@@ -810,6 +810,169 @@ fn deque_rotate_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     }
 }
 
+// ---------------------------------------------------------------------
+// `_tuplegetter`: the named tuple field descriptor.
+
+/// [`crate::types::TypeObject::collections_kind`] of the `_tuplegetter` class:
+/// the attribute paths read a named tuple field through one of its
+/// instances as a native tuple index (see [`tuplegetter_read`]).
+pub(crate) const DESCR_TUPLEGETTER: u8 = 1;
+
+/// The descriptor's field index lives in a slot whose name isn't an
+/// identifier: no Python code can reach (or rebind) it, so the index is
+/// fixed for the descriptor's life, as in CPython's C struct, and the
+/// attribute caches may remember it.
+const TG_INDEX: &str = "<index>";
+
+/// The field index of `desc` when it is an instance of a `_tuplegetter`
+/// class.
+#[inline]
+pub(crate) fn tuplegetter_index(desc: &crate::types::PyInstance) -> Option<usize> {
+    if desc.cls_raw().collections_kind.get() != DESCR_TUPLEGETTER {
+        return None;
+    }
+    let slots = desc.slots.try_borrow().ok()?;
+    match slots.get_hinted(0, TG_INDEX)? {
+        Object::Int(i) => usize::try_from(*i).ok(),
+        _ => None,
+    }
+}
+
+/// The field `desc` (a `_tuplegetter`) reads from the tuple-subclass
+/// instance `recv`, when it is in range (anything else is the Python
+/// `__get__`'s to raise).
+#[inline]
+pub(crate) fn tuplegetter_read(
+    desc: &crate::types::PyInstance,
+    recv: &crate::types::PyInstance,
+) -> Option<Object> {
+    let index = tuplegetter_index(desc)?;
+    match recv.native.get()? {
+        Object::Tuple(t) => t.get(index).cloned(),
+        _ => None,
+    }
+}
+
+/// `install_tuplegetter(cls)`: mark the `_tuplegetter` class (exactly; a
+/// subclass is never marked) for the native attribute paths.
+fn install_tuplegetter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_tuplegetter() expects a class"));
+    };
+    cls.collections_kind.set(DESCR_TUPLEGETTER);
+    Ok(Object::None)
+}
+
+/// `tuplegetter_init(desc, index)`: record the field index, once.
+fn tuplegetter_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(desc), index] = args else {
+        return Err(type_error(
+            "tuplegetter_init() expects a descriptor and an index",
+        ));
+    };
+    let index = crate::builtins::coerce_index_i64(index)?;
+    if desc.slot_get(TG_INDEX).is_some() {
+        return Err(type_error("_tuplegetter index is already set"));
+    }
+    desc.slot_set(TG_INDEX, Object::Int(index));
+    Ok(Object::None)
+}
+
+fn tg_index(desc: &Object) -> Result<i64, RuntimeError> {
+    match desc {
+        Object::Instance(d) => match d.slot_get(TG_INDEX) {
+            Some(Object::Int(i)) => Ok(i),
+            _ => Err(type_error("uninitialized _tuplegetter")),
+        },
+        _ => Err(type_error("_tuplegetter expected")),
+    }
+}
+
+/// `tuplegetter_index(desc)`: the field index (for `__reduce__`).
+fn tuplegetter_index_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [desc] = args else {
+        return Err(type_error("tuplegetter_index() expects a descriptor"));
+    };
+    tg_index(desc).map(Object::Int)
+}
+
+/// `_tuplegetter.__get__(self, obj, type=None)`, as CPython's
+/// `tuplegetter_descr_get`: the descriptor itself through the class, the
+/// field through a tuple, and an error otherwise.
+fn tuplegetter_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (desc, obj) = match args {
+        [desc, obj] | [desc, obj, _] => (desc, obj),
+        _ => return Err(type_error("__get__ expected 1 or 2 arguments")),
+    };
+    let index = tg_index(desc)?;
+    let tuple = match obj {
+        Object::Tuple(t) => Some(t),
+        Object::Instance(i) => match i.native.get() {
+            Some(Object::Tuple(t)) => Some(t),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(tuple) = tuple else {
+        if matches!(obj, Object::None) {
+            return Ok(desc.clone());
+        }
+        return Err(type_error(format!(
+            "descriptor for index '{index}' for tuple subclasses doesn't apply to '{}' object",
+            crate::builtins::class_of(obj).name
+        )));
+    };
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| tuple.get(i).cloned())
+        .ok_or_else(|| index_error("tuple index out of range"))
+}
+
+// ---------------------------------------------------------------------
+// `namedtuple` construction.
+
+/// A registered generated `__new__`: the function (weakly), the code
+/// object it was built with (held, so its address names it for the
+/// registry's life), and the field count.
+type NtNew = (
+    crate::sync::Weak<crate::object::PyFunction>,
+    Rc<weavepy_compiler::CodeObject>,
+    usize,
+);
+
+/// The generated `__new__` functions of named tuple classes (see
+/// [`namedtuple_new_shape`]).
+static NT_NEWS: parking_lot::Mutex<Vec<NtNew>> = parking_lot::Mutex::new(Vec::new());
+
+/// `namedtuple_register(new, nfields)`: `namedtuple()` vouches that `new`
+/// is its generated `lambda _cls, f1, …, fn: _tuple_new(_cls, (f1, …, fn))`
+/// (with `_tuple_new` bound to `tuple.__new__` in a namespace nothing else
+/// holds).
+fn namedtuple_register(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Function(f), Object::Int(n)] = args else {
+        return Err(type_error(
+            "namedtuple_register() expects a function and a count",
+        ));
+    };
+    let n = usize::try_from(*n).map_err(|_| type_error("negative field count"))?;
+    let code = f.code();
+    let mut reg = NT_NEWS.lock();
+    reg.retain(|(w, _, _)| w.strong_count() > 0);
+    reg.push((Rc::downgrade(f), code, n));
+    Ok(Object::None)
+}
+
+/// When `f` is a registered named tuple `__new__`: the address of the code
+/// object it was registered with and its field count. A class whose
+/// `__new__` is `f` builds `cls(*fields)` as the tuple directly while `f`
+/// still runs that code (see `Interpreter::instantiate_named_tuple`).
+pub(crate) fn namedtuple_new_shape(f: &Rc<crate::object::PyFunction>) -> Option<(usize, usize)> {
+    let reg = NT_NEWS.lock();
+    reg.iter()
+        .find(|(w, _, _)| std::ptr::eq(w.as_ptr(), Rc::as_ptr(f)) && w.strong_count() > 0)
+        .map(|(_, code, n)| (Rc::as_ptr(code) as usize, *n))
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -842,12 +1005,57 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
+        reg(
+            "install_tuplegetter",
+            "install_tuplegetter",
+            install_tuplegetter,
+        );
+        reg("tuplegetter_init", "tuplegetter_init", tuplegetter_init);
+        reg(
+            "tuplegetter_index",
+            "tuplegetter_index",
+            tuplegetter_index_builtin,
+        );
+        reg("tuplegetter_get", "__get__", tuplegetter_get);
+        reg(
+            "namedtuple_register",
+            "namedtuple_register",
+            namedtuple_register,
+        );
         reg("iterator_next", "__next__", deque_iterator_next);
         reg(
             "reverse_iterator_next",
             "__next__",
             deque_reverse_iterator_next,
         );
+        // The `OrderedDict` methods (see `collections_odict`).
+        for (export, name, body, kw) in super::collections_odict::exports() {
+            d.insert(
+                DictKey(Object::from_static(export)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: true,
+                    call: Box::new(body),
+                    call_kw: kw.map(|kw| {
+                        Box::new(kw)
+                            as Box<
+                                dyn Fn(
+                                        &[Object],
+                                        &[(String, Object)],
+                                    )
+                                        -> Result<Object, RuntimeError>
+                                    + Send
+                                    + Sync,
+                            >
+                    }),
+                })),
+            );
+        }
+        for (name, fast) in super::collections_odict::leaf_halves() {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, fast);
+            }
+        }
         // The end operations, length, truth, iterator construction, and
         // iterator steps run no Python code. Indexing and rotation require
         // an argument guard because index coercion can invoke Python's
@@ -863,6 +1071,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__reversed__",
             "iterator_next",
             "reverse_iterator_next",
+            "tuplegetter_get",
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register(b);

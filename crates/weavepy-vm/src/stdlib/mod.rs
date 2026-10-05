@@ -148,6 +148,7 @@ pub mod string_mod;
 pub mod warnings_mod;
 
 pub mod collections_native;
+pub mod collections_odict;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;

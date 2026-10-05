@@ -44,10 +44,14 @@ pub enum Dunder {
     Hash,
     GetAttr,
     GetAttribute,
+    GetItem,
+    SetItem,
+    Missing,
+    Iter,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 8;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -55,6 +59,10 @@ impl Dunder {
             Self::Hash => "__hash__",
             Self::GetAttr => "__getattr__",
             Self::GetAttribute => "__getattribute__",
+            Self::GetItem => "__getitem__",
+            Self::SetItem => "__setitem__",
+            Self::Missing => "__missing__",
+            Self::Iter => "__iter__",
         }
     }
 }
@@ -457,6 +465,10 @@ pub enum LeafAttrKind {
     /// A `property` on the MRO (a data descriptor: it wins over the
     /// instance dict); its getter is read at access time.
     Property(crate::sync::Weak<crate::object::PyProperty>),
+    /// A named tuple field: a `_tuplegetter` (a data descriptor) on the
+    /// MRO, reading this index of the instance's tuple (the descriptor's
+    /// index is fixed for its life).
+    TupleField(u32),
     /// Anything else: the full path decides.
     Other,
 }
@@ -673,6 +685,11 @@ pub struct TypeObject {
     /// are never cycle-collector tracked (like CPython's C types without
     /// `Py_TPFLAGS_HAVE_GC`), and the leaf guards key on the value.
     pub native_kind: Cell<u8>,
+    /// Non-zero for an exact `_collections` class the interpreter serves
+    /// natively: `_tuplegetter`, whose instances the attribute paths read
+    /// as tuple items (`stdlib::collections_native::DESCR_TUPLEGETTER`),
+    /// or `OrderedDict` (`stdlib::collections_odict::KIND_ODICT`).
+    pub collections_kind: Cell<u8>,
     /// Native-implementation state for such a class (see
     /// `stdlib::datetime_native`), set once.
     pub native_ext: std::sync::OnceLock<Rc<dyn std::any::Any + Send + Sync>>,
@@ -794,6 +811,13 @@ pub struct InstancePlan {
         Rc<crate::object::PyFunction>,
         Rc<weavepy_compiler::CodeObject>,
     )>,
+    /// `user_new` is a named tuple class's generated `__new__` (see
+    /// `stdlib::collections_native::namedtuple_new_shape`), `__init__` is
+    /// `object`'s, and nothing else intercepts construction: the code
+    /// object the function had when it was registered (its address) and
+    /// its field count. A call with exactly that many positional arguments builds
+    /// the tuple directly while the function still runs that code.
+    pub tuple_new: Option<(usize, usize)>,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
@@ -1081,6 +1105,7 @@ impl TypeObject {
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
+            collections_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),

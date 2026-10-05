@@ -3991,6 +3991,24 @@ pub(crate) fn dict_reentrant_get(
     }
 }
 
+/// The position of `key` in `d`, honouring keys whose `__hash__`/`__eq__`
+/// run Python (the borrow-free probe, then an identity match on the stored
+/// key).
+pub(crate) fn dict_index_of(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<Option<usize>, RuntimeError> {
+    use indexmap::map::raw_entry_v1::RawEntryApiV1;
+    let probe = dict_reentrant_probe(d, key)?;
+    match probe.stored {
+        Some(stored) => Ok(d
+            .borrow()
+            .raw_entry_v1()
+            .index_from_hash(probe.table_hash, |k| k.0.is_same(&stored))),
+        None => Ok(None),
+    }
+}
+
 /// Reentrant-safe `del d[key]` / `d.pop(key)`. Returns the evicted entry.
 pub(crate) fn dict_reentrant_remove(
     d: &RefCell<DictData>,
@@ -8304,6 +8322,11 @@ pub enum PyIterator {
         /// `di_pos >= dk_nentries` bail-out
         /// (test_dict.test_reversed_dict_after_clear_and_restore).
         reverse: bool,
+        /// An `OrderedDict`'s key iterator over its order dict (see
+        /// `stdlib::collections_odict`): the watch is taken at creation,
+        /// and a structural change raises CPython's `OrderedDict mutated
+        /// during iteration` in either direction.
+        odict: bool,
     },
     Bytes {
         data: SharedSlice<u8>,
@@ -8756,6 +8779,34 @@ impl PyIterator {
     /// `Ok(true)` when the step must end silently; an error once the dict
     /// changed under it. Nothing for any other iterator.
     fn dict_iter_guard(&mut self) -> Result<bool, RuntimeError> {
+        if let PyIterator::DictKeys {
+            dict: dict @ Some(_),
+            len,
+            watch,
+            index,
+            reverse,
+            owner,
+            odict: true,
+            ..
+        } = self
+        {
+            // An `OrderedDict` order (see `stdlib::collections_odict`): its
+            // watch was taken at creation and counts every structural
+            // change (CPython's `od_state`), which ends the iterator; a size
+            // change the order didn't see is sticky.
+            let d = dict.as_ref().expect("matched above");
+            if watch.as_ref().is_some_and(DictWatch::changed) {
+                *dict = None;
+                *owner = None;
+                return Err(runtime_error("OrderedDict mutated during iteration"));
+            }
+            if d.borrow().len() != *len {
+                *len = usize::MAX;
+                *index = if *reverse { 0 } else { usize::MAX };
+                return Err(runtime_error("OrderedDict changed size during iteration"));
+            }
+            return Ok(false);
+        }
         if let PyIterator::DictKeys {
             dict: Some(d),
             len,
@@ -10052,6 +10103,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
+                    odict: false,
                 })
             }
             Object::Set(s) => {
@@ -10117,6 +10169,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: v.owner.clone(),
+                    odict: false,
                 })
             }
             Object::MappingProxy(d) => {
@@ -10129,6 +10182,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
+                    odict: false,
                 })
             }
             // Static fallback; the VM's iteration dispatch delegates to

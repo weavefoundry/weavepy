@@ -648,6 +648,28 @@ unsafe extern "C" fn h_container(
         if let Some(n) = Interpreter::core_container_op(ins, st.stack, len, st.cap) {
             return n as u64;
         }
+        // An instance whose class's `__setitem__` is a native fast store
+        // the site cached (as the core loop's arm runs it).
+        if ins.op == OpCode::StoreSubscr && len >= 3 {
+            let ops = std::slice::from_raw_parts(st.stack.add(len - 2), 2);
+            let Some(fast) = (*st.interp).core_native_subscript(&*code, pc as usize, ops) else {
+                return u64::MAX;
+            };
+            // Bitwise views in the `__setitem__` order, never dropped.
+            let views = std::mem::ManuallyDrop::new([
+                st.stack.add(len - 2).read(),
+                st.stack.add(len - 1).read(),
+                st.stack.add(len - 3).read(),
+            ]);
+            let Some(Ok(v)) = fast(&views[..]) else {
+                return u64::MAX;
+            };
+            crate::drop_hot(v);
+            crate::drop_hot(st.stack.add(len - 1).read());
+            crate::drop_hot(st.stack.add(len - 2).read());
+            crate::drop_hot(st.stack.add(len - 3).read());
+            return (len - 3) as u64;
+        }
         // An instance whose class's `__getitem__` is a native fast
         // subscript the site cached.
         if ins.op != OpCode::BinarySubscr || len < 2 {

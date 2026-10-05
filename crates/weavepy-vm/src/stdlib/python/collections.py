@@ -358,6 +358,11 @@ try:
 except ImportError:
     _tuplegetter = lambda index, doc: property(_itemgetter(index), doc=doc)
 
+try:
+    from _collections import _namedtuple_register
+except ImportError:
+    _namedtuple_register = None
+
 def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
     """Returns a new subclass of tuple with named fields.
 
@@ -449,6 +454,8 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
     __new__.__doc__ = f'Create new instance of {typename}({arg_list})'
     if defaults is not None:
         __new__.__defaults__ = defaults
+    if _namedtuple_register is not None:
+        _namedtuple_register(__new__, num_fields)
 
     @classmethod
     def _make(cls, iterable):

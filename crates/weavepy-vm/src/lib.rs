@@ -9724,6 +9724,37 @@ impl Interpreter {
     /// called with exactly its positional arity. Allocates the instance,
     /// tracks it, and runs `__init__` as a lean activation. `None` for
     /// every other shape, which the general `instantiate` handles.
+    /// `NT(a, b, c)` for a named tuple class (or a subclass that keeps its
+    /// generated `__new__` and `object.__init__`): the tuple-subclass
+    /// instance `tuple.__new__(cls, (a, b, c))` builds, without running
+    /// the generated function. `None` (nothing done) for any other shape.
+    #[inline]
+    fn instantiate_named_tuple(&mut self, cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+        let plan = self.instance_plan(cls);
+        let (code, nfields) = plan.tuple_new?;
+        if args.len() != nfields {
+            return None;
+        }
+        let Some(Object::Function(f)) = &plan.user_new else {
+            return None;
+        };
+        // `__new__.__code__ = …` since registration, or a call observer
+        // that must see the function run.
+        // SAFETY: GIL-serialized raw read of the function's code cell; only
+        // the pointer is compared.
+        if unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize != code
+            || crate::trace::any_observers_active()
+        {
+            return None;
+        }
+        let inst = Object::Instance(Rc::new(PyInstance::with_native(
+            cls.clone(),
+            Object::new_tuple(args.to_vec()),
+        )));
+        gc_trace::track(&inst);
+        Some(inst)
+    }
+
     fn instantiate_plain_lean(
         &mut self,
         cls: &Rc<TypeObject>,
@@ -11308,6 +11339,53 @@ impl Interpreter {
                                         // SAFETY: the container's slot is free.
                                         unsafe { base.add(len).write(v) };
                                         len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        after_release!();
+                                    }
+                                    Err(e) => {
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                    }
+                                }
+                            }
+                            // An instance whose class's `__setitem__` is a
+                            // native fast store the site cached.
+                            None if ins.op == OpCode::StoreSubscr && len >= 3 => {
+                                let Some(fast) = self.core_native_subscript(
+                                    code,
+                                    pc,
+                                    // SAFETY: `len >= 3`.
+                                    unsafe { std::slice::from_raw_parts(base.add(len - 2), 2) },
+                                ) else {
+                                    break None;
+                                };
+                                // Bitwise views of the operands in the
+                                // `__setitem__` order, never dropped: the
+                                // callee clones what it keeps.
+                                // SAFETY: the three operand slots are
+                                // initialized and outlive the call.
+                                let views = std::mem::ManuallyDrop::new(unsafe {
+                                    [
+                                        base.add(len - 2).read(),
+                                        base.add(len - 1).read(),
+                                        base.add(len - 3).read(),
+                                    ]
+                                });
+                                let Some(r) = fast(&views[..]) else {
+                                    break None;
+                                };
+                                // SAFETY: the operands leave by plain
+                                // decrements (checked above).
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot(base.add(len - 3).read());
+                                }
+                                len -= 3;
+                                match r {
+                                    Ok(v) => {
+                                        drop_hot(v);
                                         last = pc;
                                         pc += 1;
                                         after_release!();
@@ -13566,6 +13644,28 @@ impl Interpreter {
         }
         let ty = ty.clone();
         let plan = self.instance_plan(&ty);
+        // A named tuple: the tuple of the arguments is the whole call (see
+        // `instantiate_named_tuple`).
+        if let (Some((code, nfields)), Some(Object::Function(f))) = (plan.tuple_new, &plan.user_new)
+        {
+            // SAFETY: GIL-serialized raw read of the function's code cell;
+            // only the pointer is compared.
+            if argc == nfields && unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize == code {
+                let fields: Vec<Object> = frame.stack.drain(self_slot + 1..).collect();
+                let inst = Object::Instance(Rc::new(PyInstance::with_native(
+                    ty,
+                    Object::new_tuple(fields),
+                )));
+                gc_trace::track(&inst);
+                frame.stack.truncate(callee_slot);
+                frame.stack.push(inst);
+                frame.pc = pc as u32 + 1;
+                if gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
+        }
         let Some((init, code)) = plan.lean_init.as_ref() else {
             // `C()` for a class with the default `__new__` and
             // `object.__init__`: the allocation is the whole call.
@@ -14092,6 +14192,7 @@ impl Interpreter {
             watch,
             reverse: false,
             owner,
+            ..
         } = it
         else {
             return DictStep::Decline;
@@ -16287,15 +16388,15 @@ impl Interpreter {
             if let Some(v) = unsafe { field_slot_hit(ext, attr_pc, inst) } {
                 return Some(Self::clone_operand(v));
             }
-            // A scalar class attribute the instance doesn't shadow (see
-            // `leaf_attr_resolve_site`).
-            if let Some(v) = ext
-                .stamp_slots
-                .get()
-                .and_then(|s| s.get(attr_pc))
-                .and_then(|s| class_attr_hit_via(s, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE))
-            {
-                if !inst_may_shadow(inst, code, name_idx) {
+            // A scalar class attribute the instance doesn't shadow, or a
+            // named tuple field (see `leaf_attr_resolve_site`).
+            if let Some(slot) = ext.stamp_slots.get().and_then(|s| s.get(attr_pc)) {
+                if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
+                    if !inst_may_shadow(inst, code, name_idx) {
+                        return Some(v);
+                    }
+                }
+                if let Some(v) = tuple_field_hit(slot, inst) {
                     return Some(v);
                 }
             }
@@ -17928,6 +18029,23 @@ impl Interpreter {
                             }
                             old
                         }
+                        // A registered leaf `__setitem__` (a dict subclass
+                        // that doesn't override it, a native container
+                        // class), with a leaf key.
+                        (Object::Instance(_), Object::Int(_) | Object::Str(_)) => {
+                            let args = [rest[0].clone(), rest[1].clone(), value_slot.clone()];
+                            match self.leaf_instance_store_subscript(&args, code, pc as u32) {
+                                Some(Ok(_)) => Object::None,
+                                Some(Err(error)) => {
+                                    drop(args);
+                                    stack.truncate(n - 3);
+                                    pc += 1;
+                                    stop = LeafStop::Raised(error);
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
                         _ => break,
                     };
                     let key = stack.pop().expect("length checked above");
@@ -18827,6 +18945,53 @@ impl Interpreter {
         Some(completed)
     }
 
+    /// [`Self::leaf_instance_subscript`] for `STORE_SUBSCR`: `args` is the
+    /// `[container, key, value]` the class's `__setitem__` takes. The fast
+    /// half is cached in the store site's own method slot.
+    #[inline(never)]
+    fn leaf_instance_store_subscript(
+        &self,
+        args: &[Object],
+        code: &CodeObject,
+        cache_pc: u32,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), _, _] = args else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let version = cls.attr_version.get();
+        let generation = leaf_builtins::generation();
+        let cached = code_vm_ext(code)
+            .and_then(|ext| ext.method_slots.get())
+            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|slot| slot.get_native_subscript(version, generation));
+        let fast = match cached {
+            Some(fast) => fast,
+            None => {
+                let Object::Builtin(builtin) = cls.lookup("__setitem__")? else {
+                    return None;
+                };
+                if !builtin.binds_instance || builtin.call_kw.is_some() {
+                    return None;
+                }
+                match self.leaf_call_kind(&builtin)? {
+                    LeafKind::Fast(fast) => {
+                        if let Some(slot) = code_method_slot(code, cache_pc) {
+                            slot.set_native_subscript(version, generation, fast);
+                        }
+                        fast
+                    }
+                    LeafKind::Opaque => return Some((builtin.call)(args)),
+                    _ => return None,
+                }
+            }
+        };
+        fast(args)
+    }
+
     /// A registered leaf builtin method `name` on the instance's class
     /// (default attribute access, native class surface), if any.
     #[inline]
@@ -19018,7 +19183,25 @@ impl Interpreter {
                     }
                 }
             }
+            // `dict`'s subscript dunders, as a dict subclass that doesn't
+            // override them inherits them (`defaultdict`, `Counter`,
+            // `OrderedDict` reads): a present key reads, and a plain key
+            // stores, natively; a miss (`__missing__`) takes the full path.
+            // (The entries are the type's own, which it keeps alive.)
             let bt = builtin_types();
+            for (name, fast) in [
+                (
+                    "__getitem__",
+                    crate::builtins::dict_getitem_leaf as leaf_builtins::Fast,
+                ),
+                ("__setitem__", crate::builtins::dict_setitem_leaf),
+            ] {
+                if let Some(Object::Builtin(f)) =
+                    bt.dict_.dict.borrow().get(&crate::object::StrKey(name))
+                {
+                    calls.insert(Rc::as_ptr(f) as usize, LeafKind::Fast(fast));
+                }
+            }
             LeafFns {
                 calls,
                 len_ptr,
@@ -19855,11 +20038,15 @@ impl Interpreter {
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
         // A scalar class attribute read through an instance that doesn't
-        // shadow it (the stamp was filled below, at this class version).
-        if let Some(v) = code_stamp_slot(code, cache_pc)
-            .and_then(|s| class_attr_hit_via(s, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE))
-        {
-            if !inst_may_shadow(inst, code, name_idx) {
+        // shadow it (the stamp was filled below, at this class version),
+        // or a named tuple field.
+        if let Some(slot) = code_stamp_slot(code, cache_pc) {
+            if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
+                if !inst_may_shadow(inst, code, name_idx) {
+                    return Some(v);
+                }
+            }
+            if let Some(v) = tuple_field_hit(slot, inst) {
                 return Some(v);
             }
         }
@@ -19898,6 +20085,21 @@ impl Interpreter {
                 receiver.clone(),
                 Object::Function(f),
             )))),
+            // A named tuple field: the tuple item (an index out of range
+            // is the descriptor's to raise), remembered for the site.
+            (LeafAttr::TupleField(ix), _) => {
+                if let Some(slot) = code_stamp_slot(code, cache_pc) {
+                    slot.set([
+                        inst.cls_raw().attr_version.get(),
+                        TUPLE_FIELD,
+                        u64::from(ix),
+                    ]);
+                }
+                match inst.native.get() {
+                    Some(Object::Tuple(t)) => t.get(ix as usize).map(Self::clone_operand),
+                    _ => None,
+                }
+            }
             (LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_), _) => {
                 None
             }
@@ -19946,6 +20148,7 @@ impl Interpreter {
             LeafAttr::InstanceOnly => None,
             // A data descriptor: the instance dict never shadows it.
             prop @ LeafAttr::Property(_) => return Some((prop, None)),
+            field @ LeafAttr::TupleField(_) => return Some((field, None)),
             other => Some(other),
         };
         match inst.dict.published() {
@@ -20003,6 +20206,7 @@ impl Interpreter {
                 K::ValueDict(w) => Some(LeafAttr::Value(Object::Dict(w.upgrade()?))),
                 K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
+                K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
                 K::Other => None,
             };
         }
@@ -20060,7 +20264,11 @@ impl Interpreter {
                 // A plain instance stored on the class (`timezone.utc`):
                 // a value unless its class makes it a descriptor.
                 Some(Object::Instance(i)) => {
-                    if i.cls_raw().lookup("__get__").is_some() {
+                    if let Some(ix) = crate::stdlib::collections_native::tuplegetter_index(&i)
+                        .and_then(|ix| u32::try_from(ix).ok())
+                    {
+                        K::TupleField(ix)
+                    } else if i.cls_raw().lookup("__get__").is_some() {
                         K::Other
                     } else {
                         K::ValueInstance(Rc::downgrade(&i))
@@ -20080,6 +20288,7 @@ impl Interpreter {
             K::ValueDict(w) => w.upgrade().map(|d| LeafAttr::Value(Object::Dict(d))),
             K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
+            K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
             K::Other => None,
         };
         cls.leaf_attrs.set(name_key, ver, kind);
@@ -20169,7 +20378,10 @@ impl Interpreter {
             LeafAttr::Value(v) => Some(v),
             // A native method read through the class stays on the full
             // path (it reports as a method descriptor, not a function).
-            LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => None,
+            LeafAttr::InstanceOnly
+            | LeafAttr::BuiltinMethod(_)
+            | LeafAttr::Property(_)
+            | LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -20204,7 +20416,10 @@ impl Interpreter {
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => Some(Object::Function(f)),
             LeafAttr::Value(v) => Some(v),
-            LeafAttr::InstanceOnly | LeafAttr::BuiltinMethod(_) | LeafAttr::Property(_) => None,
+            LeafAttr::InstanceOnly
+            | LeafAttr::BuiltinMethod(_)
+            | LeafAttr::Property(_)
+            | LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -20318,7 +20533,10 @@ impl Interpreter {
                     }
                     Some(Object::Builtin(b))
                 }
-                LeafAttr::Value(_) | LeafAttr::InstanceOnly | LeafAttr::Property(_) => None,
+                LeafAttr::Value(_)
+                | LeafAttr::InstanceOnly
+                | LeafAttr::Property(_)
+                | LeafAttr::TupleField(_) => None,
             };
         };
         let cls = inst.cls_raw();
@@ -20715,6 +20933,41 @@ impl Interpreter {
         v: Object,
         i: Object,
     ) -> Result<(), RuntimeError> {
+        // A dict subclass that keeps `dict.__getitem__` (`defaultdict`,
+        // `Counter`, `OrderedDict`): CPython's `dict_subscript`, a native
+        // lookup whose miss goes to the class's `__missing__` without
+        // building the `KeyError` first. Both resolutions are memoized
+        // per class version.
+        if let Object::Instance(inst) = &v {
+            if let Some(Object::Dict(d)) = inst.native.get() {
+                let cls = inst.cls_raw();
+                let getitem = cls.dunder(crate::types::Dunder::GetItem);
+                if getitem.present() && getitem.builtin_owner() {
+                    let d = d.clone();
+                    crate::builtins::ensure_dict_key(&i)?;
+                    let r = match crate::builtins::dict_lookup(&d, &i)? {
+                        Some(found) => found,
+                        None if cls.dunder(crate::types::Dunder::Missing).present() => {
+                            match instance_method(&v, "__missing__") {
+                                Some(miss) => self.call(
+                                    &miss,
+                                    std::slice::from_ref(&i),
+                                    &[],
+                                    &frame.globals.clone(),
+                                )?,
+                                None => return Err(crate::error::key_error_object(i)),
+                            }
+                        }
+                        None => return Err(crate::error::key_error_object(i)),
+                    };
+                    frame.push(r);
+                    if matches!(&v, Object::Instance(_)) {
+                        self.release(v);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let r = if let Object::Instance(inst) = &v {
             // Only dispatch a *user-defined* `__getitem__`; a slot
             // inherited from a built-in base (e.g. `dict.__getitem__`
@@ -20883,6 +21136,23 @@ impl Interpreter {
         target: Object,
         i: Object,
     ) -> Result<(), RuntimeError> {
+        // A dict subclass that keeps `dict.__setitem__` stores into its
+        // native payload directly (memoized per class version).
+        if let Object::Instance(inst) = &target {
+            if let Some(Object::Dict(d)) = inst.native.get() {
+                let setitem = inst.cls_raw().dunder(crate::types::Dunder::SetItem);
+                if setitem.present() && setitem.builtin_owner() {
+                    let d = d.clone();
+                    crate::builtins::ensure_dict_key(&i)?;
+                    let old = crate::builtins::dict_insert(&d, i, value)?;
+                    if let Some(old) = old {
+                        self.release(old);
+                    }
+                    self.release(target);
+                    return Ok(());
+                }
+            }
+        }
         let g = frame.globals.clone();
         if let Object::Instance(inst) = &target {
             if let Some(method) = instance_method(&target, "__setitem__") {
@@ -27499,6 +27769,13 @@ impl Interpreter {
         // dict probe below (the super-proxy check, then step (2)) may run
         // arbitrary Python via key comparison, so the order matters.
         let meta_attr = inst.cls().lookup(name);
+        // A named tuple field (a `_tuplegetter` data descriptor): the
+        // tuple item, natively.
+        if let Some(Object::Instance(desc)) = &meta_attr {
+            if let Some(v) = crate::stdlib::collections_native::tuplegetter_read(desc, inst) {
+                return Ok(v);
+            }
+        }
         let owner = Object::Type(inst.cls());
 
         // A *bound* super proxy carries `__self_class__` (`su->obj_type`),
@@ -31339,6 +31616,18 @@ impl Interpreter {
                 Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Range(..) => {
                     Object::Iter(Rc::new(RefCell::new(s.make_iter().ok()?)))
                 }
+                // A tuple subclass that keeps `tuple.__iter__` (a named
+                // tuple): its items, as the inherited iterator yields them.
+                Object::Instance(inst) => match inst.native.get() {
+                    Some(t @ Object::Tuple(_)) => {
+                        let it = inst.cls_raw().dunder(crate::types::Dunder::Iter);
+                        if !(it.present() && it.builtin_owner()) {
+                            return None;
+                        }
+                        Object::Iter(Rc::new(RefCell::new(t.make_iter().ok()?)))
+                    }
+                    _ => return None,
+                },
                 _ => return None,
             });
         }
@@ -31387,6 +31676,25 @@ impl Interpreter {
         } else {
             match inst.slot_get("_iters")? {
                 Object::Tuple(t) if t.len() == 1 => t[0].clone(),
+                // Several native iterators, not strict: one item from each
+                // until the shortest is exhausted (the class's `__next__`).
+                Object::Tuple(t) if t.iter().all(|i| matches!(i, Object::Iter(_))) => {
+                    if !matches!(inst.slot_get("_strict"), Some(Object::Bool(false))) {
+                        return None;
+                    }
+                    let mut args = Vec::with_capacity(t.len());
+                    for cursor in t.iter() {
+                        let Object::Iter(cursor) = cursor else {
+                            return None;
+                        };
+                        match cursor.borrow_mut().next_value_checked() {
+                            Ok(Some(v)) => args.push(v),
+                            Ok(None) => return Some(Ok(None)),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    return Some(self.call(&func, &args, &[], globals).map(Some));
+                }
                 _ => return None,
             }
         };
@@ -47394,6 +47702,19 @@ impl Interpreter {
             _ => None,
         };
 
+        let tuple_new = match &user_new {
+            Some(Object::Function(f))
+                if abstract_error.is_none()
+                    && init_from_object
+                    && !seeds_exception_args
+                    && matches!(&native, NativeKind::Value { base, .. } if Rc::ptr_eq(base, &bt.tuple_))
+                    && !cls.is_type_subclass() =>
+            {
+                crate::stdlib::collections_native::namedtuple_new_shape(f)
+            }
+            _ => None,
+        };
+
         crate::types::InstancePlan {
             abstract_error,
             user_new,
@@ -47404,6 +47725,7 @@ impl Interpreter {
             seeds_exception_args,
             only_object_init,
             lean_init,
+            tuple_new,
         }
     }
 
@@ -47429,6 +47751,9 @@ impl Interpreter {
             }
         }
         if kwargs.is_empty() && !cls.flags.is_builtin {
+            if let Some(r) = self.instantiate_named_tuple(&cls, args) {
+                return Ok(r);
+            }
             if let Some(r) = self.instantiate_plain_lean(&cls, args) {
                 return r;
             }
@@ -56915,6 +57240,8 @@ enum LeafAttr {
     /// A `property` on the class MRO: the getter runs (as a lean
     /// activation, from the quiet loop) with the receiver.
     Property(Rc<crate::object::PyProperty>),
+    /// A named tuple field (see [`crate::types::LeafAttrKind::TupleField`]).
+    TupleField(u32),
 }
 
 /// A builtin the leaf burst knows how to call without leaving the quiet
@@ -63325,6 +63652,27 @@ fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Ob
 /// Marks a stamp remembered for a read through an *instance* of the
 /// class, which also needs the instance not to shadow the name.
 const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
+
+/// A `LOAD_ATTR` site's stamp tag for a named tuple field (a
+/// `_tuplegetter` on the class at that version): the bits are the field
+/// index. The descriptor is a data descriptor, so no instance shadows it.
+const TUPLE_FIELD: u64 = 0x5ca1_a770_0000_0005;
+
+/// The named tuple field a `LOAD_ATTR` site's stamp remembers for
+/// `inst`'s class at its current version (see [`TUPLE_FIELD`]): the item
+/// of `inst`'s tuple, or `None` (an index out of range is the
+/// descriptor's to raise).
+#[inline(always)]
+fn tuple_field_hit(slot: &StampSlot, inst: &PyInstance) -> Option<Object> {
+    let [ver, tag, bits] = slot.get();
+    if tag != TUPLE_FIELD || ver != inst.cls_raw().attr_version.get() {
+        return None;
+    }
+    match inst.native.get()? {
+        Object::Tuple(t) => t.get(bits as usize).map(clone_hot),
+        _ => None,
+    }
+}
 
 /// [`class_attr_hit`] for a stamp filled with `via` (`0`, or
 /// [`CLASS_ATTR_VIA_INSTANCE`]).
