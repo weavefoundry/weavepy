@@ -10803,6 +10803,13 @@ impl Interpreter {
                 // (The activation is synced at every reload.)
                 return CoreExit::Switch;
             }
+            // The native code writes the stack at fixed offsets: a stack
+            // that started small (a materialized frame's) grows first.
+            #[cfg(feature = "jit")]
+            if let Some(n) = native.filter(|n| cap < n.need()) {
+                stack.reserve(n.need() - len);
+                continue 'reload;
+            }
             #[cfg(feature = "jit")]
             if pc == 0 && !NATIVE {
                 if let Some(ext) = ext {
@@ -10835,6 +10842,7 @@ impl Interpreter {
                             out: 0,
                             depth_cell: sw.depth_cell,
                             err: None,
+                            frame: sw.cur,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -14680,6 +14688,19 @@ impl Interpreter {
                         let probe = crate::object::LeafProbe::new(k)?;
                         let d = d.try_borrow().ok()?;
                         clone_hot(d.get(&probe)?)
+                    }
+                    // A pure-ASCII string's character, in range (any other
+                    // index or string is the full handler's).
+                    (Object::Str(s), Object::Int(i)) => {
+                        let n = s.len();
+                        if crate::object::str_char_len(s) != n {
+                            return None;
+                        }
+                        let i = if *i < 0 { *i + n as i64 } else { *i };
+                        if i < 0 || i >= n as i64 {
+                            return None;
+                        }
+                        Object::from_char(s.as_bytes()[i as usize] as char)
                     }
                     (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
                         let probe = crate::object::LeafProbe::new(k)?;

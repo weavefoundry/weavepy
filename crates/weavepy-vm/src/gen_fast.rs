@@ -345,6 +345,9 @@ impl Interpreter {
         fold: Option<FoldSink>,
         dead: *const std::cell::Cell<bool>,
     ) -> GenStep {
+        // The frame, for the native code's namespace reads.
+        #[cfg(feature = "jit")]
+        let frame_ptr: *mut Frame = frame;
         // SAFETY: the frame's code is immutable and outlives the step (the
         // frame holds it, and nothing here replaces it).
         let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
@@ -364,16 +367,6 @@ impl Interpreter {
             return GenStep::Bail;
         }
         let lbase = locals.as_mut_ptr();
-        let stack = &mut frame.stack;
-        if stack.capacity() - stack.len() < 8 {
-            stack.reserve(8);
-        }
-        let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
-        let mut len = stack.len();
-        let mut pc = frame.pc as usize;
-        if pc >= ninstrs {
-            return GenStep::Bail;
-        }
         // The body's native form (see `frame_jit`), run from every pc the
         // arms below leave it at; a hot body compiles.
         #[cfg(feature = "jit")]
@@ -385,6 +378,21 @@ impl Interpreter {
             }
             ext.frame_jit.get(nlocals)
         };
+        let stack = &mut frame.stack;
+        // (The native code writes the stack at fixed offsets.)
+        #[cfg(feature = "jit")]
+        let want = (stack.len() + 8).max(native.map_or(0, |n| n.need()));
+        #[cfg(not(feature = "jit"))]
+        let want = stack.len() + 8;
+        if stack.capacity() < want {
+            stack.reserve(want - stack.len());
+        }
+        let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
+        let mut len = stack.len();
+        let mut pc = frame.pc as usize;
+        if pc >= ninstrs {
+            return GenStep::Bail;
+        }
         #[cfg(feature = "jit")]
         let mut nst = crate::frame_jit::State {
             locals: lbase,
@@ -400,6 +408,7 @@ impl Interpreter {
             out: 0,
             depth_cell: std::ptr::null(),
             err: None,
+            frame: frame_ptr,
         };
         #[cfg(feature = "jit")]
         let mut handed = usize::MAX;
