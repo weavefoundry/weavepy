@@ -9,6 +9,8 @@
 //! `WEAVEPY_ALLOC_SAMPLE=<bytes>` changes the sampling interval, and the
 //! file's first line (starting `#`) gives the exact live and peak heap
 //! totals, which tell transient allocations apart from retained ones.
+//! `<file>.peak` holds the samples live when the heap last grew past a
+//! new high-water mark (within about 6% of the peak), in the same form.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
@@ -22,6 +24,12 @@ static INTERVAL: AtomicUsize = AtomicUsize::new(SAMPLE);
 /// Exact bytes currently allocated, and the most ever allocated at once.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The live total past which the next peak snapshot is taken.
+static SNAP_AT: AtomicUsize = AtomicUsize::new(1 << 20);
+/// The peak snapshot: a mapping of `SLOTS` samples, and how many it holds.
+static SNAP: AtomicUsize = AtomicUsize::new(0);
+static SNAP_LEN: AtomicUsize = AtomicUsize::new(0);
+static SNAP_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// Return addresses kept per sample.
 const DEPTH: usize = 24;
 /// Sampled blocks tracked at once (open addressing, power of two).
@@ -78,8 +86,19 @@ pub(crate) fn start() {
     {
         INTERVAL.store(n, Ordering::Relaxed);
     }
+    let (Some(p), Some(snap)) = (map_samples(), map_samples()) else {
+        return;
+    };
+    SNAP.store(snap, Ordering::Release);
+    TABLE.store(p, Ordering::Release);
+    ENABLED.store(true, Ordering::Release);
+}
+
+/// A fresh zeroed mapping of `SLOTS` samples, owned for the rest of the
+/// process.
+fn map_samples() -> Option<usize> {
     let bytes = SLOTS * std::mem::size_of::<Sample>();
-    // SAFETY: a fresh zeroed mapping owned for the rest of the process.
+    // SAFETY: an anonymous private mapping; nothing else aliases it.
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -90,11 +109,28 @@ pub(crate) fn start() {
             0,
         )
     };
-    if p == libc::MAP_FAILED {
-        return;
+    (p != libc::MAP_FAILED).then_some(p as usize)
+}
+
+/// Copy the live samples into the peak snapshot.
+fn snapshot(live: usize) {
+    let (t, snap) = (table(), SNAP.load(Ordering::Acquire) as *mut Sample);
+    lock();
+    let mut n = 0;
+    for i in 0..SLOTS {
+        // SAFETY: `i < SLOTS` and `n <= i`, inside both mappings.
+        let s = unsafe { &*t.add(i) };
+        if s.ptr != 0 && s.ptr != usize::MAX {
+            unsafe {
+                (*snap.add(n)).ptr = s.ptr;
+                (*snap.add(n)).stack = s.stack;
+            }
+            n += 1;
+        }
     }
-    TABLE.store(p as usize, Ordering::Release);
-    ENABLED.store(true, Ordering::Release);
+    SNAP_LEN.store(n, Ordering::Relaxed);
+    SNAP_LIVE.store(live, Ordering::Relaxed);
+    unlock();
 }
 
 fn record(ptr: usize) {
@@ -186,6 +222,14 @@ fn grow(size: usize) {
     let live = LIVE.fetch_add(size, Ordering::Relaxed).wrapping_add(size);
     if live < usize::MAX / 2 && live > PEAK.load(Ordering::Relaxed) {
         PEAK.fetch_max(live, Ordering::Relaxed);
+        let at = SNAP_AT.load(Ordering::Relaxed);
+        if live > at
+            && SNAP_AT
+                .compare_exchange(at, live + live / 16, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            snapshot(live);
+        }
     }
 }
 
@@ -220,18 +264,35 @@ pub(crate) fn finish() {
     if !ENABLED.swap(false, Ordering::AcqRel) {
         return;
     }
-    let t = table();
-    // SAFETY: the main executable is image 0.
-    let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as usize;
-    let interval = INTERVAL.load(Ordering::Relaxed);
-    let mut out = format!(
+    let header = format!(
         "# live {} peak {}\n",
         LIVE.load(Ordering::Relaxed) as isize,
         PEAK.load(Ordering::Relaxed)
     );
     lock();
-    for i in 0..SLOTS {
-        // SAFETY: `i < SLOTS`.
+    let out = render(header, table(), SLOTS);
+    unlock();
+    let _ = std::fs::write(&path, out);
+    let header = format!("# snapshot live {}\n", SNAP_LIVE.load(Ordering::Relaxed));
+    let snap = render(
+        header,
+        SNAP.load(Ordering::Acquire) as *mut Sample,
+        SNAP_LEN.load(Ordering::Relaxed),
+    );
+    let mut peak_path = path;
+    peak_path.push(".peak");
+    let _ = std::fs::write(peak_path, snap);
+}
+
+/// The occupied samples among the first `n` of `t`, one line each after
+/// `header`.
+fn render(header: String, t: *mut Sample, n: usize) -> String {
+    // SAFETY: the main executable is image 0.
+    let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as usize;
+    let interval = INTERVAL.load(Ordering::Relaxed);
+    let mut out = header;
+    for i in 0..n {
+        // SAFETY: `i < n <= SLOTS`.
         let s = unsafe { &*t.add(i) };
         if s.ptr == 0 || s.ptr == usize::MAX {
             continue;
@@ -242,6 +303,5 @@ pub(crate) fn finish() {
         }
         out.push('\n');
     }
-    unlock();
-    let _ = std::fs::write(path, out);
+    out
 }

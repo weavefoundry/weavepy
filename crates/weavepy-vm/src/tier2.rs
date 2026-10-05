@@ -2504,8 +2504,12 @@ const RUNTIME_PIN_CAP: usize = 1 << 16;
 
 /// Request reconstruction at the next loop poll after this many new pins.
 /// The hard cap still bounds allocations between polls. This counts handles,
-/// not bytes, and a polling stride can overshoot the soft limit.
-const RUNTIME_PIN_SOFT_LIMIT: usize = 1 << 12;
+/// not bytes, and a polling stride can overshoot the soft limit. A pin can
+/// hold a whole structure (each `copy.deepcopy` result of a loop), so the
+/// limit is kept low: at 4096 the deepcopy benchmark kept about 17 MB of
+/// dead copies alive, and a pressure exit every few hundred pins costs
+/// nothing measurable.
+const RUNTIME_PIN_SOFT_LIMIT: usize = 1 << 9;
 
 /// Retire every pin after the activation's result or complete interpreter
 /// state has been reconstructed. A pin that held an object's last
