@@ -18087,7 +18087,32 @@ impl Interpreter {
         // SAFETY: a read between two instructions (see `GilCell::peek`).
         let dict = unsafe { m.dict.peek() }?;
         let (k, v) = dict.get_index(key_idx as usize)?;
-        slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v))
+        let names: &[Object] = code_vm_ext(code).map_or(&[], |t| &t.name_objs);
+        let (Object::Str(key), Some(Object::Str(name))) = (&k.0, names.get(name_idx as usize))
+        else {
+            return slot_name_matches(code, name_idx, k).then(|| Self::clone_operand(v));
+        };
+        if SharedStr::ptr_eq(name, key) {
+            return Some(Self::clone_operand(v));
+        }
+        if **name != **key {
+            return None;
+        }
+        // The module's own spelling of the name (a natively built module's
+        // keys aren't interned): the key becomes the interned name, equal
+        // and with the same hash, so later reads match by identity.
+        let v = Self::clone_operand(v);
+        let name = name.clone();
+        // SAFETY: as above; the shared view above is no longer used.
+        if let Some(d) = unsafe { m.dict.peek_mut() } {
+            let map: &mut crate::object::DictMap = &mut *d;
+            if let Some((key, _)) =
+                indexmap::map::MutableKeys::get_index_mut2(map, key_idx as usize)
+            {
+                key.0 = Object::Str(name);
+            }
+        }
+        Some(v)
     }
 
     /// The core loop's `x.attr` on a local receiver: the cached
