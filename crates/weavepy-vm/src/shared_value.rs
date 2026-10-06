@@ -104,6 +104,13 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
         this.data == other.data
     }
 
+    /// The owner's one word: equal for every owner of the same allocation
+    /// (what [`Self::ptr_eq`] compares), and never reused while one exists.
+    #[inline]
+    pub fn word(this: &Self) -> usize {
+        this.data.as_ptr() as usize
+    }
+
     pub fn strong_count(this: &Self) -> usize {
         Arc::strong_count(&this.arc_view())
     }

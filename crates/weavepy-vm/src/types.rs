@@ -2225,6 +2225,7 @@ impl SlotStorage {
 
     /// Access native fields only when the shared layout is the same
     /// allocation. Equal user-defined slot names aren't sufficient.
+    #[inline]
     pub(crate) fn values_for_layout(&self, expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
         match &self.data {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
@@ -3292,6 +3293,41 @@ impl PyInstance {
         } else {
             self.cls_raw().dunder(dunder)
         }
+    }
+
+    /// The member slot at position `i` of the class's slot layout (see
+    /// [`TypeObject::fresh_slots`]), while this instance's slots are laid
+    /// out over its own class's layout and that slot is set: the name
+    /// there is fixed for as long as the class lives, so a caller that
+    /// proved it once needs no name check again.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline(always)]
+    pub(crate) unsafe fn laid_out_slot(&self, i: usize) -> Option<&Object> {
+        let layout = self.cls_raw().slot_layout.get()?.as_ref()?;
+        // SAFETY: forwarded contract.
+        let v = unsafe { self.slots.peek() }?
+            .values_for_layout(layout)?
+            .get(i)?;
+        (!matches!(v, Object::Unbound)).then_some(v)
+    }
+
+    /// Where [`Self::laid_out_slot`] finds member slot `name` on this
+    /// instance: its position in the class's slot layout, when the
+    /// instance's slots are laid out over it (set or not), and the
+    /// layout's word (see [`SharedSlice::word`]), which names it for as
+    /// long as the class lives.
+    pub(crate) fn laid_out_position(&self, name: &str) -> Option<(u32, usize)> {
+        let cls = self.cls();
+        let layout = cls.slot_layout.get()?.as_ref()?;
+        let slots = self.slots.try_borrow().ok()?;
+        slots.values_for_layout(layout)?;
+        let i = layout
+            .iter()
+            .position(|k| matches!(&k.0, Object::Str(s) if s.as_ref() == name))?;
+        Some((u32::try_from(i).ok()?, SharedSlice::word(layout)))
     }
 
     /// Re-point the instance at a new class (`obj.__class__ = C`).

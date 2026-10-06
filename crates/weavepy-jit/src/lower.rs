@@ -19,7 +19,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::engine::InlineMethod;
+use crate::engine::{FieldAt, InlineMethod};
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
 use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
 use crate::value::JitType;
@@ -92,7 +92,7 @@ pub(crate) fn build_function(
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
-    inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
+    inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
 ) -> bool {
     let mut builder = FunctionBuilder::new(func, fbctx);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
@@ -174,7 +174,7 @@ struct Lowerer<'a, 'b> {
     leaves: Vec<LeafTarget>,
     /// The in-line body of a method site, by method token and the lanes
     /// of its arguments (see `engine::InlineMethod::of`).
-    inline_method: Option<&'a mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>>,
+    inline_method: Option<&'a mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>>,
     /// While lowering an in-line method body: where its guards branch
     /// (the method helper's call) instead of a side exit.
     miss_redirect: Option<Block>,
@@ -1240,7 +1240,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             TOp::MathIntrinsic(func) => self.emit_math_intrinsic(func, stmt.pc),
             TOp::CallMethod { token, argc, ret } => {
-                if let Some(body) = self.inline_body_for(token, argc, ret) {
+                if let Some(body) = self.inline_body_for(token, argc, ret, stmt.pc) {
                     self.emit_call_method_inline(&body, token, argc, ret, stmt.pc);
                 } else if let Some(ix) = self.method_leaf_for(token, argc, ret) {
                     self.emit_call_method_leaf(ix, token, argc, ret, stmt.pc);
@@ -3514,8 +3514,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// pinned instance `pin`'s split values (see [`runtime::ObjLayout`]):
     /// an instance pin whose class still has the guard's version, whose
     /// values are split over its class's names, unborrowed (`read`) or
-    /// unborrowed and exclusive (a write), and hold the guard's index.
-    /// Anything else branches to `miss`.
+    /// unborrowed and exclusive (a write), and hold the guard's index; or,
+    /// for a site on a member slot (see [`crate::ir::AttrSiteMeta::slot_member`]),
+    /// whose slots are laid out over the guard's layout, under the same
+    /// borrow rule (the slot may be unset). Anything else branches to
+    /// `miss`.
     fn split_field_addr(
         &mut self,
         l: &runtime::ObjLayout,
@@ -3526,9 +3529,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ) -> Value {
         let t = MemFlags::trusted();
         let ptr = self.ptr_ty;
+        let slot_member = l.slots_ok
+            && self
+                .tfunc
+                .attr_sites
+                .get(site as usize)
+                .is_some_and(|s| s.slot_member);
         let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
-        // The guard first: a site whose field has no split position (a
-        // `__slots__` member) leaves straight away.
+        // The guard first: a site whose field has no position of this kind
+        // leaves straight away.
         let guards = self.b.ins().load(ptr, t, ctx, l.ctx_guards);
         let gbuf = self.b.ins().load(ptr, t, guards, l.guards_buf);
         let g = self
@@ -3536,10 +3545,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
         let idx = self.b.ins().uload32(t, g, l.guard_split_idx);
-        let none = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX));
+        let none = if slot_member {
+            let kind = self.b.ins().band_imm(idx, i64::from(runtime::SLOT_FIELD));
+            self.b.ins().icmp_imm(IntCC::Equal, kind, 0)
+        } else {
+            self.b
+                .ins()
+                .icmp_imm(IntCC::Equal, idx, i64::from(u32::MAX))
+        };
         // The pin.
         let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
         let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
@@ -3562,16 +3575,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.miss_if(bad, miss);
         let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
         let ver = self.b.ins().load(types::I64, t, g, l.guard_ver);
-        // The class and the split values (grouped by what each group's
-        // loads need proven: fewer blocks compile faster).
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
         let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
-        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        if slot_member {
+            // The member slot at its position in the guard's layout.
+            let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(stale, shared);
+            self.miss_if(bad, miss);
+            let layout = self.b.ins().load(ptr, t, g, l.guard_slot_layout);
+            let (vals, bad) = self.laid_out_slots(l, inst, layout, read);
+            self.miss_if(bad, miss);
+            let i = self.b.ins().band_imm(idx, i64::from(!runtime::SLOT_FIELD));
+            let off = self.b.ins().ishl_imm(i, 4);
+            return self.b.ins().iadd(vals, off);
+        }
+        // The split values (grouped by what each group's loads need proven:
+        // fewer blocks compile faster).
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
         let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
         let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
-        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
         let busy = if read {
             self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
         } else {
@@ -3955,10 +3980,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             let old = self.b.ins().uload8(types::I64, trusted, addr, 0);
             let one = self.b.ins().iconst(types::I64, 1);
             let bit = self.b.ins().ishl(one, old);
+            // (An unset member slot holds nothing to release either.)
             let scalars = (1i64 << l.tag_int)
                 | (1i64 << l.tag_float)
                 | (1i64 << l.tag_bool)
-                | (1i64 << l.tag_none);
+                | (1i64 << l.tag_none)
+                | (1i64 << l.tag_unbound);
             let m = self.b.ins().band_imm(bit, scalars);
             let heap = self.b.ins().icmp_imm(IntCC::Equal, m, 0);
             self.miss_if(heap, miss);
@@ -4663,14 +4690,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// method's name, and whose function still wears the entry's code.
     /// Anything else branches to `miss` (the method enter helper, which
     /// decides exactly). Returns the receiver's split values' block
-    /// pointer (null for none).
+    /// pointer (null for none) and its payload pointer.
     fn inline_method_guard(
         &mut self,
         l: &runtime::ObjLayout,
         pin: Value,
         token: u32,
         miss: Block,
-    ) -> Value {
+    ) -> (Value, Value) {
         let t = MemFlags::trusted();
         let ptr = self.ptr_ty;
         let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
@@ -4748,15 +4775,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().bor(foreign, shadowed);
         self.b.ins().brif(bad, miss, &[], hit, &[]);
         self.b.switch_to_block(hit);
-        block
+        (block, inst)
     }
 
     /// The in-line body of method token `token` (see
-    /// `engine::InlineMethod::of`) for this site, when the embedder
-    /// published its object layout and offers one for these argument lanes
-    /// whose result is the scalar the site expects, and every local the
-    /// body reads is a parameter or was stored first.
-    fn inline_body_for(&mut self, token: u32, argc: u8, ret: MethodRet) -> Option<InlineMethod> {
+    /// `engine::InlineMethod::of`) for this site (its call at `pc`), when
+    /// the embedder published its object layout and offers one for these
+    /// argument lanes whose result is the scalar the site expects, and
+    /// every local the body reads is a parameter or was stored first.
+    fn inline_body_for(
+        &mut self,
+        token: u32,
+        argc: u8,
+        ret: MethodRet,
+        pc: u32,
+    ) -> Option<InlineMethod> {
         if token & runtime::METHOD_NATIVE != 0 || runtime::obj_layout().is_none() {
             return None;
         }
@@ -4767,15 +4800,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             return None;
         }
         let lanes: Vec<JitType> = self.vstack[base..].iter().map(|&(_, t)| t).collect();
-        if !lanes
-            .iter()
-            .all(|t| matches!(t, JitType::Int | JitType::Float | JitType::Bool))
-        {
+        if !lanes.iter().all(|t| {
+            matches!(
+                t,
+                JitType::Int | JitType::Float | JitType::Bool | JitType::Obj
+            )
+        }) {
             return None;
         }
         let lookup = self.inline_method.as_mut()?;
-        let body = lookup(token, &lanes)?;
-        if body.ret != lane || body.params != lanes || body.field_idx.contains(&u32::MAX) {
+        let body = lookup(token, &lanes, pc)?;
+        if body.ret != lane
+            || body.params != lanes
+            || body.field_at.contains(&FieldAt::Unknown)
+            || (body
+                .field_at
+                .iter()
+                .any(|a| matches!(a, FieldAt::Slot { .. }))
+                && !runtime::obj_layout().is_some_and(|l| l.slots_ok))
+        {
             return None;
         }
         let mut defined = vec![false; body.n_locals.max(1) as usize];
@@ -4788,7 +4831,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     return None;
                 }
                 TOp::StoreLocal(s) => *defined.get_mut(s as usize)? = true,
-                TOp::AttrGet { site, .. } if site as usize >= body.field_idx.len() => return None,
+                TOp::AttrGet { site, .. } if site as usize >= body.field_at.len() => return None,
                 _ => {}
             }
         }
@@ -4798,11 +4841,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// Lower a guarded method call whose body runs in line (see
     /// `engine::InlineMethod`): the site's guard as for a direct method
     /// call, the gates a call checks (no observer or pending interpreter
-    /// work, room under the recursion limit), then the body's operations
-    /// on the receiver's split values and the call's arguments. The body
-    /// does nothing observable, so any miss (a guard, a field of another
-    /// lane or position, an overflow, a zero divisor) runs the call
-    /// through the method helper from the start.
+    /// work, room under the recursion limit), each object argument's class
+    /// version, then the body's operations on its receivers' fields and the
+    /// call's arguments. The body does nothing observable, so any miss (a
+    /// guard, a field of another lane or position, an overflow, a zero
+    /// divisor) runs the call through the method helper from the start.
     fn emit_call_method_inline(
         &mut self,
         body: &InlineMethod,
@@ -4822,8 +4865,47 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let generic_b = self.b.create_block();
         let join_b = self.b.create_block();
         self.b.append_block_param(join_b, Self::cl_ty(lane));
-        let block = self.inline_method_guard(&l, recv.0, token, generic_b);
+        let (block, inst) = self.inline_method_guard(&l, recv.0, token, generic_b);
         self.inline_call_gates(&l, generic_b);
+        // Where each receiver keeps the fields the body reads: `self`'s
+        // split values from the guard, an object argument's once its class
+        // is checked, and either's laid-out member slots.
+        let mut bases: Vec<(Option<Value>, Option<Value>)> = vec![(None, None); n + 1];
+        bases[0].0 = Some(block);
+        let mut payloads: Vec<Option<Value>> = vec![None; n + 1];
+        payloads[0] = Some(inst);
+        for (k, &r) in body.field_recv.iter().enumerate() {
+            let r = r as usize;
+            let need = match body.field_at[k] {
+                FieldAt::Split(_) => bases[r].0.is_none(),
+                FieldAt::Slot { .. } => bases[r].1.is_none(),
+                FieldAt::Unknown => unreachable!("checked by inline_body_for"),
+            };
+            if !need {
+                continue;
+            }
+            let at = match payloads[r] {
+                Some(at) => at,
+                None => {
+                    let at = self.inline_arg_guard(&l, args[r - 1].0, body.recv_ver[r], generic_b);
+                    payloads[r] = Some(at);
+                    at
+                }
+            };
+            match body.field_at[k] {
+                FieldAt::Split(_) => {
+                    let b = self.inline_split_values(&l, at, generic_b);
+                    bases[r].0 = Some(b);
+                }
+                FieldAt::Slot { layout, .. } => {
+                    let layout = self.b.ins().iconst(self.ptr_ty, layout as i64);
+                    let (vals, bad) = self.laid_out_slots(&l, at, layout, true);
+                    self.miss_if(bad, generic_b);
+                    bases[r].1 = Some(vals);
+                }
+                FieldAt::Unknown => {}
+            }
+        }
 
         let outer = std::mem::take(&mut self.vstack);
         let outer_miss = self.miss_redirect.replace(generic_b);
@@ -4844,8 +4926,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 TOp::AttrGet { site, out } => {
                     self.pop();
-                    let idx = body.field_idx[site as usize];
-                    let v = self.inline_field_read(&l, block, idx, out, generic_b);
+                    let r = body.field_recv[site as usize] as usize;
+                    let v = match body.field_at[site as usize] {
+                        FieldAt::Split(idx) => {
+                            let block = bases[r].0.expect("guarded above");
+                            self.inline_field_read(&l, block, idx, out, generic_b)
+                        }
+                        FieldAt::Slot { idx, .. } => {
+                            let vals = bases[r].1.expect("guarded above");
+                            self.inline_slot_read(&l, vals, idx, out, generic_b)
+                        }
+                        FieldAt::Unknown => unreachable!("checked by inline_body_for"),
+                    };
                     self.vstack.push((v, out));
                 }
                 op => self.emit_stmt(TStmt { pc, op }),
@@ -4867,6 +4959,132 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.switch_to_block(join_b);
         let v = self.b.block_params(join_b)[0];
         self.vstack.push((v, lane));
+    }
+
+    /// An in-line body's object argument `pin`, in line: an instance pin
+    /// whose class has version `ver`, with cells unshared. Returns its
+    /// payload pointer; anything else branches to `miss`.
+    fn inline_arg_guard(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        ver: u64,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        self.miss_if(out, miss);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let want = self.b.ins().iconst(types::I64, ver as i64);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
+        let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+        let bad = self.b.ins().bor(stale, shared);
+        self.miss_if(bad, miss);
+        inst
+    }
+
+    /// The split values of the instance at `inst` (its payload pointer,
+    /// its class checked): unpublished, not being written, and over its
+    /// class's names. Returns the block pointer; anything else (no values
+    /// included) branches to `miss`.
+    fn inline_split_values(&mut self, l: &runtime::ObjLayout, inst: Value, miss: Block) -> Value {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, lazy, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let bad = self.b.ins().bor(busy, other);
+        let bad = self.b.ins().bor(bad, empty);
+        self.miss_if(bad, miss);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        self.miss_if(foreign, miss);
+        block
+    }
+
+    /// The member slots of the instance at `inst` (its payload pointer),
+    /// as the embedder lays them out (see
+    /// [`runtime::ObjLayout::slots_laid_out`]): their values' pointer, and
+    /// whether they're unusable here (borrowed for a write, or at all when
+    /// not `read`, or not laid out over the layout whose address is
+    /// `layout`). The caller checks that cells are unshared.
+    fn laid_out_slots(
+        &mut self,
+        l: &runtime::ObjLayout,
+        inst: Value,
+        layout: Value,
+        read: bool,
+    ) -> (Value, Value) {
+        let t = MemFlags::trusted();
+        let borrow = self.b.ins().sload32(t, inst, l.inst_slots_borrow);
+        let form = self.b.ins().uload8(types::I32, t, inst, l.inst_slots_tag);
+        let names = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_layout);
+        let vals = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_values);
+        let busy = if read {
+            self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
+        } else {
+            self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
+        };
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
+        let bad = self.b.ins().bor(busy, other);
+        let bad = self.b.ins().bor(bad, foreign);
+        (vals, bad)
+    }
+
+    /// The `lane` value of member slot `idx` among the laid-out values at
+    /// `vals` (see [`Self::laid_out_slots`]): set, with that lane's tag.
+    /// Anything else branches to `miss`.
+    fn inline_slot_read(
+        &mut self,
+        l: &runtime::ObjLayout,
+        vals: Value,
+        idx: u32,
+        lane: JitType,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let at = self.b.ins().iadd_imm(vals, i64::from(idx) * 16);
+        let (want, off, ty) = Self::lane_tag(l, lane).expect("a scalar field");
+        let tag = self.b.ins().uload8(types::I32, t, at, 0);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+        self.miss_if(other, miss);
+        let v = self.b.ins().load(ty, t, at, off);
+        if ty == types::I8 {
+            self.b.ins().uextend(types::I64, v)
+        } else {
+            v
+        }
     }
 
     /// The checks a call makes before its body runs that an in-line body

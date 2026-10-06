@@ -1049,6 +1049,12 @@ pub struct AttrSiteMeta {
     /// re-validates `(type_id, ver, key-at-index, lane)` per access,
     /// so a body entered with a non-empty instance dict deopts.
     pub self_ctor: Option<u32>,
+    /// The receiver the embedder probed keeps the attribute in a
+    /// `__slots__` member its class lays out (see
+    /// [`crate::runtime::ObjLayout::slots_laid_out`]): compiled code reads
+    /// and writes it there in line instead of in split values. Set by the
+    /// embedder before lowering; the helpers decide any other shape.
+    pub slot_member: bool,
 }
 
 /// RFC 0073 WS1 — where one canonical constructor field's value comes

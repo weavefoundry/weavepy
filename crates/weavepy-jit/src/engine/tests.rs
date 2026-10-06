@@ -384,6 +384,7 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
                 new_key: false,
                 ctor: None,
                 self_ctor: None,
+                slot_member: false,
             })
             .collect();
         tfunc
@@ -704,6 +705,7 @@ fn cached_attribute_chains_keep_native_fallback_and_exact_exits() {
                 new_key: false,
                 ctor: None,
                 self_ctor: None,
+                slot_member: false,
             })
             .collect();
         f
@@ -976,7 +978,8 @@ fn adjacent_scalar_reads_share_only_a_guarded_value() {
                 store: false,
                 new_key: false,
                 ctor: None,
-                self_ctor: None
+                self_ctor: None,
+                slot_member: false,
             };
             2
         ];

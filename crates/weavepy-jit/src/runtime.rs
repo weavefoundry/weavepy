@@ -144,6 +144,11 @@ pub const METHOD_GUARD_AT_CALL: u32 = 1 << 31;
 /// the locals back itself), so the call skips the locals write-back.
 pub const METHOD_NATIVE: u32 = 1 << 30;
 
+/// Set in an attribute guard's index (see [`ObjLayout::guard_split_idx`])
+/// when it names a member slot's position in its class's slot layout
+/// rather than a split field's.
+pub const SLOT_FIELD: u32 = 1 << 31;
+
 impl SlotTag {
     /// Decode a raw tag written by native code.
     #[inline]
@@ -184,10 +189,13 @@ pub struct ObjLayout {
     pub ctx_guards: i32,
     pub guards_buf: i32,
     /// A guard: its size, its class version (`u64`), and the split-values
-    /// index its name sits at (`u32`, `u32::MAX` for none).
+    /// index its name sits at (`u32`, `u32::MAX` for none), or, with
+    /// [`SLOT_FIELD`] set, its member slot's position in the class's slot
+    /// layout, whose address is then the guard's layout word.
     pub guard_size: i32,
     pub guard_ver: i32,
     pub guard_split_idx: i32,
+    pub guard_slot_layout: i32,
     /// Object tags (the first byte of a value); a word payload is at 8, a
     /// `bool`'s at 1.
     pub tag_instance: u8,
@@ -265,6 +273,20 @@ pub struct ObjLayout {
     pub hot_gates: usize,
     pub recursion_limit: usize,
     pub ctx_depth_cell: i32,
+    /// An instance value's payload pointer → its member slots' borrow
+    /// counter (`i32`), the byte that reads [`Self::slots_laid_out`] while
+    /// they are laid out over a class's names, and then the names' pointer
+    /// and the values' pointer (words). `slots_ok` is false when the
+    /// embedder couldn't measure them (no slot reads run in line).
+    pub slots_ok: bool,
+    pub inst_slots_borrow: i32,
+    pub inst_slots_tag: i32,
+    pub slots_laid_out: u8,
+    pub inst_slots_layout: i32,
+    pub inst_slots_values: i32,
+    /// An unset member slot holds the "no value" object, whose tag this
+    /// is.
+    pub tag_unbound: u8,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();
