@@ -1155,9 +1155,10 @@ impl Lower<'_> {
     /// `(t, p)` is a plain instance whose class has the entry's version
     /// and whose values are split over its class's names, holding the
     /// entry's position (or, for a slot entry, whose member slots are laid
-    /// out over the entry's layout, the one there set); the field's value
-    /// as register words. Anything
-    /// else (and, with buffered stores, everything) branches to `miss`.
+    /// out over the entry's layout, the one there set, at a `slot_site`);
+    /// the field's value as register words. Anything else (and, with
+    /// buffered stores, everything) branches to `miss`.
+    #[allow(clippy::too_many_arguments)]
     fn inline_field(
         &mut self,
         l: &weavepy_jit::ObjLayout,
@@ -1165,6 +1166,7 @@ impl Lower<'_> {
         p: Value,
         cache: i64,
         effect: bool,
+        slot_site: bool,
         miss: Block,
     ) -> (Value, Value) {
         let f = MemFlags::trusted();
@@ -1184,30 +1186,74 @@ impl Lower<'_> {
             bad = self.b.ins().bor(bad, pending);
         }
         self.miss_if(bad, miss);
-        // An instance: its class and the site's entry.
+        // An instance: its class, its split values, and the site's entry.
         let inst = self.b.ins().load(ptr, f, p, 8);
         let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
         let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
         let at = self.b.ins().iconst(ptr, cache);
         let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
         let idx = self.b.ins().uload32(f, at, FIELD_IDX_OFFSET);
+        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
         let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
         let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
-        let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
         let bad = self.b.ins().bor(unset, stale);
-        let bad = self.b.ins().bor(bad, shared);
-        self.miss_if(bad, miss);
-        let read = self.b.create_block();
-        self.b.append_block_param(read, ptr);
-        let split = self.b.create_block();
-        if l.slots_ok {
-            // A member slot laid out over the entry's layout, and set.
-            let slot = self.b.create_block();
-            let is_slot = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
-            self.b.ins().brif(is_slot, slot, &[], split, &[]);
+        let bad = self.b.ins().bor(bad, busy);
+        let bad = self.b.ins().bor(bad, empty);
+        let bad = self.b.ins().bor(bad, other);
+        // A slot entry fails the split checks (its position is out of any
+        // split range), so the slot read waits behind them; it's compiled
+        // only for a site that has read member slots (the helper reads one
+        // otherwise).
+        let slots = l.slots_ok && slot_site;
+        let slot = if slots { self.b.create_block() } else { miss };
+        self.miss_if(bad, slot);
+        // A block over the class's names that holds the position.
+        let keys = self.b.ins().load(ptr, f, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(f, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let absent = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self.b.ins().bor(foreign, absent);
+        self.miss_if(bad, slot);
+        let off = self.b.ins().ishl_imm(idx, 4);
+        let v = self.b.ins().iadd(block, off);
+        let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+        let v = if slots {
+            let read = self.b.create_block();
+            self.b.append_block_param(read, ptr);
+            self.b.ins().jump(read, &[v.into()]);
+            // A member slot laid out over the entry's layout, and set, with
+            // the class checked and cells unshared. (Past the entry's kind,
+            // everything is read again here: values the split path reads
+            // stay unneeded past it.)
             self.b.switch_to_block(slot);
+            let split_miss = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
+            let split_miss = self.b.ins().icmp_imm(IntCC::Equal, split_miss, 0);
+            self.miss_if(split_miss, miss);
+            let inst = self.b.ins().load(ptr, f, p, 8);
+            let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
+            let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+            let at = self.b.ins().iconst(ptr, cache);
+            let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
+            let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+            let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+            let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+            let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+            let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(unset, stale);
+            let bad = self.b.ins().bor(bad, shared);
+            self.miss_if(bad, miss);
             let layout = self.b.ins().load(ptr, f, at, FIELD_LAYOUT_OFFSET);
             let (vals, bad) = self.laid_out_slots(l, inst, layout);
             self.miss_if(bad, miss);
@@ -1221,36 +1267,11 @@ impl Lower<'_> {
                 .icmp_imm(IntCC::Equal, vt, i64::from(l.tag_unbound));
             self.miss_if(none, miss);
             self.b.ins().jump(read, &[v.into()]);
+            self.b.switch_to_block(read);
+            self.b.block_params(read)[0]
         } else {
-            self.b.ins().jump(split, &[]);
-        }
-        // Split values over the class's names that hold the position.
-        self.b.switch_to_block(split);
-        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
-        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
-        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
-        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-        let other = self.b.ins().icmp_imm(IntCC::NotEqual, lazy, 0);
-        let bad = self.b.ins().bor(busy, empty);
-        let bad = self.b.ins().bor(bad, other);
-        self.miss_if(bad, miss);
-        let keys = self.b.ins().load(ptr, f, block, l.split_keys);
-        let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
-        let len = self.b.ins().uload32(f, block, l.split_len);
-        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-        let absent = self
-            .b
-            .ins()
-            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
-        let bad = self.b.ins().bor(foreign, absent);
-        self.miss_if(bad, miss);
-        let off = self.b.ins().ishl_imm(idx, 4);
-        let v = self.b.ins().iadd(block, off);
-        let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
-        self.b.ins().jump(read, &[v.into()]);
-        self.b.switch_to_block(read);
-        let v = self.b.block_params(read)[0];
+            v
+        };
         // `norm`: the scalars by value, anything else by reference.
         let vt = self.b.ins().uload8(types::I64, f, v, 0);
         let word = self.b.ins().load(types::I64, f, v, 8);
@@ -1840,7 +1861,13 @@ impl Lower<'_> {
                 self.b.append_block_param(done, types::I64);
                 if let Some(l) = crate::tier2::published_obj_layout() {
                     let slow = self.b.create_block();
-                    let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slow);
+                    // A site the interpreter has seen read a member slot
+                    // reads one in line too.
+                    let slot_site = matches!(
+                        fl.code.caches.get(u32::from(pc)),
+                        weavepy_compiler::InlineCache::LoadAttrSlot { .. }
+                    );
+                    let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slot_site, slow);
                     self.b.ins().jump(done, &[vt.into(), vp.into()]);
                     self.b.switch_to_block(slow);
                     if let Some(slot) = crate::code_stamp_slot(fl.code, u32::from(pc)) {

@@ -96,6 +96,24 @@ def dict_loop(a, b, n):
     return t
 
 
+def field_loop(points, n, hook=None, at=-1):
+    t = 0.0
+    for i in range(n):
+        if i == at:
+            hook()
+        for p in points:
+            t += p.x * p.y
+    return t
+
+
+def store_loop(p, n, hook=None, at=-1):
+    for i in range(n):
+        if i == at:
+            hook()
+        p.x = i
+    return p.x
+
+
 def frames(error):
     names = []
     tb = error.__traceback__
@@ -114,6 +132,8 @@ def warm():
         scale_loop(a, 600)
         mixed_loop(a, D(0.5, 0.5, 0.5), 600)
         dict_loop(D(1.0, 2.0, 3.0), D(0.5, 0.5, 0.5), 600)
+        field_loop([a, b], 300)
+        store_loop(V(1, 2, 3), 600)
 
 
 warm()
@@ -294,6 +314,66 @@ class SlotFieldReads(unittest.TestCase):
             sys.settrace(None)
         self.assertEqual(got, 3.0 * 20000)
         self.assertEqual(len(lines), 1000)
+
+    def test_field_reads_in_loop(self):
+        points = [V(1.0, 2.0, 3.0), V(0.5, 4.0, 1.0)]
+        self.assertEqual(field_loop(points, 10000), 4.0 * 10000)
+        points.append(W(3.0, 1.0, 0.0))
+        self.assertEqual(field_loop(points, 10000), 7.0 * 10000)
+        points.append(D(1.0, 1.0, 1.0))
+        self.assertEqual(field_loop(points, 10000), 8.0 * 10000)
+
+        def hook():
+            del points[0].y
+
+        try:
+            field_loop(points, 10000, hook, 5000)
+        except AttributeError as error:
+            self.assertEqual(frames(error)[-1], "field_loop")
+        else:
+            self.fail("a deleted slot did not raise")
+
+    def test_field_reads_after_class_change(self):
+        class Local(V):
+            __slots__ = ()
+
+        points = [Local(1.0, 2.0, 3.0)]
+        for _ in range(40):
+            field_loop(points, 300)
+
+        def hook():
+            Local.y = property(lambda self: 5.0)
+
+        self.assertEqual(field_loop(points, 10000, hook, 4000), 2.0 * 4000 + 5.0 * 6000)
+
+    def test_slot_stores(self):
+        p = V(1, 2, 3)
+        self.assertEqual(store_loop(p, 20000), 19999)
+        self.assertEqual((p.x, p.y, p.z), (19999, 2, 3))
+
+        def unset():
+            del p.x
+
+        self.assertEqual(store_loop(p, 20000, unset, 7000), 19999)
+        q = V.__new__(V)
+        self.assertEqual(store_loop(q, 20000), 19999)
+        with self.assertRaises(AttributeError):
+            q.y
+
+    def test_slot_store_through_property(self):
+        class Local(V):
+            __slots__ = ()
+
+        p = Local(1, 2, 3)
+        for _ in range(40):
+            store_loop(p, 600)
+        seen = []
+
+        def hook():
+            Local.x = property(lambda self: -1, lambda self, v: seen.append(v))
+
+        self.assertEqual(store_loop(p, 20000, hook, 15000), -1)
+        self.assertEqual(seen, list(range(15000, 20000)))
 
     def test_dict_instances(self):
         self.assertEqual(

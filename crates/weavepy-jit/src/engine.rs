@@ -169,23 +169,45 @@ impl DirectLeaf {
 
 /// A method body a guarded call site runs in line (see
 /// [`InlineMethod::of`]): its operations, which read only the call's
-/// scalar arguments, constants and scalar fields of `self`, and compute a
-/// scalar result. Nothing it does is observable, so any surprise (a field
-/// of another lane or position, an overflow, a zero divisor) restarts the
-/// call through the method helper.
+/// scalar arguments, constants and scalar fields of `self` and of its
+/// object arguments, and compute a scalar result. Nothing it does is
+/// observable, so any surprise (a receiver of another class, a field of
+/// another lane or position, an overflow, a zero divisor) restarts the call
+/// through the method helper.
 #[derive(Clone, Debug)]
 pub struct InlineMethod {
     pub(crate) ops: Vec<TOp>,
     pub(crate) n_locals: u32,
-    /// The lanes of the parameters after `self`.
+    /// The lanes of the parameters after `self`: scalars, and objects whose
+    /// fields the body reads.
     pub(crate) params: Vec<JitType>,
     pub(crate) ret: JitType,
     /// Per field read (the body's attribute site), the attribute's name
-    /// and lane, and its split index in the receiver class's names (see
-    /// [`Self::with_fields`]).
+    /// and lane, the parameter it's read off, and where the receiver's
+    /// class keeps it (see [`Self::with_fields`]).
     pub(crate) field_names: Vec<String>,
     pub(crate) field_lanes: Vec<JitType>,
-    pub(crate) field_idx: Vec<u32>,
+    pub(crate) field_recv: Vec<u32>,
+    pub(crate) field_at: Vec<FieldAt>,
+    /// Per parameter (`self` first), the class version an object argument
+    /// whose fields the body reads must have (`0` for none; the site's
+    /// method guard checks `self`'s class).
+    pub(crate) recv_ver: Vec<u64>,
+}
+
+/// Where an in-line method body finds one field of its receiver, an
+/// instance of the class the body was resolved against (see
+/// [`InlineMethod::with_fields`]): fixed for as long as the class has the
+/// version the site checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldAt {
+    /// Not resolved: the body can't run in line.
+    Unknown,
+    /// Its index in the instance's split values over the class's names.
+    Split(u32),
+    /// Its position among the member slots the class lays out, and the
+    /// layout's address, which the instance's slots must be laid out over.
+    Slot { idx: u32, layout: usize },
 }
 
 /// Operations an in-line method body may hold besides its locals and
@@ -234,9 +256,9 @@ impl InlineMethod {
     /// `tfunc`, a method's analysis with its `arg_count` parameters
     /// (`self` included) typed as one call site passes them, as an in-line
     /// body: one block returning a scalar, no guards, loops or calls, every
-    /// local a scalar except `self`, which only feeds scalar field reads
-    /// (no stores) straight off the instance, and every other operation
-    /// pure scalar work.
+    /// local a scalar except `self` and object parameters, which only feed
+    /// scalar field reads (no stores) straight off the instances, and every
+    /// other operation pure scalar work.
     #[must_use]
     pub fn of(tfunc: &TFunc, arg_count: u32) -> Option<InlineMethod> {
         let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
@@ -245,6 +267,9 @@ impl InlineMethod {
         };
         let ret = tfunc.ret_lane.filter(|&t| scalar(t))?;
         let n = arg_count as usize;
+        // An object local: `self`, or a parameter typed as one.
+        let object =
+            |s: usize| s < n && matches!(tfunc.local_types.get(s), Some(None | Some(JitType::Obj)));
         let shape_ok = tfunc.entry_block == 0
             && block.entry_stack.is_empty()
             && block.stmts.len() <= Self::MAX_OPS
@@ -256,8 +281,9 @@ impl InlineMethod {
             && tfunc
                 .local_types
                 .iter()
+                .enumerate()
                 .skip(1)
-                .all(|t| t.is_none_or(scalar))
+                .all(|(s, t)| t.is_none_or(|t| scalar(t) || (s < n && t == JitType::Obj)))
             && tfunc.livein_locals.iter().all(|&s| (s as usize) < n)
             && tfunc.global_guards.is_empty()
             && tfunc.math_guards.is_empty()
@@ -277,7 +303,7 @@ impl InlineMethod {
             && tfunc.null_spans.is_empty()
             && tfunc.max_call_args == 0
             && tfunc.attr_sites.iter().all(|s| {
-                s.slot == 0
+                object(s.slot as usize)
                     && s.path.is_empty()
                     && !s.store
                     && !s.new_key
@@ -290,13 +316,14 @@ impl InlineMethod {
         }
         let params = tfunc.local_types[1..n]
             .iter()
-            .map(|t| t.filter(|&t| scalar(t)))
+            .map(|t| t.filter(|&t| scalar(t) || t == JitType::Obj))
             .collect::<Option<Vec<_>>>()?;
         let ops_ok = block.stmts.iter().all(|st| match st.op {
-            // Only `self` is an object, and only a field read consumes it
-            // (no other operation accepts the object lane).
+            // Only `self` and object parameters are objects, and only a
+            // field read consumes one (no other operation accepts the
+            // object lane); they're never rebound.
             TOp::LoadLocal(s) => (s as usize) < tfunc.local_types.len(),
-            TOp::StoreLocal(s) => s != 0 && (s as usize) < tfunc.local_types.len(),
+            TOp::StoreLocal(s) => !object(s as usize) && (s as usize) < tfunc.local_types.len(),
             TOp::AttrGet { site, out } => {
                 tfunc.attr_sites.get(site as usize).map(|s| s.lane) == Some(out)
             }
@@ -312,7 +339,9 @@ impl InlineMethod {
             ret,
             field_names: tfunc.attr_sites.iter().map(|s| s.name.clone()).collect(),
             field_lanes: tfunc.attr_sites.iter().map(|s| s.lane).collect(),
-            field_idx: vec![u32::MAX; tfunc.attr_sites.len()],
+            field_recv: tfunc.attr_sites.iter().map(|s| s.slot).collect(),
+            field_at: vec![FieldAt::Unknown; tfunc.attr_sites.len()],
+            recv_ver: vec![0; n],
         })
     }
 
@@ -328,16 +357,44 @@ impl InlineMethod {
         &self.field_lanes
     }
 
-    /// Where each field read finds its value: the attribute's index in the
-    /// split values of an instance of the class the call site's guard
-    /// pins (the class's names never move, so the guard's version binds
-    /// the index for good). `None` when the count doesn't match.
+    /// The parameter (`0` for `self`) each field is read off, by attribute
+    /// site.
     #[must_use]
-    pub fn with_fields(mut self, idx: Vec<u32>) -> Option<Self> {
-        if idx.len() != self.field_idx.len() || idx.contains(&u32::MAX) {
+    pub fn field_receivers(&self) -> &[u32] {
+        &self.field_recv
+    }
+
+    /// Where each field read finds its value (`at`, by attribute site), in
+    /// an instance of the class each receiver must belong to: for `self`,
+    /// the class the call site's guard pins, and for the object parameters,
+    /// the one whose version `recv_ver` holds (by parameter, `self` first).
+    /// A class's names and slot layout never move, so the version binds the
+    /// positions for good. `None` when a field is unresolved, a receiver
+    /// has no version to check, or the counts don't match.
+    #[must_use]
+    pub fn with_fields(mut self, at: Vec<FieldAt>, recv_ver: Vec<u64>) -> Option<Self> {
+        if at.len() != self.field_at.len()
+            || at.contains(&FieldAt::Unknown)
+            || recv_ver.len() != self.recv_ver.len()
+        {
             return None;
         }
-        self.field_idx = idx;
+        for (k, &r) in self.field_recv.iter().enumerate() {
+            if r != 0 && recv_ver.get(r as usize).is_none_or(|&v| v == 0) {
+                return None;
+            }
+            // One receiver's slots are laid out over one layout.
+            if let FieldAt::Slot { layout, .. } = at[k] {
+                let other = self.field_recv.iter().zip(&at).any(|(&r2, a)| {
+                    r2 == r && matches!(*a, FieldAt::Slot { layout: l2, .. } if l2 != layout)
+                });
+                if other || layout == 0 {
+                    return None;
+                }
+            }
+        }
+        self.field_at = at;
+        self.recv_ver = recv_ver;
         Some(self)
     }
 }
@@ -582,7 +639,8 @@ impl JitEngine {
             probes,
             &mut |_| None,
             &mut |_| None,
-            &mut |_, _| None,
+            &mut |_, _, _| None,
+            &mut |_| false,
         )
     }
 
@@ -592,8 +650,12 @@ impl JitEngine {
     /// site enters in native code, `direct_method(token)` one a matching
     /// method site enters once its guard holds (see
     /// [`CompiledFrame::direct_method_leaf`]), and `inline_method(token,
-    /// lanes)` the body a method site passing arguments of those lanes runs
-    /// in line once its guard holds (see [`InlineMethod::of`]).
+    /// lanes, pc)` the body the method site whose call is at `pc`, passing
+    /// arguments of those lanes, runs in line once its guard holds (see
+    /// [`InlineMethod::of`]). `slot_member(site)` says whether an attribute
+    /// site's receiver keeps the attribute in a laid-out member slot (see
+    /// [`AttrSiteMeta::slot_member`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_frame_direct(
         &mut self,
         code: &CodeObject,
@@ -601,11 +663,15 @@ impl JitEngine {
         probes: &mut Probes<'_>,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
-        inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
+        inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
     ) -> Result<CompiledFrame, JitVerdict> {
-        let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+        let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
         if calls_dynamically(&tfunc) {
             return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
+        }
+        for site in &mut tfunc.attr_sites {
+            site.slot_member = slot_member(site);
         }
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
     }
@@ -622,7 +688,7 @@ impl JitEngine {
         tfunc: &TFunc,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
     ) -> Result<CompiledFrame, JitVerdict> {
-        self.compile_tfunc_methods(tfunc, direct, &mut |_| None, &mut |_, _| None)
+        self.compile_tfunc_methods(tfunc, direct, &mut |_| None, &mut |_, _, _| None)
     }
 
     /// [`Self::compile_tfunc_direct`] with direct method targets (see
@@ -632,7 +698,7 @@ impl JitEngine {
         tfunc: &TFunc,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
-        inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
+        inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
     ) -> Result<CompiledFrame, JitVerdict> {
         // These operations each lower to a dedicated embedder helper.
         // Reject missing registrations before embedding an absolute address.

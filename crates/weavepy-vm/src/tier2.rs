@@ -91,7 +91,8 @@ struct AttrGuard {
     /// The index the name holds in its class's shared names, when the
     /// site's index is that one (`u32::MAX` otherwise): compiled code
     /// reads and writes a split-layout instance's field there in line
-    /// (see [`obj_layout`]).
+    /// (see [`obj_layout`]). For a `__slots__` member the class lays out,
+    /// its position in the layout, marked [`weavepy_jit::SLOT_FIELD`].
     split_idx: u32,
     /// The value lane the site was compiled with.
     lane: JitType,
@@ -101,6 +102,13 @@ struct AttrGuard {
     ver: u64,
     /// How the access reaches its storage.
     storage: AttrStorage,
+    /// The class's slot layout's word (see
+    /// [`crate::shared_value::SharedSlice::word`]) for a member slot
+    /// [`Self::split_idx`] marks, `0` otherwise: an instance of the class
+    /// at [`Self::ver`] whose slots are laid out over it keeps the member
+    /// at that position (the class owns its layout, so the version names
+    /// it).
+    slot_layout: usize,
     /// Advisory index into the current activation's pin table. Guards are
     /// shared by nested and suspended activations, so every hit must validate
     /// the actual object's identity in the calling activation's table.
@@ -139,23 +147,38 @@ struct MethodEntry {
     /// `wpjit_call_method` once the helper has run it (see [`arm_update`]).
     update: InlineUpdate,
     /// The scalar fields the method reads off `self` where the receiver's
-    /// class at the entry's version keeps them in split values (see
-    /// [`inline_fields_of`]): what a call site needs to run the body in
-    /// line (see [`inline_method_body`]).
+    /// class at the entry's version keeps them in split values or laid-out
+    /// member slots (see [`inline_fields_of`]): what a call site needs to
+    /// run the body in line (see [`inline_method_body`]).
     fields: Vec<InlineField>,
+    /// The same for the object arguments of each call site the method was
+    /// resolved for (see [`method_call_sites`]).
+    sites: Vec<SiteArgs>,
     /// Some compiled site checks this entry's guard in line (it calls the
     /// method's body directly or runs it in line), so the helper keeps the
     /// guard's shadow bound armed (see [`arm_method_guard`]).
     guarded_in_line: Cell<bool>,
 }
 
-/// One scalar field a method reads off `self` (see [`MethodEntry::fields`]).
+/// One scalar field a method reads off a receiver (see
+/// [`MethodEntry::fields`]).
 struct InlineField {
     name: String,
     /// The value's lane when the method was resolved.
     lane: JitType,
-    /// Its index in the class's names (they never move).
-    idx: u32,
+    /// Where the receiver's class keeps it (its names and slot layout
+    /// never move).
+    at: weavepy_jit::FieldAt,
+}
+
+/// What one call site of a method passes it, as the live values in its
+/// frame showed when the site was compiled: for each argument, its class's
+/// version and the fields the method reads off it, when it's an instance
+/// whose class keeps some of them in place.
+struct SiteArgs {
+    /// The site's call instruction.
+    pc: u32,
+    args: Vec<Option<(u64, Vec<InlineField>)>>,
 }
 
 /// [`MethodEntry::update`]: compiled code reads these in place (see
@@ -1564,13 +1587,17 @@ impl JitState {
             // A method site passing scalar arguments runs a body that only
             // computes over them and `self`'s scalar fields in line (see
             // `inline_method_body`).
-            let mut inline_method = |token: u32, lanes: &[JitType]| {
+            let mut inline_method = |token: u32, lanes: &[JitType], pc: u32| {
                 let methods = methods.borrow();
                 let entry = methods.get(token as usize)?;
-                let body = inline_method_body(entry, lanes)?;
+                let body = inline_method_body(entry, lanes, pc)?;
                 entry.guarded_in_line.set(true);
                 Some(body)
             };
+            // An attribute site whose receiver keeps the attribute in a
+            // laid-out member slot reads and writes it there in line.
+            let mut slot_member =
+                |site: &AttrSiteMeta| attr_guard_of(site).is_some_and(|g| g.slot_layout != 0);
             ensure_obj_layout();
             let r = engine.compile_frame_direct(
                 code,
@@ -1579,6 +1606,7 @@ impl JitState {
                 &mut direct,
                 &mut direct_method,
                 &mut inline_method,
+                &mut slot_member,
             );
             if let Some(t0) = t0 {
                 eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
@@ -2438,14 +2466,18 @@ fn callee_ret_lane(
 /// RFC 0069 WS1 — [`callee_ret_info`] for a *method* body, with the
 /// caller's live receiver standing in for `self` (local slot 0): the
 /// analyzer's attribute probes resolve against it, which is what makes
-/// `return self.x * self.y`-shaped bodies typable. Uncached — the
-/// shared ret cache has no receiver in its key, and a method body is
-/// analyzed at most once per `(slot, name)` site per compile.
+/// `return self.x * self.y`-shaped bodies typable. `args`, when given,
+/// are a call site's live arguments: they stand in for the other
+/// parameters the same way (`return self.x * o.x`), and seed their lanes.
+/// Uncached — the shared ret cache has no receiver in its key, and a
+/// method body is analyzed at most twice per `(slot, name)` site per
+/// compile.
 fn method_ret_info(
     interp: &super::Interpreter,
     f: &Rc<PyFunction>,
     fcode: &Rc<CodeObject>,
     recv: &Object,
+    args: &[Option<Object>],
 ) -> (Option<JitType>, bool) {
     let resolve = |name: &str| resolve_plain_dicts(interp, &f.globals, &f.builtins, name);
     let mut classify = |name: &str| {
@@ -2470,12 +2502,15 @@ fn method_ret_info(
         classify_global(obj.as_ref())
     };
     let mut list = |_: u32| None;
-    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| -> Option<JitType> {
-        if slot != 0 {
-            return None;
+    let live = |slot: u32| -> Option<&Object> {
+        match slot {
+            0 => Some(recv),
+            _ => args.get(slot as usize - 1)?.as_ref(),
         }
+    };
+    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| -> Option<JitType> {
         // RFC 0071 WS3 — chains walk from the caller's live receiver.
-        let mut cur = recv.clone();
+        let mut cur = live(slot)?.clone();
         for link in path {
             cur = attr_chain_step(&cur, link)?;
         }
@@ -2486,8 +2521,15 @@ fn method_ret_info(
     let mut method = |_: u32, _: &[String], _: &str| None;
     let mut math = |_: &str, _: &str| false;
     // No live callee activation to observe parameter values from —
-    // seeding stays off (RFC 0069 WS3).
-    let mut param = |_: u32| None;
+    // seeding stays off (RFC 0069 WS3) unless a call site's arguments
+    // stand in for them.
+    let mut param = |slot: u32| match live(slot) {
+        Some(v) if slot != 0 => scalar_lane(v).or(match v {
+            Object::Instance(_) => Some(JitType::Obj),
+            _ => None,
+        }),
+        _ => None,
+    };
     // Depth bound: no constructor-shape fallback in the nested view.
     let mut ctor_field = |_: &str, _: &str| None;
     let mut path_arena = weavepy_jit::PathArena::default();
@@ -3116,6 +3158,7 @@ fn attr_site_guard(
             ver: cls.attr_version.get(),
             storage: AttrStorage::Indexed(*field_idx),
             split_idx: split_index(&cls, AttrStorage::Indexed(*field_idx), &site.name),
+            slot_layout: 0,
             last_result_pin: Cell::new(usize::MAX),
         });
     }
@@ -3145,6 +3188,7 @@ fn attr_site_guard(
             ver,
             storage: AttrStorage::Indexed(field_idx),
             split_idx: split_index(&inst.cls(), AttrStorage::Indexed(field_idx), &site.name),
+            slot_layout: 0,
             last_result_pin: Cell::new(usize::MAX),
         });
     }
@@ -3166,9 +3210,15 @@ fn attr_site_guard(
             AttrStorage::Slot(_) => scalar_update_slot_stable(&recv, &site.name, ver),
             AttrStorage::NewKey => false,
         };
-    let split_idx = match &recv {
-        Object::Instance(inst) => split_index(&inst.cls(), storage, &site.name),
-        _ => u32::MAX,
+    let (split_idx, slot_layout) = match (&recv, storage) {
+        // A member slot the class lays out (its position is its class's,
+        // whatever the instance's storage).
+        (Object::Instance(inst), AttrStorage::Slot(_)) => inst
+            .laid_out_position(&site.name)
+            .filter(|&(i, _)| i & weavepy_jit::SLOT_FIELD == 0)
+            .map_or((u32::MAX, 0), |(i, l)| (i | weavepy_jit::SLOT_FIELD, l)),
+        (Object::Instance(inst), _) => (split_index(&inst.cls(), storage, &site.name), 0),
+        _ => (u32::MAX, 0),
     };
     Some(AttrGuard {
         name: shared_name(),
@@ -3178,6 +3228,7 @@ fn attr_site_guard(
         ver,
         storage,
         split_idx,
+        slot_layout,
         last_result_pin: Cell::new(usize::MAX),
     })
 }
@@ -3447,6 +3498,7 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         guard_size: i32_of(std::mem::size_of::<AttrGuard>())?,
         guard_ver: i32_of(std::mem::offset_of!(AttrGuard, ver))?,
         guard_split_idx: i32_of(std::mem::offset_of!(AttrGuard, split_idx))?,
+        guard_slot_layout: i32_of(std::mem::offset_of!(AttrGuard, slot_layout))?,
         tag_instance: tag(obj),
         tag_int: tag(&Object::Int(0)),
         tag_float: tag(&Object::Float(0.0)),
@@ -3680,6 +3732,7 @@ fn probe_method_entry(
                 ver: cls.attr_version.get(),
                 update: InlineUpdate::unarmed(),
                 fields: Vec::new(),
+                sites: Vec::new(),
                 guarded_in_line: Cell::new(false),
             });
         }
@@ -3696,7 +3749,16 @@ fn probe_method_entry(
         // still bind; keep such shapes on the generic path.
         return None;
     }
-    let (lane, ret_none) = method_ret_info(interp, &f, &fcode, &recv);
+    // The method's call sites in this frame, with the live values each
+    // passes: a body reading fields of an object argument (`o.x`) types
+    // from them when it types from nothing else.
+    let calls = method_call_sites(frame, slot, path, name, fcode.arg_count);
+    let (mut lane, mut ret_none) = method_ret_info(interp, &f, &fcode, &recv, &[]);
+    if lane.is_none() && !ret_none {
+        if let Some((_, args)) = calls.first() {
+            (lane, ret_none) = method_ret_info(interp, &f, &fcode, &recv, args);
+        }
+    }
     let ret = if ret_none {
         MethodRet::None
     } else {
@@ -3707,6 +3769,23 @@ fn probe_method_entry(
     let ver = cls.attr_version.get();
     let arg_count = fcode.arg_count;
     let fields = inline_fields_of(&recv, &fcode, ver);
+    let sites = calls
+        .iter()
+        .map(|(pc, args)| SiteArgs {
+            pc: *pc,
+            args: args
+                .iter()
+                .map(|a| {
+                    let Some(Object::Instance(inst)) = a else {
+                        return None;
+                    };
+                    let aver = inst.cls().attr_version.get();
+                    let fields = inline_fields_of(a.as_ref()?, &fcode, aver);
+                    (!fields.is_empty()).then_some((aver, fields))
+                })
+                .collect(),
+        })
+        .collect();
     let entry = MethodEntry {
         callee: MethodCallee::Py {
             func: f,
@@ -3721,18 +3800,93 @@ fn probe_method_entry(
         ver,
         update: InlineUpdate::unarmed(),
         fields,
+        sites,
         guarded_in_line: Cell::new(false),
     };
     arm_method_guard(&entry, &cls);
     Some(entry)
 }
 
-/// The scalar fields `code` (a method) reads off its receiver whose
+/// The calls in `frame`'s code of method `name` on the local in `slot`
+/// walked through `path` that pass `arg_count - 1` arguments, each a local
+/// read through attribute loads: per call, its instruction and the live
+/// value of each argument (`None` for an unbound local or a walk that
+/// fails). At most a handful.
+fn method_call_sites(
+    frame: &super::Frame,
+    slot: u32,
+    path: &[String],
+    name: &str,
+    arg_count: u32,
+) -> Vec<(u32, Vec<Option<Object>>)> {
+    use weavepy_compiler::OpCode;
+    const MAX_SITES: usize = 8;
+    let code = &frame.code;
+    let ins = &code.instructions;
+    let named = |i: usize, op: OpCode, want: &str| {
+        ins.get(i).is_some_and(|x| {
+            x.op == op && code.names.get(x.arg as usize).is_some_and(|n| n == want)
+        })
+    };
+    let argc = arg_count.saturating_sub(1) as usize;
+    let mut out = Vec::new();
+    for p in 0..ins.len() {
+        if out.len() >= MAX_SITES {
+            break;
+        }
+        if !named(p, OpCode::LoadMethodAttr, name) {
+            continue;
+        }
+        // The receiver: the local, then the path's loads.
+        let Some(start) = p.checked_sub(path.len() + 1) else {
+            continue;
+        };
+        if ins[start].op != OpCode::LoadFast
+            || ins[start].arg != slot
+            || !path
+                .iter()
+                .enumerate()
+                .all(|(k, seg)| named(start + 1 + k, OpCode::LoadAttr, seg))
+        {
+            continue;
+        }
+        // The arguments: each a local and its attribute loads, then the
+        // call.
+        let mut q = p + 1;
+        let mut args = Vec::with_capacity(argc);
+        while args.len() < argc {
+            let Some(load) = ins.get(q).filter(|x| x.op == OpCode::LoadFast) else {
+                break;
+            };
+            q += 1;
+            let mut names = Vec::new();
+            while let Some(x) = ins.get(q).filter(|x| x.op == OpCode::LoadAttr) {
+                let Some(n) = code.names.get(x.arg as usize) else {
+                    break;
+                };
+                names.push(n.clone());
+                q += 1;
+            }
+            args.push(
+                walk_attr_path(frame, load.arg, &names).filter(|v| !matches!(v, Object::Unbound)),
+            );
+        }
+        let called = ins
+            .get(q)
+            .is_some_and(|x| x.op == OpCode::Call && x.arg as usize == argc);
+        if args.len() == argc && called {
+            out.push((q as u32, args));
+        }
+    }
+    out
+}
+
+/// The scalar fields `code` (a method) reads off a receiver whose
 /// attribute loads on `recv` (an instance of the class at version `ver`)
-/// are plain split-value reads, as the attribute sites' guards classify
-/// them: no class attribute or descriptor intervenes, and the class's
-/// names hold the field at its index. At most a handful, in first-read
-/// order.
+/// are plain split-value reads or laid-out member slot reads, as the
+/// attribute sites' guards classify them: no class attribute or
+/// descriptor intervenes, and the class's names (or slot layout) hold the
+/// field at its index. At most a handful, in first-read order.
 fn inline_fields_of(recv: &Object, code: &CodeObject, ver: u64) -> Vec<InlineField> {
     const MAX_FIELDS: usize = 8;
     let Object::Instance(inst) = recv else {
@@ -3749,45 +3903,69 @@ fn inline_fields_of(recv: &Object, code: &CodeObject, ver: u64) -> Vec<InlineFie
         if out.len() >= MAX_FIELDS || out.iter().any(|f| f.name == *name) {
             continue;
         }
-        let Some((lane, fver, storage @ AttrStorage::Indexed(i))) =
-            attr_fingerprint_obj(recv, name, false)
-        else {
+        let Some((lane, fver, storage)) = attr_fingerprint_obj(recv, name, false) else {
             continue;
         };
-        if fver != ver
-            || !matches!(lane, JitType::Int | JitType::Float | JitType::Bool)
-            || split_index(&inst.cls(), storage, name) != i
-        {
+        if fver != ver || !matches!(lane, JitType::Int | JitType::Float | JitType::Bool) {
             continue;
         }
+        let at = match storage {
+            AttrStorage::Indexed(i) if split_index(&inst.cls(), storage, name) == i => {
+                weavepy_jit::FieldAt::Split(i)
+            }
+            AttrStorage::Slot(_) => match inst.laid_out_position(name) {
+                Some((idx, layout)) => weavepy_jit::FieldAt::Slot { idx, layout },
+                None => continue,
+            },
+            _ => continue,
+        };
         out.push(InlineField {
             name: name.clone(),
             lane,
-            idx: i,
+            at,
         });
     }
     out
 }
 
-/// The body of `entry`'s method as a call site passing arguments of
-/// `lanes` runs it in line (see [`weavepy_jit::InlineMethod`]): the method
-/// analyzed with those parameter lanes and `self`'s fields (see
-/// [`MethodEntry::fields`]) and nothing else of the world (no globals,
+/// The body of `entry`'s method as the call site at `pc` passing arguments
+/// of `lanes` runs it in line (see [`weavepy_jit::InlineMethod`]): the
+/// method analyzed with those parameter lanes and the fields of `self` and
+/// of its object arguments (see [`MethodEntry::fields`] and
+/// [`MethodEntry::sites`]) and nothing else of the world (no globals,
 /// calls or other attributes), when the analysis takes the in-line shape
 /// and reads only those fields.
-fn inline_method_body(entry: &MethodEntry, lanes: &[JitType]) -> Option<weavepy_jit::InlineMethod> {
+fn inline_method_body(
+    entry: &MethodEntry,
+    lanes: &[JitType],
+    pc: u32,
+) -> Option<weavepy_jit::InlineMethod> {
     let MethodCallee::Py { code, .. } = &entry.callee else {
         return None;
     };
     if code.arg_count as usize != lanes.len() + 1 {
         return None;
     }
-    let mut classify = |_: &str| ResolvedGlobal::Opaque;
-    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| -> Option<JitType> {
-        if slot != 0 || !path.is_empty() || store {
+    let site = entry.sites.iter().find(|s| s.pc == pc);
+    // The fields of the receiver in parameter `slot`, and the version its
+    // class must have (`0` for `self`, which the site's guard checks).
+    let receiver = |slot: u32| -> Option<(&[InlineField], u64)> {
+        if slot == 0 {
+            return Some((&entry.fields, 0));
+        }
+        if lanes.get(slot as usize - 1) != Some(&JitType::Obj) {
             return None;
         }
-        entry.fields.iter().find(|f| f.name == name).map(|f| f.lane)
+        let (ver, fields) = site?.args.get(slot as usize - 1)?.as_ref()?;
+        Some((fields, *ver))
+    };
+    let mut classify = |_: &str| ResolvedGlobal::Opaque;
+    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| -> Option<JitType> {
+        if !path.is_empty() || store {
+            return None;
+        }
+        let (fields, _) = receiver(slot)?;
+        fields.iter().find(|f| f.name == name).map(|f| f.lane)
     };
     let mut param = |slot: u32| lanes.get((slot as usize).checked_sub(1)?).copied();
     let mut path_arena = weavepy_jit::PathArena::default();
@@ -3812,19 +3990,21 @@ fn inline_method_body(entry: &MethodEntry, lanes: &[JitType]) -> Option<weavepy_
     };
     let tf = weavepy_jit::analyze_frame(code, &mut classify, &mut probes).ok()?;
     let body = weavepy_jit::InlineMethod::of(&tf, code.arg_count)?;
-    let idx = body
+    let at = body
         .field_names()
         .iter()
         .zip(body.field_lanes())
-        .map(|(name, &lane)| {
-            entry
-                .fields
-                .iter()
-                .find(|f| f.name == *name && f.lane == lane)
-                .map_or(u32::MAX, |f| f.idx)
+        .zip(body.field_receivers())
+        .map(|((name, &lane), &slot)| {
+            receiver(slot)
+                .and_then(|(fields, _)| fields.iter().find(|f| f.name == *name && f.lane == lane))
+                .map_or(weavepy_jit::FieldAt::Unknown, |f| f.at)
         })
         .collect();
-    body.with_fields(idx)
+    let vers = (0..code.arg_count)
+        .map(|slot| receiver(slot).map_or(0, |(_, ver)| ver))
+        .collect();
+    body.with_fields(at, vers)
 }
 
 /// Arm what compiled code checks of `entry`'s guard in line before a
@@ -10091,7 +10271,7 @@ mod scalar_update_guard_tests {
             owner.attr_version.get()
         ));
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<AttrGuard>(), 48);
+        assert_eq!(std::mem::size_of::<AttrGuard>(), 56);
     }
 }
 

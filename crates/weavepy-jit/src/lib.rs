@@ -34,7 +34,7 @@ pub use analyze::{
     returns_none_syntactically, returns_self_syntactically, JitVerdict, MethodResolution,
     PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
-pub use engine::{CompiledFrame, DirectLeaf, InlineMethod, JitEngine, OpMix};
+pub use engine::{CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix};
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
@@ -66,7 +66,7 @@ pub use runtime::{
     ObjLayout, PollHelper, SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper,
     StrLenHelper, StrModHelper, CALL_GAPS, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT,
     DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN,
-    MAX_CACHED_ATTR_CHAIN_LEN, METHOD_GUARD_AT_CALL, METHOD_NATIVE,
+    MAX_CACHED_ATTR_CHAIN_LEN, METHOD_GUARD_AT_CALL, METHOD_NATIVE, SLOT_FIELD,
 };
 pub use value::JitType;
 
