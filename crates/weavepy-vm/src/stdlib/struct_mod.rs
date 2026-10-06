@@ -926,16 +926,17 @@ fn register(
     name: &'static str,
     body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
-    let bf = BuiltinFn {
+    let bf = Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(body),
         call_kw: None,
-    };
-    d.insert(
-        DictKey(Object::from_static(name)),
-        Object::Builtin(Rc::new(bf)),
-    );
+    });
+    // The core reads and writes plain values only (the Python wrapper
+    // coerces first): no Python runs, so the dispatch loop calls it in
+    // place.
+    crate::leaf_builtins::register(&bf);
+    d.insert(DictKey(Object::from_static(name)), Object::Builtin(bf));
 }
 
 fn fmt_arg(args: &[Object], idx: usize) -> Result<String, RuntimeError> {

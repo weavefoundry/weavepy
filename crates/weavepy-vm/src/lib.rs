@@ -10516,11 +10516,20 @@ impl Interpreter {
         }
         // `iter(obj)` (or `yield from obj`) of an instance whose `__iter__`
         // is a generator function: the generator, made in place.
-        if matches!(ins.op, OpCode::GetYieldFromIter | OpCode::GetIter) {
+        // `await obj` of an instance whose `__await__` is one likewise.
+        if matches!(
+            ins.op,
+            OpCode::GetYieldFromIter | OpCode::GetIter | OpCode::GetAwaitable
+        ) {
             let Some(v) = frame.stack.last() else {
                 return CoreAttr::Decline;
             };
-            let Some(gen) = self.instance_gen_iter(v) else {
+            let name = if ins.op == OpCode::GetAwaitable {
+                "__await__"
+            } else {
+                "__iter__"
+            };
+            let Some(gen) = self.instance_gen_call(v, name) else {
                 return CoreAttr::Decline;
             };
             let top = frame.stack.last_mut().expect("checked above");
@@ -11630,6 +11639,46 @@ impl Interpreter {
                                 last = pc;
                                 pc += 1;
                                 after_release!();
+                                continue;
+                            }
+                            // `bytes + bytes`; `ba += b` extends the bytearray
+                            // in place (unless a buffer export pins its size)
+                            // and leaves it as the result.
+                            (Object::Bytes(_) | Object::ByteArray(_), Object::Bytes(_))
+                                if kind == BinOpKind::Add =>
+                            {
+                                let r = match (a, b) {
+                                    (Object::Bytes(x), Object::Bytes(y)) => {
+                                        let mut v = Vec::with_capacity(x.len() + y.len());
+                                        v.extend_from_slice(x);
+                                        v.extend_from_slice(y);
+                                        Object::new_bytes(v)
+                                    }
+                                    (Object::ByteArray(x), Object::Bytes(y))
+                                        if ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG
+                                            != 0
+                                            && !crate::object::bytearray_is_exported(x) =>
+                                    {
+                                        let Ok(mut xs) = x.try_borrow_mut() else {
+                                            break None;
+                                        };
+                                        xs.extend_from_slice(y);
+                                        drop(xs);
+                                        a.clone()
+                                    }
+                                    _ => break None,
+                                };
+                                // SAFETY: both operand slots are initialized and
+                                // leave the stack (a bytes or bytearray release
+                                // runs nothing); the result takes the first.
+                                unsafe {
+                                    drop_hot(base.add(len - 1).read());
+                                    drop_hot(base.add(len - 2).read());
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(r) };
+                                last = pc;
+                                pc += 1;
                                 continue;
                             }
                             _ => break None,
@@ -13657,6 +13706,13 @@ impl Interpreter {
                                 _ => false,
                             };
                         if !fresh {
+                            // An instance's generator `__await__`: the helper's.
+                            // SAFETY: `len > 0` when `fresh` could fail on it.
+                            if len > 0
+                                && matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_))
+                            {
+                                break Some(CoreExit::Helper);
+                            }
                             break Some(CoreExit::Stop(LeafStop::Step));
                         }
                         last = pc;
@@ -14499,8 +14555,9 @@ impl Interpreter {
             self.try_inline_call_ex(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
-            // A generator function's call makes its generator in place.
-            return self.core_gen_call_ex(sw, pc);
+            // A generator function's call makes its generator in place, and
+            // a leaf builtin's runs in place.
+            return self.core_gen_call_ex(sw, pc) || self.core_builtin_call_ex(sw, pc);
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
@@ -14508,6 +14565,67 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The `CALL_FUNCTION_EX` at `pc` of a registered leaf builtin (its
+    /// fast half, or a whole body that runs no Python code) over an exact
+    /// tuple or list, with no keywords: `max(*xs)`. `false` touches
+    /// nothing.
+    fn core_builtin_call_ex(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let n = frame.stack.len();
+        let Some(callee_slot) = n.checked_sub(4) else {
+            return false;
+        };
+        let [Object::Builtin(b), Object::Unbound, spread, mapping] = &frame.stack[callee_slot..]
+        else {
+            return false;
+        };
+        let empty_kw = match mapping {
+            Object::Unbound => true,
+            Object::Dict(d) => d.try_borrow().is_ok_and(|d| d.is_empty()),
+            _ => false,
+        };
+        if !empty_kw || b.binds_instance {
+            return false;
+        }
+        let items: Vec<Object> = match spread {
+            Object::Tuple(t) => t.to_vec(),
+            Object::List(l) => match l.try_borrow() {
+                Ok(l) => l.clone(),
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+        let r = match self.leaf_call_kind(b) {
+            Some(LeafKind::Fast(f)) => f(&items),
+            Some(LeafKind::Opaque) => Some((b.call)(&items)),
+            _ => None,
+        };
+        let Some(r) = r else {
+            return false;
+        };
+        drop(items);
+        // The operands leave the stack; one that dies queues its finalizer,
+        // which runs before the next instruction.
+        let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        match r {
+            Ok(v) => frame.stack.push(v),
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        for o in ops {
+            self.release(o);
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
         true
     }
 
@@ -27930,6 +28048,17 @@ impl Interpreter {
             || t.is_subclass_of(&builtin_types().base_exception));
         if !is_exc_class {
             return Ok(value);
+        }
+        // A builtin exception class (not a group, whose constructor
+        // validates): the call's own construction, without the call.
+        if let Object::Type(t) = &value {
+            let bt = builtin_types();
+            if t.flags.is_builtin
+                && t.flags.is_exception
+                && !t.is_subclass_of(&bt.base_exception_group)
+            {
+                return Ok(self.build_exception_instance(t.clone(), &[]));
+            }
         }
         let inst = self.call(&value, &[], &[], globals)?;
         let ok = matches!(&inst, Object::Instance(i) if i.cls().flags.is_exception
@@ -51859,15 +51988,15 @@ impl Interpreter {
         obj
     }
 
-    /// `iter(obj)` for an instance whose class's `__iter__` is a plain
-    /// generator function of `self` alone: the generator, made without
-    /// the call machinery (`make_iter`'s instance arm). `None` when
-    /// anything else applies.
-    fn instance_gen_iter(&self, v: &Object) -> Option<Object> {
+    /// `iter(obj)` (`name` `__iter__`) or `obj.__await__()` for an
+    /// instance whose class's method `name` is a plain generator function
+    /// of `self` alone: the generator, made without the call machinery
+    /// (`make_iter`'s instance arm). `None` when anything else applies.
+    fn instance_gen_call(&self, v: &Object, name: &str) -> Option<Object> {
         let Object::Instance(inst) = v else {
             return None;
         };
-        let Some(Object::Function(f)) = inst.cls_raw().lookup("__iter__") else {
+        let Some(Object::Function(f)) = inst.cls_raw().lookup(name) else {
             return None;
         };
         let code = f.code();
