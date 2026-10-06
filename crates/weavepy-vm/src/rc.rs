@@ -387,6 +387,24 @@ impl<T: ?Sized + 'static> Drop for Rc<T> {
                 return;
             }
             if nesting_kind::<T>() {
+                // A list of scalars releases nothing through its items:
+                // they're forgotten, not dropped one call at a time, and
+                // the list frees without the trashcan.
+                if std::any::TypeId::of::<T>()
+                    == std::any::TypeId::of::<crate::sync::RefCell<Vec<crate::object::Object>>>()
+                    && Arc::strong_count(&self.0) == 1
+                {
+                    let cell = Arc::as_ptr(&self.0)
+                        .cast::<crate::sync::RefCell<Vec<crate::object::Object>>>();
+                    // The last strong reference: nothing else reads the
+                    // items while this release, which runs no code, does.
+                    let items = &mut *(*cell).as_ptr();
+                    if items.iter().all(|o| o.strong_word().is_none()) {
+                        items.set_len(0);
+                        ManuallyDrop::drop(&mut self.0);
+                        return;
+                    }
+                }
                 release_nested(ManuallyDrop::take(&mut self.0));
                 return;
             }
