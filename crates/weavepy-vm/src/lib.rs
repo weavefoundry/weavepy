@@ -12701,6 +12701,18 @@ impl Interpreter {
                     }
                     // `f(*args)` of a Python callee switches in place (see
                     // `core_call_ex`); anything else takes the full handler.
+                    // A `with` block's exit on an exception: the exit
+                    // method's call, with the activation pending.
+                    OpCode::WithExceptStart => {
+                        // SAFETY: `len <= cap`, every slot initialized.
+                        unsafe { frame.stack.set_len(len) };
+                        frame.pc = pc as u32;
+                        *last_pc = last;
+                        if !self.core_with_exit_lane(sw, pc) && sw.pending.is_none() {
+                            sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        break Some(CoreExit::Reload);
+                    }
                     OpCode::CallEx => {
                         // SAFETY: `len <= cap`, every slot initialized.
                         unsafe { frame.stack.set_len(len) };
@@ -14328,6 +14340,55 @@ impl Interpreter {
         match result {
             // SAFETY: the running activation's last-pc slot.
             Ok(()) => unsafe { *sw.last = pc },
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// `WITH_EXCEPT_START` at `pc` of `sw`'s synced running activation:
+    /// the full handler's call of the exit method (`exit(type, exc, tb)`),
+    /// run with the activation on the pending list, its result pushed.
+    /// `false` touches nothing.
+    #[inline(never)]
+    fn core_with_exit_lane(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let len = frame.stack.len();
+        if len < 5 {
+            return false;
+        }
+        // [exit_func, exit_self, lasti, prev, exc], as the full handler.
+        let exc = frame.stack[len - 1].clone();
+        let exit_self = frame.stack[len - 4].clone();
+        let exit_func = frame.stack[len - 5].clone();
+        let (ty, tb) = match &exc {
+            Object::Instance(inst) => {
+                let tb = inst.slot_get("__traceback__").unwrap_or(Object::None);
+                (Object::Type(inst.cls()), tb)
+            }
+            _ => (Object::None, Object::None),
+        };
+        frame.pc = pc as u32 + 1;
+        let globals = frame.globals.clone();
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = if matches!(exit_self, Object::Unbound) {
+            self.call(&exit_func, &[ty, exc, tb], &[], &globals)
+        } else {
+            self.call(&exit_func, &[exit_self, ty, exc, tb], &[], &globals)
+        };
+        self.lean_pending_exit(pending);
+        match result {
+            Ok(v) => {
+                // SAFETY: as in `core_builtin_lane`.
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
             Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
         }
         // SAFETY: the running thread's own flag (see `quiet_run`).
