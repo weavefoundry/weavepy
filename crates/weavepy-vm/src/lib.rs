@@ -14139,7 +14139,11 @@ impl Interpreter {
         let ok = argc < MAX_ARGS
             && match receiver {
                 Some(recv) => {
-                    b.binds_instance && (!via_call || builtins::method_memo_tag(recv).is_some())
+                    b.binds_instance
+                        && (!via_call
+                            || builtins::method_memo_tag(recv).is_some()
+                            || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                                && matches!(recv, Object::Instance(_))))
                 }
                 None => !b.binds_instance,
             };
@@ -14671,6 +14675,15 @@ impl Interpreter {
             }
             _ => return false,
         };
+        // `x.__reduce_ex__(4)` of a plain instance (`copy`, `pickle`): the
+        // ordinary call, which may run `copyreg` code, with the caller
+        // published.
+        if b.binds_instance
+            && matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+            && matches!(recv, Some(Object::Instance(_)))
+        {
+            return self.core_builtin_lane(sw, pc, true);
+        }
         let ok = match recv {
             None => !b.binds_instance,
             Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
@@ -14770,9 +14783,15 @@ impl Interpreter {
             },
             _ => return false,
         };
+        // As the core loop's `CALL` arm runs a leaf builtin.
         let r = match self.leaf_call_kind(b) {
             Some(LeafKind::Fast(f)) => f(&items),
+            Some(LeafKind::Isinstance) => Self::core_isinstance(&items),
             Some(LeafKind::Opaque) => Some((b.call)(&items)),
+            // (`object.__new__(cls, *())`, from `copyreg.__newobj__`.)
+            Some(k) if k.runs_in_core() || matches!(k, LeafKind::ObjectNew) => {
+                self.leaf_builtin_call(k, b, &items)
+            }
             _ => None,
         };
         let Some(r) = r else {
