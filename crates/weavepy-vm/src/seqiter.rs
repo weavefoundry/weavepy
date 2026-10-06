@@ -1264,6 +1264,26 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
         crate::gc_trace::track(&obj);
         return Some(obj);
     }
+    // `int(x)` of an exact int, bool, or a finite float whose truncation
+    // fits a machine word.
+    if let [x @ (Object::Int(_) | Object::Bool(_) | Object::Float(_))] = args {
+        if !Rc::ptr_eq(cls, &bt.int_) {
+            return None;
+        }
+        return match x {
+            Object::Int(i) => Some(Object::Int(*i)),
+            Object::Bool(b) => Some(Object::Int(i64::from(*b))),
+            Object::Float(f) => {
+                let t = f.trunc();
+                // (Both bounds are exact powers of two as floats.)
+                (t.is_finite()
+                    && t >= -9_223_372_036_854_775_808.0
+                    && t < 9_223_372_036_854_775_808.0)
+                    .then(|| Object::Int(t as i64))
+            }
+            _ => None,
+        };
+    }
     // `int(text, base)` of a plain ASCII literal: an optional sign, and
     // digits of an explicit base, or of the base a `0x`/`0o`/`0b` prefix
     // names for base 0 (where a decimal literal can't have a leading

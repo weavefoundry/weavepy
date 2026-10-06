@@ -11472,8 +11472,30 @@ impl Interpreter {
                         // SAFETY: `len >= 2`.
                         let (a, b) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
                         let r = match (a, b) {
-                            (Object::Int(a), Object::Int(b)) => {
-                                let (a, b) = (*a, *b);
+                            // `bool & bool` and its kin stay a `bool`.
+                            (Object::Bool(x), Object::Bool(y))
+                                if matches!(
+                                    kind,
+                                    BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor
+                                ) =>
+                            {
+                                bool_hot(match kind {
+                                    BinOpKind::BitAnd => x & y,
+                                    BinOpKind::BitOr => x | y,
+                                    _ => x ^ y,
+                                })
+                            }
+                            // Ints, with a `bool` as its int value.
+                            (
+                                Object::Int(_) | Object::Bool(_),
+                                Object::Int(_) | Object::Bool(_),
+                            ) => {
+                                let as_int = |o: &Object| match o {
+                                    Object::Int(i) => *i,
+                                    Object::Bool(b) => i64::from(*b),
+                                    _ => unreachable!("matched above"),
+                                };
+                                let (a, b) = (as_int(a), as_int(b));
                                 match kind {
                                     BinOpKind::Add => match a.checked_add(b) {
                                         Some(r) => int_hot(r),
@@ -13715,6 +13737,90 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
                         }
+                        last = pc;
+                        pc += 1;
+                    }
+                    // An f-string's pieces over the exact scalars and strings
+                    // whose conversion and formatting run no Python: `!s` (a
+                    // string is itself), `!r` of an int, no spec, and the
+                    // join.
+                    OpCode::ConvertValue => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        let v = match (ins.arg & 0x03, unsafe { &*top }) {
+                            (1, Object::Str(_)) => None,
+                            (1 | 2, Object::Int(i)) => {
+                                let mut buf = itoa::Buffer::new();
+                                Some(Object::Str(SharedStr::from(buf.format(*i))))
+                            }
+                            (1 | 2, Object::Bool(b)) => {
+                                Some(Object::from_static(if *b { "True" } else { "False" }))
+                            }
+                            (1 | 2, Object::None) => Some(Object::from_static("None")),
+                            _ => break None,
+                        };
+                        if let Some(v) = v {
+                            // SAFETY: the replaced scalar owes no drop.
+                            unsafe { top.write(v) };
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::FormatValue if ins.arg == 0 => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        match unsafe { &*top } {
+                            Object::Str(_) => {}
+                            Object::Int(i) => {
+                                let mut buf = itoa::Buffer::new();
+                                // SAFETY: the replaced int owes no drop.
+                                unsafe { top.write(Object::Str(SharedStr::from(buf.format(*i)))) };
+                            }
+                            _ => break None,
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::BuildString => {
+                        let n = ins.arg as usize;
+                        if n == 0 || n > len || crate::stdlib::tracemalloc_real::is_tracking() {
+                            break None;
+                        }
+                        // SAFETY: the top `n` slots are initialized.
+                        let parts = unsafe { std::slice::from_raw_parts(base.add(len - n), n) };
+                        let mut strs: [&str; 8] = [""; 8];
+                        if n > strs.len() {
+                            break None;
+                        }
+                        let mut all = true;
+                        for (k, p) in parts.iter().enumerate() {
+                            match p {
+                                Object::Str(s) => strs[k] = s,
+                                _ => {
+                                    all = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !all {
+                            break None;
+                        }
+                        let joined = Object::Str(SharedStr::concat(&strs[..n]));
+                        // SAFETY: the parts leave the stack (a string's release
+                        // runs nothing); the join takes the first slot.
+                        unsafe {
+                            for k in len - n..len {
+                                drop_hot(base.add(k).read());
+                            }
+                            base.add(len - n).write(joined);
+                        }
+                        len = len - n + 1;
                         last = pc;
                         pc += 1;
                     }
@@ -23110,9 +23216,8 @@ impl Interpreter {
         if name.starts_with("__") && name != "__init__" {
             return None;
         }
-        if !Self::plain_metaclass(recv_cls) {
-            return None;
-        }
+        // (The receiver's metaclass takes no part: `super()` reads the
+        // dicts along its stored MRO, which a custom `mro()` produced.)
         let mro = recv_cls.mro.try_borrow().ok()?;
         let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
         let key = crate::object::StrKey(name.as_str());
