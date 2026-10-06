@@ -2974,7 +2974,7 @@ mod tests {
         {
             let hint = CachedSlot::new(u32::MAX as usize + 100);
             assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
-            assert_eq!(std::mem::size_of::<TrackedHandle>(), 40);
+            assert_eq!(std::mem::size_of::<TrackedHandle>(), 32);
         }
     }
 
