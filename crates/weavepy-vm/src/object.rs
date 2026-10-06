@@ -3913,9 +3913,18 @@ fn key_cmp_error_pending() -> bool {
 /// nor steals the outer operation's error.
 pub(crate) fn key_cmp_scope<T>(f: impl FnOnce() -> T) -> Result<T, RuntimeError> {
     KEY_COMPARISON.with(|state| {
-        let saved = state.error.borrow_mut().take();
+        // (An error is rarely parked: the large value moves only then.)
+        let saved = if state.error.borrow().is_some() {
+            state.error.borrow_mut().take()
+        } else {
+            None
+        };
         let out = f();
-        let mine = state.error.replace(saved);
+        let mine = if state.error.borrow().is_some() || saved.is_some() {
+            state.error.replace(saved)
+        } else {
+            None
+        };
         match mine {
             Some(err) => Err(err),
             None => Ok(out),
