@@ -14339,6 +14339,13 @@ fn enter_compiled(
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
     note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
     retire_if_call_dense(&ctx);
+    // A raise before the first poll left native code after a short run,
+    // and the handler's loop enters again: charged like a deopt, so a loop
+    // that raises every few iterations retires instead of paying the
+    // round trip each time. (A loop that raises rarely reaches its polls.)
+    if matches!(status, JitStatus::Raised) && ctx.polls == 0 {
+        charge_deopt(frame);
+    }
 
     // RFC 0073 WS4 — a healthy yield whose continuation is a
     // registered resume entry parks the *whole* activation on the
@@ -14484,6 +14491,22 @@ fn note_native_exit(
                     ce.tier = Tier::NotJitable;
                     frame.code.jit_hint.mark_not_jitable();
                 }
+            }
+        }
+    });
+}
+
+/// Charge one side exit of `frame`'s compiled code against its
+/// [`DEOPT_BUDGET`], retiring the code once spent.
+fn charge_deopt(frame: &super::Frame) {
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        if let Some(ce) = st.cache.get_mut(&key) {
+            ce.deopts += 1;
+            if ce.deopts >= DEOPT_BUDGET {
+                ce.tier = Tier::NotJitable;
+                frame.code.jit_hint.mark_not_jitable();
             }
         }
     });
