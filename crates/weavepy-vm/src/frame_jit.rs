@@ -59,7 +59,7 @@ use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, OpCode, COMPARE_OP_TO
 use crate::error::RuntimeError;
 use crate::object::{Object, PyIterator};
 use crate::sync::Rc;
-use crate::{CodeConstObjects, FieldSlot, Interpreter};
+use crate::{body_pcs, CodeConstObjects, FieldSlot, Interpreter};
 
 /// The core loop runs the instruction at `pc` itself.
 pub(crate) const INTERP: u32 = 0;
@@ -502,40 +502,6 @@ fn tuning() -> Tuning {
             call_div: (v[4] as u32).max(1),
         }
     })
-}
-
-/// The pcs a call runs through on its ordinary paths: from the entry
-/// along fall-throughs and jumps (not into the exception handlers).
-fn body_pcs(code: &CodeObject) -> Vec<usize> {
-    let ins = &code.instructions;
-    let n = ins.len();
-    let mut seen = vec![false; n];
-    let mut work = vec![0usize];
-    let mut out = Vec::new();
-    while let Some(pc) = work.pop() {
-        if pc >= n || seen[pc] {
-            continue;
-        }
-        seen[pc] = true;
-        out.push(pc);
-        let i = ins[pc];
-        let next = pc + 1;
-        match i.op {
-            OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => {}
-            OpCode::JumpForward => work.push(next + i.arg as usize),
-            OpCode::JumpBackward => work.push(next.saturating_sub(i.arg as usize)),
-            OpCode::PopJumpIfFalse
-            | OpCode::PopJumpIfTrue
-            | OpCode::PopJumpIfNone
-            | OpCode::PopJumpIfNotNone
-            | OpCode::ForIter => {
-                work.push(next + i.arg as usize);
-                work.push(next);
-            }
-            _ => work.push(next),
-        }
-    }
-    out
 }
 
 /// Whether a code object of this qualified name may compile:

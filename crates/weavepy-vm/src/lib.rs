@@ -68425,6 +68425,40 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
     }
 }
 
+/// The pcs a call runs through on its ordinary paths: from the entry
+/// along fall-throughs and jumps (not into the exception handlers).
+pub(crate) fn body_pcs(code: &CodeObject) -> Vec<usize> {
+    let ins = &code.instructions;
+    let n = ins.len();
+    let mut seen = vec![false; n];
+    let mut work = vec![0usize];
+    let mut out = Vec::new();
+    while let Some(pc) = work.pop() {
+        if pc >= n || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        out.push(pc);
+        let i = ins[pc];
+        let next = pc + 1;
+        match i.op {
+            OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => {}
+            OpCode::JumpForward => work.push(next + i.arg as usize),
+            OpCode::JumpBackward => work.push(next.saturating_sub(i.arg as usize)),
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => {
+                work.push(next + i.arg as usize);
+                work.push(next);
+            }
+            _ => work.push(next),
+        }
+    }
+    out
+}
+
 /// [`code_is_pure_leaf`]'s first answer for `code`, recorded in `ext`.
 #[cold]
 #[inline(never)]
@@ -68442,7 +68476,6 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code.kwonly_count == 0
         && leaf_arity(code) <= 8
         && code.varnames.len() <= 16
-        && code.exception_table.is_empty()
         && code.instructions.len() <= 64;
     let pure_op = |ins: &weavepy_compiler::Instruction| {
         // A fresh empty list or dict is unobservable until stored, so
@@ -68490,17 +68523,25 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                 | OpCode::ReturnValue
         )
     };
-    let ok = structural && code.instructions.iter().all(pure_op);
+    // Only the ordinary paths count: an exception handler runs only after
+    // something raised, and an evaluation that meets a raise declines (the
+    // ordinary call then runs the handler).
+    let body: Vec<&weavepy_compiler::Instruction> = if structural {
+        body_pcs(code)
+            .into_iter()
+            .map(|pc| &code.instructions[pc])
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ok = structural && body.iter().all(|i| pure_op(i));
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see
     // `Interpreter::pure_leaf_eval`).
     let effect = !ok
         && structural
-        && code
-            .instructions
-            .iter()
-            .all(|i| pure_op(i) || i.op == OpCode::StoreAttr)
-        && code.instructions.iter().any(|i| i.op == OpCode::StoreAttr);
+        && body.iter().all(|i| pure_op(i) || i.op == OpCode::StoreAttr)
+        && body.iter().any(|i| i.op == OpCode::StoreAttr);
     let shape = if ok {
         let body = code.instructions.as_slice();
         let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
@@ -68782,7 +68823,6 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
 }
 
 /// Borrow an already initialized extension without filling any cache.
-#[cfg(feature = "jit")]
 #[inline]
 fn code_vm_ext_existing(code: &CodeObject) -> Option<&CodeConstObjects> {
     // SAFETY: as in `code_vm_ext`.
