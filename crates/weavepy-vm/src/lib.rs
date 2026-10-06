@@ -17422,12 +17422,21 @@ impl Interpreter {
         };
         let g = g.clone();
         boxed.gen_first_resume = false;
-        // SAFETY: `n >= 2`.
-        let sent = unsafe { frame.stack.pop().unwrap_unchecked() };
         if std::mem::take(&mut boxed.sent_consumed) {
-            drop(sent);
+            frame.stack.pop();
         } else {
-            push_fast(&mut boxed.stack, sent);
+            // SAFETY: `n >= 2`: the top slot moves into the generator's stack
+            // whole (see `move_obj`), and the caller's stack forgets it.
+            unsafe {
+                boxed.stack.reserve(1);
+                let at = boxed.stack.len();
+                move_obj(
+                    frame.stack.as_ptr().add(n - 1),
+                    boxed.stack.as_mut_ptr().add(at),
+                );
+                frame.stack.set_len(n - 1);
+                boxed.stack.set_len(at + 1);
+            }
         }
         frame.pc = send_pc as u32 + 1;
         let gen_frame: *mut Frame = &mut *boxed;
@@ -61242,6 +61251,26 @@ fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Opt
     }
     let target = (pc + 2).checked_sub(jump.arg as usize)?;
     (instrs.get(target)?.op == OpCode::Send).then_some(target)
+}
+
+/// Move the object at `src` to `dst` as one 16-byte copy: a move through
+/// a typed value (`pop` then `push`) splits it at the tag byte, and the
+/// 16-byte reload that follows stalls on store forwarding.
+///
+/// # Safety
+///
+/// `src` holds an object that is forgotten after the move; `dst` is a
+/// writable slot whose old contents (if any) need no drop.
+#[inline(always)]
+unsafe fn move_obj(src: *const Object, dst: *mut Object) {
+    // SAFETY: per the caller; `MaybeUninit` copies padding bytes too.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.cast::<std::mem::MaybeUninit<[u64; 2]>>(),
+            dst.cast::<std::mem::MaybeUninit<[u64; 2]>>(),
+            1,
+        );
+    }
 }
 
 /// `v.push(x)` with the room check in line (the call paths push one
