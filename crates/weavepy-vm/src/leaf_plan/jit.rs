@@ -92,10 +92,12 @@ pub(super) struct FieldCache {
     next: std::cell::Cell<u8>,
 }
 
-/// A module global site's value as register words, with the globals
-/// stamp it was read under (process-unique, so it names the dict and its
-/// key layout: the entry stays put) and the global value epoch (which an
-/// in-place rebinding advances). Native code reads it in line.
+/// A global site's value as register words, with the globals stamp it
+/// was read under (process-unique, so it names the dict and its key
+/// layout: the entry stays put) and the global value epoch (which an
+/// in-place rebinding advances). A builtin's also records the builtins
+/// stamp (`0` for a module global): the name must still be missing from
+/// the globals, and the builtins unchanged. Native code reads it in line.
 #[derive(Default)]
 #[repr(C)]
 pub(super) struct GlobalCache {
@@ -103,12 +105,18 @@ pub(super) struct GlobalCache {
     epoch: std::cell::Cell<u64>,
     tag: std::cell::Cell<u64>,
     pay: std::cell::Cell<u64>,
+    bstamp: std::cell::Cell<u64>,
 }
 
 const GC_STAMP: i32 = std::mem::offset_of!(GlobalCache, stamp) as i32;
 const GC_EPOCH: i32 = std::mem::offset_of!(GlobalCache, epoch) as i32;
 const GC_TAG: i32 = std::mem::offset_of!(GlobalCache, tag) as i32;
 const GC_PAY: i32 = std::mem::offset_of!(GlobalCache, pay) as i32;
+const GC_BSTAMP: i32 = std::mem::offset_of!(GlobalCache, bstamp) as i32;
+/// Where native code finds the interpreter, and in it the flag a builtin's
+/// cached read also requires clear.
+const CTX_INTERP: i32 = std::mem::offset_of!(Ctx<'static>, interp) as i32;
+const I_MISSING: i32 = std::mem::offset_of!(Interpreter, globals_missing_any) as i32;
 /// Where native code finds the evaluation's own function.
 const TOP_F_OFFSET: i32 = TOP_OFFSET + std::mem::offset_of!(Frame, f) as i32;
 
@@ -403,13 +411,18 @@ unsafe extern "C" fn h_global(
     let Some(v) = c.interp.plan_global_at(code, slot, f, pc as u16) else {
         return 1;
     };
-    // A module global's value is remembered for the in-line read (a
-    // builtin's also depends on the globals not gaining the name, which
-    // the helper checks).
-    if matches!(
-        code.caches.get(pc),
-        weavepy_compiler::InlineCache::LoadGlobalModule { .. }
-    ) {
+    // The value is remembered for the in-line read, a builtin's with the
+    // builtins stamp too (the read also requires the globals not to have
+    // gained the name, which their own stamp shows).
+    let bstamp = match code.caches.get(pc) {
+        weavepy_compiler::InlineCache::LoadGlobalModule { .. } => Some(0),
+        // SAFETY (raw dict read): nothing runs code here.
+        weavepy_compiler::InlineCache::LoadGlobalBuiltin { .. } => {
+            Some(unsafe { (*f.builtins.as_ptr()).mutation_stamp() })
+        }
+        _ => None,
+    };
+    if let Some(bstamp) = bstamp {
         // SAFETY (raw dict read): nothing runs code here.
         let gs = unsafe { (*f.globals.as_ptr()).mutation_stamp() };
         let [t, p] = words(v);
@@ -417,6 +430,7 @@ unsafe extern "C" fn h_global(
         cache.epoch.set(crate::object::global_value_epoch());
         cache.tag.set(t);
         cache.pay.set(p);
+        cache.bstamp.set(bstamp);
     }
     c.put(v);
     0
@@ -1298,6 +1312,22 @@ impl Lower<'_> {
         let moved = self.b.ins().icmp(IntCC::NotEqual, epoch, want_epoch);
         let bad = self.b.ins().bor(unset, stale);
         let bad = self.b.ins().bor(bad, moved);
+        // A builtin's: the builtins unchanged, and no globals missing
+        // their `__builtins__` (the helper's own conditions).
+        // SAFETY: as for the globals.
+        let bstamp_at = unsafe { (*fl.func).builtins.as_ptr() } as usize
+            + crate::object::DictData::STAMP_OFFSET;
+        let bstamp_at = self.b.ins().iconst(ptr, bstamp_at as i64);
+        let bstamp = self.b.ins().load(types::I64, f, bstamp_at, 0);
+        let bwant = self.b.ins().load(types::I64, f, at, GC_BSTAMP);
+        let interp = self.b.ins().load(ptr, f, self.ctx, CTX_INTERP);
+        let missing = self.b.ins().uload8(types::I64, f, interp, I_MISSING);
+        let bstale = self.b.ins().icmp(IntCC::NotEqual, bstamp, bwant);
+        let missing = self.b.ins().icmp_imm(IntCC::NotEqual, missing, 0);
+        let bbad = self.b.ins().bor(bstale, missing);
+        let builtin = self.b.ins().icmp_imm(IntCC::NotEqual, bwant, 0);
+        let bbad = self.b.ins().band(bbad, builtin);
+        let bad = self.b.ins().bor(bad, bbad);
         self.miss_if(bad, slow);
         self.b.ins().jump(done, &[t.into(), p.into()]);
     }
