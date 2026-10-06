@@ -3942,6 +3942,30 @@ pub(crate) fn with_key_eq_deferred<T>(f: impl FnOnce() -> T) -> (T, bool) {
     })
 }
 
+/// [`with_key_eq_deferred`] around [`key_cmp_scope`], in one visit to the
+/// thread's comparison state.
+pub(crate) fn key_cmp_deferred<T>(f: impl FnOnce() -> T) -> (Result<T, RuntimeError>, bool) {
+    KEY_COMPARISON.with(|state| {
+        state.defer_depth.set(state.defer_depth.get() + 1);
+        let saved_deferred = state.deferred.replace(false);
+        // (An error is rarely parked: the large value moves only then.)
+        let saved_error = if state.error.borrow().is_some() {
+            state.error.borrow_mut().take()
+        } else {
+            None
+        };
+        let out = f();
+        let mine = if state.error.borrow().is_some() || saved_error.is_some() {
+            state.error.replace(saved_error)
+        } else {
+            None
+        };
+        let deferred = state.deferred.replace(saved_deferred);
+        state.defer_depth.set(state.defer_depth.get() - 1);
+        (mine.map_or(Ok(out), Err), deferred)
+    })
+}
+
 fn key_eq_defer_active() -> bool {
     KEY_COMPARISON.with(|state| state.defer_depth.get() > 0)
 }
