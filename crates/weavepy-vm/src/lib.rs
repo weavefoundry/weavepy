@@ -10146,6 +10146,9 @@ impl Interpreter {
         let code = code.clone();
         // Committed.
         let (inst, tracked) = self.alloc_lean_instance_obj(cls, &plan.native);
+        if plan.seeds_exception_args {
+            Self::seed_exception_args(&inst, args.iter().cloned());
+        }
         if tracked && gc_trace::maybe_auto_collect() {
             self.run_pending_finalizers();
         }
@@ -13520,12 +13523,12 @@ impl Interpreter {
                             drop_hot(base.add(len - 2).read());
                             drop_hot(base.add(len - 3).read());
                             if ins.arg & 1 != 0 {
-                                base.add(len - 3).write(Object::Function(f));
+                                base.add(len - 3).write(f);
                                 base.add(len - 2).write(self_v);
                                 len -= 1;
                             } else {
                                 base.add(len - 3).write(Object::BoundMethod(Rc::new(
-                                    BoundMethod::new(self_v, Object::Function(f)),
+                                    BoundMethod::new(self_v, f),
                                 )));
                                 len -= 2;
                             }
@@ -14268,6 +14271,12 @@ impl Interpreter {
                 if native_call_ic_safe(b.name) {
                     return Some(false);
                 }
+                // `super().__init__(...)` in an exception class's own
+                // `__init__`: `BaseException.__init__` on the instance,
+                // through the full handler's dispatch.
+                if exception_init_call(b, recv) {
+                    return Some(true);
+                }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
                 builtins::method_memo_tag(recv)?;
@@ -14318,6 +14327,7 @@ impl Interpreter {
                     b.binds_instance
                         && (!via_call
                             || builtins::method_memo_tag(recv).is_some()
+                            || exception_init_call(b, recv)
                             || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
                                 && matches!(recv, Object::Instance(_))))
                 }
@@ -15485,6 +15495,7 @@ impl Interpreter {
         // runs frameless, as a leaf method call does (a plain instance
         // only).
         if matches!(plan.native, crate::types::NativeKind::Plain)
+            && !plan.seeds_exception_args
             && !Self::has_extended_params(code)
             && self.core_leaf_init(
                 frame,
@@ -15511,6 +15522,9 @@ impl Interpreter {
         let (init, code) = (init.clone(), code.clone());
         // Committed.
         let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
+        if plan.seeds_exception_args {
+            Self::seed_exception_args(&inst, frame.stack[self_slot + 1..].iter().cloned());
+        }
         drop(plan);
         if tracked && gc_trace::maybe_auto_collect() {
             self.run_pending_finalizers();
@@ -21121,13 +21135,10 @@ impl Interpreter {
                     let self_obj = stack.pop().expect("checked");
                     stack.truncate(n - 3);
                     if ins.arg & 1 != 0 {
-                        stack.push(Object::Function(f));
+                        stack.push(f);
                         stack.push(self_obj);
                     } else {
-                        stack.push(Object::BoundMethod(Rc::new(BoundMethod::new(
-                            self_obj,
-                            Object::Function(f),
-                        ))));
+                        stack.push(Object::BoundMethod(Rc::new(BoundMethod::new(self_obj, f))));
                     }
                     last = pc;
                     pc += 1;
@@ -23888,7 +23899,7 @@ impl Interpreter {
         self_obj: &Object,
         cache_pc: u32,
         name_idx: u32,
-    ) -> Option<Rc<crate::object::PyFunction>> {
+    ) -> Option<Object> {
         let Object::Type(cls) = class_obj else {
             return None;
         };
@@ -23900,10 +23911,20 @@ impl Interpreter {
         let cls_id = Rc::as_ptr(cls) as usize as u64;
         let slot = code_method_slot(code, cache_pc);
         let stamp = code_stamp_slot(code, cache_pc);
-        if stamp.is_some_and(|s| s.get() == [cls_id, ver, 1]) {
-            if let Some(f) = slot.and_then(|s| s.get(ver)) {
-                return Some(f);
+        // The stamp's last word tells a plain function (1) from a native
+        // method that binds its receiver (2), `BaseException.__init__`.
+        match stamp.map(|s| s.get()) {
+            Some([c, v, 1]) if c == cls_id && v == ver => {
+                if let Some(f) = slot.and_then(|s| s.get(ver)) {
+                    return Some(Object::Function(f));
+                }
             }
+            Some([c, v, 2]) if c == cls_id && v == ver => {
+                if let Some(b) = slot.and_then(|s| s.get_inst_builtin(ver)) {
+                    return Some(Object::Builtin(b));
+                }
+            }
+            _ => {}
         }
         let name = code.names.get(name_idx as usize)?;
         if name.starts_with("__") && name != "__init__" {
@@ -23925,14 +23946,23 @@ impl Interpreter {
                 break;
             }
         }
-        let Object::Function(f) = found? else {
-            return None;
-        };
-        if let (Some(s), Some(st)) = (slot, stamp) {
-            s.set(ver, &f);
-            st.set([cls_id, ver, 1]);
+        match found? {
+            Object::Function(f) => {
+                if let (Some(s), Some(st)) = (slot, stamp) {
+                    s.set(ver, &f);
+                    st.set([cls_id, ver, 1]);
+                }
+                Some(Object::Function(f))
+            }
+            Object::Builtin(b) if b.binds_instance => {
+                if let (Some(s), Some(st)) = (slot, stamp) {
+                    s.set_inst_builtin(ver, &b);
+                    st.set([cls_id, ver, 2]);
+                }
+                Some(Object::Builtin(b))
+            }
+            _ => None,
         }
-        Some(f)
     }
 
     /// The leaf half of `load_method_ic_hit`: the plain function (or the
@@ -50815,6 +50845,15 @@ impl Interpreter {
     /// [`Self::alloc_plain_instance_obj`] for a lean construction: a
     /// container subclass's instance carries its empty payload and is
     /// tracked at once, as the full constructor does.
+    /// `BaseException_new`'s seeding of a fresh exception instance's
+    /// `args` from the constructor's positionals, which holds even when the
+    /// class's `__init__` never calls `super().__init__`.
+    fn seed_exception_args(inst: &Object, args: impl Iterator<Item = Object>) {
+        if let Object::Instance(i) = inst {
+            i.slot_set("args", Object::new_tuple(args.collect()));
+        }
+    }
+
     fn alloc_lean_instance_obj(
         &self,
         cls: &Rc<TypeObject>,
@@ -51043,12 +51082,13 @@ impl Interpreter {
             .skip(1)
             .all(|t| Rc::ptr_eq(t, &bt.object_));
 
+        // (An exception class's instance gets its `args` seeded first, as
+        // `BaseException_new` does; see `seed_exception_args`.)
         let lean_init = match &init_fn {
             Some(Object::Function(init))
                 if abstract_error.is_none()
                     && user_new.is_none()
                     && is_object_new
-                    && !seeds_exception_args
                     && !init_from_object
                     && (matches!(native, NativeKind::Plain)
                         || Self::lean_payload(&native).is_some())
@@ -66803,6 +66843,13 @@ pub(crate) fn native_call_ic_safe(name: &str) -> bool {
         && name != "__getitem__"
         && name != "super"
         && !builtin_needs_interp(name)
+}
+
+/// Whether `b` called on `recv` is `BaseException.__init__` (the native
+/// `__init__` every built-in exception class shares) on an instance of an
+/// exception class.
+fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
+    b.name == "__init__" && matches!(recv, Object::Instance(i) if i.cls_raw().flags.is_exception)
 }
 
 /// Builtin type methods the interpreter dispatches by name (their bodies
