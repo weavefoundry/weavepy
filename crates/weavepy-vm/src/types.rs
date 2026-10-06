@@ -1216,11 +1216,24 @@ impl TypeObject {
         }
     }
 
+    /// Whether the class is one whose native method bodies read its slots
+    /// by the position its `__init__` sets them in (`collections.deque`,
+    /// `contextvars.Context`, asyncio's handles and futures): those keep
+    /// the per-key form their fast paths expect.
+    fn slots_served_natively(&self) -> bool {
+        let dict = self.dict.borrow();
+        let Some(Object::Str(m)) = dict.get(&DictKey(Object::from_static("__module__"))) else {
+            return false;
+        };
+        let m: &str = m;
+        m == "collections" || m == "contextvars" || m == "asyncio" || m.starts_with("asyncio.")
+    }
+
     /// [`Self::fresh_slots`]'s layout: the member slots the MRO declares,
     /// base classes first, each name once.
     fn member_slot_layout(&self) -> Option<SharedSlice<DictKey>> {
         const MAX: usize = 32;
-        if self.flags.is_exception || !self.declares_slots.get() {
+        if self.flags.is_exception || !self.declares_slots.get() || self.slots_served_natively() {
             return None;
         }
         let mut names: Vec<String> = Vec::new();
