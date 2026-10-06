@@ -145,7 +145,7 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
         if owes {
             try_push_pending_finalizer(Object::Instance(Rc::from_arc(inst)));
         } else {
-            drop(inst);
+            crate::rc::drop_arc(inst);
         }
     } else if t == TypeId::of::<PyGenerator>() {
         // SAFETY: as above, for `PyGenerator`.
@@ -169,7 +169,7 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             let g = Rc::from_arc(g);
             crate::Interpreter::release_finished_gen(&g);
             // (As a plain handle: this is the release being finalized.)
-            drop(Rc::into_arc(g));
+            crate::rc::drop_arc(Rc::into_arc(g));
         } else if owes {
             let kind = g.kind;
             let g = Rc::from_arc(g);
@@ -179,10 +179,10 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
                 CoroutineKind::AsyncGenerator => Object::AsyncGenerator(g),
             });
         } else {
-            drop(g);
+            crate::rc::drop_arc(g);
         }
     } else {
-        drop(arc);
+        crate::rc::drop_arc(arc);
     }
 }
 

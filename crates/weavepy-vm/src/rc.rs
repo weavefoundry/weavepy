@@ -206,6 +206,103 @@ pub(crate) unsafe fn try_free_last<T: ?Sized>(value: *const T) -> bool {
     true
 }
 
+/// Release the strong reference `arc` owns, as `Arc`'s own drop does, but
+/// with plain loads and stores while the bias holds: the last owner drops
+/// the payload in place and frees the allocation (or leaves it to the weak
+/// references) without `Arc`'s two locked decrements and fences. A
+/// payload's destructor still runs exactly once, with the strong count at
+/// zero, as in `Arc::drop_slow`.
+#[inline(always)]
+pub(crate) fn drop_arc<T: ?Sized>(arc: Arc<T>) {
+    let mut arc = ManuallyDrop::new(arc);
+    // SAFETY: `arc` owns one strong reference, released exactly once here.
+    unsafe { drop_arc_in(&mut arc) }
+}
+
+/// [`drop_arc`] of the `Arc` in `slot`, which is not used again.
+///
+/// # Safety
+///
+/// `slot` owns one strong reference and is never read or dropped again.
+#[inline(always)]
+unsafe fn drop_arc_in<T: ?Sized>(slot: &mut ManuallyDrop<Arc<T>>) {
+    if refcounts_biased() {
+        let value = Arc::as_ptr(slot);
+        // SAFETY: the allocation is live while `slot` owns a reference.
+        let strong = unsafe { &*strong_word(value) };
+        let n = strong.load(Ordering::Relaxed);
+        if n != 1 {
+            strong.store(n - 1, Ordering::Relaxed);
+            return;
+        }
+        // SAFETY: the last strong owner, per the load above.
+        unsafe { release_last(value, strong) };
+        return;
+    }
+    // SAFETY: per the caller.
+    unsafe { ManuallyDrop::drop(slot) }
+}
+
+/// The last strong owner's release of the `Arc` payload at `value` (whose
+/// strong count `strong` reads one), under the bias.
+///
+/// # Safety
+///
+/// The caller owns the payload's last strong reference, the bias held when
+/// it read the count, and nothing uses the reference afterwards.
+#[inline(never)]
+unsafe fn release_last<T: ?Sized>(value: *const T, strong: &AtomicUsize) {
+    // SAFETY: the weak count is the word after the strong one (`ArcInner`
+    // is `repr(C)`); the payload is live until it is dropped below.
+    let (weak, layout) = unsafe {
+        let payload = std::alloc::Layout::for_value(&*value);
+        let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+            .extend(payload)
+            .expect("Arc layout");
+        (&*ptr::from_ref(strong).add(1), inner.pad_to_align())
+    };
+    // As `Arc::drop_slow`: the payload drops with the strong count at zero
+    // (a weak reference no longer upgrades), then the strong owners'
+    // implicit weak reference goes.
+    strong.store(0, Ordering::Relaxed);
+    // SAFETY: the last strong owner drops the payload exactly once.
+    unsafe { ptr::drop_in_place(value.cast_mut()) };
+    let free = if refcounts_biased() {
+        let w = weak.load(Ordering::Relaxed);
+        weak.store(w - 1, Ordering::Relaxed);
+        w == 1
+    } else {
+        // (The payload's release revoked the bias: back to `Arc`'s order.)
+        let last = weak.fetch_sub(1, Ordering::Release) == 1;
+        if last {
+            std::sync::atomic::fence(Ordering::Acquire);
+        }
+        last
+    };
+    if free {
+        // SAFETY: no strong or weak reference remains; the layout is the
+        // one `Arc` allocated with (see `try_free_last`).
+        unsafe { std::alloc::dealloc(ptr::from_ref(strong).cast::<u8>().cast_mut(), layout) };
+    }
+}
+
+/// [`release_nested`] of an `Arc`'s last owner, freed through [`drop_arc`].
+pub(crate) fn release_nested_arc<T: ?Sized + 'static>(arc: Arc<T>) {
+    release_nested(LastOwner(ManuallyDrop::new(arc)));
+}
+
+/// An `Arc`'s last owner on its way to [`release_nested`]'s trashcan,
+/// released through [`drop_arc`].
+struct LastOwner<T: ?Sized + 'static>(ManuallyDrop<Arc<T>>);
+
+impl<T: ?Sized + 'static> Drop for LastOwner<T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: the owner's reference, released once.
+        unsafe { drop_arc_in(&mut self.0) }
+    }
+}
+
 /// Convert an [`Rc`] to one of an unsized type, such as a trait object:
 /// `rc_unsize!(rc => dyn Trait)`. Stable Rust only coerces its own smart
 /// pointers, so the conversion passes through `Arc`.
@@ -401,14 +498,16 @@ impl<T: ?Sized + 'static> Drop for Rc<T> {
                     let items = &mut *(*cell).as_ptr();
                     if items.iter().all(|o| o.strong_word().is_none()) {
                         items.set_len(0);
-                        ManuallyDrop::drop(&mut self.0);
+                        drop_arc_in(&mut self.0);
                         return;
                     }
                 }
-                release_nested(ManuallyDrop::take(&mut self.0));
+                release_nested(LastOwner(ManuallyDrop::new(ManuallyDrop::take(
+                    &mut self.0,
+                ))));
                 return;
             }
-            ManuallyDrop::drop(&mut self.0);
+            drop_arc_in(&mut self.0);
         }
     }
 }

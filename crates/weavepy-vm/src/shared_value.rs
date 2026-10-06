@@ -35,7 +35,7 @@ pub unsafe trait ThinPayload: sealed::Sealed {
     /// Release the last reference to a payload. A payload whose release
     /// can release more containers goes through `rc::release_nested`.
     fn release_last(last: Arc<Self>) {
-        drop(last);
+        crate::rc::drop_arc(last);
     }
     fn pointer(data: *const usize, len: usize) -> *const Self;
     fn view(&self) -> &Self::View;
@@ -946,7 +946,7 @@ impl sealed::Sealed for crate::tuple_storage::TupleStorage {}
 // unique mutation changes elements/hash, never slice length or metadata.
 unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
     fn release_last(last: Arc<Self>) {
-        crate::rc::release_nested(last);
+        crate::rc::release_nested_arc(last);
     }
     type View = Self;
     fn pointer(data: *const usize, len: usize) -> *const Self {
