@@ -86,9 +86,14 @@ pub(super) struct Native {
 /// a site several classes reach (methods a base class shares) keeps one
 /// for each. A version names one class in one state, and a class's shared
 /// names never move, so a hit needs only the instance to hold the field.
+///
+/// An entry may instead name a `__slots__` member's position in its
+/// class's slot layout (see [`SLOT_FIELD`]), with the layout's word in
+/// the parallel `layouts` entry.
 #[derive(Default)]
 pub(super) struct FieldCache {
     entries: [std::cell::Cell<(u64, u32)>; 4],
+    layouts: [std::cell::Cell<usize>; 4],
     next: std::cell::Cell<u8>,
 }
 
@@ -255,6 +260,7 @@ const FIELD_VER_OFFSET: i32 =
     (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 0)) as i32;
 const FIELD_IDX_OFFSET: i32 =
     (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 1)) as i32;
+const FIELD_LAYOUT_OFFSET: i32 = std::mem::offset_of!(FieldCache, layouts) as i32;
 const _: () = assert!(std::mem::offset_of!(Ctx<'static>, top) == TOP_OFFSET as usize);
 
 /// Run `plan`'s native code for one evaluation, compiling it once it is
@@ -488,7 +494,14 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
             if v == ver && v != 0 {
                 // SAFETY: the receiver is rooted and nothing runs code
                 // while the view is read.
-                if let Some(v) = unsafe { inst.split_field(idx as usize) } {
+                let hit = unsafe {
+                    if idx & SLOT_FIELD != 0 {
+                        inst.laid_out_slot((idx & !SLOT_FIELD) as usize)
+                    } else {
+                        inst.split_field(idx as usize)
+                    }
+                };
+                if let Some(v) = hit {
                     c.put(norm(v));
                     return 0;
                 }
@@ -504,17 +517,45 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         let ver = inst.cls_raw().attr_version.get();
         // The instance's own field (not a class value or descriptor),
         // from its split layout.
-        if let Some((_, Some(idx))) =
-            Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16)
-        {
-            if ver != 0 && inst.dict.published().is_none() {
-                let k = usize::from(cache.next.get()) % cache.entries.len();
-                cache.entries[k].set((ver, idx));
-                cache.next.set(cache.next.get().wrapping_add(1));
-            }
+        let found = match Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16) {
+            Some((_, Some(idx))) => inst.dict.published().is_none().then_some((idx, 0)),
+            // A `__slots__` member laid out over its class's names.
+            _ => laid_out_member(code, inst, pc_name >> 16, ver).map(|(i, l)| (i | SLOT_FIELD, l)),
+        };
+        if let Some((idx, layout)) = found.filter(|_| ver != 0) {
+            let k = usize::from(cache.next.get()) % cache.entries.len();
+            cache.entries[k].set((ver, idx));
+            cache.layouts[k].set(layout);
+            cache.next.set(cache.next.get().wrapping_add(1));
         }
     }
     status
+}
+
+/// A [`FieldCache`] position naming a `__slots__` member's place in its
+/// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
+/// rather than a split field's.
+const SLOT_FIELD: u32 = 1 << 31;
+
+/// Where `inst` keeps the attribute `code.names[name]` when reading it
+/// means reading a `__slots__` member its class (at version `ver`) lays
+/// out (see [`crate::types::TypeObject::fresh_slots`]): the member's
+/// position in the layout, and the layout's word.
+#[cold]
+fn laid_out_member(
+    code: &CodeObject,
+    inst: &Rc<crate::types::PyInstance>,
+    name: u32,
+    ver: u64,
+) -> Option<(u32, usize)> {
+    use weavepy_compiler::InlineCache as IC;
+    inst.cls_raw().slot_layout.get()?.as_ref()?;
+    let name = code.names.get(name as usize)?;
+    let obj = Object::Instance(inst.clone());
+    match crate::specialize::attempt_specialize_load_attr(&obj, name) {
+        IC::LoadAttrSlot { ver: v, .. } if v == ver => inst.laid_out_position(name),
+        _ => None,
+    }
 }
 
 unsafe extern "C" fn h_method(
@@ -1083,10 +1124,39 @@ impl Lower<'_> {
         self.b.switch_to_block(ok);
     }
 
+    /// The member slots of the instance at `inst` (its payload pointer),
+    /// as [`crate::types::PyInstance::laid_out_slot`] reads them: their
+    /// values' pointer, and whether they're unreadable here (borrowed for
+    /// a write, or not laid out over the layout whose word is `layout`).
+    /// The caller checks that cells are unshared.
+    fn laid_out_slots(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        inst: Value,
+        layout: Value,
+    ) -> (Value, Value) {
+        let f = MemFlags::trusted();
+        let borrow = self.b.ins().sload32(f, inst, l.inst_slots_borrow);
+        let form = self.b.ins().uload8(types::I32, f, inst, l.inst_slots_tag);
+        let names = self.b.ins().load(self.ptr, f, inst, l.inst_slots_layout);
+        let vals = self.b.ins().load(self.ptr, f, inst, l.inst_slots_values);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
+        let bad = self.b.ins().bor(busy, other);
+        let bad = self.b.ins().bor(bad, foreign);
+        (vals, bad)
+    }
+
     /// [`h_field`]'s first cache entry in line: the receiver register
     /// `(t, p)` is a plain instance whose class has the entry's version
     /// and whose values are split over its class's names, holding the
-    /// entry's position; the field's value as register words. Anything
+    /// entry's position (or, for a slot entry, whose member slots are laid
+    /// out over the entry's layout, the one there set); the field's value
+    /// as register words. Anything
     /// else (and, with buffered stores, everything) branches to `miss`.
     fn inline_field(
         &mut self,
@@ -1114,30 +1184,57 @@ impl Lower<'_> {
             bad = self.b.ins().bor(bad, pending);
         }
         self.miss_if(bad, miss);
-        // An instance: its class, its split values, and the site's entry.
+        // An instance: its class and the site's entry.
         let inst = self.b.ins().load(ptr, f, p, 8);
         let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
         let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
         let at = self.b.ins().iconst(ptr, cache);
         let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
         let idx = self.b.ins().uload32(f, at, FIELD_IDX_OFFSET);
-        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, f, flag, 0);
-        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
-        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
         let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
         let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+        let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+        let bad = self.b.ins().bor(unset, stale);
+        let bad = self.b.ins().bor(bad, shared);
+        self.miss_if(bad, miss);
+        let read = self.b.create_block();
+        self.b.append_block_param(read, ptr);
+        let split = self.b.create_block();
+        if l.slots_ok {
+            // A member slot laid out over the entry's layout, and set.
+            let slot = self.b.create_block();
+            let is_slot = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
+            self.b.ins().brif(is_slot, slot, &[], split, &[]);
+            self.b.switch_to_block(slot);
+            let layout = self.b.ins().load(ptr, f, at, FIELD_LAYOUT_OFFSET);
+            let (vals, bad) = self.laid_out_slots(l, inst, layout);
+            self.miss_if(bad, miss);
+            let i = self.b.ins().band_imm(idx, i64::from(!SLOT_FIELD));
+            let off = self.b.ins().ishl_imm(i, 4);
+            let v = self.b.ins().iadd(vals, off);
+            let vt = self.b.ins().uload8(types::I32, f, v, 0);
+            let none = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, vt, i64::from(l.tag_unbound));
+            self.miss_if(none, miss);
+            self.b.ins().jump(read, &[v.into()]);
+        } else {
+            self.b.ins().jump(split, &[]);
+        }
+        // Split values over the class's names that hold the position.
+        self.b.switch_to_block(split);
+        let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
+        let borrow = self.b.ins().sload32(f, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, f, inst, l.inst_split_block);
         let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-        let other = self.b.ins().bor(lazy, shared);
-        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
-        let bad = self.b.ins().bor(unset, stale);
-        let bad = self.b.ins().bor(bad, busy);
-        let bad = self.b.ins().bor(bad, empty);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, lazy, 0);
+        let bad = self.b.ins().bor(busy, empty);
         let bad = self.b.ins().bor(bad, other);
         self.miss_if(bad, miss);
-        // A block over the class's names that holds the position.
         let keys = self.b.ins().load(ptr, f, block, l.split_keys);
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
         let len = self.b.ins().uload32(f, block, l.split_len);
@@ -1151,6 +1248,9 @@ impl Lower<'_> {
         let off = self.b.ins().ishl_imm(idx, 4);
         let v = self.b.ins().iadd(block, off);
         let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+        self.b.ins().jump(read, &[v.into()]);
+        self.b.switch_to_block(read);
+        let v = self.b.block_params(read)[0];
         // `norm`: the scalars by value, anything else by reference.
         let vt = self.b.ins().uload8(types::I64, f, v, 0);
         let word = self.b.ins().load(types::I64, f, v, 8);

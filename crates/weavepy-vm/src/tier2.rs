@@ -3415,7 +3415,27 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     }
     let update = std::mem::offset_of!(MethodEntry, update);
     let ctx_pins = std::mem::offset_of!(CallCtx, pins);
+    // The member slots' cell: its borrow counter, and where the laid-out
+    // form keeps its layout and values (see `laid_out_slots_layout`).
+    let inst_slots = arc_data + std::mem::offset_of!(PyInstance, slots);
+    let slots_borrow = inst_slots + GilCell::<crate::types::SlotStorage>::BORROW_OFFSET;
+    let slots_at = inst_slots + GilCell::<crate::types::SlotStorage>::DATA_OFFSET;
+    let slots = laid_out_slots_layout().and_then(|(tag, fixed, layout, values)| {
+        Some((
+            i32_of(slots_at + tag)?,
+            fixed,
+            i32_of(slots_at + layout)?,
+            i32_of(slots_at + values)?,
+        ))
+    });
     Some(weavepy_jit::ObjLayout {
+        slots_ok: slots.is_some(),
+        tag_unbound: tag(&Object::Unbound),
+        inst_slots_borrow: i32_of(slots_borrow)?,
+        inst_slots_tag: slots.map_or(0, |s| s.0),
+        slots_laid_out: slots.map_or(0, |s| s.1),
+        inst_slots_layout: slots.map_or(0, |s| s.2),
+        inst_slots_values: slots.map_or(0, |s| s.3),
         ctx_pins_ptr: i32_of(ctx_pins + vec_ptr)?,
         ctx_pins_len: i32_of(ctx_pins + vec_len)?,
         pin_size: i32_of(std::mem::size_of::<Pin>())?,
@@ -3470,6 +3490,121 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         recursion_limit: crate::recursion::recursion_limit_ptr() as usize,
         ctx_depth_cell: i32_of(std::mem::offset_of!(CallCtx, depth_cell))?,
     })
+}
+
+/// Where slot storage keeps a laid-out instance's member slots (see
+/// [`crate::types::TypeObject::fresh_slots`]), measured on samples of
+/// every form it takes: the offset of the byte that tells the laid-out
+/// form apart and its value there, then the offsets of the layout's
+/// pointer and the values' pointer. `None` when the forms don't measure
+/// as expected.
+///
+/// The storage is an enum whose laid-out form fills three of its four
+/// words, so the fourth holds what tells the forms apart: in the
+/// single-slot form, an object's tag byte (the slot's name's or value's),
+/// and so in the laid-out form a value no object's tag takes. Each sample
+/// checks that reading.
+#[cfg(target_pointer_width = "64")]
+fn laid_out_slots_layout() -> Option<(usize, u8, usize, usize)> {
+    use crate::types::SlotStorage;
+    const WORDS: usize = 4;
+    if std::mem::size_of::<SlotStorage>() != WORDS * 8
+        || std::mem::size_of::<crate::shared_value::SharedSlice<DictKey>>() != 8
+    {
+        return None;
+    }
+    let words = |s: &SlotStorage| -> [usize; WORDS] {
+        let p = std::ptr::from_ref(s).cast::<u8>();
+        // SAFETY: four words inside a live value.
+        std::array::from_fn(|k| unsafe { p.add(k * 8).cast::<usize>().read_unaligned() })
+    };
+    let byte = |s: &SlotStorage, at: usize| -> u8 {
+        // SAFETY: a byte inside a live value.
+        unsafe { *std::ptr::from_ref(s).cast::<u8>().add(at) }
+    };
+    let tag = |v: &Object| -> u8 {
+        // SAFETY: `Object` is `repr(u8)`: its first byte is the tag.
+        unsafe { *std::ptr::from_ref(v).cast::<u8>() }
+    };
+    let name = |s: &str| DictKey(crate::stdlib::sys::intern_name(s));
+    let layout = crate::shared_value::SharedSlice::from(vec![name("a"), name("b"), name("c")]);
+    let layout_addr = crate::shared_value::SharedSlice::word(&layout);
+    let fixed = SlotStorage::from_layout(
+        layout.clone(),
+        vec![Object::Int(1), Object::Unbound, Object::Float(2.0)],
+    );
+    let values = fixed.values_for_layout(&layout)?.as_ptr() as usize;
+    let w = words(&fixed);
+    let find = |want: usize| -> Option<usize> {
+        let mut hits = (0..WORDS).filter(|&k| w[k] == want);
+        let k = hits.next()?;
+        hits.next().is_none().then_some(k * 8)
+    };
+    let (layout_at, values_at, len_at) = (find(layout_addr)?, find(values)?, find(3)?);
+    let free = (0..WORDS)
+        .map(|k| k * 8)
+        .find(|o| ![layout_at, values_at, len_at].contains(o))?;
+    let laid_out = byte(&fixed, free);
+    // The single-slot form: the discriminating byte is the tag of its name
+    // or of its value, whatever the value.
+    let mut name_tag = None;
+    let mut value_tag = None;
+    for value in [
+        Object::Int(5),
+        Object::Float(0.5),
+        Object::None,
+        Object::Bool(true),
+        Object::Str(crate::shared_value::SharedStr::from("v")),
+    ] {
+        let mut single = SlotStorage::default();
+        single.insert("a", value.clone());
+        let b = byte(&single, free);
+        let key_tag = tag(&Object::Str(crate::shared_value::SharedStr::from("a")));
+        if b == key_tag && value_tag.is_none() {
+            name_tag = Some(b);
+        } else if b == tag(&value) && name_tag.is_none() {
+            value_tag = Some(b);
+        } else {
+            return None;
+        }
+        if b == laid_out {
+            return None;
+        }
+    }
+    // Every other form reads differently there.
+    let others = [
+        SlotStorage::default(),
+        SlotStorage::from_entries(vec![
+            (name("a"), Object::Int(1)),
+            (name("b"), Object::Int(2)),
+        ]),
+        SlotStorage::from_entries(
+            (0..20)
+                .map(|i| (name(&format!("s{i}")), Object::Int(i)))
+                .collect(),
+        ),
+    ];
+    if others
+        .iter()
+        .any(|s| byte(s, free) == laid_out || s.values_for_layout(&layout).is_some())
+    {
+        return None;
+    }
+    // A second laid-out sample reads the same.
+    let unset = SlotStorage::from_layout(layout.clone(), vec![Object::Unbound; 3]);
+    let w2 = words(&unset);
+    if byte(&unset, free) != laid_out
+        || w2[layout_at / 8] != layout_addr
+        || w2[values_at / 8] != unset.values_for_layout(&layout)?.as_ptr() as usize
+    {
+        return None;
+    }
+    Some((free, laid_out, layout_at, values_at))
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+fn laid_out_slots_layout() -> Option<(usize, u8, usize, usize)> {
+    None
 }
 
 /// Where a list's cell sits in its `Arc` allocation at `arc`.

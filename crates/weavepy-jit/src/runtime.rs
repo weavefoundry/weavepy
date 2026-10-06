@@ -265,6 +265,20 @@ pub struct ObjLayout {
     pub hot_gates: usize,
     pub recursion_limit: usize,
     pub ctx_depth_cell: i32,
+    /// An instance value's payload pointer → its member slots' borrow
+    /// counter (`i32`), the byte that reads [`Self::slots_laid_out`] while
+    /// they are laid out over a class's names, and then the names' pointer
+    /// and the values' pointer (words). `slots_ok` is false when the
+    /// embedder couldn't measure them (no slot reads run in line).
+    pub slots_ok: bool,
+    pub inst_slots_borrow: i32,
+    pub inst_slots_tag: i32,
+    pub slots_laid_out: u8,
+    pub inst_slots_layout: i32,
+    pub inst_slots_values: i32,
+    /// An unset member slot holds the "no value" object, whose tag this
+    /// is.
+    pub tag_unbound: u8,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();
