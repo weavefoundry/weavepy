@@ -236,7 +236,7 @@ struct FutState {
     status: FutStatus,
     result: Object,
     loop_: Object,
-    callbacks: Vec<(Object, Object)>,
+    callbacks: Vec<(Object, CbContext)>,
     log_traceback: bool,
     blocking: bool,
     initialized: bool,
@@ -264,6 +264,39 @@ struct FutState {
     this: crate::sync::Weak<PyInstance>,
     scheduled: bool,
     eager: bool,
+}
+
+/// A done callback's context: the one it was added with, or a copy of
+/// the context current when it was added, which becomes a `Context` only
+/// once the callback is scheduled (or the callback list is read). A
+/// pending future's callback (`gather`'s, for each child) so holds no
+/// `Context` of its own.
+#[derive(Clone)]
+enum CbContext {
+    Given(Object),
+    /// The copied context's mapping (see
+    /// [`crate::stdlib::contextvars_native::current_data`]).
+    Copied(Rc<RefCell<DictData>>),
+}
+
+const _: () = assert!(std::mem::size_of::<CbContext>() == std::mem::size_of::<Object>());
+
+impl CbContext {
+    /// The context, built if need be.
+    fn into_context(self) -> Result<Object, RuntimeError> {
+        match self {
+            Self::Given(ctx) => Ok(ctx),
+            Self::Copied(data) => crate::stdlib::contextvars_native::context_over(data),
+        }
+    }
+
+    /// The object this holds (the copied context's mapping, if unbuilt).
+    fn into_held(self) -> Object {
+        match self {
+            Self::Given(ctx) => ctx,
+            Self::Copied(data) => Object::Dict(data),
+        }
+    }
 }
 
 /// The state of a [`FutState`] that few futures carry: a failed or
@@ -616,7 +649,7 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
     for (cb, ctx) in &s.callbacks {
         visit(cb);
-        visit(ctx);
+        visit(&ctx.clone().into_held());
     }
     // 3.14 `FutureObj_traverse` visits `fut_awaited_by`: the strong
     // waiter references it holds close the `task -> coro frame -> future
@@ -660,7 +693,7 @@ fn fut_gc_clear(obj: &Object) {
         }
         for (cb, ctx) in s.callbacks.drain(..) {
             dropped.push(cb);
-            dropped.push(ctx);
+            dropped.push(ctx.into_held());
         }
         dropped.append(&mut s.awaited_by);
         if let Some(cold) = s.cold.as_mut() {
@@ -897,7 +930,12 @@ fn schedule_callbacks(
     };
     let _ = interp;
     for (cb, ctx) in callbacks {
-        call_soon(&loop_, cb, std::slice::from_ref(self_obj), ctx)?;
+        call_soon(
+            &loop_,
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
+        )?;
     }
     Ok(())
 }
@@ -1106,13 +1144,18 @@ fn future_add_done_callback_impl(
 ) -> Result<(), RuntimeError> {
     ensure_initialized(interp, st)?;
     let ctx = if matches!(context, Object::None) {
-        crate::stdlib::contextvars_native::copy_current()?
+        CbContext::Copied(crate::stdlib::contextvars_native::current_data()?)
     } else {
-        context
+        CbContext::Given(context)
     };
     if future_done_st(st) {
         let loop_ = st.borrow().loop_.clone();
-        call_soon(&loop_, cb, std::slice::from_ref(self_obj), ctx)?;
+        call_soon(
+            &loop_,
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
+        )?;
     } else {
         let mut s = st.borrow_mut();
         // (Most futures get one callback.)
@@ -1245,7 +1288,7 @@ fn fut_remove_done_callback(args: &[Object]) -> Result<Object, RuntimeError> {
         type_error("remove_done_callback() missing 1 required positional argument: 'fn'")
     })?;
     let callbacks = st.borrow().callbacks.clone();
-    let mut kept: Vec<(Object, Object)> = Vec::with_capacity(callbacks.len());
+    let mut kept: Vec<(Object, CbContext)> = Vec::with_capacity(callbacks.len());
     let mut removed = 0i64;
     for (cb, ctx) in callbacks {
         if py_eq(interp, &cb, &target) {
@@ -1383,12 +1426,22 @@ fn futprop_loop(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_callbacks(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let cbs: Vec<Object> = st
-        .borrow()
+    // Build the copied contexts once, so each reads back as the same
+    // object.
+    let mut s = st.borrow_mut();
+    for (_, ctx) in &mut s.callbacks {
+        if let CbContext::Copied(data) = ctx {
+            *ctx = CbContext::Given(crate::stdlib::contextvars_native::context_over(
+                data.clone(),
+            )?);
+        }
+    }
+    let cbs: Vec<Object> = s
         .callbacks
         .iter()
-        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone()]))
+        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone().into_held()]))
         .collect();
+    drop(s);
     // The C getter reports `None` for an empty callback list (a fresh copy
     // otherwise) — `test_callbacks_copy` pins this.
     if cbs.is_empty() {
