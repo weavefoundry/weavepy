@@ -1960,7 +1960,9 @@ impl JitState {
                 let init = {
                     let cached = t.instance_plan.borrow();
                     let (ver, plan) = cached.as_ref()?.clone();
-                    if ver != t.attr_version.get() {
+                    // (An exception's `args` is seeded by its allocator,
+                    // which the native construction doesn't run.)
+                    if ver != t.attr_version.get() || plan.seeds_exception_args {
                         return None;
                     }
                     match plan.init_fn.as_ref() {
@@ -11281,7 +11283,7 @@ unsafe fn try_dyn_native(
             let init = {
                 let cached = t.instance_plan.borrow();
                 let (ver, plan) = cached.as_ref()?.clone();
-                if ver != t.attr_version.get() {
+                if ver != t.attr_version.get() || plan.seeds_exception_args {
                     return None;
                 }
                 match plan.init_fn.as_ref() {
