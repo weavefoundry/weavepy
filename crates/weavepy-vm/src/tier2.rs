@@ -769,17 +769,11 @@ struct JitState {
 /// of a thread-local borrow.
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
 /// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process: when the CLI starts a program
-/// file or module, and otherwise when the first code object is halfway
-/// to its compile threshold (so `-c pass` doesn't pay for it).
-pub(crate) fn spawn_codegen_prewarm_if_enabled() {
-    if jit_enabled_by_config() {
-        spawn_codegen_prewarm();
-    }
-}
-
+/// [`prewarm_codegen`]), once per process, when the first code object is
+/// halfway to its compile threshold. Not at start-up: paging the code
+/// generator in costs a program that never compiles anything about 2 MB
+/// of resident memory (a third of an empty script's over CPython's).
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -825,6 +819,7 @@ fn prewarm_codegen() {
     });
 }
 
+/// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
 fn jit_enabled_by_config() -> bool {
     // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
     // (or `off`, or an empty value) restores the pure interpreter.

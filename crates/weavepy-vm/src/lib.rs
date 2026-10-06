@@ -500,14 +500,6 @@ fn py_traceback_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
 }
 
-/// Warm the JIT's code generator on a background thread when the JIT
-/// is on (see `tier2::prewarm_codegen`): a program's first compile then
-/// doesn't pay the generator's cold start.
-pub fn spawn_jit_codegen_prewarm() {
-    #[cfg(feature = "jit")]
-    tier2::spawn_codegen_prewarm_if_enabled();
-}
-
 /// RFC 0032 — render the tier-2 JIT's counters as a markdown block for
 /// the `WEAVEPY_VM_STATS` report, or `None` when the `jit` feature is
 /// disabled or the JIT was never exercised on this thread.
