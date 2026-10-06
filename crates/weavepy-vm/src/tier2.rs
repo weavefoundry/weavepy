@@ -138,6 +138,24 @@ struct MethodEntry {
     /// update (`self.n += k; return self.n`) in line, armed by
     /// `wpjit_call_method` once the helper has run it (see [`arm_update`]).
     update: InlineUpdate,
+    /// The scalar fields the method reads off `self` where the receiver's
+    /// class at the entry's version keeps them in split values (see
+    /// [`inline_fields_of`]): what a call site needs to run the body in
+    /// line (see [`inline_method_body`]).
+    fields: Vec<InlineField>,
+    /// Some compiled site checks this entry's guard in line (it calls the
+    /// method's body directly or runs it in line), so the helper keeps the
+    /// guard's shadow bound armed (see [`arm_method_guard`]).
+    guarded_in_line: Cell<bool>,
+}
+
+/// One scalar field a method reads off `self` (see [`MethodEntry::fields`]).
+struct InlineField {
+    name: String,
+    /// The value's lane when the method was resolved.
+    lane: JitType,
+    /// Its index in the class's names (they never move).
+    idx: u32,
 }
 
 /// [`MethodEntry::update`]: compiled code reads these in place (see
@@ -1531,15 +1549,27 @@ impl JitState {
             // site's guard holds (see `wpjit_method_enter`).
             let mut direct_method = |token: u32| {
                 let methods = methods.borrow();
-                let MethodCallee::Py { code: mcode, .. } = &methods.get(token as usize)?.callee
-                else {
+                let entry = methods.get(token as usize)?;
+                let MethodCallee::Py { code: mcode, .. } = &entry.callee else {
                     return None;
                 };
                 let k = Rc::as_ptr(mcode).cast::<CodeObject>();
-                match &cache_ref.get(&k)?.tier {
-                    Tier::Compiled(a) => a.cf.direct_method_leaf(mcode.arg_count),
-                    _ => None,
-                }
+                let leaf = match &cache_ref.get(&k)?.tier {
+                    Tier::Compiled(a) => a.cf.direct_method_leaf(mcode.arg_count)?,
+                    _ => return None,
+                };
+                entry.guarded_in_line.set(true);
+                Some(leaf)
+            };
+            // A method site passing scalar arguments runs a body that only
+            // computes over them and `self`'s scalar fields in line (see
+            // `inline_method_body`).
+            let mut inline_method = |token: u32, lanes: &[JitType]| {
+                let methods = methods.borrow();
+                let entry = methods.get(token as usize)?;
+                let body = inline_method_body(entry, lanes)?;
+                entry.guarded_in_line.set(true);
+                Some(body)
             };
             ensure_obj_layout();
             let r = engine.compile_frame_direct(
@@ -1548,6 +1578,7 @@ impl JitState {
                 &mut jit_probes,
                 &mut direct,
                 &mut direct_method,
+                &mut inline_method,
             );
             if let Some(t0) = t0 {
                 eprintln!("jit compile-time {:?} {:?}", code.name, t0.elapsed());
@@ -3435,6 +3466,9 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         observers: crate::trace::observer_count_flag() as usize,
         dict_watchers: crate::capi_watchers::dicts_active_flag() as usize,
         exotic_keys: crate::object::exotic_str_keys_flag() as usize,
+        hot_gates: crate::hot_gates::hot_ptr() as usize,
+        recursion_limit: crate::recursion::recursion_limit_ptr() as usize,
+        ctx_depth_cell: i32_of(std::mem::offset_of!(CallCtx, depth_cell))?,
     })
 }
 
@@ -3510,6 +3544,8 @@ fn probe_method_entry(
                 ret: MethodRet::Scalar(JitType::Obj),
                 ver: cls.attr_version.get(),
                 update: InlineUpdate::unarmed(),
+                fields: Vec::new(),
+                guarded_in_line: Cell::new(false),
             });
         }
         _ => return None,
@@ -3535,6 +3571,7 @@ fn probe_method_entry(
     };
     let ver = cls.attr_version.get();
     let arg_count = fcode.arg_count;
+    let fields = inline_fields_of(&recv, &fcode, ver);
     let entry = MethodEntry {
         callee: MethodCallee::Py {
             func: f,
@@ -3548,9 +3585,111 @@ fn probe_method_entry(
         ret,
         ver,
         update: InlineUpdate::unarmed(),
+        fields,
+        guarded_in_line: Cell::new(false),
     };
     arm_method_guard(&entry, &cls);
     Some(entry)
+}
+
+/// The scalar fields `code` (a method) reads off its receiver whose
+/// attribute loads on `recv` (an instance of the class at version `ver`)
+/// are plain split-value reads, as the attribute sites' guards classify
+/// them: no class attribute or descriptor intervenes, and the class's
+/// names hold the field at its index. At most a handful, in first-read
+/// order.
+fn inline_fields_of(recv: &Object, code: &CodeObject, ver: u64) -> Vec<InlineField> {
+    const MAX_FIELDS: usize = 8;
+    let Object::Instance(inst) = recv else {
+        return Vec::new();
+    };
+    let mut out: Vec<InlineField> = Vec::new();
+    for ins in code.instructions.iter() {
+        if ins.op != weavepy_compiler::OpCode::LoadAttr {
+            continue;
+        }
+        let Some(name) = code.names.get(ins.arg as usize) else {
+            continue;
+        };
+        if out.len() >= MAX_FIELDS || out.iter().any(|f| f.name == *name) {
+            continue;
+        }
+        let Some((lane, fver, storage @ AttrStorage::Indexed(i))) =
+            attr_fingerprint_obj(recv, name, false)
+        else {
+            continue;
+        };
+        if fver != ver
+            || !matches!(lane, JitType::Int | JitType::Float | JitType::Bool)
+            || split_index(&inst.cls(), storage, name) != i
+        {
+            continue;
+        }
+        out.push(InlineField {
+            name: name.clone(),
+            lane,
+            idx: i,
+        });
+    }
+    out
+}
+
+/// The body of `entry`'s method as a call site passing arguments of
+/// `lanes` runs it in line (see [`weavepy_jit::InlineMethod`]): the method
+/// analyzed with those parameter lanes and `self`'s fields (see
+/// [`MethodEntry::fields`]) and nothing else of the world (no globals,
+/// calls or other attributes), when the analysis takes the in-line shape
+/// and reads only those fields.
+fn inline_method_body(entry: &MethodEntry, lanes: &[JitType]) -> Option<weavepy_jit::InlineMethod> {
+    let MethodCallee::Py { code, .. } = &entry.callee else {
+        return None;
+    };
+    if code.arg_count as usize != lanes.len() + 1 {
+        return None;
+    }
+    let mut classify = |_: &str| ResolvedGlobal::Opaque;
+    let mut attr = |slot: u32, path: &[String], name: &str, store: bool| -> Option<JitType> {
+        if slot != 0 || !path.is_empty() || store {
+            return None;
+        }
+        entry.fields.iter().find(|f| f.name == name).map(|f| f.lane)
+    };
+    let mut param = |slot: u32| lanes.get((slot as usize).checked_sub(1)?).copied();
+    let mut path_arena = weavepy_jit::PathArena::default();
+    let mut probes = Probes {
+        list: &mut |_| None,
+        dict: &mut |_| None,
+        attr: &mut attr,
+        method: &mut |_, _, _| None,
+        math: &mut |_, _| false,
+        ctor_field: &mut |_, _| None,
+        param: &mut param,
+        kw_slot: &mut |_, _| None,
+        obj_global: &mut |_| None,
+        cell: &mut |_| None,
+        obj: &mut |_| false,
+        local: &mut |_| None,
+        stack_iter: &mut |_| None,
+        pairs: &mut |_| None,
+        entry_pc: None,
+        carve_env: false,
+        paths: &mut path_arena,
+    };
+    let tf = weavepy_jit::analyze_frame(code, &mut classify, &mut probes).ok()?;
+    let body = weavepy_jit::InlineMethod::of(&tf, code.arg_count)?;
+    let idx = body
+        .field_names()
+        .iter()
+        .zip(body.field_lanes())
+        .map(|(name, &lane)| {
+            entry
+                .fields
+                .iter()
+                .find(|f| f.name == *name && f.lane == lane)
+                .map_or(u32::MAX, |f| f.idx)
+        })
+        .collect();
+    body.with_fields(idx)
 }
 
 /// Arm what compiled code checks of `entry`'s guard in line before a
@@ -7220,6 +7359,16 @@ unsafe extern "C" fn wpjit_call_method(
     let MethodCallee::Py { func, code } = &entry.callee else {
         unreachable!("native methods returned above");
     };
+    // A receiver with more values than the shadow bound allows misses the
+    // in-line guard: once the class's names cover them, the bound grows
+    // (see `arm_method_guard`).
+    if entry.guarded_in_line.get() {
+        if let Object::Instance(inst) = &recv {
+            if !crate::gil::free_threading_enabled() {
+                arm_method_guard(entry, inst.cls_raw());
+            }
+        }
+    }
 
     // A pure-leaf method (a getter, a predicate) evaluates frameless.
     // SAFETY: `argc` marshaled entries are live (the function contract),

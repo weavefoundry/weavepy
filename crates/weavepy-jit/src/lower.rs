@@ -19,6 +19,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
+use crate::engine::InlineMethod;
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
 use crate::runtime::{self, JitFrame, JitStatus, SlotTag};
 use crate::value::JitType;
@@ -91,11 +92,13 @@ pub(crate) fn build_function(
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
+    inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
 ) -> bool {
     let mut builder = FunctionBuilder::new(func, fbctx);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
     lc.self_func = self_func;
     lc.leaves = leaves;
+    lc.inline_method = Some(inline_method);
     lc.build();
     let sound = !lc.unlisted_assignment;
     builder.seal_all_blocks();
@@ -169,6 +172,12 @@ struct Lowerer<'a, 'b> {
     self_slow_sig: Option<SigRef>,
     /// Direct scalar-leaf call targets by token.
     leaves: Vec<LeafTarget>,
+    /// The in-line body of a method site, by method token and the lanes
+    /// of its arguments (see `engine::InlineMethod::of`).
+    inline_method: Option<&'a mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>>,
+    /// While lowering an in-line method body: where its guards branch
+    /// (the method helper's call) instead of a side exit.
+    miss_redirect: Option<Block>,
     /// Per local slot, whether the body assigns it (see
     /// [`assigned_slots`]): a local it never assigns still holds the
     /// frame's own value, so exits and calls don't write it back.
@@ -262,6 +271,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self_sig: None,
             self_slow_sig: None,
             leaves: Vec::new(),
+            inline_method: None,
+            miss_redirect: None,
             assignable: Vec::new(),
             var_slots: Vec::new(),
             unlisted_assignment: false,
@@ -1228,10 +1239,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.b.switch_to_block(cont);
             }
             TOp::MathIntrinsic(func) => self.emit_math_intrinsic(func, stmt.pc),
-            TOp::CallMethod { token, argc, ret } => match self.method_leaf_for(token, argc, ret) {
-                Some(ix) => self.emit_call_method_leaf(ix, token, argc, ret, stmt.pc),
-                None => self.emit_call_method(token, argc, ret, stmt.pc),
-            },
+            TOp::CallMethod { token, argc, ret } => {
+                if let Some(body) = self.inline_body_for(token, argc, ret) {
+                    self.emit_call_method_inline(&body, token, argc, ret, stmt.pc);
+                } else if let Some(ix) = self.method_leaf_for(token, argc, ret) {
+                    self.emit_call_method_leaf(ix, token, argc, ret, stmt.pc);
+                } else {
+                    self.emit_call_method(token, argc, ret, stmt.pc);
+                }
+            }
             TOp::GuardMethod { token } => {
                 let snapshot = self.vstack.clone();
                 let &(pin, _) = self.vstack.last().expect("guard on empty stack");
@@ -4646,8 +4662,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// split over its class's names (or empty) and too few to hold the
     /// method's name, and whose function still wears the entry's code.
     /// Anything else branches to `miss` (the method enter helper, which
-    /// decides exactly).
-    fn inline_method_guard(&mut self, l: &runtime::ObjLayout, pin: Value, token: u32, miss: Block) {
+    /// decides exactly). Returns the receiver's split values' block
+    /// pointer (null for none).
+    fn inline_method_guard(
+        &mut self,
+        l: &runtime::ObjLayout,
+        pin: Value,
+        token: u32,
+        miss: Block,
+    ) -> Value {
         let t = MemFlags::trusted();
         let ptr = self.ptr_ty;
         let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
@@ -4725,6 +4748,190 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().bor(foreign, shadowed);
         self.b.ins().brif(bad, miss, &[], hit, &[]);
         self.b.switch_to_block(hit);
+        block
+    }
+
+    /// The in-line body of method token `token` (see
+    /// `engine::InlineMethod::of`) for this site, when the embedder
+    /// published its object layout and offers one for these argument lanes
+    /// whose result is the scalar the site expects, and every local the
+    /// body reads is a parameter or was stored first.
+    fn inline_body_for(&mut self, token: u32, argc: u8, ret: MethodRet) -> Option<InlineMethod> {
+        if token & runtime::METHOD_NATIVE != 0 || runtime::obj_layout().is_none() {
+            return None;
+        }
+        let lane = leaf_ret_lane(ret)?;
+        let n = argc as usize;
+        let base = self.vstack.len().checked_sub(n)?;
+        if self.vstack.get(base.checked_sub(1)?)?.1 != JitType::Obj {
+            return None;
+        }
+        let lanes: Vec<JitType> = self.vstack[base..].iter().map(|&(_, t)| t).collect();
+        if !lanes
+            .iter()
+            .all(|t| matches!(t, JitType::Int | JitType::Float | JitType::Bool))
+        {
+            return None;
+        }
+        let lookup = self.inline_method.as_mut()?;
+        let body = lookup(token, &lanes)?;
+        if body.ret != lane || body.params != lanes || body.field_idx.contains(&u32::MAX) {
+            return None;
+        }
+        let mut defined = vec![false; body.n_locals.max(1) as usize];
+        for d in defined.iter_mut().take(n + 1) {
+            *d = true;
+        }
+        for &op in &body.ops {
+            match op {
+                TOp::LoadLocal(s) if !defined.get(s as usize).copied().unwrap_or(false) => {
+                    return None;
+                }
+                TOp::StoreLocal(s) => *defined.get_mut(s as usize)? = true,
+                TOp::AttrGet { site, .. } if site as usize >= body.field_idx.len() => return None,
+                _ => {}
+            }
+        }
+        Some(body)
+    }
+
+    /// Lower a guarded method call whose body runs in line (see
+    /// `engine::InlineMethod`): the site's guard as for a direct method
+    /// call, the gates a call checks (no observer or pending interpreter
+    /// work, room under the recursion limit), then the body's operations
+    /// on the receiver's split values and the call's arguments. The body
+    /// does nothing observable, so any miss (a guard, a field of another
+    /// lane or position, an overflow, a zero divisor) runs the call
+    /// through the method helper from the start.
+    fn emit_call_method_inline(
+        &mut self,
+        body: &InlineMethod,
+        token: u32,
+        argc: u8,
+        ret: MethodRet,
+        pc: u32,
+    ) {
+        let lane = leaf_ret_lane(ret).expect("checked by inline_body_for");
+        let l = *runtime::obj_layout().expect("checked by inline_body_for");
+        let n = argc as usize;
+        let base = self.vstack.len() - n;
+        let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
+        self.vstack.truncate(base);
+        let recv = self.pop();
+
+        let generic_b = self.b.create_block();
+        let join_b = self.b.create_block();
+        self.b.append_block_param(join_b, Self::cl_ty(lane));
+        let block = self.inline_method_guard(&l, recv.0, token, generic_b);
+        self.inline_call_gates(&l, generic_b);
+
+        let outer = std::mem::take(&mut self.vstack);
+        let outer_miss = self.miss_redirect.replace(generic_b);
+        let mut locals: Vec<Option<(Value, JitType)>> = vec![None; body.n_locals.max(1) as usize];
+        locals[0] = Some(recv);
+        for (j, &a) in args.iter().enumerate() {
+            locals[j + 1] = Some(a);
+        }
+        for &op in &body.ops {
+            match op {
+                TOp::LoadLocal(s) => {
+                    let v = locals[s as usize].expect("checked by inline_body_for");
+                    self.vstack.push(v);
+                }
+                TOp::StoreLocal(s) => {
+                    let v = self.pop();
+                    locals[s as usize] = Some(v);
+                }
+                TOp::AttrGet { site, out } => {
+                    self.pop();
+                    let idx = body.field_idx[site as usize];
+                    let v = self.inline_field_read(&l, block, idx, out, generic_b);
+                    self.vstack.push((v, out));
+                }
+                op => self.emit_stmt(TStmt { pc, op }),
+            }
+        }
+        let (v, _) = self.pop();
+        self.miss_redirect = outer_miss;
+        self.vstack = outer;
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        // A miss: the method helper, from the start.
+        self.b.switch_to_block(generic_b);
+        self.vstack.push(recv);
+        self.vstack.extend(args.iter().copied());
+        self.emit_call_method(token, argc, ret, pc);
+        let (v, _) = self.pop();
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        self.b.switch_to_block(join_b);
+        let v = self.b.block_params(join_b)[0];
+        self.vstack.push((v, lane));
+    }
+
+    /// The checks a call makes before its body runs that an in-line body
+    /// still needs: no observer that must see the call and no pending
+    /// interpreter work (the gate words read zero), and a call depth under
+    /// the recursion limit. Anything else branches to `miss`.
+    fn inline_call_gates(&mut self, l: &runtime::ObjLayout, miss: Block) {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let observers = self.b.ins().iconst(ptr, l.observers as i64);
+        let observers = self.b.ins().load(types::I64, t, observers, 0);
+        let hot = self.b.ins().iconst(ptr, l.hot_gates as i64);
+        let hot = self.b.ins().uload32(t, hot, 0);
+        let gates = self.b.ins().bor(observers, hot);
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        let cell = self.b.ins().load(ptr, t, ctx, l.ctx_depth_cell);
+        let depth = self.b.ins().load(types::I64, t, cell, 0);
+        let limit = self.b.ins().iconst(ptr, l.recursion_limit as i64);
+        let limit = self.b.ins().load(types::I64, t, limit, 0);
+        let deep = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, depth, limit);
+        let gated = self.b.ins().icmp_imm(IntCC::NotEqual, gates, 0);
+        let bad = self.b.ins().bor(gated, deep);
+        self.miss_if(bad, miss);
+    }
+
+    /// The `lane` value of the receiver's split field `idx`, in line: the
+    /// receiver's split values (`block`, which the method guard checked
+    /// are over its class's names) hold the field, with that lane's tag.
+    /// Anything else branches to `miss`.
+    fn inline_field_read(
+        &mut self,
+        l: &runtime::ObjLayout,
+        block: Value,
+        idx: u32,
+        lane: JitType,
+        miss: Block,
+    ) -> Value {
+        let t = MemFlags::trusted();
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+        self.miss_if(empty, miss);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let absent = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, len, i64::from(idx));
+        self.miss_if(absent, miss);
+        let at = i64::from(idx) * 16 + i64::from(l.split_values);
+        let at = self.b.ins().iadd_imm(block, at);
+        let (want, off, ty) = match lane {
+            JitType::Int => (l.tag_int, 8, types::I64),
+            JitType::Float => (l.tag_float, 8, types::F64),
+            _ => (l.tag_bool, 1, types::I8),
+        };
+        let tag = self.b.ins().uload8(types::I32, t, at, 0);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+        self.miss_if(other, miss);
+        let v = self.b.ins().load(ty, t, at, off);
+        if ty == types::I8 {
+            self.b.ins().uextend(types::I64, v)
+        } else {
+            v
+        }
     }
 
     /// Run the charged leaf `ix` in a `JitFrame` laid out in a stack slot
@@ -5274,8 +5481,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// Emit `if cond { deopt(pc, snapshot) } else { cont }` and return
     /// the `cont` block (the caller continues lowering there).
     fn guard(&mut self, cond: Value, pc: u32, snapshot: &[(Value, JitType)]) -> Block {
-        let se = self.b.create_block();
         let cont = self.b.create_block();
+        // An in-line method body restarts the call instead.
+        if let Some(miss) = self.miss_redirect {
+            self.b.ins().brif(cond, miss, &[], cont, &[]);
+            return cont;
+        }
+        let se = self.b.create_block();
         self.b.ins().brif(cond, se, &[], cont, &[]);
         self.b.switch_to_block(se);
         self.emit_deopt(pc, snapshot);

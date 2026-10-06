@@ -258,6 +258,13 @@ pub struct ObjLayout {
     pub observers: usize,
     pub dict_watchers: usize,
     pub exotic_keys: usize,
+    /// The interpreter's gate word (a `u32`, nonzero while it has work
+    /// pending), the recursion limit (a word), and [`JitFrame::ctx`] →
+    /// the pointer to this thread's call depth (a word), for a call
+    /// compiled code runs in line.
+    pub hot_gates: usize,
+    pub recursion_limit: usize,
+    pub ctx_depth_cell: i32,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();

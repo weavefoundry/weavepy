@@ -167,6 +167,181 @@ impl DirectLeaf {
     }
 }
 
+/// A method body a guarded call site runs in line (see
+/// [`InlineMethod::of`]): its operations, which read only the call's
+/// scalar arguments, constants and scalar fields of `self`, and compute a
+/// scalar result. Nothing it does is observable, so any surprise (a field
+/// of another lane or position, an overflow, a zero divisor) restarts the
+/// call through the method helper.
+#[derive(Clone, Debug)]
+pub struct InlineMethod {
+    pub(crate) ops: Vec<TOp>,
+    pub(crate) n_locals: u32,
+    /// The lanes of the parameters after `self`.
+    pub(crate) params: Vec<JitType>,
+    pub(crate) ret: JitType,
+    /// Per field read (the body's attribute site), the attribute's name
+    /// and lane, and its split index in the receiver class's names (see
+    /// [`Self::with_fields`]).
+    pub(crate) field_names: Vec<String>,
+    pub(crate) field_lanes: Vec<JitType>,
+    pub(crate) field_idx: Vec<u32>,
+}
+
+/// Operations an in-line method body may hold besides its locals and
+/// field reads: pure scalar work whose only failure is a guard.
+fn inline_op_ok(op: TOp) -> bool {
+    matches!(
+        op,
+        TOp::PushConstInt(_)
+            | TOp::PushConstFloat(_)
+            | TOp::PushConstBool(_)
+            | TOp::IntArith(
+                ArithKind::Add
+                    | ArithKind::Sub
+                    | ArithKind::Mul
+                    | ArithKind::FloorDiv
+                    | ArithKind::Mod
+                    | ArithKind::And
+                    | ArithKind::Or
+                    | ArithKind::Xor
+                    | ArithKind::TrueDiv
+            )
+            | TOp::FloatArith(
+                ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::TrueDiv
+            )
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert
+            | TOp::IntNot
+            | TOp::FloatNot
+            | TOp::Pop
+            | TOp::Dup { .. }
+            | TOp::Swap2
+            | TOp::SwapN { .. }
+            | TOp::IntToFloatTos { .. }
+            | TOp::IntToFloatSecond { .. }
+    )
+}
+
+impl InlineMethod {
+    /// The most operations an in-line body may hold.
+    const MAX_OPS: usize = 32;
+
+    /// `tfunc`, a method's analysis with its `arg_count` parameters
+    /// (`self` included) typed as one call site passes them, as an in-line
+    /// body: one block returning a scalar, no guards, loops or calls, every
+    /// local a scalar except `self`, which only feeds scalar field reads
+    /// (no stores) straight off the instance, and every other operation
+    /// pure scalar work.
+    #[must_use]
+    pub fn of(tfunc: &TFunc, arg_count: u32) -> Option<InlineMethod> {
+        let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
+        let [block] = tfunc.blocks.as_slice() else {
+            return None;
+        };
+        let ret = tfunc.ret_lane.filter(|&t| scalar(t))?;
+        let n = arg_count as usize;
+        let shape_ok = tfunc.entry_block == 0
+            && block.entry_stack.is_empty()
+            && block.stmts.len() <= Self::MAX_OPS
+            && matches!(block.term, TTerm::Return)
+            && !tfunc.ret_none
+            && n >= 1
+            && tfunc.local_types.len() >= n
+            && matches!(tfunc.local_types[0], None | Some(JitType::Obj))
+            && tfunc
+                .local_types
+                .iter()
+                .skip(1)
+                .all(|t| t.is_none_or(scalar))
+            && tfunc.livein_locals.iter().all(|&s| (s as usize) < n)
+            && tfunc.global_guards.is_empty()
+            && tfunc.math_guards.is_empty()
+            && tfunc.range_loops.is_empty()
+            && tfunc.list_loops.is_empty()
+            && tfunc.iter_loops.is_empty()
+            && tfunc.comp_saved.is_empty()
+            && tfunc.resume_entries.is_empty()
+            && tfunc.osr_entries.is_empty()
+            && tfunc.callee_spans.is_empty()
+            && tfunc.len_spans.is_empty()
+            && tfunc.method_spans.is_empty()
+            && tfunc.method_sites.is_empty()
+            && tfunc.str_method_sites.is_empty()
+            && tfunc.str_method_spans.is_empty()
+            && tfunc.math_spans.is_empty()
+            && tfunc.null_spans.is_empty()
+            && tfunc.max_call_args == 0
+            && tfunc.attr_sites.iter().all(|s| {
+                s.slot == 0
+                    && s.path.is_empty()
+                    && !s.store
+                    && !s.new_key
+                    && s.ctor.is_none()
+                    && s.self_ctor.is_none()
+                    && scalar(s.lane)
+            });
+        if !shape_ok {
+            return None;
+        }
+        let params = tfunc.local_types[1..n]
+            .iter()
+            .map(|t| t.filter(|&t| scalar(t)))
+            .collect::<Option<Vec<_>>>()?;
+        let ops_ok = block.stmts.iter().all(|st| match st.op {
+            // Only `self` is an object, and only a field read consumes it
+            // (no other operation accepts the object lane).
+            TOp::LoadLocal(s) => (s as usize) < tfunc.local_types.len(),
+            TOp::StoreLocal(s) => s != 0 && (s as usize) < tfunc.local_types.len(),
+            TOp::AttrGet { site, out } => {
+                tfunc.attr_sites.get(site as usize).map(|s| s.lane) == Some(out)
+            }
+            op => inline_op_ok(op),
+        });
+        if !ops_ok {
+            return None;
+        }
+        Some(InlineMethod {
+            ops: block.stmts.iter().map(|st| st.op).collect(),
+            n_locals: tfunc.n_locals,
+            params,
+            ret,
+            field_names: tfunc.attr_sites.iter().map(|s| s.name.clone()).collect(),
+            field_lanes: tfunc.attr_sites.iter().map(|s| s.lane).collect(),
+            field_idx: vec![u32::MAX; tfunc.attr_sites.len()],
+        })
+    }
+
+    /// The names of the fields the body reads, by attribute site.
+    #[must_use]
+    pub fn field_names(&self) -> &[String] {
+        &self.field_names
+    }
+
+    /// The lanes of the fields the body reads, by attribute site.
+    #[must_use]
+    pub fn field_lanes(&self) -> &[JitType] {
+        &self.field_lanes
+    }
+
+    /// Where each field read finds its value: the attribute's index in the
+    /// split values of an instance of the class the call site's guard
+    /// pins (the class's names never move, so the guard's version binds
+    /// the index for good). `None` when the count doesn't match.
+    #[must_use]
+    pub fn with_fields(mut self, idx: Vec<u32>) -> Option<Self> {
+        if idx.len() != self.field_idx.len() || idx.contains(&u32::MAX) {
+            return None;
+        }
+        self.field_idx = idx;
+        Some(self)
+    }
+}
+
 impl CompiledFrame {
     /// Whether this frame has one bounded block of pure scalar operations.
     /// It cannot access pins or namespaces or run a poll. Its only helpers
@@ -401,15 +576,24 @@ impl JitEngine {
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
         probes: &mut Probes<'_>,
     ) -> Result<CompiledFrame, JitVerdict> {
-        self.compile_frame_direct(code, resolve, probes, &mut |_| None, &mut |_| None)
+        self.compile_frame_direct(
+            code,
+            resolve,
+            probes,
+            &mut |_| None,
+            &mut |_| None,
+            &mut |_, _| None,
+        )
     }
 
     /// [`Self::compile_frame`] with the direct-call targets of the callee
     /// tokens: `direct(token)` names a scalar leaf compiled on this
     /// engine (see [`CompiledFrame::direct_leaf`]) that a matching call
-    /// site enters in native code, and `direct_method(token)` one a
-    /// matching method site enters once its guard holds (see
-    /// [`CompiledFrame::direct_method_leaf`]).
+    /// site enters in native code, `direct_method(token)` one a matching
+    /// method site enters once its guard holds (see
+    /// [`CompiledFrame::direct_method_leaf`]), and `inline_method(token,
+    /// lanes)` the body a method site passing arguments of those lanes runs
+    /// in line once its guard holds (see [`InlineMethod::of`]).
     pub fn compile_frame_direct(
         &mut self,
         code: &CodeObject,
@@ -417,12 +601,13 @@ impl JitEngine {
         probes: &mut Probes<'_>,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
         if calls_dynamically(&tfunc) {
             return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
         }
-        self.compile_tfunc_methods(&tfunc, direct, direct_method)
+        self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
     }
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
@@ -437,7 +622,7 @@ impl JitEngine {
         tfunc: &TFunc,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
     ) -> Result<CompiledFrame, JitVerdict> {
-        self.compile_tfunc_methods(tfunc, direct, &mut |_| None)
+        self.compile_tfunc_methods(tfunc, direct, &mut |_| None, &mut |_, _| None)
     }
 
     /// [`Self::compile_tfunc_direct`] with direct method targets (see
@@ -447,6 +632,7 @@ impl JitEngine {
         tfunc: &TFunc,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        inline_method: &mut dyn FnMut(u32, &[JitType]) -> Option<InlineMethod>,
     ) -> Result<CompiledFrame, JitVerdict> {
         // These operations each lower to a dedicated embedder helper.
         // Reject missing registrations before embedding an absolute address.
@@ -732,6 +918,7 @@ impl JitEngine {
                     receiver: leaf.receiver,
                 })
                 .collect(),
+            inline_method,
         );
         if !sound {
             self.module.clear_context(&mut self.ctx);

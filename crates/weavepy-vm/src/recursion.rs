@@ -60,6 +60,13 @@ pub fn recursion_limit() -> usize {
     RECURSION_LIMIT.load(Ordering::Relaxed)
 }
 
+/// The recursion limit's address, for native code that reads it in line
+/// where it would call [`recursion_limit`].
+#[cfg(feature = "jit")]
+pub(crate) fn recursion_limit_ptr() -> *const usize {
+    RECURSION_LIMIT.as_ptr()
+}
+
 /// Live Python call depth on the calling thread.
 pub fn current_depth() -> usize {
     DEPTH.with(|d| d.get())
