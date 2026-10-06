@@ -879,7 +879,7 @@ impl std::fmt::Debug for ColTable {
 }
 
 /// A code object's line numbers (see [`CodeObject::linetable`]): a vector,
-/// or the code cache's encoding of one (a byte per instruction, mostly),
+/// or the code cache's encoding of one (a run per statement, mostly),
 /// decoded on first use. Most code never reports a line (tracebacks,
 /// tracing, `f_lineno` and the JIT's statement boundaries read them), so
 /// a module loaded from the cache keeps the compact form until something
@@ -943,34 +943,34 @@ impl Encoded {
     }
 }
 
-/// A code object's wire marks (see [`CodeObject::wire_marks`]): a
-/// vector, or a range of the buffer its module's tables share (see
-/// [`Encoded`]), which holds the marks as they are.
+/// A code object's wire marks (see [`CodeObject::wire_marks`]): a vector,
+/// or the code cache's encoding of one (two marks a byte), decoded on
+/// first use. Only the CPython wire form of the code reads them.
 #[derive(Clone, Default)]
-pub struct WireMarks(Marks);
-
-#[derive(Clone)]
-enum Marks {
-    Owned(Vec<u8>),
-    Shared(Encoded),
-}
-
-impl Default for Marks {
-    fn default() -> Self {
-        Marks::Owned(Vec::new())
-    }
+pub struct WireMarks {
+    // Boxed so that the (usual) undecoded marks cost one word here.
+    #[allow(clippy::box_collection)]
+    marks: std::sync::OnceLock<Box<Vec<u8>>>,
+    encoded: Option<Encoded>,
 }
 
 impl WireMarks {
-    /// Marks that a range of a module's shared buffer holds.
-    pub(crate) fn shared(encoded: Encoded) -> Self {
-        WireMarks(Marks::Shared(encoded))
+    /// The marks `encoded` holds in the code cache's form (see
+    /// `native_code`), decoded when first read.
+    pub(crate) fn encoded(encoded: Encoded) -> Self {
+        WireMarks {
+            marks: std::sync::OnceLock::new(),
+            encoded: Some(encoded),
+        }
     }
 }
 
 impl From<Vec<u8>> for WireMarks {
     fn from(marks: Vec<u8>) -> Self {
-        WireMarks(Marks::Owned(marks))
+        WireMarks {
+            marks: std::sync::OnceLock::from(Box::new(marks)),
+            encoded: None,
+        }
     }
 }
 
@@ -978,10 +978,14 @@ impl std::ops::Deref for WireMarks {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match &self.0 {
-            Marks::Owned(marks) => marks,
-            Marks::Shared(encoded) => encoded.bytes(),
-        }
+        self.marks.get_or_init(|| {
+            Box::new(
+                self.encoded
+                    .as_ref()
+                    .and_then(|e| native_code::decode_wire_marks(e.bytes()))
+                    .unwrap_or_default(),
+            )
+        })
     }
 }
 
