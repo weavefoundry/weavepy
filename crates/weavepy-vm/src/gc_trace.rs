@@ -1470,7 +1470,8 @@ impl GcState {
             let parent_is_frame = matches!(cands[scanned].obj, Object::Frame(_));
             let mut found: Vec<Object> = Vec::new();
             traverse_object(&cands[scanned].obj, &mut |child| {
-                if promotes_temporarily(child, parent_is_iter, parent_is_frame)
+                if !child.never_gc_candidate()
+                    && promotes_temporarily(child, parent_is_iter, parent_is_frame)
                     && !by_id.contains_key(&id_of(child))
                 {
                     found.push(child.clone());
@@ -1496,6 +1497,9 @@ impl GcState {
         // Subtract internal references, self-references included.
         for c in &cands {
             traverse_object(&c.obj, &mut |child| {
+                if child.never_gc_candidate() {
+                    return;
+                }
                 if let Some(&i) = by_id.get(&id_of(child)) {
                     let t = &cands[i];
                     t.gc_refs.set(t.gc_refs.get() - 1);
@@ -1676,6 +1680,9 @@ impl GcState {
         while let Some(i) = grey.pop() {
             cands[i].color.set(color::Black);
             traverse_object(&cands[i].obj, &mut |child| {
+                if child.never_gc_candidate() {
+                    return;
+                }
                 if let Some(&j) = by_id.get(&id_of(child)) {
                     if cands[j].is_white() {
                         cands[j].color.set(color::Grey);

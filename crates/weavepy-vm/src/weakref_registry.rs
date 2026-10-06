@@ -681,7 +681,22 @@ pub fn next_synthetic_id() -> ObjectId {
 /// the same `Rc` produce the same id; `Object::Int(5)` and a
 /// freshly-constructed `Object::Int(5)` *also* produce the
 /// same id because small ints are interned.
+#[inline]
 pub fn id_of(obj: &Object) -> ObjectId {
+    // A heap variant's id is its payload's address, found from the tag
+    // alone (a foreign proxy reports its `PyObject`'s instead).
+    match obj.payload_addr() {
+        Some(addr) if !matches!(obj, Object::Foreign(_)) => {
+            debug_assert_eq!(addr as u64, id_of_by_variant(obj));
+            addr as u64
+        }
+        _ => id_of_by_variant(obj),
+    }
+}
+
+/// [`id_of`] by variant: the scalars' fixed ids and the foreign proxy's.
+#[inline(never)]
+fn id_of_by_variant(obj: &Object) -> ObjectId {
     use crate::sync::Rc;
     match obj {
         Object::None => 1,

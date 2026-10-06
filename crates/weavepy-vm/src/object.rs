@@ -9898,6 +9898,29 @@ impl Object {
         Some(p.wrapping_sub(back).cast())
     }
 
+    /// The address of a counted variant's payload (what `id()` reports):
+    /// a [`ThinArc`] points at it, and an `Rc`'s `ArcInner` holds it
+    /// after the two counts. `None` for a scalar.
+    #[inline(always)]
+    pub(crate) fn payload_addr(&self) -> Option<usize> {
+        let tag = u64::from(self.tag());
+        if (SCALAR_TAGS >> tag) & 1 != 0 {
+            return None;
+        }
+        // SAFETY: a counted variant's second word is its pointer.
+        let p = unsafe { *std::ptr::from_ref(self).cast::<usize>().add(1) };
+        Some(p + (((THIN_TAGS >> tag) & 1) ^ 1) as usize * 16)
+    }
+
+    /// Whether the value is one the cycle collector never holds as a
+    /// candidate: a scalar, or a string or bytes (which have no weak
+    /// handle to track them by).
+    #[inline(always)]
+    pub(crate) fn never_gc_candidate(&self) -> bool {
+        const NEVER: u64 = SCALAR_TAGS | (THIN_TAGS & !(1 << 9));
+        (NEVER >> self.tag()) & 1 != 0
+    }
+
     /// Whether the value can never (transitively) reference another
     /// object — so a container holding only such values cannot be part
     /// of a reference cycle. Used by deferred instance tracking.
