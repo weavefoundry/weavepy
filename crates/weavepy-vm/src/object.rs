@@ -3781,6 +3781,13 @@ impl PartialEq for DictKey {
         if self.0.is_same(&other.0) {
             return true;
         }
+        // Two plain strings or machine ints, the common keys, are equal by
+        // value alone.
+        match (&self.0, &other.0) {
+            (Object::Str(a), Object::Str(b)) => return a.as_bytes() == b.as_bytes(),
+            (Object::Int(a), Object::Int(b)) => return a == b,
+            _ => {}
+        }
         // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
         // which is the `a is b` half of CPython's dict-key comparison.
         if self.0.eq_value(&other.0) {
