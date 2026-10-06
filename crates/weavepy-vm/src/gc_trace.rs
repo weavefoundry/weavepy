@@ -1457,54 +1457,57 @@ impl GcState {
         }
         let mut by_id: GcIdMap = cands.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
-        // Phase 2: promote untracked nodes reachable from the candidates to
-        // temporary candidates for this pass only. CPython GC-tracks
+        // Phase 2: one walk over the candidates promotes the untracked nodes
+        // reachable from them to temporary candidates for this pass only,
+        // and tallies every candidate's internal references (self-references
+        // included) into its `gc_refs`, negated. CPython GC-tracks
         // iterators, tuples, frames, tracebacks, cells, bound methods and
         // descriptor wrappers; we keep them off the books for speed and
         // discover the ones a cycle actually routes through here, so their
-        // internal edges are accounted. Temporaries take part in the
-        // subtract/mark walk but are never reclaimed or tracked.
+        // internal edges are accounted. A temporary is a candidate from its
+        // first edge on, so each of its edges is tallied too. Temporaries
+        // take part in the mark walk but are never reclaimed or tracked.
         let mut scanned = 0usize;
+        let mut found: Vec<Object> = Vec::new();
         while scanned < cands.len() {
             let parent_is_iter = matches!(cands[scanned].obj, Object::Iter(_));
             let parent_is_frame = matches!(cands[scanned].obj, Object::Frame(_));
-            let mut found: Vec<Object> = Vec::new();
             traverse_object(&cands[scanned].obj, &mut |child| {
-                if !child.never_gc_candidate()
-                    && promotes_temporarily(child, parent_is_iter, parent_is_frame)
-                    && !by_id.contains_key(&id_of(child))
-                {
-                    found.push(child.clone());
-                }
-            });
-            for child in found {
-                let cid = id_of(&child);
-                if let std::collections::hash_map::Entry::Vacant(e) = by_id.entry(cid) {
-                    e.insert(cands.len());
-                    cands.push(Cand::new(child, cid, None));
-                }
-            }
-            scanned += 1;
-        }
-
-        // Phase 3: seed gc_refs from the outer refcount, after discovery (an
-        // iterator synthesises a fresh wrapper for its buffer on each
-        // traverse, alive only during the visit). Each candidate holds one
-        // reference of its own.
-        for c in &cands {
-            c.gc_refs.set(strong_count_for(&c.obj) as i64 - 1);
-        }
-        // Subtract internal references, self-references included.
-        for c in &cands {
-            traverse_object(&c.obj, &mut |child| {
                 if child.never_gc_candidate() {
                     return;
                 }
                 if let Some(&i) = by_id.get(&id_of(child)) {
                     let t = &cands[i];
                     t.gc_refs.set(t.gc_refs.get() - 1);
+                } else if promotes_temporarily(child, parent_is_iter, parent_is_frame) {
+                    found.push(child.clone());
                 }
             });
+            // (One entry per edge: a node reached twice is promoted once and
+            // tallied twice.)
+            for child in found.drain(..) {
+                let cid = id_of(&child);
+                let i = match by_id.entry(cid) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(cands.len());
+                        cands.push(Cand::new(child, cid, None));
+                        cands.len() - 1
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                };
+                let t = &cands[i];
+                t.gc_refs.set(t.gc_refs.get() - 1);
+            }
+            scanned += 1;
+        }
+
+        // Phase 3: add the outer refcount, read after the walk (an iterator
+        // synthesises a fresh wrapper for its buffer on each traverse, alive
+        // only during the visit). Each candidate holds one reference of its
+        // own.
+        for c in &cands {
+            c.gc_refs
+                .set(strong_count_for(&c.obj) as i64 - 1 + c.gc_refs.get());
         }
 
         // Phase 4: anything with gc_refs > 0 is reachable from outside; mark
@@ -1966,10 +1969,11 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // in a dead ModuleType namespace would be immortal
             // (test_module.test_clear_dict_in_ref_cycle).
             if i.dict.published().is_none() {
-                // Split values: the instance's own children.
+                // Split values: the instance's own children. Their names
+                // are the class's shared strings, which hold nothing (as
+                // CPython's inline values visit only the values).
                 if let Ok(split) = i.dict.split_cell().try_borrow() {
-                    for (k, v) in split.iter() {
-                        visit(&k.0);
+                    for v in split.values() {
                         visit(v);
                     }
                 }
