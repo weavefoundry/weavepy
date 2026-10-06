@@ -857,6 +857,15 @@ impl Pending {
         unsafe { self.buf[k].assume_init_ref() }
     }
 
+    /// Whether a buffered store targets `recv.name`.
+    fn stores_to(&self, recv: &Object, name: u32) -> bool {
+        (0..self.n).any(|k| {
+            let (r, _, n, _) = self.get(k);
+            // SAFETY: stable receivers (see `Store`).
+            *n == name && unsafe { (**r).is_same(recv) }
+        })
+    }
+
     /// Whether entry `k` is the last store to its attribute.
     fn latest(&self, k: usize) -> bool {
         let (r0, _, n0, _) = self.get(k);

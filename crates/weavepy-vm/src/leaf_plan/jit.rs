@@ -501,7 +501,14 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         Some(Object::Instance(inst)) => Some(inst),
         _ => None,
     };
-    if let Some(inst) = inst.filter(|_| !EFFECT || c.pend.n == 0) {
+    // A buffered store to this very attribute answers through the general
+    // read; one to anything else leaves the instance's field current.
+    let pending = EFFECT
+        && c.pend.n > 0
+        && inst.is_some()
+        // SAFETY: as above.
+        && c.pend.stores_to(unsafe { &*(p as *const Object) }, pc_name >> 16);
+    if let Some(inst) = inst.filter(|_| !pending) {
         let ver = inst.cls_raw().attr_version.get();
         for e in &cache.entries {
             let (v, idx) = e.get();
@@ -525,7 +532,7 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
     }
     // SAFETY: forwarded.
     let status = unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) };
-    if let (0, Some(inst)) = (status, inst) {
+    if let (0, Some(inst)) = (status, inst.filter(|_| !pending)) {
         // SAFETY: a live frame.
         let (code, _, _) = unsafe { (*fr).parts() };
         let ver = inst.cls_raw().attr_version.get();
