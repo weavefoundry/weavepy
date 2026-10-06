@@ -3206,7 +3206,11 @@ impl Interpreter {
                     Object::Instance(i) => Object::Type(i.cls()),
                     _ => Object::None,
                 };
-                (inst, ty, pyexc.traceback.clone())
+                (
+                    inst,
+                    ty,
+                    pyexc.traceback.iter().cloned().collect::<Vec<_>>(),
+                )
             }
             other => {
                 let inst = crate::builtin_types::make_exception("RuntimeError", other.to_string());

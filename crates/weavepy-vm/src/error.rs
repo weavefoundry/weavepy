@@ -37,12 +37,44 @@ impl PartialEq for TracebackEntry {
     }
 }
 
+/// An exception's [`TracebackEntry`] list, innermost first, with the
+/// first entry held inline: most exceptions are caught in the frame that
+/// raised them or the next one, and a raise then allocates nothing here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TracebackEntries {
+    first: Option<TracebackEntry>,
+    rest: Vec<TracebackEntry>,
+}
+
+impl TracebackEntries {
+    pub fn push(&mut self, entry: TracebackEntry) {
+        if self.first.is_none() {
+            self.first = Some(entry);
+        } else {
+            self.rest.push(entry);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    /// The entries in push order (innermost frame first).
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &TracebackEntry> {
+        self.first.iter().chain(self.rest.iter())
+    }
+}
+
 /// A Python-visible exception. The wrapped [`Object`] is always an
 /// `Object::Instance` whose class's MRO contains `BaseException`.
 #[derive(Debug, Clone)]
 pub struct PyException {
     pub instance: Object,
-    pub traceback: Vec<TracebackEntry>,
+    pub traceback: TracebackEntries,
     /// Implicit chaining context (`raise X` inside `except Y:` records
     /// `Y` as `__context__`). Stored separately from `instance.__dict__`
     /// so re-raises through pure Rust paths keep the link intact.
@@ -65,7 +97,7 @@ impl PyException {
     pub fn new(instance: Object) -> Self {
         Self {
             instance,
-            traceback: Vec::new(),
+            traceback: TracebackEntries::default(),
             context: None,
             cause: None,
             suppress_tb_once: false,
