@@ -13828,6 +13828,48 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // `raise e` of an exception instance or a builtin
+                    // exception class (neither runs Python code to raise):
+                    // the full handler's exception, straight to the catch.
+                    OpCode::RaiseVarargs if ins.arg == 1 => {
+                        if len == 0 {
+                            break None;
+                        }
+                        let bt = builtin_types();
+                        // SAFETY: `len > 0`.
+                        let ok = match unsafe { &*base.add(len - 1) } {
+                            Object::Instance(i) => {
+                                let cls = i.cls_raw();
+                                cls.flags.is_exception || cls.is_subclass_of(&bt.base_exception)
+                            }
+                            Object::Type(t) => {
+                                t.flags.is_builtin
+                                    && t.flags.is_exception
+                                    && !t.is_subclass_of(&bt.base_exception_group)
+                            }
+                            _ => false,
+                        };
+                        if !ok {
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        len -= 1;
+                        // SAFETY: the operand leaves the stack.
+                        let arg = unsafe { base.add(len).read() };
+                        let globals = frame.globals.clone();
+                        let raised = self
+                            .instantiate_raised_class(arg, &globals)
+                            .and_then(|arg| Self::normalize_exception(arg, None))
+                            .map(|mut exc| {
+                                self.attach_implicit_context(&mut exc);
+                                Self::sync_exc_attrs(&exc);
+                                RuntimeError::PyException(exc)
+                            });
+                        last = pc;
+                        pc += 1;
+                        break Some(CoreExit::Stop(LeafStop::Raised(match raised {
+                            Ok(e) | Err(e) => e,
+                        })));
+                    }
                     // An `except` clause's entry, test, and exit (the slow
                     // leaf arms' shapes, which the full handlers' match).
                     OpCode::PushExcInfo => {
