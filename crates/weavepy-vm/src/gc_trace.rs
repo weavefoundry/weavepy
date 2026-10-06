@@ -647,6 +647,8 @@ impl GcState {
                 let gens = std::mem::take(&mut *gens);
                 for w in gens {
                     if let Some(g) = w.upgrade() {
+                        // It outlived its young set: trim its frame.
+                        crate::compact_generator_frame(&g);
                         let obj = match g.kind {
                             crate::object::CoroutineKind::Generator => Object::Generator(g),
                             crate::object::CoroutineKind::Coroutine => Object::Coroutine(g),

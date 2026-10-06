@@ -2121,10 +2121,10 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
         }
     }
     fn get_name(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(gen_of(args)?.name.borrow().clone())
+        Ok(gen_of(args)?.name())
     }
     fn get_qualname(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(gen_of(args)?.qualname.borrow().clone())
+        Ok(gen_of(args)?.qualname())
     }
     let docs = [
         (
