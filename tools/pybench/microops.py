@@ -315,7 +315,8 @@ def count_instructions(interp, stmt, n):
     return int(m.group(1))
 
 
-def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=1010000):
+def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=1010000,
+                     subtract=True):
     # A cheap statement's span over `hi - lo` iterations is small next to
     # the process's own variation (JIT compiles, collections), so one under
     # `cheap` instructions an iteration is measured again over a longer one.
@@ -332,7 +333,7 @@ def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=101
             v = span(stmt, long_hi)
         return v
 
-    empty = per_iter("pass")
+    empty = per_iter("pass") if subtract else 0.0
     out = {}
     for name, stmt in cases:
         v = per_iter(stmt)
@@ -358,13 +359,17 @@ def main():
     ap.add_argument("--sort", choices=["ratio", "name"], default="ratio")
     ap.add_argument("--json")
     ap.add_argument("--instructions", action="store_true")
+    ap.add_argument("--no-subtract", action="store_true",
+                    help="with --instructions, compare whole iterations (loop "
+                    "included) instead of subtracting an empty loop's cost, "
+                    "which a JIT can compile away")
     args = ap.parse_args()
     cases = CASES
     if args.filter:
         cases = [c for c in cases if any(f in c[0] for f in args.filter)]
     if args.instructions:
-        cp = run_instructions(args.cpython, cases)
-        wp = run_instructions(args.weavepy, cases)
+        cp = run_instructions(args.cpython, cases, subtract=not args.no_subtract)
+        wp = run_instructions(args.weavepy, cases, subtract=not args.no_subtract)
     else:
         cp = run(args.cpython, cases, args.target_ms)
         wp = run(args.weavepy, cases, args.target_ms)
