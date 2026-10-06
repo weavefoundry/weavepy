@@ -53248,11 +53248,25 @@ impl Interpreter {
         if crate::trace::any_observers_active() && is_c_profiled_callable(callable) {
             if let Some(profile) = crate::trace::profile_hook() {
                 if let Some(py_frame) = self.materialize_top_py_frame() {
+                    // A native method called in the `(function, self)`
+                    // shape reports bound to its receiver, as CPython's
+                    // profiler binds a method descriptor to its first
+                    // argument (`list.append` then reads "method 'append'
+                    // of 'list' objects", not a module function).
+                    let reported = match (callable, args.first()) {
+                        (Object::Builtin(b), Some(receiver)) if b.binds_instance => {
+                            Object::BoundMethod(Rc::new(BoundMethod::new(
+                                receiver.clone(),
+                                callable.clone(),
+                            )))
+                        }
+                        _ => callable.clone(),
+                    };
                     self.invoke_observe_hook(
                         &profile,
                         &py_frame,
                         "c_call",
-                        callable.clone(),
+                        reported.clone(),
                         crate::trace::HookKind::Profile,
                     )?;
                     let result = self.call(callable, args, kwargs, globals);
@@ -53268,7 +53282,7 @@ impl Interpreter {
                             &profile,
                             &py_frame,
                             event,
-                            callable.clone(),
+                            reported,
                             crate::trace::HookKind::Profile,
                         )?;
                     }
