@@ -500,14 +500,6 @@ fn py_traceback_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
 }
 
-/// Warm the JIT's code generator on a background thread when the JIT
-/// is on (see `tier2::prewarm_codegen`): a program's first compile then
-/// doesn't pay the generator's cold start.
-pub fn spawn_jit_codegen_prewarm() {
-    #[cfg(feature = "jit")]
-    tier2::spawn_codegen_prewarm_if_enabled();
-}
-
 /// RFC 0032 — render the tier-2 JIT's counters as a markdown block for
 /// the `WEAVEPY_VM_STATS` report, or `None` when the `jit` feature is
 /// disabled or the JIT was never exercised on this thread.
@@ -3117,7 +3109,7 @@ impl Interpreter {
         // `_PyGen_Finalize`); asyncio's hook schedules `aclose()` on
         // the owning loop instead of closing synchronously here.
         if let Object::AsyncGenerator(g) = obj {
-            let finalizer = g.finalizer.borrow().clone();
+            let finalizer = g.finalizer();
             if !matches!(finalizer, Object::None) && !g.is_finished() {
                 let globals = self.builtins.clone();
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
@@ -4956,7 +4948,7 @@ impl Interpreter {
                             // hops).
                             Some(OpCode::JumpForward) => Some(crate::trace::EVENT_JUMP),
                             Some(OpCode::JumpBackward)
-                                if !frame.code.no_interrupt_jumps.contains(&(cur_pc as u32)) =>
+                                if !frame.code.no_interrupt_jumps().contains(&(cur_pc as u32)) =>
                             {
                                 Some(crate::trace::EVENT_JUMP)
                             }
@@ -5487,7 +5479,7 @@ impl Interpreter {
                 // Frozen ctypes runs as "<frozen _ctypes>" /
                 // "<frozen ctypes…>"; the regrtest bootstrap can also
                 // materialise it to "…/lib/weavepy3.13/_ctypes.py".
-                let file = shell.code.filename.as_str();
+                let file = &*shell.code.filename;
                 if file.ends_with("/_ctypes.py")
                     || file == "_ctypes.py"
                     || file.contains("/ctypes/")
@@ -29212,7 +29204,7 @@ impl Interpreter {
                         }
                         // PEP-style origin tracking
                         // (`sys.set_coroutine_origin_tracking_depth`).
-                        "origin" if prefix == "cr_" => return Ok(g.origin.borrow().clone()),
+                        "origin" if prefix == "cr_" => return Ok(g.origin()),
                         _ => {}
                     }
                 }
@@ -38735,7 +38727,7 @@ impl Interpreter {
         }
         g.hooks_inited.set(true);
         let (firstiter, finalizer) = crate::stdlib::sys::asyncgen_hooks();
-        *g.finalizer.borrow_mut() = finalizer;
+        g.set_finalizer(finalizer);
         if !matches!(firstiter, Object::None) {
             let globals = self.builtins.clone();
             self.call(&firstiter, &[agen.clone()], &[], &globals)?;
@@ -52410,7 +52402,7 @@ impl Interpreter {
                         .take(depth as usize)
                         .map(|py| {
                             Object::new_tuple_array([
-                                Object::from_str(py.code.filename.clone()),
+                                Object::from_str(&*py.code.filename),
                                 Object::Int(i64::from(py.current_lineno())),
                                 Object::from_str(py.code.name.clone()),
                             ])
@@ -52444,7 +52436,7 @@ impl Interpreter {
                     let obj = Self::wrap_started_generator(f, &code, frame);
                     if let Some(origin) = cr_origin {
                         if let Object::Coroutine(gen) = &obj {
-                            *gen.origin.borrow_mut() = origin;
+                            gen.set_origin(origin);
                         }
                     }
                     // Threshold-driven young collection at the
@@ -68472,61 +68464,29 @@ fn code_vm_ext(code: &CodeObject) -> Option<&CodeConstObjects> {
     // what the dispatch loop pays per activation, so the table's
     // construction lives out of line: inlining it here cost 4-7% on
     // call-heavy fixtures.
-    let p = code.vm_ext.1.load(std::sync::atomic::Ordering::Acquire);
-    if !p.is_null() {
-        // SAFETY: only `code_vm_ext_init` stores this pointer: the address
-        // of the `CodeConstObjects` the slot's `Arc` owns, alive as long as
-        // `code`.
-        return Some(unsafe { &*p.cast::<CodeConstObjects>() });
+    // SAFETY: `CodeConstObjects` is the only type the VM keeps in the slot.
+    if let Some(ext) = unsafe { code.vm_ext.get::<CodeConstObjects>() } {
+        return Some(ext);
     }
-    Some(code_vm_ext_ref(code_vm_ext_init(code)))
+    Some(code_vm_ext_build(code))
 }
 
 /// Borrow an already initialized extension without filling any cache.
 #[cfg(feature = "jit")]
 #[inline]
 fn code_vm_ext_existing(code: &CodeObject) -> Option<&CodeConstObjects> {
-    code.vm_ext.0.get().map(code_vm_ext_ref)
-}
-
-#[inline]
-#[allow(clippy::cast_ptr_alignment)] // The erased pointer has the producer's alignment.
-fn code_vm_ext_ref(arc: &std::sync::Arc<dyn std::any::Any + Send + Sync>) -> &CodeConstObjects {
-    // RFC 0077 (WS5): the slot has exactly one producer (the initializer
-    // above; `marshal` only ever creates the empty default), so the
-    // `Any::type_id` vtable probe on every constant/name lookup is
-    // replaced by a direct cast. The debug build keeps the checked
-    // downcast as the assertion that the invariant still holds.
-    debug_assert!(arc.downcast_ref::<CodeConstObjects>().is_some());
-    // SAFETY: `get_or_init` only ever stores an `Arc<CodeConstObjects>`
-    // here (no other code writes `vm_ext`), so the erased pointer is a
-    // pointer to a live `CodeConstObjects` for the borrowed Arc's lifetime.
-    // The cast from the erased `dyn Any` pointer to the concrete type is
-    // the whole point (the alignment lint cannot see the invariant).
-    unsafe { &*(std::sync::Arc::as_ptr(arc).cast::<CodeConstObjects>()) }
+    // SAFETY: as in `code_vm_ext`.
+    unsafe { code.vm_ext.get::<CodeConstObjects>() }
 }
 
 /// [`code_vm_ext`]'s first call for a code object: build the table.
 #[cold]
 #[inline(never)]
-fn code_vm_ext_init(
-    code: &CodeObject,
-) -> &std::sync::Arc<dyn std::any::Any + Send + Sync + 'static> {
-    let arc = code_vm_ext_build(code);
-    let p: *const CodeConstObjects = code_vm_ext_ref(arc);
-    code.vm_ext
-        .1
-        .store(p.cast_mut().cast(), std::sync::atomic::Ordering::Release);
-    arc
-}
-
-#[cold]
-#[inline(never)]
-fn code_vm_ext_build(
-    code: &CodeObject,
-) -> &std::sync::Arc<dyn std::any::Any + Send + Sync + 'static> {
-    code.vm_ext.0.get_or_init(|| {
-        std::sync::Arc::new(CodeConstObjects {
+fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
+    // SAFETY: as in `code_vm_ext` (this is the slot's one producer;
+    // `marshal` only ever creates the empty default).
+    unsafe {
+        code.vm_ext.get_or_init(|| CodeConstObjects {
             objects: code
                 .constants
                 .iter()
@@ -68561,7 +68521,7 @@ fn code_vm_ext_build(
             cold_sites: std::sync::atomic::AtomicU32::new(0),
             dispatch_len: code_dispatch_len(code),
         })
-    })
+    }
 }
 
 /// The materialized constants for `code`, built on first use. The
@@ -72831,7 +72791,7 @@ assert loop(2000) == 1999000
                         .iter()
                         .position(|ins| ins.op == OpCode::LoadAttr)
                         .unwrap() as u32;
-                    assert!(fresh.vm_ext.0.get().is_none());
+                    assert!(!fresh.vm_ext.is_set());
                     let python_root = g.get(&crate::object::StrKey("python_root")).unwrap();
                     // SAFETY: the GIL and root owner stay live; no result
                     // escapes this callback-free probe.
@@ -72840,7 +72800,7 @@ assert loop(2000) == 1999000
                     }
                     .is_none());
                     assert!(
-                        fresh.vm_ext.0.get().is_none(),
+                        !fresh.vm_ext.is_set(),
                         "a miss must not initialize metadata"
                     );
 

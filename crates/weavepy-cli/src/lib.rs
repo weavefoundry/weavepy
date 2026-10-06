@@ -1086,7 +1086,6 @@ fn real_main() -> Result<i32> {
 
     if let Some(module) = cli.module.clone() {
         let extra = cli.args.clone();
-        weavepy::vm::spawn_jit_codegen_prewarm();
         run_module(&module, extra, &flags, &extra_path)?;
         return Ok(0);
     }
@@ -1099,9 +1098,6 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Some(path) => {
-            // A program file: warm the JIT's code generator off the main
-            // thread while it starts.
-            weavepy::vm::spawn_jit_codegen_prewarm();
             run_path(path, trailing.clone(), &flags, &extra_path)?;
             Ok(0)
         }

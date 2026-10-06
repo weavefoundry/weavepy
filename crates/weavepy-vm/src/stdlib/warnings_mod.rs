@@ -1001,7 +1001,7 @@ fn setup_context(
 
     let (globals, filename, lineno) = match frame {
         Some(f) => {
-            let filename = f.code.filename.clone();
+            let filename = f.code.filename.to_string();
             let lineno = i64::from(f.current_lineno());
             (f.globals.clone(), filename, lineno)
         }

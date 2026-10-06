@@ -27,7 +27,9 @@ mod sealed {
 /// Implementations must have an initialized, immutable `usize` length at
 /// offset zero. `pointer` must reconstruct exactly the original Arc pointee,
 /// including slice metadata, size, alignment, and element destruction.
-/// Constructors must preserve this invariant for every live strong reference.
+/// Constructors must preserve this invariant for every live strong reference,
+/// and dropping the payload must leave the length in place: it still sizes
+/// the allocation for the weak owners (see [`ThinWeak`]).
 pub unsafe trait ThinPayload: sealed::Sealed {
     type View: ?Sized;
     /// Release the last reference to a payload. A payload whose release
@@ -50,12 +52,21 @@ pub struct ThinArc<T: ?Sized + ThinPayload> {
 unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Send for ThinArc<T> {}
 unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Sync for ThinArc<T> {}
 
-/// A weak owner retaining its full metadata after the payload is destroyed.
-pub struct ThinWeak<T: ?Sized + ThinPayload>(Weak<T>);
+/// A single-word weak owner of a length-prefixed Arc payload. The length
+/// word outlives the payload (see [`ThinPayload`]), so it rebuilds the
+/// full pointer after the payload is destroyed too.
+pub struct ThinWeak<T: ?Sized + ThinPayload> {
+    data: NonNull<usize>,
+    ownership: PhantomData<Weak<T>>,
+}
+
+// SAFETY: as for `ThinArc`, with `Weak`'s requirements, which are `Arc`'s.
+unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Send for ThinWeak<T> {}
+unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Sync for ThinWeak<T> {}
 
 impl<T: ?Sized + ThinPayload> fmt::Debug for ThinWeak<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        f.write_str("(Weak)")
     }
 }
 
@@ -102,7 +113,13 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
     }
 
     pub fn downgrade(this: &Self) -> ThinWeak<T> {
-        ThinWeak(Arc::downgrade(&this.arc_view()))
+        let weak = Weak::into_raw(Arc::downgrade(&this.arc_view()));
+        ThinWeak {
+            // SAFETY: a weak pointer from a live Arc is its non-null payload
+            // address, the same one this owner holds.
+            data: unsafe { NonNull::new_unchecked(weak.cast::<usize>().cast_mut()) },
+            ownership: PhantomData,
+        }
     }
 
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
@@ -203,24 +220,44 @@ where
     }
 }
 impl<T: ?Sized + ThinPayload> ThinWeak<T> {
+    #[inline]
+    fn weak_view(&self) -> ManuallyDrop<Weak<T>> {
+        // SAFETY: this owner holds a weak reference, which keeps the
+        // allocation, and so its length word, in place (see `ThinPayload`).
+        let len = unsafe { self.data.as_ptr().read() };
+        // SAFETY: the pointer `Weak::into_raw` gave, rebuilt with its
+        // original metadata; the view neither adds nor releases a reference.
+        ManuallyDrop::new(unsafe { Weak::from_raw(T::pointer(self.data.as_ptr(), len)) })
+    }
+
     /// The payload's address, as [`ThinArc::addr`] reports it for a strong
     /// owner of the same allocation.
     pub fn addr(&self) -> usize {
-        self.0.as_ptr().cast::<u8>() as usize
+        self.data.as_ptr() as usize
     }
     pub fn upgrade(&self) -> Option<ThinArc<T>> {
-        self.0.upgrade().map(ThinArc::from_arc)
+        self.weak_view().upgrade().map(ThinArc::from_arc)
     }
     pub fn strong_count(&self) -> usize {
-        self.0.strong_count()
+        self.weak_view().strong_count()
     }
     pub fn weak_count(&self) -> usize {
-        self.0.weak_count()
+        self.weak_view().weak_count()
     }
 }
 impl<T: ?Sized + ThinPayload> Clone for ThinWeak<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        // The copy accounts for the added weak reference.
+        let _ = Weak::into_raw((*self.weak_view()).clone());
+        Self {
+            data: self.data,
+            ownership: PhantomData,
+        }
+    }
+}
+impl<T: ?Sized + ThinPayload> Drop for ThinWeak<T> {
+    fn drop(&mut self) {
+        drop(ManuallyDrop::into_inner(self.weak_view()));
     }
 }
 

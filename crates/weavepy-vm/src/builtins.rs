@@ -4307,7 +4307,7 @@ pub(crate) fn code_synthetic_attr(
         } else {
             &c.qualname
         })),
-        "co_filename" => Some(Object::from_str(&c.filename)),
+        "co_filename" => Some(Object::from_str(&*c.filename)),
         "co_argcount" => Some(Object::Int(i64::from(c.arg_count))),
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
@@ -4550,7 +4550,7 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         match k.as_str() {
             "co_name" => nc.name = want_str(v, "co_name")?,
             "co_qualname" => nc.qualname = want_str(v, "co_qualname")?,
-            "co_filename" => nc.filename = want_str(v, "co_filename")?,
+            "co_filename" => nc.filename = want_str(v, "co_filename")?.into(),
             "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
             "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
@@ -4708,7 +4708,7 @@ pub fn foreign_code_object(
     let mut nc = weavepy_compiler::CodeObject {
         name,
         qualname,
-        filename,
+        filename: filename.into(),
         varnames,
         arg_count,
         posonly_count,
@@ -4902,7 +4902,7 @@ pub(crate) fn code_type_call(
     let mut nc = weavepy_compiler::CodeObject {
         name,
         qualname,
-        filename,
+        filename: filename.into(),
         constants,
         names,
         varnames,
@@ -4938,7 +4938,7 @@ pub(crate) fn code_type_call(
             nc.linetable = decoded.linetable.into();
             nc.coltable = decoded.coltable.into();
             nc.exception_table = decoded.exception_table;
-            nc.no_interrupt_jumps = decoded.no_interrupt_jumps;
+            nc.rare.get_mut().no_interrupt_jumps = decoded.no_interrupt_jumps;
         }
         None => {
             let msg = match weavepy_compiler::cpython_code::first_unknown_opcode(&codestring) {

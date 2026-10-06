@@ -158,15 +158,92 @@ pub use weavepy_parser::ast::expr_name;
 /// cloned code object starts with an empty slot), never participates in
 /// equality, and is not serialized.
 ///
-/// The second field caches the payload's address once it's set (the VM's
-/// hot accessor then reads one thin pointer instead of the fat `dyn`
-/// handle and its alignment arithmetic). The `Arc` in the first field
-/// keeps that address alive for the code object's lifetime.
+/// The slot holds the payload's address (the VM's hot accessor reads one
+/// thin pointer) and the function that drops it, two words in all.
 #[derive(Default)]
-pub struct VmExt(
-    pub std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    pub std::sync::atomic::AtomicPtr<()>,
-);
+pub struct VmExt {
+    /// The payload, a leaked `Box`, or null.
+    payload: std::sync::atomic::AtomicPtr<()>,
+    /// The payload's `drop_payload` instance, stored once `payload` is.
+    drop: std::sync::atomic::AtomicPtr<()>,
+}
+
+/// Drop a [`VmExt`] payload of type `T`.
+fn drop_payload<T>(payload: *mut ()) {
+    // SAFETY: `payload` is the `Box<T>` `VmExt::get_or_init` leaked.
+    drop(unsafe { Box::from_raw(payload.cast::<T>()) });
+}
+
+impl VmExt {
+    /// The payload, if one was set.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the type every [`Self::get_or_init`] on this slot uses.
+    #[inline]
+    pub unsafe fn get<T>(&self) -> Option<&T> {
+        let p = self.payload.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: a non-null payload is a live `T` (the caller's contract)
+        // that lives as long as the slot.
+        (!p.is_null()).then(|| unsafe { &*p.cast::<T>() })
+    }
+
+    /// The payload, set from `init` if there is none yet. Racing
+    /// initializers each build one; the first published wins.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::get`].
+    pub unsafe fn get_or_init<T: Send + Sync + 'static>(&self, init: impl FnOnce() -> T) -> &T {
+        use std::sync::atomic::Ordering;
+        // SAFETY: the caller's contract.
+        if let Some(payload) = unsafe { self.get::<T>() } {
+            return payload;
+        }
+        let fresh = Box::into_raw(Box::new(init())).cast::<()>();
+        match self.payload.compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Read only by `drop`, which has the slot to itself.
+                self.drop.store(
+                    drop_payload::<T> as fn(*mut ()) as *mut (),
+                    Ordering::Release,
+                );
+                // SAFETY: just published; it lives as long as the slot.
+                unsafe { &*fresh.cast::<T>() }
+            }
+            Err(won) => {
+                drop_payload::<T>(fresh);
+                // SAFETY: the winner's `T` (the caller's contract).
+                unsafe { &*won.cast::<T>() }
+            }
+        }
+    }
+
+    /// Whether a payload was set.
+    pub fn is_set(&self) -> bool {
+        !self
+            .payload
+            .load(std::sync::atomic::Ordering::Acquire)
+            .is_null()
+    }
+}
+
+impl Drop for VmExt {
+    fn drop(&mut self) {
+        let (payload, drop_fn) = (*self.payload.get_mut(), *self.drop.get_mut());
+        if !payload.is_null() && !drop_fn.is_null() {
+            // SAFETY: `drop_fn` was stored from a `fn(*mut ())` for this
+            // payload's type.
+            let drop_fn = unsafe { std::mem::transmute::<*mut (), fn(*mut ())>(drop_fn) };
+            drop_fn(payload);
+        }
+    }
+}
 
 impl Clone for VmExt {
     fn clone(&self) -> Self {
@@ -182,7 +259,7 @@ impl PartialEq for VmExt {
 
 impl std::fmt::Debug for VmExt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.get().is_some() {
+        f.write_str(if self.is_set() {
             "VmExt(populated)"
         } else {
             "VmExt(empty)"
@@ -494,8 +571,10 @@ pub struct CodeObject {
     /// module-level definitions. Drives `function.__qualname__` /
     /// `type.__qualname__` (and thus reprs, error messages, and pickling).
     pub qualname: String,
-    /// Source filename or `<string>`. Used for diagnostics only.
-    pub filename: String,
+    /// Source filename or `<string>`. Used for diagnostics only. Shared:
+    /// every code object compiled or decoded from one module holds the
+    /// same allocation.
+    pub filename: std::sync::Arc<str>,
     pub instructions: Vec<Instruction>,
     /// Per-instruction inline caches for adaptive specialization. The logical
     /// count matches [`Self::instructions`], with storage allocated on the first
@@ -594,6 +673,26 @@ pub struct CodeObject {
     /// pass` body), which the assembled exception table no longer
     /// mentions; recomputing from the flat stream would miss them.
     pub stacksize: Option<u32>,
+    /// One [`bytecode::wire`] mark per instruction: how the codec
+    /// presents it on the CPython wire (borrowing/checked loads,
+    /// superinstruction fusion). Empty means all plain.
+    pub wire_marks: WireMarks,
+    /// The wire and marshal metadata few code objects carry (see
+    /// [`CodeRare`]), read through [`Self::no_interrupt_jumps`],
+    /// [`Self::hidden_locals`] and [`Self::const_identifiers`].
+    pub rare: CodeRare,
+    /// A compiler-generated `__annotate__` scope (PEP 649):
+    /// `codegen_leave_annotations_scope` rebuilt its
+    /// `co_localsplusnames` (`.format` -> `format`) as a fresh tuple
+    /// outside the constant cache, so the marshal writer never shares
+    /// it. A user function named `__annotate__` is not one.
+    pub annotate_scope: bool,
+}
+
+/// The fields of a [`CodeObject`] that most code leaves empty, boxed so
+/// that a code object without any pays one word for all of them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RareFields {
     /// Sorted indices of `JumpBackward` instructions that encode as
     /// `JUMP_BACKWARD_NO_INTERRUPT` on the CPython wire (RFC 0068).
     /// CPython emits JUMP_NO_INTERRUPT for every synthetic scope-exit
@@ -603,10 +702,6 @@ pub struct CodeObject {
     /// eval-breaker poll is not observable here), so this is pure
     /// wire/dis metadata.
     pub no_interrupt_jumps: Vec<u32>,
-    /// One [`bytecode::wire`] mark per instruction: how the codec
-    /// presents it on the CPython wire (borrowing/checked loads,
-    /// superinstruction fusion). Empty means all plain.
-    pub wire_marks: Vec<u8>,
     /// Locals that were fast-hidden at some point (CPython's
     /// `u_fasthidden` keys): the targets of PEP 709 inlined
     /// comprehensions in a non-function scope. They carry
@@ -621,12 +716,76 @@ pub struct CodeObject {
     /// marshal writer's `FLAG_REF` model needs to know (non-ASCII
     /// identifiers are not interned by `intern_string_constants`).
     pub const_identifiers: Vec<String>,
-    /// A compiler-generated `__annotate__` scope (PEP 649):
-    /// `codegen_leave_annotations_scope` rebuilt its
-    /// `co_localsplusnames` (`.format` -> `format`) as a fresh tuple
-    /// outside the constant cache, so the marshal writer never shares
-    /// it. A user function named `__annotate__` is not one.
-    pub annotate_scope: bool,
+}
+
+impl RareFields {
+    fn is_empty(&self) -> bool {
+        self.no_interrupt_jumps.is_empty()
+            && self.hidden_locals.is_empty()
+            && self.const_identifiers.is_empty()
+    }
+}
+
+/// A code object's [`RareFields`], allocated when one is first set.
+/// Equality compares the fields, so an allocated set of empty fields
+/// equals none.
+#[derive(Debug, Clone, Default)]
+pub struct CodeRare(Option<Box<RareFields>>);
+
+impl CodeRare {
+    /// The fields (all empty when none were ever set).
+    pub fn get(&self) -> &RareFields {
+        static EMPTY: RareFields = RareFields {
+            no_interrupt_jumps: Vec::new(),
+            hidden_locals: Vec::new(),
+            const_identifiers: Vec::new(),
+        };
+        self.0.as_deref().unwrap_or(&EMPTY)
+    }
+
+    /// The fields for writing, allocated on first use.
+    pub fn get_mut(&mut self) -> &mut RareFields {
+        self.0.get_or_insert_with(Box::default)
+    }
+
+    /// Take the fields out, leaving none.
+    pub fn take(&mut self) -> RareFields {
+        self.0.take().map(|fields| *fields).unwrap_or_default()
+    }
+
+    /// Replace the fields, keeping no allocation when they're all empty.
+    pub fn set(&mut self, fields: RareFields) {
+        self.0 = (!fields.is_empty()).then(|| Box::new(fields));
+    }
+}
+
+impl PartialEq for CodeRare {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+// A decoded module holds a code object per function, class body and
+// comprehension, each behind an `Arc`'s two counts: at 432 bytes or
+// fewer, the allocation fits mimalloc's 448-byte size class.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<CodeObject>() <= 432);
+
+impl CodeObject {
+    /// See [`RareFields::no_interrupt_jumps`].
+    pub fn no_interrupt_jumps(&self) -> &[u32] {
+        &self.rare.get().no_interrupt_jumps
+    }
+
+    /// See [`RareFields::hidden_locals`].
+    pub fn hidden_locals(&self) -> &[String] {
+        &self.rare.get().hidden_locals
+    }
+
+    /// See [`RareFields::const_identifiers`].
+    pub fn const_identifiers(&self) -> &[String] {
+        &self.rare.get().const_identifiers
+    }
 }
 
 /// Raw CPython-3.13 wire fields pinned on a [`CodeObject`] by the
@@ -654,14 +813,16 @@ pub struct WireOverrides {
 /// the work until something does.
 #[derive(Clone, Default)]
 pub struct ColTable {
-    spans: std::sync::OnceLock<Vec<ColSpan>>,
-    encoded: Option<std::sync::Arc<[u8]>>,
+    // Boxed so that the (usual) undecoded table costs one word here.
+    #[allow(clippy::box_collection)]
+    spans: std::sync::OnceLock<Box<Vec<ColSpan>>>,
+    encoded: Option<Encoded>,
 }
 
 impl ColTable {
     /// The spans `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
-    pub(crate) fn encoded(encoded: std::sync::Arc<[u8]>) -> Self {
+    pub(crate) fn encoded(encoded: Encoded) -> Self {
         ColTable {
             spans: std::sync::OnceLock::new(),
             encoded: Some(encoded),
@@ -670,10 +831,12 @@ impl ColTable {
 
     fn spans(&self) -> &Vec<ColSpan> {
         self.spans.get_or_init(|| {
-            self.encoded
-                .as_deref()
-                .and_then(native_code::decode_coltable)
-                .unwrap_or_default()
+            Box::new(
+                self.encoded
+                    .as_ref()
+                    .and_then(|e| native_code::decode_coltable(e.bytes()))
+                    .unwrap_or_default(),
+            )
         })
     }
 }
@@ -681,7 +844,7 @@ impl ColTable {
 impl From<Vec<ColSpan>> for ColTable {
     fn from(spans: Vec<ColSpan>) -> Self {
         ColTable {
-            spans: std::sync::OnceLock::from(spans),
+            spans: std::sync::OnceLock::from(Box::new(spans)),
             encoded: None,
         }
     }
@@ -716,21 +879,23 @@ impl std::fmt::Debug for ColTable {
 }
 
 /// A code object's line numbers (see [`CodeObject::linetable`]): a vector,
-/// or the code cache's encoding of one (a byte per instruction, mostly),
+/// or the code cache's encoding of one (a run per statement, mostly),
 /// decoded on first use. Most code never reports a line (tracebacks,
 /// tracing, `f_lineno` and the JIT's statement boundaries read them), so
 /// a module loaded from the cache keeps the compact form until something
 /// does, instead of four bytes per instruction.
 #[derive(Clone, Default)]
 pub struct LineTable {
-    lines: std::sync::OnceLock<Vec<u32>>,
-    encoded: Option<std::sync::Arc<[u8]>>,
+    // Boxed so that the (usual) undecoded table costs one word here.
+    #[allow(clippy::box_collection)]
+    lines: std::sync::OnceLock<Box<Vec<u32>>>,
+    encoded: Option<Encoded>,
 }
 
 impl LineTable {
     /// The lines `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
-    pub(crate) fn encoded(encoded: std::sync::Arc<[u8]>) -> Self {
+    pub(crate) fn encoded(encoded: Encoded) -> Self {
         LineTable {
             lines: std::sync::OnceLock::new(),
             encoded: Some(encoded),
@@ -739,18 +904,107 @@ impl LineTable {
 
     fn lines(&self) -> &Vec<u32> {
         self.lines.get_or_init(|| {
-            self.encoded
-                .as_deref()
-                .and_then(native_code::decode_linetable)
-                .unwrap_or_default()
+            Box::new(
+                self.encoded
+                    .as_ref()
+                    .and_then(|e| native_code::decode_linetable(e.bytes()))
+                    .unwrap_or_default(),
+            )
         })
+    }
+}
+
+/// A [`LineTable`], [`ColTable`] or [`WireMarks`] in the code cache's
+/// encoding: a range of a buffer that every code object decoded from one
+/// module shares (see `native_code::decode`), so a module's tables take
+/// one allocation rather than three per code object.
+#[derive(Clone)]
+pub(crate) struct Encoded {
+    /// Set once the module's decoding finishes, before any table is read.
+    buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
+    start: u32,
+    end: u32,
+}
+
+impl Encoded {
+    pub(crate) fn new(
+        buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
+        start: u32,
+        end: u32,
+    ) -> Self {
+        Encoded { buffer, start, end }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.buffer
+            .get()
+            .and_then(|b| b.get(self.start as usize..self.end as usize))
+            .unwrap_or_default()
+    }
+}
+
+/// A code object's wire marks (see [`CodeObject::wire_marks`]): a vector,
+/// or the code cache's encoding of one (two marks a byte), decoded on
+/// first use. Only the CPython wire form of the code reads them.
+#[derive(Clone, Default)]
+pub struct WireMarks {
+    // Boxed so that the (usual) undecoded marks cost one word here.
+    #[allow(clippy::box_collection)]
+    marks: std::sync::OnceLock<Box<Vec<u8>>>,
+    encoded: Option<Encoded>,
+}
+
+impl WireMarks {
+    /// The marks `encoded` holds in the code cache's form (see
+    /// `native_code`), decoded when first read.
+    pub(crate) fn encoded(encoded: Encoded) -> Self {
+        WireMarks {
+            marks: std::sync::OnceLock::new(),
+            encoded: Some(encoded),
+        }
+    }
+}
+
+impl From<Vec<u8>> for WireMarks {
+    fn from(marks: Vec<u8>) -> Self {
+        WireMarks {
+            marks: std::sync::OnceLock::from(Box::new(marks)),
+            encoded: None,
+        }
+    }
+}
+
+impl std::ops::Deref for WireMarks {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.marks.get_or_init(|| {
+            Box::new(
+                self.encoded
+                    .as_ref()
+                    .and_then(|e| native_code::decode_wire_marks(e.bytes()))
+                    .unwrap_or_default(),
+            )
+        })
+    }
+}
+
+impl PartialEq for WireMarks {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for WireMarks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
     }
 }
 
 impl From<Vec<u32>> for LineTable {
     fn from(lines: Vec<u32>) -> Self {
         LineTable {
-            lines: std::sync::OnceLock::from(lines),
+            lines: std::sync::OnceLock::from(Box::new(lines)),
             encoded: None,
         }
     }
@@ -915,7 +1169,7 @@ impl CodeObject {
             && self.linetable == other.linetable
             && self.coltable == other.coltable
             && self.exception_table == other.exception_table
-            && self.no_interrupt_jumps == other.no_interrupt_jumps
+            && self.no_interrupt_jumps() == other.no_interrupt_jumps()
     }
 
     /// Render this code object as a `dis`-style listing.
@@ -1681,7 +1935,7 @@ fn compile_module_cow(
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
-        filename.to_owned(),
+        filename.into(),
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
@@ -1738,7 +1992,7 @@ fn compile_interactive_cow(
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
-        filename.to_owned(),
+        filename.into(),
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
@@ -1826,7 +2080,7 @@ fn compile_eval_cow(
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
-        filename.to_owned(),
+        filename.into(),
         CodeKind::Module,
         Rc::new(line_index),
         Rc::from(source),
@@ -2404,7 +2658,7 @@ struct UnwindFloor {
 impl Compiler {
     fn new(
         name: String,
-        filename: String,
+        filename: std::sync::Arc<str>,
         kind: CodeKind,
         line_index: Rc<LineIndex>,
         source: Rc<str>,
@@ -9077,8 +9331,12 @@ impl Compiler {
     /// Record an identifier that reaches `co_consts` as a string (see
     /// [`CodeObject::const_identifiers`]).
     fn note_identifier_const(&mut self, name: &str) {
-        if !self.co.const_identifiers.iter().any(|n| n == name) {
-            self.co.const_identifiers.push(name.to_owned());
+        if !self.co.const_identifiers().iter().any(|n| n == name) {
+            self.co
+                .rare
+                .get_mut()
+                .const_identifiers
+                .push(name.to_owned());
         }
     }
 
@@ -11221,8 +11479,8 @@ impl Compiler {
             }
             let slot = self.var_index_or_add(name);
             slots.push(slot);
-            if non_function && !self.co.hidden_locals.contains(name) {
-                self.co.hidden_locals.push(name.clone());
+            if non_function && !self.co.hidden_locals().contains(name) {
+                self.co.rare.get_mut().hidden_locals.push(name.clone());
             }
             // Save the enclosing value (a cell, when the slot is one)
             // and clear; a comprehension cell then gets a fresh cell in

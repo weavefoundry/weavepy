@@ -5211,18 +5211,15 @@ pub struct PyGenerator {
     /// finishes and the frame is dropped.
     pub code: Object,
     pub state: RefCell<GeneratorState>,
-    /// `cr_origin` — for coroutines created while
-    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
-    /// of `(filename, lineno, funcname)` triples for the creation call
-    /// stack (most recent first). `None` when tracking is off.
-    pub origin: RefCell<Object>,
+    /// [`Self::origin`] and [`Self::finalizer`], which few generators
+    /// carry, allocated when one is first set.
+    extras: RefCell<Option<Box<GenExtras>>>,
     /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
     /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
     /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
-    /// is captured here so finalization can route through the event
-    /// loop that first iterated the generator.
+    /// is captured (see [`Self::finalizer`]) so finalization can route
+    /// through the event loop that first iterated the generator.
     pub hooks_inited: crate::sync::Cell<bool>,
-    pub finalizer: RefCell<Object>,
     /// CPython's "tp_finalize already ran" GC bit: `invoke_finalizer`
     /// sets it before finalizing so a generator left suspended by its
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
@@ -5233,7 +5230,61 @@ pub struct PyGenerator {
     pub gc_registered: crate::sync::Cell<bool>,
 }
 
+/// The state of a [`PyGenerator`] that few carry.
+struct GenExtras {
+    origin: Object,
+    finalizer: Object,
+}
+
 impl PyGenerator {
+    /// `cr_origin` — for coroutines created while
+    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
+    /// of `(filename, lineno, funcname)` triples for the creation call
+    /// stack (most recent first). `None` when tracking is off.
+    pub fn origin(&self) -> Object {
+        self.extras
+            .borrow()
+            .as_ref()
+            .map_or(Object::None, |e| e.origin.clone())
+    }
+
+    /// Set [`Self::origin`].
+    pub fn set_origin(&self, origin: Object) {
+        self.set_extra(origin, |e| &mut e.origin);
+    }
+
+    /// The PEP 525 finalizer hook captured at the first iteration (see
+    /// [`Self::hooks_inited`]); `None` when there was none.
+    pub fn finalizer(&self) -> Object {
+        self.extras
+            .borrow()
+            .as_ref()
+            .map_or(Object::None, |e| e.finalizer.clone())
+    }
+
+    /// Set [`Self::finalizer`].
+    pub fn set_finalizer(&self, finalizer: Object) {
+        self.set_extra(finalizer, |e| &mut e.finalizer);
+    }
+
+    fn set_extra(&self, value: Object, field: impl FnOnce(&mut GenExtras) -> &mut Object) {
+        let old = {
+            let mut extras = self.extras.borrow_mut();
+            if extras.is_none() && matches!(value, Object::None) {
+                return;
+            }
+            let extras = extras.get_or_insert_with(|| {
+                Box::new(GenExtras {
+                    origin: Object::None,
+                    finalizer: Object::None,
+                })
+            });
+            std::mem::replace(field(extras), value)
+        };
+        // (Released outside the borrow: dropping it can run code.)
+        drop(old);
+    }
+
     pub fn new(
         name: impl Into<String>,
         qualname: impl Into<String>,
@@ -5247,9 +5298,8 @@ impl PyGenerator {
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
-            origin: RefCell::new(Object::None),
+            extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
-            finalizer: RefCell::new(Object::None),
             finalize_ran: crate::sync::Cell::new(false),
             gc_registered: crate::sync::Cell::new(false),
         }
@@ -5270,9 +5320,8 @@ impl PyGenerator {
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
-            origin: RefCell::new(Object::None),
+            extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
-            finalizer: RefCell::new(Object::None),
             finalize_ran: crate::sync::Cell::new(false),
             gc_registered: crate::sync::Cell::new(false),
         }
@@ -11505,7 +11554,7 @@ impl Object {
             Object::Frame(fr) => format!(
                 "<frame at 0x{:x}, file {}, line {}, code {}>",
                 Rc::as_ptr(fr) as usize,
-                Object::from_str(fr.code.filename.clone()).repr(),
+                Object::from_str(&*fr.code.filename).repr(),
                 fr.current_lineno(),
                 fr.code.name
             ),

@@ -87,11 +87,34 @@ use crate::weakref_registry::{id_of, ObjectId};
 /// A set of object ids (addresses), hashed with the address mixer.
 type IdSet = std::collections::HashSet<ObjectId, BuildHasherDefault<ObjectIdHasher>>;
 
-type GcIndex = std::collections::HashMap<
-    ObjectId,
-    HandleRc<TrackedHandle>,
-    BuildHasherDefault<ObjectIdHasher>,
->;
+/// The collector's id index: each tracked object's handle, found by the
+/// id the handle carries (one word a bucket, against two for a map from
+/// the id to the handle).
+type GcIndex = std::collections::HashSet<IndexEntry, BuildHasherDefault<ObjectIdHasher>>;
+
+/// A [`GcIndex`] entry: a handle, hashed, compared and looked up by its id.
+struct IndexEntry(HandleRc<TrackedHandle>);
+
+impl std::hash::Hash for IndexEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // As `ObjectId` hashes, so a lookup by id finds it.
+        self.0.id.hash(state);
+    }
+}
+
+impl PartialEq for IndexEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for IndexEntry {}
+
+impl std::borrow::Borrow<ObjectId> for IndexEntry {
+    fn borrow(&self) -> &ObjectId {
+        &self.0.id
+    }
+}
 
 /// The standard CPython generation count (3) and default
 /// thresholds (CPython 3.14's): gen 0 collects when 2000 net tracked allocations
@@ -795,13 +818,12 @@ impl GcState {
         let new_id = id_of(obj);
         {
             let mut index = self.index.borrow_mut();
-            // One probe decides the dedupe and the insert. An entry whose
-            // object died can't sit at this address: its weak handle keeps
-            // the allocation reserved until the entry is pruned.
-            let entry = match index.entry(new_id) {
-                std::collections::hash_map::Entry::Occupied(_) => return false,
-                std::collections::hash_map::Entry::Vacant(e) => e,
-            };
+            // An entry whose object died can't sit at this address: its
+            // weak handle keeps the allocation reserved until the entry is
+            // pruned.
+            if index.contains(&new_id) {
+                return false;
+            }
             let Some(handle) = TrackedHandle::new(obj, 0) else {
                 return false;
             };
@@ -814,7 +836,7 @@ impl GcState {
             // Publish to the miss-filter *before* the insert becomes
             // observable (we hold the index borrow).
             self.tracked_filter.insert(new_id);
-            entry.insert(handle.clone());
+            index.insert(IndexEntry(handle.clone()));
             // `finalized_ids` is keyed by object id (a pointer), which the
             // allocator recycles. A freshly tracked object at a recycled
             // address must start *un*-finalized (`test_is_finalized`).
@@ -850,13 +872,13 @@ impl GcState {
         ) else {
             return;
         };
-        let Some(handle) = index.get(&id) else {
+        let Some(IndexEntry(handle)) = index.get(&id) else {
             return;
         };
         if !handle.object.is_dead() || handle.color.load(Ordering::Acquire) == color::Frozen {
             return;
         }
-        let handle = index.remove(&id).expect("probed above");
+        let IndexEntry(handle) = index.take(&id).expect("probed above");
         let g = usize::from(
             handle
                 .generation
@@ -876,7 +898,7 @@ impl GcState {
         };
         if !removed {
             // Somewhere unexpected: leave it to the collector.
-            index.insert(id, handle);
+            index.insert(IndexEntry(handle));
             return;
         }
         // (As `untrack_id_in` accounts it.)
@@ -904,8 +926,8 @@ impl GcState {
         // `YOUNG_CAP` entries.) An index entry left by a dead object
         // whose address a young one now reuses is dropped, and the young
         // sets still searched.
-        let indexed = self.index.borrow_mut().remove(&id);
-        let Some(handle) = indexed else {
+        let indexed = self.index.borrow_mut().take(&id);
+        let Some(IndexEntry(handle)) = indexed else {
             if young {
                 self.untrack_young(id);
             }
@@ -989,6 +1011,8 @@ impl GcState {
     /// the index; `budget` caps how many entries are examined, starting at
     /// `start` (wrapping). Returns how many were dropped and where the
     /// examination stopped.
+    // (An `IndexEntry` hashes and compares by its handle's immutable id.)
+    #[allow(clippy::mutable_key_type)]
     fn prune_dead_in(
         index: &mut GcIndex,
         handles: &mut Vec<HandleRc<TrackedHandle>>,
@@ -1066,7 +1090,7 @@ impl GcState {
         if !self.tracked_filter.may_contain(id) {
             return false;
         }
-        self.index.borrow().contains_key(&id)
+        self.index.borrow().contains(&id)
     }
 
     /// [`Self::is_tracked`] for an instance or function, which may be
@@ -1080,7 +1104,7 @@ impl GcState {
         if !self.tracked_filter.may_contain(id) {
             return None;
         }
-        self.index.borrow().get(&id).cloned()
+        self.index.borrow().get(&id).map(|e| e.0.clone())
     }
 
     /// Snapshot every live tracked object that still carries an unrun
@@ -1434,7 +1458,7 @@ impl GcState {
     /// index borrow serializes it against every `track`.
     pub fn rebuild_tracked_filter(&self) {
         let index = self.index.borrow();
-        self.tracked_filter.rebuild(index.keys().copied());
+        self.tracked_filter.rebuild(index.iter().map(|e| e.0.id));
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -2985,7 +3009,7 @@ mod tests {
         {
             let hint = CachedSlot::new(u32::MAX as usize + 100);
             assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
-            assert_eq!(std::mem::size_of::<TrackedHandle>(), 40);
+            assert_eq!(std::mem::size_of::<TrackedHandle>(), 32);
         }
     }
 
