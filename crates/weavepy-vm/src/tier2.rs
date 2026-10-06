@@ -513,6 +513,12 @@ struct CacheEntry {
     recompile_at_osr: bool,
     /// Recompiles taken for [`Self::recompile_at_osr`].
     cold_recompiles: u8,
+    /// Loop headers the compiled frame has no entry for (a loop the
+    /// region left out, such as an inlined comprehension the analyzer
+    /// rejected). Their back edges skip the OSR request outright, and
+    /// they don't spend [`Self::osr_failures`], which would silence the
+    /// code's other loops. Cleared when the code recompiles.
+    osr_absent: Vec<u32>,
     /// Back edges run while cold (counted a consultation's stride at a
     /// time) and the activations they ran in: the activations counted
     /// here, plus the lean ones the code's `jit_hint` counts (credited
@@ -587,6 +593,7 @@ impl CacheEntry {
             probe_misses: Vec::new(),
             recompile_at_osr: false,
             cold_recompiles: 0,
+            osr_absent: Vec::new(),
             native: None,
             method_native: None,
             direct: None,
@@ -1048,7 +1055,10 @@ fn jit_process_gate_init() -> bool {
 
 impl JitState {
     fn new() -> JitState {
-        let enabled = jit_enabled_by_config();
+        // `WEAVEPY_TIER2=0` turns off this tier alone (the frame JIT and
+        // compiled leaf plans stay on), for measuring what it adds.
+        let enabled =
+            jit_enabled_by_config() && std::env::var_os("WEAVEPY_TIER2").is_none_or(|v| v != "0");
         let explicit_threshold = std::env::var("WEAVEPY_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1200,6 +1210,7 @@ impl JitState {
                 entry.recompile_at_osr = false;
                 entry.cold_recompiles = entry.cold_recompiles.saturating_add(1);
                 entry.osr_failures = 0;
+                entry.osr_absent.clear();
                 entry.tier = Tier::Cold;
                 entry.counter = entry.counter.max(self.threshold);
             }
@@ -1708,6 +1719,13 @@ impl JitState {
                         && !(code.is_generator || code.is_coroutine || code.is_async_generator);
                     if recursive || hot_loop {
                         code.jit_hint.mark_compiled();
+                    } else if !long_calls {
+                        // A loop of a few iterations a call: a mid-loop
+                        // entry rarely has enough left to pay for itself.
+                        // The interpreter's calls run it in the frame JIT
+                        // instead, which takes code once tier 2 is done
+                        // with its back edges.
+                        code.jit_hint.set_backedge_quiet();
                     }
                     let scalar_update =
                         scalar_field_update_plan(code, &cf, &attr_guards).map(Box::new);
@@ -1998,6 +2016,9 @@ impl JitState {
     /// OSR entry (RFC 0059 WS3b).
     fn note_backedge(&mut self, code: &Rc<CodeObject>) -> bool {
         if !self.enabled {
+            // Nothing here wants the back edges: the frame JIT may take
+            // the loops.
+            code.jit_hint.set_backedge_quiet();
             return false;
         }
         let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
@@ -13677,8 +13698,17 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
         if !st.enabled {
             return None;
         }
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        // A header known to have no entry (or, while cold, to miss its
+        // probes from here) asks for nothing.
+        if st.cache.get(&key).is_some_and(|e| match e.tier {
+            Tier::Compiled(_) => !e.recompile_at_osr && e.osr_absent.contains(&frame.pc),
+            Tier::Cold => e.counter >= st.threshold && e.probe_misses.contains(&frame.pc),
+            Tier::NotJitable => false,
+        }) {
+            return None;
+        }
         if st.range_budget {
-            let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
             if let Some(entry) = st.cache.get_mut(&key) {
                 if matches!(entry.tier, Tier::Cold) && short_scalar_range(frame) {
                     entry.defer_osr = true;
@@ -13759,10 +13789,17 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     let Some(osr) = cf.osr_entries.iter().find(|e| e.pc == pc) else {
         // A loop whose code stays interpreted is expected to find no
         // entry: its nested regions enter at their own headers.
-        if cf.stayed_heads.contains(&(pc as u32)) {
-            return JitEntry::Skip;
+        if !cf.stayed_heads.contains(&(pc as u32)) {
+            let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+            JIT.with(|cell| {
+                if let Some(e) = cell.borrow_mut().cache.get_mut(&key) {
+                    if !e.osr_absent.contains(&pc) {
+                        e.osr_absent.push(pc);
+                    }
+                }
+            });
         }
-        return fail(&frame.code);
+        return JitEntry::Skip;
     };
     if !guards_hold(
         interp,
