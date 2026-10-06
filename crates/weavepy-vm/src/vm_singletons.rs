@@ -156,7 +156,21 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
                 GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
                 GeneratorState::Finished | GeneratorState::Running => false,
             });
-        if owes {
+        // A plain generator suspended outside any handler of its own
+        // (CPython's `gen_close` shortcut) just finishes, here: nothing
+        // could observe the `GeneratorExit` its finalizer would throw.
+        let closed = owes
+            && g.kind == CoroutineKind::Generator
+            && crate::Interpreter::gen_close_quiet_detached(&g).is_some_and(|frame| {
+                drop(frame);
+                true
+            });
+        if closed {
+            let g = Rc::from_arc(g);
+            crate::Interpreter::release_finished_gen(&g);
+            // (As a plain handle: this is the release being finalized.)
+            drop(Rc::into_arc(g));
+        } else if owes {
             let kind = g.kind;
             let g = Rc::from_arc(g);
             try_push_pending_finalizer(match kind {

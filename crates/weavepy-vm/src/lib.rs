@@ -39602,17 +39602,31 @@ impl Interpreter {
     /// without a `GeneratorExit` (and, like CPython's, without unwind
     /// events while no tool observes them). Returns whether it did.
     fn gen_close_quiet(&mut self, g: &Rc<PyGenerator>) -> bool {
+        let Some(mut boxed) = Self::gen_close_quiet_detached(g) else {
+            return false;
+        };
+        self.recycle_frame_allocs(&mut boxed);
+        Self::release_finished_gen(g);
+        drop(boxed);
+        true
+    }
+
+    /// [`Self::gen_close_quiet`] without an interpreter at hand: the
+    /// generator finishes and hands back its frame for the caller to drop,
+    /// or `None` touches nothing. A suspended generator's last release
+    /// closes this way on the spot instead of queueing its finalizer.
+    pub(crate) fn gen_close_quiet_detached(g: &PyGenerator) -> Option<Box<Frame>> {
         const RESUME_DEPTH1_MASK: u32 = 4;
         let Ok(mut state) = g.state.try_borrow_mut() else {
-            return false;
+            return None;
         };
         let (created, boxed) = match &mut *state {
             GeneratorState::Created(boxed) => (true, boxed),
             GeneratorState::Suspended(boxed) => (false, boxed),
-            GeneratorState::Finished | GeneratorState::Running => return false,
+            GeneratorState::Finished | GeneratorState::Running => return None,
         };
         if !created && crate::trace::any_observers_active() {
-            return false;
+            return None;
         }
         let frame: &mut Frame = boxed;
         // A Python-visible frame keeps showing the locals (the general
@@ -39623,7 +39637,7 @@ impl Interpreter {
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
         {
-            return false;
+            return None;
         }
         if !created {
             // A parked native activation's pc/stack are stale until
@@ -39636,19 +39650,15 @@ impl Interpreter {
                 .get(frame.pc as usize)
                 .is_some_and(|i| i.op == OpCode::Resume && i.arg & RESUME_DEPTH1_MASK != 0);
             if !depth1 || detect_yield_from_subiter(frame).is_some() {
-                return false;
+                return None;
             }
         }
         let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
         drop(state);
-        let (GeneratorState::Created(mut boxed) | GeneratorState::Suspended(mut boxed)) = prev
-        else {
+        let (GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed)) = prev else {
             unreachable!("checked above");
         };
-        self.recycle_frame_allocs(&mut boxed);
-        Self::release_finished_gen(g);
-        drop(boxed);
-        true
+        Some(boxed)
     }
 
     fn gen_method_close_inner(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
@@ -40212,7 +40222,7 @@ impl Interpreter {
     /// rescans the tracked index). An async generator keeps its
     /// finalizer hook (which may close a cycle) and a weakref-watched
     /// one its prompt callback path.
-    fn release_finished_gen(gen: &Rc<PyGenerator>) {
+    pub(crate) fn release_finished_gen(gen: &Rc<PyGenerator>) {
         if gen.kind == crate::object::CoroutineKind::AsyncGenerator {
             return;
         }
