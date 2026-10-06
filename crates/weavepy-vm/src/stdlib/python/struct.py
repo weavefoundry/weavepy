@@ -135,9 +135,13 @@ def unpack_from(format, /, buffer, offset=0):
 
 
 def pack(format, /, *v):
-    if _needs_coercion(v):
-        v = _coerce_values(format, v)
     try:
+        # Plain values pack at once; anything else is coerced first.
+        packed = _impl._pack_plain(format, *v)
+        if packed is not None:
+            return packed
+        if _needs_coercion(v):
+            v = _coerce_values(format, v)
         return _impl.pack(format, *v)
     except ValueError as e:
         raise error(str(e)) from None
@@ -249,9 +253,10 @@ def _clearcache():
 
     CPython's ``_struct`` memoizes compiled ``Struct`` objects and exposes
     this hook to flush them (``test.libregrtest``'s ``clear_caches`` calls
-    it between tests). WeavePy compiles formats natively without a
-    Python-visible cache, so this is a compatibility no-op.
+    it between tests). WeavePy's native core keeps the compiled formats,
+    which this flushes.
     """
+    _impl._clearcache()
 
 
 class Struct:
@@ -291,12 +296,27 @@ class Struct:
         return self._fmt
 
     def pack(self, *values):
-        self._ensure_initialized()
-        return pack(self._fmt, *values)
+        fmt = self._fmt
+        if fmt is None:
+            raise RuntimeError("Struct.__init__() was not called")
+        try:
+            packed = _impl._pack_plain(fmt, *values)
+        except ValueError as e:
+            raise error(str(e)) from None
+        if packed is None:
+            return pack(fmt, *values)
+        return packed
 
     def unpack(self, buffer):
-        self._ensure_initialized()
-        return unpack(self._fmt, buffer)
+        fmt = self._fmt
+        if fmt is None:
+            raise RuntimeError("Struct.__init__() was not called")
+        if type(buffer) is bytes:
+            try:
+                return _impl.unpack(fmt, buffer)
+            except ValueError as e:
+                raise error(str(e)) from None
+        return unpack(fmt, buffer)
 
     def pack_into(self, buffer, offset, *values):
         self._ensure_initialized()
