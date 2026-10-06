@@ -3213,8 +3213,8 @@ mod slot_storage_tests {
     fn shared_layout_keeps_slot_storage_compact() {
         assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
         // The split `__dict__` values pointer and its cell: with the
-        // allocator's header the instance stays in the 160-byte class.
-        assert_eq!(std::mem::size_of::<PyInstance>(), 136);
+        // `Arc`'s two counts the instance fits the 128-byte class.
+        assert_eq!(std::mem::size_of::<PyInstance>(), 112);
     }
 
     #[test]
