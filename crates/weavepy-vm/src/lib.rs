@@ -16656,13 +16656,7 @@ impl Interpreter {
         nlocals: usize,
         consts: &[Object],
     ) -> Option<(Result<Object, RuntimeError>, usize)> {
-        let tag = match recv {
-            Object::List(_) => 1,
-            Object::Dict(_) => 2,
-            Object::Set(_) => 3,
-            Object::Str(_) => 4,
-            _ => return None,
-        };
+        let tag = leaf_recv_tag(recv)?;
         let b = mslots.get(attr_pc)?.get_builtin_ptr(tag)?;
         // Bitwise views, never dropped (see `core_native_method`).
         let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
@@ -18464,12 +18458,8 @@ impl Interpreter {
                         return CoreAttr::Done;
                     }
                     Some(recv) => {
-                        let tag = match recv {
-                            Object::List(_) => 1,
-                            Object::Dict(_) => 2,
-                            Object::Set(_) => 3,
-                            Object::Str(_) => 4,
-                            _ => return CoreAttr::Decline,
+                        let Some(tag) = leaf_recv_tag(recv) else {
+                            return CoreAttr::Decline;
                         };
                         match code_method_slot(code, pc as u32).and_then(|s| s.get_builtin(tag)) {
                             Some(b) => Object::Builtin(b),
@@ -21177,16 +21167,25 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
+                                // A native class method bound to its class:
+                                // the method, with the class as its self.
+                                Some(Object::BoundMethod(bm))
+                                    if matches!(bm.function, Object::Builtin(_))
+                                        && bm.receiver.is_same(&Object::Type(cls.clone())) =>
+                                {
+                                    let n = stack.len();
+                                    stack.push(bm.function.clone());
+                                    stack.swap(n - 1, n);
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
                                 _ => break,
                             }
                         }
                         Some(recv) => {
-                            let tag = match recv {
-                                Object::List(_) => 1,
-                                Object::Dict(_) => 2,
-                                Object::Set(_) => 3,
-                                Object::Str(_) => 4,
-                                _ => break,
+                            let Some(tag) = leaf_recv_tag(recv) else {
+                                break;
                             };
                             let slot = code_method_slot(code, pc as u32);
                             match slot.and_then(|s| s.get_builtin(tag)) {
@@ -22283,7 +22282,7 @@ impl Interpreter {
                 calls.insert(Rc::as_ptr(&f) as usize, LeafKind::ObjectNew);
             }
             let mut methods = Vec::new();
-            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 4] = [
+            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 6] = [
                 (
                     LeafRecv::List,
                     Object::new_list(Vec::new()),
@@ -22371,7 +22370,27 @@ impl Interpreter {
                         ("isprintable", LeafKind::Opaque),
                         ("istitle", LeafKind::Opaque),
                         ("isupper", LeafKind::Opaque),
+                        ("encode", LeafKind::Fast(crate::builtins::str_encode_leaf)),
                     ],
+                ),
+                (
+                    LeafRecv::Int,
+                    Object::Int(0),
+                    &[
+                        (
+                            "to_bytes",
+                            LeafKind::Fast(crate::builtins::int_to_bytes_leaf),
+                        ),
+                        (
+                            "bit_length",
+                            LeafKind::Fast(crate::builtins::int_bit_length_leaf),
+                        ),
+                    ],
+                ),
+                (
+                    LeafRecv::Bytes,
+                    Object::new_bytes(Vec::new()),
+                    &[("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf))],
                 ),
             ];
             for (recv, probe, names) in table {
@@ -22380,6 +22399,21 @@ impl Interpreter {
                         calls.insert(Rc::as_ptr(&f) as usize, kind);
                         methods.push((recv, name, f));
                     }
+                }
+            }
+            // `int.from_bytes`'s native body, for the exact class over plain
+            // arguments.
+            if let Some(Object::ClassMethod(cm)) = builtin_types()
+                .int_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("from_bytes"))
+            {
+                if let Object::Builtin(f) = cm.func() {
+                    calls.insert(
+                        Rc::as_ptr(&f) as usize,
+                        LeafKind::Fast(crate::builtins::int_from_bytes_leaf),
+                    );
                 }
             }
             // `dict`'s subscript dunders, as a dict subclass that doesn't
@@ -22532,6 +22566,8 @@ impl Interpreter {
             Object::Dict(_) => LeafRecv::Dict,
             Object::Set(_) => LeafRecv::Set,
             Object::Str(_) => LeafRecv::Str,
+            Object::Int(_) => LeafRecv::Int,
+            Object::Bytes(_) => LeafRecv::Bytes,
             _ => return None,
         };
         self.leaf_fns()
@@ -22722,13 +22758,7 @@ impl Interpreter {
         code: &CodeObject,
         name_idx: u16,
     ) -> Option<*const crate::object::BuiltinFn> {
-        let tag = match recv {
-            Object::List(_) => 1,
-            Object::Dict(_) => 2,
-            Object::Set(_) => 3,
-            Object::Str(_) => 4,
-            _ => return None,
-        };
+        let tag = leaf_recv_tag(recv)?;
         if let Some(b) = slot.get_builtin_ptr(tag) {
             return Some(b);
         }
@@ -23670,6 +23700,21 @@ impl Interpreter {
                         f,
                     ))));
                 }
+            }
+        }
+        // A builtin class's native class method (`int.from_bytes`), bound
+        // to the class as `classmethod.__get__` binds it.
+        if cls.flags.is_builtin {
+            let name = code.names.get(name_idx as usize)?;
+            let d = cls.dict.try_borrow().ok()?;
+            if let Some(Object::ClassMethod(cm)) = d.get(&crate::object::StrKey(name)) {
+                let f = cm.func();
+                return matches!(f, Object::Builtin(_)).then(|| {
+                    Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                        Object::Type(cls.clone()),
+                        f,
+                    )))
+                });
             }
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -60960,6 +61005,23 @@ enum LeafRecv {
     Dict,
     Set,
     Str,
+    Int,
+    Bytes,
+}
+
+/// A builtin receiver's tag in a method site's slot (see
+/// [`MethodSlot::set_builtin`]) for the leaf method table.
+#[inline]
+fn leaf_recv_tag(recv: &Object) -> Option<u64> {
+    Some(match recv {
+        Object::List(_) => 1,
+        Object::Dict(_) => 2,
+        Object::Set(_) => 3,
+        Object::Str(_) => 4,
+        Object::Int(_) => 5,
+        Object::Bytes(_) => 6,
+        _ => return None,
+    })
 }
 
 /// The resolved leaf builtins (see [`LeafKind`]): the interpreter-wide

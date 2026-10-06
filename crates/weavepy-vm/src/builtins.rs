@@ -5660,9 +5660,15 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let n_obj = args
         .first()
         .ok_or_else(|| type_error("to_bytes() requires self"))?;
-    let n = n_obj
-        .as_bigint()
-        .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?;
+    // (A machine int converts only if its fast path below declines.)
+    let big = match n_obj {
+        Object::Int(_) => None,
+        other => Some(
+            other
+                .as_bigint()
+                .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?,
+        ),
+    };
     let length = match arg_or_kw(args, 1, kwargs, "length") {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
         Some(Object::Bool(b)) => usize::from(*b),
@@ -5683,6 +5689,30 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let signed = match arg_or_kw(args, 3, kwargs, "signed") {
         Some(o) => o.is_truthy(),
         None => false,
+    };
+    // A machine int that fits the length: its two's-complement bytes,
+    // without the big-integer conversion (anything else, an overflow
+    // included, takes it).
+    if let (Object::Int(v), 1..=8, "big" | "little") = (n_obj, length, byteorder.as_str()) {
+        let bits = 8 * length as u32;
+        let fits = if signed {
+            let half = 1i128 << (bits - 1);
+            (-half..half).contains(&i128::from(*v))
+        } else {
+            *v >= 0 && (bits == 64 || (*v as u64) >> bits == 0)
+        };
+        if fits {
+            let be = v.to_be_bytes();
+            let mut out = be[8 - length..].to_vec();
+            if byteorder == "little" {
+                out.reverse();
+            }
+            return Ok(Object::new_bytes(out));
+        }
+    }
+    let n = match big {
+        Some(n) => n,
+        None => n_obj.as_bigint().expect("a machine int"),
     };
     let bytes = bigint_to_bytes(&n, length, &byteorder, signed)?;
     Ok(Object::new_bytes(bytes))
@@ -5746,6 +5776,25 @@ fn int_from_bytes_method(
         Some(o) => o.is_truthy(),
         None => false,
     };
+    // Up to seven bytes (eight when signed) make a machine int directly.
+    if (1..=7).contains(&data.len()) || (signed && data.len() == 8) {
+        if let "big" | "little" = byteorder.as_str() {
+            let mut word = [0u8; 8];
+            let k = data.len();
+            if byteorder == "big" {
+                word[8 - k..].copy_from_slice(&data);
+            } else {
+                for (i, b) in data.iter().enumerate() {
+                    word[7 - i] = *b;
+                }
+            }
+            let mut v = i64::from_be_bytes(word);
+            if signed && k < 8 && word[8 - k] & 0x80 != 0 {
+                v -= 1i64 << (8 * k);
+            }
+            return Ok(Object::Int(v));
+        }
+    }
     let n = bytes_to_bigint(&data, &byteorder, signed)?;
     Ok(Object::int_from_bigint(n))
 }
@@ -13514,6 +13563,110 @@ fn leaf_dict_of(recv: &Object) -> Option<&Rc<RefCell<DictData>>> {
 /// `dict.__getitem__`'s leaf half (see `leaf_builtins::Fast`): a present
 /// `str`/`int` key, found by exact native equality. A miss (which a
 /// subclass may serve through `__missing__`) takes the full path.
+/// The codecs `str.encode` and `bytes.decode` serve without the codec
+/// registry (CPython's own fast paths for them, with strict errors).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlainCodec {
+    Utf8,
+    Latin1,
+    Ascii,
+}
+
+/// `name`'s plain codec, if it is one (`None` names the default, UTF-8).
+fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
+    let Some(name) = name else {
+        return Some(PlainCodec::Utf8);
+    };
+    let Object::Str(n) = name else {
+        return None;
+    };
+    let n: &str = n;
+    if n.len() > 10 {
+        return None;
+    }
+    let n = n.to_ascii_lowercase().replace('_', "-");
+    Some(match n.as_str() {
+        "utf-8" | "utf8" => PlainCodec::Utf8,
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "l1" => PlainCodec::Latin1,
+        "ascii" | "us-ascii" => PlainCodec::Ascii,
+        _ => return None,
+    })
+}
+
+/// `s.encode([encoding])` with a plain codec, when every character
+/// encodes (an unencodable one raises on the full path).
+pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Object::Str(s), rest) = args.split_first()? else {
+        return None;
+    };
+    if rest.len() > 1 {
+        return None;
+    }
+    let s: &str = s;
+    let bytes = match plain_codec(rest.first())? {
+        PlainCodec::Utf8 => s.as_bytes().to_vec(),
+        PlainCodec::Ascii if s.is_ascii() => s.as_bytes().to_vec(),
+        PlainCodec::Latin1 => s
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).ok())
+            .collect::<Option<Vec<u8>>>()?,
+        PlainCodec::Ascii => return None,
+    };
+    Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// `b.decode([encoding])` with a plain codec, when the bytes decode (an
+/// undecodable one raises on the full path).
+pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Object::Bytes(b), rest) = args.split_first()? else {
+        return None;
+    };
+    if rest.len() > 1 {
+        return None;
+    }
+    let text = match plain_codec(rest.first())? {
+        PlainCodec::Utf8 => std::str::from_utf8(b).ok()?.to_owned(),
+        PlainCodec::Ascii if b.is_ascii() => std::str::from_utf8(b).ok()?.to_owned(),
+        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect(),
+        PlainCodec::Ascii => return None,
+    };
+    Some(Ok(Object::from_str(text)))
+}
+
+/// `i.to_bytes([length[, byteorder]])` over plain arguments.
+pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Int(_)]
+        | [Object::Int(_), Object::Int(_)]
+        | [Object::Int(_), Object::Int(_), Object::Str(_)] => Some(int_to_bytes(args, &[])),
+        _ => None,
+    }
+}
+
+/// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
+/// `bytes` buffer.
+pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Type(t), Object::Bytes(_)]
+        | [Object::Type(t), Object::Bytes(_), Object::Str(_)]
+            if crate::sync::Rc::ptr_eq(t, &builtin_types().int_) =>
+        {
+            Some(int_from_bytes_method(args, &[]))
+        }
+        _ => None,
+    }
+}
+
+/// `i.bit_length()` of a machine int.
+pub(crate) fn int_bit_length_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Int(v)] = args else {
+        return None;
+    };
+    Some(Ok(Object::Int(i64::from(
+        64 - v.unsigned_abs().leading_zeros(),
+    ))))
+}
+
 pub(crate) fn dict_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [recv, key] = args else {
         return None;
