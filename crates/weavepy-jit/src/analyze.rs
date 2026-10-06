@@ -529,16 +529,26 @@ impl Plan {
 
     /// RFC 0073 WS1 — how many *hidden* entries the interpreter's
     /// stack holds at `pc` beyond the analyzer's model stack: live
-    /// loop iterators plus the parked saved-target values of live
-    /// inlined comprehensions. This is the model-to-physical depth
-    /// correction for every recorded `interp_depth`.
+    /// loop iterators, the parked saved-target values of live inlined
+    /// comprehensions, and the erased `range` callee and its null
+    /// marker while expression bounds evaluate above them. This is the
+    /// model-to-physical depth correction for every recorded
+    /// `interp_depth`.
     fn hidden_at(&self, pc: usize) -> u32 {
         let saved = self
             .comp_headers
             .values()
             .filter(|c| (c.saved_from as usize) <= pc && pc < c.saved_to as usize)
             .count() as u32;
-        self.live_iters_at(pc) + saved
+        // The callee loads at `callee` and its `PUSH_NULL` follows; both
+        // stay until the `CALL` consumes them.
+        let range_callees: usize = self
+            .range_spans
+            .iter()
+            .filter(|&(&callee, &call)| callee < pc && pc <= call)
+            .map(|(&callee, _)| 1 + usize::from(pc > callee + 1))
+            .sum();
+        self.live_iters_at(pc) + saved + range_callees as u32
     }
 
     /// RFC 0073 WS1 — the accumulator lane slot of the innermost
