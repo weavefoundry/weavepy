@@ -22172,6 +22172,10 @@ impl Interpreter {
                     ("sum", LeafKind::Fast(crate::seqiter::sum_fast)),
                     ("any", LeafKind::Fast(crate::seqiter::any_fast)),
                     ("all", LeafKind::Fast(crate::seqiter::all_fast)),
+                    ("abs", LeafKind::Fast(crate::seqiter::abs_fast)),
+                    ("ord", LeafKind::Fast(crate::seqiter::ord_fast)),
+                    ("chr", LeafKind::Fast(crate::seqiter::chr_fast)),
+                    ("divmod", LeafKind::Fast(crate::seqiter::divmod_fast)),
                 ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
@@ -60846,8 +60850,26 @@ impl LeafKind {
                 | Self::StrReplace
                 | Self::StrFormat
                 | Self::Scalar
-        )
+        ) || matches!(self, Self::Fast(f) if pure_fast_half(f))
     }
+}
+
+/// Whether a builtin's fast half is one of the interpreter's own with no
+/// effect (a module's may have one: `getrandbits` advances its state), so a
+/// frameless evaluation that declines after calling it did nothing.
+fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
+    let pure: [leaf_builtins::Fast; 9] = [
+        crate::seqiter::min_fast,
+        crate::seqiter::max_fast,
+        crate::seqiter::sum_fast,
+        crate::seqiter::any_fast,
+        crate::seqiter::all_fast,
+        crate::seqiter::abs_fast,
+        crate::seqiter::ord_fast,
+        crate::seqiter::chr_fast,
+        crate::seqiter::divmod_fast,
+    ];
+    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f))
 }
 
 /// A receiver's builtin variant, for the method table.

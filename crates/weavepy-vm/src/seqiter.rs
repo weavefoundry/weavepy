@@ -1460,6 +1460,59 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
     Some(Ok(best.clone()))
 }
 
+/// `abs(x)` of a plain number (an int's magnitude must fit).
+pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    Some(Ok(match args {
+        [Object::Int(i)] => Object::Int(i.checked_abs()?),
+        [Object::Float(f)] => Object::Float(f.abs()),
+        [Object::Bool(b)] => Object::Int(i64::from(*b)),
+        _ => return None,
+    }))
+}
+
+/// `ord(c)` of a one-character `str`.
+pub(crate) fn ord_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(s)] = args else {
+        return None;
+    };
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(Ok(Object::Int(i64::from(u32::from(c)))))
+}
+
+/// `chr(i)` of a code point a `str` holds (a surrogate takes the full
+/// path).
+pub(crate) fn chr_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Int(i)] = args else {
+        return None;
+    };
+    let c = char::from_u32(u32::try_from(*i).ok()?)?;
+    Some(Ok(Object::from_char(c)))
+}
+
+/// `divmod(a, b)` of plain ints, floored as Python's (a zero divisor
+/// raises on the full path).
+pub(crate) fn divmod_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Int(a), Object::Int(b)] = args else {
+        return None;
+    };
+    if *b == 0 {
+        return None;
+    }
+    let (mut q, mut r) = (a.checked_div(*b)?, a.checked_rem(*b)?);
+    if r != 0 && ((r < 0) != (*b < 0)) {
+        q -= 1;
+        r += b;
+    }
+    Some(Ok(Object::new_tuple_array([
+        Object::Int(q),
+        Object::Int(r),
+    ])))
+}
+
 pub(crate) fn min_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     min_max_fast(args, false)
 }
