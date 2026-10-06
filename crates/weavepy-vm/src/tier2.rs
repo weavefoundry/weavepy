@@ -7500,6 +7500,19 @@ fn charge_native_roundtrip(ctx: &mut CallCtx) -> bool {
     true
 }
 
+/// [`wpjit_poll`]'s density verdict for the calls an activation made
+/// since its last poll, at its exit: an activation that ends before its
+/// loop reaches a poll (fewer than `JIT_POLL_STRIDE` iterations) is judged
+/// too, once it has made more generic calls than a whole poll interval
+/// may, whatever its length.
+fn retire_if_call_dense(ctx: &CallCtx) {
+    if (ctx.native_calls > NATIVE_CALLS_PER_POLL || ctx.dyn_py_calls > INTERP_CALLS_PER_POLL)
+        && !ctx.code_ptr.is_null()
+    {
+        retire_native_driver(ctx);
+    }
+}
+
 /// Retire the activation's code as a thin native driver around native
 /// callees (the interpreter's leaf calls serve such a loop better).
 fn retire_native_driver(ctx: &CallCtx) {
@@ -14323,6 +14336,7 @@ fn enter_compiled(
     // A cold exit is an expected hand-off, never a deopt charge.
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
     note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
+    retire_if_call_dense(&ctx);
 
     // RFC 0073 WS4 — a healthy yield whose continuation is a
     // registered resume entry parks the *whole* activation on the
