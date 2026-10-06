@@ -1,9 +1,11 @@
-"""abs, ord, chr and divmod run in place over plain scalars.
+"""abs, ord, chr, divmod and the scalar constructors run in place.
 
 Each takes a fast half for the common shapes, inside loops and inside
 small methods evaluated without a frame, and leaves everything else (an
 overflowing magnitude, a surrogate, a zero divisor, a wrong type) to the
-full builtin, whose results and errors must be unchanged.
+full builtin, whose results and errors must be unchanged. float, bool,
+str, tuple and list construct directly from plain scalars, lists and
+tuples, in loops and in small functions evaluated without a frame.
 """
 
 import sys
@@ -69,6 +71,50 @@ class ScalarBuiltinLeafTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             p.code("ab")
         self.assertEqual(sum(p.code("b") for _ in range(500)), 98 * 500)
+
+    def test_constructors(self):
+        def to_float(v):
+            return float(v)
+
+        def to_bool(v):
+            return bool(v)
+
+        def to_str(v):
+            return str(v)
+
+        def to_tuple(v):
+            return tuple(v)
+
+        def to_list(v):
+            return list(v)
+
+        for _ in range(300):
+            self.assertEqual(to_float(7), 7.0)
+            self.assertEqual(to_float(2**53 + 1), 9007199254740992.0)
+            self.assertEqual(to_float(-(2**63)), -9.223372036854776e18)
+            self.assertEqual(to_float(True), 1.0)
+            self.assertIs(type(to_float(3)), float)
+            self.assertIs(to_bool(0), False)
+            self.assertIs(to_bool(float("nan")), True)
+            self.assertIs(to_bool(""), False)
+            self.assertIs(to_bool(None), False)
+            self.assertEqual(to_str(-12), "-12")
+            self.assertEqual(to_str(True), "True")
+            src = [1, "a", (2,)]
+            t = to_tuple(src)
+            self.assertEqual(t, (1, "a", (2,)))
+            src.append(4)
+            self.assertEqual(len(t), 3)
+            copy = to_list(src)
+            self.assertIsNot(copy, src)
+            self.assertEqual(copy, src)
+            self.assertEqual(to_list((1, 2)), [1, 2])
+            same = (1, 2)
+            self.assertIs(to_tuple(same), same)
+        self.assertEqual(to_float("1.5"), 1.5)
+        self.assertEqual(to_str(2.5), "2.5")
+        with self.assertRaises(TypeError):
+            to_float([])
 
 
 if __name__ == "__main__":

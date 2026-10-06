@@ -1264,6 +1264,64 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
         crate::gc_trace::track(&obj);
         return Some(obj);
     }
+    // `tuple(xs)` and `list(xs)` of an exact list or tuple: a copy of its
+    // items (an exact tuple is its own tuple), with nothing to iterate.
+    if let [src @ (Object::List(_) | Object::Tuple(_))] = args {
+        if Rc::ptr_eq(cls, &bt.tuple_) {
+            return match src {
+                Object::Tuple(_) => Some(src.clone()),
+                // SAFETY: a read between two instructions (cloning runs no
+                // code).
+                Object::List(l) => Some(Object::new_tuple(unsafe { l.peek() }?.clone())),
+                _ => None,
+            };
+        }
+        if Rc::ptr_eq(cls, &bt.list_) {
+            if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
+            {
+                return None;
+            }
+            let items = match src {
+                Object::Tuple(t) => t.to_vec(),
+                // SAFETY: as above.
+                Object::List(l) => unsafe { l.peek() }?.clone(),
+                _ => return None,
+            };
+            let obj = Object::new_list(items);
+            crate::gc_trace::track(&obj);
+            return Some(obj);
+        }
+    }
+    // `float(x)`, `bool(x)` and `str(x)` of a plain scalar (an int's float
+    // is correctly rounded, as `int.__float__` is).
+    if let [x] = args {
+        if Rc::ptr_eq(cls, &bt.float_) {
+            return match x {
+                Object::Int(i) => Some(Object::Float(*i as f64)),
+                Object::Float(f) => Some(Object::Float(*f)),
+                Object::Bool(b) => Some(Object::Float(f64::from(u8::from(*b)))),
+                _ => None,
+            };
+        }
+        if Rc::ptr_eq(cls, &bt.bool_) {
+            return match x {
+                Object::Int(i) => Some(Object::Bool(*i != 0)),
+                Object::Float(f) => Some(Object::Bool(*f != 0.0)),
+                Object::Bool(b) => Some(Object::Bool(*b)),
+                Object::None => Some(Object::Bool(false)),
+                Object::Str(s) => Some(Object::Bool(!s.is_empty())),
+                _ => None,
+            };
+        }
+        if Rc::ptr_eq(cls, &bt.str_) {
+            return match x {
+                Object::Int(i) => Some(Object::from_str(i.to_string())),
+                Object::Str(_) => Some(x.clone()),
+                Object::Bool(b) => Some(Object::from_static(if *b { "True" } else { "False" })),
+                _ => None,
+            };
+        }
+    }
     // `int(x)` of an exact int, bool, or a finite float whose truncation
     // fits a machine word.
     if let [x @ (Object::Int(_) | Object::Bool(_) | Object::Float(_))] = args {

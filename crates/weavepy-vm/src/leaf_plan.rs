@@ -894,14 +894,16 @@ impl Pending {
     }
 }
 
-/// A leaf call's callee: a Python function to evaluate in place, or a
-/// builtin (with its owner, when a namespace holds one).
+/// A leaf call's callee: a Python function to evaluate in place, a
+/// builtin (with its owner, when a namespace holds one), or a builtin
+/// class whose construction is pure (see `seqiter::builtin_ctor_pure`).
 enum Callee<'a> {
     Py(*const crate::object::PyFunction),
     Native(
         *const crate::object::BuiltinFn,
         Option<&'a Rc<crate::object::BuiltinFn>>,
     ),
+    Ctor(&'a Rc<crate::types::TypeObject>),
 }
 
 /// A leaf evaluation's result: a value the caller may borrow for the rest
@@ -1154,6 +1156,7 @@ impl Interpreter {
                         V::R(p) => match unsafe { &*p } {
                             Object::Function(func) => Callee::Py(Rc::as_ptr(func)),
                             Object::Builtin(b) => Callee::Native(Rc::as_ptr(b), Some(b)),
+                            Object::Type(t) if t.flags.is_builtin => Callee::Ctor(t),
                             _ => return None,
                         },
                         _ => return None,
@@ -1169,7 +1172,7 @@ impl Interpreter {
                     }
                     let fp = match callee {
                         Callee::Py(fp) => fp,
-                        Callee::Native(b, rc) => {
+                        Callee::Native(..) | Callee::Ctor(_) => {
                             // A read-only builtin, on borrowed copies of the
                             // arguments: never dropped, so no reference moves.
                             let mut staged =
@@ -1191,7 +1194,13 @@ impl Interpreter {
                             let args = unsafe {
                                 std::slice::from_raw_parts(staged.as_ptr().cast::<Object>(), n)
                             };
-                            let r = self.leaf_pure_builtin(code, usize::from(pc), b, rc, args)?;
+                            let r = match callee {
+                                Callee::Native(b, rc) => {
+                                    self.leaf_pure_builtin(code, usize::from(pc), b, rc, args)?
+                                }
+                                Callee::Ctor(t) => crate::seqiter::builtin_ctor_pure(t, args)?,
+                                Callee::Py(_) => return None,
+                            };
                             set!(at, owned.own(r)?);
                             continue;
                         }
