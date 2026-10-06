@@ -19095,6 +19095,17 @@ impl Interpreter {
         let Ok(mut slots) = inst.slots.try_borrow_mut() else {
             return false;
         };
+        // A laid-out slot, set or not, is written in place.
+        if let Some(slot) = slots.laid_out_mut(key_idx as usize, name) {
+            if !Self::core_droppable(slot) {
+                return false;
+            }
+            // SAFETY: as below.
+            let v = unsafe { std::ptr::read(value) };
+            inst.note_slot_store(&v);
+            drop(std::mem::replace(slot, v));
+            return true;
+        }
         match slots.get_index_mut(key_idx as usize) {
             Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
             {
@@ -19135,9 +19146,12 @@ impl Interpreter {
         let Some(name) = code.names.get(name_idx as usize) else {
             return false;
         };
-        let Ok(slots) = inst.slots.try_borrow() else {
+        let Ok(mut slots) = inst.slots.try_borrow_mut() else {
             return false;
         };
+        if let Some(old) = slots.laid_out_mut(key_idx as usize, name) {
+            return Self::core_droppable(old);
+        }
         match slots.get_index(key_idx as usize) {
             Some((key, old)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) => {
                 Self::core_droppable(old)
@@ -23731,19 +23745,27 @@ impl Interpreter {
                     return None;
                 }
                 let mut slots = inst.slots.try_borrow_mut().ok()?;
-                let displaced = match slots.get_index_mut(key_idx as usize) {
-                    Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
-                    {
-                        let val = std::mem::replace(value_slot, Object::Unbound);
-                        inst.note_slot_store(&val);
-                        Some(std::mem::replace(slot, val))
-                    }
-                    _ => {
-                        let val = std::mem::replace(value_slot, Object::Unbound);
-                        inst.note_slot_store(&val);
-                        match code_name_obj(code, name_idx) {
-                            Some(Object::Str(shared)) => slots.insert_shared(shared, val),
-                            _ => slots.insert(name, val),
+                // A laid-out slot, set or not, is written in place.
+                let displaced = if let Some(slot) = slots.laid_out_mut(key_idx as usize, name) {
+                    let val = std::mem::replace(value_slot, Object::Unbound);
+                    inst.note_slot_store(&val);
+                    let old = std::mem::replace(slot, val);
+                    (!matches!(old, Object::Unbound)).then_some(old)
+                } else {
+                    match slots.get_index_mut(key_idx as usize) {
+                        Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name.as_str()) =>
+                        {
+                            let val = std::mem::replace(value_slot, Object::Unbound);
+                            inst.note_slot_store(&val);
+                            Some(std::mem::replace(slot, val))
+                        }
+                        _ => {
+                            let val = std::mem::replace(value_slot, Object::Unbound);
+                            inst.note_slot_store(&val);
+                            match code_name_obj(code, name_idx) {
+                                Some(Object::Str(shared)) => slots.insert_shared(shared, val),
+                                _ => slots.insert(name, val),
+                            }
                         }
                     }
                 };
@@ -42950,16 +42972,20 @@ impl Interpreter {
                             inst.note_slot_store(&val);
                             let old = {
                                 let mut slots = inst.slots.borrow_mut();
-                                match slots.get_index_mut(key_idx as usize) {
-                                    Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name) => {
-                                        Some(std::mem::replace(slot, val))
-                                    }
-                                    _ => match code_name_obj(&code, name_idx) {
-                                        Some(Object::Str(shared)) => {
-                                            slots.insert_shared(shared, val)
+                                if let Some(slot) = slots.laid_out_mut(key_idx as usize, name) {
+                                    Some(std::mem::replace(slot, val))
+                                } else {
+                                    match slots.get_index_mut(key_idx as usize) {
+                                        Some((key, slot)) if matches!(&key.0, Object::Str(stored) if stored.as_ref() == name) => {
+                                            Some(std::mem::replace(slot, val))
                                         }
-                                        _ => slots.insert(name, val),
-                                    },
+                                        _ => match code_name_obj(&code, name_idx) {
+                                            Some(Object::Str(shared)) => {
+                                                slots.insert_shared(shared, val)
+                                            }
+                                            _ => slots.insert(name, val),
+                                        },
+                                    }
                                 }
                             };
                             drop(old);

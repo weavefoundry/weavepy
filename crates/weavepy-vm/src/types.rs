@@ -703,6 +703,10 @@ pub struct TypeObject {
     /// An `abc.ABCMeta` class's registry and caches (see
     /// [`crate::stdlib::abc_mod`]).
     pub abc_state: std::sync::OnceLock<Box<crate::stdlib::abc_mod::AbcState>>,
+    /// The shared names a `__slots__` class's instances lay their member
+    /// slots out over (see [`TypeObject::fresh_slots`]), decided at the
+    /// first instance: `None` for a class that doesn't qualify.
+    pub slot_layout: std::sync::OnceLock<Option<SharedSlice<DictKey>>>,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -1116,6 +1120,7 @@ impl TypeObject {
             collections_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
+            slot_layout: std::sync::OnceLock::new(),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -1196,6 +1201,50 @@ impl TypeObject {
         self.dict
             .borrow()
             .contains_key(&DictKey(Object::from_static("__weakref__")))
+    }
+
+    /// Slot storage for a new instance: its member slots unset, laid out
+    /// over names shared by every instance, when the class's MRO is plain
+    /// Python classes (over `object`) declaring `__slots__`; empty
+    /// storage otherwise. Laid out, an instance's stores fill the slots
+    /// in place, with no per-instance names and no growth.
+    #[inline]
+    pub fn fresh_slots(&self) -> SlotStorage {
+        match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
+            Some(layout) => SlotStorage::unset_over(layout.clone()),
+            None => SlotStorage::default(),
+        }
+    }
+
+    /// [`Self::fresh_slots`]'s layout: the member slots the MRO declares,
+    /// base classes first, each name once.
+    fn member_slot_layout(&self) -> Option<SharedSlice<DictKey>> {
+        const MAX: usize = 32;
+        if self.flags.is_exception || !self.declares_slots.get() {
+            return None;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for t in self.mro.borrow().iter().rev() {
+            if t.flags.is_builtin {
+                if t.name == "object" {
+                    continue;
+                }
+                return None;
+            }
+            if t.flags.is_exception || t.native_kind.get() != 0 {
+                return None;
+            }
+            for name in t.slot_names.borrow().iter() {
+                if name == "__dict__" || name == "__weakref__" {
+                    continue;
+                }
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        (!names.is_empty() && names.len() <= MAX)
+            .then(|| SharedSlice::from(names.iter().map(|n| slot_key(n)).collect::<Vec<_>>()))
     }
 
     /// This type's own `__slots__` member names, sorted, excluding the
@@ -2175,6 +2224,16 @@ impl SlotStorage {
         }
     }
 
+    /// Storage for an instance whose member slots, all unset, are laid
+    /// out over `layout` (see [`TypeObject::fresh_slots`]). An unset slot
+    /// holds `Unbound`, which every reader takes as absent.
+    pub(crate) fn unset_over(layout: SharedSlice<DictKey>) -> Self {
+        let values = vec![Object::Unbound; layout.len()].into_boxed_slice();
+        Self {
+            data: SlotData::Fixed { layout, values },
+        }
+    }
+
     /// Storage holding a natively packed value (see [`SlotData::Packed`]).
     pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
         Self {
@@ -2229,8 +2288,12 @@ impl SlotStorage {
         self.unpack();
         if let SlotData::Fixed { layout, values } = &mut self.data {
             let values = std::mem::take(values);
-            let entries: Vec<(DictKey, Object)> =
-                layout.iter().cloned().zip(values.into_vec()).collect();
+            let entries: Vec<(DictKey, Object)> = layout
+                .iter()
+                .cloned()
+                .zip(values.into_vec())
+                .filter(|(_, value)| !matches!(value, Object::Unbound))
+                .collect();
             *self = Self::from_entries(entries);
         }
     }
@@ -2252,6 +2315,22 @@ impl SlotStorage {
     /// Storage holding `values` under `layout` (see the 64-bit variant).
     pub fn from_layout(layout: SharedSlice<DictKey>, values: Vec<Object>) -> Self {
         Self::from_entries(layout.iter().cloned().zip(values).collect())
+    }
+
+    /// Empty storage (the 64-bit variant lays the slots out).
+    pub(crate) fn unset_over(_layout: SharedSlice<DictKey>) -> Self {
+        Self::default()
+    }
+
+    /// [`Self::index_of`] (never laid out here; see the 64-bit variant).
+    pub fn store_position(&self, name: &str) -> Option<u32> {
+        self.index_of(name)
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    #[inline]
+    pub fn laid_out_mut(&mut self, _idx: usize, _name: &str) -> Option<&mut Object> {
+        None
     }
 
     /// Storage holding a packed value's slots (stored per key here).
@@ -2312,11 +2391,12 @@ impl SlotStorage {
             SlotData::Many(table) => table
                 .get_index_of(&crate::object::StrKey(name))
                 .and_then(|index| u32::try_from(index).ok()),
-            SlotData::Fixed { layout, .. } => layout
+            SlotData::Fixed { layout, values } => layout
                 .iter()
                 .position(
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
+                .filter(|&i| !matches!(values[i], Object::Unbound))
                 .map(|index| index as u32),
             SlotData::Packed(p) => p
                 .layout()
@@ -2336,7 +2416,10 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
             SlotData::Many(table) => table.get_index(index),
-            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get(index)),
+            SlotData::Fixed { layout, values } => layout
+                .get(index)
+                .zip(values.get(index))
+                .filter(|(_, value)| !matches!(value, Object::Unbound)),
             SlotData::Packed(p) => p.layout().get(index).zip(p.values().get(index)),
             _ => None,
         }
@@ -2349,7 +2432,10 @@ impl SlotStorage {
             SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
             SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
             SlotData::Many(table) => table.get_index_mut(index),
-            SlotData::Fixed { layout, values } => layout.get(index).zip(values.get_mut(index)),
+            SlotData::Fixed { layout, values } => layout
+                .get(index)
+                .zip(values.get_mut(index))
+                .filter(|(_, value)| !matches!(value, Object::Unbound)),
             _ => None,
         }
     }
@@ -2369,7 +2455,8 @@ impl SlotStorage {
                 .position(
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
-                .and_then(|i| values.get(i)),
+                .and_then(|i| values.get(i))
+                .filter(|value| !matches!(value, Object::Unbound)),
             SlotData::Packed(p) => p
                 .layout()
                 .iter()
@@ -2393,6 +2480,38 @@ impl SlotStorage {
             }
         }
         self.get(name)
+    }
+
+    /// Where a store of slot `name` lands: its laid-out position (see
+    /// [`Self::unset_over`]), set or not, else its populated position.
+    pub fn store_position(&self, name: &str) -> Option<u32> {
+        if let SlotData::Fixed { layout, .. } = &self.data {
+            if let Some(i) = layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            ) {
+                return Some(i as u32);
+            }
+        }
+        self.index_of(name)
+    }
+
+    /// The slot laid out for `name` at position `idx`, set or not (a
+    /// store fills it): `None` unless the storage is laid out (see
+    /// [`Self::unset_over`]) with `name` there.
+    #[inline]
+    pub fn laid_out_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
+        let SlotData::Fixed { layout, values } = &mut self.data else {
+            return None;
+        };
+        match &layout.get(idx)?.0 {
+            Object::Str(stored)
+                if std::ptr::eq(stored.as_ptr(), name.as_ptr())
+                    || slot_name_eq(stored.as_ref(), name) =>
+            {
+                values.get_mut(idx)
+            }
+            _ => None,
+        }
     }
 
     /// `get_mut(name)` with a position hint (see [`Self::get_hinted`]).
@@ -2445,6 +2564,9 @@ impl SlotStorage {
                     .zip(names)
                     .all(|(key, name)| key_named(key, name))
                 {
+                    return None;
+                }
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
                     return None;
                 }
                 Some(std::array::from_fn(|i| &values[i]))
@@ -2552,7 +2674,11 @@ impl SlotStorage {
                 {
                     return None;
                 }
-                values.get_mut(..N)?
+                let values = values.get_mut(..N)?;
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return None;
+                }
+                values
             }
             _ => return None,
         };
@@ -2577,7 +2703,8 @@ impl SlotStorage {
                 .position(
                     |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
                 )
-                .and_then(|i| values.get_mut(i)),
+                .and_then(|i| values.get_mut(i))
+                .filter(|value| !matches!(value, Object::Unbound)),
             _ => None,
         }
     }
@@ -2603,9 +2730,13 @@ impl SlotStorage {
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
         self.unpack();
-        if let SlotData::Fixed { .. } = &self.data {
-            if let Some(slot) = self.get_mut(name) {
-                return Some(std::mem::replace(slot, value));
+        if let SlotData::Fixed { layout, values } = &mut self.data {
+            // A laid-out name fills its slot, set or not.
+            if let Some(i) = layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            ) {
+                let old = std::mem::replace(&mut values[i], value);
+                return (!matches!(old, Object::Unbound)).then_some(old);
             }
             self.unfix();
         }
@@ -2664,6 +2795,16 @@ impl SlotStorage {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Object> {
+        self.unpack();
+        if let SlotData::Fixed { layout, values } = &mut self.data {
+            // A laid-out slot is unset in place.
+            if let Some(i) = layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            ) {
+                let old = std::mem::replace(&mut values[i], Object::Unbound);
+                return (!matches!(old, Object::Unbound)).then_some(old);
+            }
+        }
         self.unfix();
         match &mut self.data {
             SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if slot_name_eq(stored.as_ref(), name)) =>
@@ -2701,6 +2842,8 @@ impl SlotStorage {
                     .into_iter()
                     .flat_map(|(layout, values)| layout.iter().zip(values.iter())),
             )
+            // (An unset laid-out slot.)
+            .filter(|(_, value)| !matches!(value, Object::Unbound))
     }
 }
 
@@ -2860,12 +3003,13 @@ thread_local! {
 
 impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
+        let slots = class.fresh_slots();
         Self {
             class: RefCell::new(class),
             dict: crate::inst_dict::InstDict::new(),
             native: crate::sync::OnceBox::new(),
             inline_values: Cell::new(true),
-            slots: RefCell::new(SlotStorage::default()),
+            slots: RefCell::new(slots),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
@@ -2876,12 +3020,13 @@ impl PyInstance {
     /// Build an instance that wraps a primitive `native` value
     /// (subclass of `int`/`str`/…).
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
+        let slots = class.fresh_slots();
         Self {
             class: RefCell::new(class),
             dict: crate::inst_dict::InstDict::new(),
             native: crate::sync::OnceBox::from(native),
             inline_values: Cell::new(true),
-            slots: RefCell::new(SlotStorage::default()),
+            slots: RefCell::new(slots),
             hash_cache: crate::sync::CachedHash::new(None),
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
@@ -2906,6 +3051,7 @@ impl PyInstance {
             // class changes. A pooled instance keeps whatever dict it
             // was retired with, already cleared and carrying the record.
             if let Some(m) = Rc::get_mut(&mut inst) {
+                *m.slots.get_mut() = class.fresh_slots();
                 *m.class.get_mut() = class;
                 m.deferred.set(true);
                 if hint > 0 {
@@ -3292,8 +3438,14 @@ mod slot_storage_tests {
             assert!(second.get("extra").is_none());
             assert_eq!(matches!(first.data, SlotData::Small(_)), len == 4);
             assert_eq!(matches!(first.data, SlotData::Many(_)), len == 24);
+            // Removing a laid-out slot unsets it in place: the layout
+            // stays shared, and the slot reads as absent.
             assert!(second.remove(&names[0]).is_some());
-            assert!(weak_layout.upgrade().is_none());
+            assert!(second.remove(&names[0]).is_none());
+            assert!(second.get(&names[0]).is_none());
+            assert!(second.index_of(&names[0]).is_none());
+            assert!(matches!(second.data, SlotData::Fixed { .. }));
+            assert_eq!(weak_layout.strong_count(), 1);
             assert_eq!(weak_value.strong_count(), 2 * len - 3);
             for (index, (key, _)) in first.iter().take(len).enumerate() {
                 let Object::Str(stored) = &key.0 else {
@@ -3311,9 +3463,40 @@ mod slot_storage_tests {
             assert_eq!(weak_value.strong_count(), len - 1);
             assert!(matches!(second.get(&names[1]), Some(Object::Str(_))));
             drop(second);
+            assert!(weak_layout.upgrade().is_none());
             assert!(weak_value.upgrade().is_none());
             assert!(names.iter().all(|name| SharedStr::strong_count(name) == 1));
         }
+    }
+
+    #[test]
+    fn unset_layout_slots_read_as_absent_until_stored() {
+        let layout: SharedSlice<DictKey> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| DictKey(Object::Str(SharedStr::from(name))))
+            .collect::<Vec<_>>()
+            .into();
+        let mut slots = SlotStorage::unset_over(layout);
+        assert!(slots.get("a").is_none());
+        assert!(slots.get_index(0).is_none());
+        assert!(slots.get_mut("b").is_none());
+        assert!(slots.index_of("c").is_none());
+        assert_eq!(slots.store_position("c"), Some(2));
+        assert_eq!(slots.iter().count(), 0);
+        // A store fills its laid-out slot in place.
+        assert!(slots.insert("b", Object::Int(2)).is_none());
+        *slots.laid_out_mut(2, "c").unwrap() = Object::Int(3);
+        assert!(matches!(slots.data, SlotData::Fixed { .. }));
+        assert_eq!(slots.get("b").and_then(Object::as_i64), Some(2));
+        assert_eq!(slots.index_of("c"), Some(2));
+        let set: Vec<i64> = slots.iter().filter_map(|(_, v)| v.as_i64()).collect();
+        assert_eq!(set, [2, 3]);
+        assert!(slots.leading([&SharedStr::from("a")]).is_none());
+        // A name off the layout moves the set slots to the per-key form.
+        slots.insert("d", Object::Int(4));
+        assert!(!matches!(slots.data, SlotData::Fixed { .. }));
+        assert!(slots.get("a").is_none());
+        assert_eq!(slots.iter().count(), 3);
     }
 
     #[test]

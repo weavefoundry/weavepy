@@ -291,7 +291,7 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
                         let slots = inst.slots.borrow();
                         // A first assignment appends. The fast path still
                         // validates the name at this position on every use.
-                        let key_idx = slots.index_of(name).unwrap_or_else(|| {
+                        let key_idx = slots.store_position(name).unwrap_or_else(|| {
                             u32::try_from(slots.iter().count()).unwrap_or(u32::MAX)
                         });
                         return InlineCache::StoreAttrSlot { key_idx, ver };
