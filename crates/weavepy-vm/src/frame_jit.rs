@@ -246,6 +246,9 @@ impl Native {
 pub(crate) struct Slot {
     native: std::sync::OnceLock<Option<Box<Native>>>,
     heat: AtomicU32,
+    /// An activation's heat (see `warm`), computed once: `0` until then.
+    /// (Its division showed in every call's profile.)
+    call_heat: AtomicU32,
     /// How many times the code got hot while start-up or an import ran
     /// (see `try_compile`).
     deferred: AtomicU32,
@@ -279,7 +282,14 @@ impl Slot {
         let n = code.instructions.len() as u32;
         let add = match at {
             Heat::BackEdge(pc) => code.instructions.get(pc).map_or(1, |i| i.arg.max(1)),
-            Heat::Call | Heat::Step => (n / tuning().call_div).max(1),
+            Heat::Call | Heat::Step => match self.call_heat.load(Ordering::Relaxed) {
+                0 => {
+                    let add = (n / tuning().call_div).max(1);
+                    self.call_heat.store(add, Ordering::Relaxed);
+                    add
+                }
+                add => add,
+            },
         };
         // (A racing thread losing a count is harmless.)
         let h = self.heat.load(Ordering::Relaxed).saturating_add(add);
