@@ -353,6 +353,21 @@ fn adapt_and_bind(
     if is_directly_bindable(value) && !have_adapters() {
         return bind_one(db, stmt, idx, value);
     }
+    // An exact `int`, `float`, `str` or `bytearray` binds as is until an
+    // adapter for one of those types is registered (CPython's
+    // `need_adapt`).
+    if matches!(
+        value,
+        Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::WStr(_)
+            | Object::ByteArray(_)
+    ) && !super::base_type_adapted()
+    {
+        return bind_one(db, stmt, idx, value);
+    }
     let proto = Object::Type(prepare_protocol_class());
     // Adaptation falls back to the original object; `bind_one` then
     // raises the CPython ProgrammingError shape for unsupported types.
