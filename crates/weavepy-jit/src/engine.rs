@@ -144,6 +144,10 @@ pub struct DirectLeaf {
     /// Per parameter, the bits of the default a call that leaves it out
     /// binds (in the parameter's lane), when the caller burns it in.
     defaults: Vec<Option<u64>>,
+    /// A method whose body never reads its receiver (see
+    /// [`CompiledFrame::direct_method_leaf`]): local 0 is `self`, and
+    /// [`Self::params`] are the parameters after it.
+    receiver: bool,
 }
 
 impl DirectLeaf {
@@ -199,6 +203,41 @@ impl CompiledFrame {
             defaults: vec![None; params.len()],
             params,
             ret,
+            receiver: false,
+        })
+    }
+
+    /// This frame as the direct-call target of a method taking
+    /// `arg_count` parameters, `self` included: a [`Self::direct_leaf`]
+    /// whose body never reads `self` (its slot has no lane), so a guarded
+    /// method call enters it with the remaining parameters alone. The
+    /// caller's guard (the receiver's class version, no instance
+    /// attribute shadowing the name, the function's `__code__`) is what
+    /// binds the call to this body.
+    #[must_use]
+    pub fn direct_method_leaf(&self, arg_count: u32) -> Option<DirectLeaf> {
+        if arg_count == 0 || self.local_types.first().copied().flatten().is_some() {
+            return None;
+        }
+        let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
+        if !self.scalar_leaf || !self.global_guards.is_empty() || !self.math_guards.is_empty() {
+            return None;
+        }
+        let ret = self.ret_lane.filter(|&t| scalar(t))?;
+        let params = self
+            .local_types
+            .get(1..arg_count as usize)?
+            .iter()
+            .map(|t| t.filter(|&t| scalar(t)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(DirectLeaf {
+            func_id: self.func_id,
+            n_locals: self.n_locals,
+            max_stack: self.max_stack,
+            defaults: vec![None; params.len()],
+            params,
+            ret,
+            receiver: true,
         })
     }
 
@@ -362,25 +401,28 @@ impl JitEngine {
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
         probes: &mut Probes<'_>,
     ) -> Result<CompiledFrame, JitVerdict> {
-        self.compile_frame_direct(code, resolve, probes, &mut |_| None)
+        self.compile_frame_direct(code, resolve, probes, &mut |_| None, &mut |_| None)
     }
 
     /// [`Self::compile_frame`] with the direct-call targets of the callee
     /// tokens: `direct(token)` names a scalar leaf compiled on this
     /// engine (see [`CompiledFrame::direct_leaf`]) that a matching call
-    /// site enters in native code.
+    /// site enters in native code, and `direct_method(token)` one a
+    /// matching method site enters once its guard holds (see
+    /// [`CompiledFrame::direct_method_leaf`]).
     pub fn compile_frame_direct(
         &mut self,
         code: &CodeObject,
         resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
         probes: &mut Probes<'_>,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
         if calls_dynamically(&tfunc) {
             return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
         }
-        self.compile_tfunc_direct(&tfunc, direct)
+        self.compile_tfunc_methods(&tfunc, direct, direct_method)
     }
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
@@ -394,6 +436,17 @@ impl JitEngine {
         &mut self,
         tfunc: &TFunc,
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        self.compile_tfunc_methods(tfunc, direct, &mut |_| None)
+    }
+
+    /// [`Self::compile_tfunc_direct`] with direct method targets (see
+    /// [`Self::compile_frame_direct`]).
+    pub fn compile_tfunc_methods(
+        &mut self,
+        tfunc: &TFunc,
+        direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
     ) -> Result<CompiledFrame, JitVerdict> {
         // These operations each lower to a dedicated embedder helper.
         // Reject missing registrations before embedding an absolute address.
@@ -632,6 +685,35 @@ impl JitEngine {
             }
         }
 
+        // Direct method targets, per method token whose sites pass the
+        // leaf's parameters (lanes checked per site) and expect its result
+        // lane.
+        if runtime::self_call_helper_addrs().is_some() && runtime::method_enter_helper_addr() != 0 {
+            let mut seen: Vec<u32> = Vec::new();
+            for stmt in tfunc.blocks.iter().flat_map(|b| &b.stmts) {
+                let TOp::CallMethod {
+                    token,
+                    argc,
+                    ret: crate::ir::MethodRet::Scalar(ret),
+                } = stmt.op
+                else {
+                    continue;
+                };
+                if token & runtime::METHOD_NATIVE != 0 || seen.contains(&token) {
+                    continue;
+                }
+                seen.push(token);
+                if let Some(leaf) = direct_method(token) {
+                    if leaf.receiver && leaf.params.len() == argc as usize && leaf.ret == ret {
+                        let fref = self
+                            .module
+                            .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
+                        leaves.push((token, fref, leaf));
+                    }
+                }
+            }
+        }
+
         let sound = build_function(
             &mut self.ctx.func,
             &mut self.fbctx,
@@ -647,6 +729,7 @@ impl JitEngine {
                     max_stack: leaf.max_stack,
                     params: leaf.params,
                     defaults: leaf.defaults,
+                    receiver: leaf.receiver,
                 })
                 .collect(),
         );

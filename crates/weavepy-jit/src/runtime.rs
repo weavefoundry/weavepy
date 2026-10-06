@@ -241,7 +241,9 @@ pub struct ObjLayout {
     /// shadowing the method (`u32`), whether the increment is the call's
     /// argument (`u32`: `1`, else `0`), the literal increment (`i64`),
     /// where the function keeps its code pointer and the code pointer that
-    /// must be there (words).
+    /// must be there (words). The shadow bound and the code pair also
+    /// guard a direct method call in line (the code address is null while
+    /// they don't).
     pub method_size: i32,
     pub method_ver: i32,
     pub method_upd_idx: i32,
@@ -1209,6 +1211,30 @@ pub fn register_guard_method_helper(helper: GuardMethodHelper) {
 #[must_use]
 pub(crate) fn guard_method_helper_addr() -> usize {
     GUARD_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The enter helper of a direct method call (see
+/// [`crate::CompiledFrame::direct_method_leaf`]): the method site's
+/// guard against the receiver pin plus the [`SelfEnterHelper`]'s charge
+/// (GIL countdown, observer gate, recursion tick). `0` when the call may
+/// enter the compiled method directly (the charge is then released by the
+/// [`SelfExitHelper`]); anything else leaves the call to the
+/// [`CallMethodHelper`] with nothing charged.
+pub type MethodEnterHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, token: i64) -> i64;
+
+static METHOD_ENTER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide direct method-call enter helper. Frames
+/// compiled before it is registered call their methods through the
+/// [`CallMethodHelper`] alone.
+pub fn register_method_enter_helper(helper: MethodEnterHelper) {
+    METHOD_ENTER_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn method_enter_helper_addr() -> usize {
+    METHOD_ENTER_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 static CALL_NATIVE_METHOD_HELPER: std::sync::atomic::AtomicUsize =

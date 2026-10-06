@@ -76452,6 +76452,167 @@ assert namespace is exported.__dict__
         assert_eq!(out, run(src));
     }
 
+    /// A compiled loop calls a compiled method body that never reads
+    /// `self` directly: once the method has compiled, the loop's calls no
+    /// longer reach `wpjit_call_method`.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_direct_method_call_skips_the_method_helper() {
+        let src = "class C:\n\
+                   \x20   def m(self, a):\n\
+                   \x20       return a + 1\n\
+                   class F:\n\
+                   \x20   def __init__(self):\n\
+                   \x20       self.x = 1\n\
+                   \x20       self.y = 2\n\
+                   \x20   def m(self, a):\n\
+                   \x20       return a * 2\n\
+                   def run(o, n):\n\
+                   \x20   t = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       t += o.m(i)\n\
+                   \x20   return t\n\
+                   def run_f(o, n):\n\
+                   \x20   t = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       t += o.m(i)\n\
+                   \x20   return t\n\
+                   c = C()\n\
+                   f = F()\n\
+                   for k in range(10):\n\
+                   \x20   c.m(k)\n\
+                   \x20   f.m(k)\n\
+                   print(run(c, 20000), run_f(f, 20000))\n";
+        let src_owned = src.to_owned();
+        let (out, helper_calls, calls) = std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src_owned);
+            let helper_calls = crate::tier2::method_helper_calls_for_test();
+            let (calls, _, _) = crate::tier2::native_call_stats_for_test();
+            (out, helper_calls, calls)
+        })
+        .join()
+        .expect("jit worker thread");
+        assert_eq!(out, "200010000 399980000\n");
+        assert_eq!(out, run(src));
+        assert!(
+            helper_calls < 1000,
+            "direct method calls still took the helper: {helper_calls}"
+        );
+        assert!(calls >= 39000, "direct method calls never ran: {calls}");
+    }
+
+    /// Every change to a direct method call's binding reaches the generic
+    /// path with the interpreter's result: the class attribute reassigned,
+    /// an instance attribute shadowing the method, a swapped `__code__`,
+    /// another class, an overflow, a raising body, an observer, and the
+    /// recursion limit.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_direct_method_call_guard_changes_match_interpreter() {
+        let src = "import sys\n\
+                   class C:\n\
+                   \x20   def m(self, a):\n\
+                   \x20       return a + 1\n\
+                   \x20   def div(self, a):\n\
+                   \x20       return 100 // a\n\
+                   class Sub(C):\n\
+                   \x20   def m(self, a):\n\
+                   \x20       return a + 2\n\
+                   def other(self, a):\n\
+                   \x20   return a + 1000\n\
+                   def run(o, n, hook, at):\n\
+                   \x20   t = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       if i == at:\n\
+                   \x20           hook(o)\n\
+                   \x20       t += o.m(i)\n\
+                   \x20   return t\n\
+                   def run_div(o, values):\n\
+                   \x20   t = 0\n\
+                   \x20   for v in values:\n\
+                   \x20       t += o.div(v)\n\
+                   \x20   return t\n\
+                   def nothing(o):\n\
+                   \x20   pass\n\
+                   def rebind(o):\n\
+                   \x20   C.m = lambda self, a: a + 100\n\
+                   def shadow(o):\n\
+                   \x20   o.m = lambda a: -a\n\
+                   def swap(o):\n\
+                   \x20   C.m.__code__ = other.__code__\n\
+                   c = C()\n\
+                   for k in range(10):\n\
+                   \x20   c.m(k)\n\
+                   \x20   c.div(k + 1)\n\
+                   print(run(c, 3000, nothing, -1))\n\
+                   print(run(Sub(), 3000, nothing, -1))\n\
+                   print(run(c, 3000, shadow, 1500))\n\
+                   del c.m\n\
+                   print(run(c, 3000, nothing, -1))\n\
+                   saved = C.m.__code__\n\
+                   print(run(c, 3000, swap, 2000))\n\
+                   C.m.__code__ = saved\n\
+                   print(run(c, 3000, nothing, -1))\n\
+                   print(run(c, 3, nothing, -1), run(c, 2, nothing, -1))\n\
+                   print(run(C(), 2, lambda o: None, 5))\n\
+                   values = [5] * 3000\n\
+                   print(run_div(c, values))\n\
+                   values[2500] = 0\n\
+                   try:\n\
+                   \x20   run_div(c, values)\n\
+                   except ZeroDivisionError as e:\n\
+                   \x20   tb = e.__traceback__\n\
+                   \x20   names = []\n\
+                   \x20   while tb is not None:\n\
+                   \x20       names.append(tb.tb_frame.f_code.co_name)\n\
+                   \x20       tb = tb.tb_next\n\
+                   \x20   print('ZeroDivisionError', names[-2:])\n\
+                   def big(o, n):\n\
+                   \x20   t = 0\n\
+                   \x20   for i in range(n):\n\
+                   \x20       t += o.m(9223372036854775806 + i)\n\
+                   \x20   return t\n\
+                   print(big(c, 3000))\n\
+                   events = []\n\
+                   def prof(frame, event, arg):\n\
+                   \x20   if event == 'call' and frame.f_code.co_name == 'm':\n\
+                   \x20       events.append(1)\n\
+                   sys.setprofile(prof)\n\
+                   r = run(c, 500, nothing, -1)\n\
+                   sys.setprofile(None)\n\
+                   print(r, len(events))\n\
+                   def deep(k):\n\
+                   \x20   if k == 0:\n\
+                   \x20       return run(c, 50, nothing, -1)\n\
+                   \x20   return deep(k - 1)\n\
+                   sys.setrecursionlimit(300)\n\
+                   depth = None\n\
+                   for k in range(200, 320):\n\
+                   \x20   try:\n\
+                   \x20       deep(k)\n\
+                   \x20   except RecursionError:\n\
+                   \x20       depth = k\n\
+                   \x20       break\n\
+                   print('depth', depth)\n\
+                   print(run(c, 3000, rebind, 1000))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 2, "the method kernels never compiled");
+        assert_eq!(out, run(src));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "4501500");
+        assert_eq!(lines[1], "4504500");
+        assert_eq!(lines[2], "-2248500");
+        assert_eq!(lines[3], "4501500");
+        assert_eq!(lines[4], "5500500");
+        assert_eq!(lines[5], "4501500");
+        assert_eq!(lines[8], "60000");
+        assert_eq!(lines[9], "ZeroDivisionError ['run_div', 'div']");
+        assert_eq!(lines[11], "125250 500");
+        assert_eq!(lines[10], "27670116110564331919500");
+        assert_eq!(lines[13], "4699500");
+    }
+
     #[cfg(feature = "jit")]
     #[test]
     fn jit_side_exit_retires_temporary_pins_before_continuation() {

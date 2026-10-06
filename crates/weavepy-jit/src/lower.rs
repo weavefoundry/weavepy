@@ -48,6 +48,10 @@ pub(crate) struct LeafTarget {
     pub params: Vec<JitType>,
     /// Per parameter, the default a call that leaves it out binds.
     pub defaults: Vec<Option<u64>>,
+    /// A method target (see `engine::CompiledFrame::direct_method_leaf`):
+    /// `token` is a method token, local 0 the unread receiver, and
+    /// `params` the parameters after it.
+    pub receiver: bool,
 }
 
 /// Where a direct leaf call takes one parameter from: the call's `j`th
@@ -56,6 +60,15 @@ pub(crate) struct LeafTarget {
 enum LeafArg {
     Arg(usize),
     Default(u64),
+}
+
+/// The scalar lane a method site expects back (a direct method target
+/// returns nothing else); `None` for the procedure and object shapes.
+fn leaf_ret_lane(ret: MethodRet) -> Option<JitType> {
+    match ret {
+        MethodRet::Scalar(t @ (JitType::Int | JitType::Float | JitType::Bool)) => Some(t),
+        _ => None,
+    }
 }
 
 /// A `CallPy`/`CallPyKw` site's operands, for its ordinary call.
@@ -1215,9 +1228,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.b.switch_to_block(cont);
             }
             TOp::MathIntrinsic(func) => self.emit_math_intrinsic(func, stmt.pc),
-            TOp::CallMethod { token, argc, ret } => {
-                self.emit_call_method(token, argc, ret, stmt.pc);
-            }
+            TOp::CallMethod { token, argc, ret } => match self.method_leaf_for(token, argc, ret) {
+                Some(ix) => self.emit_call_method_leaf(ix, token, argc, ret, stmt.pc),
+                None => self.emit_call_method(token, argc, ret, stmt.pc),
+            },
             TOp::GuardMethod { token } => {
                 let snapshot = self.vstack.clone();
                 let &(pin, _) = self.vstack.last().expect("guard on empty stack");
@@ -4442,7 +4456,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// the leaf's parameter lanes and every parameter they leave out has a
     /// default the leaf carries.
     fn leaf_for(&self, token: u32, argc: u8, kwc: u8, perm: u32) -> Option<(usize, Vec<LeafArg>)> {
-        let ix = self.leaves.iter().position(|l| l.token == token)?;
+        let ix = self
+            .leaves
+            .iter()
+            .position(|l| l.token == token && !l.receiver)?;
         let leaf = &self.leaves[ix];
         let n = argc as usize + kwc as usize;
         let base = self.vstack.len().checked_sub(n)?;
@@ -4483,9 +4500,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         ret: JitType,
         pc: u32,
     ) {
-        let trusted = MemFlags::trusted();
-        let (enter_addr, exit_addr, _) =
-            runtime::self_call_helper_addrs().expect("checked by the engine");
+        let (enter_addr, _, _) = runtime::self_call_helper_addrs().expect("checked by the engine");
         let n = call.argc as usize + call.kwc as usize;
         let base = self.vstack.len() - n;
         let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
@@ -4505,8 +4520,228 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let go = self.b.ins().icmp_imm(IntCC::Equal, declined, 0);
         self.b.ins().brif(go, direct_b, &[], generic_b, &[]);
 
-        // The leaf's frame and buffers, in one slot per site.
         self.b.switch_to_block(direct_b);
+        let mut params: Vec<Option<Value>> = Vec::with_capacity(from.len());
+        for f in from {
+            params.push(Some(match *f {
+                LeafArg::Arg(j) => args[j].0,
+                LeafArg::Default(bits) => self.b.ins().iconst(types::I64, bits as i64),
+            }));
+        }
+        self.call_leaf_body(ix, &params, ret, join_b, generic_b);
+
+        // Declined or deopted: the ordinary call, from the start.
+        self.b.switch_to_block(generic_b);
+        self.vstack.extend(args.iter().copied());
+        self.emit_call_py(
+            call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc,
+        );
+        let (v, _) = self.vstack.pop().expect("the call's result");
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        self.b.switch_to_block(join_b);
+        let v = self.b.block_params(join_b)[0];
+        self.vstack.push((v, ret));
+    }
+
+    /// The direct method target of method token `token` (see
+    /// [`LeafTarget::receiver`]), when this site's `argc` arguments have
+    /// the method's parameter lanes and it expects a scalar result.
+    fn method_leaf_for(&self, token: u32, argc: u8, ret: MethodRet) -> Option<usize> {
+        if runtime::method_enter_helper_addr() == 0 || leaf_ret_lane(ret).is_none() {
+            return None;
+        }
+        let ix = self
+            .leaves
+            .iter()
+            .position(|l| l.token == token && l.receiver)?;
+        let leaf = &self.leaves[ix];
+        let n = argc as usize;
+        let base = self.vstack.len().checked_sub(n)?;
+        let lanes_ok = leaf.params.len() == n
+            && self.vstack[base..]
+                .iter()
+                .zip(&leaf.params)
+                .all(|(&(_, ty), &want)| ty == want);
+        lanes_ok.then_some(ix)
+    }
+
+    /// Lower a guarded direct call of a compiled method (see
+    /// [`LeafTarget::receiver`]). The site's guard (the receiver's class
+    /// version, no instance attribute shadowing the name, the function's
+    /// `__code__`) runs in line where the embedder published its layout,
+    /// then the self-call enter helper charges the activation; a miss asks
+    /// the method enter helper, which applies the guard exactly and charges
+    /// in one call. The method's body then runs in its own `JitFrame` on
+    /// this function's native stack frame, its receiver slot unread, and
+    /// the exit helper releases the charge. The body only computes, so when
+    /// the helpers decline (a guard miss, pending interpreter work, an
+    /// observer, the recursion limit) or the body deopts, the method helper
+    /// runs the call from the start, exactly as the site would without a
+    /// direct target.
+    fn emit_call_method_leaf(&mut self, ix: usize, token: u32, argc: u8, ret: MethodRet, pc: u32) {
+        let lane = leaf_ret_lane(ret).expect("checked by method_leaf_for");
+        let n = argc as usize;
+        let base = self.vstack.len() - n;
+        let args: Vec<(Value, JitType)> = self.vstack[base..].to_vec();
+        self.vstack.truncate(base);
+        let recv = self.pop();
+        self.writeback_locals();
+        self.store_call_site_pc(pc);
+
+        let direct_b = self.b.create_block();
+        let generic_b = self.b.create_block();
+        let join_b = self.b.create_block();
+        self.b.append_block_param(join_b, Self::cl_ty(lane));
+
+        if let Some(l) = runtime::obj_layout().copied() {
+            let slow_b = self.b.create_block();
+            self.inline_method_guard(&l, recv.0, token, slow_b);
+            let (enter_addr, _, _) =
+                runtime::self_call_helper_addrs().expect("checked by the engine");
+            let sig = self.self_sig();
+            let enter = self.b.ins().iconst(self.ptr_ty, enter_addr as i64);
+            let c = self.b.ins().call_indirect(sig, enter, &[self.frame_ptr]);
+            let declined = self.b.inst_results(c)[0];
+            let go = self.b.ins().icmp_imm(IntCC::Equal, declined, 0);
+            self.b.ins().brif(go, direct_b, &[], generic_b, &[]);
+            self.b.switch_to_block(slow_b);
+        }
+        let sig = self.list_helper_sig();
+        let enter = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, runtime::method_enter_helper_addr() as i64);
+        let tokenv = self.b.ins().iconst(types::I64, i64::from(token));
+        let c = self
+            .b
+            .ins()
+            .call_indirect(sig, enter, &[self.frame_ptr, recv.0, tokenv]);
+        let declined = self.b.inst_results(c)[0];
+        let go = self.b.ins().icmp_imm(IntCC::Equal, declined, 0);
+        self.b.ins().brif(go, direct_b, &[], generic_b, &[]);
+
+        self.b.switch_to_block(direct_b);
+        let params: Vec<Option<Value>> = std::iter::once(None)
+            .chain(args.iter().map(|&(v, _)| Some(v)))
+            .collect();
+        self.call_leaf_body(ix, &params, lane, join_b, generic_b);
+
+        // Declined or deopted: the method helper, from the start.
+        self.b.switch_to_block(generic_b);
+        self.vstack.push(recv);
+        self.vstack.extend(args.iter().copied());
+        self.emit_call_method(token, argc, ret, pc);
+        let (v, _) = self.vstack.pop().expect("the call's result");
+        self.b.ins().jump(join_b, &[v.into()]);
+
+        self.b.switch_to_block(join_b);
+        let v = self.b.block_params(join_b)[0];
+        self.vstack.push((v, lane));
+    }
+
+    /// The guard of method token `token` on the pinned receiver `pin`, in
+    /// line (see [`runtime::ObjLayout::method_upd_shadow`]): an instance
+    /// pin whose class still has the entry's version, whose values are
+    /// split over its class's names (or empty) and too few to hold the
+    /// method's name, and whose function still wears the entry's code.
+    /// Anything else branches to `miss` (the method enter helper, which
+    /// decides exactly).
+    fn inline_method_guard(&mut self, l: &runtime::ObjLayout, pin: Value, token: u32, miss: Block) {
+        let t = MemFlags::trusted();
+        let ptr = self.ptr_ty;
+        let ctx = self.b.ins().load(ptr, t, self.frame_ptr, OFF_CTX);
+        // The entry, armed with its function's code.
+        let methods = self.b.ins().load(ptr, t, ctx, l.ctx_methods);
+        let n = self.b.ins().load(types::I64, t, methods, l.methods_len);
+        let out = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, n, i64::from(token));
+        self.miss_if(out, miss);
+        let mbuf = self.b.ins().load(ptr, t, methods, l.methods_buf);
+        let e = self
+            .b
+            .ins()
+            .iadd_imm(mbuf, i64::from(token) * i64::from(l.method_size));
+        let code_at = self.b.ins().load(ptr, t, e, l.method_upd_code_at);
+        let unarmed = self.b.ins().icmp_imm(IntCC::Equal, code_at, 0);
+        // The pin.
+        let n = self.b.ins().load(types::I64, t, ctx, l.ctx_pins_len);
+        let out = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pin, n);
+        let bad = self.b.ins().bor(unarmed, out);
+        self.miss_if(bad, miss);
+        // The function still wears the code, and the pin is an instance.
+        let want = self.b.ins().load(ptr, t, e, l.method_upd_code);
+        let code = self.b.ins().load(ptr, t, code_at, 0);
+        let swapped = self.b.ins().icmp(IntCC::NotEqual, code, want);
+        let buf = self.b.ins().load(ptr, t, ctx, l.ctx_pins_ptr);
+        let off = self.b.ins().imul_imm(pin, i64::from(l.pin_size));
+        let p = self.b.ins().iadd(buf, off);
+        let ptag = self.b.ins().uload8(types::I32, t, p, l.pin_tag);
+        let otag = self.b.ins().uload8(types::I32, t, p, l.pin_obj);
+        let not_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(l.tag_instance));
+        let bad = self.b.ins().bor(not_obj, not_inst);
+        let bad = self.b.ins().bor(bad, swapped);
+        self.miss_if(bad, miss);
+        let inst = self.b.ins().load(ptr, t, p, l.pin_obj + 8);
+        // Its class against the entry's version, and its values: split (no
+        // published dict), not being written, and not shared between
+        // threads.
+        let ver = self.b.ins().load(types::I64, t, e, l.method_ver);
+        let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
+        let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
+        let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, other);
+        self.miss_if(bad, miss);
+        // No values can't shadow the name; any must be over the class's
+        // names and fewer than precede the name there.
+        let hit = self.b.create_block();
+        let values = self.b.create_block();
+        self.b.ins().brif(block, values, &[], hit, &[]);
+        self.b.switch_to_block(values);
+        let keys = self.b.ins().load(ptr, t, block, l.split_keys);
+        let ckeys = self.b.ins().load(ptr, t, cls, l.type_shared_keys);
+        let len = self.b.ins().uload32(t, block, l.split_len);
+        let shadow = self.b.ins().uload32(t, e, l.method_upd_shadow);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+        let shadowed = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, shadow);
+        let bad = self.b.ins().bor(foreign, shadowed);
+        self.b.ins().brif(bad, miss, &[], hit, &[]);
+        self.b.switch_to_block(hit);
+    }
+
+    /// Run the charged leaf `ix` in a `JitFrame` laid out in a stack slot
+    /// of this function, its locals bound to `params` (a `None`, and every
+    /// local past them, starts zeroed), then release the charge through the
+    /// self-call exit helper. A returned body jumps to `join` with its
+    /// `ret`-lane result; anything else to `fallback`.
+    fn call_leaf_body(
+        &mut self,
+        ix: usize,
+        params: &[Option<Value>],
+        ret: JitType,
+        join: Block,
+        fallback: Block,
+    ) {
+        let trusted = MemFlags::trusted();
+        let (_, exit_addr, _) = runtime::self_call_helper_addrs().expect("checked by the engine");
         let leaf = &self.leaves[ix];
         let (func, n_locals, cap) = (
             leaf.func,
@@ -4547,13 +4782,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b.ins().store(trusted, null, fp, OFF_CALL_ARGS);
         self.b.ins().store(trusted, null, fp, OFF_CALL_TAGS);
         for slot_ix in 0..n_locals {
-            let v = match from.get(slot_ix as usize) {
-                Some(&LeafArg::Arg(j)) => args[j].0,
-                Some(&LeafArg::Default(bits)) => self.b.ins().iconst(types::I64, bits as i64),
-                None => zero64,
-            };
+            let v = params
+                .get(slot_ix as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(zero64);
             self.b.ins().store(trusted, v, locals, slot_ix * 8);
         }
+        let sig = self.self_sig();
         let c = self.b.ins().call(func, &[fp]);
         let status = self.b.inst_results(c)[0];
         let exit = self.b.ins().iconst(self.ptr_ty, exit_addr as i64);
@@ -4563,26 +4799,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .b
             .ins()
             .icmp_imm(IntCC::Equal, status, JitStatus::Returned as i64);
-        self.b.ins().brif(is_ret, returned_b, &[], generic_b, &[]);
+        self.b.ins().brif(is_ret, returned_b, &[], fallback, &[]);
         self.b.switch_to_block(returned_b);
         let v = self
             .b
             .ins()
             .load(Self::cl_ty(ret), trusted, fp, OFF_RET_BITS);
-        self.b.ins().jump(join_b, &[v.into()]);
-
-        // Declined or deopted: the ordinary call, from the start.
-        self.b.switch_to_block(generic_b);
-        self.vstack.extend(args.iter().copied());
-        self.emit_call_py(
-            call.token, call.argc, call.kwc, call.perm, call.gaps, ret, pc,
-        );
-        let (v, _) = self.vstack.pop().expect("the call's result");
-        self.b.ins().jump(join_b, &[v.into()]);
-
-        self.b.switch_to_block(join_b);
-        let v = self.b.block_params(join_b)[0];
-        self.vstack.push((v, ret));
+        self.b.ins().jump(join, &[v.into()]);
     }
 
     /// The `(frame) -> i64` signature of the self-call enter/exit
