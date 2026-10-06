@@ -15679,7 +15679,8 @@ impl Interpreter {
                 }
                 let r = match (c, k) {
                     (Object::List(xs), Object::Int(i)) => {
-                        let xs = xs.try_borrow().ok()?;
+                        // SAFETY: a read between two instructions.
+                        let xs = unsafe { xs.peek() }?;
                         let n = xs.len() as i64;
                         let i = if *i < 0 { *i + n } else { *i };
                         if i < 0 || i >= n {
@@ -15697,7 +15698,9 @@ impl Interpreter {
                     }
                     (Object::Dict(d), Object::Str(_) | Object::Int(_)) => {
                         let probe = crate::object::LeafProbe::new(k)?;
-                        let d = d.try_borrow().ok()?;
+                        // SAFETY: a read between two instructions (the
+                        // probe runs no code).
+                        let d = unsafe { d.peek() }?;
                         clone_hot(d.get(&probe)?)
                     }
                     // A string's code point (`str_char_at` byte-indexes an
@@ -15713,7 +15716,8 @@ impl Interpreter {
                     }
                     (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
                         let probe = crate::object::LeafProbe::new(k)?;
-                        let d = d.try_borrow().ok()?;
+                        // SAFETY: as above.
+                        let d = unsafe { d.peek() }?;
                         clone_hot(d.get(&probe)?)
                     }
                     // `seq[a:b:c]` with plain int (or omitted) bounds: the
@@ -15789,7 +15793,9 @@ impl Interpreter {
                 let displaced_ok = |old: &Object| scalar(old) || Self::core_droppable(old);
                 let old = match (c, k) {
                     (Object::List(xs), Object::Int(i)) => {
-                        let mut xs = xs.try_borrow_mut().ok()?;
+                        // SAFETY: a store between two instructions (the
+                        // displaced value is released after the view ends).
+                        let xs = unsafe { xs.peek_mut() }?;
                         let n = xs.len() as i64;
                         let i = if *i < 0 { *i + n } else { *i };
                         if i < 0 || i >= n || !displaced_ok(&xs[i as usize]) {
@@ -15804,7 +15810,9 @@ impl Interpreter {
                             return None;
                         }
                         let probe = crate::object::LeafProbe::new(k)?;
-                        let mut d = cell.try_borrow_mut().ok()?;
+                        // SAFETY: as above (the probe and the insert run
+                        // no code).
+                        let d = unsafe { cell.peek_mut() }?;
                         let (old, changed) = match d.get_mut(&probe) {
                             Some(slot) => {
                                 if !displaced_ok(slot) {
@@ -15827,7 +15835,6 @@ impl Interpreter {
                                 (Object::None, true)
                             }
                         };
-                        drop(d);
                         if changed {
                             crate::object::dict_mutation_event(cell);
                         }
@@ -15905,7 +15912,9 @@ impl Interpreter {
                 let Object::List(lst) = (unsafe { &*base.add(len - 1 - depth) }) else {
                     return None;
                 };
-                let mut l = lst.try_borrow_mut().ok()?;
+                // SAFETY: a store between two instructions; growing the
+                // list runs no code.
+                let l = unsafe { lst.peek_mut() }?;
                 // SAFETY: the value leaves the stack into the list.
                 l.push(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
