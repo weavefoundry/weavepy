@@ -22121,6 +22121,18 @@ impl Interpreter {
     /// finalizers), the call is left to the full handler.
     #[inline]
     fn leaf_type_call(&self, ty: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+        // `ValueError("msg")`: a builtin exception class whose
+        // construction is the instance alone (no group's validating
+        // `__new__`, no class-defined `__init__` to run), as the full
+        // call builds it.
+        if ty.flags.is_builtin && ty.flags.is_exception {
+            if ty.is_subclass_of(&builtin_types().base_exception_group)
+                || lookup_exception_init(ty).is_some()
+            {
+                return None;
+            }
+            return Some(self.build_exception_instance(ty.clone(), args));
+        }
         let fns = self.leaf_fns();
         if Rc::ptr_eq(ty, &fns.str_ty) {
             // `str(x)` of a native scalar is its text: no `__str__`
