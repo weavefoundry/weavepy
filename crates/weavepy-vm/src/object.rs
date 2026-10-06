@@ -12363,8 +12363,16 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
 /// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
 /// with the reserved `-1` remapped to `-2`.
 pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
-    const MOD: u128 = (1u128 << PY_HASH_BITS) - 1;
-    let mut x = (i128::from(n).unsigned_abs() % MOD) as i64;
+    // The modulus is the Mersenne prime `2**61 - 1`, so `|n| mod P` folds
+    // the high bits onto the low ones instead of dividing: `|n| < 2**64`
+    // leaves at most one subtraction.
+    const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    let a = n.unsigned_abs();
+    let mut r = (a & MOD) + (a >> PY_HASH_BITS);
+    if r >= MOD {
+        r -= MOD;
+    }
+    let mut x = r as i64;
     if n < 0 {
         x = -x;
     }
@@ -13767,6 +13775,40 @@ const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int_hash_folds_like_the_modulus() {
+        let reference = |n: i64| -> i64 {
+            let m = (1u128 << 61) - 1;
+            let mut x = (i128::from(n).unsigned_abs() % m) as i64;
+            if n < 0 {
+                x = -x;
+            }
+            if x == -1 {
+                -2
+            } else {
+                x
+            }
+        };
+        let p = (1i64 << 61) - 1;
+        let mut cases = vec![0, 1, -1, -2, 2, i64::MAX, i64::MIN, i64::MIN + 1];
+        for base in [p, 2 * p, 3 * p, 1 << 61, 1 << 62, i64::MAX] {
+            for d in -3..=3 {
+                cases.push(base.wrapping_add(d));
+                cases.push(base.wrapping_add(d).wrapping_neg());
+            }
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            cases.push(x as i64);
+        }
+        for n in cases {
+            assert_eq!(super::py_hash_long_i64(n), reference(n), "hash({n})");
+        }
+    }
+
     #[test]
     fn clone_counts_every_layout() {
         use crate::object::Object;
