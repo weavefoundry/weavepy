@@ -17361,10 +17361,95 @@ impl Interpreter {
             }
             // (Left at the `SEND` if it declines: the core loop runs it.)
             gf.pc = send_pc as u32;
-            if !self.core_gen_resume_one(sw, send_pc, InlineResume::Send) {
+            if !self.core_send_hop(sw, send_pc) {
                 break;
             }
         }
+        true
+    }
+
+    /// One level of [`Self::core_gen_resume`]'s `yield from` chain: the
+    /// running generator activation's `SEND` at `send_pc` to the suspended
+    /// generator under its sent value, as [`Self::try_inline_gen`] resumes
+    /// it for `InlineResume::Send`, with only the checks a suspended
+    /// delegate needs. `false` touches nothing.
+    #[inline(always)]
+    fn core_send_hop(&mut self, sw: &mut CoreSwitch, send_pc: usize) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced, and
+        // its stack holds `[.., delegate, sent]` (checked by the caller).
+        let frame = unsafe { &mut *sw.cur };
+        let jump = frame.code.instructions[send_pc].arg;
+        if jump & GEN_SEND != 0 {
+            return false;
+        }
+        let n = frame.stack.len();
+        let (Object::Generator(g) | Object::Coroutine(g)) = &frame.stack[n - 2] else {
+            return false;
+        };
+        let sent_none = matches!(frame.stack[n - 1], Object::None);
+        // SAFETY: nothing below reaches the cell again until `state`'s last
+        // use (`peek_mut` rejects a live guard or shared cells).
+        let Some(state) = (unsafe { g.state.peek_mut() }) else {
+            return false;
+        };
+        let GeneratorState::Suspended(boxed) = &*state else {
+            return false;
+        };
+        let gf: &Frame = boxed;
+        #[cfg(feature = "jit")]
+        if gf.parked_native.is_some() {
+            return false;
+        }
+        if gf.py_frame.is_some()
+            || !gf.saved_exc_info.is_empty()
+            || (!sent_none && gf.sent_consumed)
+            || gf.shell_cache.as_ref().is_some_and(|c| {
+                c.has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            || !Self::lean_gen_code_ok(&gf.code)
+        {
+            return false;
+        }
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            return false;
+        };
+        // Committed.
+        let GeneratorState::Suspended(mut boxed) =
+            std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("checked above");
+        };
+        let g = g.clone();
+        boxed.gen_first_resume = false;
+        // SAFETY: `n >= 2`.
+        let sent = unsafe { frame.stack.pop().unwrap_unchecked() };
+        if std::mem::take(&mut boxed.sent_consumed) {
+            drop(sent);
+        } else {
+            push_fast(&mut boxed.stack, sent);
+        }
+        frame.pc = send_pc as u32 + 1;
+        let gen_frame: *mut Frame = &mut *boxed;
+        let mut act = self.inline_slot();
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: a pooled slot holds none of these (see `try_inline_gen`).
+        unsafe {
+            std::ptr::write(&raw mut act.gen, Some(g));
+            std::ptr::write(&raw mut act.gen_box, Some(boxed));
+            std::ptr::write(&raw mut act.guard, Some(guard));
+        }
+        act.gen_frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.act.frame = gen_frame;
+        act.call_pc = send_pc;
+        act.caller_pending = self.core_pending_enter(sw, frame, send_pc);
+        act.exc_depth = self.exc_info_len();
+        // SAFETY: see `CoreSwitch`.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = gen_frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
     }
 
@@ -17421,7 +17506,7 @@ impl Interpreter {
     fn core_gen_yield(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
         // SAFETY: see `CoreSwitch`.
         let inl = unsafe { &mut *sw.inl };
-        let depth = inl.len();
+        let mut depth = inl.len();
         let Some(top) = inl.last_mut() else {
             return false;
         };
@@ -17439,75 +17524,102 @@ impl Interpreter {
             return false;
         }
         // SAFETY: the running activation is `top`'s generator frame.
-        let frame = unsafe { &mut *sw.cur };
-        let Some(v) = frame.stack.pop() else {
+        let Some(v) = (unsafe { &mut *sw.cur }).stack.pop() else {
             return false;
         };
-        let cur_pc = frame.pc as usize;
-        frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
-        frame.pc = cur_pc as u32 + 1;
-        let mut done = inl.pop().expect("checked above");
-        if depth == sw.entry_depth {
-            sw.entry_dead = true;
-        }
-        // A shell the generator got while it ran (a `step` flushed the
-        // spine) leaves the spine as the full yield's epilogue does; the
-        // frame keeps it in `shell_cache` for the next resume.
-        if let Some(shell) = done.act.shell.take() {
-            self.retire_quiet_shell(shell, frame, cur_pc);
-        }
-        // `inline_gen_finish`'s shell-less yield (the generator parks
-        // again) and `inline_gen_deliver`'s yielded value, directly.
-        drop(done.guard.take());
-        let gen = done.gen.take().expect("a generator activation");
-        let boxed = done.gen_box.take().expect("a generator activation");
-        done.gen_frame = std::ptr::null_mut();
-        Self::park_suspended_boxed(&gen, boxed);
-        drop(gen);
-        let call_pc = done.call_pc;
-        self.lean_pending_exit(done.caller_pending);
-        // SAFETY: the shell was taken above: no drop glue owed.
-        unsafe { std::ptr::write(&raw mut done.act.shell, None) };
-        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
-        done.caller_pending = None;
-        if self.inline_pool.len() < INLINE_POOL_CAP {
-            self.inline_pool.push(done);
-        }
-        let mut tmp = None;
-        // SAFETY: the consumer is the innermost remaining activation.
-        let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
-        // SAFETY: as above.
-        unsafe { push_fast(&mut (*cframe).stack, v) };
-        sw.cur = cframe;
-        sw.last = if clast == &raw mut sw.scratch {
-            sw.scratch = usize::MAX;
-            &raw mut sw.scratch
-        } else {
-            clast
-        };
-        // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
-        // SAFETY: as above.
-        unsafe { *sw.last = call_pc };
-        if self.gil_countdown <= 2 {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
-            return true;
-        }
-        self.gil_countdown -= 1;
-        if crate::hot_gates::loop_gen() != snap_gen {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
-            return true;
-        }
-        // SAFETY: see `quiet_run`.
-        if unsafe { (*sw.maybe_dead).get() } {
+        let mut frame_ptr = sw.cur;
+        loop {
+            // SAFETY: the yielding activation is `inl`'s innermost one.
+            let frame = unsafe { &mut *frame_ptr };
+            let cur_pc = frame.pc as usize;
+            frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
+            frame.pc = cur_pc as u32 + 1;
+            let mut done = inl.pop().expect("checked above");
+            if depth == sw.entry_depth {
+                sw.entry_dead = true;
+            }
+            // A shell the generator got while it ran (a `step` flushed the
+            // spine) leaves the spine as the full yield's epilogue does;
+            // the frame keeps it in `shell_cache` for the next resume.
+            if let Some(shell) = done.act.shell.take() {
+                self.retire_quiet_shell(shell, frame, cur_pc);
+            }
+            // `inline_gen_finish`'s shell-less yield (the generator parks
+            // again) and `inline_gen_deliver`'s yielded value, directly.
+            drop(done.guard.take());
+            let gen = done.gen.take().expect("a generator activation");
+            let boxed = done.gen_box.take().expect("a generator activation");
+            done.gen_frame = std::ptr::null_mut();
+            Self::park_suspended_boxed(&gen, boxed);
+            drop(gen);
+            let call_pc = done.call_pc;
+            self.lean_pending_exit(done.caller_pending);
+            // SAFETY: the shell was taken above: no drop glue owed.
+            unsafe { std::ptr::write(&raw mut done.act.shell, None) };
+            done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+            done.caller_pending = None;
+            if self.inline_pool.len() < INLINE_POOL_CAP {
+                self.inline_pool.push(done);
+            }
+            let mut tmp = None;
+            // SAFETY: the consumer is the innermost remaining activation.
+            let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+            sw.cur = cframe;
+            sw.last = if clast == &raw mut sw.scratch {
+                sw.scratch = usize::MAX;
+                &raw mut sw.scratch
+            } else {
+                clast
+            };
+            // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
             // SAFETY: as above.
-            unsafe {
-                self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+            unsafe { *sw.last = call_pc };
+            depth -= 1;
+            // A `yield from` chain: a consumer that is itself an inline
+            // generator resume, at its own yield, passes the value straight
+            // on (its yield is the next instruction; nothing ran between).
+            // SAFETY: as above.
+            let chains = self.gil_countdown > 3
+                && inl.last().is_some_and(|t| {
+                    t.gen.is_some()
+                        && t.act
+                            .shell
+                            .as_deref()
+                            .is_none_or(|s| self.shell_pops_quietly(s, t.exc_depth))
+                })
+                && unsafe { &*cframe }
+                    .code
+                    .instructions
+                    .get(unsafe { (*cframe).pc } as usize)
+                    .is_some_and(|i| i.op == OpCode::YieldValue);
+            if chains {
+                self.gil_countdown -= 1;
+                frame_ptr = cframe;
+                continue;
             }
-            if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+            // SAFETY: as above.
+            unsafe { push_fast(&mut (*cframe).stack, v) };
+            if self.gil_countdown <= 2 {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                return true;
             }
+            self.gil_countdown -= 1;
+            if crate::hot_gates::loop_gen() != snap_gen {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                return true;
+            }
+            // SAFETY: see `quiet_run`.
+            if unsafe { (*sw.maybe_dead).get() } {
+                // SAFETY: as above.
+                unsafe {
+                    self.flush_lean(&mut *cframe, &mut *cshell.cast::<QuietShell<'_>>());
+                }
+                if self.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != snap_gen {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+                }
+            }
+            return true;
         }
-        true
     }
 
     /// [`Self::core_return`] of an inline generator resume: the quiet
