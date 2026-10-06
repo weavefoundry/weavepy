@@ -10838,6 +10838,11 @@ impl Interpreter {
             let cap = stack.capacity();
             let mut len = stack.len();
             let mut pc = frame.pc as usize;
+            // The one bounds check: from an entry pc the validated code
+            // never leaves (see `code_dispatch_len`).
+            if pc >= ext.map_or(0, |e| e.dispatch_len) {
+                return CoreExit::Stop(LeafStop::Step);
+            }
             let mut last = *last_pc;
             let pending_work = sw.maybe_dead;
             // A dying object's `Drop` queued a finalizer or callback: the
@@ -10928,13 +10933,16 @@ impl Interpreter {
                         if let Some(e) = nst.err.take() {
                             break Some(CoreExit::Stop(LeafStop::Raised(e)));
                         }
+                        // (The arms below index without a check.)
+                        if pc >= ninstrs {
+                            break Some(CoreExit::Stop(LeafStop::Step));
+                        }
                         handed = pc;
                     }
                 }
-                if pc >= ninstrs {
-                    break Some(CoreExit::Stop(LeafStop::Step));
-                }
-                // SAFETY: bounds checked just above.
+                // SAFETY: `pc < ninstrs`: checked at entry, and no arm
+                // that continues here leaves the code (see
+                // `code_dispatch_len`).
                 let ins = unsafe { *instrs.add(pc) };
                 match ins.op {
                     OpCode::LoadFast => {
@@ -11051,10 +11059,10 @@ impl Interpreter {
                                     pc = jump_pc + 1;
                                     if taken {
                                         pc += jump.arg as usize;
-                                    } else if pc < ninstrs
-                                        // SAFETY: `pc < ninstrs`.
-                                        && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
-                                    {
+                                    } else if
+                                    // SAFETY: a branch never ends the code (see
+                                    // `code_dispatch_len`).
+                                    unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken {
                                         pc += 1;
                                     }
                                     continue;
@@ -11416,10 +11424,10 @@ impl Interpreter {
                         pc += 1;
                         if is_none == (ins.op == OpCode::PopJumpIfNone) {
                             pc += ins.arg as usize;
-                        } else if pc < ninstrs
-                            // SAFETY: `pc < ninstrs`.
-                            && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
-                        {
+                        } else if
+                        // SAFETY: a branch never ends the code (see
+                        // `code_dispatch_len`).
+                        unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken {
                             pc += 1;
                         }
                     }
@@ -11954,10 +11962,10 @@ impl Interpreter {
                         pc += 1;
                         if truthy == (ins.op == OpCode::PopJumpIfTrue) {
                             pc += ins.arg as usize;
-                        } else if pc < ninstrs
-                            // SAFETY: `pc < ninstrs`.
-                            && unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken
-                        {
+                        } else if
+                        // SAFETY: a branch never ends the code (see
+                        // `code_dispatch_len`).
+                        unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken {
                             pc += 1;
                         }
                     }
@@ -12147,8 +12155,9 @@ impl Interpreter {
                                         last = pc;
                                         pc += 1 + ins.arg as usize;
                                         let op_at = |pc: usize| {
-                                            // SAFETY: `pc < ninstrs` is checked first.
-                                            (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                                            // SAFETY: a loop's exit and the `END_FOR` after it
+                                            // never end the code (see `code_dispatch_len`).
+                                            Some(unsafe { (*instrs.add(pc)).op })
                                         };
                                         if op_at(pc) == Some(OpCode::EndFor) {
                                             pc += 1;
@@ -12360,8 +12369,9 @@ impl Interpreter {
                                         last = pc;
                                         pc += 1 + ins.arg as usize;
                                         let op_at = |pc: usize| {
-                                            // SAFETY: `pc < ninstrs` is checked first.
-                                            (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                                            // SAFETY: a loop's exit and the `END_FOR` after it
+                                            // never end the code (see `code_dispatch_len`).
+                                            Some(unsafe { (*instrs.add(pc)).op })
                                         };
                                         if op_at(pc) == Some(OpCode::EndFor) {
                                             pc += 1;
@@ -12488,8 +12498,9 @@ impl Interpreter {
                             last = pc;
                             pc += 1 + ins.arg as usize;
                             let op_at = |pc: usize| {
-                                // SAFETY: `pc < ninstrs` is checked first.
-                                (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op })
+                                // SAFETY: a loop's exit and the `END_FOR` after it
+                                // never end the code (see `code_dispatch_len`).
+                                Some(unsafe { (*instrs.add(pc)).op })
                             };
                             if op_at(pc) == Some(OpCode::EndFor) {
                                 pc += 1;
@@ -66717,6 +66728,55 @@ struct CodeConstObjects {
     /// unallocated, until the code is warm enough to allocate them (see
     /// [`site_tables_warm`]).
     cold_sites: std::sync::atomic::AtomicU32,
+    /// The pcs the core loop may enter the code at (see
+    /// [`code_dispatch_len`]): the instruction count, or `0` when some
+    /// path could run off the end.
+    dispatch_len: usize,
+}
+
+/// The bound the core loop checks a code object's entry pc against, so it
+/// dispatches each instruction without a bounds check: the instruction
+/// count when no path from an instruction can leave the code, else `0`
+/// (such code never runs in the core loop).
+///
+/// The core loop's arms advance past an instruction, jump by its
+/// argument, or leave the loop (a call, return, raise or handoff, whose
+/// new pc the next entry checks). So the code qualifies when its last
+/// instruction can't fall through and every forward jump lands on an
+/// instruction; a backward jump saturates at `0`. A fused arm advances
+/// over several instructions, each of which falls through, so it stays
+/// in bounds too.
+fn code_dispatch_len(code: &CodeObject) -> usize {
+    let instrs = &code.instructions;
+    let n = instrs.len();
+    let terminal = |op| {
+        matches!(
+            op,
+            OpCode::ReturnValue
+                | OpCode::Reraise
+                | OpCode::RaiseVarargs
+                | OpCode::JumpBackward
+                | OpCode::JumpForward
+        )
+    };
+    if instrs.last().is_none_or(|i| !terminal(i.op)) {
+        return 0;
+    }
+    let jumps_in = instrs.iter().enumerate().all(|(p, i)| match i.op {
+        OpCode::PopJumpIfFalse
+        | OpCode::PopJumpIfTrue
+        | OpCode::PopJumpIfNone
+        | OpCode::PopJumpIfNotNone
+        | OpCode::JumpForward
+        | OpCode::ForIter
+        | OpCode::Send => p + 1 + (i.arg as usize) < n,
+        _ => true,
+    });
+    if jumps_in {
+        n
+    } else {
+        0
+    }
 }
 
 /// Whether `ext`'s code (of `ninstrs` instructions) may allocate its
@@ -68443,6 +68503,7 @@ fn code_vm_ext_build(
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
             cold_sites: std::sync::atomic::AtomicU32::new(0),
+            dispatch_len: code_dispatch_len(code),
         })
     })
 }
