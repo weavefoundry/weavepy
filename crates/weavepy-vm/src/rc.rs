@@ -294,6 +294,20 @@ impl<T: ?Sized + 'static> Rc<T> {
 
     #[inline]
     pub fn downgrade(this: &Self) -> Weak<T> {
+        if refcounts_biased() {
+            // `Arc::downgrade`'s compare-and-swap loop guards against
+            // another thread's `get_mut` locking the weak count, which the
+            // bias rules out: the count (the word after the strong one) is
+            // bumped in place, and the new owner is the one it accounts for.
+            let p = Arc::as_ptr(&this.0);
+            // SAFETY: `this` keeps the allocation alive; `strong_word` is
+            // its `ArcInner`'s first field, the weak count its second.
+            unsafe {
+                let weak = &*strong_word(p).add(1);
+                weak.store(weak.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                return Weak(std::sync::Weak::from_raw(p));
+            }
+        }
         Weak(Arc::downgrade(&this.0))
     }
 

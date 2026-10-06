@@ -14020,6 +14020,29 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         Self::unpack_bound_callee(unsafe { &mut *sw.cur }, pc);
+        // A generator function's call is `core_gen_call`'s (no inline
+        // shape below admits one).
+        {
+            // SAFETY: as above.
+            let frame = unsafe { &*sw.cur };
+            let argc = frame
+                .code
+                .instructions
+                .get(pc)
+                .map_or(0, |i| i.arg as usize);
+            if let Some(Object::Function(f)) = frame
+                .stack
+                .len()
+                .checked_sub(argc + 2)
+                .and_then(|k| frame.stack.get(k))
+            {
+                // SAFETY: GIL-serialized raw read of the function's code cell.
+                let code = unsafe { &*f.code.as_ptr() };
+                if code.is_generator || code.is_coroutine || code.is_async_generator {
+                    return false;
+                }
+            }
+        }
         if self.core_call_plain(sw, pc) {
             return true;
         }
@@ -39778,10 +39801,16 @@ impl Interpreter {
         if gen.kind == crate::object::CoroutineKind::AsyncGenerator {
             return;
         }
+        // A generator still in the collector's young set has no index
+        // entry to remove (the set drops it once it's dead).
+        if !gen.gc_registered.get() {
+            return;
+        }
         let id = Rc::as_ptr(gen) as usize as u64;
         if crate::weakref_registry::count_for(id) > 0 {
             return;
         }
+        gen.gc_registered.set(false);
         gc_trace::untrack_registered_id(id);
     }
 

@@ -399,24 +399,13 @@ impl Interpreter {
         if pc >= ninstrs {
             return GenStep::Bail;
         }
+        // The native code's view of the body, built at its first entry.
         #[cfg(feature = "jit")]
-        let mut nst = crate::frame_jit::State {
-            locals: lbase,
-            stack: base,
-            len,
-            cap,
-            pc,
-            last: pc,
-            countdown: std::ptr::addr_of_mut!(self.gil_countdown),
-            snap_gen,
-            maybe_dead: dead,
-            interp: std::ptr::from_ref(self),
-            out: 0,
-            depth_cell: std::ptr::null(),
-            err: None,
-            frame: frame_ptr,
-            sw: std::ptr::null_mut(),
-        };
+        let mut nst: Option<crate::frame_jit::State> = None;
+        #[cfg(feature = "jit")]
+        let countdown = std::ptr::addr_of_mut!(self.gil_countdown);
+        #[cfg(feature = "jit")]
+        let interp = std::ptr::from_ref(self);
         #[cfg(feature = "jit")]
         let mut handed = usize::MAX;
         // SAFETY (throughout): `base` indexes only below `len` (initialized)
@@ -429,12 +418,29 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             if pc != handed {
                 if let Some(native) = native.filter(|n| n.enters_at(pc)) {
+                    let nst = nst.get_or_insert_with(|| crate::frame_jit::State {
+                        locals: lbase,
+                        stack: base,
+                        len,
+                        cap,
+                        pc,
+                        last: pc,
+                        countdown,
+                        snap_gen,
+                        maybe_dead: dead,
+                        interp,
+                        out: 0,
+                        depth_cell: std::ptr::null(),
+                        err: None,
+                        frame: frame_ptr,
+                        sw: std::ptr::null_mut(),
+                    });
                     nst.len = len;
                     nst.pc = pc;
                     // SAFETY: the body's activation state, as this loop
                     // holds it (its locals count checked above). A queued
                     // finalizer waits for the general loop's next check.
-                    let _ = unsafe { native.run(&mut nst) };
+                    let _ = unsafe { native.run(nst) };
                     len = nst.len;
                     pc = nst.pc;
                     handed = pc;

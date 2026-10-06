@@ -5228,6 +5228,9 @@ pub struct PyGenerator {
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
+    /// Whether the cycle collector's index holds an entry for this
+    /// generator (one still in a young set has none).
+    pub gc_registered: crate::sync::Cell<bool>,
 }
 
 impl PyGenerator {
@@ -5248,6 +5251,7 @@ impl PyGenerator {
             hooks_inited: crate::sync::Cell::new(false),
             finalizer: RefCell::new(Object::None),
             finalize_ran: crate::sync::Cell::new(false),
+            gc_registered: crate::sync::Cell::new(false),
         }
     }
 
@@ -5270,6 +5274,7 @@ impl PyGenerator {
             hooks_inited: crate::sync::Cell::new(false),
             finalizer: RefCell::new(Object::None),
             finalize_ran: crate::sync::Cell::new(false),
+            gc_registered: crate::sync::Cell::new(false),
         }
     }
 

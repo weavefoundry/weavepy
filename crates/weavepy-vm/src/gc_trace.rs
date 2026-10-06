@@ -806,6 +806,11 @@ impl GcState {
                 return false;
             };
             let handle = HandleRc::new(handle);
+            // A generator remembers it has an index entry, which its
+            // finishing release then removes (see `release_finished_gen`).
+            if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = obj {
+                g.gc_registered.set(true);
+            }
             // Publish to the miss-filter *before* the insert becomes
             // observable (we hold the index borrow).
             self.tracked_filter.insert(new_id);
