@@ -114,6 +114,9 @@ use crate::types::{PyInstance, TypeObject};
 
 // ---------- frame ----------
 
+/// Slots in a fresh pooled operand stack, the smallest the pool keeps.
+const POOLED_STACK_CAPACITY: usize = 16;
+
 /// An activation's execution state. Public only so a suspended generator
 /// can own one ([`GeneratorState`]); its fields are private to the VM.
 #[doc(hidden)]
@@ -150,40 +153,12 @@ pub struct Frame {
     /// effective on both the `LOAD_GLOBAL` fast path (the inline-cache
     /// guard fingerprints this dict) and the slow path.
     builtins: Rc<RefCell<DictData>>,
-    /// `globals['__builtins__']` when it is an arbitrary *mapping* rather
-    /// than a plain dict/module (CPython allows any object there —
-    /// `exec(code, {'__builtins__': MappingProxyType({...})})`). Name
-    /// misses then dispatch `__getitem__` on this object (KeyError →
-    /// NameError) instead of reading the `builtins` dict, which stays as
-    /// the interpreter default purely as a fallback container. `None` on
-    /// the common path (test_builtin test_eval_builtins_mapping).
-    builtins_obj: Option<Object>,
-    /// For class-body frames, names are stored here instead of globals.
-    /// `None` for ordinary function and module frames.
-    class_namespace: Option<Rc<RefCell<DictData>>>,
-    /// PEP 3115: when a metaclass `__prepare__` returns a *custom* mapping
-    /// (not a plain `dict`), class-body `STORE_NAME`/`LOAD_NAME`/`DELETE_NAME`
-    /// route through this object's `__setitem__`/`__getitem__`/`__delitem__`
-    /// so the mapping observes every binding (e.g. `enum._EnumDict` detecting
-    /// members). `None` for the common plain-dict path, which keeps using the
-    /// fast `class_namespace` `DictData`.
-    class_namespace_obj: Option<Object>,
-    /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
-    /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
-    /// Each entry is tagged with the pc just past its handler body
-    /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
-    /// exception propagates *out of* (see `handle_exception`).
-    exc_handlers: Vec<(u32, PyException)>,
-    /// A *generator/coroutine* frame's own handled-exception entries,
-    /// detached from the interpreter-wide `exc_info_stack` while it is
-    /// suspended at a `yield`. CPython stores this as the generator's
-    /// `exc_state`: on resume the entries are pushed back so an
-    /// `except`/`with` block the generator suspended inside is active
-    /// again (and `gen.throw` chains its `__context__`); on suspend they
-    /// are peeled back off so they don't leak into the *resumer's*
-    /// `sys.exc_info()`. Always empty for ordinary frames (they never
-    /// suspend).
-    saved_exc_info: Vec<PyException>,
+    /// The state few frames carry: a custom builtins mapping, a class
+    /// body's namespace (see [`FrameRare`]). Allocated when first set.
+    rare: Option<Box<FrameRare>>,
+    /// The frame's exception-handling state (see [`FrameExc`]), allocated
+    /// when it first handles an exception.
+    exc: Option<Box<FrameExc>>,
     /// For an async-generator frame: was the most recent suspension caused
     /// by the agen's *own* `yield` (a value for the consumer) rather than an
     /// inner `await` passing a suspension's value through? Set by the
@@ -198,21 +173,6 @@ pub struct Frame {
     /// pc *before* the current instruction — used to look up the
     /// exception handler when an opcode raises.
     pc: u32,
-    /// pc of the instruction whose exception is being handled by a
-    /// *cleanup* handler (`push_lasti` exception-table entries: `with`
-    /// exits, except-variable unbind blocks). CPython pushes this on
-    /// the value stack and `RERAISE k>0` restores `f_lasti` from it so
-    /// `frame.f_lineno` reports the original raise site after the
-    /// cleanup re-raises (PEP 626).
-    cleanup_lasti: Option<u32>,
-    /// CPython models `RERAISE k>0` by rewriting `frame->instr_ptr` to
-    /// the restored offset *before* unwinding; the handler lookup still
-    /// uses the re-raise site, but a cleanup handler entered from it
-    /// pushes the restored offset as its lasti slot (so the final
-    /// RERAISE propagates the original raise site through nested
-    /// cleanup tails). Set only by `RERAISE k>0`; consumed by the
-    /// immediately following `handle_exception`.
-    pending_lasti: Option<u32>,
     /// Persistent Python-visible frame snapshot for generator /
     /// coroutine / async-generator frames. A generator is re-entered
     /// on every `next()`/`send()`; CPython keeps a single `gi_frame`
@@ -271,7 +231,133 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+// Every live generator holds its frame boxed for its whole life, so the
+// state few frames carry stays out of line (see `FrameRare`, `FrameExc`).
+const _: () = assert!(std::mem::size_of::<Frame>() <= 128);
+
+/// The state of a [`Frame`] that few frames carry.
+#[derive(Default)]
+struct FrameRare {
+    /// `globals['__builtins__']` when it is an arbitrary *mapping* rather
+    /// than a plain dict/module (CPython allows any object there —
+    /// `exec(code, {'__builtins__': MappingProxyType({...})})`). Name
+    /// misses then dispatch `__getitem__` on this object (KeyError →
+    /// NameError) instead of reading the `builtins` dict, which stays as
+    /// the interpreter default purely as a fallback container. `None` on
+    /// the common path (test_builtin test_eval_builtins_mapping).
+    builtins_obj: Option<Object>,
+    /// For class-body frames, names are stored here instead of globals.
+    /// `None` for ordinary function and module frames.
+    class_namespace: Option<Rc<RefCell<DictData>>>,
+    /// PEP 3115: when a metaclass `__prepare__` returns a *custom* mapping
+    /// (not a plain `dict`), class-body `STORE_NAME`/`LOAD_NAME`/`DELETE_NAME`
+    /// route through this object's `__setitem__`/`__getitem__`/`__delitem__`
+    /// so the mapping observes every binding (e.g. `enum._EnumDict` detecting
+    /// members). `None` for the common plain-dict path, which keeps using the
+    /// fast `class_namespace` `DictData`.
+    class_namespace_obj: Option<Object>,
+}
+
+/// A [`Frame`]'s exception-handling state, which only a frame that has
+/// handled an exception carries.
+#[derive(Default)]
+struct FrameExc {
+    /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
+    /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
+    /// Each entry is tagged with the pc just past its handler body
+    /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
+    /// exception propagates *out of* (see `handle_exception`).
+    handlers: Vec<(u32, PyException)>,
+    /// A *generator/coroutine* frame's own handled-exception entries,
+    /// detached from the interpreter-wide `exc_info_stack` while it is
+    /// suspended at a `yield`. CPython stores this as the generator's
+    /// `exc_state`: on resume the entries are pushed back so an
+    /// `except`/`with` block the generator suspended inside is active
+    /// again (and `gen.throw` chains its `__context__`); on suspend they
+    /// are peeled back off so they don't leak into the *resumer's*
+    /// `sys.exc_info()`. Always empty for ordinary frames (they never
+    /// suspend).
+    saved: Vec<PyException>,
+    /// pc of the instruction whose exception is being handled by a
+    /// *cleanup* handler (`push_lasti` exception-table entries: `with`
+    /// exits, except-variable unbind blocks). CPython pushes this on
+    /// the value stack and `RERAISE k>0` restores `f_lasti` from it so
+    /// `frame.f_lineno` reports the original raise site after the
+    /// cleanup re-raises (PEP 626).
+    cleanup_lasti: Option<u32>,
+    /// CPython models `RERAISE k>0` by rewriting `frame->instr_ptr` to
+    /// the restored offset *before* unwinding; the handler lookup still
+    /// uses the re-raise site, but a cleanup handler entered from it
+    /// pushes the restored offset as its lasti slot (so the final
+    /// RERAISE propagates the original raise site through nested
+    /// cleanup tails). Set only by `RERAISE k>0`; consumed by the
+    /// immediately following `handle_exception`.
+    pending_lasti: Option<u32>,
+}
+
 impl Frame {
+    /// [`FrameRare::builtins_obj`].
+    #[inline]
+    fn builtins_obj(&self) -> Option<&Object> {
+        self.rare.as_ref()?.builtins_obj.as_ref()
+    }
+
+    /// [`FrameRare::class_namespace`].
+    #[inline]
+    fn class_namespace(&self) -> Option<&Rc<RefCell<DictData>>> {
+        self.rare.as_ref()?.class_namespace.as_ref()
+    }
+
+    /// [`FrameRare::class_namespace_obj`].
+    #[inline]
+    fn class_namespace_obj(&self) -> Option<&Object> {
+        self.rare.as_ref()?.class_namespace_obj.as_ref()
+    }
+
+    /// The frame's rare state, allocated if need be (to set a field).
+    fn rare_mut(&mut self) -> &mut FrameRare {
+        self.rare.get_or_insert_with(Box::default)
+    }
+
+    /// The frame's exception-handling state, allocated if need be.
+    #[inline]
+    fn exc_mut(&mut self) -> &mut FrameExc {
+        self.exc.get_or_insert_with(Box::default)
+    }
+
+    /// Pop the innermost [`FrameExc::handlers`] entry.
+    #[inline]
+    fn exc_handlers_pop(&mut self) -> Option<(u32, PyException)> {
+        self.exc.as_mut()?.handlers.pop()
+    }
+
+    /// Whether the frame holds detached [`FrameExc::saved`] entries.
+    #[inline]
+    fn has_saved_exc_info(&self) -> bool {
+        self.exc.as_ref().is_some_and(|e| !e.saved.is_empty())
+    }
+
+    /// The innermost [`FrameExc::saved`] entry.
+    fn saved_exc_info_last(&self) -> Option<&PyException> {
+        self.exc.as_ref()?.saved.last()
+    }
+
+    /// Take the [`FrameExc::saved`] entries.
+    fn take_saved_exc_info(&mut self) -> Vec<PyException> {
+        self.exc
+            .as_mut()
+            .map(|e| std::mem::take(&mut e.saved))
+            .unwrap_or_default()
+    }
+
+    /// Set the [`FrameExc::saved`] entries.
+    fn set_saved_exc_info(&mut self, saved: Vec<PyException>) {
+        if saved.is_empty() && self.exc.is_none() {
+            return;
+        }
+        self.exc_mut().saved = saved;
+    }
+
     #[inline]
     fn push(&mut self, v: Object) {
         self.stack.push(v);
@@ -3073,7 +3159,7 @@ impl Interpreter {
                 crate::object::AgenAwaitKind::Close => "aclose",
             };
             let qualname = match &a.agen {
-                Object::AsyncGenerator(g) => g.qualname.borrow().to_str(),
+                Object::AsyncGenerator(g) => g.qualname().to_str(),
                 other => other.type_name_owned(),
             };
             let _ = self.emit_runtime_warning(format!(
@@ -3099,7 +3185,7 @@ impl Interpreter {
         if let Object::Coroutine(g) = obj {
             if matches!(&*g.state.borrow(), GeneratorState::Created(_)) {
                 *g.state.borrow_mut() = GeneratorState::Finished;
-                let qualname = g.qualname.borrow().to_str();
+                let qualname = g.qualname().to_str();
                 self.warn_unawaited_coroutine(obj, &qualname);
                 return true;
             }
@@ -3742,7 +3828,7 @@ impl Interpreter {
         self.frame_stack_pool
             .borrow_mut()
             .pop()
-            .unwrap_or_else(|| Vec::with_capacity(16))
+            .unwrap_or_else(|| Vec::with_capacity(POOLED_STACK_CAPACITY))
     }
 
     /// RFC 0061 (WS3b): args-first locals fill. The arguments *move*
@@ -3832,7 +3918,8 @@ impl Interpreter {
     fn recycle_frame_allocs(&self, frame: &mut Frame) {
         const POOL_CAP: usize = 64;
         let mut stack = std::mem::take(&mut frame.stack);
-        if stack.capacity() > 0 {
+        // (A generator's stack, sized to its code, is too small to pool.)
+        if stack.capacity() >= POOLED_STACK_CAPACITY {
             stack.clear();
             let mut pool = self.frame_stack_pool.borrow_mut();
             if pool.len() < POOL_CAP {
@@ -3868,6 +3955,7 @@ impl Interpreter {
         let nlocals = code.varnames.len();
         positional.truncate(nlocals);
         let locals_rc = self.pooled_locals_from_args(&mut positional, nlocals);
+        let stack = self.pooled_stack();
         self.recycle_scratch(positional);
         // Build cells: cellvars come first (fresh), then freevars
         // (provided by the caller via `closure`).
@@ -3924,20 +4012,20 @@ impl Interpreter {
             code,
             locals: locals_rc,
             cells,
-            stack: self.pooled_stack(),
+            stack,
             globals,
             builtins,
-            builtins_obj,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
+            rare: builtins_obj.map(|b| {
+                Box::new(FrameRare {
+                    builtins_obj: Some(b),
+                    ..FrameRare::default()
+                })
+            }),
+            exc: None,
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
             gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -4132,8 +4220,8 @@ impl Interpreter {
         // `with` block it yielded inside is the active handled exception
         // again. Empty for ordinary frames and a generator's first run,
         // so this is a no-op there.
-        if !frame.saved_exc_info.is_empty() {
-            let restored = std::mem::take(&mut frame.saved_exc_info);
+        if frame.has_saved_exc_info() {
+            let restored = frame.take_saved_exc_info();
             self.exc_info_stack.borrow_mut().extend(restored);
         }
         // Distinguish the three ways control can enter a frame here:
@@ -4275,7 +4363,7 @@ impl Interpreter {
                     {
                         let mut stack = self.exc_info_stack.borrow_mut();
                         if stack.len() > exc_depth_on_entry {
-                            frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                            frame.set_saved_exc_info(stack.split_off(exc_depth_on_entry));
                         }
                     }
                     self.recycle_frame_shell(shell);
@@ -4319,7 +4407,7 @@ impl Interpreter {
                     {
                         let mut stack = self.exc_info_stack.borrow_mut();
                         if stack.len() > exc_depth_on_entry {
-                            frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                            frame.set_saved_exc_info(stack.split_off(exc_depth_on_entry));
                         }
                     }
                     self.recycle_frame_shell(shell);
@@ -5247,7 +5335,7 @@ impl Interpreter {
                 // `sys.exc_info()`.
                 let mut stack = self.exc_info_stack.borrow_mut();
                 if stack.len() > exc_depth_on_entry {
-                    frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                    frame.set_saved_exc_info(stack.split_off(exc_depth_on_entry));
                 }
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -5387,9 +5475,9 @@ impl Interpreter {
                         crate::object::FrameSlot::new(frame.cells.clone())
                     };
                 }
-                m.builtins_obj = frame.builtins_obj.clone();
-                m.class_namespace = frame.class_namespace.clone();
-                m.class_namespace_obj = frame.class_namespace_obj.clone();
+                m.builtins_obj = frame.builtins_obj().cloned();
+                m.class_namespace = frame.class_namespace().cloned();
+                m.class_namespace_obj = frame.class_namespace_obj().cloned();
                 m.is_gen = is_gen;
                 *m.gen_owner.get_mut() = gen_owner;
                 m.lasti = std::sync::atomic::AtomicU32::new(frame.pc);
@@ -5405,9 +5493,9 @@ impl Interpreter {
             cells: crate::object::FrameSlot::new(frame.cells.clone()),
             globals: crate::object::FrameSlot::new(frame.globals.clone()),
             builtins: crate::object::FrameSlot::new(frame.builtins.clone()),
-            builtins_obj: frame.builtins_obj.clone(),
-            class_namespace: frame.class_namespace.clone(),
-            class_namespace_obj: frame.class_namespace_obj.clone(),
+            builtins_obj: frame.builtins_obj().cloned(),
+            class_namespace: frame.class_namespace().cloned(),
+            class_namespace_obj: frame.class_namespace_obj().cloned(),
             is_gen,
             gen_owner: RefCell::new(gen_owner),
             lasti: std::sync::atomic::AtomicU32::new(frame.pc),
@@ -5565,8 +5653,8 @@ impl Interpreter {
             back: RefCell::new(back),
             locals_cache: RefCell::new(None),
             cells: frame.cells.clone(),
-            class_namespace: frame.class_namespace.clone(),
-            class_namespace_obj: frame.class_namespace_obj.clone(),
+            class_namespace: frame.class_namespace().cloned(),
+            class_namespace_obj: frame.class_namespace_obj().cloned(),
             // At module / exec scope CPython makes `locals() is
             // globals()`. We detect the module body by its
             // conventional code name so a top-level `locals()` /
@@ -5601,7 +5689,7 @@ impl Interpreter {
             frame.stack.pop();
         }
         for _ in 0..jump.exc_pops {
-            frame.exc_handlers.pop();
+            frame.exc_handlers_pop();
             self.exc_info_stack.borrow_mut().pop();
         }
         frame.pc = jump.target_pc;
@@ -5753,7 +5841,7 @@ impl Interpreter {
                     // the "was never awaited" RuntimeWarning (bpo-45813).
                     if matches!(g.kind, crate::object::CoroutineKind::Coroutine) {
                         let obj = Object::Coroutine(g.clone());
-                        let qualname = g.qualname.borrow().to_str();
+                        let qualname = g.qualname().to_str();
                         self.warn_unawaited_coroutine(&obj, &qualname);
                     }
                     // Tear down the never-started generator: its frame
@@ -8006,15 +8094,15 @@ impl Interpreter {
         // Everything the general loop may have set on the way (a clean
         // activation never left the quiet loop's leaf paths).
         if !act.clean {
-            fr.exc_handlers.clear();
-            fr.saved_exc_info.clear();
-            fr.builtins_obj = None;
-            fr.class_namespace = None;
-            fr.class_namespace_obj = None;
+            if let Some(exc) = fr.exc.as_mut() {
+                exc.handlers.clear();
+                exc.saved.clear();
+                exc.cleanup_lasti = None;
+                exc.pending_lasti = None;
+            }
+            fr.rare = None;
             fr.py_frame = None;
             fr.gen_owner = None;
-            fr.cleanup_lasti = None;
-            fr.pending_lasti = None;
             fr.shell_cache = None;
             fr.agen_yielded_value = true;
             fr.suppress_call_event = false;
@@ -8150,7 +8238,7 @@ impl Interpreter {
             };
             let gf: &Frame = boxed;
             if gf.py_frame.is_some()
-                || !gf.saved_exc_info.is_empty()
+                || gf.has_saved_exc_info()
                 || gf.pc == 0
                 || !Self::lean_gen_code_ok(&gf.code)
                 || gf.shell_cache.as_ref().is_some_and(|c| {
@@ -8624,9 +8712,9 @@ impl Interpreter {
                     m.builtins = crate::object::FrameSlot::borrowed(&frame.builtins);
                 }
                 m.cells = cells;
-                m.builtins_obj = frame.builtins_obj.clone();
-                m.class_namespace = frame.class_namespace.clone();
-                m.class_namespace_obj = frame.class_namespace_obj.clone();
+                m.builtins_obj = frame.builtins_obj().cloned();
+                m.class_namespace = frame.class_namespace().cloned();
+                m.class_namespace_obj = frame.class_namespace_obj().cloned();
                 m.is_gen = false;
                 *m.gen_owner.get_mut() = frame.gen_owner.clone();
                 m.lasti = std::sync::atomic::AtomicU32::new(lasti);
@@ -8642,9 +8730,9 @@ impl Interpreter {
             cells,
             globals: crate::object::FrameSlot::new(frame.globals.clone()),
             builtins: crate::object::FrameSlot::new(frame.builtins.clone()),
-            builtins_obj: frame.builtins_obj.clone(),
-            class_namespace: frame.class_namespace.clone(),
-            class_namespace_obj: frame.class_namespace_obj.clone(),
+            builtins_obj: frame.builtins_obj().cloned(),
+            class_namespace: frame.class_namespace().cloned(),
+            class_namespace_obj: frame.class_namespace_obj().cloned(),
             is_gen: false,
             gen_owner: RefCell::new(frame.gen_owner.clone()),
             lasti: std::sync::atomic::AtomicU32::new(lasti),
@@ -9906,17 +9994,12 @@ impl Interpreter {
             stack: self.pooled_stack(),
             globals: borrowed_rc(&f.globals),
             builtins: borrowed_rc(&f.builtins),
-            builtins_obj: None,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
+            rare: None,
+            exc: None,
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
             gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -10734,7 +10817,7 @@ impl Interpreter {
             || load.op != OpCode::LoadFast
             || call.op != OpCode::Call
             || call.arg != 1
-            || frame.builtins_obj.is_some()
+            || frame.builtins_obj().is_some()
             || frame.code.names.get(name_idx as usize).map(String::as_str) != Some("len")
         {
             return None;
@@ -10775,7 +10858,7 @@ impl Interpreter {
         macro_rules! stamps {
             ($cache:ident, $frame:expr, $ext:expr) => {
                 *$cache.get_or_insert_with(|| {
-                    if $frame.builtins_obj.is_none() {
+                    if $frame.builtins_obj().is_none() {
                         $ext.and_then(|e| e.stamp_slots.get())
                             .map_or(&[][..], |s| &s[..])
                     } else {
@@ -13920,7 +14003,11 @@ impl Interpreter {
                         }
                         len += 1;
                         let pe = PyException::new(exc);
-                        frame.exc_handlers.push((ins.arg, pe.clone()));
+                        frame
+                            .exc
+                            .get_or_insert_with(Box::default)
+                            .handlers
+                            .push((ins.arg, pe.clone()));
                         self.exc_info_stack.borrow_mut().push(pe);
                         last = pc;
                         pc += 1;
@@ -13952,7 +14039,7 @@ impl Interpreter {
                         len -= 1;
                         // SAFETY: the slot at `len` is initialized.
                         let prev = unsafe { base.add(len).read() };
-                        let popped = frame.exc_handlers.pop();
+                        let popped = frame.exc.as_mut().and_then(|e| e.handlers.pop());
                         let top = self.exc_info_stack.borrow_mut().pop();
                         // See the full handler: the handled exception dies
                         // here unless something else holds it.
@@ -16084,9 +16171,9 @@ impl Interpreter {
     /// names resolve in the globals, then the builtins, both exact dicts.
     #[inline(always)]
     fn core_name_scope(&self, frame: &Frame) -> bool {
-        frame.class_namespace.is_none()
-            && frame.class_namespace_obj.is_none()
-            && frame.builtins_obj.is_none()
+        frame.class_namespace().is_none()
+            && frame.class_namespace_obj().is_none()
+            && frame.builtins_obj().is_none()
             && !frame.code.is_class_body
             && !self.globals_missing_any.get()
     }
@@ -17633,7 +17720,7 @@ impl Interpreter {
             return false;
         }
         if gf.py_frame.is_some()
-            || !gf.saved_exc_info.is_empty()
+            || gf.has_saved_exc_info()
             || (!sent_none && gf.sent_consumed)
             || gf.shell_cache.as_ref().is_some_and(|c| {
                 c.has_materialized
@@ -18234,7 +18321,11 @@ impl Interpreter {
                 CoreAttr::Done
             }
             OpCode::LoadGlobal => {
-                if frame.builtins_obj.is_some() {
+                if frame
+                    .rare
+                    .as_ref()
+                    .is_some_and(|r| r.builtins_obj.is_some())
+                {
                     return CoreAttr::Decline;
                 }
                 let Some(v) = self.leaf_global(code, &frame.globals, &frame.builtins, pc, ins.arg)
@@ -19631,8 +19722,8 @@ impl Interpreter {
             stack,
             globals,
             builtins,
-            builtins_obj,
-            exc_handlers,
+            rare,
+            exc: frame_exc,
             ..
         } = frame;
         let code: &CodeObject = code_rc;
@@ -20731,7 +20822,7 @@ impl Interpreter {
                     pc += 1;
                 }
                 OpCode::LoadGlobal => {
-                    if builtins_obj.is_some() {
+                    if rare.as_ref().is_some_and(|r| r.builtins_obj.is_some()) {
                         break;
                     }
                     let Some(name) = code.names.get(ins.arg as usize) else {
@@ -21428,7 +21519,10 @@ impl Interpreter {
                     stack.push(prev);
                     stack.push(exc.clone());
                     let pe = PyException::new(exc);
-                    exc_handlers.push((ins.arg, pe.clone()));
+                    frame_exc
+                        .get_or_insert_with(Box::default)
+                        .handlers
+                        .push((ins.arg, pe.clone()));
                     self.exc_info_stack.borrow_mut().push(pe);
                     last = pc;
                     pc += 1;
@@ -21448,7 +21542,7 @@ impl Interpreter {
                 }
                 OpCode::PopExcept => {
                     let Some(prev) = stack.pop() else { break };
-                    let popped = exc_handlers.pop();
+                    let popped = frame_exc.as_mut().and_then(|e| e.handlers.pop());
                     let top = self.exc_info_stack.borrow_mut().pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
@@ -24624,21 +24718,20 @@ impl Interpreter {
                 // `__pdb_convenience_variables[...]` and broke as
                 // `_<module>__pdb_convenience_variables`).
                 if frame.code.is_class_body
-                    && (frame.class_namespace_obj.is_some() || frame.class_namespace.is_some())
+                    && (frame.class_namespace_obj().is_some() || frame.class_namespace().is_some())
                 {
                     if let Some(m) = mangle_class_private(&frame.code.name, &name) {
                         name = m;
                     }
                 }
-                let from_ns = match frame.class_namespace_obj.clone() {
+                let from_ns = match frame.class_namespace_obj().cloned() {
                     // PEP 3115 custom namespace: read it before globals.
                     Some(ns_obj) => {
                         let g = frame.globals.clone();
                         self.class_ns_load(&ns_obj, &name, &g)?
                     }
                     None => frame
-                        .class_namespace
-                        .as_ref()
+                        .class_namespace()
                         .and_then(|ns| ns.borrow().get(&crate::object::StrKey(&name)).cloned()),
                 };
                 let v = match from_ns {
@@ -24810,9 +24903,9 @@ impl Interpreter {
             // namespace inside a class body (custom `__prepare__`
             // mappings included), the globals dict at module level.
             OpCode::LoadLocals => {
-                let mapping = if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                let mapping = if let Some(ns_obj) = frame.class_namespace_obj().cloned() {
                     ns_obj
-                } else if let Some(ns) = frame.class_namespace.clone() {
+                } else if let Some(ns) = frame.class_namespace().cloned() {
                     Object::Dict(ns)
                 } else {
                     Object::Dict(frame.globals.clone())
@@ -24873,7 +24966,7 @@ impl Interpreter {
                 let v = frame.pop()?;
                 let mut name = self.name_at(&frame.code, ins.arg)?;
                 if frame.code.is_class_body
-                    && (frame.class_namespace_obj.is_some() || frame.class_namespace.is_some())
+                    && (frame.class_namespace_obj().is_some() || frame.class_namespace().is_some())
                 {
                     // Private name mangling: `__x` bound in a class body
                     // is stored as `_ClassName__x` (CPython mangles at
@@ -24883,7 +24976,7 @@ impl Interpreter {
                         name = m;
                     }
                 }
-                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                if let Some(ns_obj) = frame.class_namespace_obj().cloned() {
                     // PEP 3115: a custom class namespace observes the binding
                     // through its `__setitem__` (e.g. `enum._EnumDict`); the old
                     // value is the namespace's to manage, so no reap here.
@@ -24899,7 +24992,7 @@ impl Interpreter {
                     // STORE_NAME uses `PyObject_SetItem` on non-exact
                     // dicts — a read-only frozendict raises here,
                     // test_builtin test_exec_globals).
-                    if frame.class_namespace.is_none() {
+                    if frame.class_namespace().is_none() {
                         if let Some(owner) = self.globals_missing_owner(&frame.globals) {
                             let overridden = match &owner {
                                 Object::Instance(inst) => inst
@@ -24926,7 +25019,7 @@ impl Interpreter {
                         Some(n @ Object::Str(s)) if **s == *name => n.clone(),
                         _ => Object::from_str(name),
                     };
-                    let old = if let Some(ns) = &frame.class_namespace {
+                    let old = if let Some(ns) = frame.class_namespace() {
                         ns.borrow_mut().insert(DictKey(key), v)
                     } else {
                         // A module-level rebinding keeps the key layout (see
@@ -24980,18 +25073,18 @@ impl Interpreter {
             OpCode::DeleteName => {
                 let mut name = self.name_at(&frame.code, ins.arg)?;
                 if frame.code.is_class_body
-                    && (frame.class_namespace_obj.is_some() || frame.class_namespace.is_some())
+                    && (frame.class_namespace_obj().is_some() || frame.class_namespace().is_some())
                 {
                     if let Some(m) = mangle_class_private(&frame.code.name, &name) {
                         name = m;
                     }
                 }
-                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                if let Some(ns_obj) = frame.class_namespace_obj().cloned() {
                     let g = frame.globals.clone();
                     self.class_ns_delete(&ns_obj, &name, &g)?;
                     return Ok(StepOutcome::Continue);
                 }
-                if let Some(ns) = &frame.class_namespace {
+                if let Some(ns) = frame.class_namespace() {
                     if ns
                         .borrow_mut()
                         .shift_remove(&DictKey(Object::from_str(&name)))
@@ -26689,7 +26782,7 @@ impl Interpreter {
                 // a plain class body binds in its locals dict, and a module
                 // body binds in globals.
                 let key = DictKey(Object::from_static("__annotations__"));
-                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                if let Some(ns_obj) = frame.class_namespace_obj().cloned() {
                     let g = frame.globals.clone();
                     let probe = self.subscr_via_protocol(
                         &ns_obj,
@@ -26699,7 +26792,7 @@ impl Interpreter {
                     if probe.is_err() {
                         self.class_ns_store(&ns_obj, "__annotations__", Object::new_dict(), &g)?;
                     }
-                } else if let Some(ns) = frame.class_namespace.clone() {
+                } else if let Some(ns) = frame.class_namespace().cloned() {
                     if !ns.borrow().contains_key(&key) {
                         ns.borrow_mut().insert(key, Object::new_dict());
                     }
@@ -26988,7 +27081,7 @@ impl Interpreter {
                 // stripped `__builtins__` mapping loses class statements
                 // (test_builtin test_exec_globals: NameError
                 // "__build_class__ not found").
-                let v = if let Some(bobj) = frame.builtins_obj.clone() {
+                let v = if let Some(bobj) = frame.builtins_obj().cloned() {
                     let g = frame.globals.clone();
                     match self.class_ns_load(&bobj, "__build_class__", &g)? {
                         Some(v) => v,
@@ -27270,7 +27363,7 @@ impl Interpreter {
                     if let Some(top) = self.exc_info_stack.borrow_mut().last_mut() {
                         *top = pe.clone();
                     }
-                    if let Some(top) = frame.exc_handlers.last_mut() {
+                    if let Some(top) = frame.exc.as_mut().and_then(|e| e.handlers.last_mut()) {
                         top.1 = pe;
                     }
                 }
@@ -27303,7 +27396,7 @@ impl Interpreter {
                     // bytecode); leave it untagged and let frame-exit
                     // reconciliation handle any residue.
                     let body_end = ins.arg;
-                    frame.exc_handlers.push((body_end, pe.clone()));
+                    frame.exc_mut().handlers.push((body_end, pe.clone()));
                     self.exc_info_stack.borrow_mut().push(pe);
                 }
             }
@@ -27314,7 +27407,7 @@ impl Interpreter {
                 // `sys.exc_info()` restore, so the value itself is
                 // discarded).
                 let _prev = frame.pop()?;
-                let popped = frame.exc_handlers.pop();
+                let popped = frame.exc_handlers_pop();
                 drop(self.exc_info_stack.borrow_mut().pop());
                 // CPython clears the just-handled exception at the end of an
                 // `except` block (the implicit `del` of the bound name plus
@@ -27365,7 +27458,7 @@ impl Interpreter {
                 let exc = frame.pop()?;
                 if ins.arg != 0 {
                     if let Some(Object::Int(l)) = frame.peek_back(ins.arg as usize - 1) {
-                        frame.cleanup_lasti = Some(u32::try_from(*l).unwrap_or(0));
+                        frame.exc_mut().cleanup_lasti = Some(u32::try_from(*l).unwrap_or(0));
                     }
                 }
                 let mut pe = Self::normalize_exception(exc, None)?;
@@ -27383,13 +27476,13 @@ impl Interpreter {
                 // RERAISE site (ceval.c: "We can't use frame->instr_ptr
                 // here, as RERAISE may have set it"); redirecting the pc
                 // would re-enter the same cleanup handler forever.
-                if let Some(orig) = frame.cleanup_lasti.take() {
+                if let Some(orig) = frame.exc.as_mut().and_then(|e| e.cleanup_lasti.take()) {
                     // Carry the restored offset into the very next
                     // `handle_exception`: a cleanup entry covering this
                     // RERAISE pushes it as its own lasti slot (CPython
                     // rewrites `frame->instr_ptr`, from which the next
                     // handler's lasti push reads).
-                    frame.pending_lasti = Some(orig);
+                    frame.exc_mut().pending_lasti = Some(orig);
                     if let Some(shell) = self.frame_stack.borrow().last() {
                         shell
                             .lasti
@@ -27499,7 +27592,7 @@ impl Interpreter {
                 // CPython the bootstrap modules are frozen and initialized
                 // before user code can patch `builtins.__import__`.
                 let hook = if self.internal_import_depth == 0 {
-                    if let Some(bobj) = frame.builtins_obj.clone() {
+                    if let Some(bobj) = frame.builtins_obj().cloned() {
                         // Mapping-object `__builtins__`: `__import__` must
                         // come from the sandbox mapping or the import
                         // fails outright (test_builtin
@@ -27565,9 +27658,10 @@ impl Interpreter {
                 // frame when one is installed (test_pkg's exec'd
                 // `from t2 import *` reads the names back via `dir()`);
                 // at true module scope locals are the globals dict.
-                if let (None, Some(mapping)) =
-                    (&frame.class_namespace, frame.class_namespace_obj.clone())
-                {
+                if let (None, Some(mapping)) = (
+                    frame.class_namespace(),
+                    frame.class_namespace_obj().cloned(),
+                ) {
                     // A non-dict locals mapping (an `exec` namespace that
                     // is an OrderedDict, say): `PyObject_SetItem` per name.
                     let names = Rc::new(RefCell::new(DictData::default()));
@@ -27582,8 +27676,8 @@ impl Interpreter {
                     }
                 } else {
                     let target = frame
-                        .class_namespace
-                        .clone()
+                        .class_namespace()
+                        .cloned()
                         .unwrap_or_else(|| frame.globals.clone());
                     self.import_star(&module, &target)?;
                 }
@@ -28358,17 +28452,21 @@ impl Interpreter {
             // `frame->instr_ptr` here, so nested cleanup tails keep
             // relaying the *original* raise site (PEP 626,
             // test_exceptions test_lineno_after_with).
-            let lasti_slot = frame.pending_lasti.take().unwrap_or(raise_pc);
+            let lasti_slot = frame
+                .exc
+                .as_mut()
+                .and_then(|e| e.pending_lasti.take())
+                .unwrap_or(raise_pc);
             // CPython's `lasti` exception-table flag: a cleanup handler
             // (with-exit, except-unbind) re-raises via RERAISE, which
             // must restore `f_lasti` to the *original* raise site so
             // `frame.f_lineno` keeps reporting the line that raised
             // (PEP 626). Record it; the RERAISE arm consumes it.
-            frame.cleanup_lasti = if handler.push_lasti {
-                Some(lasti_slot)
-            } else {
-                None
-            };
+            if handler.push_lasti {
+                frame.exc.get_or_insert_with(Box::default).cleanup_lasti = Some(lasti_slot);
+            } else if let Some(exc) = frame.exc.as_mut() {
+                exc.cleanup_lasti = None;
+            }
             // CPython 3.13 discipline: a lasti-flagged handler receives
             // the raising offset as a real stack slot under the
             // exception (`RERAISE n` reads it; the depth math in the
@@ -28574,7 +28672,7 @@ impl Interpreter {
     /// the entries we detached on suspend (`frame.saved_exc_info`).
     fn chain_thrown_context(exc: &mut PyException, frame: &Frame) {
         exc.context_settled = true;
-        let Some(active) = frame.saved_exc_info.last() else {
+        let Some(active) = frame.saved_exc_info_last() else {
             return;
         };
         let Object::Instance(active_inst) = &active.instance else {
@@ -28931,7 +29029,7 @@ impl Interpreter {
         // A mapping-object `__builtins__` replaces the builtins dict
         // entirely: resolve by item access, a miss falling through to
         // the NameError below (test_builtin test_eval_builtins_mapping).
-        if let Some(bobj) = frame.builtins_obj.clone() {
+        if let Some(bobj) = frame.builtins_obj().cloned() {
             // CPython reads builtins with `PyObject_GetItem`; a
             // non-subscriptable `__builtins__` (e.g. `123`) surfaces as
             // TypeError, not NameError (test_builtin test_exec_globals).
@@ -29331,8 +29429,8 @@ impl Interpreter {
                     })));
                 }
                 match name {
-                    "__name__" => Ok(g.name.borrow().clone()),
-                    "__qualname__" => Ok(g.qualname.borrow().clone()),
+                    "__name__" => Ok(g.name()),
+                    "__qualname__" => Ok(g.qualname()),
                     _ => Err(attribute_error(format!(
                         "'{}' object has no attribute '{}'",
                         obj.type_name(),
@@ -39905,7 +40003,7 @@ impl Interpreter {
             };
             let frame: &Frame = boxed;
             if frame.py_frame.is_some()
-                || !frame.saved_exc_info.is_empty()
+                || frame.has_saved_exc_info()
                 || frame.pc == 0
                 || !Self::lean_gen_code_ok(&frame.code)
                 || frame.shell_cache.as_ref().is_some_and(|c| {
@@ -42379,7 +42477,7 @@ impl Interpreter {
         // must never serve from inline caches: `frame.builtins` is only
         // the fallback container there, so a cache hit would leak real
         // builtins past the sandbox mapping.
-        if frame.builtins_obj.is_some() {
+        if frame.builtins_obj().is_some() {
             let name = self.name_at(&frame.code, name_idx)?;
             return self.lookup_global_or_builtin(frame, &name);
         }
@@ -44433,12 +44531,11 @@ impl Interpreter {
                 match name {
                     "__name__" | "__qualname__" => match value {
                         Object::Str(_) | Object::WStr(_) => {
-                            let target = if name == "__name__" {
-                                &g.name
+                            if name == "__name__" {
+                                g.set_name(value.clone());
                             } else {
-                                &g.qualname
-                            };
-                            *target.borrow_mut() = value.clone();
+                                g.set_qualname(value.clone());
+                            }
                             Ok(())
                         }
                         _ => Err(type_error(format!("{name} must be set to a string object"))),
@@ -48918,9 +49015,9 @@ impl Interpreter {
             Some(body_fn.builtins.clone()),
         );
         if let Some(obj) = &ns_obj {
-            frame.class_namespace_obj = Some(obj.clone());
+            frame.rare_mut().class_namespace_obj = Some(obj.clone());
         } else {
-            frame.class_namespace = Some(class_ns.clone());
+            frame.rare_mut().class_namespace = Some(class_ns.clone());
         }
         // PEP 695 (RFC 0051): annotation scopes created in this class
         // body (type-param bounds/defaults, `type` alias thunks, the
@@ -49292,9 +49389,9 @@ impl Interpreter {
             Some(body_fn.builtins.clone()),
         );
         if let Some(obj) = &ns_obj {
-            frame.class_namespace_obj = Some(obj.clone());
+            frame.rare_mut().class_namespace_obj = Some(obj.clone());
         } else {
-            frame.class_namespace = Some(class_ns.clone());
+            frame.rare_mut().class_namespace = Some(class_ns.clone());
         }
         // PEP 695: seed any `__classdict__` cell (see the main build path).
         if let Some(i) = frame
@@ -52586,26 +52683,21 @@ impl Interpreter {
         // CPython snapshots the *function's* current `__name__` and
         // `__qualname__` (which user code may have reassigned) into
         // `gi_name`/`gi_qualname` at call time, sharing the objects.
-        let (name, qualname) = match code_vm_ext(code) {
-            Some(ext) if f.names_seeded() => {
-                let (name, qualname) = ext.gen_names.get_or_init(|| {
-                    (
-                        crate::stdlib::sys::intern_name(&code.name),
-                        crate::stdlib::sys::intern_name(&code.qualname),
-                    )
-                });
-                (Some(name.clone()), Some(qualname.clone()))
-            }
-            _ => f.name_objects(),
-        };
         let gen_code = Object::Code(frame.code.clone());
-        let gen = Rc::new(PyGenerator::with_names(
-            name.unwrap_or_else(|| Object::from_str(f.name.clone())),
-            qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
-            kind,
-            gen_code,
-            Box::new(frame),
-        ));
+        let gen = if f.names_seeded() {
+            // The code's names, which the generator reads by default.
+            PyGenerator::new(kind, gen_code, Box::new(frame))
+        } else {
+            let (name, qualname) = f.name_objects();
+            PyGenerator::with_names(
+                name.unwrap_or_else(|| Object::from_str(f.name.clone())),
+                qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+                kind,
+                gen_code,
+                Box::new(frame),
+            )
+        };
+        let gen = Rc::new(gen);
         Self::set_frame_gen_owner(&gen);
         let obj = if code.is_coroutine {
             Object::Coroutine(gen)
@@ -52797,13 +52889,7 @@ impl Interpreter {
                     crate::object::CoroutineKind::Generator
                 };
                 let gen_code = Object::Code(frame.code.clone());
-                let gen = Rc::new(PyGenerator::new(
-                    code.name.clone(),
-                    code.qualname.clone(),
-                    kind,
-                    gen_code,
-                    Box::new(frame),
-                ));
+                let gen = Rc::new(PyGenerator::new(kind, gen_code, Box::new(frame)));
                 Self::set_frame_gen_owner(&gen);
                 let obj = if code.is_coroutine {
                     Object::Coroutine(gen)
@@ -53517,17 +53603,12 @@ impl Interpreter {
             stack: self.pooled_stack(),
             globals: f.globals.clone(),
             builtins: f.builtins.clone(),
-            builtins_obj: None,
-            class_namespace: None,
-            class_namespace_obj: None,
-            exc_handlers: Vec::new(),
-            saved_exc_info: Vec::new(),
+            rare: None,
+            exc: None,
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
             gen_owner: None,
-            cleanup_lasti: None,
-            pending_lasti: None,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -55657,8 +55738,8 @@ impl Interpreter {
         );
         // Run top-level names into the distinct locals mapping when present.
         match exec_locals {
-            Some(Object::Dict(d)) => frame.class_namespace = Some(d),
-            Some(mapping) => frame.class_namespace_obj = Some(mapping),
+            Some(Object::Dict(d)) => frame.rare_mut().class_namespace = Some(d),
+            Some(mapping) => frame.rare_mut().class_namespace_obj = Some(mapping),
             None => {}
         }
         // PyCF_ALLOW_TOP_LEVEL_AWAIT module code is a coroutine; CPython's
@@ -55803,8 +55884,8 @@ impl Interpreter {
                 let mut frame =
                     self.make_frame(c.clone(), Vec::new(), Vec::new(), globals_dict, None);
                 match eval_locals.clone() {
-                    Some(Object::Dict(d)) => frame.class_namespace = Some(d),
-                    Some(mapping) => frame.class_namespace_obj = Some(mapping),
+                    Some(Object::Dict(d)) => frame.rare_mut().class_namespace = Some(d),
+                    Some(mapping) => frame.rare_mut().class_namespace_obj = Some(mapping),
                     None => {}
                 }
                 // PyCF_ALLOW_TOP_LEVEL_AWAIT module code is a coroutine:
@@ -55850,8 +55931,8 @@ impl Interpreter {
         .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
         let mut frame = self.make_frame(Rc::new(code), Vec::new(), Vec::new(), globals_dict, None);
         match eval_locals {
-            Some(Object::Dict(d)) => frame.class_namespace = Some(d),
-            Some(mapping) => frame.class_namespace_obj = Some(mapping),
+            Some(Object::Dict(d)) => frame.rare_mut().class_namespace = Some(d),
+            Some(mapping) => frame.rare_mut().class_namespace_obj = Some(mapping),
             None => {}
         }
         self.run_frame(&mut frame)
@@ -60989,17 +61070,12 @@ impl InlineAct {
                 stack: Vec::with_capacity(16),
                 globals: borrowed_rc(&placeholder.dict),
                 builtins: borrowed_rc(&placeholder.dict),
-                builtins_obj: None,
-                class_namespace: None,
-                class_namespace_obj: None,
-                exc_handlers: Vec::new(),
-                saved_exc_info: Vec::new(),
+                rare: None,
+                exc: None,
                 agen_yielded_value: true,
                 pc: 0,
                 py_frame: None,
                 gen_owner: None,
-                cleanup_lasti: None,
-                pending_lasti: None,
                 suppress_call_event: false,
                 gen_first_resume: false,
                 sent_consumed: false,
@@ -68581,6 +68657,53 @@ struct BinderLayout {
     kwonly_end: usize,
     star_idx: usize,
     kwargs_slot: Option<usize>,
+}
+
+/// `code`'s interned `co_name` and `co_qualname`, the names a generator
+/// running it takes by default.
+pub(crate) fn code_gen_names(code: &CodeObject) -> (Object, Object) {
+    let intern = || {
+        (
+            crate::stdlib::sys::intern_name(&code.name),
+            crate::stdlib::sys::intern_name(&code.qualname),
+        )
+    };
+    match code_vm_ext(code) {
+        Some(ext) => ext.gen_names.get_or_init(intern).clone(),
+        None => intern(),
+    }
+}
+
+/// Trim the storage of `gen`'s frame, unless it's running, to what its
+/// code needs: the operand stack to `co_stacksize` and the locals to
+/// their count. A generator's frame starts on the pooled vectors every
+/// activation draws from (sized for whatever ran last), which suits one
+/// that's consumed at once; the collector calls this as a generator
+/// outlives its young set, so a long-lived one (a parked coroutine, say)
+/// holds no more than it needs.
+pub(crate) fn compact_generator_frame(gen: &PyGenerator) {
+    let Ok(mut state) = gen.state.try_borrow_mut() else {
+        return;
+    };
+    let (GeneratorState::Created(frame) | GeneratorState::Suspended(frame)) = &mut *state else {
+        return;
+    };
+    // (A parked native activation's buffers hold the frame's values.)
+    #[cfg(feature = "jit")]
+    if frame.parked_native.is_some() {
+        return;
+    }
+    let depth = frame
+        .code
+        .stacksize
+        .map_or(POOLED_STACK_CAPACITY, |s| s as usize)
+        .max(frame.stack.len());
+    if frame.stack.capacity() > depth {
+        frame.stack.shrink_to(depth);
+    }
+    if let Ok(mut locals) = frame.locals.try_borrow_mut() {
+        locals.shrink_to_fit();
+    };
 }
 
 #[inline]

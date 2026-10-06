@@ -311,7 +311,7 @@ impl Interpreter {
     #[inline]
     pub(crate) fn gen_fast_frame_ok(frame: &Frame) -> bool {
         frame.py_frame.is_none()
-            && frame.saved_exc_info.is_empty()
+            && !frame.has_saved_exc_info()
             && frame.pc != 0
             && !frame.shell_cache.as_ref().is_some_and(|c| {
                 c.has_materialized
@@ -385,11 +385,16 @@ impl Interpreter {
             ext.frame_jit.get(nlocals)
         };
         let stack = &mut frame.stack;
-        // (The native code writes the stack at fixed offsets.)
+        // Room for the body's deepest stack (the frame lives on in its
+        // generator, so no more than that), and the native code writes the
+        // stack at fixed offsets.
+        let deepest = code
+            .stacksize
+            .map_or(stack.len() + 8, |s| (s as usize).max(stack.len() + 1));
         #[cfg(feature = "jit")]
-        let want = (stack.len() + 8).max(native.map_or(0, |n| n.need()));
+        let want = deepest.max(native.map_or(0, |n| n.need()));
         #[cfg(not(feature = "jit"))]
-        let want = stack.len() + 8;
+        let want = deepest;
         if stack.capacity() < want {
             stack.reserve(want - stack.len());
         }

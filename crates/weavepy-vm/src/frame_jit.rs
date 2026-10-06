@@ -655,9 +655,6 @@ struct Tags {
     float: u8,
     cell: u8,
     instance: u8,
-    /// `Option::<Object>::None`'s first byte, when the option keeps
-    /// `Object`'s size (its tag byte's niche).
-    opt_none: Option<u8>,
     /// The heap variants whose payload word is an `Rc`'s allocation, its
     /// strong count the allocation's first word (a clone is an increment
     /// there): instances, lists, dicts and classes, as far as measured.
@@ -714,12 +711,6 @@ fn tags() -> Option<Tags> {
         float: tag(&Object::Float(1.0)),
         cell: tag(&cell),
         instance: tag(&inst),
-        opt_none: {
-            let none: Option<Object> = None;
-            // SAFETY: reading the first byte of a 16-byte value.
-            (std::mem::size_of::<Option<Object>>() == 16)
-                .then(|| unsafe { *std::ptr::from_ref(&none).cast::<u8>() })
-        },
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -1473,7 +1464,7 @@ unsafe extern "C" fn h_load_global(
         let frame = &*st.frame;
         let interp = &*st.interp;
         let (code, ext, pc, len) = (&*code, &*ext, pc as usize, len as usize);
-        if frame.builtins_obj.is_some() {
+        if frame.builtins_obj().is_some() {
             return DECLINED;
         }
         let Some(slot) = ext.stamp_slots.get().and_then(|s| s.get(pc)) else {
@@ -1655,7 +1646,7 @@ const GC_VALUE: i32 = std::mem::offset_of!(GlobalCache, value) as i32;
 /// and a dict's stamp sit.
 const F_GLOBALS: usize = std::mem::offset_of!(crate::Frame, globals);
 const F_BUILTINS: usize = std::mem::offset_of!(crate::Frame, builtins);
-const F_BUILTINS_OBJ: usize = std::mem::offset_of!(crate::Frame, builtins_obj);
+const F_RARE: usize = std::mem::offset_of!(crate::Frame, rare);
 const I_MISSING: usize = std::mem::offset_of!(Interpreter, globals_missing_any);
 const DICT_STAMP: i32 = crate::object::DictData::STAMP_OFFSET as i32;
 const _: () = {
@@ -5046,7 +5037,7 @@ impl<'a> Lower<'a> {
         self.global_caches.push(cache);
         let helper = self.b.create_block();
         let done = self.b.create_block();
-        if let Some(none_tag) = self.tags.opt_none {
+        {
             let ptr = self.ptr;
             let c = self.b.ins().iconst(ptr, cache_at);
             let frame = self.b.ins().load(ptr, FLAGS, self.st, S_FRAME);
@@ -5060,15 +5051,11 @@ impl<'a> Lower<'a> {
             self.branch_out(other, helper);
             let gs = self.b.ins().load(types::I64, FLAGS, gd, DICT_STAMP);
             let cgs = self.b.ins().load(types::I64, FLAGS, c, GC_GSTAMP);
-            let bo = self
-                .b
-                .ins()
-                .uload8(types::I64, FLAGS, frame, F_BUILTINS_OBJ as i32);
+            // (A frame with rare state, a custom builtins mapping among
+            // it, takes the helper.)
+            let rare = self.b.ins().load(types::I64, FLAGS, frame, F_RARE as i32);
             let moved = self.b.ins().icmp(IntCC::NotEqual, gs, cgs);
-            let custom = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::NotEqual, bo, i64::from(none_tag));
+            let custom = self.b.ins().icmp_imm(IntCC::NotEqual, rare, 0);
             let bad = self.b.ins().bor(moved, custom);
             self.branch_out(bad, helper);
             let cb = self.b.ins().load(types::I64, FLAGS, c, GC_BUILTINS);
@@ -5100,8 +5087,6 @@ impl<'a> Lower<'a> {
             let v = self.b.ins().load(ptr, FLAGS, c, GC_VALUE);
             self.copy_value(dst, v);
             self.b.ins().jump(done, &[]);
-        } else {
-            self.b.ins().jump(helper, &[]);
         }
         self.b.switch_to_block(helper);
         let code = self.code_ptr();

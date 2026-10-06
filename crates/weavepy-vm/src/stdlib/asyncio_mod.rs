@@ -235,18 +235,10 @@ impl FutStatus {
 struct FutState {
     status: FutStatus,
     result: Object,
-    exception: Object,
-    /// `exception.__traceback__` as of `set_exception` — restored on every
-    /// raise so re-awaiting the same future doesn't accumulate awaiter
-    /// frames (CPython's `fut_exception_tb`, test_futures2).
-    exception_tb: Object,
-    cancelled_exc: Object,
     loop_: Object,
-    callbacks: Vec<(Object, Object)>,
-    cancel_message: Object,
+    callbacks: Vec<(Object, CbContext)>,
     log_traceback: bool,
     blocking: bool,
-    source_traceback: Object,
     initialized: bool,
     /// 3.14 `fut_awaited_by`: the native futures/tasks currently awaiting
     /// this one (identity set; `_asyncio_awaited_by` exposes a frozenset).
@@ -255,13 +247,15 @@ struct FutState {
     /// emptied) set, so `_asyncio_awaited_by` then reports `frozenset()`
     /// rather than `None`.
     awaited_by_touched: bool,
+    /// The state few futures carry (see [`FutCold`]), allocated when
+    /// first set.
+    cold: Option<Box<FutCold>>,
     // Task-only fields.
     coro: Object,
     name: Object,
     context: Object,
     must_cancel: bool,
     fut_waiter: Object,
-    num_cancels_requested: i64,
     log_destroy_pending: bool,
     /// The instance (for `all_tasks`), and whether this task is in the
     /// scheduled or eager registry: native tasks register here instead of
@@ -272,29 +266,119 @@ struct FutState {
     eager: bool,
 }
 
+/// A done callback's context: the one it was added with, or a copy of
+/// the context current when it was added, which becomes a `Context` only
+/// once the callback is scheduled (or the callback list is read). A
+/// pending future's callback (`gather`'s, for each child) so holds no
+/// `Context` of its own.
+#[derive(Clone)]
+enum CbContext {
+    Given(Object),
+    /// The copied context's mapping (see
+    /// [`crate::stdlib::contextvars_native::current_data`]).
+    Copied(Rc<RefCell<DictData>>),
+}
+
+const _: () = assert!(std::mem::size_of::<CbContext>() == std::mem::size_of::<Object>());
+
+impl CbContext {
+    /// The context, built if need be.
+    fn into_context(self) -> Result<Object, RuntimeError> {
+        match self {
+            Self::Given(ctx) => Ok(ctx),
+            Self::Copied(data) => crate::stdlib::contextvars_native::context_over(data),
+        }
+    }
+
+    /// The object this holds (the copied context's mapping, if unbuilt).
+    fn into_held(self) -> Object {
+        match self {
+            Self::Given(ctx) => ctx,
+            Self::Copied(data) => Object::Dict(data),
+        }
+    }
+}
+
+/// The state of a [`FutState`] that few futures carry: a failed or
+/// cancelled one's outcome and debug-mode records.
+struct FutCold {
+    exception: Object,
+    /// `exception.__traceback__` as of `set_exception` — restored on every
+    /// raise so re-awaiting the same future doesn't accumulate awaiter
+    /// frames (CPython's `fut_exception_tb`, test_futures2).
+    exception_tb: Object,
+    cancelled_exc: Object,
+    cancel_message: Object,
+    source_traceback: Object,
+    num_cancels_requested: i64,
+}
+
+impl Default for FutCold {
+    fn default() -> Self {
+        Self {
+            exception: Object::None,
+            exception_tb: Object::None,
+            cancelled_exc: Object::None,
+            cancel_message: Object::None,
+            source_traceback: Object::None,
+            num_cancels_requested: 0,
+        }
+    }
+}
+
+impl FutState {
+    /// The future's [`FutCold`] state, allocated if need be (to set it).
+    fn cold_mut(&mut self) -> &mut FutCold {
+        self.cold.get_or_insert_with(Box::default)
+    }
+
+    fn exception(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.exception.clone())
+    }
+
+    fn exception_tb(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.exception_tb.clone())
+    }
+
+    fn cancel_message(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.cancel_message.clone())
+    }
+
+    fn source_traceback(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.source_traceback.clone())
+    }
+
+    fn num_cancels_requested(&self) -> i64 {
+        self.cold.as_ref().map_or(0, |c| c.num_cancels_requested)
+    }
+}
+
 impl Default for FutState {
     fn default() -> Self {
         Self {
             status: FutStatus::Pending,
             result: Object::None,
-            exception: Object::None,
-            exception_tb: Object::None,
-            cancelled_exc: Object::None,
             loop_: Object::None,
             callbacks: Vec::new(),
-            cancel_message: Object::None,
             log_traceback: false,
             blocking: false,
-            source_traceback: Object::None,
             initialized: false,
             awaited_by: Vec::new(),
             awaited_by_touched: false,
+            cold: None,
             coro: Object::None,
             name: Object::None,
             context: Object::None,
             must_cancel: false,
             fut_waiter: Object::None,
-            num_cancels_requested: 0,
             log_destroy_pending: true,
             this: crate::sync::Weak::new(),
             scheduled: false,
@@ -455,6 +539,8 @@ fn awaited_by_add(fut: &Object, waiter: &Object) {
     let mut s = st.borrow_mut();
     s.awaited_by_touched = true;
     if !s.awaited_by.iter().any(|w| same_object(w, waiter)) {
+        // (Most futures have one awaiter.)
+        s.awaited_by.reserve_exact(1);
         s.awaited_by.push(waiter.clone());
     }
 }
@@ -516,7 +602,7 @@ pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
             return false;
         };
         let has_loop = !matches!(s.loop_, Object::None);
-        let log_exc = s.log_traceback && !matches!(s.exception, Object::None) && has_loop;
+        let log_exc = s.log_traceback && !matches!(s.exception(), Object::None) && has_loop;
         let log_pending = is_task
             && s.status == FutStatus::Pending
             && s.initialized
@@ -553,12 +639,7 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     let Ok(s) = st.try_borrow() else { return };
     for o in [
         &s.result,
-        &s.exception,
-        &s.exception_tb,
-        &s.cancelled_exc,
         &s.loop_,
-        &s.cancel_message,
-        &s.source_traceback,
         &s.coro,
         &s.name,
         &s.context,
@@ -568,13 +649,24 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
     for (cb, ctx) in &s.callbacks {
         visit(cb);
-        visit(ctx);
+        visit(&ctx.clone().into_held());
     }
     // 3.14 `FutureObj_traverse` visits `fut_awaited_by`: the strong
     // waiter references it holds close the `task -> coro frame -> future
     // -> awaited_by -> task` loop (test_log_destroyed_pending_task).
     for w in &s.awaited_by {
         visit(w);
+    }
+    if let Some(cold) = &s.cold {
+        for o in [
+            &cold.exception,
+            &cold.exception_tb,
+            &cold.cancelled_exc,
+            &cold.cancel_message,
+            &cold.source_traceback,
+        ] {
+            visit(o);
+        }
     }
 }
 
@@ -588,14 +680,9 @@ fn fut_gc_clear(obj: &Object) {
     let mut dropped: Vec<Object> = Vec::new();
     if let Ok(mut s) = st.try_borrow_mut() {
         let s = &mut *s;
-        let fields: [&mut Object; 11] = [
+        let fields: [&mut Object; 6] = [
             &mut s.result,
-            &mut s.exception,
-            &mut s.exception_tb,
-            &mut s.cancelled_exc,
             &mut s.loop_,
-            &mut s.cancel_message,
-            &mut s.source_traceback,
             &mut s.coro,
             &mut s.name,
             &mut s.context,
@@ -606,9 +693,21 @@ fn fut_gc_clear(obj: &Object) {
         }
         for (cb, ctx) in s.callbacks.drain(..) {
             dropped.push(cb);
-            dropped.push(ctx);
+            dropped.push(ctx.into_held());
         }
         dropped.append(&mut s.awaited_by);
+        if let Some(cold) = s.cold.as_mut() {
+            let fields: [&mut Object; 5] = [
+                &mut cold.exception,
+                &mut cold.exception_tb,
+                &mut cold.cancelled_exc,
+                &mut cold.cancel_message,
+                &mut cold.source_traceback,
+            ];
+            for o in fields {
+                dropped.push(std::mem::replace(o, Object::None));
+            }
+        }
     }
     // The registry entry itself dies too — the instance dict (and with it
     // the handle) is cleared right after this hook runs.
@@ -831,7 +930,12 @@ fn schedule_callbacks(
     };
     let _ = interp;
     for (cb, ctx) in callbacks {
-        call_soon(&loop_, cb, std::slice::from_ref(self_obj), ctx)?;
+        call_soon(
+            &loop_,
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
+        )?;
     }
     Ok(())
 }
@@ -850,8 +954,10 @@ fn make_cancelled_error(
 ) -> Result<Object, RuntimeError> {
     let (saved, msg) = {
         let mut s = st.borrow_mut();
-        let saved = std::mem::replace(&mut s.cancelled_exc, Object::None);
-        (saved, s.cancel_message.clone())
+        let saved = s.cold.as_mut().map_or(Object::None, |c| {
+            std::mem::replace(&mut c.cancelled_exc, Object::None)
+        });
+        (saved, s.cancel_message())
     };
     if !matches!(saved, Object::None) {
         return Ok(saved);
@@ -889,11 +995,7 @@ fn future_result_impl(
             let (exc, tb, result) = {
                 let mut s = st.borrow_mut();
                 s.log_traceback = false;
-                (
-                    s.exception.clone(),
-                    s.exception_tb.clone(),
-                    s.result.clone(),
-                )
+                (s.exception(), s.exception_tb(), s.result.clone())
             };
             if matches!(exc, Object::None) {
                 Ok(result)
@@ -926,7 +1028,7 @@ fn future_exception_impl(
         FutStatus::Finished => {
             let mut s = st.borrow_mut();
             s.log_traceback = false;
-            Ok(s.exception.clone())
+            Ok(s.exception())
         }
     }
 }
@@ -997,8 +1099,8 @@ fn future_set_exception_impl(
     };
     {
         let mut s = st.borrow_mut();
-        s.exception_tb = exc_traceback_of(&exc_inst);
-        s.exception = exc_inst;
+        s.cold_mut().exception_tb = exc_traceback_of(&exc_inst);
+        s.cold_mut().exception = exc_inst;
         s.status = FutStatus::Finished;
         s.log_traceback = true;
     }
@@ -1027,7 +1129,7 @@ fn future_cancel_impl(
             return Ok(false);
         }
         s.status = FutStatus::Cancelled;
-        s.cancel_message = msg;
+        s.cold_mut().cancel_message = msg;
     }
     schedule_callbacks(interp, self_obj, st)?;
     Ok(true)
@@ -1042,15 +1144,25 @@ fn future_add_done_callback_impl(
 ) -> Result<(), RuntimeError> {
     ensure_initialized(interp, st)?;
     let ctx = if matches!(context, Object::None) {
-        crate::stdlib::contextvars_native::copy_current()?
+        CbContext::Copied(crate::stdlib::contextvars_native::current_data()?)
     } else {
-        context
+        CbContext::Given(context)
     };
     if future_done_st(st) {
         let loop_ = st.borrow().loop_.clone();
-        call_soon(&loop_, cb, std::slice::from_ref(self_obj), ctx)?;
+        call_soon(
+            &loop_,
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
+        )?;
     } else {
-        st.borrow_mut().callbacks.push((cb, ctx));
+        let mut s = st.borrow_mut();
+        // (Most futures get one callback.)
+        if s.callbacks.is_empty() {
+            s.callbacks.reserve_exact(1);
+        }
+        s.callbacks.push((cb, ctx));
     }
     Ok(())
 }
@@ -1106,7 +1218,7 @@ fn fut_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     if debug {
         let extract_stack = import_attr(interp, "asyncio.format_helpers", "extract_stack")?;
         let stack = call(interp, &extract_stack, &[])?;
-        st.borrow_mut().source_traceback = stack;
+        st.borrow_mut().cold_mut().source_traceback = stack;
     }
     let _ = inst;
     Ok(Object::None)
@@ -1176,7 +1288,7 @@ fn fut_remove_done_callback(args: &[Object]) -> Result<Object, RuntimeError> {
         type_error("remove_done_callback() missing 1 required positional argument: 'fn'")
     })?;
     let callbacks = st.borrow().callbacks.clone();
-    let mut kept: Vec<(Object, Object)> = Vec::with_capacity(callbacks.len());
+    let mut kept: Vec<(Object, CbContext)> = Vec::with_capacity(callbacks.len());
     let mut removed = 0i64;
     for (cb, ctx) in callbacks {
         if py_eq(interp, &cb, &target) {
@@ -1255,7 +1367,7 @@ fn fut_del(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state_of_instance(&inst);
     let (log, exc, loop_) = {
         let s = st.borrow();
-        (s.log_traceback, s.exception.clone(), s.loop_.clone())
+        (s.log_traceback, s.exception(), s.loop_.clone())
     };
     if log && !matches!(exc, Object::None) && !matches!(loop_, Object::None) {
         if let Ok(interp) = interp() {
@@ -1270,7 +1382,7 @@ fn fut_del(args: &[Object]) -> Result<Object, RuntimeError> {
             );
             ctx.insert(DictKey(Object::from_static("exception")), exc);
             ctx.insert(DictKey(Object::from_static("future")), self_obj);
-            let source_tb = st.borrow().source_traceback.clone();
+            let source_tb = st.borrow().source_traceback();
             if !matches!(source_tb, Object::None) {
                 ctx.insert(DictKey(Object::from_static("source_traceback")), source_tb);
             }
@@ -1314,12 +1426,22 @@ fn futprop_loop(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_callbacks(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let cbs: Vec<Object> = st
-        .borrow()
+    // Build the copied contexts once, so each reads back as the same
+    // object.
+    let mut s = st.borrow_mut();
+    for (_, ctx) in &mut s.callbacks {
+        if let CbContext::Copied(data) = ctx {
+            *ctx = CbContext::Given(crate::stdlib::contextvars_native::context_over(
+                data.clone(),
+            )?);
+        }
+    }
+    let cbs: Vec<Object> = s
         .callbacks
         .iter()
-        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone()]))
+        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone().into_held()]))
         .collect();
+    drop(s);
     // The C getter reports `None` for an empty callback list (a fresh copy
     // otherwise) — `test_callbacks_copy` pins this.
     if cbs.is_empty() {
@@ -1336,7 +1458,7 @@ fn futprop_result(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_exception(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().exception.clone();
+    let out = st.borrow().exception();
     Ok(out)
 }
 
@@ -1358,19 +1480,19 @@ fn futprop_set_log_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_source_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().source_traceback.clone();
+    let out = st.borrow().source_traceback();
     Ok(out)
 }
 
 fn futprop_cancel_message(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().cancel_message.clone();
+    let out = st.borrow().cancel_message();
     Ok(out)
 }
 
 fn futprop_set_cancel_message(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    st.borrow_mut().cancel_message = args.get(1).cloned().unwrap_or(Object::None);
+    st.borrow_mut().cold_mut().cancel_message = args.get(1).cloned().unwrap_or(Object::None);
     Ok(Object::None)
 }
 
@@ -1442,7 +1564,7 @@ fn taskprop_set_log_destroy_pending(args: &[Object]) -> Result<Object, RuntimeEr
 
 fn taskprop_num_cancels(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = Object::Int(st.borrow().num_cancels_requested);
+    let out = Object::Int(st.borrow().num_cancels_requested());
     Ok(out)
 }
 
@@ -1761,7 +1883,7 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         // `extract_stack(sys._getframe(1))` (no pop needed;
         // `test_task_source_traceback` checks `[-2]` is the test body).
         let stack = call(interp, &extract_stack, &[])?;
-        st.borrow_mut().source_traceback = stack;
+        st.borrow_mut().cold_mut().source_traceback = stack;
     }
     // Coroutine validation (a native coroutine needs no Python call).
     let is_coro = matches!(coro, Object::Coroutine(_)) || {
@@ -1796,7 +1918,9 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         s.coro = coro;
         s.name = name_obj;
         s.context = ctx.clone();
-        s.num_cancels_requested = 0;
+        if let Some(cold) = s.cold.as_mut() {
+            cold.num_cancels_requested = 0;
+        }
         s.must_cancel = false;
         s.fut_waiter = Object::None;
     }
@@ -1977,7 +2101,7 @@ fn task_step_handle_result(
             let must_cancel = st.borrow().must_cancel;
             if must_cancel {
                 st.borrow_mut().must_cancel = false;
-                let msg = st.borrow().cancel_message.clone();
+                let msg = st.borrow().cancel_message();
                 future_cancel_impl(interp, task, st, msg)?;
             } else {
                 // Internal set_result (bypasses Task's override).
@@ -1996,7 +2120,7 @@ fn task_step_handle_result(
         SendOutcome::Raise(RuntimeError::PyException(pe)) => {
             let inst = pe.instance.clone();
             if is_instance_of_named(interp, &inst, "asyncio.exceptions", "CancelledError") {
-                st.borrow_mut().cancelled_exc = inst;
+                st.borrow_mut().cold_mut().cancelled_exc = inst;
                 future_cancel_impl(interp, task, st, Object::None)?;
                 Ok(())
             } else if is_builtin_exc(&inst, "KeyboardInterrupt")
@@ -2060,7 +2184,7 @@ fn task_step_handle_result(
             awaited_by_add(&result, task);
             let must_cancel = st.borrow().must_cancel;
             if must_cancel {
-                let msg = st.borrow().cancel_message.clone();
+                let msg = st.borrow().cancel_message();
                 let cancelled =
                     call_method_kw(interp, &result, "cancel", &[], &[("msg".to_owned(), msg)])?;
                 if truthy(&cancelled) {
@@ -2106,7 +2230,7 @@ fn task_step_handle_result(
                         awaited_by_add(&result, task);
                         let must_cancel = st.borrow().must_cancel;
                         if must_cancel {
-                            let msg = st.borrow().cancel_message.clone();
+                            let msg = st.borrow().cancel_message();
                             let cancelled = call_method_kw(
                                 interp,
                                 &result,
@@ -2173,8 +2297,8 @@ fn task_internal_set_exception(
     }
     {
         let mut s = st.borrow_mut();
-        s.exception_tb = exc_traceback_of(&exc_inst);
-        s.exception = exc_inst;
+        s.cold_mut().exception_tb = exc_traceback_of(&exc_inst);
+        s.cold_mut().exception = exc_inst;
         s.status = FutStatus::Finished;
         s.log_traceback = true;
     }
@@ -2239,7 +2363,7 @@ fn task_cancel(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     if future_done_st(&st) {
         return Ok(Object::Bool(false));
     }
-    st.borrow_mut().num_cancels_requested += 1;
+    st.borrow_mut().cold_mut().num_cancels_requested += 1;
     let fut_waiter = st.borrow().fut_waiter.clone();
     if !matches!(fut_waiter, Object::None) {
         let cancelled = call_method_kw(
@@ -2256,27 +2380,27 @@ fn task_cancel(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     {
         let mut s = st.borrow_mut();
         s.must_cancel = true;
-        s.cancel_message = msg;
+        s.cold_mut().cancel_message = msg;
     }
     Ok(Object::Bool(true))
 }
 
 fn task_cancelling(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = Object::Int(st.borrow().num_cancels_requested);
+    let out = Object::Int(st.borrow().num_cancels_requested());
     Ok(out)
 }
 
 fn task_uncancel(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let mut s = st.borrow_mut();
-    if s.num_cancels_requested > 0 {
-        s.num_cancels_requested -= 1;
-        if s.num_cancels_requested == 0 {
+    if s.num_cancels_requested() > 0 {
+        s.cold_mut().num_cancels_requested -= 1;
+        if s.num_cancels_requested() == 0 {
             s.must_cancel = false;
         }
     }
-    Ok(Object::Int(s.num_cancels_requested))
+    Ok(Object::Int(s.num_cancels_requested()))
 }
 
 fn task_get_coro(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2395,7 +2519,7 @@ fn task_del(args: &[Object]) -> Result<Object, RuntimeError> {
                 Object::from_static("Task was destroyed but it is pending!"),
             );
             ctx.insert(DictKey(Object::from_static("task")), self_obj);
-            let source_tb = st.borrow().source_traceback.clone();
+            let source_tb = st.borrow().source_traceback();
             if !matches!(source_tb, Object::None) {
                 ctx.insert(DictKey(Object::from_static("source_traceback")), source_tb);
             }

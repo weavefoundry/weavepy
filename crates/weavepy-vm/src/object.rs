@@ -393,10 +393,10 @@ impl fmt::Debug for Object {
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.cls().name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
-            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow().to_str()),
-            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow().to_str()),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name().to_str()),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name().to_str()),
             Object::AsyncGenerator(g) => {
-                write!(f, "<async_generator object {}>", g.name.borrow().to_str())
+                write!(f, "<async_generator object {}>", g.name().to_str())
             }
             Object::AsyncGenAwait(a) => write!(f, "<{} object>", a.kind.type_name()),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
@@ -5197,17 +5197,6 @@ pub struct PySlice {
 /// itself is opaque to outside code — it's owned by the VM module via
 /// `state` and only legal to inspect via interpreter methods.
 pub struct PyGenerator {
-    /// `gi_name`. Seeded from the function's `__name__` at call time;
-    /// user code may reassign it (`gen.__name__ = ...`). Held as the
-    /// *string object* so repeated reads return the identical object —
-    /// CPython stores `gi_name` as a `PyObject*` and
-    /// `gen.__name__ is gen.__name__` holds (test_types
-    /// CoroutineTests.test_gen reads it through two paths and
-    /// asserts `is`).
-    pub name: RefCell<Object>,
-    /// `gi_qualname` (PEP 3155). Seeded from the function's
-    /// `__qualname__` at call time; reassignable like `name`.
-    pub qualname: RefCell<Object>,
     /// Whether this is a plain generator, a coroutine, or an async
     /// generator. Needed so the shared send/throw machinery can apply
     /// PEP 479 (a `StopIteration` escaping the *body* becomes a
@@ -5218,8 +5207,9 @@ pub struct PyGenerator {
     /// finishes and the frame is dropped.
     pub code: Object,
     pub state: RefCell<GeneratorState>,
-    /// [`Self::origin`] and [`Self::finalizer`], which few generators
-    /// carry, allocated when one is first set.
+    /// [`Self::name`] and [`Self::qualname`] when they aren't the code's,
+    /// [`Self::origin`] and [`Self::finalizer`]: the state few generators
+    /// carry, allocated when first set.
     extras: RefCell<Option<Box<GenExtras>>>,
     /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
     /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
@@ -5239,11 +5229,89 @@ pub struct PyGenerator {
 
 /// The state of a [`PyGenerator`] that few carry.
 struct GenExtras {
+    name: Option<Object>,
+    qualname: Option<Object>,
     origin: Object,
     finalizer: Object,
 }
 
+/// A [`GenExtras`] field.
+trait ExtraField {
+    /// Whether this is the field's unset value.
+    fn is_unset(&self) -> bool;
+}
+
+impl ExtraField for Object {
+    fn is_unset(&self) -> bool {
+        matches!(self, Object::None)
+    }
+}
+
+impl ExtraField for Option<Object> {
+    fn is_unset(&self) -> bool {
+        self.is_none()
+    }
+}
+
+impl Default for GenExtras {
+    fn default() -> Self {
+        Self {
+            name: None,
+            qualname: None,
+            origin: Object::None,
+            finalizer: Object::None,
+        }
+    }
+}
+
 impl PyGenerator {
+    /// `gi_name`. Seeded from the function's `__name__` at call time;
+    /// user code may reassign it (`gen.__name__ = ...`). Held as the
+    /// *string object* so repeated reads return the identical object —
+    /// CPython stores `gi_name` as a `PyObject*` and
+    /// `gen.__name__ is gen.__name__` holds (test_types
+    /// CoroutineTests.test_gen reads it through two paths and
+    /// asserts `is`). Unless set otherwise, the code's interned name.
+    pub fn name(&self) -> Object {
+        if let Some(name) = self.extras.borrow().as_ref().and_then(|e| e.name.clone()) {
+            return name;
+        }
+        self.code_names().0
+    }
+
+    /// `gi_qualname` (PEP 3155). Seeded from the function's
+    /// `__qualname__` at call time; reassignable like [`Self::name`].
+    pub fn qualname(&self) -> Object {
+        if let Some(name) = self
+            .extras
+            .borrow()
+            .as_ref()
+            .and_then(|e| e.qualname.clone())
+        {
+            return name;
+        }
+        self.code_names().1
+    }
+
+    /// Set [`Self::name`].
+    pub fn set_name(&self, name: Object) {
+        self.set_extra(Some(name), |e| &mut e.name);
+    }
+
+    /// Set [`Self::qualname`].
+    pub fn set_qualname(&self, qualname: Object) {
+        self.set_extra(Some(qualname), |e| &mut e.qualname);
+    }
+
+    /// The code's interned name and qualified name, the default
+    /// [`Self::name`] and [`Self::qualname`].
+    fn code_names(&self) -> (Object, Object) {
+        match &self.code {
+            Object::Code(code) => crate::code_gen_names(code),
+            _ => (Object::from_static(""), Object::from_static("")),
+        }
+    }
+
     /// `cr_origin` — for coroutines created while
     /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
     /// of `(filename, lineno, funcname)` triples for the creation call
@@ -5274,34 +5342,23 @@ impl PyGenerator {
         self.set_extra(finalizer, |e| &mut e.finalizer);
     }
 
-    fn set_extra(&self, value: Object, field: impl FnOnce(&mut GenExtras) -> &mut Object) {
+    fn set_extra<T: ExtraField>(&self, value: T, field: impl FnOnce(&mut GenExtras) -> &mut T) {
         let old = {
             let mut extras = self.extras.borrow_mut();
-            if extras.is_none() && matches!(value, Object::None) {
+            if extras.is_none() && value.is_unset() {
                 return;
             }
-            let extras = extras.get_or_insert_with(|| {
-                Box::new(GenExtras {
-                    origin: Object::None,
-                    finalizer: Object::None,
-                })
-            });
+            let extras = extras.get_or_insert_with(Box::default);
             std::mem::replace(field(extras), value)
         };
         // (Released outside the borrow: dropping it can run code.)
         drop(old);
     }
 
-    pub fn new(
-        name: impl Into<String>,
-        qualname: impl Into<String>,
-        kind: CoroutineKind,
-        code: Object,
-        frame: Box<crate::Frame>,
-    ) -> Self {
+    /// A generator of `kind` over `frame`, running `code`, named after
+    /// its code.
+    pub fn new(kind: CoroutineKind, code: Object, frame: Box<crate::Frame>) -> Self {
         Self {
-            name: RefCell::new(Object::from_str(name.into())),
-            qualname: RefCell::new(Object::from_str(qualname.into())),
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
@@ -5321,17 +5378,16 @@ impl PyGenerator {
         code: Object,
         frame: Box<crate::Frame>,
     ) -> Self {
-        Self {
-            name: RefCell::new(name),
-            qualname: RefCell::new(qualname),
-            kind,
-            code,
-            state: RefCell::new(GeneratorState::Created(frame)),
-            extras: RefCell::new(None),
-            hooks_inited: crate::sync::Cell::new(false),
-            finalize_ran: crate::sync::Cell::new(false),
-            gc_registered: crate::sync::Cell::new(false),
+        let gen = Self::new(kind, code, frame);
+        // (The code's own names, the common case, aren't stored.)
+        let (code_name, code_qualname) = gen.code_names();
+        if !name.is_same(&code_name) {
+            gen.set_name(name);
         }
+        if !qualname.is_same(&code_qualname) {
+            gen.set_qualname(qualname);
+        }
+        gen
     }
 
     pub fn is_finished(&self) -> bool {
@@ -5351,7 +5407,7 @@ impl PyGenerator {
 
 impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<generator {}>", self.name.borrow().to_str())
+        write!(f, "<generator {}>", self.name().to_str())
     }
 }
 
@@ -11402,17 +11458,17 @@ impl Object {
             // CPython's repr shows the qualified name (PEP 3155).
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::Coroutine(g) => format!(
                 "<coroutine object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenerator(g) => format!(
                 "<async_generator object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenAwait(a) => format!(

@@ -203,12 +203,25 @@ pub(crate) fn set_current(ctx: Object) {
 
 /// `contextvars.copy_context()`, for native callers (asyncio).
 pub(crate) fn copy_current() -> Result<Object, RuntimeError> {
+    context_over(current_data()?)
+}
+
+/// The current context's mapping, shared: a snapshot of it, as
+/// [`copy_current`] would take, for a caller that may never need the
+/// `Context` itself (a later `ContextVar.set` copies a shared mapping
+/// before writing, so the snapshot never changes).
+pub(crate) fn current_data() -> Result<Rc<RefCell<DictData>>, RuntimeError> {
     let st = state()?;
     let cur = current(&st);
     let Object::Instance(i) = &cur else {
         unreachable!("the current context is an instance")
     };
-    let data = data_of(i).unwrap_or_else(new_dict_raw);
+    Ok(data_of(i).unwrap_or_else(new_dict_raw))
+}
+
+/// A `Context` over a [`current_data`] snapshot: the copy it stands for.
+pub(crate) fn context_over(data: Rc<RefCell<DictData>>) -> Result<Object, RuntimeError> {
+    let st = state()?;
     Ok(new_context(&st, Object::Dict(data)))
 }
 
