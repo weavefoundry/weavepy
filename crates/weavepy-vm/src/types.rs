@@ -2384,7 +2384,7 @@ impl SlotStorage {
     /// `get(name)` with a position hint: one key compare when the slot
     /// sits at `idx` (the usual layout for a class whose `__init__`
     /// assigns its slots in a fixed order), the name scan otherwise.
-    #[inline]
+    #[inline(always)]
     pub fn get_hinted(&self, idx: usize, name: &str) -> Option<&Object> {
         if let Some((DictKey(Object::Str(stored)), value)) = self.get_index(idx) {
             // Interned names usually share the probe's storage.
