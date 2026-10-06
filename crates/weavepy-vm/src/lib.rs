@@ -20465,32 +20465,38 @@ impl Interpreter {
                         break;
                     };
                     let cls = inst.cls_raw();
-                    // (`object`'s own `__delattr__` is the default.)
-                    let custom_delattr = match cls.lookup("__delattr__") {
-                        None => false,
-                        Some(Object::Builtin(b)) => !builtin_types()
-                            .object_
-                            .dict
-                            .borrow()
-                            .get(&crate::object::StrKey("__delattr__"))
-                            .is_some_and(|o| matches!(o, Object::Builtin(d) if Rc::ptr_eq(d, &b))),
-                        Some(_) => true,
-                    };
+                    // An ordinary instance's own attribute, by the default
+                    // `__delattr__` (exceptions' special names, the
+                    // text wrapper's chunk size, and slots classes are
+                    // the full path's).
                     if inst.native.get().is_some()
                         || name.starts_with("__")
+                        || name == "_CHUNK_SIZE"
+                        || cls.flags.is_exception
+                        || cls.forbids_dict
                         || crate::capi_watchers::dicts_active()
-                        || custom_delattr
-                        || cls.lookup(name).is_some()
+                        || !Self::default_delattr(cls)
+                        || !matches!(
+                            Self::leaf_class_attr(code, cls, ins.arg),
+                            Some(LeafAttr::InstanceOnly)
+                        )
                     {
                         break;
                     }
-                    let inst = inst.clone();
-                    let obj = Object::Instance(inst.clone());
-                    if self.generic_delattr_instance(&inst, &obj, name).is_err() {
+                    let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
                         break;
-                    }
-                    drop(obj);
+                    };
+                    let removed = inst
+                        .dict_cell()
+                        .borrow_mut()
+                        .shift_remove(&DictKey(Object::Str(key.clone())));
+                    // A missing attribute raises through the full path.
+                    let Some(removed) = removed else {
+                        break;
+                    };
                     drop(stack.pop());
+                    // Released at once, as CPython's decref is.
+                    self.release(removed);
                     last = pc;
                     pc += 1;
                 }
@@ -22223,6 +22229,38 @@ impl Interpreter {
             1 => true,
             2 => false,
             _ => Self::default_getattribute_slow(cls),
+        }
+    }
+
+    /// Whether `cls`'s `__delattr__` is `object`'s, cached on the class
+    /// under its attribute version.
+    fn default_delattr(cls: &TypeObject) -> bool {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for the answer (an address no interned name has).
+        static DELATTR_KEY: u8 = 0;
+        let key = std::ptr::addr_of!(DELATTR_KEY) as usize;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::InstanceOnly) => true,
+            Some(_) => false,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return false;
+                }
+                let default = match cls.lookup("__delattr__") {
+                    None => true,
+                    Some(Object::Builtin(b)) => builtin_types()
+                        .object_
+                        .dict
+                        .borrow()
+                        .get(&crate::object::StrKey("__delattr__"))
+                        .is_some_and(|o| matches!(o, Object::Builtin(d) if Rc::ptr_eq(d, &b))),
+                    Some(_) => false,
+                };
+                cls.leaf_attrs
+                    .set(key, ver, if default { K::InstanceOnly } else { K::Other });
+                default
+            }
         }
     }
 
