@@ -11726,6 +11726,8 @@ impl Interpreter {
                     | OpCode::BinarySlice
                     | OpCode::StoreSubscr
                     | OpCode::ListAppend
+                    | OpCode::SetAdd
+                    | OpCode::MapAdd
                     | OpCode::UnpackSequence => {
                         // SAFETY: the `len` slots at `base` are initialized,
                         // and the helper touches nothing else.
@@ -15897,6 +15899,73 @@ impl Interpreter {
                     drop_hot(seq);
                 }
                 Some(len - 1 + n)
+            }
+            // A comprehension's add onto its exact set or dict, for a key
+            // whose hash and equality are native (see `LeafProbe`). A
+            // duplicate key's release, or a displaced value's, runs nothing.
+            OpCode::SetAdd | OpCode::MapAdd => {
+                let depth = ins.arg as usize;
+                let operands = if ins.op == OpCode::MapAdd { 2 } else { 1 };
+                if depth == 0 || len < operands + depth {
+                    return None;
+                }
+                // SAFETY: `len >= operands + depth`, so every slot named is
+                // initialized.
+                let (target, key) = unsafe {
+                    (
+                        &*base.add(len - operands - depth),
+                        &*base.add(len - operands),
+                    )
+                };
+                let probe = crate::object::LeafProbe::new(key)?;
+                match target {
+                    Object::Set(st) => {
+                        // SAFETY: a store between two instructions (the probe
+                        // and the insert run no code).
+                        let st = unsafe { st.peek_mut() }?;
+                        if st.get_index_of(&probe).is_some() {
+                            if !Self::core_droppable(key) {
+                                return None;
+                            }
+                            // SAFETY: the key leaves the stack.
+                            unsafe { drop_hot(base.add(len - 1).read()) };
+                        } else if probe.miss_is_exact() {
+                            // SAFETY: as above.
+                            st.insert(DictKey(unsafe { base.add(len - 1).read() }));
+                        } else {
+                            return None;
+                        }
+                    }
+                    Object::Dict(cell) => {
+                        if crate::capi_watchers::dicts_active() {
+                            return None;
+                        }
+                        // SAFETY: as above.
+                        let d = unsafe { cell.peek_mut() }?;
+                        let (k, v) = (base.wrapping_add(len - 2), base.wrapping_add(len - 1));
+                        match d.get_mut(&probe) {
+                            Some(slot) => {
+                                if !Self::core_droppable(slot) || !Self::core_droppable(key) {
+                                    return None;
+                                }
+                                // SAFETY: both operands leave the stack; the
+                                // displaced value and the duplicate key are
+                                // droppable.
+                                unsafe {
+                                    drop_hot(std::mem::replace(slot, v.read()));
+                                    drop_hot(k.read());
+                                }
+                            }
+                            None if probe.miss_is_exact() => {
+                                // SAFETY: as above.
+                                unsafe { d.insert(DictKey(k.read()), v.read()) };
+                            }
+                            None => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+                Some(len - operands)
             }
             OpCode::ListAppend => {
                 let depth = ins.arg as usize;
@@ -20551,6 +20620,21 @@ impl Interpreter {
                     }
                     let items = stack.split_off(stack.len() - n);
                     let obj = Object::new_list(items);
+                    gc_trace::track(&obj);
+                    stack.push(obj);
+                    last = pc;
+                    pc += 1;
+                }
+                // An empty set (a set comprehension's start), tracked as the
+                // full handler tracks every set.
+                OpCode::BuildSet if ins.arg == 0 => {
+                    if crate::stdlib::tracemalloc_real::is_tracking()
+                        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                        || gc_trace::auto_collect_due()
+                    {
+                        break;
+                    }
+                    let obj = Object::Set(Rc::new(RefCell::new(crate::object::SetData::default())));
                     gc_trace::track(&obj);
                     stack.push(obj);
                     last = pc;
@@ -62129,6 +62213,7 @@ static SLOW_LEAF_OPS: [bool; 256] = {
         OpCode::BinarySubscr,
         OpCode::BuildList,
         OpCode::BuildMap,
+        OpCode::BuildSet,
         OpCode::BuildString,
         OpCode::BuildTuple,
         OpCode::Call,
