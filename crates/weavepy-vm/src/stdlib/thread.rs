@@ -42,10 +42,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("allocate_lock")),
             b("allocate_lock", allocate_lock),
         );
-        d.insert(
-            DictKey(Object::from_static("get_ident")),
-            b("get_ident", get_ident),
-        );
+        let ident = b("get_ident", get_ident);
+        // Reads the thread's id: no Python runs.
+        if let Object::Builtin(f) = &ident {
+            crate::leaf_builtins::register(f);
+        }
+        d.insert(DictKey(Object::from_static("get_ident")), ident);
         d.insert(
             DictKey(Object::from_static("get_native_id")),
             b("get_native_id", get_ident),

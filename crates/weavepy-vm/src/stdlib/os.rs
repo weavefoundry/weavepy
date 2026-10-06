@@ -296,10 +296,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("chdir")),
             builtin("chdir", os_chdir),
         );
-        d.insert(
-            DictKey(Object::from_static("fspath")),
-            builtin("fspath", os_fspath),
-        );
+        let fspath = builtin("fspath", os_fspath);
+        // `fspath` of a `str` or `bytes` is the argument itself, run in
+        // place; anything else (a `__fspath__`) takes the full call.
+        if let Object::Builtin(b) = &fspath {
+            crate::leaf_builtins::register_fast(b, fspath_fast);
+        }
+        d.insert(DictKey(Object::from_static("fspath")), fspath);
         d.insert(
             DictKey(Object::from_static("fsdecode")),
             builtin("fsdecode", os_fsdecode),
@@ -8401,5 +8404,13 @@ mod tests {
         assert_eq!(nt_splitdrive(r"\\?\C:\x"), (r"\\?\C:", r"\x"));
         assert_eq!(nt_splitdrive(r"\x\y"), ("", r"\x\y"));
         assert_eq!(nt_splitdrive("rel"), ("", "rel"));
+    }
+}
+
+/// `os.fspath`'s leaf half (see `leaf_builtins::register_fast`).
+fn fspath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [x @ (Object::Str(_) | Object::Bytes(_))] => Some(Ok(x.clone())),
+        _ => None,
     }
 }

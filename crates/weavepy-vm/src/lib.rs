@@ -17974,6 +17974,28 @@ impl Interpreter {
         let recv = recv?;
         let name = code.names.get(name_idx as usize)?.as_str();
         match recv {
+            // A code object's fields and a frame's plain ones (neither type
+            // can be subclassed, and no getter here runs Python); the full
+            // path keeps the deprecated `co_lnotab`, a generator frame's
+            // re-derived `f_back`, and a line-0 `f_lineno`.
+            Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
+            Object::Frame(fr) => match name {
+                "f_code" => Some(Object::Code(fr.code.clone())),
+                "f_globals" => Some(Object::Dict(fr.globals.clone())),
+                "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
+                "f_lineno" => match fr.current_lineno() {
+                    0 => None,
+                    line => Some(Object::Int(i64::from(line))),
+                },
+                "f_back"
+                    if !(fr.code.is_generator
+                        || fr.code.is_coroutine
+                        || fr.code.is_async_generator) =>
+                {
+                    Some(fr.back_frame().map_or(Object::None, Object::Frame))
+                }
+                _ => None,
+            },
             // `x.__class__` of a builtin value: its exact type (no instance
             // or class can override it there).
             Object::Generator(_)
