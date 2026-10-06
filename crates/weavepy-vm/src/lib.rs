@@ -22836,8 +22836,14 @@ impl Interpreter {
             return None;
         };
         let name: &str = name;
-        if args.len() > 3 || name.starts_with("__") || crate::object::exotic_str_keys_possible() {
+        if args.len() > 3 || crate::object::exotic_str_keys_possible() {
             return None;
+        }
+        // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
+        // default.
+        if name.starts_with("__") {
+            return (args.len() == 3 && attr_certainly_missing(&args[0], name))
+                .then(|| Ok(args[2].clone()));
         }
         let cls = inst.cls_raw();
         if cls.native_kind.get() != 0
@@ -62775,7 +62781,8 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     let Object::Instance(inst) = obj else {
         return false;
     };
-    if name.starts_with("__") || inst.native.get().is_some() || inst.c_body.get() != 0 {
+    let dunder = name.starts_with("__");
+    if inst.native.get().is_some() || inst.c_body.get() != 0 {
         return false;
     }
     let cls = inst.cls();
@@ -62785,6 +62792,23 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
         || cls.lookup(name).is_some()
     {
         return false;
+    }
+    // A dunder may also come from a builtin base's slot (`__repr__`,
+    // `__reduce_ex__`), or be an instance-level special; one that none
+    // supplies (`__deepcopy__`, which `copy` probes) is missing.
+    if dunder {
+        let special = matches!(
+            name,
+            "__class__" | "__dict__" | "__weakref__" | "__doc__" | "__module__"
+        );
+        let builtin_base = cls
+            .mro
+            .borrow()
+            .iter()
+            .any(|t| t.flags.is_builtin && t.name != "object");
+        if special || builtin_base || builtin_slot_wrapper(&cls, name).is_some() {
+            return false;
+        }
     }
     match inst.dict.published() {
         Some(d) => d
