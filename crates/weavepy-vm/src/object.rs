@@ -11482,7 +11482,7 @@ impl Object {
             Object::Frame(fr) => format!(
                 "<frame at 0x{:x}, file {}, line {}, code {}>",
                 Rc::as_ptr(fr) as usize,
-                Object::from_str(fr.code.filename.clone()).repr(),
+                Object::from_str(&*fr.code.filename).repr(),
                 fr.current_lineno(),
                 fr.code.name
             ),

@@ -824,7 +824,7 @@ impl MarshalWriter {
         self.force_unshared_next = CodePlan::is_annotate(co);
         self.write_interned_str(&strs_to_tuple(&cp.localsplusnames))?;
         self.write_kinds_bytes(&cp.localspluskinds)?;
-        self.write_interned_str(&Object::from_str(co.filename.clone()))?;
+        self.write_interned_str(&Object::from_str(&*co.filename))?;
         self.write_interned_str(&Object::from_str(co.name.clone()))?;
         // PEP 3155 qualified name, computed at compile time from lexical
         // nesting (`outer.<locals>.inner`, `C.method`). Round-trips so an
@@ -1172,15 +1172,15 @@ impl Scan {
                         && !startup_interned(text)
                         && !self.qualnames_done.contains(text))
                         || class_names.contains(&text)
-                        || co.const_identifiers.iter().any(|n| n == text);
+                        || co.const_identifiers().iter().any(|n| n == text);
                     self.register(text, interned);
                 }
                 Object::Code(inner) => self.unit(inner),
-                other => self.literals(other, &co.const_identifiers),
+                other => self.literals(other, co.const_identifiers()),
             }
         }
         self.identifiers
-            .extend(co.const_identifiers.iter().cloned());
+            .extend(co.const_identifiers().iter().cloned());
         // Names never pass through the compiler's constant cache, so an
         // equal string *constant* keeps its own object: the canonical
         // constant is not decided here, only the identifier set.
@@ -1732,10 +1732,10 @@ impl<'a> MarshalReader<'a> {
         // CO_OPTIMIZED|CO_NEWLOCALS on `co_flags`
         // (test_capi.test_eval_code_ex test_custom_locals).
         let is_class_body = flags & CO_OPTIMIZED == 0 && co_name != "<module>";
-        let co = CodeObject {
+        let mut co = CodeObject {
             name: co_name,
             qualname: co_qualname,
-            filename: string_of(&filename, "co_filename")?,
+            filename: string_of(&filename, "co_filename")?.into(),
             caches: CacheTable::with_len(decoded.instructions.len()),
             vm_ext: weavepy_compiler::VmExt::default(),
             jit_hint: weavepy_compiler::JitHint::default(),
@@ -1768,12 +1768,15 @@ impl<'a> MarshalReader<'a> {
             cp_cache: cpython_code::CpCache::default(),
             wire: None,
             stacksize: u32::try_from(stacksize).ok(),
-            no_interrupt_jumps: decoded.no_interrupt_jumps,
-            wire_marks: decoded.wire_marks,
-            hidden_locals: decoded.hidden_locals,
-            const_identifiers: Vec::new(),
+            wire_marks: decoded.wire_marks.into(),
+            rare: weavepy_compiler::CodeRare::default(),
             annotate_scope: false,
         };
+        co.rare.set(weavepy_compiler::RareFields {
+            no_interrupt_jumps: decoded.no_interrupt_jumps,
+            hidden_locals: decoded.hidden_locals,
+            const_identifiers: Vec::new(),
+        });
         Ok(Object::Code(Rc::new(co)))
     }
 }

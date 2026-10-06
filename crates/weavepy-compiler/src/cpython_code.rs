@@ -759,7 +759,7 @@ fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
     }
     for (i, v) in code.varnames.iter().enumerate() {
         let mut kind = CO_FAST_LOCAL | arg_kind_of.get(i).copied().unwrap_or(0);
-        if code.hidden_locals.iter().any(|h| h == v) {
+        if code.hidden_locals().iter().any(|h| h == v) {
             kind |= CO_FAST_HIDDEN;
         }
         if code.cellvars.iter().any(|c| c == v) {
@@ -858,7 +858,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
     // The internal stream folds both backward jumps into one opcode;
     // `no_interrupt_jumps` says which ones are `JUMP_NO_INTERRUPT`.
-    for &j in &code.no_interrupt_jumps {
+    for &j in code.no_interrupt_jumps() {
         if let Some(m) = mapped.get_mut(j as usize) {
             if m.cp_op == op::JUMP_BACKWARD {
                 m.cp_op = op::JUMP_BACKWARD_NO_INTERRUPT;

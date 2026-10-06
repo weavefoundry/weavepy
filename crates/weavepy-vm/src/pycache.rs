@@ -297,7 +297,7 @@ pub fn try_load(source_path: &Path, optimize: u8) -> Option<CodeObject> {
             // diverge from the module's `__file__` and break consumers that
             // bridge the two (`warnings.warn(stacklevel=)` filename checks).
             let current = source_path.to_string_lossy();
-            if code.filename != current {
+            if *code.filename != *current {
                 rewrite_filenames(&mut code, &current);
             }
             Some(code)
@@ -316,14 +316,19 @@ pub(crate) fn own_decoded_code(code: Rc<CodeObject>) -> CodeObject {
 /// Recursively stamp `filename` on a code object and every nested code
 /// constant (function/class bodies, comprehensions).
 pub(crate) fn rewrite_filenames(code: &mut CodeObject, filename: &str) {
-    code.filename = filename.to_owned();
-    fn walk(c: &mut weavepy_compiler::Constant, filename: &str) {
+    // Every code object shares one copy of the name.
+    rewrite_shared(code, &std::sync::Arc::from(filename));
+}
+
+fn rewrite_shared(code: &mut CodeObject, filename: &std::sync::Arc<str>) {
+    code.filename = filename.clone();
+    fn walk(c: &mut weavepy_compiler::Constant, filename: &std::sync::Arc<str>) {
         match c {
             // Freshly decoded pools own their code Arcs uniquely, so
             // `make_mut` rewrites in place (no clone).
             weavepy_compiler::Constant::Code(inner) => {
                 let inner = std::sync::Arc::make_mut(inner);
-                rewrite_filenames(inner, filename)
+                rewrite_shared(inner, filename)
             }
             weavepy_compiler::Constant::Tuple(items) => {
                 for it in items {
@@ -441,7 +446,7 @@ mod ownership_tests {
         fn collect(code: &CodeObject, rows: &mut Vec<(*const CodeObject, String)>) {
             for c in &code.constants {
                 if let Constant::Code(inner) = c {
-                    rows.push((Arc::as_ptr(inner), inner.filename.clone()));
+                    rows.push((Arc::as_ptr(inner), inner.filename.to_string()));
                     collect(inner, rows);
                 }
             }
@@ -452,7 +457,7 @@ mod ownership_tests {
         rewrite_filenames(&mut code, "relocated/module.py");
         let mut after = Vec::new();
         collect(&code, &mut after);
-        assert_eq!(code.filename, "relocated/module.py");
+        assert_eq!(&*code.filename, "relocated/module.py");
         assert_eq!(before.len(), after.len());
         for ((old_ptr, old_name), (new_ptr, new_name)) in before.iter().zip(&after) {
             assert_eq!(old_ptr, new_ptr);
@@ -465,25 +470,25 @@ mod ownership_tests {
     fn relocation_preserves_shared_code_and_nested_tuple_constants() {
         let child = Arc::new(CodeObject {
             name: "child".to_owned(),
-            filename: "original.py".to_owned(),
+            filename: "original.py".into(),
             ..CodeObject::default()
         });
         let root = Arc::new(CodeObject {
-            filename: "original.py".to_owned(),
+            filename: "original.py".into(),
             constants: vec![Constant::Tuple(vec![Constant::Code(child.clone())])],
             ..CodeObject::default()
         });
         let mut moved = own_decoded_code(Rc::from_arc(root.clone()));
         rewrite_filenames(&mut moved, "relocated.py");
-        assert_eq!(root.filename, "original.py");
-        assert_eq!(child.filename, "original.py");
+        assert_eq!(&*root.filename, "original.py");
+        assert_eq!(&*child.filename, "original.py");
         let Constant::Tuple(items) = &moved.constants[0] else {
             panic!("expected tuple");
         };
         let Constant::Code(relocated) = &items[0] else {
             panic!("expected code");
         };
-        assert_eq!(relocated.filename, "relocated.py");
+        assert_eq!(&*relocated.filename, "relocated.py");
         assert!(!Arc::ptr_eq(&child, relocated));
     }
 }

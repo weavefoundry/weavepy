@@ -230,7 +230,7 @@ fn dump_frames(out: &mut String, frame_stack: &crate::object::FrameStack) {
 /// crash dump must not show them, just as CPython shows no frame for C
 /// code.
 fn frame_is_native_stand_in(frame: &crate::object::FrameShell) -> bool {
-    let filename = frame.code.filename.as_str();
+    let filename = &*frame.code.filename;
     let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     base == "_seqtools.py" || base.starts_with("_weave_")
 }

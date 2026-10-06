@@ -52,13 +52,48 @@ pub(crate) fn decode_linetable(bytes: &[u8]) -> Option<Vec<u32>> {
 
 /// Decode what [`encode`] wrote, stamping `filename` on every code
 /// object. `None` for input it didn't write (or a different version's).
+///
+/// The code objects share one copy of the filename, and one buffer
+/// holds all their line and column tables and wire marks (see
+/// `LineTable`).
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
     let mut r = Reader { bytes, pos: 0 };
     if r.byte()? != VERSION {
         return None;
     }
-    let code = r.code(filename, 0)?;
-    (r.pos == bytes.len()).then_some(code)
+    let mut module = Module {
+        filename: Arc::from(filename),
+        tables: Vec::new(),
+        buffer: Arc::new(std::sync::OnceLock::new()),
+    };
+    let code = r.code(&mut module, 0)?;
+    if r.pos != bytes.len() {
+        return None;
+    }
+    // (Copied rather than shrunk in place, which can keep the vector's
+    // spare capacity.)
+    let _ = module.buffer.set(Box::from(module.tables.as_slice()));
+    Some(code)
+}
+
+/// What the code objects of one module decoded by [`decode`] share.
+struct Module {
+    filename: Arc<str>,
+    /// Every code object's encoded line and column tables and wire
+    /// marks, in order.
+    tables: Vec<u8>,
+    /// Where `tables` goes once the decoding is done.
+    buffer: Arc<std::sync::OnceLock<Box<[u8]>>>,
+}
+
+impl Module {
+    /// Append an encoded table to the shared buffer.
+    fn table(&mut self, bytes: &[u8]) -> Option<crate::Encoded> {
+        let start = u32::try_from(self.tables.len()).ok()?;
+        self.tables.extend_from_slice(bytes);
+        let end = u32::try_from(self.tables.len()).ok()?;
+        Some(crate::Encoded::new(self.buffer.clone(), start, end))
+    }
 }
 
 struct Writer(Vec<u8>);
@@ -170,10 +205,10 @@ impl Writer {
         self.uint(bits);
         self.uint(u64::from(c.future_flags));
         self.uint(c.stacksize.map_or(0, |s| u64::from(s) + 1));
-        self.u32s(&c.no_interrupt_jumps);
+        self.u32s(c.no_interrupt_jumps());
         self.bytes(&c.wire_marks);
-        self.strs(&c.hidden_locals);
-        self.strs(&c.const_identifiers);
+        self.strs(c.hidden_locals());
+        self.strs(c.const_identifiers());
         Some(())
     }
 
@@ -366,7 +401,7 @@ impl Reader<'_> {
         Some(f64::from_bits(u64::from_le_bytes(b.try_into().ok()?)))
     }
 
-    fn code(&mut self, filename: &str, depth: u32) -> Option<CodeObject> {
+    fn code(&mut self, module: &mut Module, depth: u32) -> Option<CodeObject> {
         if depth > MAX_NESTING {
             return None;
         }
@@ -381,7 +416,7 @@ impl Reader<'_> {
         let n = self.len()?;
         let mut constants = Vec::with_capacity(n);
         for _ in 0..n {
-            constants.push(self.constant(filename, depth)?);
+            constants.push(self.constant(module, depth)?);
         }
         let names = self.strs()?;
         let varnames = self.strs()?;
@@ -398,8 +433,8 @@ impl Reader<'_> {
                 push_lasti: self.byte()? != 0,
             });
         }
-        let linetable = crate::LineTable::encoded(Arc::from(self.deltas_raw()?));
-        let coltable = crate::ColTable::encoded(Arc::from(self.raw()?));
+        let linetable = crate::LineTable::encoded(module.table(self.deltas_raw()?)?);
+        let coltable = crate::ColTable::encoded(module.table(self.raw()?)?);
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;
@@ -408,13 +443,20 @@ impl Reader<'_> {
         let future_flags = self.u32()?;
         let stacksize = self.u32()?.checked_sub(1);
         let no_interrupt_jumps = self.u32s()?;
-        let wire_marks = self.raw()?.to_vec();
-        let hidden_locals = self.strs()?;
-        let const_identifiers = self.strs()?;
+        let wire_marks = match self.raw()? {
+            [] => crate::WireMarks::default(),
+            marks => crate::WireMarks::shared(module.table(marks)?),
+        };
+        let mut rare = crate::CodeRare::default();
+        rare.set(crate::RareFields {
+            no_interrupt_jumps,
+            hidden_locals: self.strs()?,
+            const_identifiers: self.strs()?,
+        });
         Some(CodeObject {
             name,
             qualname,
-            filename: filename.to_owned(),
+            filename: module.filename.clone(),
             caches: CacheTable::with_len(instructions.len()),
             instructions,
             constants,
@@ -441,15 +483,13 @@ impl Reader<'_> {
             annotate_scope: flag(10),
             future_flags,
             stacksize,
-            no_interrupt_jumps,
             wire_marks,
-            hidden_locals,
-            const_identifiers,
+            rare,
             ..CodeObject::default()
         })
     }
 
-    fn constant(&mut self, filename: &str, depth: u32) -> Option<Constant> {
+    fn constant(&mut self, module: &mut Module, depth: u32) -> Option<Constant> {
         Some(match self.byte()? {
             0 => Constant::None,
             1 => Constant::Bool(false),
@@ -465,7 +505,7 @@ impl Reader<'_> {
                 let n = self.len()?;
                 let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
-                    items.push(self.constant(filename, depth)?);
+                    items.push(self.constant(module, depth)?);
                 }
                 if tag == 10 {
                     Constant::Tuple(items)
@@ -473,12 +513,12 @@ impl Reader<'_> {
                     Constant::FrozenSet(items)
                 }
             }
-            12 => Constant::Code(Arc::new(self.code(filename, depth + 1)?)),
+            12 => Constant::Code(Arc::new(self.code(module, depth + 1)?)),
             13 => Constant::Ellipsis,
             14 => Constant::Slice(Box::new((
-                self.constant(filename, depth)?,
-                self.constant(filename, depth)?,
-                self.constant(filename, depth)?,
+                self.constant(module, depth)?,
+                self.constant(module, depth)?,
+                self.constant(module, depth)?,
             ))),
             _ => return None,
         })
@@ -494,7 +534,7 @@ mod tests {
         let inner = CodeObject {
             name: "f".to_owned(),
             qualname: "C.f".to_owned(),
-            filename: "m.py".to_owned(),
+            filename: "m.py".into(),
             instructions: vec![
                 Instruction::new(OpCode::Resume, 0),
                 Instruction::new(OpCode::LoadConst, 300),
@@ -510,10 +550,10 @@ mod tests {
             stacksize: Some(3),
             ..CodeObject::default()
         };
-        let code = CodeObject {
+        let mut code = CodeObject {
             name: "<module>".to_owned(),
             qualname: "<module>".to_owned(),
-            filename: "m.py".to_owned(),
+            filename: "m.py".into(),
             instructions: vec![Instruction::new(OpCode::Nop, 0)],
             constants: vec![
                 Constant::None,
@@ -542,16 +582,24 @@ mod tests {
                 depth: 2,
                 push_lasti: true,
             }],
-            no_interrupt_jumps: vec![7],
-            wire_marks: vec![0, 3],
-            hidden_locals: vec!["h".to_owned()],
-            const_identifiers: vec!["k".to_owned()],
+            wire_marks: vec![0, 3].into(),
             future_flags: 0x100,
             ..CodeObject::default()
         };
+        code.rare.set(crate::RareFields {
+            no_interrupt_jumps: vec![7],
+            hidden_locals: vec!["h".to_owned()],
+            const_identifiers: vec!["k".to_owned()],
+        });
         let bytes = encode(&code).expect("encodable");
         let back = decode(&bytes, "m.py").expect("decodable");
         assert_eq!(back, code);
+        // Every code object shares the module's filename.
+        let Some(Constant::Code(inner)) = back.constants.last() else {
+            panic!("nested code object expected");
+        };
+        assert!(Arc::ptr_eq(&back.filename, &inner.filename));
+        assert_eq!(*inner.linetable, [1, 2, 2]);
     }
 
     #[test]

@@ -87,7 +87,7 @@ pub fn insert(name: &str, code: &CodeObject) {
     CACHE.with(|c| {
         c.borrow_mut().insert(
             static_name,
-            (code.filename.as_str().into(), bytes.into_boxed_slice()),
+            ((*code.filename).into(), bytes.into_boxed_slice()),
         );
     });
 }
