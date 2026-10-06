@@ -3109,7 +3109,7 @@ impl Interpreter {
         // `_PyGen_Finalize`); asyncio's hook schedules `aclose()` on
         // the owning loop instead of closing synchronously here.
         if let Object::AsyncGenerator(g) = obj {
-            let finalizer = g.finalizer.borrow().clone();
+            let finalizer = g.finalizer();
             if !matches!(finalizer, Object::None) && !g.is_finished() {
                 let globals = self.builtins.clone();
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
@@ -29036,7 +29036,7 @@ impl Interpreter {
                         }
                         // PEP-style origin tracking
                         // (`sys.set_coroutine_origin_tracking_depth`).
-                        "origin" if prefix == "cr_" => return Ok(g.origin.borrow().clone()),
+                        "origin" if prefix == "cr_" => return Ok(g.origin()),
                         _ => {}
                     }
                 }
@@ -38559,7 +38559,7 @@ impl Interpreter {
         }
         g.hooks_inited.set(true);
         let (firstiter, finalizer) = crate::stdlib::sys::asyncgen_hooks();
-        *g.finalizer.borrow_mut() = finalizer;
+        g.set_finalizer(finalizer);
         if !matches!(firstiter, Object::None) {
             let globals = self.builtins.clone();
             self.call(&firstiter, &[agen.clone()], &[], &globals)?;
@@ -52264,7 +52264,7 @@ impl Interpreter {
                     let obj = Self::wrap_started_generator(f, &code, frame);
                     if let Some(origin) = cr_origin {
                         if let Object::Coroutine(gen) = &obj {
-                            *gen.origin.borrow_mut() = origin;
+                            gen.set_origin(origin);
                         }
                     }
                     // Threshold-driven young collection at the
