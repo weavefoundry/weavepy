@@ -131,10 +131,11 @@ pub(crate) fn cursor_class() -> Rc<TypeObject> {
             DictKey(Object::from_static("__iter__")),
             method("__iter__", cur_iter),
         );
-        dict.insert(
-            DictKey(Object::from_static("__next__")),
-            method("__next__", cur_next),
-        );
+        let next = method("__next__", cur_next);
+        if let Object::Builtin(b) = &next {
+            crate::leaf_builtins::register_fast(b, cur_next_fast);
+        }
+        dict.insert(DictKey(Object::from_static("__next__")), next);
         dict.insert(
             DictKey(Object::from_static("__del__")),
             method("__del__", cur_del),
@@ -662,6 +663,41 @@ fn cur_next(args: &[Object]) -> Result<Object, RuntimeError> {
             crate::error::PyException::from_builtin("StopIteration", ""),
         )),
     }
+}
+
+/// `__next__`'s leaf half (see `leaf_builtins::register_fast`): the full
+/// body, when fetching a row can run no Python code: no converters, no
+/// row factory, the default text factory, and no Python callbacks
+/// (functions, aggregates, collations, hooks) on the connection that the
+/// step could call. Anything else (or an unusable cursor) declines.
+fn cur_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [self_obj] = args else {
+        return None;
+    };
+    // (Any error below is the full body's to raise.)
+    let ip = interp().ok()?;
+    let (st, conn) = checked_cursor(self_obj).ok()?;
+    {
+        let s = st.try_borrow().ok()?;
+        let c = conn.try_borrow().ok()?;
+        if s.locked
+            || !matches!(s.row_factory, Object::None)
+            || s.converters.iter().any(Option::is_some)
+            || !matches!(c.row_factory, Object::None)
+            || !matches!(&c.text_factory, Object::Type(t) if t.name == "str")
+            || !c.hook_refs.is_empty()
+        {
+            return None;
+        }
+    }
+    let _lock = CursorLock::acquire(&st).ok()?;
+    Some(match advance(ip, self_obj, &st, &conn) {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin("StopIteration", ""),
+        )),
+        Err(e) => Err(e),
+    })
 }
 
 // ---------------------------------------------------------------
