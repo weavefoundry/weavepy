@@ -23631,7 +23631,7 @@ impl Interpreter {
             BinOpKind::Pow
                 if a.is_finite()
                     && b.is_finite()
-                    && (a > 0.0 || (a != 0.0 && b.fract() == 0.0)) =>
+                    && (a > 0.0 || (a != 0.0 && b.fract() == 0.0) || (a == 0.0 && b >= 0.0)) =>
             {
                 let r = a.powf(b);
                 if !r.is_finite() {
