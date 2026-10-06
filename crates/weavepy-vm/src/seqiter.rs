@@ -1276,9 +1276,8 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             Object::Float(f) => {
                 let t = f.trunc();
                 // (Both bounds are exact powers of two as floats.)
-                (t.is_finite()
-                    && t >= -9_223_372_036_854_775_808.0
-                    && t < 9_223_372_036_854_775_808.0)
+                (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+                    .contains(&t)
                     .then(|| Object::Int(t as i64))
             }
             _ => None,

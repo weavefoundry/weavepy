@@ -17462,7 +17462,7 @@ impl Interpreter {
             }
         }
         frame.pc = send_pc as u32 + 1;
-        let gen_frame: *mut Frame = &mut *boxed;
+        let gen_frame: *mut Frame = &raw mut *boxed;
         let mut act = self.inline_slot();
         debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
         // SAFETY: a pooled slot holds none of these (see `try_inline_gen`).
