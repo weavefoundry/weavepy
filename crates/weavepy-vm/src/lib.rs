@@ -13237,15 +13237,18 @@ impl Interpreter {
                                             // SAFETY: `load.arg < nlocals`.
                                             let n = match unsafe { &*lbase.add(load.arg as usize) }
                                             {
+                                                // SAFETY: a read between two
+                                                // instructions.
                                                 Object::List(l) => {
-                                                    l.try_borrow().ok().map(|l| l.len())
+                                                    unsafe { l.peek() }.map(Vec::len)
                                                 }
                                                 Object::Tuple(t) => Some(t.len()),
                                                 Object::Str(s) => {
                                                     Some(crate::object::str_char_len(s))
                                                 }
+                                                // SAFETY: as above.
                                                 Object::Dict(d) => {
-                                                    d.try_borrow().ok().map(|d| d.len())
+                                                    unsafe { d.peek() }.map(|d| d.len())
                                                 }
                                                 // A native `__len__` (a deque's).
                                                 v @ Object::Instance(_) => {
@@ -13386,14 +13389,14 @@ impl Interpreter {
                         let Some(cell) = frame.cells.get(ins.arg as usize) else {
                             break Some(CoreExit::Helper);
                         };
-                        let Ok(v) = cell.try_borrow() else {
+                        // SAFETY: a read between two instructions.
+                        let Some(v) = (unsafe { cell.peek() }) else {
                             break Some(CoreExit::Helper);
                         };
-                        if matches!(*v, Object::Unbound) {
+                        if matches!(v, Object::Unbound) {
                             break Some(CoreExit::Helper);
                         }
-                        let c = Self::clone_operand(&v);
-                        drop(v);
+                        let c = Self::clone_operand(v);
                         // SAFETY: `len < cap`.
                         unsafe { base.add(len).write(c) };
                         len += 1;
@@ -21424,7 +21427,9 @@ impl Interpreter {
         let member = Self::leaf_member_eq;
         match container {
             Object::List(l) => {
-                let items = l.try_borrow().ok()?;
+                // SAFETY: a read between two instructions (the member test
+                // runs no code).
+                let items = unsafe { l.peek() }?;
                 for x in items.iter() {
                     if member(x, item)? {
                         return Some(true);
@@ -21454,8 +21459,10 @@ impl Interpreter {
                 // (see `LeafProbe`).
                 if let Some(probe) = crate::object::LeafProbe::new(item) {
                     let found = match container {
-                        Object::Dict(d) => d.try_borrow().ok()?.get_index_of(&probe).is_some(),
-                        Object::Set(st) => st.try_borrow().ok()?.get_index_of(&probe).is_some(),
+                        // SAFETY: as above (the probe runs no code).
+                        Object::Dict(d) => unsafe { d.peek() }?.get_index_of(&probe).is_some(),
+                        // SAFETY: as above.
+                        Object::Set(st) => unsafe { st.peek() }?.get_index_of(&probe).is_some(),
                         Object::FrozenSet(fs) => fs.get_index_of(&probe).is_some(),
                         _ => return None,
                     };

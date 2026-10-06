@@ -1303,14 +1303,14 @@ unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
             Object::None => false,
             Object::Str(s) => !s.is_empty(),
             Object::Float(f) => *f != 0.0,
-            Object::List(l) => match l.try_borrow() {
-                Ok(l) => !l.is_empty(),
-                Err(_) => return 2,
+            Object::List(l) => match l.peek() {
+                Some(l) => !l.is_empty(),
+                None => return 2,
             },
             Object::Tuple(t) => !t.is_empty(),
-            Object::Dict(d) => match d.try_borrow() {
-                Ok(d) => !d.is_empty(),
-                Err(_) => return 2,
+            Object::Dict(d) => match d.peek() {
+                Some(d) => !d.is_empty(),
+                None => return 2,
             },
             Object::Instance(_) => match (*(*st).interp).leaf_instance_truth(v) {
                 Some(b) => b,
@@ -2291,13 +2291,13 @@ unsafe extern "C" fn h_load_deref(st: *mut State, i: u64, dst: *mut Object) -> u
         let Some(cell) = frame.cells.get(i as usize) else {
             return 1;
         };
-        let Ok(v) = cell.try_borrow() else {
+        let Some(v) = cell.peek() else {
             return 1;
         };
-        if matches!(*v, Object::Unbound) {
+        if matches!(v, Object::Unbound) {
             return 1;
         }
-        dst.write(Interpreter::clone_operand(&v));
+        dst.write(Interpreter::clone_operand(v));
         0
     }
 }
