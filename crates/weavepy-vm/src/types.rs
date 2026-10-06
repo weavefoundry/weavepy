@@ -1738,6 +1738,13 @@ impl TypeObject {
                 h(ext, self);
             }
         }
+        // (A read between instructions settles without a borrow guard.)
+        // SAFETY: the view ends before anything else runs.
+        if let Some(meta) = unsafe { self.metaclass.peek() } {
+            return meta
+                .as_ref()
+                .is_none_or(|m| Rc::ptr_eq(m, &crate::builtin_types::builtin_types().type_));
+        }
         let ty = &crate::builtin_types::builtin_types().type_;
         match self.metaclass.borrow().as_ref() {
             Some(m) => Rc::ptr_eq(m, ty),
@@ -1748,10 +1755,14 @@ impl TypeObject {
     /// `True` when `self` is a subclass of `other` (including itself).
     pub fn is_subclass_of(&self, other: &TypeObject) -> bool {
         let other_ptr = std::ptr::from_ref::<TypeObject>(other);
-        self.mro
-            .borrow()
-            .iter()
-            .any(|t| std::ptr::eq(Rc::as_ptr(t), other_ptr))
+        let found =
+            |mro: &[Rc<TypeObject>]| mro.iter().any(|t| std::ptr::eq(Rc::as_ptr(t), other_ptr));
+        // (As `metaclass_is_type`: a guard-free view when one is free.)
+        // SAFETY: the view ends before anything else runs.
+        if let Some(mro) = unsafe { self.mro.peek() } {
+            return found(mro);
+        }
+        found(&self.mro.borrow())
     }
 
     /// Look up `name` in this type's MRO.

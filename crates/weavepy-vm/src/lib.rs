@@ -16037,6 +16037,23 @@ impl Interpreter {
             _ => return None,
         };
         let mut hit = false;
+        // A common builtin value's class, borrowed from the registry
+        // (`class_of` clones it).
+        let bt = builtin_types();
+        let builtin_cls = match obj {
+            Object::None => Some(&bt.none_type),
+            Object::Bool(_) => Some(&bt.bool_),
+            Object::Int(_) | Object::Long(_) => Some(&bt.int_),
+            Object::Float(_) => Some(&bt.float_),
+            Object::Str(_) | Object::WStr(_) => Some(&bt.str_),
+            Object::Bytes(_) => Some(&bt.bytes_),
+            Object::Tuple(_) => Some(&bt.tuple_),
+            Object::List(_) => Some(&bt.list_),
+            Object::Dict(_) => Some(&bt.dict_),
+            Object::Set(_) => Some(&bt.set_),
+            Object::FrozenSet(_) => Some(&bt.frozenset_),
+            _ => None,
+        };
         for cls in classes {
             let Object::Type(cls) = cls else {
                 return None;
@@ -16044,12 +16061,13 @@ impl Interpreter {
             if !cls.metaclass_is_type() {
                 return None;
             }
-            hit |= match obj {
+            hit |= match (obj, builtin_cls) {
                 // A miss on an instance is left to the full check, which
                 // also consults `__class__`.
-                Object::Instance(inst) => inst.cls_raw().is_subclass_of(cls),
-                Object::File(_) => return None,
-                obj => builtins::class_of(obj).is_subclass_of(cls),
+                (Object::Instance(inst), _) => inst.cls_raw().is_subclass_of(cls),
+                (Object::File(_), _) => return None,
+                (_, Some(own)) => Rc::ptr_eq(own, cls) || own.is_subclass_of(cls),
+                (obj, None) => builtins::class_of(obj).is_subclass_of(cls),
             };
         }
         if !hit && matches!(obj, Object::Instance(_)) {
