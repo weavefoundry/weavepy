@@ -1042,6 +1042,23 @@ const FOR_RAISED: u32 = 5;
 /// `LIST_APPEND`, `UNPACK_SEQUENCE`; the one at `ins`, the `pc`th of
 /// `code`) on the top of a `len`-deep stack, as the core loop's arm runs
 /// it: the new depth, or `u64::MAX` declined untouched.
+/// `LIST_APPEND` onto the exact list at `list` of the value at `value`:
+/// `0` the value moved in, anything else declined untouched.
+unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) -> u32 {
+    // SAFETY: the code passes two initialized stack slots; growing the
+    // list runs no code, so nothing reaches it while it is peeked at.
+    unsafe {
+        let Object::List(l) = &*list else {
+            return 1;
+        };
+        let Some(items) = l.peek_mut() else {
+            return 1;
+        };
+        crate::push_fast(items, value.read());
+        0
+    }
+}
+
 unsafe extern "C" fn h_container(
     st: *mut State,
     ins: *const weavepy_compiler::Instruction,
@@ -3589,8 +3606,11 @@ impl<'a> Lower<'a> {
             OpCode::BinarySubscr
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
-            | OpCode::ListAppend
             | OpCode::UnpackSequence => return self.container(pc),
+            OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
+                return self.list_append(pc, ins.arg as usize)
+            }
+            OpCode::ListAppend => return self.container(pc),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
             OpCode::LoadAttr => return self.load_attr(pc, ins.arg),
             OpCode::LoadGlobal => return self.load_global(pc),
@@ -4342,6 +4362,22 @@ impl<'a> Lower<'a> {
         self.depth = after as usize;
         self.set_last(pc);
         self.check_released(pc + 1);
+        true
+    }
+
+    /// `LIST_APPEND` through [`h_list_append`] (the value leaves the stack
+    /// into the list `arg` below it).
+    fn list_append(&mut self, pc: usize, arg: usize) -> bool {
+        self.flush();
+        let list = self.slot_addr(self.depth - 1 - arg);
+        let value = self.slot_addr(self.depth - 1);
+        let r = self
+            .call(h_list_append as *const () as usize, &[list, value], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth -= 1;
+        self.set_last(pc);
         true
     }
 
