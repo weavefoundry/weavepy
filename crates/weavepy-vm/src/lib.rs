@@ -10431,7 +10431,11 @@ impl Interpreter {
                                 {
                                     continue
                                 }
-                                Some(OpCode::Call) if self.core_leaf_call_lane(sw) => continue,
+                                Some(OpCode::Call)
+                                    if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
+                                {
+                                    continue
+                                }
                                 _ => {}
                             }
                         }
@@ -14584,6 +14588,66 @@ impl Interpreter {
     /// the builtin lane rather than as a full step. `false` touches
     /// nothing.
     #[inline(never)]
+    /// The `CALL` at the running activation's pc of an exact builtin
+    /// container type over one positional argument (`set(genexpr)`,
+    /// `list(xs)`), through the ordinary call with the caller published
+    /// (consuming the argument may run Python code), as the builtin lane
+    /// runs a builtin function. `false` touches nothing.
+    fn core_type_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        if ins.op != OpCode::Call || ins.arg != 1 {
+            return false;
+        }
+        let n = frame.stack.len();
+        let Some(callee_at) = n.checked_sub(3) else {
+            return false;
+        };
+        let (Object::Type(ty), Object::Unbound) =
+            (&frame.stack[callee_at], &frame.stack[callee_at + 1])
+        else {
+            return false;
+        };
+        let bt = builtin_types();
+        if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_]
+            .iter()
+            .any(|t| Rc::ptr_eq(t, ty))
+        {
+            return false;
+        }
+        // Committed: the callee, its self slot, and the argument leave.
+        let arg = frame.stack.pop().expect("checked above");
+        frame.stack.pop();
+        let callee = frame.stack.pop().expect("checked above");
+        frame.pc = pc as u32 + 1;
+        let globals = frame.globals.clone();
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = self.call(&callee, std::slice::from_ref(&arg), &[], &globals);
+        self.lean_pending_exit(pending);
+        self.release(arg);
+        drop(callee);
+        match result {
+            Ok(v) => {
+                // SAFETY: as in `core_builtin_lane` (the call ran nested
+                // activations of its own, never this one).
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
     fn core_leaf_call_lane(&mut self, sw: &mut CoreSwitch) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
@@ -21131,6 +21195,9 @@ impl Interpreter {
             | Object::Coroutine(_)
             | Object::AsyncGenerator(_)
             | Object::Module(_) => true,
+            Object::Tuple(t) => t
+                .iter()
+                .all(|x| matches!(x, Object::Int(_) | Object::Str(_))),
             Object::Type(t) => crate::object::type_hash_is_identity(t),
             Object::Instance(inst) => {
                 inst.native.get().is_none()

@@ -3347,8 +3347,9 @@ pub struct LeafProbe<'a> {
 impl<'a> LeafProbe<'a> {
     /// `None` unless `key` is a `str`, a machine `int`, a plain instance
     /// hashed by identity (its `__hash__` is `object`'s), a class whose
-    /// metaclass keeps `type`'s `__hash__` and `__eq__`, or a function,
-    /// generator-family object or module.
+    /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
+    /// generator-family object or module, or a tuple of machine ints and
+    /// strings.
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3361,6 +3362,14 @@ impl<'a> LeafProbe<'a> {
                 identity_hash(key)
             }
             Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
+            // A tuple of machine ints and strings: its (cached) hash, with
+            // no item's `__hash__` to run.
+            Object::Tuple(t)
+                if t.iter()
+                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_))) =>
+            {
+                py_hash_value(key)?
+            }
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
             | Object::Generator(_)
@@ -3420,6 +3429,22 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
             | (Object::Coroutine(a), Object::Coroutine(b))
             | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            // Item by item; any item pairing other than int-int or str-str
+            // (an equal `True` or `1.0`, say) may need Python's equality.
+            (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
+                let mut equal = true;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match (x, y) {
+                        (Object::Int(p), Object::Int(q)) => equal &= p == q,
+                        (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
+                        _ => {
+                            self.foreign.set(true);
+                            return false;
+                        }
+                    }
+                }
+                equal
+            }
             _ => {
                 self.foreign.set(true);
                 false
