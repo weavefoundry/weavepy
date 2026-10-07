@@ -22075,6 +22075,53 @@ impl Interpreter {
         }
     }
 
+    /// Whether `cls` resolves `name` to nothing on its MRO, cached on the
+    /// class under its attribute version at `key` (as
+    /// [`Self::instance_dunder_function`]).
+    fn class_lacks(cls: &TypeObject, key: usize, name: &str) -> bool {
+        use crate::types::LeafAttrKind as K;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::InstanceOnly) => true,
+            Some(_) => false,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return false;
+                }
+                let absent = cls.lookup(name).is_none();
+                cls.leaf_attrs
+                    .set(key, ver, if absent { K::InstanceOnly } else { K::Other });
+                absent
+            }
+        }
+    }
+
+    /// Call a class's dunder `f` (see [`Self::instance_dunder_function`])
+    /// with `args` (the instance first): a warm pure or effect leaf
+    /// evaluates in place, anything else runs as an ordinary call.
+    fn call_dunder_function(
+        &mut self,
+        f: Rc<crate::object::PyFunction>,
+        args: &[Object],
+    ) -> Result<Object, RuntimeError> {
+        let code = f.code();
+        if code.arg_count as usize == args.len() && args.len() <= 8 && pure_leaf_warm(&code) {
+            let pure = code_is_pure_leaf(&code);
+            let depth = crate::recursion::current_depth();
+            if (pure || code_is_effect_leaf(&code)) && depth < crate::recursion::recursion_limit() {
+                let mut ptrs: [*const Object; 8] = [std::ptr::null(); 8];
+                for (k, a) in args.iter().enumerate() {
+                    ptrs[k] = a;
+                }
+                if let Some(r) = self.pure_leaf_call(&code, &f, &ptrs[..args.len()], !pure, depth) {
+                    return Ok(r);
+                }
+            }
+        }
+        let g = self.builtins.clone();
+        self.call(&Object::Function(f), args, &[], &g)
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -36045,6 +36092,17 @@ impl Interpreter {
                     return Ok(Object::Int(h));
                 }
             }
+            /// The class cache key for `__hash__` (see
+            /// `instance_dunder_function`).
+            static HASH_KEY: u8 = 0;
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(HASH_KEY) as usize,
+                "__hash__",
+            ) {
+                let result = self.call_dunder_function(f, std::slice::from_ref(obj))?;
+                return self.normalize_hash_result(result);
+            }
             match inst.cls().lookup_with_owner("__hash__") {
                 Some((Object::None, _)) => {
                     return Err(type_error(format!(
@@ -37198,6 +37256,17 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         let g = self.builtins.clone();
         if let Object::Instance(inst) = target {
+            /// The class cache key for `__setitem__` (see
+            /// `instance_dunder_function`).
+            static SETITEM_KEY: u8 = 0;
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(SETITEM_KEY) as usize,
+                "__setitem__",
+            ) {
+                self.call_dunder_function(f, &[target.clone(), i.clone(), value])?;
+                return Ok(());
+            }
             if let Some(method) = instance_method(target, "__setitem__") {
                 // Slice assignment detours to `store_subscr` only for a VM
                 // native-backed builtin subclass (`inst.native` set); a
@@ -37543,6 +37612,19 @@ impl Interpreter {
         } else {
             container.clone()
         };
+        if let Object::Instance(inst) = &container {
+            /// The class cache key for `__contains__` (see
+            /// `instance_dunder_function`).
+            static CONTAINS_KEY: u8 = 0;
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(CONTAINS_KEY) as usize,
+                "__contains__",
+            ) {
+                let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
+                return Ok(r.is_truthy());
+            }
+        }
         let found = if let Some(method) = instance_method(&container, "__contains__")
             .or_else(|| metaclass_method(&container, "__contains__"))
         {
@@ -41117,6 +41199,42 @@ impl Interpreter {
             }
         }
         let (dunder, rdunder) = binop_dunders(op);
+        // Two plain instances of one class whose `op` is a plain Python
+        // method and that has no reflected one: CPython calls the method
+        // alone, and a `NotImplemented` from it is the TypeError below. The
+        // method is called with the instances, with no bound method built.
+        if let (Object::Instance(ai), Object::Instance(bi)) = (a, b) {
+            /// Class cache keys per operator: its method, and whether the
+            /// reflected method is absent (see `instance_dunder_function`).
+            static OP_KEYS: [u8; 16] = [0; 16];
+            static ROP_KEYS: [u8; 16] = [0; 16];
+            let k = op as usize;
+            if std::ptr::eq(ai.cls_raw(), bi.cls_raw())
+                && ai.native.get().is_none()
+                && Self::class_lacks(
+                    ai.cls_raw(),
+                    std::ptr::addr_of!(ROP_KEYS[k]) as usize,
+                    rdunder,
+                )
+            {
+                if let Some(f) = Self::instance_dunder_function(
+                    ai,
+                    std::ptr::addr_of!(OP_KEYS[k]) as usize,
+                    dunder,
+                ) {
+                    let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
+                    if !r.is_same(&crate::vm_singletons::not_implemented()) {
+                        return Ok(r);
+                    }
+                    return Err(type_error(format!(
+                        "unsupported operand type(s) for {}: '{}' and '{}'",
+                        op.as_str(),
+                        a.type_name_owned(),
+                        b.type_name_owned()
+                    )));
+                }
+            }
+        }
         if tsdbg() {
             eprintln!(
                 "[TSDBG] vm dispatch_binary_op {op:?} a={} ({:?}) b={} ({:?})",
@@ -41338,7 +41456,14 @@ impl Interpreter {
                 return Ok(r);
             }
         }
-        if !reflected_tried {
+        // CPython's `binary_op1` gives the right operand's reflected slot a
+        // turn only when its type differs from the left's.
+        let same_type =
+            matches!(
+                (a, b),
+                (Object::Instance(_), Object::Instance(_)) | (Object::Type(_), Object::Type(_))
+            ) && Rc::ptr_eq(&crate::builtins::class_of(a), &crate::builtins::class_of(b));
+        if !reflected_tried && !same_type {
             if let Some(method) =
                 instance_method(b, rdunder).or_else(|| metaclass_method(b, rdunder))
             {
@@ -41348,6 +41473,9 @@ impl Interpreter {
                 }
                 b_declined = true;
             }
+        }
+        if same_type && a_declined && !defer_seq_wrapper {
+            b_declined = true;
         }
         if !a_tried && defer_seq_wrapper {
             if let Some(r) = run_a_pass(self, &mut a_declined)? {
@@ -41744,8 +41872,15 @@ impl Interpreter {
         let mut forward_ran = false;
         if let (Object::Instance(ia), Object::Instance(ib)) = (a, b) {
             if std::ptr::eq(ia.cls_raw(), ib.cls_raw()) {
-                if let Some(f @ Object::Function(_)) = ia.cls_raw().lookup(cmp_dunder(op).0) {
-                    let r = self.call(&f, &[a.clone(), b.clone()], &[], globals)?;
+                /// Class cache keys per comparison (see
+                /// `instance_dunder_function`).
+                static CMP_KEYS: [u8; 8] = [0; 8];
+                if let Some(f) = Self::instance_dunder_function(
+                    ia,
+                    std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
+                    cmp_dunder(op).0,
+                ) {
+                    let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
                     if !r.is_same(&crate::vm_singletons::not_implemented()) {
                         return Ok(r);
                     }
