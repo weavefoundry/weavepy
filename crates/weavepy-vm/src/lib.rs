@@ -2490,6 +2490,19 @@ impl Interpreter {
     /// plus the freelists, which take a dead plain instance's or tuple's
     /// allocation for the next one.
     fn release(&self, dropped: Object) {
+        // A scalar, or a shared value's plain decrement: nothing dies, so
+        // there is nothing to report, recycle or finalize.
+        if Self::core_drops_plain() {
+            match dropped.strong_word() {
+                None => return std::mem::forget(dropped),
+                // SAFETY: `dropped` owns a reference, released here unless
+                // it is the last one.
+                Some(word) if unsafe { crate::rc::try_release_word(word) } => {
+                    return std::mem::forget(dropped);
+                }
+                Some(_) => {}
+            }
+        }
         // C-API watcher probes (test_capi.test_watchers): a watched dict
         // losing its last binding fires PyDict_EVENT_DEALLOCATED; a dying
         // function fires PyFunction_EVENT_DESTROY. Both gates are relaxed
@@ -69108,6 +69121,20 @@ pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
         .get()
         .and_then(|s| s.get(pc))
         .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The bytes compiled code tests before releasing a shared value in line:
+/// the reference-count bias's shared flag and every observer
+/// [`Interpreter::core_drops_plain`] consults; all zero for a plain
+/// decrement.
+pub(crate) fn plain_release_flags() -> [*const u8; 4] {
+    let [dicts, funcs] = crate::capi_watchers::release_flags();
+    [
+        crate::sync::rc_shared_flag().as_ptr().cast_const().cast(),
+        dicts,
+        funcs,
+        crate::stdlib::testinternalcapi_mod::reftrace_print_flag(),
+    ]
 }
 
 /// `v.clone()`, in line (see `Object`'s `Clone`).

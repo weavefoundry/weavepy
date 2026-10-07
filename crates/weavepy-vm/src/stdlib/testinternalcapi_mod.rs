@@ -315,6 +315,12 @@ fn remove_mem_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 static REFTRACE_PRINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// [`reftrace_print_active`]'s byte (nonzero while active), for compiled
+/// code that tests it in line.
+pub(crate) fn reftrace_print_flag() -> *const u8 {
+    REFTRACE_PRINT.as_ptr().cast_const().cast()
+}
+
 /// Consulted by the VM's allocation/reap chokepoints.
 #[inline]
 pub fn reftrace_print_active() -> bool {

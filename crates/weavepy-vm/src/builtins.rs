@@ -14004,7 +14004,8 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = Object::Dict(Rc::new(RefCell::new(cloned)));
     // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
     // iff the source is (test_dict `test_copy_maintains_tracking`).
-    if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(&Object::Dict(d))) {
+    let id = crate::weakref_registry::id_of(&Object::Dict(d));
+    if crate::gc_trace::with_state(|s| s.is_tracked_instance(id)) {
         crate::gc_trace::track(&out);
     }
     Ok(out)

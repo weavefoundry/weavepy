@@ -101,6 +101,15 @@ fn call_dispatcher(cb: &Object, args: Vec<Object>) {
 // ---------------------------------------------------------------- dicts
 
 #[inline(always)]
+/// The dict and function watcher flags' bytes (nonzero while any is
+/// registered), for compiled code that tests them in line.
+pub(crate) fn release_flags() -> [*const u8; 2] {
+    [
+        DICTS_ACTIVE.as_ptr().cast_const().cast(),
+        FUNCS_ACTIVE.as_ptr().cast_const().cast(),
+    ]
+}
+
 pub fn dicts_active() -> bool {
     DICTS_ACTIVE.load(Ordering::Relaxed)
 }

@@ -516,10 +516,10 @@ fn object_is_tracked(target: &Object) -> bool {
         Object::List(_) | Object::Dict(_) | Object::Set(_) => {
             let id = id_of(target);
             gc_trace::with_state(|s| {
-                if !s.is_tracked(id) {
+                if !s.is_tracked_instance(id) {
                     s.track_now(target);
                 }
-                s.is_tracked(id)
+                s.is_tracked_instance(id)
             })
         }
         other => {

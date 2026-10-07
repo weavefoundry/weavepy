@@ -3950,7 +3950,7 @@ impl<'a> Lower<'a> {
                 let slow = self.b.create_block();
                 let done = self.b.create_block();
                 let fast = self.b.create_block();
-                self.b.ins().brif(plain_old, fast, &[], slow, &[]);
+                self.release_or(plain_old, local, old, fast, slow);
                 self.b.switch_to_block(fast);
                 let t8 = self.b.ins().ireduce(types::I8, tag);
                 self.b.ins().store(FLAGS, t8, local, 0);
@@ -3980,7 +3980,7 @@ impl<'a> Lower<'a> {
                 let slow = self.b.create_block();
                 let done = self.b.create_block();
                 let fast = self.b.create_block();
-                self.b.ins().brif(plain_old, fast, &[], slow, &[]);
+                self.release_or(plain_old, local, old, fast, slow);
                 self.b.switch_to_block(fast);
                 self.copy16(local, src);
                 self.b.ins().jump(done, &[]);
@@ -3991,6 +3991,45 @@ impl<'a> Lower<'a> {
             }
         }
         true
+    }
+
+    /// Branch to `fast` when the value at `local` (tagged `old`) can be
+    /// overwritten in place: `plain` (a scalar, or nothing), or a shared
+    /// instance, list, dict or class whose reference is released here by
+    /// a plain decrement (one thread owns every count, and no watcher or
+    /// tracer wants the release). Anything else goes to `slow`.
+    fn release_or(&mut self, plain: Value, local: Value, old: Value, fast: Block, slow: Block) {
+        if self.cold || self.tags.rc_counted == 0 {
+            self.b.ins().brif(plain, fast, &[], slow, &[]);
+            return;
+        }
+        let heap = self.b.create_block();
+        let counted = self.b.create_block();
+        let dec = self.b.create_block();
+        self.b.ins().brif(plain, fast, &[], heap, &[]);
+        self.b.switch_to_block(heap);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, old);
+        let rc = self.b.ins().band_imm(bit, self.tags.rc_counted);
+        let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+        // The single-thread bias, and the release observers, all off.
+        let mut quiet = rc;
+        for flag in crate::plain_release_flags() {
+            let addr = self.b.ins().iconst(self.ptr, flag as i64);
+            let on = self.b.ins().load(types::I8, FLAGS, addr, 0);
+            let off = self.b.ins().icmp_imm(IntCC::Equal, on, 0);
+            quiet = self.b.ins().band(quiet, off);
+        }
+        self.b.ins().brif(quiet, counted, &[], slow, &[]);
+        self.b.switch_to_block(counted);
+        let w = self.b.ins().load(self.ptr, FLAGS, local, 8);
+        let c = self.b.ins().load(types::I64, FLAGS, w, 0);
+        let shared = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, c, 1);
+        self.b.ins().brif(shared, dec, &[], slow, &[]);
+        self.b.switch_to_block(dec);
+        let c1 = self.b.ins().iadd_imm(c, -1);
+        self.b.ins().store(FLAGS, c1, w, 0);
+        self.b.ins().jump(fast, &[]);
     }
 
     /// `STORE_FAST i` of the value at stack `slot` (just above the

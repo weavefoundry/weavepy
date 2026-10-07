@@ -426,6 +426,12 @@ pub struct GcState {
     /// `await` of a coroutine function makes one per call, and most
     /// finish (holding no frame) and die before any collection.
     young_gens: RefCell<Vec<crate::sync::Weak<crate::object::PyGenerator>>>,
+    /// Lists and dicts born since the last collection that could close a
+    /// cycle, held weakly as [`Self::young`] holds instances: a function
+    /// that builds and returns `[a, b]` or `{k: obj}` makes one per call,
+    /// and most die before any collection.
+    young_lists: RefCell<Vec<crate::sync::Weak<RefCell<Vec<Object>>>>>,
+    young_dicts: RefCell<Vec<crate::sync::Weak<RefCell<crate::object::DictData>>>>,
     /// Frozen handles. `gc.freeze()` moves all tracked objects
     /// here; they are skipped by future collections until
     /// `gc.unfreeze()` runs.
@@ -477,6 +483,8 @@ impl GcState {
             young: RefCell::new(Vec::new()),
             young_fns: RefCell::new(Vec::new()),
             young_gens: RefCell::new(Vec::new()),
+            young_lists: RefCell::new(Vec::new()),
+            young_dicts: RefCell::new(Vec::new()),
             frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
@@ -516,6 +524,8 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_fns));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_gens));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_lists));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_dicts));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
@@ -570,6 +580,16 @@ impl GcState {
             }
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
                 if self.nurse(&self.young_gens, g) {
+                    return;
+                }
+            }
+            Object::List(l) => {
+                if self.nurse(&self.young_lists, l) {
+                    return;
+                }
+            }
+            Object::Dict(d) => {
+                if self.nurse(&self.young_dicts, d) {
                     return;
                 }
             }
@@ -628,8 +648,7 @@ impl GcState {
         true
     }
 
-    /// Register the young instances and functions still alive with the
-    /// collector.
+    /// Register the young objects still alive with the collector.
     fn flush_young(&self) {
         if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
             if !fns.is_empty() {
@@ -661,6 +680,20 @@ impl GcState {
                 }
             }
         }
+        if let Ok(mut lists) = self.young_lists.try_borrow_mut() {
+            for w in std::mem::take(&mut *lists) {
+                if let Some(l) = w.upgrade() {
+                    self.register(&Object::List(l), false);
+                }
+            }
+        }
+        if let Ok(mut dicts) = self.young_dicts.try_borrow_mut() {
+            for w in std::mem::take(&mut *dicts) {
+                if let Some(d) = w.upgrade() {
+                    self.register(&Object::Dict(d), false);
+                }
+            }
+        }
         let young = match self.young.try_borrow_mut() {
             Ok(mut young) if !young.is_empty() => std::mem::take(&mut *young),
             _ => return,
@@ -681,6 +714,12 @@ impl GcState {
         }) + self.young_gens.try_borrow_mut().map_or(0, |mut gens| {
             gens.retain(|w| w.strong_count() > 0);
             gens.len()
+        }) + self.young_lists.try_borrow_mut().map_or(0, |mut lists| {
+            lists.retain(|w| w.strong_count() > 0);
+            lists.len()
+        }) + self.young_dicts.try_borrow_mut().map_or(0, |mut dicts| {
+            dicts.retain(|w| w.strong_count() > 0);
+            dicts.len()
         });
         let Ok(mut young) = self.young.try_borrow_mut() else {
             return fns;
@@ -689,7 +728,7 @@ impl GcState {
         young.len() + fns
     }
 
-    /// Whether the instance or function `id` is in a young set.
+    /// Whether the object `id` is in a young set.
     fn is_young(&self, id: ObjectId) -> bool {
         fn holds<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
             set.try_borrow().is_ok_and(|young| {
@@ -698,7 +737,11 @@ impl GcState {
                     .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
             })
         }
-        holds(&self.young, id) || holds(&self.young_fns, id) || holds(&self.young_gens, id)
+        holds(&self.young, id)
+            || holds(&self.young_fns, id)
+            || holds(&self.young_gens, id)
+            || holds(&self.young_lists, id)
+            || holds(&self.young_dicts, id)
     }
 
     /// [`Self::track`] for a container its builder knows holds only
@@ -1002,7 +1045,12 @@ impl GcState {
                 None => false,
             }
         }
-        if remove(&self.young_fns, id) || remove(&self.young, id) || remove(&self.young_gens, id) {
+        if remove(&self.young_fns, id)
+            || remove(&self.young, id)
+            || remove(&self.young_gens, id)
+            || remove(&self.young_lists, id)
+            || remove(&self.young_dicts, id)
+        {
             let mut counts = self.counts.borrow_mut();
             counts[0] = counts[0].saturating_sub(1);
             self.sync_gen0_gauge(counts[0], None);
@@ -1095,8 +1143,8 @@ impl GcState {
         self.index.borrow().contains(&id)
     }
 
-    /// [`Self::is_tracked`] for an instance or function, which may be
-    /// young.
+    /// [`Self::is_tracked`] for an object that may be young (an instance,
+    /// function, generator, list or dict).
     pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
         self.is_tracked(id) || self.is_young(id)
     }
