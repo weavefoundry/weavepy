@@ -435,7 +435,8 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::MakeFunction
             | OpCode::SetFunctionAttribute
             | OpCode::ListToTuple
-            | OpCode::UnpackEx => false,
+            | OpCode::UnpackEx
+            | OpCode::LoadSuperAttr => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -1176,6 +1177,10 @@ unsafe extern "C" fn h_container(
     unsafe {
         let st = &mut *st;
         let (ins, len) = (*ins, len as usize);
+        if ins.op == OpCode::LoadSuperAttr {
+            return Interpreter::core_super_attr(&*code, ins, pc as usize, st.stack, len)
+                .map_or(u64::MAX, |n| n as u64);
+        }
         if let Some(n) = Interpreter::core_container_op(ins, st.stack, len, st.cap) {
             return n as u64;
         }
@@ -2386,6 +2391,81 @@ unsafe extern "C" fn h_binop_dunder(
     }
 }
 
+/// `LOAD_ATTR` (the `pc`th instruction of `code`) of a `property` whose
+/// getter the site has cached for the receiver's class (see
+/// `MethodSlot::getter`): the getter called directly ([`direct_call`]),
+/// its result at stack slot `slot`. The receiver is the stack's at `slot`
+/// (`local` 0) or the local at `recv`, read in place. `0` done,
+/// `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
+/// [`h_call`]'s.
+unsafe extern "C" fn h_property(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    recv: *const Object,
+    local: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `LOAD_ATTR`s, the result's slot (with room for one more above it,
+    // and nothing virtual below), the receiver, and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let Object::Instance(inst) = &*recv else {
+            return CALL_DECLINED;
+        };
+        let Some((getter, gcode)) = crate::code_vm_ext(&*code)
+            .and_then(|ext| ext.method_slots.get())
+            .and_then(|s| s.get(pc))
+            .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
+        else {
+            return CALL_DECLINED;
+        };
+        let at = st.stack.add(slot);
+        // A pure leaf getter (no native body of its own: it never runs as
+        // an activation) evaluates in place, as the core loop's arm does.
+        if crate::code_is_pure_leaf(&gcode)
+            && crate::pure_leaf_warm(&gcode)
+            && crate::recursion::current_depth() < crate::recursion::recursion_limit()
+            && (local != 0 || droppable(&*recv))
+        {
+            let interp = &*st.interp;
+            if let Some(v) = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv]) {
+                if local == 0 {
+                    crate::drop_hot(at.read());
+                }
+                at.write(v);
+                return 0;
+            }
+        }
+        // `[recv]` becomes the method call `[getter, recv]`.
+        if local != 0 {
+            at.add(1).write(crate::clone_hot(&*recv));
+        } else {
+            at.add(1).write(at.read());
+        }
+        at.write(Object::Function(getter));
+        match direct_call(st, pc, slot, slot + 2, &mut *site, None) {
+            None => {
+                let f = at.read();
+                if local != 0 {
+                    crate::drop_hot(at.add(1).read());
+                } else {
+                    at.write(at.add(1).read());
+                }
+                drop(f);
+                CALL_DECLINED
+            }
+            Some(r) => r,
+        }
+    }
+}
+
 /// [`h_call`] with a direct call ([`direct_call`]) of the plain Python
 /// function `site` caches tried first. (The native code calls `h_call`
 /// itself for any other callee, and while a site without a body waits
@@ -3558,6 +3638,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::SetFunctionAttribute
             | OpCode::ListToTuple
             | OpCode::UnpackEx
+            | OpCode::LoadSuperAttr
     )
 }
 
@@ -4487,7 +4568,8 @@ impl<'a> Lower<'a> {
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
             | OpCode::UnpackSequence
-            | OpCode::UnpackEx => return self.container(pc),
+            | OpCode::UnpackEx
+            | OpCode::LoadSuperAttr => return self.container(pc),
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
@@ -5017,8 +5099,13 @@ impl<'a> Lower<'a> {
             return self.binary_borrowed(pc, kind, ai, bi);
         }
         // A site that has run on instances keeps its operands and result
-        // on the stack, where an operator method's direct call leaves it.
-        if native || crate::instance_site(self.ext, pc) {
+        // on the stack, where an operator method's direct call leaves it
+        // (with the whole stack on the frame's, see `binop_declined`).
+        if crate::instance_site(self.ext, pc) {
+            self.flush();
+            return self.binary_helper(pc, kind, ai, bi);
+        }
+        if native {
             return self.binary_helper(pc, kind, ai, bi);
         }
         // A value on the stack (a call's result, an element, a field) is as
@@ -6059,6 +6146,11 @@ impl<'a> Lower<'a> {
     /// (a scalar copied, anything else with a reference taken); a stack
     /// receiver is released after. A miss is the core loop's.
     fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
+        // A property's getter may run here (see `h_property`), which needs
+        // the whole stack on the frame's.
+        if crate::property_site(self.ext, pc) {
+            self.flush();
+        }
         let item = self.pop();
         let at = match item {
             Item::Local(i) => self.local_addr(i),
@@ -6186,7 +6278,45 @@ impl<'a> Lower<'a> {
             ),
         }
         .expect("returns");
-        self.b.ins().brif(r, exit, &[], done, &[]);
+        // A property whose getter the site has cached runs directly, when
+        // nothing virtual lies below (its call can raise or switch).
+        if self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+            let prop = self.b.create_block();
+            self.b.ins().brif(r, prop, &[], done, &[]);
+            self.b.switch_to_block(prop);
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            let code = self.code_ptr();
+            let slotv = self.b.ins().iconst(types::I64, slot as i64);
+            let local = self
+                .b
+                .ins()
+                .iconst(types::I64, i64::from(matches!(item, Item::Local(_))));
+            let r = self
+                .call(
+                    h_property as *const () as usize,
+                    &[self.st, code, pcv, slotv, at, local, site_at],
+                    true,
+                )
+                .expect("returns");
+            let other = self.b.create_block();
+            self.b.ins().brif(r, other, &[], done, &[]);
+            self.b.switch_to_block(other);
+            let declined = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+            let leave = self.b.create_block();
+            self.b.ins().brif(declined, exit, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.b.ins().return_(&[r]);
+        } else {
+            self.b.ins().brif(r, exit, &[], done, &[]);
+        }
         self.b.switch_to_block(done);
         self.push(Item::Mem(slot));
         self.set_last(pc);

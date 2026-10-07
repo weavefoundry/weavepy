@@ -13699,49 +13699,11 @@ impl Interpreter {
                     // leaving the core loop). Stack (top-down): self, class,
                     // the `super` global.
                     OpCode::LoadSuperAttr => {
-                        if ins.arg & 2 != 0 || len < 3 {
-                            break Some(CoreExit::Helper);
-                        }
-                        // SAFETY: `len >= 3`.
-                        let (g, cls_obj, self_obj) = unsafe {
-                            (
-                                &*base.add(len - 3),
-                                &*base.add(len - 2),
-                                &*base.add(len - 1),
-                            )
-                        };
-                        if !is_super_callable(g)
-                            || !Self::core_droppable(g)
-                            || !Self::core_droppable(cls_obj)
-                        {
-                            break Some(CoreExit::Helper);
-                        }
-                        let Some(f) = Self::leaf_load_super_attr(
-                            code,
-                            cls_obj,
-                            self_obj,
-                            pc as u32,
-                            ins.arg >> 2,
-                        ) else {
-                            break Some(CoreExit::Helper);
-                        };
-                        // SAFETY: all three operands leave the stack; the two
-                        // released ones were checked droppable, and `self`
-                        // moves into the shape the `CALL` expects.
-                        unsafe {
-                            let self_v = base.add(len - 1).read();
-                            drop_hot(base.add(len - 2).read());
-                            drop_hot(base.add(len - 3).read());
-                            if ins.arg & 1 != 0 {
-                                base.add(len - 3).write(f);
-                                base.add(len - 2).write(self_v);
-                                len -= 1;
-                            } else {
-                                base.add(len - 3).write(Object::BoundMethod(Rc::new(
-                                    BoundMethod::new(self_v, f),
-                                )));
-                                len -= 2;
-                            }
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack.
+                        match unsafe { Self::core_super_attr(code, ins, pc, base, len) } {
+                            Some(n) => len = n,
+                            None => break Some(CoreExit::Helper),
                         }
                         last = pc;
                         pc += 1;
@@ -16205,6 +16167,57 @@ impl Interpreter {
         }
     }
 
+    /// Zero-argument `super().name` (`LOAD_SUPER_ATTR` `ins` at `pc` over
+    /// the `len` stack slots at `base`; top-down: self, class, the `super`
+    /// global) of a plain method later in the receiver's MRO, in the
+    /// elided-method shape the `CALL` folds `self` into, or bound. Returns
+    /// the new stack length, or `None`, having touched nothing.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    #[inline(never)]
+    unsafe fn core_super_attr(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        if ins.arg & 2 != 0 || len < 3 {
+            return None;
+        }
+        // SAFETY: `len >= 3`.
+        let (g, cls_obj, self_obj) = unsafe {
+            (
+                &*base.add(len - 3),
+                &*base.add(len - 2),
+                &*base.add(len - 1),
+            )
+        };
+        if !is_super_callable(g) || !Self::core_droppable(g) || !Self::core_droppable(cls_obj) {
+            return None;
+        }
+        let f = Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)?;
+        // SAFETY: all three operands leave the stack; the two released ones
+        // were checked droppable, and `self` moves into the shape the
+        // `CALL` expects.
+        unsafe {
+            let self_v = base.add(len - 1).read();
+            drop_hot(base.add(len - 2).read());
+            drop_hot(base.add(len - 3).read());
+            if ins.arg & 1 != 0 {
+                base.add(len - 3).write(f);
+                base.add(len - 2).write(self_v);
+                Some(len - 1)
+            } else {
+                base.add(len - 3)
+                    .write(Object::BoundMethod(Rc::new(BoundMethod::new(self_v, f))));
+                Some(len - 2)
+            }
+        }
+    }
+
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
     /// exact containers (an in-range index or a present `str`/`int` key),
     /// `seq[i] = v` in range and `d[key] = v`, and a comprehension's
@@ -16263,7 +16276,9 @@ impl Interpreter {
                         }
                         clone_hot(&t[i as usize])
                     }
-                    (Object::Dict(d), Object::Str(_) | Object::Int(_)) => {
+                    // (A tuple key's probe takes only ints and strings,
+                    // which compare and drop without running code.)
+                    (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
                         let probe = crate::object::LeafProbe::new(k)?;
                         // SAFETY: a read between two instructions (the
                         // probe runs no code).
@@ -16372,7 +16387,7 @@ impl Interpreter {
                         // stack into the list.
                         std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
                     }
-                    (Object::Dict(cell), Object::Str(_) | Object::Int(_)) => {
+                    (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
                         if crate::capi_watchers::dicts_active() {
                             return None;
                         }
@@ -69231,6 +69246,16 @@ fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
     }
 }
 
+/// Whether the `LOAD_ATTR` at `pc` has run a `property`'s getter (its
+/// method slot holds one).
+#[cfg(feature = "jit")]
+pub(crate) fn property_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.method_slots
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(MethodSlot::holds_getter)
+}
+
 /// Whether the `BINARY_OP` at `pc` has run on an instance operand.
 pub(crate) fn instance_site(ext: &CodeConstObjects, pc: usize) -> bool {
     ext.instance_sites
@@ -69883,6 +69908,13 @@ impl MethodSlot {
         }
         let c = f.code();
         (Rc::as_ptr(&c) == code.as_ptr()).then(|| (f.clone(), c))
+    }
+
+    /// Whether the site has cached a `property` getter (for any class).
+    #[cfg(feature = "jit")]
+    fn holds_getter(&self) -> bool {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`.
+        matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::Getter { .. }))
     }
 
     /// [`Self::getter`] borrowed, for a read that runs no Python.
