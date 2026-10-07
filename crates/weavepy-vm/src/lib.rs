@@ -13901,7 +13901,19 @@ impl Interpreter {
                                 }
                                 break Some(CoreExit::Helper);
                             }
-                            _ => break Some(CoreExit::Helper),
+                            // A builtin container's method read as a value
+                            // (`append = y.append`), a frame's or code
+                            // object's field (the helper's plain values).
+                            _ => {
+                                // SAFETY: `top` is the receiver's slot.
+                                if unsafe { self.core_plain_attr(code, ins.arg, top) } {
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                break Some(CoreExit::Helper);
+                            }
                         };
                         // A natively served instance's public field (see
                         // `stdlib::datetime_native`).
@@ -16627,6 +16639,28 @@ impl Interpreter {
                 }
             }
         }
+        // SAFETY: the receiver (droppable) is replaced in place.
+        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+        true
+    }
+
+    /// `x.name` at `top` for a receiver whose attribute is a plain value
+    /// no Python code computes (see [`Self::leaf_plain_attr_value`]): the
+    /// value replaces the receiver. `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `top` is the core loop's top stack slot.
+    #[inline(never)]
+    unsafe fn core_plain_attr(&self, code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let recv = unsafe { &*top };
+        if !Self::core_droppable(recv) {
+            return false;
+        }
+        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx) else {
+            return false;
+        };
         // SAFETY: the receiver (droppable) is replaced in place.
         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
         true
@@ -23000,6 +23034,11 @@ impl Interpreter {
                     ("len", LeafKind::Len),
                     ("isinstance", LeafKind::Isinstance),
                     ("getattr", LeafKind::GetAttr),
+                    ("hasattr", LeafKind::Fast(Interpreter::leaf_hasattr)),
+                    ("issubclass", LeafKind::Fast(leaf_issubclass)),
+                    // Bodies that run no Python code for any arguments.
+                    ("id", LeafKind::Opaque),
+                    ("callable", LeafKind::Opaque),
                     ("iter", LeafKind::Fast(crate::seqiter::iter_fast)),
                     ("min", LeafKind::Fast(crate::seqiter::min_fast)),
                     ("max", LeafKind::Fast(crate::seqiter::max_fast)),
@@ -23631,6 +23670,22 @@ impl Interpreter {
             }
             None => return None,
         }))
+    }
+
+    /// `hasattr(obj, name)` decided as [`Self::leaf_getattr`] decides
+    /// `getattr(obj, name, default)`: `True` for a value it finds, `False`
+    /// for a name it proves missing. `None` for anything the full call
+    /// must decide.
+    fn leaf_hasattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [obj, name] = args else {
+            return None;
+        };
+        let probe = [obj.clone(), name.clone(), Object::Unbound];
+        match Self::leaf_getattr(&probe)? {
+            Ok(Object::Unbound) => Some(Ok(Object::Bool(false))),
+            Ok(_) => Some(Ok(Object::Bool(true))),
+            Err(_) => None,
+        }
     }
 
     /// Call a leaf builtin if `args` (receiver first for methods) has an
@@ -62016,11 +62071,39 @@ impl LeafKind {
     }
 }
 
+/// `issubclass(cls, classinfo)` for a class against classes (or a flat
+/// tuple of them) whose metaclass is `type`: the MRO alone answers, with
+/// no `__subclasscheck__` to run. `None` for anything else.
+fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(cls), spec] = args else {
+        return None;
+    };
+    let classes: &[Object] = match spec {
+        Object::Type(_) => std::slice::from_ref(spec),
+        Object::Tuple(items) if items.len() <= 8 => items,
+        _ => return None,
+    };
+    for c in classes {
+        let Object::Type(c) = c else {
+            return None;
+        };
+        if !c.metaclass_is_type() {
+            return None;
+        }
+        if Rc::ptr_eq(cls, c) || cls.is_subclass_of(c) {
+            return Some(Ok(Object::Bool(true)));
+        }
+    }
+    Some(Ok(Object::Bool(false)))
+}
+
 /// Whether a builtin's fast half is one of the interpreter's own with no
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 15] = [
+    let pure: [leaf_builtins::Fast; 17] = [
+        leaf_issubclass,
+        Interpreter::leaf_hasattr,
         crate::seqiter::min_fast,
         crate::seqiter::max_fast,
         crate::seqiter::sum_fast,
