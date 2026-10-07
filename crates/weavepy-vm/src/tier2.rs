@@ -13839,8 +13839,22 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     let pc = frame.pc;
     // A region loop entered once per iteration of the interpreted code
     // around it is worth entering only for enough remaining iterations.
-    if cf.region_roots.contains(&(pc as u32)) && short_live_loop(&frame.stack) {
-        return JitEntry::Skip;
+    if cf.region_roots.contains(&(pc as u32)) {
+        if short_live_loop(&frame.stack) {
+            return JitEntry::Skip;
+        }
+        // A loop over a generator: each native step resumes it the way the
+        // interpreter does, so the loop gains little natively, while a
+        // short one (a genexpr over a few items) pays an entry and an exit
+        // per pass of the code around it. The frame JIT takes the code's
+        // loops instead.
+        if matches!(frame.stack.last(), Some(Object::Generator(_))) {
+            if crate::hot_gates::env_flags::jit_trace() {
+                eprintln!("jit genloop {:?} pc {}", frame.code.qualname, pc);
+            }
+            frame.code.jit_hint.set_backedge_quiet();
+            return JitEntry::Skip;
+        }
     }
     let Some(osr) = cf.osr_entries.iter().find(|e| e.pc == pc) else {
         // A loop whose code stays interpreted is expected to find no
