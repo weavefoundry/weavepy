@@ -2,11 +2,15 @@
 slowest relative to CPython.
 
     python3 tools/pybench/microops.py --weavepy BIN [--cpython python3.14]
-        [--filter SUBSTR] [--target-ms 40] [--instructions]
+        [--filter SUBSTR] [--target-ms 40] [--instructions] [--locals]
 
 Each case is a (setup, statement) pair. The statement runs in a loop
 inside a generated function, so locals are fast locals as in real code.
 The per-iteration time of an empty loop is subtracted.
+
+``--locals`` passes the objects a statement uses (not its modules,
+classes or functions) to the loop function as parameters, as a real
+function's operands usually arrive, instead of reading them as globals.
 
 ``--instructions`` instead counts instructions retired (macOS
 ``/usr/bin/time -l``) for processes running each loop ten thousand
@@ -259,17 +263,39 @@ CASES = [
     ("builtin_read", "len"),
 ]
 
+# The generated loop function. With `--locals`, the objects a statement
+# uses (not its modules, classes or functions) arrive as parameters, as a
+# real function's operands usually do, instead of being read as globals.
+MAKE = r'''
+def make(stmt, as_locals=LOCALS):
+    import types
+    body = "\n".join("        " + line for line in stmt.splitlines())
+    ns = dict(globals())
+    params = []
+    if as_locals:
+        names = set()
+        def walk(co):
+            names.update(co.co_names)
+            for c in co.co_consts:
+                if isinstance(c, types.CodeType):
+                    walk(c)
+        walk(compile(stmt, "<stmt>", "exec"))
+        shared = (types.ModuleType, type, types.FunctionType, types.BuiltinFunctionType)
+        params = sorted(n for n in names if n in ns and not isinstance(ns[n], shared))
+    src = "def bench(n%s):\n    for i in range(n):\n%s\n" % (
+        "".join(", " + p for p in params), body)
+    exec(src, ns)
+    bench = ns["bench"]
+    args = [ns[p] for p in params]
+    return lambda n: bench(n, *args)
+'''
+
 RUNNER = r'''
 import json, sys, time
 SETUP
 cases = json.loads(sys.argv[1])
 target = float(sys.argv[2]) / 1000.0
-def make(stmt):
-    body = "\n".join("        " + line for line in stmt.splitlines())
-    src = "def bench(n):\n    for i in range(n):\n" + body + "\n"
-    ns = dict(globals())
-    exec(src, ns)
-    return ns["bench"]
+MAKE
 def per_iter(fn):
     n = 64
     while True:
@@ -297,16 +323,18 @@ print(json.dumps(out))
 ONE = r'''
 import sys
 SETUP
-stmt = sys.argv[1]
-body = "\n".join("        " + line for line in stmt.splitlines())
-ns = dict(globals())
-exec("def bench(n):\n    for i in range(n):\n" + body + "\n", ns)
-ns["bench"](int(sys.argv[2]))
+MAKE
+make(sys.argv[1])(int(sys.argv[2]))
 '''
 
 
-def count_instructions(interp, stmt, n):
-    src = ONE.replace("SETUP", SETUP_COMMON)
+def program(template, as_locals):
+    return template.replace("MAKE", MAKE.replace("LOCALS", str(as_locals))).replace(
+        "SETUP", SETUP_COMMON)
+
+
+def count_instructions(interp, stmt, n, as_locals=False):
+    src = program(ONE, as_locals)
     proc = subprocess.run(["/usr/bin/time", "-l", interp, "-c", src, stmt, str(n)],
                           capture_output=True, text=True, timeout=600)
     m = re.search(r"(\d+)\s+instructions retired", proc.stderr)
@@ -316,13 +344,13 @@ def count_instructions(interp, stmt, n):
 
 
 def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=1010000,
-                     subtract=True):
+                     subtract=True, as_locals=False):
     # A cheap statement's span over `hi - lo` iterations is small next to
     # the process's own variation (JIT compiles, collections), so one under
     # `cheap` instructions an iteration is measured again over a longer one.
     def span(stmt, top):
-        a = count_instructions(interp, stmt, lo)
-        b = count_instructions(interp, stmt, top)
+        a = count_instructions(interp, stmt, lo, as_locals)
+        b = count_instructions(interp, stmt, top, as_locals)
         if a is None or b is None:
             return None
         return (b - a) / (top - lo)
@@ -341,8 +369,8 @@ def run_instructions(interp, cases, lo=10000, hi=110000, cheap=2000, long_hi=101
     return out
 
 
-def run(interp, cases, target):
-    src = RUNNER.replace("SETUP", SETUP_COMMON)
+def run(interp, cases, target, as_locals=False):
+    src = program(RUNNER, as_locals)
     proc = subprocess.run([interp, "-c", src, json.dumps(cases), str(target)],
                           capture_output=True, text=True, timeout=3600)
     if proc.returncode != 0:
@@ -359,6 +387,10 @@ def main():
     ap.add_argument("--sort", choices=["ratio", "name"], default="ratio")
     ap.add_argument("--json")
     ap.add_argument("--instructions", action="store_true")
+    ap.add_argument("--locals", action="store_true",
+                    help="pass the objects a statement uses (not its modules, "
+                    "classes or functions) to the loop function as parameters "
+                    "instead of reading them as globals")
     ap.add_argument("--no-subtract", action="store_true",
                     help="with --instructions, compare whole iterations (loop "
                     "included) instead of subtracting an empty loop's cost, "
@@ -368,11 +400,13 @@ def main():
     if args.filter:
         cases = [c for c in cases if any(f in c[0] for f in args.filter)]
     if args.instructions:
-        cp = run_instructions(args.cpython, cases, subtract=not args.no_subtract)
-        wp = run_instructions(args.weavepy, cases, subtract=not args.no_subtract)
+        cp = run_instructions(args.cpython, cases, subtract=not args.no_subtract,
+                              as_locals=args.locals)
+        wp = run_instructions(args.weavepy, cases, subtract=not args.no_subtract,
+                              as_locals=args.locals)
     else:
-        cp = run(args.cpython, cases, args.target_ms)
-        wp = run(args.weavepy, cases, args.target_ms)
+        cp = run(args.cpython, cases, args.target_ms, args.locals)
+        wp = run(args.weavepy, cases, args.target_ms, args.locals)
     unit = "in" if args.instructions else "ns"
     rows = []
     for name, _ in cases:
