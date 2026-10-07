@@ -12684,15 +12684,7 @@ impl Interpreter {
                                     let top = unsafe { base.add(len - 1) };
                                     // SAFETY: the sink is the consumer's local,
                                     // alive and untouched while the resume runs.
-                                    let folded = match sink {
-                                        // A scalar has no drop glue.
-                                        FoldSink::Sum(acc) => unsafe { (*acc).add_scalar(&*top) },
-                                        FoldSink::Collect(out) => {
-                                            // The yielded value moves out.
-                                            unsafe { (*out).push(top.read()) };
-                                            true
-                                        }
-                                    };
+                                    let folded = unsafe { sink.fold(top) };
                                     if folded {
                                         // SAFETY: the sent `None` takes the
                                         // (moved or trivially dropped) slot.
@@ -36431,6 +36423,29 @@ impl Interpreter {
                 "{name}() takes exactly one argument ({} given)",
                 args.len()
             )));
+        }
+        // A generator's items whose truth is known natively and doesn't
+        // decide are folded in place by its resume (see `FoldSink::Truth`):
+        // only the rest come back here.
+        if let Object::Generator(g) = &args[0] {
+            loop {
+                let x = match self.generator_send_fold(
+                    g,
+                    Object::None,
+                    Some(FoldSink::Truth(want_any)),
+                ) {
+                    Ok(v) => v,
+                    Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                        self.fire_caught_stop_iteration(&exc)?;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if self.obj_truthy(&x, globals)? == want_any {
+                    return Ok(Object::Bool(want_any));
+                }
+            }
+            return Ok(Object::Bool(!want_any));
         }
         let it = self.make_iter(&args[0], globals)?;
         while let Some(x) = self.iter_next(&it, globals)? {
@@ -62666,11 +62681,46 @@ impl CoreSwitch {
 /// for everything after (each phase is left for good).
 /// A draining consumer's sink for a lean generator resume's yields (see
 /// [`Interpreter::sum_fold`]): `sum()`'s running total, which takes
-/// scalars, or `list()`'s item buffer, which takes anything.
+/// scalars, `list()`'s item buffer, which takes anything, or `all()` /
+/// `any()`'s scan, which takes an item whose truth is known natively and
+/// isn't the deciding one (`Truth(true)` for `any`).
 #[derive(Clone, Copy)]
 enum FoldSink {
     Sum(*mut SumState),
     Collect(*mut Vec<Object>),
+    Truth(bool),
+}
+
+impl FoldSink {
+    /// Fold the yielded value at `top` into the sink: `true` when the sink
+    /// took it, its slot left to be overwritten without a drop (moved out,
+    /// or a scalar); `false` when it must go back to the consumer.
+    ///
+    /// # Safety
+    ///
+    /// `top` holds the yielded value, and the sink's target is the
+    /// consumer's own, live and untouched while its resume runs.
+    #[inline]
+    unsafe fn fold(self, top: *mut Object) -> bool {
+        match self {
+            // A scalar has no drop glue.
+            // SAFETY: the caller's contract.
+            Self::Sum(acc) => unsafe { (*acc).add_scalar(&*top) },
+            Self::Collect(out) => {
+                // SAFETY: the yielded value moves out.
+                unsafe { (*out).push(top.read()) };
+                true
+            }
+            // SAFETY: the caller's contract.
+            Self::Truth(decides) => match unsafe { &*top } {
+                Object::Bool(b) => *b != decides,
+                Object::Int(i) => (*i != 0) != decides,
+                Object::Float(x) => (*x != 0.0) != decides,
+                Object::None => decides,
+                _ => false,
+            },
+        }
+    }
 }
 
 // SAFETY: a sink is installed only while a resume runs on the thread that

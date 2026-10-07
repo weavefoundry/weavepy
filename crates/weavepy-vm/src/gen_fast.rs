@@ -680,17 +680,10 @@ impl Interpreter {
                     // into the sink (or is a scalar), and the sent `None`
                     // takes its place.
                     let top = unsafe { base.add(len - 1) };
-                    let folded = match fold {
-                        // SAFETY: the sink is the consumer's own, live and
-                        // untouched while its resume runs (as the core
-                        // loop's fold).
-                        Some(FoldSink::Sum(acc)) => unsafe { (*acc).add_scalar(&*top) },
-                        Some(FoldSink::Collect(out)) => {
-                            unsafe { (*out).push(top.read()) };
-                            true
-                        }
-                        None => false,
-                    };
+                    // SAFETY: the sink is the consumer's own, live and
+                    // untouched while its resume runs (as the core loop's
+                    // fold).
+                    let folded = fold.is_some_and(|sink| unsafe { sink.fold(top) });
                     if folded {
                         unsafe { top.write(Object::None) };
                         continue;

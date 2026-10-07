@@ -3418,7 +3418,11 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         match (self.key, &key.0) {
-            (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
+            // (The same string object, an interned name's usual case,
+            // settles before any byte compare.)
+            (Object::Str(a), Object::Str(b)) => {
+                std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.as_bytes() == b.as_bytes()
+            }
             (Object::Int(a), Object::Int(b)) => a == b,
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
