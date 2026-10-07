@@ -16648,13 +16648,15 @@ impl Interpreter {
             return None;
         };
         let cls = inst.cls_raw();
+        if cls.slot_layout.get().is_none_or(Option::is_none) {
+            return None;
+        }
         let ver = cls.attr_version.get();
         let stamp = code_stamp_slot(code, pc as u32)?;
         let idx = match stamp.get() {
             [v, LAID_OUT_SLOT, idx] if v == ver => idx as usize,
             _ => {
-                if cls.slot_layout.get().is_none_or(Option::is_none)
-                    || cls.native_kind.get() != 0
+                if cls.native_kind.get() != 0
                     || !Self::default_getattribute(cls)
                     || crate::object::exotic_str_keys_possible()
                 {
@@ -35798,17 +35800,14 @@ impl Interpreter {
             // ``next(coro)`` advances it with ``send(None)`` exactly like
             // a generator. CPython hides this behind a ``coroutine_wrapper``;
             // here the coroutine *is* the wrapper.
-            Object::Generator(g) => match self.generator_send(g, Object::None) {
-                Ok(v) => Ok(v),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    if let Some(d) = default {
-                        Ok(d)
-                    } else {
-                        Err(RuntimeError::PyException(exc))
-                    }
+            // With a default, the exhaustion builds no `StopIteration`.
+            Object::Generator(g) if default.is_some() => {
+                match self.gen_drain_next(g, None, false)? {
+                    Some(v) => Ok(v),
+                    None => Ok(default.expect("checked above")),
                 }
-                Err(e) => Err(e),
-            },
+            }
+            Object::Generator(g) => self.generator_send(g, Object::None),
             Object::Coroutine(_) => match self.gen_method_send(it, Object::None) {
                 Ok(v) => Ok(v),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
@@ -36186,7 +36185,7 @@ impl Interpreter {
                     // (see `Interpreter::sum_fold`).
                     loop {
                         let sink = FoldSink::Collect(std::ptr::from_mut(&mut out));
-                        match self.gen_drain_next(g, sink, false)? {
+                        match self.gen_drain_next(g, Some(sink), false)? {
                             Some(x) => out.push(x),
                             None => return Ok(out),
                         }
@@ -36357,7 +36356,7 @@ impl Interpreter {
                 // (see `Interpreter::sum_fold`); it returns at the first
                 // yield it cannot fold, or when the generator ends.
                 let sink = FoldSink::Sum(std::ptr::from_mut(&mut total));
-                let Some(x) = self.gen_drain_next(g, sink, true)? else {
+                let Some(x) = self.gen_drain_next(g, Some(sink), true)? else {
                     break;
                 };
                 total.add(self, x)?;
@@ -36467,7 +36466,7 @@ impl Interpreter {
         // only the rest come back here.
         if let Object::Generator(g) = &args[0] {
             loop {
-                let Some(x) = self.gen_drain_next(g, FoldSink::Truth(want_any), true)? else {
+                let Some(x) = self.gen_drain_next(g, Some(FoldSink::Truth(want_any)), true)? else {
                     break;
                 };
                 if self.obj_truthy(&x, globals)? == want_any {
@@ -41463,14 +41462,14 @@ impl Interpreter {
     fn gen_drain_next(
         &mut self,
         g: &Rc<PyGenerator>,
-        fold: FoldSink,
+        fold: Option<FoldSink>,
         fire: bool,
     ) -> Result<Option<Object>, RuntimeError> {
         let raw = !crate::trace::any_observers_active();
         if raw {
             GEN_RAW_RETURN.with(|r| r.set(true));
         }
-        match self.generator_send_fold(g, Object::None, Some(fold)) {
+        match self.generator_send_fold(g, Object::None, fold) {
             Ok(Object::Unbound) if raw => {
                 drop(GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()));
                 Ok(None)

@@ -116,6 +116,35 @@ class ContainerCtorTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             list(x=1)
 
+    def test_next_with_default(self):
+        for _ in range(500):
+            g = squares(2)
+            self.assertEqual(next(g, "d"), 0)
+            self.assertEqual(next(g, "d"), 1)
+            self.assertEqual(next(g, "d"), "d")
+            self.assertEqual(next(g, "d"), "d")
+        g = returns_value()
+        self.assertEqual(next(g, None), 1)
+        self.assertIsNone(next(g, None))
+
+        def bad():
+            yield 1
+            raise KeyError("k")
+
+        g = bad()
+        next(g, None)
+        with self.assertRaises(KeyError):
+            next(g, None)
+
+        def leaky():
+            yield 1
+            raise StopIteration
+
+        g = leaky()
+        next(g)
+        with self.assertRaises(RuntimeError):
+            next(g, None)
+
     def test_monitoring_sees_the_drain(self):
         if not hasattr(sys, "monitoring"):
             self.skipTest("no sys.monitoring")
