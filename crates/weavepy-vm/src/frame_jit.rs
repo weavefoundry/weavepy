@@ -4556,17 +4556,17 @@ impl<'a> Lower<'a> {
 
     /// `local[i]` of a list or tuple local and an `int` index, in line:
     /// the item is read in place (the local gives no reference to take or
-    /// release) and copied to the stack. Anything else (another type, a
-    /// borrowed list, an index out of range) leaves for the core loop with
-    /// both operands back. `false`, emitting nothing, for other operand
-    /// shapes.
+    /// release) and copied to the stack. Any other operands (a `str` or a
+    /// dict, a borrowed list, an index out of range) take the container
+    /// helper, as [`Self::container`] would. `false`, emitting nothing, for
+    /// other operand shapes.
     fn seq_index(&mut self, pc: usize) -> bool {
         let (Some(list), Some((tlen, titems))) = (self.tags.list_layout, self.tags.tuple_layout)
         else {
             return false;
         };
         let n = self.vs.len();
-        if self.cold || n < 2 {
+        if self.cold || n < 2 || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0 {
             return false;
         }
         let (cont, key) = (self.vs[n - 2], self.vs[n - 1]);
@@ -4583,14 +4583,18 @@ impl<'a> Lower<'a> {
         }
         self.pop();
         self.pop();
-        let out = self.exit_with(pc, &[cont, key], INTERP);
+        // Both paths join with the rest of the stack written out.
+        self.flush();
+        let slot = self.depth;
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
         let idx = self.operand(key).expect("an int-shaped key");
         if let Some(t) = idx.tag {
             let other = self
                 .b
                 .ins()
                 .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.int));
-            self.branch_out(other, out);
+            self.branch_out(other, slow);
         }
         let addr = self.local_addr(l);
         let tag = self.tag_at(addr);
@@ -4613,10 +4617,10 @@ impl<'a> Lower<'a> {
             .ins()
             .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
         let shared = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
-        self.branch_out(shared, out);
+        self.branch_out(shared, slow);
         let borrow = self.b.ins().load(types::I32, FLAGS, word, list.borrow);
         let held = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-        self.branch_out(held, out);
+        self.branch_out(held, slow);
         let len = self.b.ins().load(types::I64, FLAGS, word, list.len);
         let items = self.b.ins().load(self.ptr, FLAGS, word, list.ptr);
         self.b.ins().jump(found, &[len.into(), items.into()]);
@@ -4625,7 +4629,7 @@ impl<'a> Lower<'a> {
             .b
             .ins()
             .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.tuple));
-        self.b.ins().brif(is_tuple, as_tuple, &[], out, &[]);
+        self.b.ins().brif(is_tuple, as_tuple, &[], slow, &[]);
         self.b.switch_to_block(as_tuple);
         let len = self.b.ins().load(types::I64, FLAGS, word, tlen);
         let items = self.b.ins().iadd_imm(word, i64::from(titems));
@@ -4638,12 +4642,44 @@ impl<'a> Lower<'a> {
         let wrapped = self.b.ins().iadd(i, len);
         let i = self.b.ins().select(neg, wrapped, i);
         let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
-        self.branch_out(outside, out);
+        self.branch_out(outside, slow);
         let off = self.b.ins().ishl_imm(i, 4);
         let item = self.b.ins().iadd(items, off);
-        let slot = self.depth;
         let dst = self.slot_addr(slot);
         self.copy_value(dst, item);
+        self.b.ins().jump(join, &[]);
+        // Anything else: both operands to the stack, and the helper.
+        self.b.switch_to_block(slow);
+        self.materialize(cont, slot);
+        self.materialize(key, slot + 1);
+        let ins = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref(&self.code.instructions[pc]) as i64,
+        );
+        let code = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let lenv = self.b.ins().iconst(types::I64, slot as i64 + 2);
+        let r = self
+            .call_typed(
+                h_container as *const () as usize,
+                &[self.st, ins, code, pcv, lenv],
+                Some(types::I64),
+            )
+            .expect("returns");
+        let declined = self.b.ins().icmp_imm(IntCC::Equal, r, -1);
+        let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
+        self.branch_out(declined, out);
+        // (The helper released the operands; a finalizer it queued runs
+        // before the next instruction, as after `Self::container`.)
+        self.depth = slot + 1;
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        self.depth = slot;
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
         self.push(Item::Mem(slot));
         self.set_last(pc);
         true
