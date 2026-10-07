@@ -13023,13 +13023,18 @@ impl Interpreter {
                                 }
                             }
                         }
+                        // (A plain function skips the builtin shapes below.)
+                        // SAFETY: `len >= argc + 2`: the callee.
+                        let plain_fn =
+                            matches!(unsafe { &*base.add(len - argc - 2) }, Object::Function(_));
                         // A builtin type whose native constructor runs no
                         // Python code (`range(a, b)`, `type(x)`, an empty
                         // container), in place.
                         // SAFETY: `len >= argc + 2`: the callee and its self
                         // slot, then the arguments.
-                        if let Some(v) =
-                            unsafe { self.core_builtin_ctor(base, len - argc - 2, len) }
+                        if let Some(v) = (!plain_fn)
+                            .then(|| unsafe { self.core_builtin_ctor(base, len - argc - 2, len) })
+                            .flatten()
                         {
                             let callee_at = len - argc - 2;
                             // SAFETY: every operand was checked droppable;
@@ -13049,6 +13054,7 @@ impl Interpreter {
                         // `FOR_ITER`, with the yield as the call's result.
                         // SAFETY: `len >= argc + 2 == 3`.
                         if argc == 1
+                            && !plain_fn
                             && matches!(
                                 unsafe { (&*base.add(len - 3), &*base.add(len - 2), &*base.add(len - 1)) },
                                 (Object::Builtin(b), Object::Unbound, Object::Generator(_))
@@ -13068,6 +13074,7 @@ impl Interpreter {
                         // value sent in.
                         // SAFETY: `len >= argc + 2 == 3`.
                         if argc == 1
+                            && !plain_fn
                             && matches!(
                                 unsafe { (&*base.add(len - 3), &*base.add(len - 2)) },
                                 (Object::BoundMethod(bm), Object::Unbound)
