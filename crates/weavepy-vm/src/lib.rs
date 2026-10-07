@@ -15270,6 +15270,10 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // A generator function's call makes its generator in place.
+        if self.core_gen_call_ex(sw, pc) {
+            return true;
+        }
         // SAFETY: see `CoreSwitch`: the running activation is synced.
         if self.try_leaf_call_ex(unsafe { &mut *sw.cur }, pc) {
             return true;
@@ -15282,9 +15286,8 @@ impl Interpreter {
             self.try_inline_call_ex(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
-            // A generator function's call makes its generator in place, and
-            // a leaf builtin's runs in place.
-            return self.core_gen_call_ex(sw, pc) || self.core_builtin_call_ex(sw, pc);
+            // A leaf builtin's call runs in place.
+            return self.core_builtin_call_ex(sw, pc);
         };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
@@ -15391,19 +15394,23 @@ impl Interpreter {
         if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
             return false;
         }
-        let positional: Vec<Object> = match spread {
-            Object::Tuple(t) => t.to_vec(),
+        let mut positional = self.pooled_scratch();
+        match spread {
+            Object::Tuple(t) => positional.extend(t.iter().cloned()),
             Object::List(l) => match l.try_borrow() {
-                Ok(l) => l.clone(),
+                Ok(l) => positional.extend(l.iter().cloned()),
                 Err(_) => return false,
             },
             _ => return false,
-        };
+        }
         let Some(gen) = self.start_generator_fast(f, &code, positional) else {
             return false;
         };
-        for o in frame.stack.drain(callee_slot..).collect::<Vec<_>>() {
-            self.release(o);
+        // The callee, its self slot, the spread and the mapping leave.
+        for _ in callee_slot..n {
+            if let Some(o) = frame.stack.pop() {
+                self.release(o);
+            }
         }
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
