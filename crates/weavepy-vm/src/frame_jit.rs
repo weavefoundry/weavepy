@@ -631,6 +631,13 @@ struct Tags {
     float: u8,
     cell: u8,
     instance: u8,
+    /// A list's tag, and where its items are (see [`ListLayout`]).
+    list: u8,
+    list_layout: Option<ListLayout>,
+    /// A tuple's tag, and where its length and items are, from its
+    /// payload word: `(length, first item)` byte offsets.
+    tuple: u8,
+    tuple_layout: Option<(i32, i32)>,
     /// The heap variants whose payload word is an `Rc`'s allocation, its
     /// strong count the allocation's first word (a clone is an increment
     /// there): instances, lists, dicts and classes, as far as measured.
@@ -687,6 +694,10 @@ fn tags() -> Option<Tags> {
         float: tag(&Object::Float(1.0)),
         cell: tag(&cell),
         instance: tag(&inst),
+        list: tag(&Object::new_list(Vec::new())),
+        list_layout: list_layout(),
+        tuple: tag(&Object::new_tuple_array([Object::None])),
+        tuple_layout: tuple_layout(),
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -724,6 +735,75 @@ fn tags() -> Option<Tags> {
         && word(&Object::Float(1.5)) == 1.5f64.to_bits()
         && std::mem::size_of::<Object>() == 16)
         .then_some(t)
+}
+
+/// Where a list's items are, from its payload word (its allocation): the
+/// byte offsets of its cell's borrow counter (an `i32`; negative while
+/// mutably borrowed) and of its vector's pointer and length.
+#[derive(Clone, Copy)]
+struct ListLayout {
+    borrow: i32,
+    ptr: i32,
+    len: i32,
+}
+
+/// [`ListLayout`], read off a sample list (`None` if it isn't the shape
+/// the code assumes).
+fn list_layout() -> Option<ListLayout> {
+    let mut v: Vec<Object> = Vec::with_capacity(7);
+    v.extend([Object::Int(1), Object::Int(2), Object::Int(3)]);
+    let (vp, vl) = (v.as_ptr() as u64, v.len() as u64);
+    let o = Object::new_list(v);
+    let Object::List(rc) = &o else {
+        return None;
+    };
+    // SAFETY: every `Object` is 16 bytes; a list's second word is its
+    // allocation's address.
+    let word = unsafe { *std::ptr::from_ref(&o).cast::<u64>().add(1) };
+    let cell = Rc::as_ptr(rc) as u64;
+    let at_cell = cell.checked_sub(word)?;
+    let (borrow, data) = crate::sync::object_vec_cell_offsets();
+    // SAFETY: the vector's three words, inside the live sample.
+    let words: [u64; 3] = unsafe { std::ptr::read((cell as usize + data) as *const [u64; 3]) };
+    let ptr = words.iter().position(|&w| w == vp)?;
+    let len = words.iter().position(|&w| w == vl)?;
+    let off = |d: usize| i32::try_from(at_cell as usize + d).ok();
+    // The borrow counter reads as unborrowed, and a borrow moves it.
+    // SAFETY: as above.
+    let counter = unsafe { &*((cell as usize + borrow) as *const std::sync::atomic::AtomicI32) };
+    let idle = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let held = {
+        let _g = rc.borrow_mut();
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    (idle == 0 && held < 0 && ptr != len).then_some(())?;
+    Some(ListLayout {
+        borrow: off(borrow)?,
+        ptr: off(data + 8 * ptr)?,
+        len: off(data + 8 * len)?,
+    })
+}
+
+/// A tuple's `(length, first item)` byte offsets from its payload word,
+/// read off a sample tuple (`None` if it isn't the shape assumed).
+fn tuple_layout() -> Option<(i32, i32)> {
+    const MARK: i64 = 0x5eed_7a91_e000_0001;
+    let o = Object::new_tuple(vec![Object::Int(MARK), Object::Int(2), Object::Int(3)]);
+    // SAFETY: every `Object` is 16 bytes; a tuple's second word addresses
+    // its payload.
+    let word = unsafe { *std::ptr::from_ref(&o).cast::<u64>().add(1) } as usize;
+    let Object::Tuple(t) = &o else {
+        return None;
+    };
+    // SAFETY: the payload's leading words, inside the live sample (its
+    // items follow its length and cached hash).
+    let words: [u64; 8] = unsafe { std::ptr::read(word as *const [u64; 8]) };
+    let len = words.iter().position(|&w| w == 3)?;
+    let first = std::ptr::from_ref(&t[0]) as usize;
+    let items = first.checked_sub(word)?;
+    let at = |i: usize| words.get(i).copied();
+    (at(items / 8 + 1)? == MARK as u64 && items % 8 == 0 && len * 8 < items)
+        .then(|| Some((i32::try_from(len * 8).ok()?, i32::try_from(items).ok()?)))?
 }
 
 /// Whether cloning `o` (whose payload word is `w`) adds one to the word at
@@ -3633,6 +3713,7 @@ impl<'a> Lower<'a> {
                 return false;
             }
             OpCode::ForIter => return self.for_iter(pc, ins.arg),
+            OpCode::BinarySubscr if self.seq_index(pc) => true,
             OpCode::BinarySubscr
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
@@ -4431,6 +4512,101 @@ impl<'a> Lower<'a> {
         self.depth = after as usize;
         self.set_last(pc);
         self.check_released(pc + 1);
+        true
+    }
+
+    /// `local[i]` of a list or tuple local and an `int` index, in line:
+    /// the item is read in place (the local gives no reference to take or
+    /// release) and copied to the stack. Anything else (another type, a
+    /// borrowed list, an index out of range) leaves for the core loop with
+    /// both operands back. `false`, emitting nothing, for other operand
+    /// shapes.
+    fn seq_index(&mut self, pc: usize) -> bool {
+        let (Some(list), Some((tlen, titems))) = (self.tags.list_layout, self.tags.tuple_layout)
+        else {
+            return false;
+        };
+        let n = self.vs.len();
+        if self.cold || n < 2 {
+            return false;
+        }
+        let (cont, key) = (self.vs[n - 2], self.vs[n - 1]);
+        let Item::Local(l) = cont else {
+            return false;
+        };
+        let int_key = match key {
+            Item::Int(_) | Item::Local(_) | Item::Dyn(..) => true,
+            Item::Const(k) => matches!(self.ext.objects[k as usize], Object::Int(_)),
+            _ => false,
+        };
+        if !int_key {
+            return false;
+        }
+        self.pop();
+        self.pop();
+        let out = self.exit_with(pc, &[cont, key], INTERP);
+        let idx = self.operand(key).expect("an int-shaped key");
+        if let Some(t) = idx.tag {
+            let other = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.int));
+            self.branch_out(other, out);
+        }
+        let addr = self.local_addr(l);
+        let tag = self.tag_at(addr);
+        let word = self.b.ins().load(self.ptr, FLAGS, addr, 8);
+        let as_list = self.b.create_block();
+        let not_list = self.b.create_block();
+        let as_tuple = self.b.create_block();
+        let found = self.b.create_block();
+        self.b.append_block_param(found, types::I64);
+        self.b.append_block_param(found, self.ptr);
+        let is_list = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.list));
+        self.b.ins().brif(is_list, as_list, &[], not_list, &[]);
+        // A list: its cell unborrowed, and cells unshared.
+        self.b.switch_to_block(as_list);
+        let flag = self
+            .b
+            .ins()
+            .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
+        let shared = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+        self.branch_out(shared, out);
+        let borrow = self.b.ins().load(types::I32, FLAGS, word, list.borrow);
+        let held = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        self.branch_out(held, out);
+        let len = self.b.ins().load(types::I64, FLAGS, word, list.len);
+        let items = self.b.ins().load(self.ptr, FLAGS, word, list.ptr);
+        self.b.ins().jump(found, &[len.into(), items.into()]);
+        self.b.switch_to_block(not_list);
+        let is_tuple = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.tuple));
+        self.b.ins().brif(is_tuple, as_tuple, &[], out, &[]);
+        self.b.switch_to_block(as_tuple);
+        let len = self.b.ins().load(types::I64, FLAGS, word, tlen);
+        let items = self.b.ins().iadd_imm(word, i64::from(titems));
+        self.b.ins().jump(found, &[len.into(), items.into()]);
+        self.b.switch_to_block(found);
+        let p = self.b.block_params(found);
+        let (len, items) = (p[0], p[1]);
+        let i = idx.word;
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
+        let wrapped = self.b.ins().iadd(i, len);
+        let i = self.b.ins().select(neg, wrapped, i);
+        let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
+        self.branch_out(outside, out);
+        let off = self.b.ins().ishl_imm(i, 4);
+        let item = self.b.ins().iadd(items, off);
+        let slot = self.depth;
+        let dst = self.slot_addr(slot);
+        self.copy_value(dst, item);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
         true
     }
 
