@@ -13873,7 +13873,18 @@ impl Interpreter {
                                         pc += 1;
                                         continue;
                                     }
-                                    _ => break Some(CoreExit::Helper),
+                                    _ => {
+                                        // Any other plain class value (an enum
+                                        // member, a function), out of line.
+                                        // SAFETY: `top` is the receiver's slot.
+                                        if unsafe { Self::core_class_value(code, ins.arg, pc, top) }
+                                        {
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                        break Some(CoreExit::Helper);
+                                    }
                                 }
                             }
                             // `module.name` off the site's cached index (a
@@ -16664,6 +16675,106 @@ impl Interpreter {
         // SAFETY: the receiver (droppable) is replaced in place.
         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
         true
+    }
+
+    /// `cls.name` at `top` (a class) for a plain value on the class's
+    /// MRO, read as `type.__getattribute__` reads it: the class (held
+    /// elsewhere too) is replaced by the value the `LOAD_ATTR` site at `pc`
+    /// remembers under the class's and the metaclass's versions (see
+    /// [`MethodSlotFn::ClassValue`]), resolved on a miss. `false` touches
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// `top` is the core loop's top stack slot.
+    #[inline(never)]
+    unsafe fn core_class_value(
+        code: &CodeObject,
+        name_idx: u32,
+        pc: usize,
+        top: *mut Object,
+    ) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Type(cls) = (unsafe { &*top }) else {
+            return false;
+        };
+        if Rc::strong_count(cls) <= 1 {
+            return false;
+        }
+        // SAFETY: GIL-serialized read of the metaclass cell.
+        let meta = unsafe { cls.metaclass.peek() }.and_then(|m| m.clone());
+        let meta = meta.filter(|m| !Rc::ptr_eq(m, &builtin_types().type_));
+        let meta_ver = meta.as_ref().map_or(0, |m| m.attr_version.get());
+        let ver = cls.attr_version.get();
+        let Some(slot) = code_method_slot(code, pc as u32) else {
+            return false;
+        };
+        let v = match slot.class_value(ver, meta_ver) {
+            // (A remembered decline: the helper's.)
+            Some(Object::Unbound) => return false,
+            Some(v) => Self::clone_operand(v),
+            None => {
+                let Some(v) = Self::plain_class_value(cls, meta.as_deref(), code, name_idx) else {
+                    slot.set_class_value(ver, meta_ver, Object::Unbound);
+                    return false;
+                };
+                slot.set_class_value(ver, meta_ver, v.clone());
+                v
+            }
+        };
+        // SAFETY: the class (count above one) is replaced in place.
+        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+        true
+    }
+
+    /// `cls.name` when `type`'s attribute lookup answers it with a value
+    /// stored on the class's MRO that binds to nothing (no `__get__`
+    /// runs): `meta` (the metaclass, unless it is `type`) neither replaces
+    /// `__getattribute__` nor defines the name, and the name is no dunder.
+    fn plain_class_value(
+        cls: &TypeObject,
+        meta: Option<&TypeObject>,
+        code: &CodeObject,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if name.starts_with("__") || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        if let Some(m) = meta {
+            // (The builtin hook resolves as `type`'s or `object`'s entry.)
+            let bt = builtin_types();
+            let own = |t: &TypeObject, found: &Object| {
+                t.dict
+                    .borrow()
+                    .get(&crate::object::StrKey("__getattribute__"))
+                    .is_some_and(|own| own.is_same(found))
+            };
+            let default = match m.lookup("__getattribute__") {
+                None => true,
+                Some(found) => own(&bt.type_, &found) || own(&bt.object_, &found),
+            };
+            if !default || m.lookup(name).is_some() {
+                return None;
+            }
+        }
+        let v = cls.lookup(name)?;
+        let plain = match &v {
+            Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+            | Object::FrozenSet(_)
+            | Object::Function(_)
+            | Object::Builtin(_) => true,
+            Object::Type(t) => Self::plain_metaclass(t),
+            Object::Instance(i) => i.cls_raw().lookup("__get__").is_none(),
+            _ => false,
+        };
+        plain.then_some(v)
     }
 
     /// `f.name` at `top` (a function): its stored value replaces the
@@ -69090,6 +69201,15 @@ enum MethodSlotFn {
         func: crate::sync::Weak<crate::object::PyFunction>,
         code: crate::sync::Weak<CodeObject>,
     },
+    /// A `LOAD_ATTR` site's plain class value (an enum member, a class's
+    /// function or constant) for the class at the key's version under a
+    /// metaclass at `meta_ver` (`0` for `type`), which reads it as `type`
+    /// does (see `Interpreter::core_class_value`); `Unbound` remembers that
+    /// the name has no such value there.
+    ClassValue {
+        meta_ver: u64,
+        value: Object,
+    },
 }
 
 // SAFETY: read and written only from the dispatch loop with the GIL
@@ -69501,6 +69621,31 @@ impl MethodSlot {
                 },
             );
         };
+    }
+
+    /// The class value the slot holds for the class at `ver` under a
+    /// metaclass at `meta_ver` (see [`MethodSlotFn::ClassValue`]).
+    #[inline]
+    fn class_value(&self, ver: u64, meta_ver: u64) -> Option<&Object> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set_class_value`.
+        match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::ClassValue { meta_ver: m, value }) if *v == ver && *m == meta_ver => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_class_value(&self, ver: u64, meta_ver: u64, value: Object) {
+        // SAFETY: as `set`; the displaced entry drops after the store.
+        let old = unsafe {
+            std::mem::replace(
+                &mut *self.0.get(),
+                (ver, MethodSlotFn::ClassValue { meta_ver, value }),
+            )
+        };
+        drop(old);
     }
 
     #[inline]
