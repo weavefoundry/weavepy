@@ -15451,14 +15451,16 @@ impl Interpreter {
             if self.try_leaf_call_ex(frame, pc + 3) {
                 return true;
             }
-            let act = self.try_inline_call_ex(frame, &mut *shell.cast::<QuietShell<'_>>(), pc + 3);
-            if act.is_none() {
-                // Declined untouched: the operand leaves again.
-                frame.stack.pop();
-            }
-            act
+            self.try_inline_call_ex(frame, &mut *shell.cast::<QuietShell<'_>>(), pc + 3)
         };
         let Some(mut act) = act else {
+            // A generator function's call makes its generator in place.
+            if self.core_gen_call_ex(sw, pc + 3) {
+                return true;
+            }
+            // Declined untouched: the operand leaves again.
+            // SAFETY: as above (the running activation).
+            unsafe { (*sw.cur).stack.pop() };
             return false;
         };
         let callee: *mut Frame = &raw mut *act.frame;
