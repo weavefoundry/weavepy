@@ -402,6 +402,12 @@ pub struct GcState {
     /// remembered here, so that a collection can re-examine them and
     /// promote any that has since acquired a non-atomic element.
     deferred: RefCell<Vec<DeferredContainer>>,
+    /// The deferred containers that outlived a sweep: an older generation
+    /// of them, re-examined only by collections of the middle generation
+    /// and up (a young collection leaves old objects alone, as CPython's
+    /// does), so each young collection costs what was deferred since the
+    /// last, not every scalar container still alive.
+    deferred_old: RefCell<Vec<DeferredContainer>>,
     /// Length at which [`GcState::sweep_deferred`] compacts `deferred`.
     deferred_limit: AtomicUsize,
     /// Dead entries of the older generations pruned since the last
@@ -478,6 +484,7 @@ impl GcState {
             counts: RefCell::new([0; N_GENERATIONS]),
             gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
             deferred: RefCell::new(Vec::new()),
+            deferred_old: RefCell::new(Vec::new()),
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             old_deaths: AtomicUsize::new(0),
             young: RefCell::new(Vec::new()),
@@ -521,6 +528,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).thresholds));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred_old));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_fns));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_gens));
@@ -808,13 +816,23 @@ impl GcState {
     /// enough for the collector to see every cycle it would have seen
     /// with eager tracking.
     fn sweep_deferred(&self, promote_all: bool) {
+        self.sweep_deferred_from(promote_all, promote_all);
+    }
+
+    /// [`Self::sweep_deferred`] of the young deferrals, and of the old ones
+    /// too when `old` (see [`Self::deferred_old`]); the young survivors
+    /// join the old.
+    fn sweep_deferred_from(&self, promote_all: bool, old: bool) {
         self.flush_young();
         let mut promote: Vec<Object> = Vec::new();
         {
-            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+            let (Ok(mut deferred), Ok(mut aged)) = (
+                self.deferred.try_borrow_mut(),
+                self.deferred_old.try_borrow_mut(),
+            ) else {
                 return;
             };
-            deferred.retain(|entry| {
+            let mut keep = |entry: &DeferredContainer| {
                 let Some(obj) = entry.upgrade() else {
                     return false;
                 };
@@ -823,17 +841,22 @@ impl GcState {
                     return false;
                 }
                 true
-            });
-            let live = deferred.len();
-            if live >= DEFERRED_CAP {
+            };
+            deferred.retain(&mut keep);
+            if old {
+                aged.retain(&mut keep);
+            }
+            aged.append(&mut deferred);
+            if aged.len() >= DEFERRED_CAP && !old {
+                // (Dead entries first: the old ones were left unswept.)
+                aged.retain(|e| !e.is_dead());
+            }
+            if aged.len() >= DEFERRED_CAP {
                 // The set has stopped being a churn buffer: hand it all
                 // over, so these allocations resume pacing collections.
-                promote.extend(deferred.drain(..).filter_map(|e| e.upgrade()));
+                promote.extend(aged.drain(..).filter_map(|e| e.upgrade()));
             }
-            self.deferred_limit.store(
-                DEFERRED_FLOOR.max(deferred.len().saturating_mul(2)),
-                Ordering::Relaxed,
-            );
+            self.deferred_limit.store(DEFERRED_FLOOR, Ordering::Relaxed);
         }
         for obj in promote {
             self.track_now(&obj);
@@ -1190,9 +1213,10 @@ impl GcState {
         // died, then add those still live. `gc.get_count()` and
         // `_testinternalcapi.get_tracked_heap_size()` then read exactly as
         // they would have (`test_gc.test_heap_size`).
-        self.sweep_deferred(false);
+        self.sweep_deferred_from(false, true);
         let mut counts = *self.counts.borrow();
-        counts[0] = counts[0].saturating_add(self.deferred.borrow().len());
+        counts[0] = counts[0]
+            .saturating_add(self.deferred.borrow().len() + self.deferred_old.borrow().len());
         counts
     }
 
@@ -1412,7 +1436,7 @@ impl GcState {
     /// *without* the destructive teardown of a real collection. See
     /// [`Self::collect_generation`]'s `weakref_only` discussion.
     pub fn fire_dead_weakrefs(&self) {
-        self.sweep_deferred(false);
+        self.sweep_deferred_from(false, true);
         if self
             .collecting
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1437,9 +1461,10 @@ impl GcState {
     fn collect_impl(&self, upto: usize, exact: bool) -> usize {
         self.old_deaths.store(0, Ordering::Relaxed);
         // Promote any deferred container that can now anchor a cycle, so
-        // the mark phase sees the whole candidate population. Before the
+        // the mark phase sees the whole candidate population (the old
+        // deferrals only for the older generations). Before the
         // re-entrancy claim: promotion calls `track_now`.
-        self.sweep_deferred(false);
+        self.sweep_deferred_from(false, upto >= 1);
         // Atomic claim: overlapping collections over the shared heap would
         // subtract the same internal edges twice.
         if self
@@ -1593,7 +1618,7 @@ impl GcState {
                 grey.push(i);
             }
         }
-        if std::env::var_os("WP_ROOT_DBG").is_some() {
+        if root_debug() {
             for &i in &grey {
                 let c = &cands[i];
                 eprintln!(
@@ -2784,6 +2809,12 @@ pub fn is_atomic(obj: &Object) -> bool {
 /// this is CPython's container-untracking optimization applied at
 /// construction time, and it keeps numeric/string-heavy workloads off
 /// the GC's books entirely.
+/// `WP_ROOT_DBG`: print each collection's roots (read once).
+fn root_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WP_ROOT_DBG").is_some())
+}
+
 /// The smallest deferral population worth compacting: below this, the
 /// sweep's fixed cost outweighs what it reclaims.
 const DEFERRED_FLOOR: usize = 4096;
