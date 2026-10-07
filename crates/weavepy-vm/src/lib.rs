@@ -8144,6 +8144,7 @@ impl Interpreter {
         }
         act.parked = true;
         act.clean = false;
+        act.direct = false;
         act.act.shell = None;
         act.guard = None;
         act.caller_pending = None;
@@ -8168,6 +8169,7 @@ impl Interpreter {
         }
         act.parked = true;
         act.clean = false;
+        act.direct = false;
         act.guard = None;
         act.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
@@ -14955,13 +14957,47 @@ impl Interpreter {
         {
             return false;
         }
-        let Some(mut act) = self.inline_pool.pop() else {
+        let Some(act) = self.inline_pool.pop() else {
             return false;
         };
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
             self.inline_pool.push(act);
             return false;
         };
+        // SAFETY: as above; the checks above hold.
+        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, fp, act, guard) };
+        true
+    }
+
+    /// The committed half of [`Self::core_call_plain`]: the arguments of
+    /// the `CALL` at `pc` of `sw`'s running activation (the callable at
+    /// `callee_slot`, its self slot filled when `has_self`) move into the
+    /// pooled slot `act`'s locals, and `act`, bound to the plain function
+    /// `fp` (with exactly its arity) under the recursion `guard`, is
+    /// pushed and made the running activation.
+    ///
+    /// # Safety
+    ///
+    /// The running activation is synced and unborrowed, and the call's
+    /// shape is one `core_call_plain` admits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_bind_plain(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        callee_slot: usize,
+        has_self: bool,
+        fp: *const crate::object::PyFunction,
+        mut act: Box<InlineAct>,
+        guard: crate::recursion::Guard,
+    ) -> *mut Frame {
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *sw.cur };
+        let n = frame.stack.len();
+        // SAFETY: `fp` is the function at `callee_slot`, alive while the
+        // stack holds it.
+        let code_rc: &Rc<CodeObject> = unsafe { &*(*fp).code.as_ptr() };
         // Committed. The arguments move into the slot's (empty, sole-owned)
         // locals; the callable and the empty self slot leave the stack.
         let code = code_rc.clone();
@@ -15030,7 +15066,7 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
-        true
+        callee
     }
 
     /// A bound method over a plain function with an empty self slot,
@@ -62552,6 +62588,9 @@ struct InlineAct {
     /// The frame's `cells` handle is the activation's own (a callee with
     /// cell variables, see [`fresh_cells`]), not borrowed from the callee.
     owns_cells: bool,
+    /// A native caller runs the activation and finishes its return itself
+    /// (see `frame_jit::direct_call`).
+    direct: bool,
 }
 
 impl InlineAct {
@@ -62596,6 +62635,7 @@ impl InlineAct {
             exhaust_arg: 0,
             init_inst: None,
             owns_cells: false,
+            direct: false,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):

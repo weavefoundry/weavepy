@@ -72,6 +72,10 @@ pub(crate) const RAISED: u32 = 2;
 /// `Interpreter::core_call`), the frame synced first: the core loop
 /// reloads.
 pub(crate) const RELOAD: u32 = 4;
+/// A directly called activation returned (see [`direct_call`]), its state
+/// synced to the return with the value atop its stack: the caller
+/// finishes the return.
+const DIRECT_RET: u32 = 5;
 
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
@@ -174,6 +178,9 @@ pub(crate) struct Native {
     _globals: Vec<Box<GlobalCache>>,
     #[allow(clippy::vec_box)]
     _slots: Vec<Box<SlotCache>>,
+    /// The `CALL` sites' direct-call caches.
+    #[allow(clippy::vec_box)]
+    _direct: Vec<Box<DirectSite>>,
 }
 
 // SAFETY: the code only touches the state it is handed; it is only
@@ -368,8 +375,8 @@ pub(crate) enum Heat {
 /// whose back edge did (any loop, for a generator step), or, for a call
 /// of loop-free code, the body. Each instruction the core loop runs costs
 /// a round trip out of the native code and back, so a loop of calls gains
-/// little from compiling, and a body's entry costs about what a few
-/// natively run instructions save.
+/// little from compiling, while a body pays off once its native run saves
+/// what its exits cost.
 fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool {
     use weavepy_compiler::OpCode;
     let ins = &code.instructions;
@@ -488,7 +495,10 @@ struct Tuning {
     /// a call, and anything else.
     call_exit: usize,
     exit: usize,
-    /// The natively run instructions a body needs beyond its exits' cost.
+    /// The natively run instructions a body needs beyond its exits' cost
+    /// (none by default: a compiled body's call from native code runs
+    /// directly, see `direct_call`, which costs less than the core loop's
+    /// call even for a short body).
     body_min: usize,
     /// An activation's heat: the code's length over this.
     call_div: u32,
@@ -497,7 +507,7 @@ struct Tuning {
 fn tuning() -> Tuning {
     static T: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        let mut v = [8usize, 1, 3, 8, 10];
+        let mut v = [8usize, 1, 3, 0, 10];
         if let Ok(s) = std::env::var("WEAVEPY_FRAME_JIT_TUNE") {
             for (slot, x) in v.iter_mut().zip(s.split(',')) {
                 if let Ok(x) = x.trim().parse() {
@@ -608,6 +618,7 @@ mod stats {
             (0, None) => "<end>".to_owned(),
             (super::RELOAD, _) => "<switched>".to_owned(),
             (super::RAISED, _) => "<raised>".to_owned(),
+            (super::DIRECT_RET, _) => "<direct return>".to_owned(),
             _ => "<marked>".to_owned(),
         };
         let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -632,6 +643,8 @@ struct Tags {
     float: u8,
     cell: u8,
     instance: u8,
+    /// A Python function's (see [`direct_call`]).
+    function: u8,
     /// A list's tag, and where its items are (see [`ListLayout`]).
     list: u8,
     list_layout: Option<ListLayout>,
@@ -695,6 +708,18 @@ fn tags() -> Option<Tags> {
         float: tag(&Object::Float(1.0)),
         cell: tag(&cell),
         instance: tag(&inst),
+        function: {
+            let dict = Rc::new(crate::sync::RefCell::new(crate::object::DictData::default()));
+            tag(&crate::new_function(
+                Rc::new(CodeObject::default()),
+                &dict,
+                &dict,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ))
+        },
         list: tag(&Object::new_list(Vec::new())),
         list_layout: list_layout(),
         tuple: tag(&Object::new_tuple_array([Object::None])),
@@ -721,7 +746,7 @@ fn tags() -> Option<Tags> {
         return None;
     }
     let all = [
-        t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance,
+        t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance, t.function,
     ];
     let distinct = all
         .iter()
@@ -2166,6 +2191,321 @@ unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
     }
 }
 
+/// Whether the call whose operands started at `start` finished in place
+/// (a frameless `__init__`, a builtin's lane): nothing pending, the same
+/// activation running, its result alone in their place. Then the native
+/// code goes on (`st.len` past the result).
+///
+/// # Safety
+///
+/// `st` is a live state whose switch is non-null.
+unsafe fn finished_in_place(st: &mut State, start: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let sw = &*st.sw;
+        let done = sw.pending.is_none()
+            && std::ptr::eq(sw.cur, st.frame)
+            && (*st.frame).stack.len() == start + 1
+            && crate::hot_gates::loop_gen() == st.snap_gen;
+        if done {
+            st.len = start + 1;
+        }
+        done
+    }
+}
+
+/// A `CALL` site's direct-call cache (see [`direct_call`]): the code of
+/// the plain function it calls directly (a counted reference, so the
+/// address names one code object while cached) and that code's native
+/// body, and whether the self slot is filled. A site whose callee failed
+/// the checks keeps the code with no body and rechecks after `retry` more
+/// calls.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct DirectSite {
+    code: usize,
+    native: usize,
+    retry: u32,
+    has_self: bool,
+}
+
+const DS_NATIVE: i32 = std::mem::offset_of!(DirectSite, native) as i32;
+const DS_RETRY: i32 = std::mem::offset_of!(DirectSite, retry) as i32;
+
+impl Drop for DirectSite {
+    fn drop(&mut self) {
+        if self.code != 0 {
+            // SAFETY: `code` holds the count `fill` took.
+            unsafe { drop(Rc::from_raw(self.code as *const CodeObject)) };
+        }
+    }
+}
+
+impl DirectSite {
+    /// Record a call of `code` (with or without its self slot): its native
+    /// body if it qualifies, or none until `retry` more calls.
+    fn fill(&mut self, code: &Rc<CodeObject>, has_self: bool, native: usize) {
+        if Rc::as_ptr(code) as usize != self.code {
+            let old = std::mem::replace(&mut self.code, Rc::into_raw(code.clone()) as usize);
+            if old != 0 {
+                // SAFETY: `old` held the count an earlier fill took.
+                unsafe { drop(Rc::from_raw(old as *const CodeObject)) };
+            }
+        }
+        self.has_self = has_self;
+        self.native = native;
+        self.retry = if native == 0 { 64 } else { 0 };
+    }
+}
+
+/// Whether a call of `f` (running `code`) with `nargs` positional
+/// arguments binds as [`Interpreter::core_call_plain`] binds it, and
+/// `code`'s native body runs from its start: that body.
+fn direct_body<'a>(
+    f: &crate::object::PyFunction,
+    code: &'a CodeObject,
+    nargs: usize,
+) -> Option<&'a Native> {
+    if code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || !code.cellvars.is_empty()
+        || !code.freevars.is_empty()
+        || !f.closure.is_empty()
+        || Interpreter::has_extended_params(code)
+        || code.arg_count as usize != nargs
+        || code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
+    {
+        return None;
+    }
+    let ext = crate::code_vm_ext(code)?;
+    if ext.dispatch_len == 0 {
+        return None;
+    }
+    ext.frame_jit.get(code.varnames.len().max(nargs))
+}
+
+/// [`h_call`] with a direct call ([`direct_call`]) of the plain Python
+/// function `site` caches tried first. (The native code calls `h_call`
+/// itself for any other callee, and while a site without a body waits
+/// out its retries.)
+unsafe extern "C" fn h_call_direct(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: as `h_call`'s; `site` is this `CALL`'s own cache.
+    unsafe {
+        let s = &mut *st;
+        let argc = (&(*code).instructions)[pc as usize].arg as usize;
+        let len_u = len as usize;
+        if len_u >= argc + 2 && !s.sw.is_null() {
+            let start = len_u - argc - 2;
+            if let Some(r) = direct_call(s, pc as usize, start, len_u, &mut *site) {
+                return r;
+            }
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
+/// a plain Python function whose body has native code, run straight from
+/// here: the callee's activation is bound as the core loop's arm binds it
+/// ([`Interpreter::core_bind_plain`]), its native code runs, and its
+/// return comes back here ([`h_return`]'s `DIRECT_RET`) to be finished
+/// without the core loop's switch back. `Some(0)` leaves the result at
+/// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
+/// state synced), `None` touched nothing.
+#[inline(always)]
+unsafe fn direct_call(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    site: &mut DirectSite,
+) -> Option<u32> {
+    // SAFETY: `h_call`'s contract, with a non-null switch.
+    unsafe {
+        let Object::Function(f) = &*st.stack.add(start) else {
+            return None;
+        };
+        let fp = Rc::as_ptr(f);
+        let has_self = !matches!(&*st.stack.add(start + 1), Object::Unbound);
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        // (The site keys on the code: a fresh function made from the same
+        // `def` binds the same way, and code without free variables takes
+        // no closure.)
+        if site.code != Rc::as_ptr(code_rc) as usize
+            || site.has_self != has_self
+            || site.native == 0
+        {
+            let nargs = len - start - 2 + usize::from(has_self);
+            let native = direct_body(f, code_rc, nargs)
+                .map_or(0, |n| std::ptr::from_ref::<Native>(n) as usize);
+            site.fill(code_rc, has_self, native);
+            if native == 0 {
+                return None;
+            }
+        }
+        let native = &*(site.native as *const Native);
+        let interp = &mut *st.interp.cast_mut();
+        let nested = interp.direct_calls.get();
+        let code: &CodeObject = code_rc;
+        if nested >= DIRECT_CALL_DEPTH
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || !native.enters_at(0)
+            || !interp.inline_calls_ok()
+            || crate::gil::free_threading_enabled()
+            || !(crate::tier2::jit_off_for_process()
+                || code.jit_hint.is_not_jitable()
+                || !code.jit_hint.is_compiled())
+        {
+            return None;
+        }
+        let act = interp.inline_pool.pop()?;
+        let sw = &mut *st.sw;
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            interp.inline_pool.push(act);
+            return None;
+        };
+        // Committed: the caller synced as the core loop's arm syncs it, and
+        // the callee's activation made the running one.
+        let caller = &mut *st.frame;
+        caller.stack.set_len(len);
+        caller.pc = pc as u32;
+        *sw.last = st.last;
+        let saved_last = sw.last;
+        let callee = interp.core_bind_plain(sw, pc, start, has_self, fp, act, guard);
+        let depth = (*sw.inl).len();
+        if let Some(a) = (*sw.inl).last_mut() {
+            a.direct = true;
+        }
+        let cframe = &mut *callee;
+        let stack = &mut cframe.stack;
+        if stack.capacity() < native.need() {
+            stack.reserve(native.need() - stack.len());
+        }
+        let mut cst = State {
+            locals: (*cframe.locals.as_ptr()).as_mut_ptr(),
+            stack: stack.as_mut_ptr(),
+            len: 0,
+            cap: stack.capacity(),
+            pc: 0,
+            last: usize::MAX,
+            countdown: st.countdown,
+            snap_gen: st.snap_gen,
+            maybe_dead: st.maybe_dead,
+            interp: st.interp,
+            out: 0,
+            depth_cell: st.depth_cell,
+            err: None,
+            frame: callee,
+            sw: st.sw,
+        };
+        interp.direct_calls.set(nested + 1);
+        let status = native.run(&mut cst);
+        interp.direct_calls.set(nested);
+        let sw = &mut *st.sw;
+        let inl = &mut *sw.inl;
+        let ours = inl.len() == depth
+            && inl
+                .last()
+                .is_some_and(|a| std::ptr::eq(&raw const *a.frame, callee));
+        if status == DIRECT_RET && ours {
+            let clean = cst.len == 1
+                && inl.last().is_some_and(|a| a.act.shell.is_none())
+                && Rc::strong_count(&cframe.locals) == 1
+                && interp.gil_countdown > 2
+                && crate::hot_gates::loop_gen() == st.snap_gen;
+            if clean {
+                // `core_return`'s clean return, with the caller known.
+                let v = cst.stack.read();
+                cframe.stack.set_len(0);
+                let mut done = inl.pop().expect("checked above");
+                if depth == sw.entry_depth {
+                    sw.entry_dead = true;
+                }
+                done.clean = true;
+                crate::release_locals(&mut *cframe.locals.as_ptr());
+                drop(done.guard.take());
+                interp.lean_pending_exit(done.caller_pending);
+                // SAFETY: moved out once; the parked slot treats the field
+                // as stale (see `inline_deliver`).
+                let callable = std::ptr::read(&raw const done.callable);
+                interp.inline_park_clean(done);
+                st.stack.add(start).write(v);
+                caller.stack.set_len(start + 1);
+                match callable {
+                    Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
+                    callable => interp.release(callable),
+                }
+                sw.cur = st.frame;
+                interp.gil_countdown -= 1;
+                if (*sw.maybe_dead).get() {
+                    let mut tmp = None;
+                    let (cf, _, cshell) = sw.activation(depth - 1, &mut tmp);
+                    interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+                    if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+                    }
+                }
+                sw.last = saved_last;
+                if std::ptr::eq(saved_last, &raw mut sw.scratch) {
+                    sw.scratch = usize::MAX;
+                }
+                *sw.last = pc;
+                if sw.pending.is_some() {
+                    return Some(RELOAD);
+                }
+                st.len = start + 1;
+                return Some(0);
+            }
+            // Any other return is the core loop's arm's (as `h_return`'s).
+            cframe.stack.set_len(cst.len);
+            cframe.pc = cst.pc as u32;
+            *sw.last = cst.last;
+            inl.last_mut().expect("checked above").direct = false;
+            if !interp.core_return(sw, st.snap_gen) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+        } else if ours {
+            inl.last_mut().expect("checked above").direct = false;
+        } else if let Some(a) = inl.get_mut(depth - 1) {
+            if std::ptr::eq(&raw const *a.frame, callee) {
+                a.direct = false;
+            }
+        }
+        if status == RELOAD || status == DIRECT_RET {
+            // Returned into the caller, nothing pending: done. Otherwise
+            // whoever switched last synced what runs next.
+            if sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && caller.stack.len() == start + 1
+            {
+                st.len = start + 1;
+                return Some(0);
+            }
+            return Some(RELOAD);
+        }
+        // The callee stopped partway: its state, synced as the core loop
+        // syncs it after a native run, for the core loop to go on with.
+        let cframe = &mut *cst.frame;
+        cframe.stack.set_len(cst.len);
+        cframe.pc = cst.pc as u32;
+        *sw.last = cst.last;
+        if status == MARKED {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+        } else if let Some(e) = cst.err.take() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+        }
+        Some(RELOAD)
+    }
+}
+
 /// `CALL` (the `pc`th instruction of `code`) on a stack `len` deep, for
 /// the shapes the core loop's arm runs in place: a pure leaf callee, a
 /// natively served class's constructor or bound method, an exact list's
@@ -2174,6 +2514,7 @@ unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
 /// operands released, `st.len` and `st.pc` as the arm leaves them),
 /// anything else declined (a Python callee's activation is the core
 /// loop's).
+#[inline(never)]
 unsafe extern "C" fn h_call(
     st: *mut State,
     code: *const CodeObject,
@@ -2324,6 +2665,9 @@ unsafe extern "C" fn h_call(
                     return 0;
                 }
             }
+            if switched && finished_in_place(st, start) {
+                return 0;
+            }
             return RELOAD;
         }
         // A builtin the site has settled as a leaf (one it hasn't runs
@@ -2359,6 +2703,9 @@ unsafe extern "C" fn h_call(
                 let sw = &mut *st.sw;
                 let interp = &mut *st.interp.cast_mut();
                 if interp.core_builtin_lane(sw, pc, via_call) {
+                    if finished_in_place(st, start) {
+                        return 0;
+                    }
                     return RELOAD;
                 }
             }
@@ -2509,8 +2856,10 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
 
 /// `RETURN_VALUE` (the `pc`th instruction) of an inline activation with
 /// the value atop a `len`-deep stack: the frame synced and the caller
-/// switched back to as the core loop's arm does (`1`), or `0` for the
-/// root activation's, which the core loop's quiet loop returns from.
+/// switched back to as the core loop's arm does (`RELOAD`), the state
+/// synced for a direct caller to finish it (`DIRECT_RET`, see
+/// [`direct_call`]), or `0` for the root activation's, which the core
+/// loop's quiet loop returns from.
 unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
     // SAFETY: the code passes its live state, whose switch is the core
     // loop's (non-null: generator bodies don't return through here), and
@@ -2518,8 +2867,14 @@ unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
     unsafe {
         let st = &mut *st;
         let sw = &mut *st.sw;
-        if (*sw.inl).is_empty() {
+        let Some(top) = (*sw.inl).last() else {
             return 0;
+        };
+        // A direct call's activation: its caller finishes the return.
+        if top.direct && std::ptr::eq(&raw const *top.frame, st.frame) {
+            st.len = len as usize;
+            st.pc = pc as usize;
+            return DIRECT_RET;
         }
         let frame = &mut *st.frame;
         frame.stack.set_len(len as usize);
@@ -2529,7 +2884,7 @@ unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
         if !interp.core_return(sw, st.snap_gen) {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
         }
-        1
+        RELOAD
     }
 }
 
@@ -2704,6 +3059,7 @@ fn compile_with(
     let entries: Vec<bool>;
     let globals: Vec<Box<GlobalCache>>;
     let slots: Vec<Box<SlotCache>>;
+    let direct: Vec<Box<DirectSite>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
     let built = {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
@@ -2712,6 +3068,7 @@ fn compile_with(
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
         globals = std::mem::take(&mut lower.global_caches);
         slots = std::mem::take(&mut lower.slot_caches);
+        direct = std::mem::take(&mut lower.direct_sites);
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
@@ -2763,6 +3120,7 @@ fn compile_with(
         need: stack_need(depths),
         _globals: globals,
         _slots: slots,
+        _direct: direct,
     })
 }
 
@@ -2861,6 +3219,8 @@ struct Lower<'a> {
     global_caches: Vec<Box<GlobalCache>>,
     #[allow(clippy::vec_box)]
     slot_caches: Vec<Box<SlotCache>>,
+    #[allow(clippy::vec_box)]
+    direct_sites: Vec<Box<DirectSite>>,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -2996,6 +3356,7 @@ impl<'a> Lower<'a> {
             side_exits: Vec::new(),
             global_caches: Vec::new(),
             slot_caches: Vec::new(),
+            direct_sites: Vec::new(),
         }
     }
 
@@ -3931,9 +4292,9 @@ impl<'a> Lower<'a> {
                 let out = self.exit_with(pc, &[], INTERP);
                 let switched = self.b.create_block();
                 self.b.ins().brif(r, switched, &[], out, &[]);
+                // Switched back (`RELOAD`), or a direct call's return.
                 self.b.switch_to_block(switched);
-                let s = self.b.ins().iconst(types::I32, i64::from(RELOAD));
-                self.b.ins().return_(&[s]);
+                self.b.ins().return_(&[r]);
                 return false;
             }
             _ => {
@@ -5669,6 +6030,49 @@ impl<'a> Lower<'a> {
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        // A Python function's call tries a direct call first, unless its
+        // site found the callee without a native body and has retries
+        // left to count down.
+        let site: Box<DirectSite> = Box::default();
+        let site_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+        self.direct_sites.push(site);
+        let callee = self.slot_addr(self.depth - argc - 2);
+        let tag = self.tag_at(callee);
+        let is_fn = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.function));
+        let direct = self.b.create_block();
+        let general = self.b.create_block();
+        let called = self.b.create_block();
+        let fresh = self.b.create_block();
+        let waiting = self.b.create_block();
+        let counted = self.b.create_block();
+        self.b.append_block_param(called, types::I32);
+        self.b.ins().brif(is_fn, fresh, &[], general, &[]);
+        self.b.switch_to_block(fresh);
+        let native = self.b.ins().load(types::I64, FLAGS, site_at, DS_NATIVE);
+        self.b.ins().brif(native, direct, &[], waiting, &[]);
+        self.b.switch_to_block(waiting);
+        let retry = self.b.ins().load(types::I32, FLAGS, site_at, DS_RETRY);
+        self.b.ins().brif(retry, counted, &[], direct, &[]);
+        self.b.switch_to_block(counted);
+        let left = self.b.ins().iadd_imm(retry, -1);
+        self.b.ins().store(FLAGS, left, site_at, DS_RETRY);
+        self.b.ins().jump(general, &[]);
+        self.b.switch_to_block(direct);
+        let r = self
+            .call(
+                h_call_direct as *const () as usize,
+                &[self.st, code, ext, pcv, len, site_at],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().jump(called, &[r.into()]);
+        self.b.switch_to_block(general);
         let r = self
             .call(
                 h_call as *const () as usize,
@@ -5676,6 +6080,9 @@ impl<'a> Lower<'a> {
                 true,
             )
             .expect("returns");
+        self.b.ins().jump(called, &[r.into()]);
+        self.b.switch_to_block(called);
+        let r = self.b.block_params(called)[0];
         let out = self.exit_with(pc, &[], INTERP);
         let ran = self.b.create_block();
         let other = self.b.create_block();
