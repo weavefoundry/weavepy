@@ -63152,7 +63152,7 @@ unsafe fn move_obj(src: *const Object, dst: *mut Object) {
 /// activation, slot or result per call, and the out-of-line `push` showed
 /// up in their profiles).
 #[inline(always)]
-fn push_fast<T>(v: &mut Vec<T>, x: T) {
+pub(crate) fn push_fast<T>(v: &mut Vec<T>, x: T) {
     let n = v.len();
     if n < v.capacity() {
         // SAFETY: `n < capacity`: the slot is allocated and unused.

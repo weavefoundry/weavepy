@@ -378,11 +378,11 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         let native = {
             let nlocals = locals.len();
-            if ext.frame_jit.get(nlocals).is_none() {
+            ext.frame_jit.get(nlocals).or_else(|| {
                 ext.frame_jit
                     .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
-            }
-            ext.frame_jit.get(nlocals)
+                ext.frame_jit.get(nlocals)
+            })
         };
         let stack = &mut frame.stack;
         // Room for the body's deepest stack (the frame lives on in its
@@ -856,7 +856,7 @@ impl Interpreter {
         if partial {
             frame.sent_consumed = false;
         } else {
-            frame.stack.push(Object::None);
+            crate::push_fast(&mut frame.stack, Object::None);
         }
         debug_assert!(!frame.stack.is_empty());
         let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead, true) {
