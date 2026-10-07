@@ -2973,13 +2973,13 @@ unsafe extern "C" fn h_call(
             }
         }
         let Object::Builtin(b) = &ops[0] else {
-            return CALL_DECLINED;
+            return leaf_call_lane(st, pc, start, len);
         };
         if Rc::strong_count(b) <= 1 {
             return CALL_DECLINED;
         }
         let Some(kind) = slot.get_leaf(b) else {
-            return CALL_DECLINED;
+            return leaf_call_lane(st, pc, start, len);
         };
         if argc <= 1 && matches!(&ops[1], Object::List(_)) {
             // `lst.append(x)` / `lst.pop()` on an exact list: the operand
@@ -3012,7 +3012,7 @@ unsafe extern "C" fn h_call(
             return 0;
         }
         if !kind.runs_in_core() {
-            return CALL_DECLINED;
+            return leaf_call_lane(st, pc, start, len);
         }
         let first = if matches!(&ops[1], Object::Unbound) {
             start + 2
@@ -3034,7 +3034,7 @@ unsafe extern "C" fn h_call(
             k => interp.leaf_builtin_call(k, b, args),
         };
         match r {
-            None => CALL_DECLINED,
+            None => leaf_call_lane(st, pc, start, len),
             Some(Ok(v)) => done(st, v),
             Some(Err(e)) => {
                 for k in start..len {
@@ -3045,6 +3045,39 @@ unsafe extern "C" fn h_call(
                 st.err = Some(e);
                 RAISED
             }
+        }
+    }
+}
+
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of a
+/// leaf builtin whose leaf half declined, or of an instance's
+/// `__reduce_ex__`, through the core loop's lane for them
+/// (`Interpreter::core_leaf_call_lane`), the frame synced first: `0` the
+/// result at `start`, `RELOAD` the core loop goes on, `CALL_DECLINED`
+/// nothing done.
+///
+/// # Safety
+///
+/// As [`h_call`]'s.
+unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_leaf_call_lane(sw) {
+            return CALL_DECLINED;
+        }
+        if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
         }
     }
 }
