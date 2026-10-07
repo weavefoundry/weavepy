@@ -14299,79 +14299,20 @@ impl Interpreter {
                     }
                     // An `except` clause's entry, test, and exit (the slow
                     // leaf arms' shapes, which the full handlers' match).
-                    OpCode::PushExcInfo => {
-                        // SAFETY: `len > 0` is checked first.
-                        if len == 0
-                            || len == cap
-                            || !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_))
-                        {
-                            break None;
-                        }
-                        // SAFETY: as above.
-                        let exc = unsafe { &*base.add(len - 1) }.clone();
-                        let prev = self
-                            .exc_info_stack
-                            .borrow()
-                            .last()
-                            .map_or(Object::None, |pe| pe.instance.clone());
-                        // SAFETY: the exception moves up one slot and the
-                        // previous one takes its place (`len < cap`).
-                        unsafe {
-                            let top = base.add(len - 1).read();
-                            base.add(len - 1).write(prev);
-                            base.add(len).write(top);
-                        }
-                        len += 1;
-                        let pe = PyException::new(exc);
-                        frame
-                            .exc
-                            .get_or_insert_with(Box::default)
-                            .handlers
-                            .push((ins.arg, pe.clone()));
-                        self.exc_info_stack.borrow_mut().push(pe);
-                        last = pc;
-                        pc += 1;
-                    }
-                    OpCode::CheckExcMatch => {
-                        if len < 2 {
-                            break None;
-                        }
-                        // SAFETY: `len >= 2`.
-                        let matched = match unsafe {
-                            Self::leaf_exc_match(&*base.add(len - 2), &*base.add(len - 1))
-                        } {
-                            Some(m) => m,
+                    // An `except` clause's entry, test and exit (see
+                    // `core_exc_op`).
+                    OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack, with room to `cap`.
+                        match unsafe { self.core_exc_op(&mut frame.exc, ins, base, len, cap) } {
+                            Some(n) => len = n,
                             None => break None,
-                        };
-                        // SAFETY: the class (or tuple of classes) leaves the
-                        // top slot; releasing it runs nothing.
-                        unsafe {
-                            drop_hot(base.add(len - 1).read());
-                            base.add(len - 1).write(bool_hot(matched));
                         }
                         last = pc;
                         pc += 1;
-                    }
-                    OpCode::PopExcept => {
-                        if len == 0 {
-                            break None;
+                        if ins.op == OpCode::PopExcept {
+                            after_release!();
                         }
-                        len -= 1;
-                        // SAFETY: the slot at `len` is initialized.
-                        let prev = unsafe { base.add(len).read() };
-                        let popped = frame.exc.as_mut().and_then(|e| e.handlers.pop());
-                        let top = self.exc_info_stack.borrow_mut().pop();
-                        // See the full handler: the handled exception dies
-                        // here unless something else holds it.
-                        self.recheck_frame_observed = true;
-                        last = pc;
-                        pc += 1;
-                        drop(top);
-                        if let Some((_, pe)) = popped {
-                            self.release(pe.instance);
-                        }
-                        self.release(prev);
-                        after_release!();
                     }
                     // The finished delegate leaves from under the result.
                     OpCode::EndSend => {
@@ -16247,6 +16188,95 @@ impl Interpreter {
                 let obj = Object::new_list(items);
                 gc_trace::track(&obj);
                 Some(obj)
+            }
+            _ => None,
+        }
+    }
+
+    /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
+    /// `POP_EXCEPT` (`ins`) of a frame (its handler state `exc`) over the
+    /// `len` stack slots at `base`
+    /// (room to `cap`), as the full handlers run their common shapes: an
+    /// exception instance on entry, class operands that are
+    /// `BaseException` subclasses. Returns the new stack length, or
+    /// `None`, having touched nothing. A `POP_EXCEPT`'s releases may queue
+    /// a finalizer (the caller checks).
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are the frame's initialized operand stack
+    /// entries.
+    #[inline(never)]
+    unsafe fn core_exc_op(
+        &mut self,
+        exc: &mut Option<Box<FrameExc>>,
+        ins: weavepy_compiler::Instruction,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<usize> {
+        match ins.op {
+            OpCode::PushExcInfo => {
+                // SAFETY: `len > 0` is checked first.
+                if len == 0
+                    || len == cap
+                    || !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_))
+                {
+                    return None;
+                }
+                // SAFETY: as above.
+                let instance = unsafe { &*base.add(len - 1) }.clone();
+                let prev = self
+                    .exc_info_stack
+                    .borrow()
+                    .last()
+                    .map_or(Object::None, |pe| pe.instance.clone());
+                // SAFETY: the exception moves up one slot and the previous
+                // one takes its place (`len < cap`).
+                unsafe {
+                    let top = base.add(len - 1).read();
+                    base.add(len - 1).write(prev);
+                    base.add(len).write(top);
+                }
+                let pe = PyException::new(instance);
+                exc.get_or_insert_with(Box::default)
+                    .handlers
+                    .push((ins.arg, pe.clone()));
+                self.exc_info_stack.borrow_mut().push(pe);
+                Some(len + 1)
+            }
+            OpCode::CheckExcMatch => {
+                if len < 2 {
+                    return None;
+                }
+                // SAFETY: `len >= 2`.
+                let matched =
+                    unsafe { Self::leaf_exc_match(&*base.add(len - 2), &*base.add(len - 1)) }?;
+                // SAFETY: the class (or tuple of classes) leaves the top
+                // slot; releasing it runs nothing.
+                unsafe {
+                    drop_hot(base.add(len - 1).read());
+                    base.add(len - 1).write(bool_hot(matched));
+                }
+                Some(len)
+            }
+            OpCode::PopExcept => {
+                if len == 0 {
+                    return None;
+                }
+                // SAFETY: the slot at `len - 1` is initialized.
+                let prev = unsafe { base.add(len - 1).read() };
+                let popped = exc.as_mut().and_then(|e| e.handlers.pop());
+                let top = self.exc_info_stack.borrow_mut().pop();
+                // See the full handler: the handled exception dies here
+                // unless something else holds it.
+                self.recheck_frame_observed = true;
+                drop(top);
+                if let Some((_, pe)) = popped {
+                    self.release(pe.instance);
+                }
+                self.release(prev);
+                Some(len - 1)
             }
             _ => None,
         }

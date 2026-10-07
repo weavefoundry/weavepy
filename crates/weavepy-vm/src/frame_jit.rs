@@ -436,7 +436,11 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::SetFunctionAttribute
             | OpCode::ListToTuple
             | OpCode::UnpackEx
-            | OpCode::LoadSuperAttr => false,
+            | OpCode::LoadSuperAttr
+            | OpCode::PushExcInfo
+            | OpCode::CheckExcMatch
+            | OpCode::PopExcept
+            | OpCode::DeleteFast => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -478,9 +482,16 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         }
         let top = (pc + 1).saturating_sub(i.arg as usize);
         let (mut n, mut exits) = (0usize, 0usize);
-        for k in top..=pc {
+        for (k, ins_k) in ins.iter().enumerate().take(pc + 1).skip(top) {
             match gain(k) {
                 Some(g) => n += g,
+                // (A loop's epilogue inside a region a handler's back edge
+                // spans: `FOR_ITER`'s exit skips the first two, and a
+                // return leaves anyway.)
+                None if matches!(
+                    ins_k.op,
+                    OpCode::EndFor | OpCode::PopIter | OpCode::ReturnValue
+                ) => {}
                 None => exits += 1,
             }
         }
@@ -1144,10 +1155,6 @@ const FOR_SWITCHED: u32 = 4;
 /// [`h_for_iter`]'s iterator raised (`RAISED`, the state past it).
 const FOR_RAISED: u32 = 5;
 
-/// A container instruction (`BINARY_SUBSCR`, `BINARY_SLICE`, `STORE_SUBSCR`,
-/// `LIST_APPEND`, `UNPACK_SEQUENCE`; the one at `ins`, the `pc`th of
-/// `code`) on the top of a `len`-deep stack, as the core loop's arm runs
-/// it: the new depth, or `u64::MAX` declined untouched.
 /// `LIST_APPEND` onto the exact list at `list` of the value at `value`:
 /// `0` the value moved in, anything else declined untouched.
 unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) -> u32 {
@@ -1165,12 +1172,23 @@ unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) ->
     }
 }
 
+/// [`h_container`]'s raise: the error in `st`, `st.len` and `st.pc` past
+/// the instruction.
+const CONTAINER_RAISED: u64 = u64::MAX - 1;
+
+/// A container instruction (`BINARY_SUBSCR`, `BINARY_SLICE`, `STORE_SUBSCR`,
+/// `LIST_APPEND`, `UNPACK_SEQUENCE`, `UNPACK_EX`, `LOAD_SUPER_ATTR`, and an
+/// `except` clause's entry, test and exit; the one at `ins`, the `pc`th of
+/// `code`) on the top of a `len`-deep stack, as the core loop's arm runs
+/// it: the new depth, [`CONTAINER_RAISED`] (only when `can_raise`: the
+/// whole stack is on the frame's), or `u64::MAX` declined untouched.
 unsafe extern "C" fn h_container(
     st: *mut State,
     ins: *const weavepy_compiler::Instruction,
     code: *const CodeObject,
     pc: u64,
     len: u64,
+    can_raise: u64,
 ) -> u64 {
     // SAFETY: the code passes its live state, one of its own instructions
     // and its code, and its stack depth.
@@ -1181,8 +1199,38 @@ unsafe extern "C" fn h_container(
             return Interpreter::core_super_attr(&*code, ins, pc as usize, st.stack, len)
                 .map_or(u64::MAX, |n| n as u64);
         }
+        if matches!(
+            ins.op,
+            OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept
+        ) {
+            let interp = &mut *st.interp.cast_mut();
+            return interp
+                .core_exc_op(&mut (*st.frame).exc, ins, st.stack, len, st.cap)
+                .map_or(u64::MAX, |n| n as u64);
+        }
         if let Some(n) = Interpreter::core_container_op(ins, st.stack, len, st.cap) {
             return n as u64;
+        }
+        // `d[key]` of an exact dict missing a key that compares natively:
+        // its `KeyError`, raised here (see `h_catch`).
+        if ins.op == OpCode::BinarySubscr && len >= 2 && can_raise != 0 && !st.sw.is_null() {
+            let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
+            if let (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) = (c, k) {
+                if let (Some(probe), true) = (crate::object::LeafProbe::new(k), droppable(c)) {
+                    let missing = d
+                        .peek()
+                        .is_some_and(|d| d.get(&probe).is_none() && probe.miss_is_exact());
+                    if missing {
+                        let err = crate::error::key_error_object(k.clone());
+                        crate::drop_hot(st.stack.add(len - 1).read());
+                        crate::drop_hot(st.stack.add(len - 2).read());
+                        st.len = len - 2;
+                        st.pc = pc as usize + 1;
+                        st.err = Some(err);
+                        return CONTAINER_RAISED;
+                    }
+                }
+            }
         }
         // An instance whose class's `__setitem__` is a native fast store
         // the site cached (as the core loop's arm runs it).
@@ -3123,6 +3171,72 @@ unsafe extern "C" fn h_load_deref(st: *mut State, i: u64, dst: *mut Object) -> u
     }
 }
 
+/// `DELETE_FAST i` of the running frame's bound local: `0` the local
+/// emptied and its value released, anything else (an unbound local, whose
+/// `UnboundLocalError` is the core loop's) declined untouched.
+unsafe extern "C" fn h_delete_fast(st: *mut State, i: u64) -> u32 {
+    // SAFETY: the code passes its live state and one of its locals.
+    unsafe {
+        let st = &*st;
+        let slot = st.locals.add(i as usize);
+        if matches!(&*slot, Object::Unbound) {
+            return 1;
+        }
+        let old = std::mem::replace(&mut *slot, Object::Unbound);
+        (*st.interp.cast_mut()).release(old);
+        0
+    }
+}
+
+/// The exception a helper raised (`RAISED`, `st` synced past the raising
+/// instruction) caught by a handler of the running activation, as the
+/// quiet loop catches it (`Interpreter::quiet_catch`): `0` the state at
+/// the handler (its stack set up), `RELOAD` caught but the core loop goes
+/// on (an eval breaker came due), `RAISED` uncaught (the error back in
+/// `st`).
+unsafe extern "C" fn h_catch(st: *mut State) -> u32 {
+    // SAFETY: the code passes its live state.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return RAISED;
+        }
+        let Some(err) = st.err.take() else {
+            return RAISED;
+        };
+        let frame = &mut *st.frame;
+        frame.stack.set_len(st.len);
+        frame.pc = st.pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        if !std::ptr::eq(sw.cur, st.frame) {
+            st.err = Some(err);
+            return RAISED;
+        }
+        let interp = &mut *st.interp.cast_mut();
+        let depth = (*sw.inl).len();
+        let mut tmp = None;
+        let (_, _, shell) = sw.activation(depth, &mut tmp);
+        let raise_pc = st.pc - 1;
+        match interp.quiet_catch(frame, &mut *shell.cast::<crate::QuietShell<'_>>(), err) {
+            Ok(()) => {
+                *sw.last = raise_pc;
+                st.pc = frame.pc as usize;
+                st.len = frame.stack.len();
+                st.last = raise_pc;
+                if interp.quiet_caught_yields(st.snap_gen) {
+                    return RELOAD;
+                }
+                0
+            }
+            Err(e) => {
+                st.err = Some(e);
+                RAISED
+            }
+        }
+    }
+}
+
 /// `LOAD_CLOSURE i` of the running frame: `0` the cell written to the
 /// free slot `dst`, anything else declined untouched.
 unsafe extern "C" fn h_load_closure(st: *mut State, i: u64, dst: *mut Object) -> u32 {
@@ -3569,6 +3683,9 @@ struct Lower<'a> {
     slot_caches: Vec<Box<SlotCache>>,
     #[allow(clippy::vec_box)]
     direct_sites: Vec<Box<DirectSite>>,
+    /// The block a helper's raise goes to (see [`Self::leave`]), made on
+    /// first use.
+    catch: Option<Block>,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -3639,6 +3756,10 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::ListToTuple
             | OpCode::UnpackEx
             | OpCode::LoadSuperAttr
+            | OpCode::PushExcInfo
+            | OpCode::CheckExcMatch
+            | OpCode::PopExcept
+            | OpCode::DeleteFast
     )
 }
 
@@ -3717,6 +3838,7 @@ impl<'a> Lower<'a> {
             global_caches: Vec::new(),
             slot_caches: Vec::new(),
             direct_sites: Vec::new(),
+            catch: None,
         }
     }
 
@@ -3995,8 +4117,30 @@ impl<'a> Lower<'a> {
         block
     }
 
-    /// Fill the side exits' blocks.
+    /// Return a helper's status `r` from the native code, a raise first
+    /// trying the running activation's handlers (see [`h_catch`]).
+    fn leave(&mut self, r: Value) {
+        let catch = *self.catch.get_or_insert_with(|| self.b.create_block());
+        let ret = self.b.create_block();
+        let raised = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RAISED));
+        self.b.ins().brif(raised, catch, &[], ret, &[]);
+        self.b.switch_to_block(ret);
+        self.b.ins().return_(&[r]);
+    }
+
+    /// Fill the side exits' blocks, and the catch block: a raise its
+    /// handler caught goes on through the dispatch (at the handler).
     fn side_exits(&mut self) {
+        if let Some(catch) = self.catch {
+            self.b.switch_to_block(catch);
+            let r = self
+                .call(h_catch as *const () as usize, &[self.st], true)
+                .expect("returns");
+            let ret = self.b.create_block();
+            self.b.ins().brif(r, ret, &[], self.dispatch, &[]);
+            self.b.switch_to_block(ret);
+            self.b.ins().return_(&[r]);
+        }
         while let Some(x) = self.side_exits.pop() {
             self.b.switch_to_block(x.block);
             self.vs = x.vs;
@@ -4274,6 +4418,12 @@ impl<'a> Lower<'a> {
                         starts[call + 1] = true;
                     }
                 }
+            }
+        }
+        // A handler, entered from a helper's raise (see `h_catch`).
+        for h in &code.exception_table {
+            if (h.handler as usize) < n {
+                starts[h.handler as usize] = true;
             }
         }
         for (pc, s) in starts.iter_mut().enumerate() {
@@ -4569,7 +4719,24 @@ impl<'a> Lower<'a> {
             | OpCode::StoreSubscr
             | OpCode::UnpackSequence
             | OpCode::UnpackEx
-            | OpCode::LoadSuperAttr => return self.container(pc),
+            | OpCode::LoadSuperAttr
+            | OpCode::PushExcInfo
+            | OpCode::CheckExcMatch
+            | OpCode::PopExcept => return self.container(pc),
+            OpCode::DeleteFast if (ins.arg as usize) < self.nlocals => {
+                let i = ins.arg;
+                self.flush_local(i);
+                let iv = self.b.ins().iconst(types::I64, i64::from(i));
+                let r = self
+                    .call(h_delete_fast as *const () as usize, &[self.st, iv], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                self.bound[i as usize] = false;
+                self.set_last(pc);
+                self.check_released(pc + 1);
+                true
+            }
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
@@ -4685,7 +4852,7 @@ impl<'a> Lower<'a> {
                 let leave = self.b.create_block();
                 self.b.ins().brif(raised, leave, &[], out, &[]);
                 self.b.switch_to_block(leave);
-                self.b.ins().return_(&[r]);
+                self.leave(r);
                 self.b.switch_to_block(ok);
                 for _ in 0..n {
                     self.pop();
@@ -4866,7 +5033,7 @@ impl<'a> Lower<'a> {
         self.b.ins().brif(raised, raise_b, &[], declined, &[]);
         self.b.switch_to_block(raise_b);
         let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
-        self.b.ins().return_(&[s]);
+        self.leave(s);
         self.b.switch_to_block(declined);
         self.last_pc = saved;
     }
@@ -5415,7 +5582,7 @@ impl<'a> Lower<'a> {
         let leave = self.b.create_block();
         self.b.ins().brif(declined, out, &[], leave, &[]);
         self.b.switch_to_block(leave);
-        self.b.ins().return_(&[r]);
+        self.leave(r);
     }
 
     /// `BINARY_OP` through [`h_binop`]: the operands onto the stack, and
@@ -5505,16 +5672,25 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let can_raise = self.b.ins().iconst(types::I64, 1);
         let n = self
             .call_typed(
                 h_container as *const () as usize,
-                &[self.st, ins, code, pcv, len],
+                &[self.st, ins, code, pcv, len, can_raise],
                 Some(types::I64),
             )
             .expect("returns");
         let declined = self.b.ins().icmp_imm(IntCC::Equal, n, -1);
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(declined, out);
+        let raised = self.b.ins().icmp_imm(IntCC::Equal, n, -2);
+        let raise_b = self.b.create_block();
+        let ok = self.b.create_block();
+        self.b.ins().brif(raised, raise_b, &[], ok, &[]);
+        self.b.switch_to_block(raise_b);
+        let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
+        self.leave(s);
+        self.b.switch_to_block(ok);
         self.depth = after as usize;
         self.set_last(pc);
         self.check_released(pc + 1);
@@ -5629,16 +5805,30 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let lenv = self.b.ins().iconst(types::I64, slot as i64 + 2);
+        // (A raise needs the whole stack on the frame's: nothing virtual
+        // below the operands.)
+        let raisable = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+        let can_raise = self.b.ins().iconst(types::I64, i64::from(raisable));
         let r = self
             .call_typed(
                 h_container as *const () as usize,
-                &[self.st, ins, code, pcv, lenv],
+                &[self.st, ins, code, pcv, lenv, can_raise],
                 Some(types::I64),
             )
             .expect("returns");
         let declined = self.b.ins().icmp_imm(IntCC::Equal, r, -1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         self.branch_out(declined, out);
+        if raisable {
+            let raised = self.b.ins().icmp_imm(IntCC::Equal, r, -2);
+            let raise_b = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(raised, raise_b, &[], ok, &[]);
+            self.b.switch_to_block(raise_b);
+            let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
+            self.leave(s);
+            self.b.switch_to_block(ok);
+        }
         // (The helper released the operands; a finalizer it queued runs
         // before the next instruction, as after `Self::container`.)
         self.depth = slot + 1;
@@ -6133,7 +6323,7 @@ impl<'a> Lower<'a> {
         let reload = self.b.ins().iconst(types::I32, i64::from(RELOAD));
         let raise = self.b.ins().iconst(types::I32, i64::from(RAISED));
         let s = self.b.ins().select(switched, reload, raise);
-        self.b.ins().return_(&[s]);
+        self.leave(s);
         self.b.switch_to_block(declined);
         self.last_pc = before;
         self.exit(INTERP, pc);
@@ -6313,7 +6503,7 @@ impl<'a> Lower<'a> {
             let leave = self.b.create_block();
             self.b.ins().brif(declined, exit, &[], leave, &[]);
             self.b.switch_to_block(leave);
-            self.b.ins().return_(&[r]);
+            self.leave(r);
         } else {
             self.b.ins().brif(r, exit, &[], done, &[]);
         }
@@ -6652,7 +6842,7 @@ impl<'a> Lower<'a> {
         let leave = self.b.create_block();
         self.b.ins().brif(declined, out, &[], leave, &[]);
         self.b.switch_to_block(leave);
-        self.b.ins().return_(&[r]);
+        self.leave(r);
         self.b.switch_to_block(ran);
         self.depth -= argc + 1;
         self.set_last(pc);
@@ -6692,7 +6882,7 @@ impl<'a> Lower<'a> {
         let leave = self.b.create_block();
         self.b.ins().brif(declined, out, &[], leave, &[]);
         self.b.switch_to_block(leave);
-        self.b.ins().return_(&[r]);
+        self.leave(r);
         self.b.switch_to_block(ran);
         self.depth = after as usize;
         self.set_last(pc);
