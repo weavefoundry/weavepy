@@ -2081,6 +2081,91 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
     0
 }
 
+/// How deep compiled callees may run inside their compiled callers' calls
+/// (each level holds two native frames and the helpers between them).
+const DIRECT_CALL_DEPTH: u32 = 48;
+
+/// Run the activation a compiled caller's `CALL` just switched to, the
+/// callee, through its own native code, from the caller's call helper:
+/// `true` when it returned, the caller running again with the result at
+/// `start` on its stack (its native code continues past the call).
+/// `false` leaves whatever activation is running (the callee partway, or
+/// one it called) synced for the core loop, which the caller's native code
+/// then leaves for, as it did before the call ran anything.
+///
+/// # Safety
+///
+/// `st` is the caller's live state, its switch non-null, and the running
+/// activation the callee its `CALL` just pushed.
+unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let sw = &mut *st.sw;
+        let interp = &*st.interp;
+        let nested = interp.direct_calls.get();
+        if nested >= DIRECT_CALL_DEPTH || crate::hot_gates::loop_gen() != st.snap_gen {
+            return false;
+        }
+        let cframe = &mut *sw.cur;
+        let Some(ext) = crate::code_vm_ext(&cframe.code) else {
+            return false;
+        };
+        let locals: &mut Vec<Object> = &mut *cframe.locals.as_ptr();
+        let nlocals = locals.len();
+        let Some(native) = ext.frame_jit.get(nlocals) else {
+            return false;
+        };
+        let pc = cframe.pc as usize;
+        if pc >= ext.dispatch_len || !native.enters_at(pc) {
+            return false;
+        }
+        let stack = &mut cframe.stack;
+        if stack.capacity() < native.need() {
+            stack.reserve(native.need() - stack.len());
+        }
+        let mut cst = State {
+            locals: locals.as_mut_ptr(),
+            stack: stack.as_mut_ptr(),
+            len: stack.len(),
+            cap: stack.capacity(),
+            pc,
+            last: *sw.last,
+            countdown: st.countdown,
+            snap_gen: st.snap_gen,
+            maybe_dead: st.maybe_dead,
+            interp: st.interp,
+            out: 0,
+            depth_cell: st.depth_cell,
+            err: None,
+            frame: sw.cur,
+            sw: st.sw,
+        };
+        interp.direct_calls.set(nested + 1);
+        let status = native.run(&mut cst);
+        interp.direct_calls.set(nested);
+        let sw = &mut *st.sw;
+        if status == RELOAD {
+            // Returned into the caller, nothing pending: done. Otherwise
+            // whoever switched last synced what runs next.
+            return sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && (*st.frame).stack.len() == start + 1;
+        }
+        // The callee stopped partway: its state, synced as the core loop
+        // syncs it after a native run, for the core loop to go on with.
+        let cframe = &mut *cst.frame;
+        cframe.stack.set_len(cst.len);
+        cframe.pc = cst.pc as u32;
+        *sw.last = cst.last;
+        if status == MARKED {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+        } else if let Some(e) = cst.err.take() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+        }
+        false
+    }
+}
+
 /// `CALL` (the `pc`th instruction of `code`) on a stack `len` deep, for
 /// the shapes the core loop's arm runs in place: a pure leaf callee, a
 /// natively served class's constructor or bound method, an exact list's
@@ -2230,6 +2315,14 @@ unsafe extern "C" fn h_call(
             };
             if !switched && sw.pending.is_none() {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            // A compiled callee runs from here, and its return continues
+            // this code natively (anything else leaves for the core loop).
+            if switched && sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+                if run_callee_directly(st, start) {
+                    st.len = start + 1;
+                    return 0;
+                }
             }
             return RELOAD;
         }

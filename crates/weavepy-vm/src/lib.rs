@@ -970,6 +970,10 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
+    /// Compiled callees the frame JIT is running from inside a compiled
+    /// caller's `CALL` (see `frame_jit::run_callee_directly`), bounding
+    /// the native stack those nested runs take.
+    pub(crate) direct_calls: std::cell::Cell<u32>,
     /// While a lean resume runs on behalf of a consumer that drains the
     /// generator (`sum()`, `list()`, see [`FoldSink`]): the generator's
     /// frame (its address) and the consumer's sink. The core loop folds
@@ -1235,6 +1239,7 @@ impl Default for Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             recheck_frame_observed: false,
@@ -1362,6 +1367,7 @@ impl Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
+            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             recheck_frame_observed: false,
