@@ -18177,7 +18177,7 @@ impl Interpreter {
         let ext = code_vm_ext(code)?;
         let tries = ext.leaf_tries.load(std::sync::atomic::Ordering::Relaxed);
         let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
-        if bails >= LEAF_BAIL_LIMIT && bails > done.saturating_mul(4) {
+        if bails >= LEAF_BAIL_LIMIT && bails > done {
             return None;
         }
         let r = self.pure_leaf_call_inner(code, f, args, effect, depth);
