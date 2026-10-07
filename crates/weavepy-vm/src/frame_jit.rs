@@ -2285,6 +2285,70 @@ fn direct_body<'a>(
     ext.frame_jit.get(code.varnames.len().max(nargs))
 }
 
+/// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
+/// stack slots `slot` and above it whose class's method runs alone (see
+/// `Interpreter::binop_instance_dunder`): the method called directly
+/// ([`direct_call`]) as `method(a, b)`, the result at `slot`. `0` done,
+/// `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
+/// [`h_call`]'s.
+unsafe extern "C" fn h_binop_dunder(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `BINARY_OP`s, the operands' slot (with room for one more above
+    // them, and nothing virtual below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let arg = (&(*code).instructions)[pc].arg;
+        let op: BinOpKind = std::mem::transmute(arg as u8);
+        let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
+        let at = st.stack.add(slot);
+        let Some(f) = Interpreter::binop_instance_dunder(&*at, &*at.add(1), op, inplace) else {
+            return CALL_DECLINED;
+        };
+        let Object::Instance(a) = &*at else {
+            return CALL_DECLINED;
+        };
+        let cls = a.cls();
+        // `[a, b]` becomes the method call `[method, a, b]`, `a` its self.
+        at.add(2).write(at.add(1).read());
+        at.add(1).write(at.read());
+        at.write(Object::Function(f));
+        match direct_call(
+            st,
+            pc,
+            slot,
+            slot + 3,
+            &mut *site,
+            Some((op, inplace, &cls)),
+        ) {
+            None => {
+                let f = at.read();
+                at.write(at.add(1).read());
+                at.add(1).write(at.add(2).read());
+                drop(f);
+                CALL_DECLINED
+            }
+            Some(0) if (*at).is_same(&crate::vm_singletons::not_implemented()) => {
+                crate::drop_hot(at.read());
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(crate::binop_type_error(op, inplace, &cls));
+                RAISED
+            }
+            Some(r) => r,
+        }
+    }
+}
+
 /// [`h_call`] with a direct call ([`direct_call`]) of the plain Python
 /// function `site` caches tried first. (The native code calls `h_call`
 /// itself for any other callee, and while a site without a body waits
@@ -2304,7 +2368,7 @@ unsafe extern "C" fn h_call_direct(
         let len_u = len as usize;
         if len_u >= argc + 2 && !s.sw.is_null() {
             let start = len_u - argc - 2;
-            if let Some(r) = direct_call(s, pc as usize, start, len_u, &mut *site) {
+            if let Some(r) = direct_call(s, pc as usize, start, len_u, &mut *site, None) {
                 return r;
             }
         }
@@ -2319,7 +2383,9 @@ unsafe extern "C" fn h_call_direct(
 /// return comes back here ([`h_return`]'s `DIRECT_RET`) to be finished
 /// without the core loop's switch back. `Some(0)` leaves the result at
 /// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
-/// state synced), `None` touched nothing.
+/// state synced), `None` touched nothing. An instance operator's method
+/// (`binop`) that leaves the direct return to the core loop carries the
+/// operator, whose `TypeError` its `NotImplemented` becomes there.
 #[inline(always)]
 unsafe fn direct_call(
     st: &mut State,
@@ -2327,6 +2393,7 @@ unsafe fn direct_call(
     start: usize,
     len: usize,
     site: &mut DirectSite,
+    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
     unsafe {
@@ -2415,6 +2482,13 @@ unsafe fn direct_call(
             && inl
                 .last()
                 .is_some_and(|a| std::ptr::eq(&raw const *a.frame, callee));
+        // The activation goes on as any other (see `InlineAct::binop`).
+        let leave = |a: &mut crate::InlineAct| {
+            a.direct = false;
+            if let Some((op, inplace, cls)) = binop {
+                a.binop = Some((op, inplace, cls.clone()));
+            }
+        };
         if status == DIRECT_RET && ours {
             let clean = cst.len == 1
                 && inl.last().is_some_and(|a| a.act.shell.is_none())
@@ -2468,15 +2542,15 @@ unsafe fn direct_call(
             cframe.stack.set_len(cst.len);
             cframe.pc = cst.pc as u32;
             *sw.last = cst.last;
-            inl.last_mut().expect("checked above").direct = false;
+            leave(inl.last_mut().expect("checked above"));
             if !interp.core_return(sw, st.snap_gen) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             }
         } else if ours {
-            inl.last_mut().expect("checked above").direct = false;
+            leave(inl.last_mut().expect("checked above"));
         } else if let Some(a) = inl.get_mut(depth - 1) {
             if std::ptr::eq(&raw const *a.frame, callee) {
-                a.direct = false;
+                leave(a);
             }
         }
         if status == RELOAD || status == DIRECT_RET {
@@ -2669,6 +2743,28 @@ unsafe extern "C" fn h_call(
                 return 0;
             }
             return RELOAD;
+        }
+        // A builtin type's call (`range(a, b)`, `float(x)`, `list(xs)`), as
+        // the core loop's arms run it: in place when nothing it does can
+        // run Python code, else through its lane.
+        if let Object::Type(t) = &ops[0] {
+            if t.flags.is_builtin {
+                if let Some(r) = interp.core_builtin_ctor(base, start, len) {
+                    return done(st, r);
+                }
+                if argc == 1 && !st.sw.is_null() {
+                    sync(st);
+                    let sw = &mut *st.sw;
+                    let interp = &mut *st.interp.cast_mut();
+                    if interp.core_type_lane(sw) {
+                        return if finished_in_place(st, start) {
+                            0
+                        } else {
+                            RELOAD
+                        };
+                    }
+                }
+            }
         }
         // A builtin the site has settled as a leaf (one it hasn't runs
         // through the core loop's builtin lane).
@@ -4639,7 +4735,9 @@ impl<'a> Lower<'a> {
         {
             return self.binary_borrowed(pc, kind, ai, bi);
         }
-        if native {
+        // A site that has run on instances keeps its operands and result
+        // on the stack, where an operator method's direct call leaves it.
+        if native || crate::instance_site(self.ext, pc) {
             return self.binary_helper(pc, kind, ai, bi);
         }
         // A value on the stack (a call's result, an element, a field) is as
@@ -4856,7 +4954,7 @@ impl<'a> Lower<'a> {
             .call(h_binop as *const () as usize, &[dst, k], true)
             .expect("returns");
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.b.ins().brif(r, out, &[], done, &[]);
+        self.binop_declined(pc, slot, r, out, done);
         self.b.switch_to_block(done);
         self.push(Item::Mem(slot));
         self.set_last(pc);
@@ -4889,7 +4987,9 @@ impl<'a> Lower<'a> {
             .call(h_binop as *const () as usize, &[at, k], true)
             .expect("returns");
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.branch_out(r, out);
+        let ok = self.b.create_block();
+        self.binop_declined(pc, slot, r, out, ok);
+        self.b.switch_to_block(ok);
         // (The operands were a local's, a constant's or scalars: their
         // copies' releases free nothing.)
         let saved = self.last_pc.replace(pc);
@@ -4907,6 +5007,49 @@ impl<'a> Lower<'a> {
             .jump(done, &[tag.into(), w.into(), byte.into()]);
     }
 
+    /// After [`h_binop`] returned `r` for the operands at `slot` and above:
+    /// done (`r` zero) at `ok`; otherwise two instances whose class's
+    /// method runs alone through [`h_binop_dunder`] (its result at `slot`,
+    /// at `ok` too), and anything else at `out`. The method's call can
+    /// raise or switch, which leaves the whole stack on the frame's: only
+    /// a stack with nothing virtual below the operands tries it.
+    fn binop_declined(&mut self, pc: usize, slot: usize, r: Value, out: Block, ok: Block) {
+        if !self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+            self.b.ins().brif(r, out, &[], ok, &[]);
+            return;
+        }
+        let dunder = self.b.create_block();
+        self.b.ins().brif(r, dunder, &[], ok, &[]);
+        self.b.switch_to_block(dunder);
+        let site: Box<DirectSite> = Box::default();
+        let site_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+        self.direct_sites.push(site);
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let slotv = self.b.ins().iconst(types::I64, slot as i64);
+        let r = self
+            .call(
+                h_binop_dunder as *const () as usize,
+                &[self.st, code, pcv, slotv, site_at],
+                true,
+            )
+            .expect("returns");
+        let other = self.b.create_block();
+        self.b.ins().brif(r, other, &[], ok, &[]);
+        self.b.switch_to_block(other);
+        let declined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+        let leave = self.b.create_block();
+        self.b.ins().brif(declined, out, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.b.ins().return_(&[r]);
+    }
+
     /// `BINARY_OP` through [`h_binop`]: the operands onto the stack, and
     /// the result in the lower one's slot.
     fn binary_helper(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> bool {
@@ -4919,7 +5062,9 @@ impl<'a> Lower<'a> {
             .call(h_binop as *const () as usize, &[at, k], true)
             .expect("returns");
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.branch_out(r, out);
+        let ok = self.b.create_block();
+        self.binop_declined(pc, slot, r, out, ok);
+        self.b.switch_to_block(ok);
         self.push(Item::Mem(slot));
         self.set_last(pc);
         true

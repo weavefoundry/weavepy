@@ -8145,6 +8145,7 @@ impl Interpreter {
         act.parked = true;
         act.clean = false;
         act.direct = false;
+        act.binop = None;
         act.act.shell = None;
         act.guard = None;
         act.caller_pending = None;
@@ -8170,6 +8171,7 @@ impl Interpreter {
         act.parked = true;
         act.clean = false;
         act.direct = false;
+        act.binop = None;
         act.guard = None;
         act.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
@@ -8603,6 +8605,14 @@ impl Interpreter {
                 ))),
                 Err(e) => Err(e),
             },
+        };
+        let result = match (done.binop.take(), result) {
+            (Some((op, inplace, cls)), Ok(v))
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
+                Err(binop_type_error(op, inplace, &cls))
+            }
+            (_, result) => result,
         };
         let call_pc = done.call_pc;
         self.lean_pending_exit(done.caller_pending);
@@ -14779,6 +14789,13 @@ impl Interpreter {
         {
             return false;
         }
+        if ins.op == OpCode::BinaryOp {
+            if let Some(ext) = code_vm_ext_existing(&frame.code) {
+                if !instance_site(ext, pc) {
+                    instance_site_note(ext, frame.code.instructions.len(), pc);
+                }
+            }
+        }
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
         let result = if ins.op == OpCode::BinaryOp {
@@ -18996,7 +19013,7 @@ impl Interpreter {
             && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
-        if clean && done.init_inst.is_none() {
+        if clean && done.init_inst.is_none() && done.binop.is_none() {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -22926,6 +22943,39 @@ impl Interpreter {
                 absent
             }
         }
+    }
+
+    /// The plain Python method a `BINARY_OP` of `op` (augmented when
+    /// `inplace`) over `a` and `b` runs alone, as `dispatch_binary_op`'s
+    /// same-class shape finds it: two plain instances of one class that
+    /// defines no reflected method (nor, augmented, an in-place one).
+    /// Called with `(a, b)`, its `NotImplemented` is the operator's
+    /// `TypeError` ([`binop_type_error`]).
+    fn binop_instance_dunder(
+        a: &Object,
+        b: &Object,
+        op: BinOpKind,
+        inplace: bool,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let (Object::Instance(ai), Object::Instance(bi)) = (a, b) else {
+            return None;
+        };
+        let cls = ai.cls_raw();
+        let k = op as usize;
+        let (dunder, rdunder) = binop_dunders(op);
+        if !std::ptr::eq(cls, bi.cls_raw())
+            || ai.native.get().is_some()
+            || (inplace
+                && !Self::class_lacks(
+                    cls,
+                    std::ptr::addr_of!(IBINOP_KEYS[k]) as usize,
+                    op.inplace_dunder(),
+                ))
+            || !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder)
+        {
+            return None;
+        }
+        Self::instance_dunder_function(ai, std::ptr::addr_of!(BINOP_KEYS[k]) as usize, dunder)
     }
 
     /// Call a class's dunder `f` (see [`Self::instance_dunder_function`])
@@ -42213,22 +42263,18 @@ impl Interpreter {
         // alone, and a `NotImplemented` from it is the TypeError below. The
         // method is called with the instances, with no bound method built.
         if let (Object::Instance(ai), Object::Instance(bi)) = (a, b) {
-            /// Class cache keys per operator: its method, and whether the
-            /// reflected method is absent (see `instance_dunder_function`).
-            static OP_KEYS: [u8; 16] = [0; 16];
-            static ROP_KEYS: [u8; 16] = [0; 16];
             let k = op as usize;
             if std::ptr::eq(ai.cls_raw(), bi.cls_raw())
                 && ai.native.get().is_none()
                 && Self::class_lacks(
                     ai.cls_raw(),
-                    std::ptr::addr_of!(ROP_KEYS[k]) as usize,
+                    std::ptr::addr_of!(RBINOP_KEYS[k]) as usize,
                     rdunder,
                 )
             {
                 if let Some(f) = Self::instance_dunder_function(
                     ai,
-                    std::ptr::addr_of!(OP_KEYS[k]) as usize,
+                    std::ptr::addr_of!(BINOP_KEYS[k]) as usize,
                     dunder,
                 ) {
                     let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
@@ -62591,6 +62637,11 @@ struct InlineAct {
     /// A native caller runs the activation and finishes its return itself
     /// (see `frame_jit::direct_call`).
     direct: bool,
+    /// An instance operator's method (see
+    /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
+    /// the operator's `TypeError` (the operator, whether augmented, and
+    /// the operands' class).
+    binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
 }
 
 impl InlineAct {
@@ -62636,6 +62687,7 @@ impl InlineAct {
             init_inst: None,
             owns_cells: false,
             direct: false,
+            binop: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -68131,6 +68183,25 @@ fn tsdbg() -> bool {
     *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
 }
 
+/// Class cache keys per operator (see
+/// `Interpreter::instance_dunder_function`): its method, and whether the
+/// reflected and in-place methods are absent.
+static BINOP_KEYS: [u8; 16] = [0; 16];
+static RBINOP_KEYS: [u8; 16] = [0; 16];
+static IBINOP_KEYS: [u8; 16] = [0; 16];
+
+/// The `TypeError` of a `BINARY_OP` of `op` (augmented when `inplace`)
+/// whose method returned `NotImplemented` for two instances of `cls`.
+fn binop_type_error(op: BinOpKind, inplace: bool, cls: &TypeObject) -> RuntimeError {
+    type_error(format!(
+        "unsupported operand type(s) for {}{}: '{}' and '{}'",
+        op.as_str(),
+        if inplace { "=" } else { "" },
+        cls.name,
+        cls.name
+    ))
+}
+
 fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
     use BinOpKind as B;
     match op {
@@ -68581,6 +68652,11 @@ struct CodeConstObjects {
     /// frame compiler to send through its helpers instead of the scalar
     /// arms; allocated on the first recorded one.
     native_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
+    /// The `BINARY_OP` sites the core loop has run on an instance operand
+    /// (a Python operator method), for the frame compiler to keep their
+    /// operands and result on the stack (see `frame_jit::h_binop_dunder`);
+    /// allocated on the first recorded one.
+    instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
     leaf_sites: std::sync::OnceLock<Box<[LeafSite]>>,
@@ -69218,6 +69294,27 @@ pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
+/// Record that the `BINARY_OP` at `pc` ran on an instance operand (see
+/// [`CodeConstObjects::instance_sites`]).
+#[cold]
+fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sites = ext
+        .instance_sites
+        .get_or_init(|| (0..ninstrs).map(|_| AtomicBool::new(false)).collect());
+    if let Some(site) = sites.get(pc) {
+        site.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether the `BINARY_OP` at `pc` has run on an instance operand.
+pub(crate) fn instance_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.instance_sites
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
     ext.native_sites
         .get()
@@ -70544,6 +70641,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             field_slots: std::sync::OnceLock::new(),
             native_sites: std::sync::OnceLock::new(),
+            instance_sites: std::sync::OnceLock::new(),
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
