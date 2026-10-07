@@ -9138,7 +9138,7 @@ unsafe extern "C" fn wpjit_dict_set(
         return 1;
     }
     match crate::builtins::dict_insert(&d, key, v) {
-        Ok(_) => 0,
+        Ok(_) => stored_status(),
         Err(_) => 1,
     }
 }
@@ -11070,7 +11070,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 }
             };
             drop(old);
-            0
+            stored_status()
         }
         AttrStorage::Indexed(key_idx) => {
             // Replacing an existing key's value leaves the key layout (and
@@ -11093,7 +11093,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
             // `maybe_prompt_reap_replaced`.
             let old = std::mem::replace(dst, v);
             drop(old);
-            0
+            stored_status()
         }
         // RFC 0071 WS2 — the constructor-pattern store: a single-probe
         // insert-or-replace, exactly the tier-1 `StoreAttrNewKey`
@@ -11115,7 +11115,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 match inst.split_store(&g.name, v) {
                     Ok(old) => {
                         drop(old);
-                        return 0;
+                        return stored_status();
                     }
                     Err(v) => v,
                 }
@@ -11154,7 +11154,7 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 }
             };
             drop(old);
-            0
+            stored_status()
         }
     }
 }
@@ -12183,7 +12183,7 @@ unsafe extern "C" fn wpjit_dyn_attr_set(frame: *mut JitFrame, pin: i64, name: i6
         {
             // The store moved the value's bits into the instance.
             std::mem::forget(value);
-            return 0;
+            return if finalizer_queued() { 2 } else { 0 };
         }
     }
     ctx.dirty = true;
@@ -12201,13 +12201,34 @@ unsafe extern "C" fn wpjit_dyn_attr_set(frame: *mut JitFrame, pin: i64, name: i6
                 &ctx.callees,
                 &ctx.math,
             );
-            if still_valid {
+            if still_valid && !finalizer_queued() {
                 0
             } else {
                 2
             }
         }
     }
+}
+
+/// `wpjit_attr_set`'s status for a completed store: `0`, or `2` when the
+/// displaced value queued a finalizer (see [`finalizer_queued`]).
+#[inline]
+fn stored_status() -> i64 {
+    if finalizer_queued() {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether releasing a value queued a finalizer (a `__del__`, a weak
+/// reference callback) for this thread's next safe point: a store that
+/// displaced the value's last reference then leaves native code after it,
+/// so the finalizer runs at once, as the interpreter's own store runs it.
+#[inline]
+fn finalizer_queued() -> bool {
+    // SAFETY: the running thread's own flag.
+    unsafe { (*crate::gc_trace::maybe_dead_flag()).get() }
 }
 
 /// The `wpjit_truth` helper (RFC 0076 WS8): the interpreter's exact
@@ -12615,7 +12636,7 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
                 &ctx.callees,
                 &ctx.math,
             );
-            if still_valid {
+            if still_valid && !finalizer_queued() {
                 0
             } else {
                 ctx.parked = None;

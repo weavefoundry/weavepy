@@ -13867,6 +13867,17 @@ impl Interpreter {
                                     _ => break Some(CoreExit::Helper),
                                 }
                             }
+                            // A function's stored attribute (`wrapper.calls`).
+                            Object::Function(_) => {
+                                // SAFETY: `top` is the receiver's slot.
+                                if unsafe { Self::core_function_load(code, ins.arg, top) } {
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                break Some(CoreExit::Helper);
+                            }
                             _ => break Some(CoreExit::Helper),
                         };
                         // A natively served instance's public field (see
@@ -13934,8 +13945,24 @@ impl Interpreter {
                         }
                         // SAFETY: `len >= 2`.
                         let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
-                        let Object::Instance(inst) = recv else {
-                            break Some(CoreExit::Helper);
+                        let inst = match recv {
+                            Object::Instance(inst) => inst,
+                            // A function's own attribute (`wrapper.calls = n`).
+                            Object::Function(_) => {
+                                // SAFETY: `len >= 2`: the receiver over the
+                                // value.
+                                if unsafe {
+                                    Self::core_function_store(code, ins.arg, base.add(len - 1))
+                                } {
+                                    len -= 2;
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                break Some(CoreExit::Helper);
+                            }
+                            _ => break Some(CoreExit::Helper),
                         };
                         if !Self::core_droppable(recv)
                             || !Self::core_store_attr(code, inst, pc, ins.arg, val)
@@ -16454,6 +16481,81 @@ impl Interpreter {
             drop_hot(std::mem::replace(&mut *top, v));
             top.add(1).write(Object::Unbound);
         }
+        true
+    }
+
+    /// `f.name` at `top` (a function): its stored value replaces the
+    /// receiver (see [`Self::leaf_function_read`]). `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `top` is the core loop's top stack slot.
+    #[inline(never)]
+    unsafe fn core_function_load(code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Function(f) = (unsafe { &*top }) else {
+            return false;
+        };
+        let Some(v) = Self::leaf_function_read(code, f, name_idx) else {
+            return false;
+        };
+        // SAFETY: as above; the function is held by the variable it was
+        // loaded from, or released by a plain decrement.
+        if !Self::core_droppable(unsafe { &*top }) {
+            return false;
+        }
+        // SAFETY: the receiver is replaced in place.
+        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+        true
+    }
+
+    /// `f.name = v` with the function at `recv` and the value below it: a
+    /// non-dunder name written to the function's `__dict__` (as
+    /// [`Self::leaf_function_attr`]'s store), both leaving the stack.
+    /// `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `recv` is the core loop's top stack slot, the value the one below.
+    #[inline(never)]
+    unsafe fn core_function_store(code: &CodeObject, name_idx: u32, recv: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let (Object::Function(f), value) = (unsafe { &*recv }, unsafe { &*recv.sub(1) }) else {
+            return false;
+        };
+        if crate::capi_watchers::dicts_active()
+            || crate::capi_watchers::funcs_active()
+            || !Self::core_droppable(unsafe { &*recv })
+        {
+            return false;
+        }
+        let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        if n.starts_with("__") {
+            return false;
+        }
+        let dict = f.attrs();
+        let old = {
+            let Ok(mut d) = dict.try_borrow_mut() else {
+                return false;
+            };
+            // SAFETY: the value moves into the dictionary; its slot is
+            // forgotten below.
+            let value = unsafe { std::ptr::read(value) };
+            match d.get_mut(&crate::object::StrKey(n)) {
+                Some(slot) => Some(std::mem::replace(slot, value)),
+                None => {
+                    d.insert(DictKey(name.clone()), value);
+                    None
+                }
+            }
+        };
+        // SAFETY: the function leaves by a plain decrement (checked
+        // droppable); the value's slot moved out above.
+        unsafe { drop_hot(recv.read()) };
+        // (Released after the dictionary's borrow ends.)
+        drop(old);
         true
     }
 

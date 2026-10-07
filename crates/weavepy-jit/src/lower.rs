@@ -2719,10 +2719,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// RFC 0073 WS2 — `d[k] = v` on a pinned exact dict. The value is
-    /// staged through `ret_bits` (the `emit_list_set` trick); any
-    /// helper refusal (watchers active, reapable displaced value, lane
-    /// surprise) deopts at this pc and the interpreter re-executes the
-    /// store generically.
+    /// staged through `ret_bits` (the `emit_list_set` trick); status `2`
+    /// (stored, a finalizer queued) leaves at the next pc, and any other
+    /// helper refusal (watchers active, lane surprise) deopts at this pc
+    /// and the interpreter re-executes the store generically.
     fn emit_dict_set(&mut self, key: JitType, val: JitType, pc: u32) {
         let trusted = MemFlags::trusted();
         let snapshot = self.vstack.clone();
@@ -2731,6 +2731,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let (v, _) = self.pop();
         self.b.ins().store(trusted, v, self.frame_ptr, OFF_RET_BITS);
         let status = self.emit_dict_call(runtime::dict_set_helper_addr(), pin, k, key, val);
+        // `2`: stored, but the displaced value queued a finalizer, which
+        // runs before the next instruction: leave natively past this one.
+        let after = self.vstack.clone();
+        let queued_b = self.b.create_block();
+        let other_b = self.b.create_block();
+        let queued = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(queued, queued_b, &[], other_b, &[]);
+        self.b.switch_to_block(queued_b);
+        self.emit_exit(pc + 1, &after, JitStatus::Deopt);
+        self.b.switch_to_block(other_b);
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
@@ -3937,8 +3947,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// RFC 0065 WS5 — pinned-instance attribute write via
-    /// `wpjit_attr_set`. The value is staged through `ret_bits`; a
-    /// non-zero status deopts at this pc with `[value, receiver]`
+    /// `wpjit_attr_set`. The value is staged through `ret_bits`; status
+    /// `2` (stored, a finalizer queued) leaves at the next pc, and any
+    /// other non-zero status deopts at this pc with `[value, receiver]`
     /// spilled, so the interpreter re-executes the `STORE_ATTR`.
     fn emit_attr_set(&mut self, site: u32, pc: u32) {
         let trusted = MemFlags::trusted();
@@ -4016,6 +4027,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .call_indirect(sig, helper, &[self.frame_ptr, pin, sitev]);
         let status = self.b.inst_results(call)[0];
+        // `2`: stored, but the displaced value queued a finalizer, which
+        // runs before the next instruction: leave natively past this one.
+        let after = self.vstack.clone();
+        let queued_b = self.b.create_block();
+        let other_b = self.b.create_block();
+        let queued = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+        self.b.ins().brif(queued, queued_b, &[], other_b, &[]);
+        self.b.switch_to_block(queued_b);
+        self.emit_exit(pc + 1, &after, JitStatus::Deopt);
+        self.b.switch_to_block(other_b);
         let bad = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
