@@ -2,9 +2,9 @@
 
 Generator expressions made in a loop (closures, `MAKE_FUNCTION`,
 `SET_FUNCTION_ATTRIBUTE`, `LOAD_COMMON_CONSTANT`), cell stores, starred
-unpacking, set and string iteration, tuple and list concatenation, and an
-inlined comprehension's variable in a function with cells must behave as
-the interpreter runs them, errors included.
+unpacking, set and string iteration, tuple and list concatenation, list
+slice stores, and an inlined comprehension's variable in a function with
+cells must behave as the interpreter runs them, errors included.
 """
 
 import os
@@ -72,6 +72,16 @@ def concat(n):
     return t, l
 
 
+def slice_stores(n):
+    xs = list(range(10))
+    for i in range(n):
+        k = i % 10
+        xs[k:] = xs[k + 1:] + xs[k:k + 1]
+        xs[:1] = (xs[0],)
+        xs[-3:-1] = [xs[-2], xs[-3]]
+    return xs
+
+
 def comprehension_with_cells(values, n):
     s = "outer"
     total = 0
@@ -112,6 +122,15 @@ class MoreOpsTest(unittest.TestCase):
         t, l = concat(N)
         self.assertEqual(t, tuple(range(N)))
         self.assertEqual(l, list(range(N)))
+
+    def test_slice_stores(self):
+        expect = list(range(10))
+        for i in range(N):
+            k = i % 10
+            expect[k:] = expect[k + 1:] + expect[k:k + 1]
+            expect[:1] = (expect[0],)
+            expect[-3:-1] = [expect[-2], expect[-3]]
+        self.assertEqual(slice_stores(N), expect)
 
     def test_comprehension_with_cells(self):
         self.assertEqual(comprehension_with_cells([0, 1, 2, 3], N), (5 * N, "outer"))

@@ -440,7 +440,8 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept
-            | OpCode::DeleteFast => false,
+            | OpCode::DeleteFast
+            | OpCode::StoreSlice => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -3820,6 +3821,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::CheckExcMatch
             | OpCode::PopExcept
             | OpCode::DeleteFast
+            | OpCode::StoreSlice
     )
 }
 
@@ -4783,7 +4785,8 @@ impl<'a> Lower<'a> {
             | OpCode::LoadSuperAttr
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
-            | OpCode::PopExcept => return self.container(pc),
+            | OpCode::PopExcept
+            | OpCode::StoreSlice => return self.container(pc),
             OpCode::RaiseVarargs if matches!(ins.arg, 1 | 2) && self.depth >= ins.arg as usize => {
                 self.flush();
                 self.store_last();

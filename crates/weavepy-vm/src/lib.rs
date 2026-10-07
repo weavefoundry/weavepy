@@ -16600,6 +16600,60 @@ impl Interpreter {
                 }
                 Some(len - 1 + n)
             }
+            // `xs[a:b] = items` of an exact list with int (or omitted)
+            // bounds and a tuple or list of items, as the leaf arm runs it.
+            OpCode::StoreSlice => {
+                if len < 4 {
+                    return None;
+                }
+                let bound = |o: &Object| match o {
+                    Object::None => Some(None),
+                    Object::Int(i) => Some(Some(*i)),
+                    _ => None,
+                };
+                // SAFETY: `len >= 4`.
+                let (value, dst, start, stop) = unsafe {
+                    (
+                        &*base.add(len - 4),
+                        &*base.add(len - 3),
+                        &*base.add(len - 2),
+                        &*base.add(len - 1),
+                    )
+                };
+                let (Some(start), Some(stop), Object::List(dst)) = (bound(start), bound(stop), dst)
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(value) {
+                    return None;
+                }
+                let items: Vec<Object> = match value {
+                    Object::Tuple(t) => t.to_vec(),
+                    Object::List(l) if !Rc::ptr_eq(l, dst) => l.try_borrow().ok()?.clone(),
+                    _ => return None,
+                };
+                let mut d = dst.try_borrow_mut().ok()?;
+                let n = d.len() as i64;
+                let clamp = |i: Option<i64>, dflt: i64| {
+                    let i = i.unwrap_or(dflt);
+                    let i = if i < 0 { i + n } else { i };
+                    i.clamp(0, n) as usize
+                };
+                let a = clamp(start, 0);
+                let b = clamp(stop, n).max(a);
+                let removed: Vec<Object> = d.splice(a..b, items).collect();
+                drop(d);
+                drop(removed);
+                // SAFETY: the four operands leave the stack: two scalars or
+                // `None`s, the list (still held by its owner) and the items'
+                // container (droppable).
+                unsafe {
+                    for k in (len - 4..len).rev() {
+                        drop_hot(base.add(k).read());
+                    }
+                }
+                Some(len - 4)
+            }
             // `a, *b, c = seq` of a tuple or list, as the core loop's arm
             // runs it: the trailing items, the middle's new list, then the
             // leading items, the first on top.
