@@ -13017,6 +13017,28 @@ impl Interpreter {
                                 }
                             }
                         }
+                        // A builtin type whose native constructor runs no
+                        // Python code (`range(a, b)`, `type(x)`, an empty
+                        // container), in place.
+                        // SAFETY: `len >= argc + 2`: the callee and its self
+                        // slot, then the arguments.
+                        if let Some(v) =
+                            unsafe { self.core_builtin_ctor(base, len - argc - 2, len) }
+                        {
+                            let callee_at = len - argc - 2;
+                            // SAFETY: every operand was checked droppable;
+                            // the result takes the callee's slot.
+                            unsafe {
+                                for k in callee_at..len {
+                                    drop_hot(base.add(k).read());
+                                }
+                                base.add(callee_at).write(v);
+                            }
+                            len = callee_at + 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         // `next(gen)`: the generator resumes inline, as for
                         // `FOR_ITER`, with the yield as the call's result.
                         // SAFETY: `len >= argc + 2 == 3`.
@@ -16482,6 +16504,41 @@ impl Interpreter {
             top.add(1).write(Object::Unbound);
         }
         true
+    }
+
+    /// The call at `base[callee_at..len]` (the callee, its self slot,
+    /// the arguments) of an exact builtin type whose native constructor
+    /// builds without running Python code (see [`Self::leaf_type_call`]
+    /// and [`crate::seqiter::builtin_ctor_pure`]), when every operand
+    /// leaves by a plain decrement: the new object. `None` touches
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// The slots `base[callee_at..len]` are the core loop's initialized
+    /// stack.
+    #[inline(never)]
+    unsafe fn core_builtin_ctor(
+        &self,
+        base: *mut Object,
+        callee_at: usize,
+        len: usize,
+    ) -> Option<Object> {
+        // SAFETY: the caller's contract.
+        let Object::Type(t) = (unsafe { &*base.add(callee_at) }) else {
+            return None;
+        };
+        // SAFETY: as above.
+        if !t.flags.is_builtin || !matches!(unsafe { &*base.add(callee_at + 1) }, Object::Unbound) {
+            return None;
+        }
+        // SAFETY: as above.
+        let ops = unsafe { std::slice::from_raw_parts(base.add(callee_at), len - callee_at) };
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        self.leaf_type_call(t, &ops[2..])
+            .or_else(|| crate::seqiter::builtin_ctor_pure(t, &ops[2..]))
     }
 
     /// `f.name` at `top` (a function): its stored value replaces the
