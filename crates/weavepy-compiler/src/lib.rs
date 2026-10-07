@@ -289,9 +289,9 @@ pub struct JitHint {
     /// Lean (interpreted) activations so far; the VM warms the tier-2
     /// compile from it so native callers can still reach a compiled form.
     lean_entries: std::sync::atomic::AtomicU32,
-    /// Whether every loop in the code yields (0 unknown, 1 no, 2 yes):
-    /// a generator whose native resume could run at most one iteration
-    /// of any loop before yielding again.
+    /// Whether every loop a resume can reach yields (0 unknown, 1 no,
+    /// 2 yes): a generator whose native resume could run at most one
+    /// iteration of any loop before yielding again.
     yields_in_loops: std::sync::atomic::AtomicU8,
     /// The VM's tier-2 compiled a native entry at pc 0 that the
     /// interpreter's calls should take (not just its native callers).
@@ -494,9 +494,10 @@ impl JitHint {
 }
 
 impl JitHint {
-    /// Whether every loop back edge in `code` spans a `YIELD_VALUE`
-    /// (see the field docs), derived on first use. Vacuously true for
-    /// loop-free code.
+    /// Whether every loop back edge in `code` spans a `YIELD_VALUE`, or
+    /// belongs to a loop that runs only before the first yield (see the
+    /// field docs), derived on first use. Vacuously true for loop-free
+    /// code.
     #[must_use]
     pub fn every_loop_yields(&self, code: &CodeObject) -> bool {
         match self
@@ -525,8 +526,17 @@ impl JitHint {
                         *e = (*e).max(pc);
                     }
                 }
+                // A loop that runs only before the first yield (one no
+                // yielding loop encloses) never runs on a resume.
+                let first_yield = ins.iter().position(|j| j.op == OpCode::YieldValue);
+                let prologue = |target: usize, end: usize| {
+                    first_yield.is_some_and(|y| {
+                        end < y && !extent.iter().any(|(&t2, &e2)| t2 <= target && e2 >= y)
+                    })
+                };
                 let all = extent.iter().all(|(&target, &end)| {
-                    ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue)
+                    prologue(target, end)
+                        || ins[target..=end].iter().any(|j| j.op == OpCode::YieldValue)
                 });
                 self.yields_in_loops.store(
                     if all { 2 } else { 1 },

@@ -11,11 +11,12 @@ def total(n):
 
 
 def values(n):
-    # Keep a non-yielding loop so this body is eligible for native parking.
-    warm = 0
-    while warm < 1:
-        warm += 1
     for i in range(n):
+        # A non-yielding loop between yields keeps this body eligible for
+        # native parking (one before the first yield never runs again).
+        warm = 0
+        while warm < 1:
+            warm += 1
         yield i * 3
 
 

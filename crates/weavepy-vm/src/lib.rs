@@ -76508,15 +76508,16 @@ assert namespace is exported.__dict__
         // without a native cycle) and each yield parks the activation
         // in place, so resumes skip the marshal/spill round trip
         // entirely. Results stay exact.        //
-        // The body opens with a loop that does not yield: a generator
-        // whose *every* loop yields is handed to the interpreted resume
-        // on purpose -- the native resume protocol costs more than the
-        // single iteration it would run, measured at 2.5x on the
-        // `generators` fixture -- so a yield-dense body would never reach
-        // the parking path this test is about. The extra loop does not
+        // Each pass runs a loop that does not yield: a generator whose
+        // *every* loop a resume reaches yields is handed to the
+        // interpreted resume on purpose -- the native resume protocol
+        // costs more than the single iteration it would run, measured at
+        // 2.5x on the `generators` fixture -- so a yield-dense body would
+        // never reach the parking path this test is about. (A loop before
+        // the first yield never runs on a resume.) The extra loop does not
         // change what is yielded.
-        let src = "def g(n):\n    j = 0\n    while j < 1:\n        j = j + 1\n\
-                   \x20   for i in range(n):\n        yield i * 2\n\
+        let src = "def g(n):\n    for i in range(n):\n        j = 0\n\
+                   \x20       while j < 1:\n            j = j + 1\n        yield i * 2\n\
                    t = 0\nk = 0\n\
                    while k < 60:\n\
                    \x20   for v in g(20):\n        t = t + v\n\
@@ -79380,13 +79381,19 @@ print(sliced('é😀z', 2))
         // RFC 0073 WS4 — the `while`-shaped yield-dense counter now
         // compiles and parks per yield (see the `for`-shaped sibling
         // above); the park keeps the whole resume cycle native.
-        // It too opens with a non-yielding loop; see the sibling.
-        let src = "def counter(n):\n    i = 0\n    j = 0\n\
-                   \x20   while j < 1:\n        j = j + 1\n\
-                   \x20   while i < n:\n        yield i\n        i = i + 1\n\
+        // It too runs a non-yielding loop on each pass; see the sibling.
+        // Its consumer resumes it with `send(None)`, the activation that
+        // parks natively (a `for` loop may step a simple body in place).
+        let src = "def counter(n):\n    i = 0\n\
+                   \x20   while i < n:\n        j = 0\n\
+                   \x20       while j < 1:\n            j = j + 1\n\
+                   \x20       yield i\n        i = i + 1\n\
                    t = 0\nk = 0\n\
                    while k < 60:\n\
-                   \x20   for v in counter(20):\n        t = t + v\n\
+                   \x20   g = counter(20)\n\
+                   \x20   try:\n\
+                   \x20       while True:\n            t = t + g.send(None)\n\
+                   \x20   except StopIteration:\n        pass\n\
                    \x20   k = k + 1\n\
                    print(t)\n";
         let (out, compiled, resumes, yields) = run_jit_resume(src);
