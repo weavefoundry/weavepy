@@ -11981,18 +11981,36 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     // SAFETY: the activation retains the code object until native return.
     let code = unsafe { &*ctx.code_ptr };
     let (value, kind) = match receiver {
-        Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => (
+        Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => {
             // The site's split-layout shortcut first (the interpreter's
-            // own fastest read), then its inline cache.
-            super::code_vm_ext(code)
+            // own fastest read), then a property getter the site
+            // remembers, evaluated in place, then its inline cache.
+            let field = super::code_vm_ext(code)
                 // SAFETY: the view is cloned before anything else runs.
                 .and_then(|ext| unsafe { super::field_slot_hit(ext, jf.deopt_pc as usize, inst) })
-                .map(super::clone_hot)
-                .or_else(|| {
-                    super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx)
-                }),
-            0,
-        ),
+                .map(super::clone_hot);
+            // SAFETY: as for the full getter read below.
+            let interp = unsafe { &*ctx.interp };
+            match field {
+                Some(v) => (Some(v), 0),
+                None => {
+                    // SAFETY: the activation retains this thread's depth cell.
+                    let depth = unsafe { (*ctx.depth_cell).get() };
+                    match interp.leaf_site_getter(code, jf.deopt_pc, inst, receiver, depth) {
+                        Some(v) => (Some(v), 4),
+                        None => (
+                            super::Interpreter::leaf_load_attr_recv(
+                                code,
+                                receiver,
+                                jf.deopt_pc,
+                                name_idx,
+                            ),
+                            0,
+                        ),
+                    }
+                }
+            }
+        }
         Object::Type(cls) if super::Interpreter::plain_metaclass(cls) => (
             super::Interpreter::leaf_load_type_attr(code, cls, jf.deopt_pc, name_idx),
             1,
@@ -12044,7 +12062,8 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
             let interp = unsafe { &*ctx.interp };
             // SAFETY: the activation retains this thread's depth cell.
             let depth = unsafe { (*ctx.depth_cell).get() };
-            let Some(value) = interp.leaf_getter_read(code, receiver, name_idx, depth) else {
+            let Some(value) = interp.leaf_getter_read(code, receiver, jf.deopt_pc, name_idx, depth)
+            else {
                 return 3;
             };
             (value, 4)

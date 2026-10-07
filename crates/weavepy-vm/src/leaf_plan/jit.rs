@@ -473,6 +473,7 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
         value(t, p),
         pc,
         name,
+        c.nest,
     ) {
         Some(v) => {
             c.put(v);
@@ -534,14 +535,28 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
     let status = unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) };
     if let (0, Some(inst)) = (status, inst.filter(|_| !pending)) {
         // SAFETY: a live frame.
-        let (code, _, _) = unsafe { (*fr).parts() };
+        let (code, ext, _) = unsafe { (*fr).parts() };
         let ver = inst.cls_raw().attr_version.get();
+        // A property's getter answered (see `plan_getter`): nothing to
+        // remember.
+        let site = ext
+            .method_slots
+            .get()
+            .and_then(|s| s.get((pc_name & 0xffff) as usize));
+        // SAFETY: GIL-serialized; the references don't outlive the check.
+        if site.is_some_and(|s| unsafe { s.getter_peek(ver) }.is_some()) {
+            return status;
+        }
         // The instance's own field (not a class value or descriptor),
         // from its split layout.
         let found = match Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16) {
             Some((_, Some(idx))) => inst.dict.published().is_none().then_some((idx, 0)),
+            // A class value or descriptor.
+            Some(_) => None,
             // A `__slots__` member laid out over its class's names.
-            _ => laid_out_member(code, inst, pc_name >> 16, ver).map(|(i, l)| (i | SLOT_FIELD, l)),
+            None => {
+                laid_out_member(code, inst, pc_name >> 16, ver).map(|(i, l)| (i | SLOT_FIELD, l))
+            }
         };
         if let Some((idx, layout)) = found.filter(|_| ver != 0) {
             let k = usize::from(cache.next.get()) % cache.entries.len();

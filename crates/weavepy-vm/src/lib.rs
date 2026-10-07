@@ -23506,14 +23506,11 @@ impl Interpreter {
         &self,
         code: &CodeObject,
         receiver: &Object,
+        cache_pc: u32,
         name_idx: u32,
         depth: usize,
     ) -> Option<Object> {
-        if !self.inline_calls_ok()
-            || self.lean_snapshot().is_none()
-            || crate::object::exotic_str_keys_possible()
-            || depth >= crate::recursion::recursion_limit()
-        {
+        if !self.leaf_getter_ok(depth) {
             return None;
         }
         let Object::Instance(inst) = receiver else {
@@ -23523,8 +23520,13 @@ impl Interpreter {
         if cls.native_kind.get() != 0 || !Self::default_getattribute(cls) {
             return None;
         }
+        let mut property = None;
         let (getter, name) = match Self::leaf_class_attr(code, cls, name_idx)? {
-            LeafAttr::Property(property) => (property.fget(), None),
+            LeafAttr::Property(p) => {
+                let getter = p.fget();
+                property = Some(p);
+                (getter, None)
+            }
             LeafAttr::InstanceOnly => {
                 // A data descriptor or a real field wins over __getattr__.
                 // This probe must prove a miss without comparing Python keys.
@@ -23547,23 +23549,13 @@ impl Interpreter {
         ];
         let nargs = 1 + usize::from(name.is_some());
         let fcode = f.code.try_borrow().ok()?;
-        if fcode.arg_count as usize != nargs
-            || fcode.has_varargs
-            || fcode.has_varkeywords
-            || fcode.kwonly_count != 0
-            || fcode.is_generator
-            || fcode.is_coroutine
-            || fcode.is_async_generator
-            || fcode.is_iterable_coroutine
-            || fcode.is_class_body
-            || !fcode.freevars.is_empty()
-            || !fcode.cellvars.is_empty()
-            || !fcode.exception_table.is_empty()
-            || fcode.varnames.len() != nargs
-            || fcode.instructions.len() > 64
-            || fcode.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
-        {
+        if !Self::leaf_getter_code_ok(&fcode, nargs) {
             return None;
+        }
+        // The site remembers a property's getter for the next read (see
+        // `leaf_site_getter`).
+        if let (Some(p), Some(slot)) = (&property, code_method_slot(code, cache_pc)) {
+            slot.set_getter(cls.attr_version.get(), p, &f, &fcode);
         }
         // Warm the existing tiny-return classification. A cold error branch
         // may prevent whole-body leaf admission, but the evaluator can still
@@ -23573,6 +23565,73 @@ impl Interpreter {
         // ordinary pure-call evaluation avoids these extra checks.
         let _ = code_is_pure_leaf(&fcode);
         self.pure_leaf_eval::<true, false>(&fcode, &f, &args[..nargs])
+    }
+
+    /// [`Self::leaf_getter_read`] of the property getter the `LOAD_ATTR`
+    /// site at `cache_pc` remembers for `inst`'s class (see
+    /// [`MethodSlot::getter`]), with no class resolution and no handles
+    /// taken. `None` for anything else, or a getter that declines.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn leaf_site_getter(
+        &self,
+        code: &CodeObject,
+        cache_pc: u32,
+        inst: &PyInstance,
+        receiver: &Object,
+        depth: usize,
+    ) -> Option<Object> {
+        let slot = code_vm_ext(code)?
+            .method_slots
+            .get()?
+            .get(cache_pc as usize)?;
+        let cls = inst.cls_raw();
+        // SAFETY: GIL-serialized (the caller declines free threading); the
+        // getter evaluation runs no Python, so nothing rebinds either.
+        let (f, fcode) = unsafe { slot.getter_peek(cls.attr_version.get()) }?;
+        if !Self::default_getattribute(cls)
+            || !self.leaf_getter_ok(depth)
+            || !Self::leaf_getter_code_ok(fcode, 1)
+        {
+            return None;
+        }
+        let _ = code_is_pure_leaf(fcode);
+        self.pure_leaf_eval::<true, false>(fcode, f, &[std::ptr::from_ref(receiver)])
+    }
+
+    /// Whether a getter may be evaluated in place at recursion depth
+    /// `depth` (see [`Self::leaf_getter_read`]).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn leaf_getter_ok(&self, depth: usize) -> bool {
+        self.inline_calls_ok()
+            && self.lean_snapshot().is_some()
+            && !crate::object::exotic_str_keys_possible()
+            && depth < crate::recursion::recursion_limit()
+    }
+
+    /// Whether a getter's code binds exactly `nargs` positional arguments
+    /// and nothing else, in a short plain body (its other locals are the
+    /// leaf plan's registers).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn leaf_getter_code_ok(fcode: &CodeObject, nargs: usize) -> bool {
+        fcode.arg_count as usize == nargs
+            && !fcode.has_varargs
+            && !fcode.has_varkeywords
+            && fcode.kwonly_count == 0
+            && !fcode.is_generator
+            && !fcode.is_coroutine
+            && !fcode.is_async_generator
+            && !fcode.is_iterable_coroutine
+            && !fcode.is_class_body
+            && fcode.freevars.is_empty()
+            && fcode.cellvars.is_empty()
+            // A handler never runs here (the evaluation declines before
+            // anything raises), but only a certified body may have one.
+            && (fcode.exception_table.is_empty() || code_is_pure_leaf(fcode))
+            && fcode.instructions.len() <= 64
+            && fcode.wire.as_ref().is_none_or(|w| w.exec_error.is_none())
     }
 
     /// The cache-free half of [`Self::leaf_load_attr_recv`]: the site's
@@ -68710,6 +68769,34 @@ impl MethodSlot {
         }
         let c = f.code();
         (Rc::as_ptr(&c) == code.as_ptr()).then(|| (f.clone(), c))
+    }
+
+    /// [`Self::getter`] borrowed, for a read that runs no Python.
+    ///
+    /// # Safety
+    ///
+    /// GIL-serialized, and the references must not outlive anything that
+    /// could rebind the property's getter or the function's code, or
+    /// change the class.
+    #[inline]
+    unsafe fn getter_peek(&self, ver: u64) -> Option<(&crate::object::PyFunction, &CodeObject)> {
+        // SAFETY: as `getter`.
+        let (v, MethodSlotFn::Getter { prop, func, code }) = (unsafe { &*self.0.get() }) else {
+            return None;
+        };
+        if *v != ver || prop.strong_count() == 0 {
+            return None;
+        }
+        // SAFETY: as `getter`; the forwarded contract keeps both alive.
+        let Object::Function(f) = (unsafe { &*(*prop.as_ptr()).fget.as_ptr() }) else {
+            return None;
+        };
+        if Rc::as_ptr(f) != func.as_ptr() {
+            return None;
+        }
+        // SAFETY: as `PyFunction::code` (the function holds its code).
+        let c: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        (Rc::as_ptr(c) == code.as_ptr()).then_some((&**f, &**c))
     }
 
     #[inline]

@@ -1113,6 +1113,7 @@ impl Interpreter {
                         get!(src),
                         pc,
                         name,
+                        nest + depth as u8,
                     )?;
                     set!(dst, v);
                 }
@@ -1614,6 +1615,7 @@ impl Interpreter {
         src: V,
         pc: u16,
         name: u16,
+        nest: u8,
     ) -> Option<V> {
         let V::R(p) = src else {
             return None;
@@ -1642,8 +1644,13 @@ impl Interpreter {
                 match unsafe { Self::leaf_cached_instance_field(ext, code, inst, pc, name) } {
                     Some(v) => Some(norm(v)),
                     // A stale or absent site cache resolves through the
-                    // site's own entries.
-                    None => owned.own(Self::leaf_attr_resolve_site(code, inst, recv, pc, name)?),
+                    // site's own entries (a property through its getter).
+                    None => match self.plan_getter::<EFFECT>(ext, pend, inst, recv, pc, nest) {
+                        Some(v) => owned.own(v),
+                        None => {
+                            owned.own(Self::leaf_attr_resolve_site(code, inst, recv, pc, name)?)
+                        }
+                    },
                 }
             }
             Object::Type(cls) => {
@@ -1676,6 +1683,43 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// `recv.name` through the property getter the `LOAD_ATTR` site at `pc`
+    /// remembers for the receiver's class (see [`crate::MethodSlot`]): a
+    /// pure-leaf getter, evaluated one level down as a pure-leaf call is,
+    /// at call-nesting depth `nest`.
+    #[inline(never)]
+    fn plan_getter<const EFFECT: bool>(
+        &self,
+        ext: &CodeConstObjects,
+        pend: &Pending,
+        inst: &crate::types::PyInstance,
+        recv: &Object,
+        pc: u32,
+        nest: u8,
+    ) -> Option<Object> {
+        // Only while no store is buffered (the getter would not see one).
+        if (EFFECT && pend.n > 0) || nest >= NEST {
+            return None;
+        }
+        let slot = ext.method_slots.get()?.get(pc as usize)?;
+        let cls = inst.cls_raw();
+        // SAFETY: GIL-serialized; nothing here runs Python, so nothing
+        // rebinds the getter or its code, or changes the class.
+        let (f, fcode) = unsafe { slot.getter_peek(cls.attr_version.get()) }?;
+        if !Self::default_getattribute(cls)
+            || !crate::code_is_pure_leaf(fcode)
+            || !Self::leaf_code_ok(fcode)
+            || crate::leaf_arity(fcode) != 1
+            || fcode.has_varkeywords
+            || crate::recursion::current_depth() + usize::from(nest) + 1
+                >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        self.leaf_eval_nested(fcode, f, &[std::ptr::from_ref(recv)], nest + 1)?
+            .into_object()
     }
 
     /// The method-form load of `src.name` off the site's slot: the function
