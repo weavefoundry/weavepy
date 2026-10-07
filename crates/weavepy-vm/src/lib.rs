@@ -15008,6 +15008,10 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        if self.try_leaf_call_ex(unsafe { &mut *sw.cur }, pc) {
+            return true;
+        }
         let mut tmp = None;
         // SAFETY: see `CoreSwitch` (as in `core_call`).
         let act = unsafe {
@@ -15175,6 +15179,9 @@ impl Interpreter {
                 _ => return false,
             };
             frame.stack.push(mapping);
+            if self.try_leaf_call_ex(frame, pc + 3) {
+                return true;
+            }
             let act = self.try_inline_call_ex(frame, &mut *shell.cast::<QuietShell<'_>>(), pc + 3);
             if act.is_none() {
                 // Declined untouched: the operand leaves again.
@@ -15191,6 +15198,54 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// The `CALL_FUNCTION_EX` at `pc` (operands `[callee, NULL, spread,
+    /// mapping]` on top of `frame`'s stack) of a warm pure or effect leaf
+    /// over an exact tuple of its arity, with no keywords: evaluated in
+    /// place, its result replacing the operands. `false` touches nothing.
+    fn try_leaf_call_ex(&mut self, frame: &mut Frame, pc: usize) -> bool {
+        let n = frame.stack.len();
+        let Some(cs) = n.checked_sub(4) else {
+            return false;
+        };
+        let [Object::Function(f), Object::Unbound, Object::Tuple(items), mapping] =
+            &frame.stack[cs..]
+        else {
+            return false;
+        };
+        match mapping {
+            Object::Unbound => {}
+            Object::Dict(d) if d.borrow().is_empty() => {}
+            _ => return false,
+        }
+        let code = f.code();
+        let pure = code_is_pure_leaf(&code);
+        let depth = crate::recursion::current_depth();
+        if !(pure || code_is_effect_leaf(&code))
+            || code.has_varkeywords
+            || items.len() != code.arg_count as usize
+            || items.len() > 8
+            || !pure_leaf_warm(&code)
+            || depth >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        let mut ptrs: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, a) in items.iter().enumerate() {
+            ptrs[k] = a;
+        }
+        let f = f.clone();
+        let Some(r) = self.pure_leaf_call(&code, &f, &ptrs[..items.len()], !pure, depth) else {
+            return false;
+        };
+        let operands: Vec<Object> = frame.stack.drain(cs..).collect();
+        frame.stack.push(r);
+        frame.pc = pc as u32 + 1;
+        for o in operands {
+            self.release(o);
+        }
         true
     }
 
