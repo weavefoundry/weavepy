@@ -926,6 +926,26 @@ thread_local! {
 /// The cap the clamp above starts from.
 pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
 
+/// Whether every `LOAD_GLOBAL name` in `code` feeds an attribute load of
+/// a [`weavepy_jit::MathFunc`] intrinsic, the only use the analyzer's
+/// `math` marker admits.
+fn math_intrinsic_uses_only(code: &CodeObject, name: &str) -> bool {
+    let instrs = &code.instructions;
+    instrs.iter().enumerate().all(|(i, ins)| {
+        ins.op != weavepy_compiler::OpCode::LoadGlobal
+            || code.names.get(ins.arg as usize).is_none_or(|n| n != name)
+            || instrs.get(i + 1).is_some_and(|next| {
+                matches!(
+                    next.op,
+                    weavepy_compiler::OpCode::LoadAttr | weavepy_compiler::OpCode::LoadMethodAttr
+                ) && code
+                    .names
+                    .get(next.arg as usize)
+                    .is_some_and(|a| weavepy_jit::MathFunc::from_attr(a).is_some())
+            })
+    })
+}
+
 #[inline]
 /// Credit `n` activations a frameless path ran for `code` to its tier-2
 /// warm-up counter (the framed entries that count otherwise never happen
@@ -1411,8 +1431,10 @@ impl JitState {
                 // RFC 0069 WS2 — a module named `math`: the intrinsic
                 // probe decides per attribute whether the pair is
                 // burnable; a mis-shaped module simply fails every probe.
+                // A `math` used any other way (`math.floor`, `math.pi`)
+                // is an ordinary object global.
                 if let Some(Object::Module(m)) = obj.as_ref() {
-                    if m.name == "math" {
+                    if m.name == "math" && math_intrinsic_uses_only(code, name) {
                         return ResolvedGlobal::MathModule;
                     }
                 }
@@ -11208,17 +11230,43 @@ unsafe extern "C" fn wpjit_global_obj(frame: *mut JitFrame, token: i64) -> i64 {
 }
 
 /// Pin an arbitrary object-lane value (RFC 0074 WS2): `None` rides
-/// the nullable `-1`; anything else gets a fresh runtime pin. `None`
-/// (the Option) only on cap pressure.
+/// the nullable `-1`; the newest pin serves again when it holds the same
+/// object (a loop reading one value each iteration keeps one pin, not one
+/// per iteration); anything else gets a fresh runtime pin. `None` (the
+/// Option) only on cap pressure.
 fn pin_any(v: Object, pins: &mut PinTable) -> Option<u64> {
     if matches!(v, Object::None) {
         return Some(u64::MAX);
+    }
+    if let Some(Pin::Obj(last)) = pins.last() {
+        if pin_reusable(last, &v) {
+            return Some((pins.len() - 1) as u64);
+        }
     }
     if pins.len() >= RUNTIME_PIN_CAP {
         return None;
     }
     pins.push(Pin::Obj(v));
     Some((pins.len() - 1) as u64)
+}
+
+/// Whether a pin holding `last` can stand for `v`: the same object (or an
+/// equal scalar, which has no identity of its own).
+#[inline]
+fn pin_reusable(last: &Object, v: &Object) -> bool {
+    match (last, v) {
+        (Object::Int(a), Object::Int(b)) => a == b,
+        (Object::Bool(a), Object::Bool(b)) => a == b,
+        (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
+        (Object::Str(a), Object::Str(b)) => crate::SharedStr::ptr_eq(a, b),
+        (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
+        (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
+        (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
+        (Object::List(a), Object::List(b)) => Rc::ptr_eq(a, b),
+        (Object::Dict(a), Object::Dict(b)) => Rc::ptr_eq(a, b),
+        (Object::Type(a), Object::Type(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
 }
 
 /// RFC 0076 WS7 — the opaque-call lane's per-kind fast path: a callee
@@ -12015,6 +12063,14 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
                 .map(super::clone_hot);
             // SAFETY: as for the full getter read below.
             let interp = unsafe { &*ctx.interp };
+            let field = field.or_else(|| {
+                super::Interpreter::laid_out_attr_value(
+                    code,
+                    name_idx,
+                    jf.deopt_pc as usize,
+                    receiver,
+                )
+            });
             match field {
                 Some(v) => (Some(v), 0),
                 None => {
@@ -12108,11 +12164,8 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     // Consume the completed value once. On cap pressure retain that same
     // value for the interpreter; None still uses its allocation-free sentinel.
     let bits = match value {
-        Object::None => u64::MAX,
         value if ctx.pins.len() < RUNTIME_PIN_CAP => {
-            let index = ctx.pins.len();
-            ctx.pins.push(Pin::Obj(value));
-            index as u64
+            pin_any(value, &mut ctx.pins).expect("below the cap")
         }
         value => {
             ctx.parked = Some(value);

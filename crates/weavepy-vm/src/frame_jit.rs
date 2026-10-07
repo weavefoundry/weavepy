@@ -1659,6 +1659,16 @@ unsafe extern "C" fn h_load_method(
         if matches!(&*top, Object::Generator(_) | Object::Coroutine(_)) {
             return u32::from(!crate::core_gen_method(code, name, top));
         }
+        // `module.func(...)`: the attribute with an empty self slot, as the
+        // core loop's arm loads it.
+        if let Object::Module(m) = &*top {
+            let Some(v) = Interpreter::core_module_attr(code, m, pc, name) else {
+                return 1;
+            };
+            crate::drop_hot(std::mem::replace(&mut *top, v));
+            st.stack.add(len).write(Object::Unbound);
+            return 0;
+        }
         let Some(ms) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
             return 1;
         };

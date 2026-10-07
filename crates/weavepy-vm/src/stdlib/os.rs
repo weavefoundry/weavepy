@@ -6822,9 +6822,16 @@ fn nt_path_splitroot(args: &[Object]) -> Result<Object, RuntimeError> {
 /// recognise it (and apply the `__fspath__` structural check, like CPython's
 /// `PathLike.__subclasshook__`).
 pub fn path_like_type() -> Rc<crate::types::TypeObject> {
-    static CLS: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
-    CLS.get_or_init(|| path_like_type_singleton("PathLike"))
+    PATH_LIKE
+        .get_or_init(|| path_like_type_singleton("PathLike"))
         .clone()
+}
+
+static PATH_LIKE: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
+
+/// Whether `t` is [`path_like_type`] (without taking a reference).
+pub(crate) fn is_path_like(t: &Rc<crate::types::TypeObject>) -> bool {
+    PATH_LIKE.get().is_some_and(|c| Rc::ptr_eq(c, t))
 }
 
 fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {

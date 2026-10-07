@@ -13729,6 +13729,24 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Helper);
                         }
+                        // `module.func(...)`: the attribute off the site's
+                        // cached index (no method binds), with an empty self
+                        // slot; a shared module leaves by a plain decrement.
+                        // SAFETY: as above.
+                        if let Object::Module(m) = unsafe { &*top } {
+                            let Some(v) = Self::core_module_attr(code, m, pc, ins.arg) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            // SAFETY: `len < cap`: `top` and the slot above.
+                            unsafe {
+                                drop_hot(std::mem::replace(&mut *top, v));
+                                base.add(len).write(Object::Unbound);
+                            }
+                            len += 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
                             break Some(CoreExit::Helper);
                         };
@@ -15129,7 +15147,11 @@ impl Interpreter {
         frame.pc = pc as u32 + 1;
         let globals = frame.globals.clone();
         let pending = self.core_pending_enter(sw, frame, pc);
-        let result = self.call(&callee, std::slice::from_ref(&arg), &[], &globals);
+        let result = match &callee {
+            Object::Type(ty) => self.container_ctor1(ty, &arg),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.call(&callee, std::slice::from_ref(&arg), &[], &globals));
         self.lean_pending_exit(pending);
         self.release(arg);
         drop(callee);
@@ -16569,12 +16591,9 @@ impl Interpreter {
     }
 
     /// The `__slots__` member `co_names[name_idx]` of the instance at
-    /// `top`, read at its position in the class's slot layout (see
-    /// [`crate::types::PyInstance::laid_out_slot`]) and replacing the
-    /// instance there. The `LOAD_ATTR` site at `pc` remembers the position
-    /// under the class's attribute version (see [`LAID_OUT_SLOT`]), found
-    /// when the class resolves the name to its slot descriptor. `false`
-    /// (an unset member, any other shape) touches nothing.
+    /// `top`, read at its position in the class's slot layout and
+    /// replacing the instance there (see [`Self::laid_out_attr_value`]).
+    /// `false` (an unset member, any other shape) touches nothing.
     ///
     /// # Safety
     ///
@@ -16588,46 +16607,60 @@ impl Interpreter {
     ) -> bool {
         // SAFETY: the caller's contract.
         let recv = unsafe { &*top };
-        let Object::Instance(inst) = recv else {
+        if !Self::core_droppable(recv) {
             return false;
+        }
+        let Some(v) = Self::laid_out_attr_value(code, name_idx, pc, recv) else {
+            return false;
+        };
+        // SAFETY: the receiver (droppable) is replaced in place.
+        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+        true
+    }
+
+    /// The `__slots__` member `co_names[name_idx]` of `recv`, an instance,
+    /// read at its position in the class's slot layout (see
+    /// [`crate::types::PyInstance::laid_out_slot`]). The `LOAD_ATTR` site
+    /// at `pc` remembers the position under the class's attribute version
+    /// (see [`LAID_OUT_SLOT`]), found when the class resolves the name to
+    /// its slot descriptor. `None` for an unset member or any other shape.
+    #[inline(always)]
+    pub(crate) fn laid_out_attr_value(
+        code: &CodeObject,
+        name_idx: u32,
+        pc: usize,
+        recv: &Object,
+    ) -> Option<Object> {
+        let Object::Instance(inst) = recv else {
+            return None;
         };
         let cls = inst.cls_raw();
         let ver = cls.attr_version.get();
-        let Some(stamp) = code_stamp_slot(code, pc as u32) else {
-            return false;
-        };
+        let stamp = code_stamp_slot(code, pc as u32)?;
         let idx = match stamp.get() {
             [v, LAID_OUT_SLOT, idx] if v == ver => idx as usize,
             _ => {
-                if cls.native_kind.get() != 0
+                if cls.slot_layout.get().is_none_or(Option::is_none)
+                    || cls.native_kind.get() != 0
                     || !Self::default_getattribute(cls)
                     || crate::object::exotic_str_keys_possible()
                 {
-                    return false;
+                    return None;
                 }
-                let Some(name) = code.names.get(name_idx as usize) else {
-                    return false;
-                };
+                let name = code.names.get(name_idx as usize)?;
                 if matches!(name.as_str(), "__weakref__" | "__dict__")
                     || !matches!(cls.lookup(name), Some(Object::SlotDescriptor(sd)) if sd.name == *name)
                 {
-                    return false;
+                    return None;
                 }
-                let Some((i, _)) = inst.laid_out_position(name) else {
-                    return false;
-                };
+                let (i, _) = inst.laid_out_position(name)?;
                 stamp.set([ver, LAID_OUT_SLOT, u64::from(i)]);
                 i as usize
             }
         };
-        if !Self::core_droppable(recv) {
-            return false;
-        }
         // SAFETY: a read between two instructions; the value is cloned
         // before anything else runs.
-        let Some(v) = (unsafe { inst.laid_out_slot(idx) }).map(Self::clone_operand) else {
-            return false;
-        };
+        let v = (unsafe { inst.laid_out_slot(idx) }).map(Self::clone_operand)?;
         // The site's inline cache takes the slot shape too, as the full
         // handler's specialization would: the frameless evaluators read
         // the member through it.
@@ -16642,9 +16675,7 @@ impl Interpreter {
                 }
             }
         }
-        // SAFETY: the receiver (droppable) is replaced in place.
-        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
-        true
+        Some(v)
     }
 
     /// `x.name` at `top` for a receiver whose attribute is a plain value
@@ -16707,10 +16738,10 @@ impl Interpreter {
             Some(v) => Self::clone_operand(v),
             None => {
                 let Some(v) = Self::plain_class_value(cls, meta.as_deref(), code, name_idx) else {
-                    slot.set_class_value(ver, meta_ver, Object::Unbound);
+                    slot.set_class_value(ver, meta_ver, &Object::Unbound);
                     return false;
                 };
-                slot.set_class_value(ver, meta_ver, v.clone());
+                slot.set_class_value(ver, meta_ver, &v);
                 v
             }
         };
@@ -16885,7 +16916,7 @@ impl Interpreter {
         // also consults `__class__`.
         if let (Object::Instance(inst), Object::Type(cls)) = (obj, spec) {
             let ic = inst.cls_raw();
-            if std::ptr::eq(ic, &**cls) {
+            if std::ptr::eq(ic, Rc::as_ptr(cls)) {
                 return Some(Ok(Object::Bool(true)));
             }
             if !cls.metaclass_is_type() {
@@ -16926,7 +16957,9 @@ impl Interpreter {
             if !cls.metaclass_is_type() {
                 // An ABC answers here only when its verdict is known.
                 let known = match (obj, builtin_cls) {
-                    (Object::Instance(inst), _) if std::ptr::eq(inst.cls_raw(), &**cls) => {
+                    (Object::Instance(inst), _)
+                        if std::ptr::eq(inst.cls_raw(), Rc::as_ptr(cls)) =>
+                    {
                         Some(true)
                     }
                     (Object::Instance(inst), _) => {
@@ -36138,14 +36171,9 @@ impl Interpreter {
                     // (see `Interpreter::sum_fold`).
                     loop {
                         let sink = FoldSink::Collect(std::ptr::from_mut(&mut out));
-                        match self.generator_send_fold(g, Object::None, Some(sink)) {
-                            Ok(x) => out.push(x),
-                            Err(RuntimeError::PyException(exc))
-                                if exc.type_name() == "StopIteration" =>
-                            {
-                                return Ok(out);
-                            }
-                            Err(e) => return Err(e),
+                        match self.gen_drain_next(g, sink, false)? {
+                            Some(x) => out.push(x),
+                            None => return Ok(out),
                         }
                     }
                 }
@@ -36314,13 +36342,8 @@ impl Interpreter {
                 // (see `Interpreter::sum_fold`); it returns at the first
                 // yield it cannot fold, or when the generator ends.
                 let sink = FoldSink::Sum(std::ptr::from_mut(&mut total));
-                let x = match self.generator_send_fold(g, Object::None, Some(sink)) {
-                    Ok(v) => v,
-                    Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                        self.fire_caught_stop_iteration(&exc)?;
-                        break;
-                    }
-                    Err(e) => return Err(e),
+                let Some(x) = self.gen_drain_next(g, sink, true)? else {
+                    break;
                 };
                 total.add(self, x)?;
             }
@@ -36429,17 +36452,8 @@ impl Interpreter {
         // only the rest come back here.
         if let Object::Generator(g) = &args[0] {
             loop {
-                let x = match self.generator_send_fold(
-                    g,
-                    Object::None,
-                    Some(FoldSink::Truth(want_any)),
-                ) {
-                    Ok(v) => v,
-                    Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                        self.fire_caught_stop_iteration(&exc)?;
-                        break;
-                    }
-                    Err(e) => return Err(e),
+                let Some(x) = self.gen_drain_next(g, FoldSink::Truth(want_any), true)? else {
+                    break;
                 };
                 if self.obj_truthy(&x, globals)? == want_any {
                     return Ok(Object::Bool(want_any));
@@ -41422,6 +41436,37 @@ impl Interpreter {
                     .unwrap_or(Object::None),
             )),
             Ok(v) => Ok(GenResume::Yielded(v)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The next item a consumer draining `g` (`list`, `sum`, `any`, ...)
+    /// gets back from its resume, the yields `fold` takes folded in place
+    /// (see [`Self::generator_send_fold`]): `None` once `g` is exhausted.
+    /// Without observers, the return builds no `StopIteration`; with them,
+    /// `fire` reports the one it raises as caught.
+    fn gen_drain_next(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        fold: FoldSink,
+        fire: bool,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let raw = !crate::trace::any_observers_active();
+        if raw {
+            GEN_RAW_RETURN.with(|r| r.set(true));
+        }
+        match self.generator_send_fold(g, Object::None, Some(fold)) {
+            Ok(Object::Unbound) if raw => {
+                drop(GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()));
+                Ok(None)
+            }
+            Ok(x) => Ok(Some(x)),
+            Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                if fire {
+                    self.fire_caught_stop_iteration(&exc)?;
+                }
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
@@ -49527,6 +49572,11 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        if let ([arg], []) = (args, kwargs) {
+            if let Some(r) = self.container_ctor1(ty, arg) {
+                return r;
+            }
+        }
         // CPython routes `str(x)` / `repr(x)` through dunders;
         // intercept the built-in classes here so that the
         // user's `__str__` / `__repr__` wins over the default
@@ -49602,6 +49652,74 @@ impl Interpreter {
         // allocations just like their literal forms; `track_new_object`
         // ignores untrackable result types.
         self.record_alloc(&obj);
+        Ok(obj)
+    }
+
+    /// `list(x)`, `tuple(x)`, `set(x)` or `frozenset(x)` of the exact
+    /// builtin type: what [`Self::instantiate`] builds for it, without the
+    /// per-type checks it runs first. `None` for any other type.
+    fn container_ctor1(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        arg: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        if !ty.flags.is_builtin {
+            return None;
+        }
+        let bt = builtin_types();
+        let r = if Rc::ptr_eq(ty, &bt.list_) || Rc::ptr_eq(ty, &bt.tuple_) {
+            let name = if Rc::ptr_eq(ty, &bt.list_) {
+                "list"
+            } else {
+                "tuple"
+            };
+            let globals = self.builtins.clone();
+            self.do_list_or_tuple_call(name, arg, &globals)
+        } else if Rc::ptr_eq(ty, &bt.set_) || Rc::ptr_eq(ty, &bt.frozenset_) {
+            let is_set = Rc::ptr_eq(ty, &bt.set_);
+            if matches!(
+                arg,
+                Object::Generator(_) | Object::Iter(_) | Object::Instance(_)
+            ) || object_needs_vm_iter(arg)
+            {
+                self.set_from_vm_iter(arg, is_set)
+            } else if is_set {
+                crate::builtins::b_set(std::slice::from_ref(arg))
+            } else {
+                crate::builtins::b_frozenset(std::slice::from_ref(arg))
+            }
+        } else {
+            return None;
+        };
+        Some(r.inspect(|obj| self.record_alloc(obj)))
+    }
+
+    /// `set(it)` or `frozenset(it)` of an iterable only the interpreter
+    /// can drive (a generator, a `zip`/`map`/`filter` view, an instance's
+    /// `__iter__`, RFC 0033).
+    fn set_from_vm_iter(&mut self, it: &Object, is_set: bool) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        let items = self.collect_iterable(it, &globals)?;
+        // Admit each element like CPython's `set_add_entry`: an unhashable
+        // element (a list out of a generator, e.g. pandas' `should_cache`
+        // probing `set(islice(series_of_lists, n))`) raises `TypeError:
+        // unhashable type`.
+        let mut out = crate::object::SetData::with_capacity_and_hasher(
+            items.len(),
+            crate::fasthash::FxBuildHasher,
+        );
+        for v in items {
+            let key = crate::builtins::set_insert_key(&v)?;
+            crate::object::key_cmp_scope(|| out.insert(key))?;
+        }
+        if !is_set {
+            return Ok(Object::FrozenSet(Rc::new(
+                crate::object::FrozenSetObj::new(out),
+            )));
+        }
+        // CPython tracks every set (as `b_set` does).
+        let obj = Object::Set(Rc::new(RefCell::new(out)));
+        gc_trace::track(&obj);
         Ok(obj)
     }
 
@@ -52596,22 +52714,7 @@ impl Interpreter {
                 && kwargs.is_empty()
             {
                 if cls.name == "set" || cls.name == "frozenset" {
-                    let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                    let items = self.collect_iterable(&args[0], &global_dummy)?;
-                    // Admit each element like CPython's `set_add_entry`: an
-                    // unhashable element (a list out of a generator, e.g.
-                    // pandas' `should_cache` probing `set(islice(series_of_
-                    // lists, n))`) raises `TypeError: unhashable type`.
-                    let mut out = crate::object::SetData::default();
-                    for v in items {
-                        let key = crate::builtins::set_insert_key(&v)?;
-                        crate::object::key_cmp_scope(|| out.insert(key))?;
-                    }
-                    return Ok(if cls.name == "set" {
-                        Object::Set(Rc::new(RefCell::new(out)))
-                    } else {
-                        Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(out)))
-                    });
+                    return self.set_from_vm_iter(&args[0], cls.name == "set");
                 }
                 if cls.name == "dict" {
                     let global_dummy = Rc::new(RefCell::new(DictData::default()));
@@ -62216,7 +62319,8 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         if !c.metaclass_is_type() {
             return None;
         }
-        if Rc::ptr_eq(cls, c) || cls.is_subclass_of(c) {
+        // (`os.PathLike` answers structurally, as the full call does.)
+        if Rc::ptr_eq(cls, c) || crate::builtins::type_subclass_match(cls, c) {
             return Some(Ok(Object::Bool(true)));
         }
     }
@@ -69255,10 +69359,15 @@ enum MethodSlotFn {
     /// function or constant) for the class at the key's version under a
     /// metaclass at `meta_ver` (`0` for `type`), which reads it as `type`
     /// does (see `Interpreter::core_class_value`); `Unbound` remembers that
-    /// the name has no such value there.
+    /// the name has no such value there. The value is a borrowed copy, as
+    /// CPython's attribute caches hold theirs: the class's MRO dict entry
+    /// keeps it alive while the class stays at the key's version (any
+    /// change to the entry bumps it), and only a receiver class at that
+    /// version reads it. The slot never releases it, and so never keeps
+    /// the class's cycles (`A.od[A]`) alive.
     ClassValue {
         meta_ver: u64,
-        value: Object,
+        value: std::mem::ManuallyDrop<Object>,
     },
 }
 
@@ -69680,14 +69789,20 @@ impl MethodSlot {
         // SAFETY: GIL-serialized; no `&mut` escapes `set_class_value`.
         match unsafe { &*self.0.get() } {
             (v, MethodSlotFn::ClassValue { meta_ver: m, value }) if *v == ver && *m == meta_ver => {
-                Some(value)
+                Some(&**value)
             }
             _ => None,
         }
     }
 
+    /// Remember `value`, the class dict entry `cls.name` resolves to at
+    /// `ver` (or `Unbound`), as a borrowed copy (see
+    /// [`MethodSlotFn::ClassValue`]).
     #[inline]
-    fn set_class_value(&self, ver: u64, meta_ver: u64, value: Object) {
+    fn set_class_value(&self, ver: u64, meta_ver: u64, value: &Object) {
+        // SAFETY: a bitwise copy that takes no reference and is never
+        // released; it is read only while the dict entry it copies lives.
+        let value = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(value) });
         // SAFETY: as `set`; the displaced entry drops after the store.
         let old = unsafe {
             std::mem::replace(
@@ -69840,7 +69955,8 @@ fn leaf_kwonly_defaults(
     for slot in npos..npos + kwonly {
         if covered & (1 << slot) == 0 {
             let name = code.varnames.get(slot)?.as_str();
-            *args.get_mut(slot)? = &f.kw_defaults.iter().find(|(n, _)| n == name)?.1;
+            *args.get_mut(slot)? =
+                std::ptr::from_ref(&f.kw_defaults.iter().find(|(n, _)| n == name)?.1);
         }
     }
     Some(())

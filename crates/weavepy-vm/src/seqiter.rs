@@ -131,11 +131,16 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         if let Object::Function(f) = func {
             if let Some(r) = self.call_pure_leaf(f, std::slice::from_ref(&v)) {
+                self.release(v);
                 return Ok(r);
             }
             return self.call_python_owned(f, vec![v], Vec::new());
         }
-        self.call(func, std::slice::from_ref(&v), &[], globals)
+        let r = self.call(func, std::slice::from_ref(&v), &[], globals);
+        // A dead item's allocation is recycled (a tuple's, as CPython's
+        // freelist does: `map(id, ((i, i) for ...))` sees one address).
+        self.release(v);
+        r
     }
 
     /// Drain a builtin adapter into `out` (`list(map(f, xs))`, `sorted`,

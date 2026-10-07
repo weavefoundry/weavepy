@@ -7260,7 +7260,7 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Type(class_of(arg)))
 }
 
-fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     // `set()` takes at most one positional argument (the iterable);
     // `set([], 2)` is a `TypeError` (CPython `set_init`, test_new_or_init).
     if args.len() > 1 {
@@ -7323,7 +7323,7 @@ fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
     }
 }
 
-fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
     // `frozenset()` takes at most one positional argument (CPython
     // `frozenset_new`); `frozenset([], 2)` is a `TypeError`.
     if args.len() > 1 {
@@ -8977,8 +8977,11 @@ pub fn class_matches_classinfo_named(
 /// is *exactly* `os.PathLike`: a user subclass `class A(os.PathLike)` inherits
 /// the hook, which returns `NotImplemented` for `cls is not PathLike`, so it
 /// falls back to a normal MRO check (`test_pathlike_subclasshook`).
-fn type_subclass_match(cls: &crate::types::TypeObject, t: &Rc<crate::types::TypeObject>) -> bool {
-    if Rc::ptr_eq(t, &crate::stdlib::os::path_like_type()) {
+pub(crate) fn type_subclass_match(
+    cls: &crate::types::TypeObject,
+    t: &Rc<crate::types::TypeObject>,
+) -> bool {
+    if crate::stdlib::os::is_path_like(t) {
         return cls
             .lookup("__fspath__")
             .is_some_and(|m| !matches!(m, Object::None));
