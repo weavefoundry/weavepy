@@ -1,7 +1,8 @@
 """`isinstance` against ABCs answered from the ABC's positive cache.
 
 A class whose subclass check succeeded once stays an answer of `True`,
-read without calling `__instancecheck__`. A class only registered later,
+and one that failed stays `False` until a registration, read without
+calling `__instancecheck__`, for instances and builtin values alike. A class only registered later,
 a cleared cache, a replaced `__instancecheck__`, an instance whose
 `__class__` reports another class, and a subclass hook that rejects must
 still go through the full check.
@@ -42,6 +43,15 @@ class AbcIsinstanceCacheTest(unittest.TestCase):
         self.assertTrue(isinstance(o, Base))
         Base._abc_caches_clear()
         self.assertTrue(isinstance(o, Base))
+
+    def test_builtin_values(self):
+        from collections.abc import Mapping, Sequence
+
+        for _ in range(2000):
+            self.assertTrue(isinstance({}, Mapping))
+            self.assertFalse(isinstance([], Mapping))
+            self.assertTrue(isinstance([], (Mapping, Sequence)))
+            self.assertFalse(isinstance(1, (Mapping, Sequence)))
 
     def test_custom_metaclass_hook(self):
         class Meta(abc.ABCMeta):

@@ -16658,13 +16658,14 @@ impl Interpreter {
         // also consults `__class__`.
         if let (Object::Instance(inst), Object::Type(cls)) = (obj, spec) {
             let ic = inst.cls_raw();
-            let hit = std::ptr::eq(ic, &**cls)
-                || if cls.metaclass_is_type() {
-                    ic.is_subclass_of(cls)
-                } else {
-                    crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
-                };
-            return hit.then_some(Ok(Object::Bool(true)));
+            if std::ptr::eq(ic, &**cls) {
+                return Some(Ok(Object::Bool(true)));
+            }
+            if !cls.metaclass_is_type() {
+                return crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
+                    .map(|b| Ok(Object::Bool(b)));
+            }
+            return ic.is_subclass_of(cls).then_some(Ok(Object::Bool(true)));
         }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).
@@ -16696,15 +16697,24 @@ impl Interpreter {
                 return None;
             };
             if !cls.metaclass_is_type() {
-                // An ABC answers here only when its verdict is known true.
-                match obj {
-                    Object::Instance(inst)
-                        if std::ptr::eq(inst.cls_raw(), &**cls)
-                            || crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls()) =>
-                    {
-                        return Some(Ok(Object::Bool(true)));
+                // An ABC answers here only when its verdict is known.
+                let known = match (obj, builtin_cls) {
+                    (Object::Instance(inst), _) if std::ptr::eq(inst.cls_raw(), &**cls) => {
+                        Some(true)
                     }
-                    _ => return None,
+                    (Object::Instance(inst), _) => {
+                        crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
+                    }
+                    (Object::File(_), _) => None,
+                    (_, Some(own)) => crate::stdlib::abc_mod::abc_instance_cached(cls, own),
+                    (obj, None) => {
+                        crate::stdlib::abc_mod::abc_instance_cached(cls, &builtins::class_of(obj))
+                    }
+                };
+                match known {
+                    Some(true) => return Some(Ok(Object::Bool(true))),
+                    Some(false) => continue,
+                    None => return None,
                 }
             }
             hit |= match (obj, builtin_cls) {
@@ -16715,6 +16725,10 @@ impl Interpreter {
                 (_, Some(own)) => Rc::ptr_eq(own, cls) || own.is_subclass_of(cls),
                 (obj, None) => builtins::class_of(obj).is_subclass_of(cls),
             };
+            // (The first match answers, as `isinstance` asks in order.)
+            if hit {
+                return Some(Ok(Object::Bool(true)));
+            }
         }
         if !hit && matches!(obj, Object::Instance(_)) {
             return None;

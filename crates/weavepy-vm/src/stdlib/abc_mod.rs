@@ -442,33 +442,39 @@ pub(crate) fn forwarded_check(
     Some(body)
 }
 
-/// Whether `isinstance(instance, cls)` is known true for the ABC `cls`
-/// and an instance of `inst_cls` without running anything: `cls`'s
-/// metaclass checks instances with `abc`'s own forwarding
-/// `__instancecheck__` (see [`forwarded_check`]), the instance reports its
-/// class as `__class__` (`object`'s descriptor), and `cls`'s positive
-/// cache already holds that class, as [`abc_instancecheck`] would find
-/// first. `false` leaves the question to the full check.
-pub(crate) fn abc_instance_cached(cls: &TypeObject, inst_cls: &Rc<TypeObject>) -> bool {
+/// `isinstance(instance, cls)` for the ABC `cls` and an instance of
+/// `inst_cls` when it's known without running anything: `cls`'s metaclass
+/// checks instances with `abc`'s own forwarding `__instancecheck__` (see
+/// [`forwarded_check`]), the instance reports its class as `__class__`
+/// (`object`'s descriptor), and `cls`'s positive cache, or its current
+/// negative cache, already holds that class, as [`abc_instancecheck`]
+/// would find first. `None` leaves the question to the full check.
+pub(crate) fn abc_instance_cached(cls: &TypeObject, inst_cls: &Rc<TypeObject>) -> Option<bool> {
     // SAFETY: GIL-serialized read of the metaclass cell, finished before
     // anything else runs.
-    let Some(meta) = (unsafe { cls.metaclass.peek() }).and_then(|m| m.clone()) else {
-        return false;
-    };
-    let Some(hook) = instancecheck_hook(&meta) else {
-        return false;
-    };
+    let meta = (unsafe { cls.metaclass.peek() }).and_then(|m| m.clone())?;
+    let hook = instancecheck_hook(&meta)?;
     if forwarded_check(&hook, false).is_none() || !default_class_attr(inst_cls) {
-        return false;
+        return None;
     }
     let held = Object::Type(inst_cls.clone());
+    let verdict = |owner: &TypeObject| {
+        let data = state(owner);
+        if data.cache.borrow().contains(&held) {
+            Some(true)
+        } else if data.negative_cache_version.get() == INVALIDATION_COUNTER.load(Ordering::Relaxed)
+            && data.negative_cache.borrow().contains(&held)
+        {
+            Some(false)
+        } else {
+            None
+        }
+    };
     if cls.abc_state.get().is_some() {
-        return state(cls).cache.borrow().contains(&held);
+        return verdict(cls);
     }
     let mro = cls.mro.borrow();
-    mro.iter()
-        .find(|base| base.abc_state.get().is_some())
-        .is_some_and(|base| state(base).cache.borrow().contains(&held))
+    verdict(mro.iter().find(|base| base.abc_state.get().is_some())?)
 }
 
 /// `meta.__instancecheck__` off the metaclass's MRO, remembered under its
