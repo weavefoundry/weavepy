@@ -127,6 +127,7 @@ fn scalar_leaf_returns_and_deopts_with_no_embedder_context() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: crate::runtime::JIT_POLL_STRIDE,
         };
         // SAFETY: the certified scalar leaf needs no helper context, all
         // buffers fit its metadata, and the owning engine is still alive.
@@ -196,6 +197,7 @@ fn scalar_math_leaves_need_no_embedder_context() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: crate::runtime::JIT_POLL_STRIDE,
         };
         // SAFETY: only certified scalar operations run, buffers fit, and
         // the context-free math helpers were registered before compilation.
@@ -244,6 +246,7 @@ fn explicit_exit_preserves_operands_and_updated_locals() {
         ctx: std::ptr::null_mut(),
         call_args: std::ptr::null_mut(),
         call_tags: std::ptr::null_mut(),
+        poll_left: crate::runtime::JIT_POLL_STRIDE,
     };
     // SAFETY: this IR uses only scalar loads/stores and an explicit exit,
     // needs no helpers, and all buffers fit the live compiled metadata.
@@ -417,6 +420,7 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: crate::runtime::JIT_POLL_STRIDE,
         };
         // SAFETY: all buffers and the registered helper context remain live;
         // the owning engine outlives the call.
@@ -540,6 +544,7 @@ fn dynamic_attribute_reads_publish_each_cache_pc() {
         ctx: std::ptr::null_mut(),
         call_args: std::ptr::null_mut(),
         call_tags: std::ptr::null_mut(),
+        poll_left: crate::runtime::JIT_POLL_STRIDE,
     };
     // SAFETY: the engine, frame, and buffers outlive this entry.
     assert_eq!(
@@ -735,6 +740,7 @@ fn cached_attribute_chains_keep_native_fallback_and_exact_exits() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: crate::runtime::JIT_POLL_STRIDE,
         };
         // SAFETY: all buffers fit the compiled metadata and outlive this call.
         assert_eq!(unsafe { compiled.enter(&raw mut frame) }, expected);
@@ -1018,6 +1024,7 @@ fn adjacent_scalar_reads_share_only_a_guarded_value() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: crate::runtime::JIT_POLL_STRIDE,
         };
         // SAFETY: the engine, buffers, and registered helper outlive this call.
         let status = unsafe { compiled.enter(&raw mut frame) };

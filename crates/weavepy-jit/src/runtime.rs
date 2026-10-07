@@ -350,6 +350,11 @@ pub struct JitFrame {
     pub call_args: *mut u64,
     /// Matching [`SlotTag`]s for [`Self::call_args`].
     pub call_tags: *mut u32,
+    /// The loop-header poll countdown at the last exit (see
+    /// [`JIT_POLL_STRIDE`]): with the activation's poll count, how many
+    /// loop iterations it ran natively. Left as seeded by code without
+    /// loops.
+    pub poll_left: i64,
 }
 
 impl JitFrame {

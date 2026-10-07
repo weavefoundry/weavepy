@@ -519,6 +519,10 @@ struct CacheEntry {
     /// they don't spend [`Self::osr_failures`], which would silence the
     /// code's other loops. Cleared when the code recompiles.
     osr_absent: Vec<u32>,
+    /// Per OSR entry pc (a loop entered at its back edge): the entries
+    /// counted toward the next verdict, and the loop iterations they ran
+    /// natively (see [`note_osr_trips`]).
+    osr_trips: Vec<(u32, u32, u64)>,
     /// Back edges run while cold (counted a consultation's stride at a
     /// time) and the activations they ran in: the activations counted
     /// here, plus the lean ones the code's `jit_hint` counts (credited
@@ -594,6 +598,7 @@ impl CacheEntry {
             recompile_at_osr: false,
             cold_recompiles: 0,
             osr_absent: Vec::new(),
+            osr_trips: Vec::new(),
             native: None,
             method_native: None,
             direct: None,
@@ -5313,6 +5318,7 @@ unsafe fn enter_scalar_leaf(
         ctx: std::ptr::null_mut(),
         call_args: std::ptr::null_mut(),
         call_tags: std::ptr::null_mut(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
     // SAFETY: the engine's scalar-leaf allowlist excludes every contextual
     // helper, pin, poll, and Python call. Its math helpers need only scalar
@@ -6114,6 +6120,7 @@ unsafe fn try_native_call(
         ctx: std::ptr::from_mut::<CallCtx>(nctx).cast::<u8>(),
         call_args: call_args.as_mut_ptr(),
         call_tags: call_tags.as_mut_ptr(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
     // SAFETY: the buffers are sized per the compiled frame's analysis
     // (the same invariants `enter_compiled` documents); the engine
@@ -13477,6 +13484,7 @@ pub(crate) fn try_call_native_direct(
         ctx: std::ptr::from_mut(&mut ctx).cast::<u8>(),
         call_args: call_args.as_mut_ptr(),
         call_tags: call_tags.as_mut_ptr(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
     // SAFETY: the buffers are sized per the compiled frame's analysis
     // (the invariants `enter_compiled` documents); the engine backing
@@ -13944,6 +13952,62 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     enter_compiled(interp, frame, &entry, pc, &synth, None)
 }
 
+/// OSR entries at one pc counted toward a verdict on it.
+const OSR_VERDICT_ENTRIES: u32 = 16;
+
+/// The fewest loop iterations an OSR entry's runs must average: an entry
+/// and its exit (the frame rebuilt for the interpreter) cost several
+/// interpreted iterations, though a float kernel's iteration gains enough
+/// natively for a short loop to pay (`scimark`'s `lu` runs 16 a pass in
+/// its last rows).
+const OSR_MIN_TRIPS: u64 = 8;
+
+/// Count an OSR entry of `code` at `pc` that ran `trips` loop iterations
+/// natively before handing the frame back. An entry whose runs average
+/// too few to pay for themselves (a scanner's inner `while`, run a few
+/// characters per token; a loop over a node's few neighbors) is taken no
+/// more, and the code's back edges are left to the frame JIT, which runs
+/// its loops without the hand-off.
+fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    let short = JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let Some(e) = st.cache.get_mut(&key) else {
+            return false;
+        };
+        let k = match e.osr_trips.iter().position(|r| r.0 == pc) {
+            Some(k) => k,
+            None => {
+                e.osr_trips.push((pc, 0, 0));
+                e.osr_trips.len() - 1
+            }
+        };
+        let r = &mut e.osr_trips[k];
+        r.1 += 1;
+        r.2 = r.2.saturating_add(trips);
+        if r.1 < OSR_VERDICT_ENTRIES {
+            return false;
+        }
+        let short = r.2 < u64::from(r.1) * OSR_MIN_TRIPS;
+        if crate::hot_gates::env_flags::jit_trace() {
+            eprintln!(
+                "jit osr trips {:?} pc {} average {}",
+                code.qualname,
+                pc,
+                r.2 / u64::from(r.1)
+            );
+        }
+        *r = (pc, 0, 0);
+        if short && !e.osr_absent.contains(&pc) {
+            e.osr_absent.push(pc);
+        }
+        short
+    });
+    if short {
+        code.jit_hint.set_backedge_quiet();
+    }
+}
+
 /// Whether the innermost live loop iterator (the top of an OSR request's
 /// stack) has fewer than `weavepy_jit::MIN_REGION_TRIPS` items left.
 fn short_live_loop(stack: &[Object]) -> bool {
@@ -14377,6 +14441,7 @@ fn enter_compiled(
         ctx: std::ptr::from_mut(&mut ctx).cast::<u8>(),
         call_args: call_args.as_mut_ptr(),
         call_tags: call_tags.as_mut_ptr(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
 
     // SAFETY: `locals_buf` is `n_locals` wide, `spill`/`tags` are
@@ -14390,6 +14455,14 @@ fn enter_compiled(
     let status = with_native_frame(&frame.locals, jf_ptr, || unsafe { cf.enter(jf_ptr) });
     end_introspection(&ctx);
 
+    // A loop's entry at its back edge: how many iterations it ran before
+    // handing the frame back.
+    if matches!(status, JitStatus::Deopt) && entry_pc != 0 && resume_bits.is_none() {
+        let left = jf.poll_left.clamp(0, weavepy_jit::JIT_POLL_STRIDE);
+        let trips = u64::from(ctx.polls) * weavepy_jit::JIT_POLL_STRIDE as u64
+            + (weavepy_jit::JIT_POLL_STRIDE - left) as u64;
+        note_osr_trips(&frame.code, entry_pc, trips);
+    }
     // A cold exit is an expected hand-off, never a deopt charge.
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
     note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);
@@ -15289,6 +15362,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         ctx: std::ptr::from_mut(&mut ctx).cast::<u8>(),
         call_args: act.call_args.as_mut_ptr(),
         call_tags: act.call_tags.as_mut_ptr(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();

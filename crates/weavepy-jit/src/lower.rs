@@ -37,6 +37,7 @@ const OFF_CALL_TAGS: i32 = core::mem::offset_of!(JitFrame, call_tags) as i32;
 const OFF_N_LOCALS: i32 = core::mem::offset_of!(JitFrame, n_locals) as i32;
 const OFF_STACK_CAP: i32 = core::mem::offset_of!(JitFrame, stack_cap) as i32;
 const OFF_CTX: i32 = core::mem::offset_of!(JitFrame, ctx) as i32;
+const OFF_POLL_LEFT: i32 = core::mem::offset_of!(JitFrame, poll_left) as i32;
 
 /// A call token whose sites may enter a compiled scalar leaf directly
 /// (see `engine::CompiledFrame::direct_leaf`): the leaf's function in
@@ -5755,6 +5756,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.b
             .ins()
             .store(trusted, pcv, self.frame_ptr, OFF_DEOPT_PC);
+        // How far the loops counted toward their next poll.
+        if let Some(cd_var) = self.poll_countdown {
+            let cd = self.b.use_var(cd_var);
+            self.b
+                .ins()
+                .store(trusted, cd, self.frame_ptr, OFF_POLL_LEFT);
+        }
         let status = self.b.ins().iconst(types::I64, status as i64);
         self.b.ins().return_(&[status]);
     }

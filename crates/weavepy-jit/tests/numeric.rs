@@ -36,6 +36,7 @@ fn run(tfunc: &TFunc, locals_in: &[u64]) -> (JitStatus, u64, u32, Vec<(u64, u32)
         ctx: std::ptr::null_mut(),
         call_args: std::ptr::null_mut(),
         call_tags: std::ptr::null_mut(),
+        poll_left: weavepy_jit::JIT_POLL_STRIDE,
     };
     // SAFETY: buffers are sized to n_locals / max_stack; `engine` (and so
     // the backing module) outlives this call.
@@ -171,6 +172,7 @@ fn checked_integer_results_and_overflow_snapshots_match_wide_arithmetic() {
             ctx: std::ptr::null_mut(),
             call_args: std::ptr::null_mut(),
             call_tags: std::ptr::null_mut(),
+            poll_left: weavepy_jit::JIT_POLL_STRIDE,
         };
         for &(a, b) in &pairs {
             locals.copy_from_slice(&[a as u64, b as u64]);
