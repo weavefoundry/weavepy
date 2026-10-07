@@ -12279,7 +12279,7 @@ impl Interpreter {
                                     // its frame released may have queued a
                                     // finalizer, run before the next
                                     // instruction).
-                                    gen_fast::GenNext::Exhausted => {
+                                    gen_fast::GenNext::Exhausted(_) => {
                                         len -= 1;
                                         // SAFETY: the slot is initialized.
                                         unsafe { drop_hot(base.add(len).read()) };
@@ -13061,6 +13061,47 @@ impl Interpreter {
                                     if Rc::as_ptr(b) as usize == self.leaf_fns().next_ptr
                             )
                         {
+                            // A simple body steps to its next yield in place,
+                            // as `FOR_ITER`'s does (see `gen_fast`).
+                            // SAFETY: `len >= 3`: the generator's slot.
+                            if let (Object::Generator(g), true) =
+                                (unsafe { &*base.add(len - 1) }, Self::core_drops_plain())
+                            {
+                                match self.gen_fast_next(g, snap_gen, 0, pending_work) {
+                                    gen_fast::GenNext::Yielded(v) => {
+                                        // SAFETY: the builtin and the generator
+                                        // (the loop's own slots hold them past
+                                        // the step) leave by plain decrements;
+                                        // the value takes the callee's slot.
+                                        unsafe {
+                                            for k in len - 3..len {
+                                                drop_hot(base.add(k).read());
+                                            }
+                                            base.add(len - 3).write(v);
+                                        }
+                                        len -= 2;
+                                        last = pc;
+                                        pc += 1;
+                                        after_release!();
+                                        continue;
+                                    }
+                                    // `next(gen)` raises `StopIteration(value)`.
+                                    gen_fast::GenNext::Exhausted(v) => {
+                                        // SAFETY: as above.
+                                        unsafe {
+                                            for k in len - 3..len {
+                                                drop_hot(base.add(k).read());
+                                            }
+                                        }
+                                        len -= 3;
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(
+                                            crate::error::stop_iteration_with(v),
+                                        )));
+                                    }
+                                    gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
+                                }
+                            }
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;

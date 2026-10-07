@@ -43,8 +43,8 @@ pub(crate) enum GenStep {
 /// How a fast `next()` of a generator ended.
 pub(crate) enum GenNext {
     Yielded(Object),
-    /// The generator returned, and is finished.
-    Exhausted,
+    /// The generator returned this value, and is finished.
+    Exhausted(Object),
     /// Nothing happened: the generator is as it was.
     Declined,
     /// The generator consumed its sent value and advanced, then stopped
@@ -778,7 +778,8 @@ impl Interpreter {
             // that could reach this frame.)
             Object::Generator(g) => match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
                 GenNext::Yielded(v) => ForNext::Value(v),
-                GenNext::Exhausted => ForNext::Exhausted,
+                // (A `FOR_ITER` discards the return value.)
+                GenNext::Exhausted(_) => ForNext::Exhausted,
                 GenNext::Declined | GenNext::Partial => ForNext::Bail,
             },
             _ => ForNext::Bail,
@@ -863,16 +864,14 @@ impl Interpreter {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             // The general epilogue of a return (`inline_gen_finish`): the
             // generator finishes and its frame is released (anything that
-            // dies with it queues its finalizer; the value a `FOR_ITER`
-            // discards too).
+            // dies with it queues its finalizer).
             GenStep::Returned(v) => {
                 *g.state.borrow_mut() = GeneratorState::Finished;
-                drop(v);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(g);
                 drop(boxed);
-                return GenNext::Exhausted;
+                return GenNext::Exhausted(v);
             }
             GenStep::Bail if frame.pc == start => {
                 // Nothing ran: the resume is undone.

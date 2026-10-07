@@ -891,7 +891,7 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                     unsafe { out.write(v) };
                     return 1;
                 }
-                crate::gen_fast::GenNext::Exhausted => {
+                crate::gen_fast::GenNext::Exhausted(_) => {
                     // SAFETY: the finished generator leaves the stack.
                     drop(unsafe { it.read() });
                     // SAFETY: the running thread's own flag.
