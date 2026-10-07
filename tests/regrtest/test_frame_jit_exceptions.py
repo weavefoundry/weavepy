@@ -1,12 +1,12 @@
 """Exceptions caught by handlers in compiled code.
 
-A raise from a helper of compiled code (a dict's missing key, a call)
-goes to the running function's handler without leaving native code, and
-the handler's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH`, `POP_EXCEPT` and the
-`as` name's `DELETE_FAST` run there too. Everything an interpreted handler
-shows must hold: the bound name and its unbinding, `sys.exc_info()`,
-chaining, tracebacks, `finally`, a handler that doesn't match, nesting,
-and generators.
+A raise from a helper of compiled code (a dict's missing key, a call, a
+`raise`) goes to the running function's handler without leaving native
+code, and the handler's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH`, `POP_EXCEPT`
+and the `as` name's `DELETE_FAST` run there too. Everything an
+interpreted handler shows must hold: the bound name and its unbinding,
+`sys.exc_info()`, chaining, tracebacks, `finally`, a handler that doesn't
+match, nesting, and generators.
 """
 
 import os
@@ -104,6 +104,37 @@ def raise_line(d):
     return last.__traceback__.tb_lineno
 
 
+class AppError(Exception):
+    pass
+
+
+def raise_from(d, n):
+    seen = []
+    for i in range(n):
+        try:
+            try:
+                d[i]
+            except KeyError as e:
+                if i % 2:
+                    raise AppError(i) from None
+                raise AppError(i) from e
+        except AppError as err:
+            seen.append((err.args[0], err.__cause__ is None, err.__suppress_context__,
+                         type(err.__context__).__name__))
+    return seen
+
+
+def raise_class(n):
+    count = 0
+    for i in range(n):
+        try:
+            raise ValueError
+        except ValueError as e:
+            assert type(e) is ValueError and e.args == ()
+            count += 1
+    return count
+
+
 def gen(d, n):
     for i in range(n):
         try:
@@ -138,6 +169,15 @@ class FrameJitExceptionsTest(unittest.TestCase):
     def test_traceback_line(self):
         line = raise_line({})
         self.assertEqual(line, raise_line.__code__.co_firstlineno + 3)
+
+    def test_raise_from(self):
+        seen = raise_from({}, N)
+        self.assertEqual(seen[0], (0, False, True, "KeyError"))
+        self.assertEqual(seen[1], (1, True, True, "KeyError"))
+        self.assertEqual(len(seen), N)
+
+    def test_raise_class(self):
+        self.assertEqual(raise_class(N), N)
 
     def test_generator(self):
         d = {i: i for i in range(0, N, 2)}

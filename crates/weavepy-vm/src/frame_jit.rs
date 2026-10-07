@@ -3171,6 +3171,66 @@ unsafe extern "C" fn h_load_deref(st: *mut State, i: u64, dst: *mut Object) -> u
     }
 }
 
+/// `RAISE_VARARGS n` (`raise e`, or `raise e from cause`; the `pc`th
+/// instruction) over the operands atop a `len`-deep stack, as the core
+/// loop's arm raises: an exception instance or builtin exception class,
+/// and a cause of `None` or an exception instance. `RAISED` the exception
+/// in `st` (the operands gone, `st` past the instruction); anything else
+/// (`CALL_DECLINED`) is the core loop's, untouched.
+unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
+    // SAFETY: the code passes its live state, one of its raises, and its
+    // stack depth (the stack written out).
+    unsafe {
+        let st = &mut *st;
+        let (len, n) = (len as usize, n as usize);
+        if st.sw.is_null() || !(1..=2).contains(&n) || len < n {
+            return CALL_DECLINED;
+        }
+        let bt = crate::builtin_types::builtin_types();
+        let instance = |v: &Object| match v {
+            Object::Instance(i) => {
+                let cls = i.cls_raw();
+                cls.flags.is_exception || cls.is_subclass_of(&bt.base_exception)
+            }
+            _ => false,
+        };
+        let exc_ok = match &*st.stack.add(len - n) {
+            v @ Object::Instance(_) => instance(v),
+            Object::Type(t) => {
+                t.flags.is_builtin
+                    && t.flags.is_exception
+                    && !t.is_subclass_of(&bt.base_exception_group)
+            }
+            _ => false,
+        };
+        let cause_ok = n == 1 || {
+            let c = &*st.stack.add(len - 1);
+            matches!(c, Object::None) || instance(c)
+        };
+        if !exc_ok || !cause_ok {
+            return CALL_DECLINED;
+        }
+        let cause = (n == 2).then(|| st.stack.add(len - 1).read());
+        let arg = st.stack.add(len - n).read();
+        let interp = &mut *st.interp.cast_mut();
+        let globals = (*st.frame).globals.clone();
+        let raised = interp
+            .instantiate_raised_class(arg, &globals)
+            .and_then(|arg| Interpreter::normalize_exception(arg, cause))
+            .map(|mut exc| {
+                interp.attach_implicit_context(&mut exc);
+                Interpreter::sync_exc_attrs(&exc);
+                crate::RuntimeError::PyException(exc)
+            });
+        st.err = Some(match raised {
+            Ok(e) | Err(e) => e,
+        });
+        st.len = len - n;
+        st.pc = pc as usize + 1;
+        RAISED
+    }
+}
+
 /// `DELETE_FAST i` of the running frame's bound local: `0` the local
 /// emptied and its value released, anything else (an unbound local, whose
 /// `UnboundLocalError` is the core loop's) declined untouched.
@@ -3771,6 +3831,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
         OpCode::BuildTuple => (1..=3).contains(&ins.arg),
         OpCode::BuildMap => (1..=8).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
+        OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
         // (A slot shared with a cell saves the cell itself.)
         OpCode::LoadFastAndClear => {
             Interpreter::shared_cell_index(code, ins.arg as usize).is_none()
@@ -4723,6 +4784,26 @@ impl<'a> Lower<'a> {
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept => return self.container(pc),
+            OpCode::RaiseVarargs if matches!(ins.arg, 1 | 2) && self.depth >= ins.arg as usize => {
+                self.flush();
+                self.store_last();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let n = self.b.ins().iconst(types::I64, i64::from(ins.arg));
+                let r = self
+                    .call(h_raise as *const () as usize, &[self.st, pcv, len, n], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let raised = self.b.create_block();
+                let declined = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+                self.b.ins().brif(declined, out, &[], raised, &[]);
+                self.b.switch_to_block(raised);
+                self.leave(r);
+                return false;
+            }
             OpCode::DeleteFast if (ins.arg as usize) < self.nlocals => {
                 let i = ins.arg;
                 self.flush_local(i);
