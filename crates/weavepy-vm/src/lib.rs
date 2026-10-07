@@ -26728,53 +26728,7 @@ impl Interpreter {
                     .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
                 frame.push(Object::Cell(cell));
             }
-            OpCode::LoadAttr => {
-                // The receiver temporary dies when the attribute load pops it,
-                // so finalize it promptly (CPython decrefs the receiver after
-                // the load, on *both* the success and failure paths). This
-                // makes `f().cr_frame` warn on a never-awaited coroutine
-                // (bpo-45813) and — crucially for a *failing* load like
-                // `io.BufferedReader(raw).xyzzy` — flushes/closes the discarded
-                // io temporary, routing a failing `close()` to
-                // `sys.unraisablehook` even though the receiver was already
-                // popped (`test_io.test_error_through_destructor`). Only
-                // finalizable receiver kinds are captured so the hot path pays
-                // at most one `Rc` bump.
-                let receiver = match frame.stack.last() {
-                    Some(
-                        o @ (Object::Generator(_)
-                        | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)
-                        | Object::Instance(_)),
-                    ) => Some(o.clone()),
-                    _ => None,
-                };
-                match self.specialized_load_attr(frame, cache_pc, ins.arg) {
-                    Ok(v) => {
-                        frame.push(v);
-                        if let Some(r) = receiver {
-                            // On success only the cheap gen/coro warning case
-                            // needs prompt finalization; `prompt_reap_dropped`
-                            // early-outs when the receiver is still live (the
-                            // common `self.attr` case keeps `self` alive).
-                            if matches!(
-                                r,
-                                Object::Generator(_)
-                                    | Object::Coroutine(_)
-                                    | Object::AsyncGenerator(_)
-                            ) {
-                                self.release(r);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(r) = receiver {
-                            self.release(r);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
+            OpCode::LoadAttr => self.load_attr_step(frame, cache_pc, ins.arg)?,
             OpCode::StoreAttr => {
                 self.specialized_store_attr(frame, cache_pc, ins.arg)?;
             }
@@ -44247,6 +44201,77 @@ impl Interpreter {
     /// dict (instance / module / type), guarded by the cached
     /// type/module fingerprint. On miss we deopt and run the
     /// generic [`Self::load_attr`].
+    /// The full `LOAD_ATTR` of `co_names[name_idx]` on the receiver atop
+    /// `frame`'s stack (the site's cache at `cache_pc`): the value replaces
+    /// the receiver.
+    fn load_attr_step(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<(), RuntimeError> {
+        // The receiver temporary dies when the attribute load pops it, so
+        // finalize it promptly (CPython decrefs the receiver after the load,
+        // on *both* the success and failure paths). This makes
+        // `f().cr_frame` warn on a never-awaited coroutine (bpo-45813) and
+        // (crucially for a *failing* load like
+        // `io.BufferedReader(raw).xyzzy`) flushes and closes the discarded
+        // io temporary, routing a failing `close()` to `sys.unraisablehook`
+        // even though the receiver was already popped
+        // (`test_io.test_error_through_destructor`). Only finalizable
+        // receiver kinds are captured so the hot path pays at most one `Rc`
+        // bump.
+        let receiver = match frame.stack.last() {
+            Some(
+                o @ (Object::Generator(_)
+                | Object::Coroutine(_)
+                | Object::AsyncGenerator(_)
+                | Object::Instance(_)),
+            ) => Some(o.clone()),
+            _ => None,
+        };
+        match self.specialized_load_attr(frame, cache_pc, name_idx) {
+            Ok(v) => {
+                frame.push(v);
+                if let Some(r) = receiver {
+                    // On success only the cheap gen/coro warning case needs
+                    // prompt finalization; `prompt_reap_dropped` early-outs
+                    // when the receiver is still live (the common
+                    // `self.attr` case keeps `self` alive).
+                    if matches!(
+                        r,
+                        Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_)
+                    ) {
+                        self.release(r);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(r) = receiver {
+                    self.release(r);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::load_attr_step`] of the `LOAD_ATTR` at `pc` of `sw`'s synced
+    /// running activation, which waits on the pending list meanwhile (the
+    /// load may run Python code: a property, a descriptor, `__getattr__`).
+    #[cfg(feature = "jit")]
+    fn core_attr_lane(&mut self, sw: &mut CoreSwitch, pc: usize) -> Result<(), RuntimeError> {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let arg = frame.code.instructions[pc].arg;
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let r = self.load_attr_step(frame, pc as u32, arg);
+        self.lean_pending_exit(pending);
+        r
+    }
+
     fn specialized_load_attr(
         &mut self,
         frame: &mut Frame,

@@ -65,6 +65,55 @@ def read_swapped(n):
     return t
 
 
+class Wide(Box):
+    @property
+    def w(self):
+        return self._w * 10
+
+
+class Lazy:
+    def __getattr__(self, name):
+        return 7
+
+
+def counted():
+    def wrapper():
+        wrapper.calls += 1
+        return wrapper.calls
+
+    wrapper.calls = 0
+    return wrapper
+
+
+def other_attrs(objs, n):
+    w = counted()
+    t = 0
+    for i in range(n):
+        o = objs[i % len(objs)]
+        t += type(o).__name__ == "Box"
+        t += w()
+        t += o.w
+    return t, w.calls
+
+
+def missing_attr(obj, n):
+    caught = 0
+    for i in range(n):
+        try:
+            obj.nope
+        except AttributeError:
+            caught += 1
+    return caught
+
+
+def getattr_fallback(obj, n):
+    out = 0
+    for i in range(n):
+        x = obj.anything
+        out += x
+    return out
+
+
 class Base:
     def __init__(self, tag):
         self.tags = [tag]
@@ -120,6 +169,18 @@ class PropertyAndSuperTest(unittest.TestCase):
 
     def test_swapped_property(self):
         self.assertEqual(read_swapped(4000), 2000 + 2000 * 10)
+
+    def test_other_attributes(self):
+        objs = [Box(1), Wide(2)]
+        t, calls = other_attrs(objs, N)
+        self.assertEqual(calls, N)
+        self.assertEqual(t, N // 2 + sum(range(1, N + 1)) + N // 2 * 1 + N // 2 * 20)
+
+    def test_missing_attribute(self):
+        self.assertEqual(missing_attr(Box(1), N), N)
+
+    def test_getattr_in_place(self):
+        self.assertEqual(getattr_fallback(Lazy(), 50), 350)
 
     def test_super_chains(self):
         tags, names = build(N)

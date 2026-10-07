@@ -2440,12 +2440,13 @@ unsafe extern "C" fn h_binop_dunder(
     }
 }
 
-/// `LOAD_ATTR` (the `pc`th instruction of `code`) of a `property` whose
-/// getter the site has cached for the receiver's class (see
-/// `MethodSlot::getter`): the getter called directly ([`direct_call`]),
-/// its result at stack slot `slot`. The receiver is the stack's at `slot`
-/// (`local` 0) or the local at `recv`, read in place. `0` done,
-/// `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
+/// `LOAD_ATTR` (the `pc`th instruction of `code`) the in-line and cached
+/// reads declined: a `property` whose getter the site has cached for the
+/// receiver's class (see `MethodSlot::getter`) called directly
+/// ([`direct_call`]), or anything else as the full handler loads it
+/// ([`attr_lane`]); the result at stack slot `slot`. The receiver is the
+/// stack's at `slot` (`local` 0) or the local at `recv`, read in place.
+/// `0` done, `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
 /// [`h_call`]'s.
 unsafe extern "C" fn h_property(
     st: *mut State,
@@ -2466,14 +2467,14 @@ unsafe extern "C" fn h_property(
         }
         let (pc, slot) = (pc as usize, slot as usize);
         let Object::Instance(inst) = &*recv else {
-            return CALL_DECLINED;
+            return attr_lane(st, pc, slot, recv, local);
         };
         let Some((getter, gcode)) = crate::code_vm_ext(&*code)
             .and_then(|ext| ext.method_slots.get())
             .and_then(|s| s.get(pc))
             .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
         else {
-            return CALL_DECLINED;
+            return attr_lane(st, pc, slot, recv, local);
         };
         let at = st.stack.add(slot);
         // A pure leaf getter (no native body of its own: it never runs as
@@ -2508,9 +2509,58 @@ unsafe extern "C" fn h_property(
                     at.write(at.add(1).read());
                 }
                 drop(f);
-                CALL_DECLINED
+                attr_lane(st, pc, slot, recv, local)
             }
             Some(r) => r,
+        }
+    }
+}
+
+/// The `LOAD_ATTR` at `pc` (its receiver the stack's at `slot`, or the
+/// local at `recv` when `local`) as the full handler runs it
+/// (`Interpreter::core_attr_lane`), the frame synced and waiting on the
+/// pending list (the load may run Python code): `0` the value at `slot`,
+/// `RAISED` its error, `RELOAD` the core loop goes on, `CALL_DECLINED`
+/// nothing done.
+///
+/// # Safety
+///
+/// As [`h_property`]'s.
+unsafe fn attr_lane(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    recv: *const Object,
+    local: u64,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+            return CALL_DECLINED;
+        }
+        if local != 0 {
+            st.stack.add(slot).write(crate::clone_hot(&*recv));
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot + 1);
+        frame.pc = pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        match interp.core_attr_lane(sw, pc) {
+            Ok(()) => {
+                if finished_in_place(st, slot) {
+                    0
+                } else {
+                    RELOAD
+                }
+            }
+            Err(e) => {
+                st.err = Some(e);
+                st.len = slot;
+                st.pc = pc + 1;
+                RAISED
+            }
         }
     }
 }
