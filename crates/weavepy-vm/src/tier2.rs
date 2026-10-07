@@ -10044,7 +10044,7 @@ unsafe extern "C" fn wpjit_build_map(frame: *mut JitFrame, n: i64) -> i64 {
         return -1;
     }
     let n = n as usize;
-    let mut d = DictData::default();
+    let mut d = DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
     for p in 0..n {
         // SAFETY: per the function contract, `2n` marshaled entries
         // and tags are live.

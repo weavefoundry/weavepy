@@ -410,6 +410,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::StoreAttr
             | OpCode::BuildTuple
             | OpCode::BuildList
+            | OpCode::BuildMap
             | OpCode::LoadDeref
             | OpCode::GetIter
             | OpCode::BinarySubscr
@@ -2046,6 +2047,40 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
     }
 }
 
+/// `BUILD_MAP` of the `n` key/value pairs at `at` into a dict at `at`, as
+/// the leaf arm builds it: only for keys whose hashing and equality are
+/// native (`str`, `int`, `bool`, `None`). `0` built, anything else
+/// declined with the slots untouched.
+unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
+    let n = n as usize;
+    // SAFETY: the code passes `2n` initialized stack slots.
+    unsafe {
+        if crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::gc_trace::auto_collect_due()
+            || !(0..n).all(|j| {
+                matches!(
+                    &*at.add(2 * j),
+                    Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None
+                )
+            })
+        {
+            return 1;
+        }
+        let mut d =
+            crate::object::DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+        for j in 0..n {
+            let k = at.add(2 * j).read();
+            let v = at.add(2 * j + 1).read();
+            d.insert(crate::object::DictKey(k), v);
+        }
+        let obj = Object::Dict(Rc::new(crate::sync::RefCell::new(d)));
+        crate::gc_trace::track(&obj);
+        at.write(obj);
+    }
+    0
+}
+
 /// `CALL` (the `pc`th instruction of `code`) on a stack `len` deep, for
 /// the shapes the core loop's arm runs in place: a pure leaf callee, a
 /// natively served class's constructor or bound method, an exact list's
@@ -2803,6 +2838,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
     let ins = code.instructions[pc];
     match ins.op {
         OpCode::BuildTuple => (1..=3).contains(&ins.arg),
+        OpCode::BuildMap => (1..=8).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::LoadFastAndClear => code.cellvars.is_empty(),
         op => native_op(op),
@@ -3738,6 +3774,9 @@ impl<'a> Lower<'a> {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
+            OpCode::BuildMap if (1..=8).contains(&ins.arg) => {
+                return self.build_map(pc, ins.arg as usize)
+            }
             // PEP 709: the local's value (`Unbound` included) moves onto
             // the stack and the local empties (a cell-sharing local is the
             // core loop's).
@@ -5585,6 +5624,25 @@ impl<'a> Lower<'a> {
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
         self.depth = self.depth - n + 1;
+        self.set_last(pc);
+        true
+    }
+
+    /// `BUILD_MAP` of `n` pairs through [`h_build_map`].
+    fn build_map(&mut self, pc: usize, n: usize) -> bool {
+        if 2 * n > self.depth {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let at = self.slot_addr(self.depth - 2 * n);
+        let nv = self.b.ins().iconst(types::I64, n as i64);
+        let r = self
+            .call(h_build_map as *const () as usize, &[at, nv], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth = self.depth - 2 * n + 1;
         self.set_last(pc);
         true
     }
