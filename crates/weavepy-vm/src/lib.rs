@@ -16470,6 +16470,59 @@ impl Interpreter {
                 }
                 Some(len - 1 + n)
             }
+            // `a, *b, c = seq` of a tuple or list, as the core loop's arm
+            // runs it: the trailing items, the middle's new list, then the
+            // leading items, the first on top.
+            OpCode::UnpackEx => {
+                let before = ((ins.arg >> 8) & 0xFF) as usize;
+                let after = (ins.arg & 0xFF) as usize;
+                let n = before + 1 + after;
+                if len == 0
+                    || len - 1 + n > cap
+                    || crate::stdlib::tracemalloc_real::is_tracking()
+                    || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                {
+                    return None;
+                }
+                // SAFETY: `len > 0`.
+                let seq = unsafe { &*base.add(len - 1) };
+                let unique = match seq {
+                    Object::Tuple(t) => ThinArc::strong_count(t) == 1,
+                    Object::List(l) => Rc::strong_count(l) == 1,
+                    _ => false,
+                };
+                if !unique && !Self::core_droppable(seq) {
+                    return None;
+                }
+                let items: Vec<Object> = match seq {
+                    Object::Tuple(t) => t.to_vec(),
+                    Object::List(l) => l.try_borrow().ok()?.clone(),
+                    _ => return None,
+                };
+                if items.len() < before + after {
+                    return None;
+                }
+                let mid_end = items.len() - after;
+                let mid = Object::new_list(items[before..mid_end].to_vec());
+                // SAFETY: the sequence leaves its slot, which the last item
+                // (pushed first) takes; `len - 1 + n <= cap`.
+                unsafe {
+                    let seq = base.add(len - 1).read();
+                    let mut k = len - 1;
+                    for x in items[mid_end..].iter().rev() {
+                        base.add(k).write(x.clone());
+                        k += 1;
+                    }
+                    base.add(k).write(mid);
+                    k += 1;
+                    for x in items[..before].iter().rev() {
+                        base.add(k).write(x.clone());
+                        k += 1;
+                    }
+                    drop_hot(seq);
+                }
+                Some(len - 1 + n)
+            }
             // A comprehension's add onto its exact set or dict, for a key
             // whose hash and equality are native (see `LeafProbe`). A
             // duplicate key's release, or a displaced value's, runs nothing.
@@ -21581,20 +21634,8 @@ impl Interpreter {
                 // CPython 3.14's `LOAD_COMMON_CONSTANT` (the full handler's
                 // table).
                 OpCode::LoadCommonConstant => {
-                    use weavepy_compiler::bytecode::{
-                        COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
-                        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
-                    };
-                    let bt = builtin_types();
-                    let v = match ins.arg {
-                        COMMON_CONSTANT_ASSERTION_ERROR => Object::Type(bt.assertion_error.clone()),
-                        COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR => {
-                            Object::Type(bt.not_implemented_error.clone())
-                        }
-                        COMMON_CONSTANT_TUPLE => Object::Type(bt.tuple_.clone()),
-                        COMMON_CONSTANT_ALL => self.common_all_any[0].clone(),
-                        COMMON_CONSTANT_ANY => self.common_all_any[1].clone(),
-                        _ => break,
+                    let Some(v) = self.common_constant(ins.arg) else {
+                        break;
                     };
                     stack.push(v);
                     last = pc;
@@ -22943,6 +22984,25 @@ impl Interpreter {
                 absent
             }
         }
+    }
+
+    /// CPython 3.14's `LOAD_COMMON_CONSTANT` value `arg`, from the
+    /// interpreter-wide `common_consts` table (keep in sync with
+    /// `opcode._common_constants`).
+    fn common_constant(&self, arg: u32) -> Option<Object> {
+        use weavepy_compiler::bytecode::{
+            COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
+            COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
+        };
+        let bt = builtin_types();
+        Some(match arg {
+            COMMON_CONSTANT_ASSERTION_ERROR => Object::Type(bt.assertion_error.clone()),
+            COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR => Object::Type(bt.not_implemented_error.clone()),
+            COMMON_CONSTANT_TUPLE => Object::Type(bt.tuple_.clone()),
+            COMMON_CONSTANT_ALL => self.common_all_any[0].clone(),
+            COMMON_CONSTANT_ANY => self.common_all_any[1].clone(),
+            _ => return None,
+        })
     }
 
     /// The plain Python method a `BINARY_OP` of `op` (augmented when
@@ -28202,56 +28262,8 @@ impl Interpreter {
                 }
             }
             OpCode::MakeFunction => {
-                let code_obj = frame.pop()?;
-                let code = match code_obj {
-                    Object::Code(c) => c,
-                    _ => {
-                        return Err(RuntimeError::Internal(
-                            "MAKE_FUNCTION expects code on top".to_owned(),
-                        ))
-                    }
-                };
-                let flags = ins.arg;
-                let mut closure: Vec<Object> = Vec::new();
-                if flags & 0x08 != 0 {
-                    let tup = frame.pop()?;
-                    if let Object::Tuple(items) = tup {
-                        closure = items.iter().cloned().collect();
-                    }
-                }
-                // Flag 0x04 — annotations dict produced by the
-                // compiler from ``def f(x: T) -> R`` annotations.
-                let mut annotations_obj: Option<Object> = None;
-                if flags & 0x04 != 0 {
-                    annotations_obj = Some(frame.pop()?);
-                }
-                let mut kw_defaults: Vec<(String, Object)> = Vec::new();
-                if flags & 0x02 != 0 {
-                    let dict = frame.pop()?;
-                    if let Object::Dict(d) = dict {
-                        for (k, v) in d.borrow().iter() {
-                            if let Object::Str(name) = &k.0 {
-                                kw_defaults.push((name.to_string(), v.clone()));
-                            }
-                        }
-                    }
-                }
-                let mut defaults: Vec<Object> = Vec::new();
-                if flags & 0x01 != 0 {
-                    let tup = frame.pop()?;
-                    if let Object::Tuple(items) = tup {
-                        defaults = items.iter().cloned().collect();
-                    }
-                }
-                let obj = new_function(
-                    code,
-                    &frame.globals,
-                    &frame.builtins,
-                    defaults,
-                    kw_defaults,
-                    closure,
-                    annotations_obj,
-                );
+                let (globals, builtins) = (frame.globals.clone(), frame.builtins.clone());
+                let obj = make_function(ins.arg, || frame.pop(), &globals, &builtins)?;
                 // PEP 590-era function watchers: PyFunction_EVENT_CREATE
                 // fires from `PyFunction_New*` (test_capi.test_watchers).
                 if crate::capi_watchers::funcs_active() {
@@ -28260,83 +28272,11 @@ impl Interpreter {
                 frame.push(obj);
             }
             // RFC 0068 — CPython 3.13's function-attribute attach: the
-            // freshly built function is on top, the value below it. The
-            // GC registry holds a strong clone from MAKE_FUNCTION's
-            // `track`, so momentarily untrack to regain sole ownership
-            // for the in-place field write, then re-track.
+            // freshly built function is on top, the value below it.
             OpCode::SetFunctionAttribute => {
                 let func = frame.pop()?;
                 let value = frame.pop()?;
-                let Object::Function(mut pf) = func else {
-                    return Err(RuntimeError::Internal(
-                        "SET_FUNCTION_ATTRIBUTE expects a function on top".to_owned(),
-                    ));
-                };
-                gc_trace::untrack(&Object::Function(pf.clone()));
-                {
-                    let f = Rc::get_mut(&mut pf).ok_or_else(|| {
-                        RuntimeError::Internal(
-                            "SET_FUNCTION_ATTRIBUTE on a shared function".to_owned(),
-                        )
-                    })?;
-                    match ins.arg {
-                        0x01 => {
-                            if let Object::Tuple(items) = value {
-                                f.defaults = items.iter().cloned().collect();
-                            }
-                        }
-                        0x02 => {
-                            if let Object::Dict(d) = value {
-                                f.kw_defaults = d
-                                    .borrow()
-                                    .iter()
-                                    .filter_map(|(k, v)| match &k.0 {
-                                        Object::Str(name) => Some((name.to_string(), v.clone())),
-                                        _ => None,
-                                    })
-                                    .collect();
-                            }
-                        }
-                        0x04 => {
-                            f.slots()
-                                .borrow_mut()
-                                .insert(DictKey(Object::from_static("__annotations__")), value);
-                        }
-                        0x08 => {
-                            if let Object::Tuple(items) = value {
-                                f.closure = items.iter().cloned().collect();
-                            }
-                        }
-                        // PEP 649 (RFC 0077 WS10): `MAKE_FUNCTION_ANNOTATE`
-                        // attaches the compiler-generated `__annotate__`
-                        // function. gh-137814: its `__qualname__` becomes
-                        // `<owner qualname>.__annotate__` (the code object
-                        // keeps the scope-derived `co_qualname`).
-                        0x10 => {
-                            if let Object::Function(annotate) = &value {
-                                let owner_qualname = f
-                                    .slot("__qualname__")
-                                    .map(|q| q.to_str())
-                                    .unwrap_or_else(|| f.code.borrow().qualname.clone());
-                                annotate.set_slot(
-                                    "__qualname__",
-                                    Object::from_str(format!("{owner_qualname}.__annotate__")),
-                                );
-                            }
-                            f.slots()
-                                .borrow_mut()
-                                .insert(DictKey(Object::from_static("__annotate__")), value);
-                        }
-                        _ => {
-                            return Err(RuntimeError::Internal(
-                                "SET_FUNCTION_ATTRIBUTE: bad flag".to_owned(),
-                            ))
-                        }
-                    }
-                }
-                let obj = Object::Function(pf);
-                gc_trace::track(&obj);
-                frame.push(obj);
+                frame.push(set_function_attribute(func, value, ins.arg)?);
             }
             // RFC 0068 — CPython prologue unit; WeavePy's frame setup
             // already copied the closure cells, so this is a no-op.
@@ -28440,28 +28380,12 @@ impl Interpreter {
                 frame.push(v);
             }
             OpCode::LoadCommonConstant => {
-                // CPython 3.14 `LOAD_COMMON_CONSTANT`: the interpreter-wide
-                // `common_consts` table (keep in sync with
-                // `opcode._common_constants`).
-                use weavepy_compiler::bytecode::{
-                    COMMON_CONSTANT_ALL, COMMON_CONSTANT_ANY, COMMON_CONSTANT_ASSERTION_ERROR,
-                    COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR, COMMON_CONSTANT_TUPLE,
-                };
-                let bt = crate::builtin_types::builtin_types();
-                let v = match ins.arg {
-                    COMMON_CONSTANT_ASSERTION_ERROR => Object::Type(bt.assertion_error.clone()),
-                    COMMON_CONSTANT_NOT_IMPLEMENTED_ERROR => {
-                        Object::Type(bt.not_implemented_error.clone())
-                    }
-                    COMMON_CONSTANT_TUPLE => Object::Type(bt.tuple_.clone()),
-                    COMMON_CONSTANT_ALL => self.common_all_any[0].clone(),
-                    COMMON_CONSTANT_ANY => self.common_all_any[1].clone(),
-                    other => {
-                        return Err(RuntimeError::Internal(format!(
-                            "LOAD_COMMON_CONSTANT: unknown index {other}"
-                        )))
-                    }
-                };
+                let v = self.common_constant(ins.arg).ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "LOAD_COMMON_CONSTANT: unknown index {}",
+                        ins.arg
+                    ))
+                })?;
                 frame.push(v);
             }
             OpCode::LoadSmallInt => {
@@ -70707,6 +70631,138 @@ fn code_names_anywhere(code: &CodeObject, name: &str) -> bool {
 /// The function getset-slot keys, interned once: a fresh
 /// `Object::from_static` would allocate the text and recompute its hash
 /// at every `MAKE_FUNCTION`.
+/// `SET_FUNCTION_ATTRIBUTE` with `flag`: `value` attached to the freshly
+/// made function `func`, which comes back. The GC registry holds a strong
+/// clone from `MAKE_FUNCTION`'s `track`, so the function is untracked for
+/// the in-place field write (regaining sole ownership), then re-tracked.
+fn set_function_attribute(func: Object, value: Object, flag: u32) -> Result<Object, RuntimeError> {
+    let Object::Function(mut pf) = func else {
+        return Err(RuntimeError::Internal(
+            "SET_FUNCTION_ATTRIBUTE expects a function on top".to_owned(),
+        ));
+    };
+    gc_trace::untrack(&Object::Function(pf.clone()));
+    {
+        let f = Rc::get_mut(&mut pf).ok_or_else(|| {
+            RuntimeError::Internal("SET_FUNCTION_ATTRIBUTE on a shared function".to_owned())
+        })?;
+        match flag {
+            0x01 => {
+                if let Object::Tuple(items) = value {
+                    f.defaults = items.iter().cloned().collect();
+                }
+            }
+            0x02 => {
+                if let Object::Dict(d) = value {
+                    f.kw_defaults = d
+                        .borrow()
+                        .iter()
+                        .filter_map(|(k, v)| match &k.0 {
+                            Object::Str(name) => Some((name.to_string(), v.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+            0x04 => {
+                f.slots()
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__annotations__")), value);
+            }
+            0x08 => {
+                if let Object::Tuple(items) = value {
+                    f.closure = items.iter().cloned().collect();
+                }
+            }
+            // PEP 649 (RFC 0077 WS10): `MAKE_FUNCTION_ANNOTATE`
+            // attaches the compiler-generated `__annotate__`
+            // function. gh-137814: its `__qualname__` becomes
+            // `<owner qualname>.__annotate__` (the code object
+            // keeps the scope-derived `co_qualname`).
+            0x10 => {
+                if let Object::Function(annotate) = &value {
+                    let owner_qualname = f
+                        .slot("__qualname__")
+                        .map(|q| q.to_str())
+                        .unwrap_or_else(|| f.code.borrow().qualname.clone());
+                    annotate.set_slot(
+                        "__qualname__",
+                        Object::from_str(format!("{owner_qualname}.__annotate__")),
+                    );
+                }
+                f.slots()
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__annotate__")), value);
+            }
+            _ => {
+                return Err(RuntimeError::Internal(
+                    "SET_FUNCTION_ATTRIBUTE: bad flag".to_owned(),
+                ))
+            }
+        }
+    }
+    let obj = Object::Function(pf);
+    gc_trace::track(&obj);
+    Ok(obj)
+}
+
+/// `MAKE_FUNCTION` with `flags`: the code object and the operands its
+/// flags name, taken by `pop` from the top down (the code, then a closure
+/// tuple, annotations, keyword defaults and positional defaults), made a
+/// function of `globals` and `builtins`.
+fn make_function(
+    flags: u32,
+    mut pop: impl FnMut() -> Result<Object, RuntimeError>,
+    globals: &Rc<RefCell<DictData>>,
+    builtins: &Rc<RefCell<DictData>>,
+) -> Result<Object, RuntimeError> {
+    let code = match pop()? {
+        Object::Code(c) => c,
+        _ => {
+            return Err(RuntimeError::Internal(
+                "MAKE_FUNCTION expects code on top".to_owned(),
+            ))
+        }
+    };
+    let mut closure: Vec<Object> = Vec::new();
+    if flags & 0x08 != 0 {
+        if let Object::Tuple(items) = pop()? {
+            closure = items.iter().cloned().collect();
+        }
+    }
+    // Flag 0x04 — annotations dict produced by the compiler from
+    // ``def f(x: T) -> R`` annotations.
+    let mut annotations_obj: Option<Object> = None;
+    if flags & 0x04 != 0 {
+        annotations_obj = Some(pop()?);
+    }
+    let mut kw_defaults: Vec<(String, Object)> = Vec::new();
+    if flags & 0x02 != 0 {
+        if let Object::Dict(d) = pop()? {
+            for (k, v) in d.borrow().iter() {
+                if let Object::Str(name) = &k.0 {
+                    kw_defaults.push((name.to_string(), v.clone()));
+                }
+            }
+        }
+    }
+    let mut defaults: Vec<Object> = Vec::new();
+    if flags & 0x01 != 0 {
+        if let Object::Tuple(items) = pop()? {
+            defaults = items.iter().cloned().collect();
+        }
+    }
+    Ok(new_function(
+        code,
+        globals,
+        builtins,
+        defaults,
+        kw_defaults,
+        closure,
+        annotations_obj,
+    ))
+}
+
 /// `MAKE_FUNCTION`'s function: `code` with the defining frame's globals
 /// and builtins, and the operands the instruction's flags popped.
 #[allow(clippy::too_many_arguments)]

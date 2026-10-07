@@ -427,7 +427,15 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::SetAdd
             | OpCode::MapAdd
             | OpCode::UnpackSequence
-            | OpCode::ContainsOp => false,
+            | OpCode::ContainsOp
+            | OpCode::LoadClosure
+            | OpCode::LoadClosureBorrow
+            | OpCode::StoreDeref
+            | OpCode::LoadCommonConstant
+            | OpCode::MakeFunction
+            | OpCode::SetFunctionAttribute
+            | OpCode::ListToTuple
+            | OpCode::UnpackEx => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -1097,6 +1105,28 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
             *count += 1;
             Object::new_tuple_array([Object::Int(i), x])
         }
+        // A set's next element while the set keeps its size (a change,
+        // and exhaustion, are the core loop's to report).
+        PyIterator::Set { set, len, index } => {
+            let Ok(items) = set.try_borrow() else {
+                return 3;
+            };
+            if items.len() != *len {
+                return 3;
+            }
+            let Some(k) = items.get_index(*index) else {
+                return 3;
+            };
+            let v = crate::clone_hot(&k.0);
+            *index += 1;
+            v
+        }
+        // Any other cursor whose step runs no code (a string's, bytes');
+        // its exhaustion is the core loop's.
+        other if other.pure_ready() => match other.next_value() {
+            Some(v) => v,
+            None => return 3,
+        },
         _ => return 3,
     };
     if let Object::Int(i) = v {
@@ -1213,7 +1243,8 @@ unsafe extern "C" fn h_contains(at: *mut Object) -> u32 {
 
 /// `BINARY_OP` of `kind` over the values at `at` and above it, for the
 /// shapes the core loop's arm runs (two numbers; strings' concatenation,
-/// repetition and `%` formatting; a natively served instance's operator):
+/// repetition and `%` formatting; two tuples' or lists' concatenation; a
+/// natively served instance's operator):
 /// `0` the result at `at` (the operands released), anything else declined
 /// untouched.
 unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
@@ -1240,6 +1271,12 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
         let r = match (a, b) {
             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
                 Interpreter::core_str_binop(a, b, kind)
+            }
+            // Two exact tuples' or lists' concatenation.
+            (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_))
+                if kind == BinOpKind::Add && droppable(a) && droppable(b) =>
+            {
+                Interpreter::core_seq_concat(a, b)
             }
             (Object::Instance(i), _) if i.cls_raw().native_kind.get() != 0 => {
                 match Interpreter::core_native_binop(kind, a, b) {
@@ -3006,6 +3043,137 @@ unsafe extern "C" fn h_load_deref(st: *mut State, i: u64, dst: *mut Object) -> u
     }
 }
 
+/// `LOAD_CLOSURE i` of the running frame: `0` the cell written to the
+/// free slot `dst`, anything else declined untouched.
+unsafe extern "C" fn h_load_closure(st: *mut State, i: u64, dst: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and a free stack slot.
+    unsafe {
+        let frame = &*(*st).frame;
+        let Some(cell) = frame.cells.get(i as usize) else {
+            return 1;
+        };
+        dst.write(Object::Cell(cell.clone()));
+        0
+    }
+}
+
+/// `STORE_DEREF i` of the value at stack slot `at` into the running
+/// frame's cell, as the core loop's arm runs it: `0` stored (the value
+/// moved in; the displaced one released), anything else declined
+/// untouched.
+unsafe extern "C" fn h_store_deref(st: *mut State, i: u64, at: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and an initialized slot.
+    unsafe {
+        let frame = &*(*st).frame;
+        let Some(cell) = frame.cells.get(i as usize) else {
+            return 1;
+        };
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return 1;
+        };
+        let old = std::mem::replace(&mut *slot, at.read());
+        drop(slot);
+        drop(old);
+        0
+    }
+}
+
+/// `LOAD_COMMON_CONSTANT arg`: `0` the constant written to the free slot
+/// `dst`, anything else declined untouched.
+unsafe extern "C" fn h_common_const(st: *mut State, arg: u64, dst: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and a free stack slot.
+    unsafe {
+        match (*(*st).interp).common_constant(arg as u32) {
+            Some(v) => {
+                dst.write(v);
+                0
+            }
+            None => 1,
+        }
+    }
+}
+
+/// `MAKE_FUNCTION flags` over the operands from stack slot `at` up (the
+/// code object on top): `0` the function at `at`, anything else declined
+/// untouched (a function watcher's event is the full handler's).
+unsafe extern "C" fn h_make_function(st: *mut State, at: *mut Object, flags: u64) -> u32 {
+    // SAFETY: the code passes its live state and the instruction's
+    // initialized operand slots.
+    unsafe {
+        let frame = &*(*st).frame;
+        let n = 1 + (flags & 0xf).count_ones() as usize;
+        if crate::capi_watchers::funcs_active() || !matches!(&*at.add(n - 1), Object::Code(_)) {
+            return 1;
+        }
+        let mut k = n;
+        let f = crate::make_function(
+            flags as u32,
+            || {
+                k -= 1;
+                Ok(at.add(k).read())
+            },
+            &frame.globals,
+            &frame.builtins,
+        )
+        .expect("a code object on top makes a function");
+        at.write(f);
+        0
+    }
+}
+
+/// `SET_FUNCTION_ATTRIBUTE flag` of the value at stack slot `at` on the
+/// fresh function above it: `0` the function at `at`, `RAISED` its error
+/// (`st` synced past the instruction at `pc`), anything else declined
+/// untouched.
+unsafe extern "C" fn h_set_function_attr(
+    st: *mut State,
+    at: *mut Object,
+    flag: u64,
+    pc: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state and two initialized slots,
+    // with nothing virtual below them.
+    unsafe {
+        if !matches!(&*at.add(1), Object::Function(_)) {
+            return 1;
+        }
+        let (value, func) = (at.read(), at.add(1).read());
+        match crate::set_function_attribute(func, value, flag as u32) {
+            Ok(f) => {
+                at.write(f);
+                0
+            }
+            Err(e) => {
+                let st = &mut *st;
+                st.len = at.offset_from(st.stack) as usize;
+                st.pc = pc as usize + 1;
+                st.err = Some(e);
+                RAISED
+            }
+        }
+    }
+}
+
+/// `LIST_TO_TUPLE` of the list at stack slot `at` only the stack holds:
+/// `0` its items' tuple in its place, anything else declined untouched.
+unsafe extern "C" fn h_list_to_tuple(at: *mut Object) -> u32 {
+    // SAFETY: the code passes an initialized slot.
+    unsafe {
+        let Object::List(l) = &*at else {
+            return 1;
+        };
+        if Rc::strong_count(l) != 1 || !droppable(&*at) {
+            return 1;
+        }
+        let Some(items) = l.peek_mut() else {
+            return 1;
+        };
+        let t = Object::new_tuple(std::mem::take(items));
+        crate::drop_hot(std::mem::replace(&mut *at, t));
+        0
+    }
+}
+
 /// `GET_ITER` of the value at stack slot `at`, as the core loop's arm
 /// runs it: `0` the iterator in its place, anything else declined
 /// untouched.
@@ -3026,6 +3194,10 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
                 | Object::Range(_)
                 | Object::Dict(_)
                 | Object::DictView(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
         ) || !droppable(v)
         {
             return 1;
@@ -3378,6 +3550,14 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::GetIter
             | OpCode::UnaryOp
             | OpCode::LoadFastAndClear
+            | OpCode::LoadClosure
+            | OpCode::LoadClosureBorrow
+            | OpCode::StoreDeref
+            | OpCode::LoadCommonConstant
+            | OpCode::MakeFunction
+            | OpCode::SetFunctionAttribute
+            | OpCode::ListToTuple
+            | OpCode::UnpackEx
     )
 }
 
@@ -3389,7 +3569,10 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
         OpCode::BuildTuple => (1..=3).contains(&ins.arg),
         OpCode::BuildMap => (1..=8).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
-        OpCode::LoadFastAndClear => code.cellvars.is_empty(),
+        // (A slot shared with a cell saves the cell itself.)
+        OpCode::LoadFastAndClear => {
+            Interpreter::shared_cell_index(code, ins.arg as usize).is_none()
+        }
         op => native_op(op),
     }
 }
@@ -4303,7 +4486,8 @@ impl<'a> Lower<'a> {
             OpCode::BinarySubscr
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
-            | OpCode::UnpackSequence => return self.container(pc),
+            | OpCode::UnpackSequence
+            | OpCode::UnpackEx => return self.container(pc),
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
@@ -4331,7 +4515,8 @@ impl<'a> Lower<'a> {
             // the stack and the local empties (a cell-sharing local is the
             // core loop's).
             OpCode::LoadFastAndClear
-                if (ins.arg as usize) < self.nlocals && self.code.cellvars.is_empty() =>
+                if (ins.arg as usize) < self.nlocals
+                    && Interpreter::shared_cell_index(self.code, ins.arg as usize).is_none() =>
             {
                 let i = ins.arg;
                 self.flush_local(i);
@@ -4342,6 +4527,102 @@ impl<'a> Lower<'a> {
                 self.write_tag(src, self.tags.unbound);
                 self.bound[i as usize] = false;
                 self.push(Item::Mem(s));
+                true
+            }
+            OpCode::LoadClosure | OpCode::LoadClosureBorrow | OpCode::LoadCommonConstant => {
+                let s = self.depth;
+                let dst = self.slot_addr(s);
+                let i = self.b.ins().iconst(types::I64, i64::from(ins.arg));
+                let helper = if ins.op == OpCode::LoadCommonConstant {
+                    h_common_const as *const () as usize
+                } else {
+                    h_load_closure as *const () as usize
+                };
+                let r = self
+                    .call(helper, &[self.st, i, dst], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                self.push(Item::Mem(s));
+                true
+            }
+            OpCode::StoreDeref => {
+                if self.depth == 0 {
+                    self.exit(INTERP, pc);
+                    return false;
+                }
+                let s = self.top_to_mem();
+                let at = self.slot_addr(s);
+                let i = self.b.ins().iconst(types::I64, i64::from(ins.arg));
+                let r = self
+                    .call(h_store_deref as *const () as usize, &[self.st, i, at], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                self.pop();
+                // (The displaced value's release may queue a finalizer.)
+                self.set_last(pc);
+                self.check_released(pc + 1);
+                true
+            }
+            OpCode::MakeFunction | OpCode::SetFunctionAttribute => {
+                let n = if ins.op == OpCode::MakeFunction {
+                    1 + (ins.arg & 0xf).count_ones() as usize
+                } else {
+                    2
+                };
+                if self.depth < n {
+                    self.exit(INTERP, pc);
+                    return false;
+                }
+                self.flush();
+                let s = self.depth - n;
+                let at = self.slot_addr(s);
+                let arg = self.b.ins().iconst(types::I64, i64::from(ins.arg));
+                let r = if ins.op == OpCode::MakeFunction {
+                    self.call(
+                        h_make_function as *const () as usize,
+                        &[self.st, at, arg],
+                        true,
+                    )
+                } else {
+                    let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                    self.call(
+                        h_set_function_attr as *const () as usize,
+                        &[self.st, at, arg, pcv],
+                        true,
+                    )
+                }
+                .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let other = self.b.create_block();
+                let ok = self.b.create_block();
+                self.b.ins().brif(r, other, &[], ok, &[]);
+                self.b.switch_to_block(other);
+                let raised = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RAISED));
+                let leave = self.b.create_block();
+                self.b.ins().brif(raised, leave, &[], out, &[]);
+                self.b.switch_to_block(leave);
+                self.b.ins().return_(&[r]);
+                self.b.switch_to_block(ok);
+                for _ in 0..n {
+                    self.pop();
+                }
+                self.push(Item::Mem(s));
+                true
+            }
+            OpCode::ListToTuple => {
+                if self.depth == 0 {
+                    self.exit(INTERP, pc);
+                    return false;
+                }
+                let s = self.top_to_mem();
+                let at = self.slot_addr(s);
+                let r = self
+                    .call(h_list_to_tuple as *const () as usize, &[at], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
                 true
             }
             OpCode::LoadDeref => {
