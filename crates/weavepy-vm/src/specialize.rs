@@ -273,6 +273,19 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let ver = cls.attr_version.get();
+            // Names intercepted by `generic_setattr_instance` before any
+            // store: `__class__` / `__dict__` assignment and, on an
+            // exception, BaseException's `args` / `__traceback__` /
+            // `__cause__` / `__context__` coercions (the exception's own
+            // slots). Every cache shape would silently skip the
+            // interception (e.g. `e.args = [1]` must coerce to a tuple on
+            // every store, warmed cache or not), so never specialize these.
+            if matches!(name, "__class__" | "__dict__")
+                || (matches!(name, "args" | "__traceback__" | "__cause__" | "__context__")
+                    && cls.mro.borrow().iter().any(|t| t.name == "BaseException"))
+            {
+                return InlineCache::Cooldown(COOLDOWN);
+            }
             // A class-level data descriptor — a `__slots__` member, a
             // `property`, or any object exposing `__set__`/`__delete__` —
             // owns the write. A *plain slot member* gets its own fast
@@ -306,19 +319,6 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
                     }
                 }
                 _ => {}
-            }
-            // Names intercepted by `generic_setattr_instance` before the
-            // plain dict write: `__class__` / `__dict__` assignment and
-            // BaseException's `args` / `__traceback__` / `__cause__` /
-            // `__context__` coercions. Both cache shapes would silently
-            // skip the interception (e.g. `e.args = [1]` must coerce to a
-            // tuple on every store, warmed cache or not), so never
-            // specialize these.
-            if matches!(
-                name,
-                "__class__" | "__dict__" | "args" | "__traceback__" | "__cause__" | "__context__"
-            ) {
-                return InlineCache::Cooldown(COOLDOWN);
             }
             if let Some(idx) = inst.attr_position_str(name) {
                 return InlineCache::StoreAttrInstance { key_idx: idx, ver };
