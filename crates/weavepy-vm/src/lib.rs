@@ -31868,7 +31868,9 @@ impl Interpreter {
                                 // `open()`ed files report the locale encoding
                                 // (`locale.getencoding()`, e.g. 'UTF-8' on
                                 // macOS — test_builtin
-                                // test_open_default_encoding compares them).
+                                // test_open_default_encoding compares them),
+                                // or "utf-8" in UTF-8 mode
+                                // (test_utf8_mode.test_io).
                                 let enc = f.encoding_name.borrow().clone().unwrap_or_else(|| {
                                     let stdio = matches!(
                                         &*f.backend.borrow(),
@@ -31876,7 +31878,7 @@ impl Interpreter {
                                             | crate::object::FileBackend::Stderr(_)
                                             | crate::object::FileBackend::Stdin
                                     );
-                                    if stdio {
+                                    if stdio || crate::vm_singletons::utf8_mode() {
                                         "utf-8".to_owned()
                                     } else {
                                         crate::stdlib::locale_mod::current_codeset()
@@ -62350,7 +62352,7 @@ fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
         crate::builtins::bytes_decode_leaf,
         crate::builtins::dict_getitem_leaf,
     ];
-    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f))
+    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f)) || crate::stdlib::math::is_fast_half(f)
 }
 
 /// A receiver's builtin variant, for the method table.

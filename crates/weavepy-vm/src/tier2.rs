@@ -926,6 +926,17 @@ thread_local! {
 /// The cap the clamp above starts from.
 pub(crate) const LEAN_WARM_COMPILE_THRESHOLD_CAP: u32 = 24;
 
+/// The pcs `code`'s back edges jump to: its loop headers, where an OSR
+/// entry can happen.
+fn loop_headers(code: &CodeObject) -> impl Iterator<Item = u32> + '_ {
+    code.instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, ins)| ins.op == weavepy_compiler::OpCode::JumpBackward)
+        .filter_map(|(pc, ins)| (pc + 1).checked_sub(ins.arg as usize))
+        .map(|pc| pc as u32)
+}
+
 /// Whether every `LOAD_GLOBAL name` in `code` feeds an attribute load of
 /// a [`weavepy_jit::MathFunc`] intrinsic, the only use the analyzer's
 /// `math` marker admits.
@@ -1814,6 +1825,12 @@ impl JitState {
                     if let Some(entry) = self.cache.get_mut(&key) {
                         if !entry.probe_misses.contains(&entry_pc) {
                             entry.probe_misses.push(entry_pc);
+                        }
+                        // Once every loop header has missed, no back edge
+                        // can enter: they stop asking (the frame JIT may
+                        // take the loops), and an activation still can.
+                        if loop_headers(code).all(|pc| entry.probe_misses.contains(&pc)) {
+                            code.jit_hint.set_backedge_quiet();
                         }
                     }
                     return None;

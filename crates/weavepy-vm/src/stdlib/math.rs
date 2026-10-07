@@ -276,11 +276,149 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             crate::leaf_builtins::register_scalar(b);
         }
     }
+    // The commonest functions' fast halves (registered last, so they win).
+    for (name, fast) in FAST_HALVES {
+        if let Some(Object::Builtin(b)) = dict.borrow().get(&crate::object::StrKey(name)) {
+            crate::leaf_builtins::register_fast(b, fast);
+        }
+    }
     Rc::new(PyModule {
         name: "math".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// The fast halves of the commonest functions: the full body's result for
+/// plain `float` and `int` arguments whose result is an ordinary number,
+/// computed without the body's argument conversion and result checks. A
+/// domain or range error, or a NaN (which the body re-tags), declines to
+/// the full body.
+const FAST_HALVES: [(&str, crate::leaf_builtins::Fast); 12] = [
+    ("floor", floor_fast),
+    ("ceil", ceil_fast),
+    ("sqrt", sqrt_fast),
+    ("exp", exp_fast),
+    ("log", log_fast),
+    ("sin", sin_fast),
+    ("cos", cos_fast),
+    ("fabs", fabs_fast),
+    ("atan2", atan2_fast),
+    ("hypot", hypot_fast),
+    ("isfinite", isfinite_fast),
+    ("isnan", isnan_fast),
+];
+
+/// Whether `f` is one of [`FAST_HALVES`] (all pure).
+pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
+    FAST_HALVES.iter().any(|&(_, g)| std::ptr::fn_addr_eq(g, f))
+}
+
+type FastResult = Option<Result<Object, RuntimeError>>;
+
+/// A plain `float` or `int` argument's value.
+#[inline]
+fn plain_f64(x: &Object) -> Option<f64> {
+    match x {
+        Object::Float(f) => Some(*f),
+        Object::Int(i) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+/// `f(x)` of one plain argument, when the result is a number.
+#[inline]
+fn unary_fast(args: &[Object], ok: impl Fn(f64) -> bool, f: impl Fn(f64) -> f64) -> FastResult {
+    let [x] = args else {
+        return None;
+    };
+    let x = plain_f64(x)?;
+    if !ok(x) {
+        return None;
+    }
+    let r = f(x);
+    (!r.is_nan()).then_some(Ok(Object::Float(r)))
+}
+
+/// `floor`/`ceil` of a plain argument: an `int` is its own; a finite
+/// `float` rounds to a machine-word `int`.
+#[inline]
+fn round_fast(args: &[Object], op: fn(f64) -> f64) -> FastResult {
+    match args {
+        [Object::Int(i)] => Some(Ok(Object::Int(*i))),
+        [Object::Float(f)] => {
+            let r = op(*f);
+            // (Exclusive bounds: `i64::MAX as f64` rounds up past it.)
+            (r > i64::MIN as f64 && r < i64::MAX as f64).then_some(Ok(Object::Int(r as i64)))
+        }
+        _ => None,
+    }
+}
+
+fn floor_fast(args: &[Object]) -> FastResult {
+    round_fast(args, f64::floor)
+}
+
+fn ceil_fast(args: &[Object]) -> FastResult {
+    round_fast(args, f64::ceil)
+}
+
+fn sqrt_fast(args: &[Object]) -> FastResult {
+    unary_fast(args, |x| x >= 0.0, f64::sqrt)
+}
+
+fn exp_fast(args: &[Object]) -> FastResult {
+    let r = unary_fast(args, f64::is_finite, f64::exp)?;
+    matches!(r, Ok(Object::Float(v)) if v.is_finite()).then_some(r)
+}
+
+fn log_fast(args: &[Object]) -> FastResult {
+    unary_fast(args, |x| x > 0.0 && x.is_finite(), f64::ln)
+}
+
+fn sin_fast(args: &[Object]) -> FastResult {
+    unary_fast(args, f64::is_finite, f64::sin)
+}
+
+fn cos_fast(args: &[Object]) -> FastResult {
+    unary_fast(args, f64::is_finite, f64::cos)
+}
+
+fn fabs_fast(args: &[Object]) -> FastResult {
+    unary_fast(args, |_| true, f64::abs)
+}
+
+fn atan2_fast(args: &[Object]) -> FastResult {
+    let [y, x] = args else {
+        return None;
+    };
+    let r = plain_f64(y)?.atan2(plain_f64(x)?);
+    (!r.is_nan()).then_some(Ok(Object::Float(r)))
+}
+
+fn hypot_fast(args: &[Object]) -> FastResult {
+    let [x, y] = args else {
+        return None;
+    };
+    let (x, y) = (plain_f64(x)?.abs(), plain_f64(y)?.abs());
+    if !(x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    Some(Ok(Object::Float(vector_norm(&mut [x, y], x.max(y), false))))
+}
+
+fn isfinite_fast(args: &[Object]) -> FastResult {
+    let [x] = args else {
+        return None;
+    };
+    Some(Ok(Object::Bool(plain_f64(x)?.is_finite())))
+}
+
+fn isnan_fast(args: &[Object]) -> FastResult {
+    let [x] = args else {
+        return None;
+    };
+    Some(Ok(Object::Bool(plain_f64(x)?.is_nan())))
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
