@@ -12321,14 +12321,25 @@ unsafe extern "C" fn wpjit_contains_dyn(frame: *mut JitFrame, pin: i64, negate: 
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // SAFETY: native code staged the item in slot 0.
+    let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
+    // A membership no Python code decides, on the borrowed operands: no
+    // guard can have changed.
+    if let Some(Pin::Obj(container)) = ctx.pins.get(pin as usize) {
+        let mut tmp = None;
+        if let Some(found) = staged_ref(bits, tag, &ctx.pins, &mut tmp)
+            .and_then(|item| dyn_leaf_contains(container, item))
+        {
+            jf.ret_bits = u64::from(found != (negate != 0));
+            return 0;
+        }
+    }
     // `x in None` raises — cold; re-execute generically for the exact
     // TypeError.
     let container = match ctx.pins.get(pin as usize) {
         Some(p) => p.to_object(),
         None => return 3,
     };
-    // SAFETY: native code staged the item in slot 0.
-    let (bits, tag) = unsafe { (*jf.call_args, *jf.call_tags) };
     let item = unpack_pins(bits, tag, &ctx.pins);
     ctx.dirty = true;
     match interp.py_contains(&container, &item) {
@@ -12378,6 +12389,82 @@ unsafe fn dyn_operands(jf: &JitFrame, ctx: &CallCtx) -> (Object, Object) {
         unpack_pins(a_bits, a_tag, &ctx.pins),
         unpack_pins(b_bits, b_tag, &ctx.pins),
     )
+}
+
+/// The staged operand `(bits, tag)` borrowed off its pin, or rebuilt in
+/// `tmp` for an `int`. `None` for any other lane.
+fn staged_ref<'a>(
+    bits: u64,
+    tag: u32,
+    pins: &'a PinTable,
+    tmp: &'a mut Option<Object>,
+) -> Option<&'a Object> {
+    match SlotTag::from_raw(tag) {
+        SlotTag::Int => Some(tmp.insert(Object::Int(bits as i64))),
+        SlotTag::ObjPin => match pins.get(bits as usize)? {
+            Pin::Obj(o) => Some(o),
+            Pin::List(..) => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `container[index]` of the two staged operands when it runs no
+/// Python code: an exact list's or tuple's item at an `int` index, or an
+/// exact dict's value for a key no stored key needs a Python comparison
+/// with (see [`crate::object::LeafProbe`]). `None` (a miss, an index out
+/// of range, anything else) leaves the subscript to the interpreter.
+///
+/// # Safety
+///
+/// As [`dyn_operands`].
+unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
+    // SAFETY: per the function contract.
+    let (c_bits, c_tag, i_bits, i_tag) = unsafe {
+        (
+            *jf.call_args,
+            *jf.call_tags,
+            *jf.call_args.add(1),
+            *jf.call_tags.add(1),
+        )
+    };
+    let (mut c_tmp, mut k_tmp) = (None, None);
+    let container = staged_ref(c_bits, c_tag, &ctx.pins, &mut c_tmp)?;
+    let key = staged_ref(i_bits, i_tag, &ctx.pins, &mut k_tmp)?;
+    let at = |i: i64, n: usize| {
+        let i = if i < 0 { i + n as i64 } else { i };
+        usize::try_from(i).ok().filter(|&i| i < n)
+    };
+    match (container, key) {
+        (Object::List(l), Object::Int(i)) => {
+            // SAFETY: nothing runs code while the items are viewed.
+            let xs = unsafe { l.peek() }?;
+            xs.get(at(*i, xs.len())?).map(super::clone_hot)
+        }
+        (Object::Tuple(t), Object::Int(i)) => t.get(at(*i, t.len())?).map(super::clone_hot),
+        (Object::Dict(d), _) => {
+            let probe = crate::object::LeafProbe::new(key)?;
+            // SAFETY: as above.
+            unsafe { d.peek() }?.get(&probe).map(super::clone_hot)
+        }
+        _ => None,
+    }
+}
+
+/// `item in container` when it runs no Python code: an exact dict or set
+/// probed for a key no stored key needs a Python comparison with, a miss
+/// counting only when the probe met no key of another kind (see
+/// [`crate::object::LeafProbe::miss_is_exact`]).
+fn dyn_leaf_contains(container: &Object, item: &Object) -> Option<bool> {
+    let probe = crate::object::LeafProbe::new(item)?;
+    let found = match container {
+        // SAFETY: nothing runs code while the table is viewed.
+        Object::Dict(d) => unsafe { d.peek() }?.contains_key(&probe),
+        // SAFETY: as above.
+        Object::Set(s) => unsafe { s.peek() }?.contains(&probe),
+        _ => return None,
+    };
+    (found || probe.miss_is_exact()).then_some(found)
 }
 
 /// Deliver a generic operation's completed result `v` as an object pin
@@ -12467,6 +12554,21 @@ unsafe extern "C" fn wpjit_dyn_getitem(frame: *mut JitFrame, _arg: i64, _unused:
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // An item no Python code computes, read off the borrowed operands: no
+    // guard can have changed, so none is rechecked.
+    // SAFETY: native code staged both operands.
+    if let Some(v) = unsafe { dyn_leaf_getitem(jf, ctx) } {
+        if !ctx.temporary_pin_limit_reached() {
+            if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+                jf.ret_bits = bits;
+                return 0;
+            }
+        } else {
+            ctx.pin_pressure_exit = true;
+        }
+        ctx.parked = Some(v);
+        return 2;
+    }
     // SAFETY: native code staged both operands.
     let (container, index) = unsafe { dyn_operands(jf, ctx) };
     ctx.dirty = true;
