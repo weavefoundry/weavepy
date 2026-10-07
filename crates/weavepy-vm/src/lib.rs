@@ -13931,9 +13931,20 @@ impl Interpreter {
                                 continue;
                             }
                         }
-                        let IC::LoadAttrInstance { key_idx, ver } = code.caches.get(pc as u32)
-                        else {
-                            break Some(CoreExit::Helper);
+                        let (key_idx, ver) = match code.caches.get(pc as u32) {
+                            IC::LoadAttrInstance { key_idx, ver } => (key_idx, ver),
+                            // A `__slots__` member laid out over its class's
+                            // names (the site remembers its position), out
+                            // of line.
+                            _ => {
+                                // SAFETY: `top` is the receiver's slot.
+                                if unsafe { Self::core_laid_out_attr(code, ins.arg, pc, top) } {
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                break Some(CoreExit::Helper);
+                            }
                         };
                         let cls = inst.cls_raw();
                         if cls.attr_version.get() != ver
@@ -16540,6 +16551,85 @@ impl Interpreter {
         }
         self.leaf_type_call(t, &ops[2..])
             .or_else(|| crate::seqiter::builtin_ctor_pure(t, &ops[2..]))
+    }
+
+    /// The `__slots__` member `co_names[name_idx]` of the instance at
+    /// `top`, read at its position in the class's slot layout (see
+    /// [`crate::types::PyInstance::laid_out_slot`]) and replacing the
+    /// instance there. The `LOAD_ATTR` site at `pc` remembers the position
+    /// under the class's attribute version (see [`LAID_OUT_SLOT`]), found
+    /// when the class resolves the name to its slot descriptor. `false`
+    /// (an unset member, any other shape) touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `top` is the core loop's top stack slot.
+    #[inline(never)]
+    unsafe fn core_laid_out_attr(
+        code: &CodeObject,
+        name_idx: u32,
+        pc: usize,
+        top: *mut Object,
+    ) -> bool {
+        // SAFETY: the caller's contract.
+        let recv = unsafe { &*top };
+        let Object::Instance(inst) = recv else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let Some(stamp) = code_stamp_slot(code, pc as u32) else {
+            return false;
+        };
+        let idx = match stamp.get() {
+            [v, LAID_OUT_SLOT, idx] if v == ver => idx as usize,
+            _ => {
+                if cls.native_kind.get() != 0
+                    || !Self::default_getattribute(cls)
+                    || crate::object::exotic_str_keys_possible()
+                {
+                    return false;
+                }
+                let Some(name) = code.names.get(name_idx as usize) else {
+                    return false;
+                };
+                if matches!(name.as_str(), "__weakref__" | "__dict__")
+                    || !matches!(cls.lookup(name), Some(Object::SlotDescriptor(sd)) if sd.name == *name)
+                {
+                    return false;
+                }
+                let Some((i, _)) = inst.laid_out_position(name) else {
+                    return false;
+                };
+                stamp.set([ver, LAID_OUT_SLOT, u64::from(i)]);
+                i as usize
+            }
+        };
+        if !Self::core_droppable(recv) {
+            return false;
+        }
+        // SAFETY: a read between two instructions; the value is cloned
+        // before anything else runs.
+        let Some(v) = (unsafe { inst.laid_out_slot(idx) }).map(Self::clone_operand) else {
+            return false;
+        };
+        // The site's inline cache takes the slot shape too, as the full
+        // handler's specialization would: the frameless evaluators read
+        // the member through it.
+        if !matches!(
+            code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::LoadAttrSlot { ver: v, .. } if v == ver
+        ) {
+            if let Some(name) = code.names.get(name_idx as usize) {
+                let ic = specialize::attempt_specialize_load_attr(recv, name);
+                if matches!(ic, weavepy_compiler::InlineCache::LoadAttrSlot { .. }) {
+                    code.caches.set(pc as u32, ic);
+                }
+            }
+        }
+        // SAFETY: the receiver (droppable) is replaced in place.
+        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+        true
     }
 
     /// `f.name` at `top` (a function): its stored value replaces the
@@ -68781,6 +68871,12 @@ const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
 /// `_tuplegetter` on the class at that version): the bits are the field
 /// index. The descriptor is a data descriptor, so no instance shadows it.
 const TUPLE_FIELD: u64 = 0x5ca1_a770_0000_0005;
+
+/// A `LOAD_ATTR` site's stamp tag for a `__slots__` member laid out over
+/// its class's names: the bits are its position in the class's slot
+/// layout (see [`Interpreter::core_laid_out_attr`]). A slot member is a
+/// data descriptor, so no instance dictionary shadows it.
+const LAID_OUT_SLOT: u64 = 0x5ca1_a770_0000_0006;
 
 /// The named tuple field a `LOAD_ATTR` site's stamp remembers for
 /// `inst`'s class at its current version (see [`TUPLE_FIELD`]): the item
