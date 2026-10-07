@@ -16273,10 +16273,24 @@ impl Interpreter {
     #[inline(always)]
     fn core_droppable(v: &Object) -> bool {
         // (A never-driven `asend` awaitable warns as it goes.)
-        !matches!(v, Object::AsyncGenAwait(_))
-            && !crate::capi_watchers::dicts_active()
+        !matches!(v, Object::AsyncGenAwait(_)) && Self::core_drops_plain()
+    }
+
+    /// Whether a release reports to nothing (no dict or function watcher,
+    /// no reference tracing), so a droppable value leaves by a plain
+    /// decrement (see [`Self::core_droppable`]).
+    #[inline(always)]
+    fn core_drops_plain() -> bool {
+        !crate::capi_watchers::dicts_active()
             && !crate::capi_watchers::funcs_active()
             && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+    }
+
+    /// [`Self::core_droppable`] for every one of `ops`, with the global
+    /// checks made once.
+    #[inline(always)]
+    pub(crate) fn core_all_droppable(ops: &[Object]) -> bool {
+        Self::core_drops_plain() && !ops.iter().any(|v| matches!(v, Object::AsyncGenAwait(_)))
     }
 
     /// Module scope for the core loop's `LOAD_NAME` / `STORE_NAME` arms:
@@ -16297,6 +16311,12 @@ impl Interpreter {
         let [obj, spec] = ops else {
             return None;
         };
+        // An instance of one class: its class's MRO alone (a miss is left
+        // to the full check, which also consults `__class__`).
+        if let (Object::Instance(inst), Object::Type(cls)) = (obj, spec) {
+            return (cls.metaclass_is_type() && inst.cls_raw().is_subclass_of(cls))
+                .then_some(Ok(Object::Bool(true)));
+        }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).
         let classes: &[Object] = match spec {
@@ -18677,9 +18697,10 @@ impl Interpreter {
     }
 
     /// `f.name` or `f.name = v` (`ins`, a `LOAD_ATTR` without the method
-    /// flag or a `STORE_ATTR`) on a plain function at the top of `stack`,
-    /// for a non-dunder name: read from or written to its `__dict__`.
-    /// `None` for anything else (a missing name raises on the full path).
+    /// flag or a `STORE_ATTR`) on a plain function at the top of `stack`:
+    /// a stored value read (see [`Self::leaf_function_read`]), or a
+    /// non-dunder name written to its `__dict__`. `None` for anything else
+    /// (a missing name raises on the full path).
     #[inline]
     fn leaf_function_attr(
         code: &CodeObject,
@@ -18695,21 +18716,17 @@ impl Interpreter {
         {
             return None;
         }
+        if ins.op == OpCode::LoadAttr {
+            let v = Self::leaf_function_read(code, f, ins.arg)?;
+            let top = stack.last_mut()?;
+            drop(std::mem::replace(top, v));
+            return Some(CoreAttr::Done);
+        }
         let Some(name @ Object::Str(n)) = code_name_obj(code, ins.arg) else {
             return None;
         };
         if n.starts_with("__") {
             return None;
-        }
-        if ins.op == OpCode::LoadAttr {
-            let v = {
-                let attrs = f.attrs.try_borrow().ok()?;
-                let d = attrs.as_ref()?.try_borrow().ok()?;
-                d.get(&crate::object::StrKey(n)).cloned()?
-            };
-            let top = stack.last_mut()?;
-            drop(std::mem::replace(top, v));
-            return Some(CoreAttr::Done);
         }
         let n_ = stack.len();
         if n_ < 2 {
@@ -23080,13 +23097,20 @@ impl Interpreter {
     /// the default. `None` for anything else (descriptors, dunders, a
     /// missing attribute's `AttributeError`), which the full call handles.
     fn leaf_getattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-        let (Object::Instance(inst), Object::Str(name)) = (args.first()?, args.get(1)?) else {
+        let (recv, Object::Str(name_obj)) = (args.first()?, args.get(1)?) else {
             return None;
         };
-        let name: &str = name;
+        let name: &str = name_obj;
         if args.len() > 3 || crate::object::exotic_str_keys_possible() {
             return None;
         }
+        let inst = match recv {
+            Object::Instance(inst) => inst,
+            // A function's stored attribute (`__doc__` once read,
+            // `__wrapped__`).
+            Object::Function(f) => return function_stored_attr(f, name_obj).map(Ok),
+            _ => return None,
+        };
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
         // default.
         if name.starts_with("__") {
@@ -23494,7 +23518,36 @@ impl Interpreter {
             (_, Object::Instance(inst)) => {
                 Self::leaf_attr_resolve_site(code, inst, receiver, cache_pc, name_idx)
             }
+            (_, Object::Function(f)) => Self::leaf_function_read(code, f, name_idx),
             _ => None,
+        }
+    }
+
+    /// `f.name` for a Python function, as `load_attr_inner` resolves it
+    /// when the value is stored: a getset slot (`__name__`, `__doc__`,
+    /// ...) from the function's slots, any other name from its
+    /// `__dict__` (see [`function_stored_attr`]). `None` for anything the
+    /// full path computes or raises.
+    #[inline]
+    fn leaf_function_read(
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        // (Both resolve through the class before any dictionary.)
+        if matches!(name, "__class__" | "__new__") || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let probe = code_name_leaf_probe(code, name_idx)?;
+        let read = |d: &DictData| d.get_full(&probe).map(|(_, _, v)| Self::clone_operand(v));
+        if crate::object::is_function_slot(name) {
+            let slots = f.slots().try_borrow().ok()?;
+            read(&slots)
+        } else {
+            let attrs = f.attrs.try_borrow().ok()?;
+            let dict = attrs.as_ref()?.try_borrow().ok()?;
+            read(&dict)
         }
     }
 
@@ -69643,6 +69696,27 @@ fn dict_may_shadow(dict: &RefCell<DictData>, code: &CodeObject, name_idx: u32) -
 /// A pre-hashed, Python-free probe for `co_names[name_idx]` (see
 /// [`crate::object::LeafNameProbe`]).
 #[inline]
+/// `f.name` as `load_attr_inner` resolves it when the value is stored:
+/// a getset slot (`__name__`, `__doc__`, ...) from the function's slots,
+/// any other name from its `__dict__`. `None` for anything the full path
+/// computes or raises, and for the names it resolves through the class
+/// first.
+fn function_stored_attr(f: &crate::object::PyFunction, name: &SharedStr) -> Option<Object> {
+    if matches!(&**name, "__class__" | "__new__") {
+        return None;
+    }
+    let key = crate::object::StrKeyHashed {
+        s: name,
+        hash: SharedStr::hash_cached(name),
+    };
+    if crate::object::is_function_slot(name) {
+        return f.slots().try_borrow().ok()?.get(&key).cloned();
+    }
+    let attrs = f.attrs.try_borrow().ok()?;
+    let dict = attrs.as_ref()?.try_borrow().ok()?;
+    dict.get(&key).cloned()
+}
+
 fn code_name_leaf_probe(
     code: &CodeObject,
     name_idx: u32,

@@ -11602,6 +11602,23 @@ unsafe fn call_dyn_impl(
     // natively through the `wpjit_call_py` machinery; everything else
     // pays the interpreter core below. Keyword sites stay generic —
     // the kwnames binder is the interpreter's.
+    // A builtin type whose native constructor builds without running code
+    // (`type(x)`, `zip(xs, ys)`), on arguments staged in place.
+    if kwc == 0 && argc <= 4 {
+        if let Object::Type(t) = &callee {
+            if t.flags.is_builtin {
+                let mut staged = [const { Object::None }; 4];
+                for (j, slot) in staged.iter_mut().enumerate().take(argc as usize) {
+                    // SAFETY: native code wrote `argc` entries.
+                    let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+                    *slot = unpack_pins(bits, tag, &ctx.pins);
+                }
+                if let Some(v) = crate::seqiter::builtin_ctor_pure(t, &staged[..argc as usize]) {
+                    return dyn_leaf_result(jf, ctx, v, int_result);
+                }
+            }
+        }
+    }
     if kwc == 0 && !retry_python {
         // SAFETY: per the function contract — same live buffers.
         if let Some(status) = unsafe { try_dyn_native(jf, ctx, interp, &callee, argc, int_result) }
@@ -12018,6 +12035,11 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
         Object::Module(module) if crate::object::module_class(module).is_none() => (
             super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
             2,
+        ),
+        // A function's stored attributes (`f.__name__`, `f.__wrapped__`).
+        Object::Function(_) => (
+            super::Interpreter::leaf_load_attr_recv(code, receiver, jf.deopt_pc, name_idx),
+            3,
         ),
         // Exact built-in values have no instance overrides. Their method
         // table only constructs native callables; binding doesn't invoke

@@ -1681,6 +1681,7 @@ impl Interpreter {
                 }
                 owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?)
             }
+            Object::Function(_) => owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?),
             _ => None,
         }
     }

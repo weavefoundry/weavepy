@@ -2013,6 +2013,46 @@ unsafe extern "C" fn h_call(
             st.len = start + 1;
             0
         };
+        // The commonest settled leaf builtins first (`isinstance(x, C)`, a
+        // fast half), without the shape checks below; a decline falls
+        // through to them untouched.
+        if let Object::Builtin(b) = &*base.add(start) {
+            let kind = ext
+                .method_slots
+                .get()
+                .and_then(|s| s.get(pc))
+                .and_then(|s| s.get_leaf(b));
+            if matches!(kind, Some(LeafKind::Isinstance | LeafKind::Fast(_)))
+                && Rc::strong_count(b) > 1
+                && !st.sw.is_null()
+            {
+                let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                    start + 2
+                } else {
+                    start + 1
+                };
+                let args = std::slice::from_raw_parts(base.add(first), len - first);
+                if Interpreter::core_all_droppable(args) {
+                    let r = match kind {
+                        Some(LeafKind::Fast(f)) => f(args),
+                        _ => Interpreter::core_isinstance(args),
+                    };
+                    match r {
+                        None => {}
+                        Some(Ok(v)) => return done(st, v),
+                        Some(Err(e)) => {
+                            for k in start..len {
+                                crate::drop_hot(base.add(k).read());
+                            }
+                            st.len = start;
+                            st.pc = pc + 1;
+                            st.err = Some(e);
+                            return RAISED;
+                        }
+                    }
+                }
+            }
+        }
         let ops = std::slice::from_raw_parts(base.add(start), argc + 2);
         let python = match &ops[0] {
             Object::Function(_) => 1,
