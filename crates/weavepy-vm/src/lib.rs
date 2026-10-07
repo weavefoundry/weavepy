@@ -17089,12 +17089,23 @@ impl Interpreter {
         }
         #[cfg(test)]
         note_predicate_stage(code_rc, 1);
-        let slot = code_call_slot(code, pc)?;
-        let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
+        let has_self = !matches!(ops.get(1)?, Object::Unbound);
+        let hit = code_call_slot(code, pc).and_then(|s| s.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc)));
+        let missing = match hit {
+            Some((missing, slot_self)) if slot_self == has_self => missing,
+            Some(_) => return None,
+            // A positional call caches no shape for keyword-only
+            // parameters (the defaults bind them below): its count of
+            // positional defaults, directly.
+            None if code_rc.kwonly_count != 0 => {
+                let given = ops.len() - 2 + usize::from(has_self);
+                u32::try_from(Self::missing_defaults(f, code_rc, given)?).ok()?
+            }
+            None => return None,
+        };
         #[cfg(test)]
         note_predicate_stage(code_rc, 2);
-        let has_self = !matches!(ops.get(1)?, Object::Unbound);
-        if slot_self != has_self || !Self::leaf_code_ok(code_rc) {
+        if !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let missing = missing as usize;
@@ -17154,7 +17165,9 @@ impl Interpreter {
         let first = if has_self { 1 } else { 2 };
         let nargs = ops.len() - first;
         let total = nargs + missing;
-        if total != code_rc.arg_count as usize || total > 8 {
+        // (A positional call binds no `**kwargs` dictionary.)
+        let arity = leaf_arity(code_rc);
+        if total != code_rc.arg_count as usize || arity > 8 || code_rc.has_varkeywords {
             return None;
         }
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
@@ -17164,9 +17177,10 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
+        leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..total], effect, depth)
+        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -17220,9 +17234,10 @@ impl Interpreter {
         {
             return None;
         }
-        // A pure leaf has no keyword-only parameters; its `**kwargs`
-        // dictionary, if any, follows the positional ones.
-        let total = code_rc.arg_count as usize;
+        // Its keyword-only parameters follow the positional ones, then its
+        // `**kwargs` dictionary, if any.
+        let npos = code_rc.arg_count as usize;
+        let total = npos + code_rc.kwonly_count as usize;
         let arity = leaf_arity(code_rc);
         if arity > 8 {
             return None;
@@ -17254,13 +17269,12 @@ impl Interpreter {
             }
             args[slot] = o;
         }
-        for (slot, arg) in args.iter_mut().enumerate().take(total).skip(eff_argc) {
+        for (slot, arg) in args.iter_mut().enumerate().take(npos).skip(eff_argc) {
             if covered & (1 << slot) == 0 {
-                *arg = f
-                    .defaults
-                    .get(f.defaults.len().checked_sub(total - slot)?)?;
+                *arg = f.defaults.get(f.defaults.len().checked_sub(npos - slot)?)?;
             }
         }
+        leaf_kwonly_defaults(f, code_rc, &mut args, covered)?;
         let dict;
         if code_rc.has_varkeywords {
             dict = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
@@ -17319,9 +17333,10 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
-        // A pure leaf has no keyword-only parameters; its `**kwargs`
-        // dictionary, if any, follows the positional ones.
-        let total = code_rc.arg_count as usize;
+        // Its keyword-only parameters follow the positional ones, then its
+        // `**kwargs` dictionary, if any.
+        let npos = code_rc.arg_count as usize;
+        let total = npos + code_rc.kwonly_count as usize;
         let arity = leaf_arity(code_rc);
         if arity > 8 {
             return None;
@@ -17352,13 +17367,12 @@ impl Interpreter {
             }
             args[slot] = o;
         }
-        for (slot, arg) in args.iter_mut().enumerate().take(total).skip(eff_argc) {
+        for (slot, arg) in args.iter_mut().enumerate().take(npos).skip(eff_argc) {
             if covered & (1 << slot) == 0 {
-                *arg = f
-                    .defaults
-                    .get(f.defaults.len().checked_sub(total - slot)?)?;
+                *arg = f.defaults.get(f.defaults.len().checked_sub(npos - slot)?)?;
             }
         }
+        leaf_kwonly_defaults(f, code_rc, &mut args, covered)?;
         if let Some(d) = &varkw {
             args[total] = d;
         }
@@ -69017,12 +69031,39 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
     })
 }
 
-/// A leaf's parameter count: its positional parameters, then its
-/// `**kwargs` dictionary when it has one (bound by keyword calls only; a
-/// leaf has no `*args` or keyword-only parameters).
+/// A leaf's parameter count: its positional parameters, its keyword-only
+/// ones, then its `**kwargs` dictionary when it has one (bound by keyword
+/// calls only; a leaf has no `*args`).
 #[inline(always)]
 pub(crate) fn leaf_arity(code: &CodeObject) -> usize {
-    code.arg_count as usize + usize::from(code.has_varkeywords)
+    code.arg_count as usize + code.kwonly_count as usize + usize::from(code.has_varkeywords)
+}
+
+/// Point each of `code`'s keyword-only parameters the call didn't bind
+/// (`covered`, a bit per parameter slot) at `f`'s default for it. `None`
+/// when one has no default, or `__kwdefaults__` was replaced (the full
+/// binder reads the replacement).
+fn leaf_kwonly_defaults(
+    f: &crate::object::PyFunction,
+    code: &CodeObject,
+    args: &mut [*const Object; 8],
+    covered: u32,
+) -> Option<()> {
+    let npos = code.arg_count as usize;
+    let kwonly = code.kwonly_count as usize;
+    if kwonly == 0 {
+        return Some(());
+    }
+    if f.defaults_maybe_overridden() && f.slot("__kwdefaults__").is_some() {
+        return None;
+    }
+    for slot in npos..npos + kwonly {
+        if covered & (1 << slot) == 0 {
+            let name = code.varnames.get(slot)?.as_str();
+            *args.get_mut(slot)? = &f.kw_defaults.iter().find(|(n, _)| n == name)?.1;
+        }
+    }
+    Some(())
 }
 
 fn code_is_pure_leaf(code: &CodeObject) -> bool {
@@ -69088,7 +69129,6 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         // variables would need cells of the evaluation's own.)
         && code.cellvars.is_empty()
         && !code.has_varargs
-        && code.kwonly_count == 0
         && leaf_arity(code) <= 8
         && code.varnames.len() <= 16
         && code.instructions.len() <= 64;
