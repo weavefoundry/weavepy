@@ -13691,14 +13691,39 @@ impl Interpreter {
                     // receiver moves up into the self slot under the function;
                     // a class receiver leaves an empty self slot.
                     OpCode::LoadMethodAttr => {
-                        let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
-                            break Some(CoreExit::Helper);
-                        };
                         if len == 0 || len == cap {
                             break Some(CoreExit::Helper);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
+                        // `gen.send(...)` and the other generator and
+                        // coroutine methods: the bound method, with an empty
+                        // self slot (the helper's case, which the `CALL` arm
+                        // then resumes inline), in place.
+                        // SAFETY: as above.
+                        if let recv @ (Object::Generator(_) | Object::Coroutine(_)) =
+                            unsafe { &*top }
+                        {
+                            let Some(name) = code.names.get(ins.arg as usize).filter(|n| {
+                                matches!(n.as_str(), "send" | "throw" | "close" | "__next__")
+                            }) else {
+                                break Some(CoreExit::Helper);
+                            };
+                            let bm = make_gen_method(name, recv);
+                            // SAFETY: `len < cap`; the generator (held by the
+                            // bound method too) is replaced in place.
+                            unsafe {
+                                drop_hot(std::mem::replace(&mut *top, bm));
+                                base.add(len).write(Object::Unbound);
+                            }
+                            len += 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
+                        let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
+                            break Some(CoreExit::Helper);
+                        };
                         let f = match unsafe { &*top } {
                             Object::Instance(inst) => {
                                 // The site slot and the class cache are keyed
@@ -13933,6 +13958,26 @@ impl Interpreter {
                                 Object::Coroutine(_) => {
                                     frame.code.is_coroutine || frame.code.is_iterable_coroutine
                                 }
+                                // `yield from obj` of an instance whose
+                                // `__iter__` is a generator function: the
+                                // generator, made in place (the helper's
+                                // case, without leaving the loop).
+                                top @ Object::Instance(_) if Self::core_droppable(top) => {
+                                    match self.instance_gen_call(top, "__iter__") {
+                                        Some(gen) => {
+                                            // SAFETY: the instance (droppable)
+                                            // is replaced in place.
+                                            unsafe {
+                                                drop_hot(std::mem::replace(
+                                                    &mut *base.add(len - 1),
+                                                    gen,
+                                                ));
+                                            }
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                }
                                 _ => false,
                             };
                         if !ok {
@@ -13958,12 +14003,30 @@ impl Interpreter {
                                 _ => false,
                             };
                         if !fresh {
-                            // An instance's generator `__await__`: the helper's.
+                            // An instance's generator `__await__`: the
+                            // generator, made in place (the helper's case).
                             // SAFETY: `len > 0` when `fresh` could fail on it.
-                            if len > 0
-                                && matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_))
-                            {
-                                break Some(CoreExit::Helper);
+                            if len > 0 {
+                                let top = unsafe { &*base.add(len - 1) };
+                                if matches!(top, Object::Instance(_)) {
+                                    if Self::core_droppable(top) {
+                                        if let Some(gen) = self.instance_gen_call(top, "__await__")
+                                        {
+                                            // SAFETY: the instance (droppable)
+                                            // is replaced in place.
+                                            unsafe {
+                                                drop_hot(std::mem::replace(
+                                                    &mut *base.add(len - 1),
+                                                    gen,
+                                                ));
+                                            }
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                    }
+                                    break Some(CoreExit::Helper);
+                                }
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
                         }
