@@ -1741,8 +1741,15 @@ impl Interpreter {
         src: V,
         name: u16,
     ) -> Option<(V, V)> {
-        let V::R(p) = src else {
-            return None;
+        let p = match src {
+            V::R(p) => p,
+            // An `int` held unboxed (`x.bit_length()`): its type's method,
+            // the receiver staying unboxed (the call stages it).
+            V::I(i) => {
+                let b = self.leaf_builtin_method_ptr(ms, &Object::Int(i), code, name)?;
+                return Some((V::Bi(b), src));
+            }
+            _ => return None,
         };
         // SAFETY: as `norm`.
         match unsafe { &*p } {

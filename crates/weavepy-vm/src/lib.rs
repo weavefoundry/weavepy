@@ -23313,7 +23313,29 @@ impl Interpreter {
                 });
                 !deferred && matches!(safe, Ok(Some(true)))
             }
-            K::SetAdd | K::SetDiscard => {
+            // `s.add(x)`: one insertion, with any Python comparison
+            // deferred. A deferral (a stored key only a user `__eq__` could
+            // compare) undoes the insertion it may have wrongly made, and
+            // the call takes the full path.
+            K::SetAdd => {
+                let (O::Set(st), [_, item]) = (&args[0], args) else {
+                    return None;
+                };
+                if !Self::leaf_hash_native(item) {
+                    return None;
+                }
+                let mut m = st.try_borrow_mut().ok()?;
+                let ((_, inserted), deferred) =
+                    crate::object::with_key_eq_deferred(|| m.insert_full(DictKey(item.clone())));
+                if deferred {
+                    if inserted {
+                        m.pop();
+                    }
+                    return None;
+                }
+                return Some(Ok(O::None));
+            }
+            K::SetDiscard => {
                 if !(args.len() == 2
                     && matches!(args[0], O::Set(_))
                     && Self::leaf_hash_native(&args[1]))
@@ -61417,7 +61439,7 @@ impl LeafKind {
     /// all leave by plain decrements): the registered leaf bodies, and the
     /// native methods that release no reference beyond their operands (a
     /// removal, which drops an element, goes through the helper, whose
-    /// release grading covers it).
+    /// release grading covers it; `set.add` keeps a stored equal key).
     fn runs_in_core(self) -> bool {
         matches!(
             self,
@@ -61426,6 +61448,7 @@ impl LeafKind {
                 | Self::Fast(_)
                 | Self::Isinstance
                 | Self::Len
+                | Self::SetAdd
                 | Self::ListAppend
                 | Self::ListPop
                 | Self::ListInsert
@@ -61515,7 +61538,7 @@ impl LeafKind {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 9] = [
+    let pure: [leaf_builtins::Fast; 15] = [
         crate::seqiter::min_fast,
         crate::seqiter::max_fast,
         crate::seqiter::sum_fast,
@@ -61525,6 +61548,12 @@ fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
         crate::seqiter::ord_fast,
         crate::seqiter::chr_fast,
         crate::seqiter::divmod_fast,
+        crate::builtins::int_bit_length_leaf,
+        crate::builtins::int_to_bytes_leaf,
+        crate::builtins::int_from_bytes_leaf,
+        crate::builtins::str_encode_leaf,
+        crate::builtins::bytes_decode_leaf,
+        crate::builtins::dict_getitem_leaf,
     ];
     pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f))
 }
@@ -61541,18 +61570,20 @@ enum LeafRecv {
 }
 
 /// A builtin receiver's tag in a method site's slot (see
-/// [`MethodSlot::set_builtin`]) for the leaf method table.
+/// [`MethodSlot::set_builtin`]) for the leaf method table: the core
+/// loop's own tag ([`builtin_recv_tag`]), so either fills a slot the other
+/// reads.
 #[inline]
 fn leaf_recv_tag(recv: &Object) -> Option<u64> {
-    Some(match recv {
-        Object::List(_) => 1,
-        Object::Dict(_) => 2,
-        Object::Set(_) => 3,
-        Object::Str(_) => 4,
-        Object::Int(_) => 5,
-        Object::Bytes(_) => 6,
-        _ => return None,
-    })
+    match recv {
+        Object::List(_)
+        | Object::Dict(_)
+        | Object::Set(_)
+        | Object::Str(_)
+        | Object::Int(_)
+        | Object::Bytes(_) => builtin_recv_tag(recv),
+        _ => None,
+    }
 }
 
 /// The resolved leaf builtins (see [`LeafKind`]): the interpreter-wide

@@ -612,6 +612,10 @@ unsafe extern "C" fn h_method(
     let [a, b] = words(func);
     let [d, e] = words(recv);
     c.out = [a, b, d, e];
+    // (An unboxed `int`'s builtin method has no in-line check.)
+    if t != T_R {
+        return 0;
+    }
     // Remember the resolution for the in-line check.
     // SAFETY: the method load succeeded on a heap receiver (as `norm`).
     match (func, unsafe { &*(p as *const Object) }) {
