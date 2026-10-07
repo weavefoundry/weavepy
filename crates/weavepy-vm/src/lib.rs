@@ -12939,6 +12939,84 @@ impl Interpreter {
                         if len < argc + 2 {
                             break None;
                         }
+                        // A builtin the site settled as a leaf of the
+                        // commonest kinds (`isinstance`, a registered body,
+                        // a fast half), before the shape checks below, none
+                        // of which applies to one. A decline falls through
+                        // to them untouched (`next(gen)` resumes inline).
+                        // SAFETY: `len >= argc + 2`: the callee.
+                        if let Object::Builtin(b) = unsafe { &*base.add(len - argc - 2) } {
+                            let kind = mslots!(cold_mslots, ext)
+                                .get(pc)
+                                .and_then(|s| s.get_leaf(b));
+                            if matches!(
+                                kind,
+                                Some(
+                                    LeafKind::Isinstance
+                                        | LeafKind::Fast(_)
+                                        | LeafKind::Scalar
+                                        | LeafKind::Opaque
+                                )
+                            ) && Rc::strong_count(b) > 1
+                            {
+                                let callee_at = len - argc - 2;
+                                // SAFETY: `len >= argc + 2`: the self slot.
+                                let first = if matches!(
+                                    unsafe { &*base.add(callee_at + 1) },
+                                    Object::Unbound
+                                ) {
+                                    callee_at + 2
+                                } else {
+                                    callee_at + 1
+                                };
+                                // SAFETY: the operands above the callee.
+                                let ops = unsafe {
+                                    std::slice::from_raw_parts(base.add(first), len - first)
+                                };
+                                if Self::core_all_droppable(ops) {
+                                    let r = match kind {
+                                        Some(LeafKind::Fast(f)) => f(ops),
+                                        Some(LeafKind::Isinstance) => Self::core_isinstance(ops),
+                                        Some(LeafKind::Opaque) => Some(match b.call_kw.as_ref() {
+                                            Some(ckw) => ckw(ops, &[]),
+                                            None => (b.call)(ops),
+                                        }),
+                                        Some(k) => self.leaf_builtin_call(k, b, ops),
+                                        None => None,
+                                    };
+                                    match r {
+                                        None => {}
+                                        Some(Ok(v)) => {
+                                            // SAFETY: every operand (checked) and
+                                            // the builtin (count above one) leave
+                                            // by plain decrements; the result
+                                            // takes the callee's slot.
+                                            unsafe {
+                                                for k in callee_at..len {
+                                                    drop_hot(base.add(k).read());
+                                                }
+                                                base.add(callee_at).write(v);
+                                            }
+                                            len = callee_at + 1;
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                        Some(Err(e)) => {
+                                            // SAFETY: as above.
+                                            unsafe {
+                                                for k in callee_at..len {
+                                                    drop_hot(base.add(k).read());
+                                                }
+                                            }
+                                            len = callee_at;
+                                            pc += 1;
+                                            break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // `next(gen)`: the generator resumes inline, as for
                         // `FOR_ITER`, with the yield as the call's result.
                         // SAFETY: `len >= argc + 2 == 3`.
