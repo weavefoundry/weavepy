@@ -13701,25 +13701,18 @@ impl Interpreter {
                         // self slot (the helper's case, which the `CALL` arm
                         // then resumes inline), in place.
                         // SAFETY: as above.
-                        if let recv @ (Object::Generator(_) | Object::Coroutine(_)) =
-                            unsafe { &*top }
-                        {
-                            let Some(name) = code.names.get(ins.arg as usize).filter(|n| {
-                                matches!(n.as_str(), "send" | "throw" | "close" | "__next__")
-                            }) else {
-                                break Some(CoreExit::Helper);
-                            };
-                            let bm = make_gen_method(name, recv);
-                            // SAFETY: `len < cap`; the generator (held by the
-                            // bound method too) is replaced in place.
-                            unsafe {
-                                drop_hot(std::mem::replace(&mut *top, bm));
-                                base.add(len).write(Object::Unbound);
+                        if matches!(
+                            unsafe { &*top },
+                            Object::Generator(_) | Object::Coroutine(_)
+                        ) {
+                            // SAFETY: `len < cap`: `top` and the slot above.
+                            if unsafe { core_gen_method(code, ins.arg, top) } {
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
                             }
-                            len += 1;
-                            last = pc;
-                            pc += 1;
-                            continue;
+                            break Some(CoreExit::Helper);
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
                             break Some(CoreExit::Helper);
@@ -13735,9 +13728,19 @@ impl Interpreter {
                                 if !Self::default_getattribute(cls) {
                                     break Some(CoreExit::Helper);
                                 }
-                                // The instance's attributes must not shadow
-                                // the method.
+                                // An attribute the instance holds itself (a
+                                // stored callable, `self.fn(...)`): the value,
+                                // with an empty self slot, as the helper
+                                // loads it.
                                 if inst_may_shadow(inst, code, ins.arg) {
+                                    // SAFETY: `len < cap`: `top` and the slot
+                                    // above it.
+                                    if unsafe { Self::core_value_method(code, ins.arg, top) } {
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
                                     break Some(CoreExit::Helper);
                                 }
                                 let f = match ms.get_held(ver) {
@@ -16415,6 +16418,43 @@ impl Interpreter {
     fn core_droppable(v: &Object) -> bool {
         // (A never-driven `asend` awaitable warns as it goes.)
         !matches!(v, Object::AsyncGenAwait(_)) && Self::core_drops_plain()
+    }
+
+    /// The method-form load at `top` of an attribute the instance there
+    /// holds itself (a stored callable, `self.fn(...)`): the value, with an
+    /// empty self slot above it, as the helper loads it. `false` touches
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// `top` is the core loop's top stack slot (an instance), and the slot
+    /// above it is free.
+    #[inline(never)]
+    pub(crate) unsafe fn core_value_method(
+        code: &CodeObject,
+        name_idx: u32,
+        top: *mut Object,
+    ) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return false;
+        };
+        let Some((LeafAttr::Value(v), _)) =
+            Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)
+        else {
+            return false;
+        };
+        // SAFETY: as above.
+        if !Self::core_droppable(unsafe { &*top }) {
+            return false;
+        }
+        // SAFETY: the receiver (droppable) is replaced in place; the slot
+        // above is free.
+        unsafe {
+            drop_hot(std::mem::replace(&mut *top, v));
+            top.add(1).write(Object::Unbound);
+        }
+        true
     }
 
     /// Whether a release reports to nothing (no dict or function watcher,
@@ -63825,6 +63865,34 @@ fn make_agen_await(
 /// `<gen>.send` / `.throw` / `.close` / `.__next__` / `.__iter__`.
 /// The actual dispatch is handled by [`Interpreter::call`] via the
 /// special name prefix `.gen_*`.
+/// The method-form load at `top` of a generator or coroutine method
+/// (`send`, `throw`, `close`, `__next__`): the bound method, with an empty
+/// self slot above it. `false` touches nothing.
+///
+/// # Safety
+///
+/// `top` is a stack slot holding the receiver, and the slot above it is
+/// free.
+#[inline(never)]
+unsafe fn core_gen_method(code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+    let Some(name) = code
+        .names
+        .get(name_idx as usize)
+        .filter(|n| matches!(n.as_str(), "send" | "throw" | "close" | "__next__"))
+    else {
+        return false;
+    };
+    // SAFETY: the caller's contract.
+    let bm = make_gen_method(name, unsafe { &*top });
+    // SAFETY: the generator (held by the bound method too) is replaced in
+    // place; the slot above is free.
+    unsafe {
+        drop_hot(std::mem::replace(&mut *top, bm));
+        top.add(1).write(Object::Unbound);
+    }
+    true
+}
+
 fn make_gen_method(name: &str, receiver: &Object) -> Object {
     fn unreachable_call(_args: &[Object]) -> Result<Object, RuntimeError> {
         Err(RuntimeError::Internal(

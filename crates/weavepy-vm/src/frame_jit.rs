@@ -1656,18 +1656,8 @@ unsafe extern "C" fn h_load_method(
         // `gen.send(...)` and the other generator and coroutine methods: the
         // bound method with an empty self slot, as the core loop's arm loads
         // it.
-        if let recv @ (Object::Generator(_) | Object::Coroutine(_)) = &*top {
-            let Some(method) = code
-                .names
-                .get(name as usize)
-                .filter(|n| matches!(n.as_str(), "send" | "throw" | "close" | "__next__"))
-            else {
-                return 1;
-            };
-            let bm = crate::make_gen_method(method, recv);
-            crate::drop_hot(std::mem::replace(&mut *top, bm));
-            st.stack.add(len).write(Object::Unbound);
-            return 0;
+        if matches!(&*top, Object::Generator(_) | Object::Coroutine(_)) {
+            return u32::from(!crate::core_gen_method(code, name, top));
         }
         let Some(ms) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
             return 1;
@@ -1676,10 +1666,13 @@ unsafe extern "C" fn h_load_method(
             Object::Instance(inst) => {
                 let cls = inst.cls_raw();
                 let ver = cls.attr_version.get();
-                if !Interpreter::default_getattribute(cls)
-                    || crate::inst_may_shadow(inst, code, name)
-                {
+                if !Interpreter::default_getattribute(cls) {
                     return 1;
+                }
+                // An attribute the instance holds itself (a stored callable):
+                // the value with an empty self slot, as the core loop's arm.
+                if crate::inst_may_shadow(inst, code, name) {
+                    return u32::from(!Interpreter::core_value_method(code, name, top));
                 }
                 let f = match ms.get_held(ver) {
                     Some(f) => Object::Function(f),
