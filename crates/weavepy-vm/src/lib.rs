@@ -9829,6 +9829,44 @@ impl Interpreter {
     /// `__getitem__` is a plain Python function of `(self, key)`, as an
     /// inline activation (CPython's `BINARY_SUBSCR_GETITEM`): the operands
     /// leave the stack as its arguments, and its return pushes the result.
+    /// `container[key]` at `frame.pc` for an instance whose class's
+    /// `__getitem__` (the site's remembered function) is a pure leaf: the
+    /// result replaces the operands, as the full call would leave it.
+    /// `false` touches nothing.
+    fn try_leaf_getitem(&mut self, frame: &mut Frame) -> bool {
+        let pc = frame.pc as usize;
+        let n = frame.stack.len();
+        let Some(Object::Instance(inst)) = n.checked_sub(2).and_then(|k| frame.stack.get(k)) else {
+            return false;
+        };
+        let ver = inst.cls_raw().attr_version.get();
+        let Some(f) = code_method_slot(&frame.code, pc as u32).and_then(|s| s.get_held(ver)) else {
+            return false;
+        };
+        let code = f.code();
+        if code.arg_count != 2
+            || !code_is_pure_leaf(&code)
+            || !pure_leaf_warm(&code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        let args = [
+            std::ptr::from_ref(&frame.stack[n - 2]),
+            std::ptr::from_ref(&frame.stack[n - 1]),
+        ];
+        let Some(r) = self.pure_leaf_eval::<false, false>(&code, &f, &args) else {
+            return false;
+        };
+        let key = frame.stack.pop().expect("checked above");
+        let container = frame.stack.pop().expect("checked above");
+        frame.stack.push(r);
+        frame.pc = pc as u32 + 1;
+        self.release(key);
+        self.release(container);
+        true
+    }
+
     fn try_inline_getitem(
         &mut self,
         frame: &mut Frame,
@@ -14795,6 +14833,11 @@ impl Interpreter {
     fn core_getitem(&mut self, sw: &mut CoreSwitch, descr: bool) -> bool {
         if !self.inline_calls_ok() {
             return false;
+        }
+        // A pure leaf `__getitem__`: evaluated in place, no activation.
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        if !descr && self.try_leaf_getitem(unsafe { &mut *sw.cur }) {
+            return true;
         }
         let mut tmp = None;
         // SAFETY: see `CoreSwitch` (as in `core_call`).
@@ -21770,9 +21813,31 @@ impl Interpreter {
         let b = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
             Some(K::Value(_)) => return self.leaf_instance_len_fast(cls, ver, v),
+            // A Python `__len__` that is a pure leaf: evaluated in place, as
+            // a cached property's getter is (a declined or odd result
+            // leaves the call to the full path, which nothing observed).
+            Some(K::Method(w)) => {
+                let f = w.upgrade()?;
+                let code = f.code();
+                if !code_is_pure_leaf(&code)
+                    || !pure_leaf_warm(&code)
+                    || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+                {
+                    return None;
+                }
+                return match self.pure_leaf_eval::<false, false>(
+                    &code,
+                    &f,
+                    &[std::ptr::from_ref(v)],
+                )? {
+                    Object::Int(n) if n >= 0 => Some(Object::Int(n)),
+                    _ => None,
+                };
+            }
             Some(_) => return None,
             None => {
                 let kind = match cls.lookup("__len__") {
+                    Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
                     Some(Object::Builtin(b)) if b.binds_instance => {
                         match self.leaf_call_kind(&b) {
                             Some(LeafKind::Opaque) => K::BuiltinMethod(b),
@@ -21783,7 +21848,7 @@ impl Interpreter {
                     }
                     _ => K::Other,
                 };
-                let found = matches!(kind, K::BuiltinMethod(_) | K::Value(_));
+                let found = matches!(kind, K::BuiltinMethod(_) | K::Value(_) | K::Method(_));
                 cls.leaf_attrs.set(key, ver, kind);
                 return if found {
                     self.leaf_instance_len(v)
@@ -21965,6 +22030,38 @@ impl Interpreter {
             Some(_) => None,
             None => {
                 let kind = match cls.lookup("__call__") {
+                    Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::Method(w) => w.upgrade(),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
+        }
+    }
+
+    /// `type(inst).<name>` when it is a plain Python function, cached on
+    /// the class under its attribute version at `key` (an address no
+    /// interned name has; one per dunder).
+    fn instance_dunder_function(
+        inst: &PyInstance,
+        key: usize,
+        name: &str,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::Method(w)) => w.upgrade(),
+            Some(_) => None,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return None;
+                }
+                let kind = match cls.lookup(name) {
                     Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
                     _ => K::Other,
                 };
@@ -33448,7 +33545,21 @@ impl Interpreter {
         }
         // `len(x)` is `type(x).__len__(x)` — for an *instance* that's the
         // class's method; for a *class* it's the metaclass's
-        // (`len(SomeEnum)` → `EnumType.__len__`).
+        // (`len(SomeEnum)` → `EnumType.__len__`). A plain Python method is
+        // called with the instance, with no bound method built for it.
+        if let Object::Instance(inst) = v {
+            /// The class cache key for `__len__` (see
+            /// `instance_dunder_function`).
+            static LEN_FN_KEY: u8 = 0;
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(LEN_FN_KEY) as usize,
+                "__len__",
+            ) {
+                let r = self.call(&Object::Function(f), std::slice::from_ref(v), &[], globals)?;
+                return coerce_len_result(r).map(Object::Int);
+            }
+        }
         if let Some(r) = instance_native_dunder(v, "__len__", None) {
             return coerce_len_result(r?).map(Object::Int);
         }
@@ -36968,6 +37079,30 @@ impl Interpreter {
             return self.subscr_get_public(&inner, i);
         }
         if let Object::Instance(inst) = v {
+            /// The class cache key for `__getitem__` (see
+            /// `instance_dunder_function`).
+            static GETITEM_KEY: u8 = 0;
+            // A plain Python `__getitem__`: called with the instance, with
+            // no bound method built for it.
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(GETITEM_KEY) as usize,
+                "__getitem__",
+            ) {
+                // A pure leaf evaluates in place, without an activation.
+                let code = f.code();
+                if code.arg_count == 2
+                    && code_is_pure_leaf(&code)
+                    && pure_leaf_warm(&code)
+                    && crate::recursion::current_depth() < crate::recursion::recursion_limit()
+                {
+                    let args = [std::ptr::from_ref(v), std::ptr::from_ref(i)];
+                    if let Some(r) = self.pure_leaf_eval::<false, false>(&code, &f, &args) {
+                        return Ok(r);
+                    }
+                }
+                return self.call(&Object::Function(f), &[v.clone(), i.clone()], &[], &g);
+            }
             let user_getitem = inst
                 .cls()
                 .lookup_with_owner("__getitem__")
