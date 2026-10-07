@@ -810,6 +810,11 @@ pub struct InstancePlan {
     pub init_from_object: bool,
     /// Instances descend from `BaseException`: seed `.args` at allocation.
     pub seeds_exception_args: bool,
+    /// An exception class that keeps `BaseException`'s allocator and
+    /// `__init__` (no override anywhere in its MRO): a call is the
+    /// allocation and that `__init__`'s stores (see
+    /// `builtin_types::exc_init`).
+    pub exc_native_init: bool,
     /// The MRO beyond the class itself is just `object` — the strict
     /// "takes no arguments" arity check applies when no `__init__` exists.
     pub only_object_init: bool,

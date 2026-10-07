@@ -4466,7 +4466,7 @@ fn syntax_basename(filename: &Object) -> String {
 /// on the instance so every subclass — built-in or user-defined
 /// — exposes `e.args` automatically. Module-scope so the docs surface
 /// pass (RFC 0056 WS4) can mint per-exception-type mirrors of it.
-fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let inst = args
             .first()

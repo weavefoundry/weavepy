@@ -12870,7 +12870,7 @@ impl Interpreter {
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        if !self.core_call_ex(sw, pc) && sw.pending.is_none() {
+                        if !self.core_call_ex(sw, pc, snap_gen) && sw.pending.is_none() {
                             sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                         }
                         break Some(CoreExit::Reload);
@@ -15328,12 +15328,16 @@ impl Interpreter {
     /// Python callee (or a bound method over one) runs as an inline
     /// activation switched to here. `false` touches nothing.
     #[inline(never)]
-    fn core_call_ex(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+    fn core_call_ex(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
         if !self.inline_calls_ok() {
             return false;
         }
         // A generator function's call makes its generator in place.
         if self.core_gen_call_ex(sw, pc) {
+            return true;
+        }
+        // A plain class's construction, as a `CALL`'s.
+        if self.core_new_ex(sw, pc, snap_gen) {
             return true;
         }
         // SAFETY: see `CoreSwitch`: the running activation is synced.
@@ -15829,6 +15833,68 @@ impl Interpreter {
     /// touches nothing.
     #[inline(never)]
     fn core_new(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let Some(argc) = (unsafe { &*sw.cur })
+            .code
+            .instructions
+            .get(pc)
+            .map(|i| i.arg as usize)
+        else {
+            return false;
+        };
+        self.core_new_n(sw, pc, argc, snap_gen)
+    }
+
+    /// `cls(*args)` (the `CALL_FUNCTION_EX` at `pc` of `sw`'s synced
+    /// running activation) of a plain class over an exact tuple or list,
+    /// with no keywords: the items spread into a call's operands for
+    /// [`Self::core_new_n`], and the operands restored when it declines.
+    #[inline(never)]
+    fn core_new_ex(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(at) = frame.stack.len().checked_sub(4) else {
+            return false;
+        };
+        let [Object::Type(ty), Object::Unbound, spread, mapping] = &frame.stack[at..] else {
+            return false;
+        };
+        let no_kw = match mapping {
+            Object::Unbound => true,
+            Object::Dict(d) => d.try_borrow().is_ok_and(|d| d.is_empty()),
+            _ => false,
+        };
+        if ty.flags.is_builtin || !no_kw {
+            return false;
+        }
+        let items: Vec<Object> = match spread {
+            Object::Tuple(t) if t.len() <= 16 => t.to_vec(),
+            Object::List(l) => match l.try_borrow() {
+                Ok(l) if l.len() <= 16 => l.clone(),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let argc = items.len();
+        let mapping = frame.stack.pop().expect("checked above");
+        let spread = frame.stack.pop().expect("checked above");
+        frame.stack.extend(items);
+        if self.core_new_n(sw, pc, argc, snap_gen) {
+            self.release(spread);
+            self.release(mapping);
+            return true;
+        }
+        // SAFETY: as above (a declined construction touched nothing).
+        let frame = unsafe { &mut *sw.cur };
+        frame.stack.truncate(at + 2);
+        frame.stack.push(spread);
+        frame.stack.push(mapping);
+        false
+    }
+
+    /// [`Self::core_new`] of the class `argc` positional arguments below
+    /// the top of the stack, called by the instruction at `pc`.
+    fn core_new_n(&mut self, sw: &mut CoreSwitch, pc: usize, argc: usize, snap_gen: u64) -> bool {
         use weavepy_compiler::InlineCache as IC;
         if !self.inline_calls_ok()
             || crate::stdlib::tracemalloc_real::is_tracking()
@@ -15840,9 +15906,6 @@ impl Interpreter {
         }
         // SAFETY: see `CoreSwitch`.
         let frame = unsafe { &mut *sw.cur };
-        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
-            return false;
-        };
         let n = frame.stack.len();
         let Some(self_slot) = n.checked_sub(argc + 1) else {
             return false;
@@ -15853,10 +15916,12 @@ impl Interpreter {
         let Object::Type(ty) = &frame.stack[callee_slot] else {
             return false;
         };
+        // (A `CALL` site's first execution still specializes it.)
         if !matches!(frame.stack[self_slot], Object::Unbound)
             || ty.flags.is_builtin
             || !Self::metaclass_calls_like_type(ty)
-            || matches!(frame.code.caches.get(pc as u32), IC::Empty)
+            || (frame.code.instructions[pc].op == OpCode::Call
+                && matches!(frame.code.caches.get(pc as u32), IC::Empty))
         {
             return false;
         }
@@ -15882,6 +15947,26 @@ impl Interpreter {
             }
         }
         let Some((init, code)) = plan.lean_init.as_ref() else {
+            // `E(*args)` for an exception class that keeps
+            // `BaseException`'s allocator and `__init__`: the allocation,
+            // and that `__init__`'s `args` (and a `StopIteration`'s
+            // `value`).
+            if plan.exc_native_init {
+                let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
+                let mut init_args = Vec::with_capacity(argc + 1);
+                init_args.push(inst.clone());
+                init_args.extend(frame.stack.drain(self_slot + 1..));
+                // (An instance's `__init__` stores can't fail.)
+                let _ = builtin_types::exc_init(&init_args);
+                drop(init_args);
+                frame.stack.truncate(callee_slot);
+                frame.stack.push(inst);
+                frame.pc = pc as u32 + 1;
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
             // `C()` for a class with the default `__new__` and
             // `object.__init__`: the allocation is the whole call.
             if argc == 0
@@ -52460,6 +52545,22 @@ impl Interpreter {
             _ => None,
         };
 
+        let exc_native_init = seeds_exception_args
+            && is_object_new
+            && abstract_error.is_none()
+            && matches!(native, NativeKind::Plain)
+            && !cls.is_type_subclass()
+            && match (
+                &init_fn,
+                bt.base_exception
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__init__"))),
+            ) {
+                (Some(Object::Builtin(a)), Some(Object::Builtin(b))) => Rc::ptr_eq(a, b),
+                _ => false,
+            };
+
         crate::types::InstancePlan {
             abstract_error,
             user_new,
@@ -52468,6 +52569,7 @@ impl Interpreter {
             init_fn,
             init_from_object,
             seeds_exception_args,
+            exc_native_init,
             only_object_init,
             lean_init,
             tuple_new,
