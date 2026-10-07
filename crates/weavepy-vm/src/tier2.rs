@@ -5940,20 +5940,17 @@ unsafe fn try_native_call(
         return status;
     }
 
-    // A framed native call of a *tiny* callee (a getter, a comparison)
-    // costs more than the interpreter's own inline activation of the
-    // same body, so a loop dense with them belongs to tier-1: charge it
-    // to the poll's density judgment (see `wpjit_poll`).
     // A body the interpreter evaluates without a frame at all (a pure
-    // leaf: a getter, a comparison, a constant return) is one such
-    // callee whatever its shape. A tiny *method* that stores — the
-    // attribute fixtures' `tick` — is not, and its loop keeps its
-    // native lane.
+    // leaf: a getter, a comparison, a constant return) costs less there
+    // than as a framed native call, so a loop dense with them belongs to
+    // tier-1: charge it to the poll's density judgment (see
+    // `wpjit_poll`). Any other callee keeps its native lane (since the
+    // frame JIT's direct calls, a short non-leaf body included).
     let pure_leaf = match nc.code.jit_hint.pure_leaf() {
         Some(known) => known,
         None => crate::code_is_pure_leaf_pub(&nc.code),
     };
-    if pure_leaf || (recv.is_none() && nc.code.instructions.len() <= TINY_CALLEE_OPS) {
+    if pure_leaf {
         ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     // The framed native call below is itself expensive (buffers, pins, a
@@ -6652,12 +6649,6 @@ unsafe fn try_native_ctor(
         return None;
     }
     ctx.interp_calls = ctx.interp_calls.saturating_add(1);
-    // A constructor whose `__init__` is tiny is dominated by the call
-    // and the allocation, which the interpreter's own `instantiate`
-    // does with less ceremony: charge the poll's density judgment.
-    if nc.code.instructions.len() <= TINY_CALLEE_OPS {
-        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
-    }
     let (inst, ran_finalizers) = interp.alloc_plain_instance(cls)?;
     if ran_finalizers {
         // Threshold collection ran finalizers — arbitrary Python.
@@ -7598,12 +7589,6 @@ const STR_METHOD_RETIRE_BUDGET: u32 = 256;
 /// loop-header iterations) may make: more than one per four native
 /// iterations and the loop is a driver around its calls.
 const NATIVE_CALLS_PER_POLL: u32 = (weavepy_jit::JIT_POLL_STRIDE / 4) as u32;
-
-/// A compiled callee this size or smaller is served better by the
-/// interpreter's inline activation than by a framed native call: its
-/// body is a getter, a comparison or a constant return, and the call's
-/// own buffers, pins, context and recursion tick dominate it.
-const TINY_CALLEE_OPS: usize = 12;
 
 /// Generic *interpreter* calls one poll interval may make before the
 /// same judgment applies (see [`wpjit_poll`]). A call every fourth
