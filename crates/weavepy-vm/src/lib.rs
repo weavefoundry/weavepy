@@ -12953,6 +12953,7 @@ impl Interpreter {
                                 kind,
                                 Some(
                                     LeafKind::Isinstance
+                                        | LeafKind::GetAttr
                                         | LeafKind::Fast(_)
                                         | LeafKind::Scalar
                                         | LeafKind::Opaque
@@ -16651,11 +16652,19 @@ impl Interpreter {
         let [obj, spec] = ops else {
             return None;
         };
-        // An instance of one class: its class's MRO alone (a miss is left
-        // to the full check, which also consults `__class__`).
+        // An instance of one class: its exact class (as `isinstance` asks
+        // first, before any `__instancecheck__`), its class's MRO, or an
+        // ABC's cached verdict. A miss is left to the full check, which
+        // also consults `__class__`.
         if let (Object::Instance(inst), Object::Type(cls)) = (obj, spec) {
-            return (cls.metaclass_is_type() && inst.cls_raw().is_subclass_of(cls))
-                .then_some(Ok(Object::Bool(true)));
+            let ic = inst.cls_raw();
+            let hit = std::ptr::eq(ic, &**cls)
+                || if cls.metaclass_is_type() {
+                    ic.is_subclass_of(cls)
+                } else {
+                    crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
+                };
+            return hit.then_some(Ok(Object::Bool(true)));
         }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).
@@ -16687,7 +16696,16 @@ impl Interpreter {
                 return None;
             };
             if !cls.metaclass_is_type() {
-                return None;
+                // An ABC answers here only when its verdict is known true.
+                match obj {
+                    Object::Instance(inst)
+                        if std::ptr::eq(inst.cls_raw(), &**cls)
+                            || crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls()) =>
+                    {
+                        return Some(Ok(Object::Bool(true)));
+                    }
+                    _ => return None,
+                }
             }
             hit |= match (obj, builtin_cls) {
                 // A miss on an instance is left to the full check, which
@@ -36192,6 +36210,11 @@ impl Interpreter {
             return Ok(Object::Bool(false));
         }
         if let Object::Type(cls) = classinfo {
+            // An object of exactly `cls` is an instance before any
+            // `__instancecheck__` is asked (CPython `PyObject_IsInstance`).
+            if Rc::ptr_eq(&crate::builtins::class_of(obj), cls) {
+                return Ok(Object::Bool(true));
+            }
             let meta = cls.metaclass_or_type();
             // Only dispatch to a *user-defined* __instancecheck__.
             // The built-in `type.__instancecheck__` is already what
@@ -61801,6 +61824,7 @@ impl LeafKind {
                 | Self::Scalar
                 | Self::Fast(_)
                 | Self::Isinstance
+                | Self::GetAttr
                 | Self::Len
                 | Self::SetAdd
                 | Self::ListAppend

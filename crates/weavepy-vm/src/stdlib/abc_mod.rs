@@ -442,6 +442,88 @@ pub(crate) fn forwarded_check(
     Some(body)
 }
 
+/// Whether `isinstance(instance, cls)` is known true for the ABC `cls`
+/// and an instance of `inst_cls` without running anything: `cls`'s
+/// metaclass checks instances with `abc`'s own forwarding
+/// `__instancecheck__` (see [`forwarded_check`]), the instance reports its
+/// class as `__class__` (`object`'s descriptor), and `cls`'s positive
+/// cache already holds that class, as [`abc_instancecheck`] would find
+/// first. `false` leaves the question to the full check.
+pub(crate) fn abc_instance_cached(cls: &TypeObject, inst_cls: &Rc<TypeObject>) -> bool {
+    // SAFETY: GIL-serialized read of the metaclass cell, finished before
+    // anything else runs.
+    let Some(meta) = (unsafe { cls.metaclass.peek() }).and_then(|m| m.clone()) else {
+        return false;
+    };
+    let Some(hook) = instancecheck_hook(&meta) else {
+        return false;
+    };
+    if forwarded_check(&hook, false).is_none() || !default_class_attr(inst_cls) {
+        return false;
+    }
+    let held = Object::Type(inst_cls.clone());
+    if cls.abc_state.get().is_some() {
+        return state(cls).cache.borrow().contains(&held);
+    }
+    let mro = cls.mro.borrow();
+    mro.iter()
+        .find(|base| base.abc_state.get().is_some())
+        .is_some_and(|base| state(base).cache.borrow().contains(&held))
+}
+
+/// `meta.__instancecheck__` off the metaclass's MRO, remembered under its
+/// attribute version.
+fn instancecheck_hook(meta: &TypeObject) -> Option<Object> {
+    use crate::types::LeafAttrKind as K;
+    /// The cache key (an address no interned name has).
+    static HOOK_KEY: u8 = 0;
+    let key = std::ptr::addr_of!(HOOK_KEY) as usize;
+    let ver = meta.attr_version.get();
+    match meta.leaf_attrs.get(key, ver) {
+        Some(K::Value(hook)) => Some(hook.clone()),
+        Some(_) => None,
+        None => {
+            let hook = meta.lookup("__instancecheck__");
+            let kind = match &hook {
+                Some(h @ Object::Function(_)) => K::Value(h.clone()),
+                _ => K::Other,
+            };
+            meta.leaf_attrs.set(key, ver, kind);
+            hook.filter(|h| matches!(h, Object::Function(_)))
+        }
+    }
+}
+
+/// Whether instances of `cls` report their class through `object`'s own
+/// `__class__` descriptor, remembered under the class's attribute version.
+fn default_class_attr(cls: &TypeObject) -> bool {
+    use crate::types::LeafAttrKind as K;
+    /// The cache key (an address no interned name has).
+    static CLASS_KEY: u8 = 0;
+    let key = std::ptr::addr_of!(CLASS_KEY) as usize;
+    let ver = cls.attr_version.get();
+    match cls.leaf_attrs.get(key, ver) {
+        Some(K::InstanceOnly) => true,
+        Some(_) => false,
+        None => {
+            let object_own = crate::builtin_types::builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("__class__"))
+                .cloned();
+            let default = match (cls.lookup("__class__"), object_own) {
+                (None, _) => true,
+                (Some(found), Some(own)) => found.is_same(&own),
+                (Some(_), None) => false,
+            };
+            cls.leaf_attrs
+                .set(key, ver, if default { K::InstanceOnly } else { K::Other });
+            default
+        }
+    }
+}
+
 /// `_abc_instancecheck(cls, instance)`.
 fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
     let [cls, instance] = args_exact::<2>(args, "_abc_instancecheck")?;
