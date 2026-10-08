@@ -13994,6 +13994,17 @@ impl Interpreter {
                             }
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
+                            // (No site slots yet: a static or class method
+                            // read through an instance still loads here.)
+                            // SAFETY: `len < cap`: `top` and the slot above.
+                            if matches!(unsafe { &*top }, Object::Instance(_))
+                                && unsafe { Self::core_class_fn_method(code, ins.arg, top) }
+                            {
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             break Some(CoreExit::Helper);
                         };
                         let f = match unsafe { &*top } {
@@ -14027,6 +14038,18 @@ impl Interpreter {
                                                 // path serves it next time.
                                                 ms.set(ver, &f);
                                                 Object::Function(f)
+                                            }
+                                            // A static or class method.
+                                            // SAFETY: `len < cap`: `top` and
+                                            // the slot above it.
+                                            None if unsafe {
+                                                Self::core_class_fn_method(code, ins.arg, top)
+                                            } =>
+                                            {
+                                                len += 1;
+                                                last = pc;
+                                                pc += 1;
+                                                continue;
                                             }
                                             None => break Some(CoreExit::Helper),
                                         },
@@ -17441,6 +17464,37 @@ impl Interpreter {
     fn core_droppable(v: &Object) -> bool {
         // (A never-driven `asend` awaitable warns as it goes.)
         !matches!(v, Object::AsyncGenAwait(_)) && Self::core_drops_plain()
+    }
+
+    /// [`Self::core_value_method`] for a static or class method read
+    /// through an instance: the function, with an empty self slot or the
+    /// instance's class as its self, as the helper loads it.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::core_value_method`].
+    #[inline(never)]
+    unsafe fn core_class_fn_method(code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return false;
+        };
+        let (f, self_obj) = match Self::leaf_resolve_instance_attr(code, inst, name_idx) {
+            Some(LeafAttr::Value(f @ Object::Function(_))) => (f, Object::Unbound),
+            Some(LeafAttr::ClassMethod(f)) => (Object::Function(f), Object::Type(inst.cls())),
+            _ => return false,
+        };
+        // SAFETY: as above.
+        if !Self::core_droppable(unsafe { &*top }) {
+            return false;
+        }
+        // SAFETY: the receiver (droppable) is replaced in place; the slot
+        // above is free.
+        unsafe {
+            drop_hot(std::mem::replace(&mut *top, f));
+            top.add(1).write(self_obj);
+        }
+        true
     }
 
     /// The method-form load at `top` of an attribute the instance there
