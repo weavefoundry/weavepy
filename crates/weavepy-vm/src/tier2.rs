@@ -1068,6 +1068,30 @@ fn import_compilation_budget() -> bool {
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
 pub(crate) fn note_startup_finished() {
     STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    warm_engine();
+}
+
+/// Build this thread's engine and run one throwaway compile through it
+/// (see [`JitEngine::warm_up`]) as start-up ends, when the JIT is on: the
+/// first hot loop's compile then doesn't pay the code generator's cold
+/// start inside the work it speeds up.
+fn warm_engine() {
+    if jit_off_for_process() {
+        return;
+    }
+    JIT.with(|cell| {
+        let Ok(mut st) = cell.try_borrow_mut() else {
+            return;
+        };
+        if !st.enabled || st.engine.is_some() {
+            return;
+        }
+        st.engine = JitEngine::new();
+        match st.engine.as_mut() {
+            Some(engine) => engine.warm_up(),
+            None => st.enabled = false,
+        }
+    });
 }
 
 /// Whether a code object whose counter reached `counter` against
