@@ -13217,6 +13217,48 @@ unsafe extern "C" fn wpjit_iter_next_pair(
             }
         };
     }
+    // `enumerate` over bytes or tuples into typed lanes: the specialized
+    // steps, ahead of the general pure step below.
+    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
+        let pair = match ctx.pins.get(pin as usize) {
+            Some(Pin::Obj(it)) => next_enumerated_byte(it),
+            _ => NativeBytePair::Unsupported,
+        };
+        match pair {
+            NativeBytePair::Value(index, byte) => {
+                jf.ret_bits = index as u64;
+                // SAFETY: the marshal buffer has at least one slot,
+                // as required by this helper's live-buffer contract.
+                unsafe { *jf.call_args = u64::from(byte) };
+                return 0;
+            }
+            NativeBytePair::Exhausted => return 1,
+            NativeBytePair::Unsupported => {}
+        }
+    } else if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
+        let pair = match ctx.pins.get(pin as usize) {
+            Some(Pin::Obj(it)) => next_enumerated_tuple(it, ctx.pins.len() < RUNTIME_PIN_CAP),
+            _ => NativeObjectPair::Unsupported,
+        };
+        match pair {
+            NativeObjectPair::Value(index, value) => {
+                let bits = if matches!(value, Object::None) {
+                    u64::MAX
+                } else {
+                    debug_assert!(ctx.pins.len() < RUNTIME_PIN_CAP);
+                    let bits = ctx.pins.len() as u64;
+                    ctx.pins.push(Pin::Obj(value));
+                    bits
+                };
+                jf.ret_bits = index as u64;
+                // SAFETY: the helper's marshal buffer contains one slot.
+                unsafe { *jf.call_args = bits };
+                return 0;
+            }
+            NativeObjectPair::Exhausted => return 1,
+            NativeObjectPair::Unsupported => {}
+        }
+    }
     // An `enumerate` or two-source `zip` over native iterators whose step
     // runs no code: the pair straight into the lanes, as above.
     let pair = match ctx.pins.get(pin as usize) {
@@ -13300,46 +13342,6 @@ unsafe extern "C" fn wpjit_iter_next_pair(
             (ctx.pins.len() - 1) as u64
         };
         return 3;
-    }
-    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
-        let pair = match ctx.pins.get(pin as usize) {
-            Some(Pin::Obj(it)) => next_enumerated_byte(it),
-            _ => NativeBytePair::Unsupported,
-        };
-        match pair {
-            NativeBytePair::Value(index, byte) => {
-                jf.ret_bits = index as u64;
-                // SAFETY: the marshal buffer has at least one slot,
-                // as required by this helper's live-buffer contract.
-                unsafe { *jf.call_args = u64::from(byte) };
-                return 0;
-            }
-            NativeBytePair::Exhausted => return 1,
-            NativeBytePair::Unsupported => {}
-        }
-    } else if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
-        let pair = match ctx.pins.get(pin as usize) {
-            Some(Pin::Obj(it)) => next_enumerated_tuple(it, ctx.pins.len() < RUNTIME_PIN_CAP),
-            _ => NativeObjectPair::Unsupported,
-        };
-        match pair {
-            NativeObjectPair::Value(index, value) => {
-                let bits = if matches!(value, Object::None) {
-                    u64::MAX
-                } else {
-                    debug_assert!(ctx.pins.len() < RUNTIME_PIN_CAP);
-                    let bits = ctx.pins.len() as u64;
-                    ctx.pins.push(Pin::Obj(value));
-                    bits
-                };
-                jf.ret_bits = index as u64;
-                // SAFETY: the helper's marshal buffer contains one slot.
-                unsafe { *jf.call_args = bits };
-                return 0;
-            }
-            NativeObjectPair::Exhausted => return 1,
-            NativeObjectPair::Unsupported => {}
-        }
     }
     let it = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_)))) => {
