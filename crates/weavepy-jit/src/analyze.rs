@@ -8207,6 +8207,24 @@ fn emit_instr(
                 *max_stack = (*max_stack).max(stack.len() as u32);
                 return Ok(());
             };
+            // A method of a local the requesting activation hasn't bound
+            // yet (a later loop's receiver, compiled for an entry into an
+            // earlier loop): carved out, so that loop compiles from its
+            // own entry with the receiver live and its methods resolved,
+            // rather than through the generic helpers. (A list element's
+            // residue resolves against its source list below.)
+            if path.is_none()
+                && probes.entry_pc.is_some_and(|pc| pc != 0)
+                && !(probes.obj)(slot)
+                && (probes.local)(slot).is_none()
+                && (probes.list)(slot).is_none()
+                && (probes.dict)(slot).is_none()
+                && ctor.elem_root(slot).is_none()
+            {
+                return Err(JitVerdict::UnsupportedOpcode(
+                    "method of a local the entry hasn't bound",
+                ));
+            }
             let names = probes.paths.names(path);
             // RFC 0069 WS1 — a class-resolved method: re-mark the
             // receiver in place (its pin stays the native value) and
