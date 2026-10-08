@@ -105,16 +105,25 @@ fn op_supported(op: OpCode) -> bool {
 /// (cached in the code's extension table). The prologue may hold others
 /// (`range(n)` built before the loop): the first resume's step stops at
 /// them, and the general loop runs them once.
+#[inline]
 fn code_ok(code: &CodeObject) -> bool {
     use std::sync::atomic::Ordering;
     let Some(ext) = crate::code_vm_ext(code) else {
         return false;
     };
     match ext.gen_fast.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
+        1 => false,
+        2 => true,
+        _ => code_ok_scan(code, ext),
     }
+}
+
+/// [`code_ok`]'s first verdict for a code object, remembered in its
+/// extension table.
+#[cold]
+#[inline(never)]
+fn code_ok_scan(code: &CodeObject, ext: &crate::CodeConstObjects) -> bool {
+    use std::sync::atomic::Ordering;
     let ok = code.is_generator
         && !code.is_coroutine
         && !code.is_async_generator
@@ -376,8 +385,9 @@ impl Interpreter {
         // The body's native form (see `frame_jit`), run from every pc the
         // arms below leave it at; a hot body compiles.
         #[cfg(feature = "jit")]
-        let native = {
-            let nlocals = locals.len();
+        let nlocals = locals.len();
+        #[cfg(feature = "jit")]
+        let mut native = {
             ext.frame_jit.get(nlocals).or_else(|| {
                 ext.frame_jit
                     .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
@@ -609,6 +619,15 @@ impl Interpreter {
                     }
                     self.gil_countdown -= 1;
                     pc = (pc + 1).saturating_sub(ins.arg as usize);
+                    // A draining consumer's fold can run the whole body in
+                    // this one step: its loop warms the body as each step
+                    // would, and enters the native form once compiled.
+                    #[cfg(feature = "jit")]
+                    if native.is_none() {
+                        ext.frame_jit
+                            .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
+                        native = ext.frame_jit.get(nlocals);
+                    }
                 }
                 // `iter()` of an iterator or a generator is itself.
                 OpCode::GetIter => {

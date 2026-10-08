@@ -64388,7 +64388,7 @@ impl FoldSink {
     ///
     /// `top` holds the yielded value, and the sink's target is the
     /// consumer's own, live and untouched while its resume runs.
-    #[inline]
+    #[inline(always)]
     unsafe fn fold(self, top: *mut Object) -> bool {
         match self {
             // A scalar has no drop glue.
