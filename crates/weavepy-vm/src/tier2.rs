@@ -9156,13 +9156,25 @@ unsafe extern "C" fn wpjit_dict_set(
     let Some((d, key)) = dict_pin_and_key(ctx, pin, key_bits, key_tag) else {
         return 1;
     };
+    let (key, v) = match crate::builtins::dict_insert_exact(&d, key, v) {
+        Ok(old) => {
+            // (The displaced value goes first: its release may queue a
+            // finalizer.)
+            drop(old);
+            return stored_status();
+        }
+        Err(kv) => kv,
+    };
     // Python-free pre-probe: a deferral means the insert below could run
     // Python.
     if dict_probe_native(&d, &key).is_err() {
         return 1;
     }
     match crate::builtins::dict_insert(&d, key, v) {
-        Ok(_) => stored_status(),
+        Ok(old) => {
+            drop(old);
+            stored_status()
+        }
         Err(_) => 1,
     }
 }

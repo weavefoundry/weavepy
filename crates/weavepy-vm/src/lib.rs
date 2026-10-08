@@ -19118,7 +19118,7 @@ impl Interpreter {
                     frame: gf,
                     shell: None,
                 },
-                send_pc: level_send as u32,
+                send_pc: level_send,
             });
             g = Rc::as_ptr(inner);
             gf = inner_frame;
@@ -19159,7 +19159,7 @@ impl Interpreter {
         // Committed: each level is just past its `SEND`.
         for level in &act.delegates {
             // SAFETY: the level's frame, in its generator's box.
-            unsafe { (*level.act.frame).pc = level.send_pc + 1 };
+            unsafe { (*level.act.frame).pc = level.send_pc as u32 + 1 };
         }
         let inner = inner.clone();
         // SAFETY: suspended (checked), no borrow of its state live.
@@ -19290,8 +19290,8 @@ impl Interpreter {
         act.exc_depth = done.exc_depth;
         std::mem::swap(&mut act.delegates, &mut done.delegates);
         // SAFETY: the level's frame, just past its `SEND`.
-        let jump = unsafe { &*gen_frame }.code.instructions[level.send_pc as usize].arg;
-        done.call_pc = level.send_pc as usize;
+        let jump = unsafe { &*gen_frame }.code.instructions[level.send_pc].arg;
+        done.call_pc = level.send_pc;
         done.exhaust_arg = jump | GEN_SEND;
         done.caller_pending = level_pending;
         act
@@ -63235,8 +63235,8 @@ struct Delegate {
     /// its shell once a flush pushed one. Its address is on the pending
     /// list while the chain runs unflushed.
     act: LeanAct,
-    /// The level's `SEND`.
-    send_pc: u32,
+    /// The level's `SEND` (a full word: the walk writes it whole).
+    send_pc: usize,
 }
 
 impl Delegate {
@@ -63248,7 +63248,7 @@ impl Delegate {
     /// state live.
     unsafe fn suspend(&self) {
         // SAFETY: the frame lives in the generator's box (see above).
-        unsafe { (*self.act.frame).pc = self.send_pc + 2 };
+        unsafe { (*self.act.frame).pc = self.send_pc as u32 + 2 };
         // SAFETY: the caller's contract; the box moves between variants
         // without drop glue.
         unsafe {

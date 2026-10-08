@@ -13414,6 +13414,47 @@ pub(crate) fn dict_lookup(
     }
 }
 
+/// [`dict_insert`] for a key that settles by native equality (a `str`,
+/// a machine `int`, ...; see [`crate::object::LeafProbe`]): one probe
+/// finds its entry, or proves no stored key could equal it, and nothing
+/// runs Python. Hands the key and value back when it can't decide so
+/// (another kind of key, a stored key Python would compare, a borrowed
+/// table, dict watchers).
+pub(crate) fn dict_insert_exact(
+    d: &Rc<RefCell<DictData>>,
+    key: Object,
+    value: Object,
+) -> Result<Option<Object>, (Object, Object)> {
+    if crate::capi_watchers::dicts_active() {
+        return Err((key, value));
+    }
+    let Some(probe) = crate::object::LeafProbe::new(&key) else {
+        return Err((key, value));
+    };
+    let Ok(mut m) = d.try_borrow_mut() else {
+        return Err((key, value));
+    };
+    if let Some(slot) = m.get_mut(&probe) {
+        let replaced = !slot.is_same(&value);
+        let old = std::mem::replace(slot, value);
+        drop(m);
+        // (Re-storing the identical object is no change; PEP 509.)
+        if replaced {
+            crate::object::dict_mutation_event(d);
+        }
+        return Ok(Some(old));
+    }
+    if !probe.miss_is_exact() {
+        drop(m);
+        return Err((key, value));
+    }
+    m.insert(DictKey(key), value);
+    drop(m);
+    crate::object::dict_watch_bump(d);
+    crate::object::dict_mutation_event(d);
+    Ok(None)
+}
+
 /// `d[key] = value` honouring re-entrant keys (see [`dict_lookup`]).
 /// Returns the replaced value, if any.
 pub(crate) fn dict_insert(
@@ -13421,6 +13462,10 @@ pub(crate) fn dict_insert(
     key: Object,
     value: Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    let (key, value) = match dict_insert_exact(d, key, value) {
+        Ok(old) => return Ok(old),
+        Err(kv) => kv,
+    };
     if crate::object::dict_key_is_reentrant(&key) {
         return crate::object::dict_reentrant_insert(d, key, value);
     }
