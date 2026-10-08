@@ -39927,7 +39927,7 @@ impl Interpreter {
                 // (`argparse._check_value` relies on `value in
                 // iter(choices)`). Drive it through the VM so a
                 // Python generator / user `__next__` works too.
-                Object::Iter(_) | Object::Generator(_) => {
+                Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_) => {
                     self.contains_via_iter(&container, item, globals)?
                 }
                 _ => container.contains(item)?,
@@ -40384,7 +40384,7 @@ impl Interpreter {
                     // and anything without `__next__` is a non-iterator.
                     match &it {
                         Object::Coroutine(_) => Err(type_error("__await__() returned a coroutine")),
-                        Object::Iter(_) | Object::Generator(_) => Ok(it),
+                        Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_) => Ok(it),
                         Object::Instance(_) if instance_method(&it, "__next__").is_some() => Ok(it),
                         other => Err(type_error(format!(
                             "__await__() returned non-iterator of type '{}'",
