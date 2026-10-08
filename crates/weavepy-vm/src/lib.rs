@@ -65952,37 +65952,34 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
     // display names can say "coroutine" (CPython has distinct method
     // tables for `PyGen_Type` and `PyCoro_Type`).
     let is_coro = matches!(receiver, Object::Coroutine(_));
-    let internal_name: &'static str = match name {
-        "send" if is_coro => ".cor_send",
-        "throw" if is_coro => ".cor_throw",
-        "close" if is_coro => ".cor_close",
-        "send" => ".gen_send",
-        "throw" => ".gen_throw",
-        "close" => ".gen_close",
-        "__next__" => ".gen_next",
-        "__iter__" | "__await__" => ".gen_iter",
-        "__aiter__" => ".agen_aiter",
-        "__anext__" => ".agen_anext",
-        "asend" => ".agen_send",
-        "athrow" => ".agen_throw",
-        "aclose" => ".agen_close",
-        _ => ".gen_unknown",
+    let (slot, internal_name): (usize, &'static str) = match name {
+        "send" if is_coro => (0, ".cor_send"),
+        "throw" if is_coro => (1, ".cor_throw"),
+        "close" if is_coro => (2, ".cor_close"),
+        "send" => (3, ".gen_send"),
+        "throw" => (4, ".gen_throw"),
+        "close" => (5, ".gen_close"),
+        "__next__" => (6, ".gen_next"),
+        "__iter__" | "__await__" => (7, ".gen_iter"),
+        "__aiter__" => (8, ".agen_aiter"),
+        "__anext__" => (9, ".agen_anext"),
+        "asend" => (10, ".agen_send"),
+        "athrow" => (11, ".agen_throw"),
+        "aclose" => (12, ".agen_close"),
+        _ => (13, ".gen_unknown"),
     };
     // One method object per name, shared as a type's method descriptor is.
-    static METHODS: std::sync::OnceLock<RefCell<crate::fasthash::FxHashMap<&'static str, Object>>> =
-        std::sync::OnceLock::new();
-    let methods = METHODS.get_or_init(Default::default);
-    let cached = methods.borrow().get(internal_name).cloned();
-    let builtin = cached.unwrap_or_else(|| {
-        let builtin = Object::Builtin(Rc::new(BuiltinFn {
-            name: internal_name,
-            binds_instance: false,
-            call: Box::new(unreachable_call),
-            call_kw: None,
-        }));
-        methods.borrow_mut().insert(internal_name, builtin.clone());
-        builtin
-    });
+    static METHODS: [std::sync::OnceLock<Object>; 14] = [const { std::sync::OnceLock::new() }; 14];
+    let builtin = METHODS[slot]
+        .get_or_init(|| {
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: internal_name,
+                binds_instance: false,
+                call: Box::new(unreachable_call),
+                call_kw: None,
+            }))
+        })
+        .clone();
     Object::BoundMethod(Rc::new(BoundMethod::new(receiver.clone(), builtin)))
 }
 
