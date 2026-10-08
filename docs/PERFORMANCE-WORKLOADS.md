@@ -41,9 +41,9 @@ Geometric means over the 33 workloads:
 
 | Measure | Branch vs CPython | Branch vs start (`main`) |
 | --- | ---: | ---: |
-| Instructions | 1.75 | 0.44 |
-| Wall time (warm) | 1.73 | |
-| Wall time (cold) | 1.94 | |
+| Instructions | 1.66 | 0.42 |
+| Wall time (warm) | 1.63 | |
+| Wall time (cold) | 1.87 | |
 | Peak resident memory | 1.89 | |
 
 At the start, WeavePy retired 4.04 times CPython's instructions on this
@@ -58,44 +58,45 @@ Per workload, ordered by the instruction ratio (lower is better; below
 
 | Workload | Instructions vs CPython | Instructions vs start | Time vs CPython | Peak RSS vs CPython |
 | --- | ---: | ---: | ---: | ---: |
-| `json_roundtrip` | 0.77 | 1.00 | 0.70 | 1.44 |
-| `pickle_roundtrip` | 0.80 | 0.97 | 0.64 | 1.57 |
-| `scimark` | 0.87 | 0.27 | 0.77 | 1.79 |
-| `float_points` | 0.90 | 0.48 | 0.82 | 1.55 |
-| `unpack_sequence` | 1.01 | 0.71 | 1.04 | 1.71 |
-| `xml_etree` | 1.04 | 0.09 | 1.09 | 1.75 |
-| `regex_mix` | 1.04 | 0.95 | 0.83 | 1.66 |
-| `decimal_telco` | 1.14 | 0.01 | 0.78 | 2.11 |
-| `sorting` | 1.35 | 0.83 | 1.19 | 1.97 |
-| `chaos` | 1.36 | 0.59 | 1.60 | 2.36 |
-| `oo_patterns` | 1.52 | 0.48 | 1.60 | 1.94 |
-| `collections_mix` | 1.53 | 0.10 | 1.67 | 1.75 |
-| `sqlite_queries` | 1.54 | 0.46 | 1.49 | 1.73 |
-| `class_creation` | 1.64 | 0.82 | 1.69 | 1.87 |
-| `bytes_codecs` | 1.73 | 0.38 | 1.71 | 1.61 |
-| `text_processing` | 1.74 | 0.69 | 1.55 | 2.09 |
-| `raytrace` | 1.76 | 0.49 | 1.67 | 1.88 |
-| `comprehensions` | 1.77 | 0.60 | 1.64 | 4.08 |
-| `exceptions` | 1.92 | 0.85 | 2.52 | 1.57 |
-| `graph_search` | 2.19 | 0.61 | 1.93 | 1.73 |
-| `sudoku` | 2.28 | 0.64 | 2.14 | 1.76 |
-| `go` | 2.32 | 0.61 | 2.34 | 1.96 |
-| `nqueens` | 2.37 | 0.55 | 2.44 | 1.78 |
-| `closures_decorators` | 2.43 | 0.57 | 2.88 | 1.76 |
-| `coroutines` | 2.45 | 0.30 | 2.48 | 1.48 |
-| `mini_interpreter` | 2.47 | 0.65 | 2.45 | 1.93 |
-| `tomllib_loads` | 2.47 | 0.48 | 2.47 | 2.27 |
-| `context_managers` | 2.85 | 0.53 | 3.93 | 1.83 |
-| `stdlib_utils` | 2.87 | 0.57 | 2.50 | 2.29 |
-| `deepcopy` | 2.96 | 0.34 | 3.61 | 2.08 |
-| `logging_mix` | 3.03 | 0.78 | 3.24 | 2.03 |
-| `async_tree` | 3.10 | 0.24 | 3.73 | 2.20 |
-| `generators_tree` | 3.75 | 0.23 | 3.59 | 2.14 |
+| `json_roundtrip` | 0.76 | 0.99 | 0.72 | 1.48 |
+| `pickle_roundtrip` | 0.80 | 0.97 | 0.63 | 1.52 |
+| `scimark` | 0.87 | 0.27 | 0.78 | 1.77 |
+| `float_points` | 0.90 | 0.48 | 0.81 | 1.51 |
+| `xml_etree` | 0.97 | 0.08 | 1.03 | 1.66 |
+| `unpack_sequence` | 0.98 | 0.67 | 0.94 | 1.70 |
+| `regex_mix` | 1.05 | 0.95 | 0.81 | 1.65 |
+| `decimal_telco` | 1.15 | 0.01 | 0.77 | 2.11 |
+| `oo_patterns` | 1.28 | 0.42 | 1.27 | 1.93 |
+| `collections_mix` | 1.33 | 0.09 | 1.32 | 1.83 |
+| `sorting` | 1.35 | 0.83 | 1.17 | 1.82 |
+| `chaos` | 1.35 | 0.58 | 1.56 | 2.24 |
+| `sqlite_queries` | 1.41 | 0.42 | 1.30 | 1.76 |
+| `graph_search` | 1.46 | 0.41 | 1.32 | 1.73 |
+| `class_creation` | 1.63 | 0.81 | 1.69 | 1.87 |
+| `comprehensions` | 1.69 | 0.56 | 1.58 | 3.59 |
+| `text_processing` | 1.73 | 0.68 | 1.49 | 2.13 |
+| `bytes_codecs` | 1.74 | 0.38 | 1.69 | 1.70 |
+| `raytrace` | 1.74 | 0.48 | 1.69 | 1.89 |
+| `exceptions` | 1.89 | 0.86 | 2.42 | 1.71 |
+| `go` | 2.26 | 0.61 | 2.24 | 1.95 |
+| `sudoku` | 2.28 | 0.63 | 2.14 | 1.72 |
+| `closures_decorators` | 2.28 | 0.54 | 2.65 | 1.75 |
+| `nqueens` | 2.33 | 0.54 | 2.44 | 1.78 |
+| `mini_interpreter` | 2.40 | 0.64 | 2.29 | 1.98 |
+| `coroutines` | 2.41 | 0.30 | 2.54 | 1.46 |
+| `tomllib_loads` | 2.43 | 0.48 | 2.55 | 2.44 |
+| `generators_tree` | 2.69 | 0.17 | 2.67 | 1.85 |
+| `context_managers` | 2.73 | 0.50 | 3.89 | 1.89 |
+| `stdlib_utils` | 2.84 | 0.57 | 2.59 | 2.37 |
+| `deepcopy` | 2.86 | 0.33 | 3.37 | 2.07 |
+| `logging_mix` | 2.87 | 0.72 | 2.84 | 2.04 |
+| `async_tree` | 2.88 | 0.22 | 3.52 | 2.65 |
 
-The instruction counts come from a `quick` build of commit `c2e5d2c`, the
+The instruction counts come from a `quick` build of commit `8178aa3`, the
 times and memory from a profile-guided release build of the same commit.
-Six workloads beat CPython's time: `pickle_roundtrip`, `json_roundtrip`,
-`scimark`, `decimal_telco`, `float_points`, and `regex_mix`.
+Seven workloads beat CPython's time: `pickle_roundtrip`, `json_roundtrip`,
+`decimal_telco`, `scimark`, `float_points`, `regex_mix`, and
+`unpack_sequence`.
 
 ## What changed
 
@@ -104,7 +105,39 @@ fast paths (the core loop's slow-step and handoff counters,
 `WEAVEPY_BURST_STATS=1`), or where its time goes (sampled profiles and
 per-function instruction estimates), then remove the cost at its source.
 
-**Since the previous checkpoint.** Most of this round moved work out of
+**Since the previous checkpoint.** This round hunted the generic paths that
+fast paths fell back to, and the places where hot code still left the core
+loop for a full step (which first pushes a frame shell for every waiting
+caller, several thousand instructions a few calls deep):
+
+- *Recursive generators.* Resuming a `yield from` chain now resumes its
+  innermost generator directly; the levels between stay parked in their
+  `SEND`s in a `Delegating` state Python sees as running, and a yield
+  comes straight back (`generators_tree`: 28% fewer instructions).
+- *Comparisons.* Tuples and lists of ints, floats, strings and such tuples
+  compare in place rather than copying both sequences and dispatching
+  every element (`graph_search`: 29% fewer), and an instance's Python
+  `__lt__` is called directly across sibling classes (`oo_patterns`: 7%).
+- *Callbacks.* A Python function that native code calls back (a sort key,
+  a `partial`, `lru_cache`, `**kwargs` forwarding) runs as a lean
+  activation even while a builtin lane has its caller published, rather
+  than as a general frame (`closures_decorators`: 7% fewer). `map` and
+  `filter` over Python functions step in such a lane too, and so do
+  keyword and spread calls of classes and functions the inline paths
+  decline.
+- *Fewer full steps.* Truth tests of native objects, a stream's methods,
+  `str % dict` over plain values, property setters, `del` of list items
+  and dict keys, `float()` and `int()` of plain values, `async with`'s
+  special methods, module and container class attributes, and several
+  native builtins (`os.getpid`, `time.localtime`, `strftime`, a
+  namedtuple's `_replace`) now run in the core loop (`collections_mix`:
+  11%, `logging_mix`: 8%).
+- *Libraries and the collector.* SQLite connections skip the per-call
+  mutex while the GIL serializes them (`sqlite_queries`: 9%), tier 2's
+  dict stores probe once, and young collections that keep finding no
+  cycles back off (`async_tree`: 7%, `comprehensions`: 6%).
+
+**The round before.** Most of that round moved work out of
 the core loop and into the frame JIT's native code, where a compiled
 function had been leaving for the interpreter at each instruction it
 didn't cover:
@@ -197,26 +230,34 @@ about 19% and the import set's 27%.
 
 - **Calls.** A direct call between compiled functions still costs about
   three times CPython's (the activation's binding and teardown); a call the
-  frame JIT can't make directly, of an uncompiled callee or one that leaves
-  native code, costs about 1,500 instructions against CPython's 300. This is
-  the broadest remaining cost.
+  core loop runs inline, from code the frame JIT doesn't cover (coroutine
+  bodies, functions it declines), costs about twice CPython's plus two
+  switches of the loop's state. This is the broadest remaining cost.
 - **Interpreter dispatch.** A simple bytecode costs about 35 to 50
   instructions in the core loop against CPython's 15. The loop is one very
   large function, so its state lives in stack slots and every dispatch
   reloads it.
-- **Generators.** A `yield from` level still costs about four times
-  CPython's, and creating a generator about three times (four allocations
-  against CPython's one).
-- **Exceptions.** Raising and catching a builtin exception costs about 2.3
-  times CPython's instructions, and a raise that crosses a call about three
-  times: each raise builds a slot table, a traceback object and a legacy
-  traceback entry, and the catch materializes the frames' shells. Exception
-  handlers run in the core loop, not in native code.
+- **Generators.** Creating a generator and running it to its end costs
+  about three times CPython's (four allocations against CPython's one),
+  though a resumed `yield from` chain now costs a short walk per level.
+- **The cycle collector.** It keeps tracked objects in a side index, so an
+  object that outlives the young set pays an index entry and its removal,
+  and each collection candidate costs several hash probes: a collection
+  costs several times CPython's per object.
+- **Exceptions.** Raising and catching a builtin exception costs about 2.5
+  times CPython's instructions, and a missing attribute's `AttributeError`
+  about three times: each raise builds a slot table, a traceback object and
+  a legacy traceback entry, a failing lookup tries several resolution paths
+  before the general one, and the handler's operations move the large
+  exception record by value. Deleting an instance attribute converts the
+  instance's shared-key storage into a full dictionary (ten times
+  CPython's cost), which contextlib's generator managers do three times
+  per `with`.
 - **Instructions per cycle.** The binary carries 47 MB of code, and these
   workloads touch hundreds of its functions per iteration; profile-guided
   layout recovered part of the instruction-cache cost.
 - **Memory.** Peak resident memory is about 1.9 times CPython's: per-object
   headers, the cycle collector's per-object bookkeeping, decoded code
   objects, and compiled bodies dominate. Garbage only a collection frees
-  also builds up across calls: `comprehensions` peaks at about four times
+  also builds up across calls: `comprehensions` peaks at about 3.6 times
   CPython's memory over five calls, against twice over one.
