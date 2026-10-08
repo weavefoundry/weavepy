@@ -10759,6 +10759,9 @@ impl Interpreter {
                         Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
                             continue
                         }
+                        Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => {
+                            continue
+                        }
                         Some(OpCode::BinaryOp | OpCode::CompareOp)
                             if self.core_operator_lane(sw) =>
                         {
@@ -14582,6 +14585,9 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // `{1, 2, 3}`'s update from its folded constant
+                    // (`core_set_op`, or else the full handler).
+                    OpCode::SetUpdate => break None,
                     // An opcode the full leaf arms have no arm for is the quiet
                     // loop's straight away.
                     op if !SLOW_LEAF_OPS[op as u8 as usize] => {
@@ -14937,6 +14943,88 @@ impl Interpreter {
         }
         // SAFETY: the running thread's own flag (see `quiet_run`).
         if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// Set algebra on exact `set`/`frozenset` operands that runs no Python
+    /// code ([`set_algebra_fast`]), or `SET_UPDATE` of an empty set from a
+    /// set whose keys hash natively (a `{1, 2, 3}` display, whose items the
+    /// compiler folds into a `frozenset` constant), at `sw`'s running
+    /// activation's pc. `false` touches nothing.
+    #[inline(never)]
+    fn core_set_op(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        if n < 2 {
+            return false;
+        }
+        let set_like = |o: &Object| matches!(o, Object::Set(_) | Object::FrozenSet(_));
+        match ins.op {
+            OpCode::BinaryOp => {
+                let (a, b) = (&frame.stack[n - 2], &frame.stack[n - 1]);
+                if !(set_like(a) && set_like(b)) {
+                    return false;
+                }
+                let op = [
+                    BinOpKind::BitOr,
+                    BinOpKind::BitAnd,
+                    BinOpKind::Sub,
+                    BinOpKind::BitXor,
+                ]
+                .into_iter()
+                .find(|k| *k as u32 == ins.arg);
+                let Some(v) = op.and_then(|op| set_algebra_fast(a, b, op)) else {
+                    return false;
+                };
+                let b = frame.stack.pop().expect("checked above");
+                let a = frame.stack.pop().expect("checked above");
+                frame.stack.push(v);
+                self.release(b);
+                self.release(a);
+            }
+            OpCode::SetUpdate => {
+                let Some(at) = n.checked_sub(ins.arg as usize + 1) else {
+                    return false;
+                };
+                let Object::Set(target) = &frame.stack[at] else {
+                    return false;
+                };
+                if !target.try_borrow().is_ok_and(|t| t.is_empty()) {
+                    return false;
+                }
+                let items = match &frame.stack[n - 1] {
+                    Object::FrozenSet(s) => (**s).clone(),
+                    Object::Set(s) => match s.try_borrow() {
+                        Ok(s) => s.clone(),
+                        Err(_) => return false,
+                    },
+                    _ => return false,
+                };
+                if items
+                    .iter()
+                    .any(|k| crate::object::dict_key_is_reentrant(&k.0))
+                {
+                    return false;
+                }
+                *target.borrow_mut() = items;
+                let v = frame.stack.pop().expect("checked above");
+                self.release(v);
+            }
+            _ => return false,
+        }
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
@@ -66511,10 +66599,14 @@ fn freeze_set_result(o: Object) -> Object {
     }
 }
 
-/// Whether no element of either `set`/`frozenset` operand can run Python
-/// code to hash or compare (see [`crate::object::dict_key_is_reentrant`]),
-/// so set algebra may run under their borrows without a snapshot.
-fn set_algebra_plain_ok(a: &Object, b: &Object) -> bool {
+/// `a op b` for `set`/`frozenset` operands, run under their borrows with
+/// no snapshot when that runs no Python code: every key the operation
+/// hashes (the operand it walks) hashes and compares natively (see
+/// [`crate::object::dict_key_is_reentrant`]), and a comparison with a
+/// stored key that would run Python defers instead. `None` (nothing
+/// observable done) sends the operation to the snapshot path.
+fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+    // Whether every key of `o` hashes and compares natively.
     fn plain(o: &Object) -> bool {
         let check = |s: &crate::object::SetData| {
             !s.iter().any(|k| crate::object::dict_key_is_reentrant(&k.0))
@@ -66525,11 +66617,37 @@ fn set_algebra_plain_ok(a: &Object, b: &Object) -> bool {
             _ => false,
         }
     }
-    plain(a) && plain(b)
+    fn len(o: &Object) -> Option<usize> {
+        match o {
+            Object::Set(s) => s.try_borrow().ok().map(|s| s.len()),
+            Object::FrozenSet(s) => Some(s.len()),
+            _ => None,
+        }
+    }
+    // Only the keys the operation hashes need checking: those it walks
+    // (see `set_algebra_plain`). The other operand's keys are only
+    // compared against, which defers below.
+    let walked_plain = match op {
+        BinOpKind::BitOr => plain(b),
+        BinOpKind::BitAnd => {
+            if len(b)? > len(a)? {
+                plain(a)
+            } else {
+                plain(b)
+            }
+        }
+        BinOpKind::Sub => plain(a),
+        _ => plain(a) && plain(b),
+    };
+    if !walked_plain {
+        return None;
+    }
+    let (out, deferred) = crate::object::with_key_eq_deferred(|| set_algebra_plain(a, b, op));
+    (!deferred).then_some(out)
 }
 
-/// `a op b` for `set`/`frozenset` operands that [`set_algebra_plain_ok`]
-/// accepted, with CPython's iteration order and element choice: a union
+/// `a op b` for `set`/`frozenset` operands that [`set_algebra_fast`]
+/// admitted, with CPython's iteration order and element choice: a union
 /// copies the left and adds the right; an intersection walks the smaller
 /// operand (the right one on a tie) and keeps its elements; a difference
 /// walks the left. The result kind follows the left operand.
@@ -66539,7 +66657,7 @@ fn set_algebra_plain(a: &Object, b: &Object, op: BinOpKind) -> Object {
         match o {
             Object::Set(s) => f(&s.borrow()),
             Object::FrozenSet(s) => f(s),
-            _ => unreachable!("checked by set_algebra_plain_ok"),
+            _ => unreachable!("checked by set_algebra_fast"),
         }
     }
     let out = with(a, |x| {
@@ -72662,6 +72780,20 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
     // native value is the correct (and CPython-matching) fallback.
     let a = a.native_value().unwrap_or_else(|| a.clone());
     let b = b.native_value().unwrap_or_else(|| b.clone());
+    // Set algebra whose hashing runs no Python code: under the operands'
+    // borrows, with no snapshot (see `set_algebra_fast`).
+    if matches!(
+        (&a, &b, op),
+        (
+            O::Set(_) | O::FrozenSet(_),
+            O::Set(_) | O::FrozenSet(_),
+            B::BitOr | B::BitAnd | B::Sub | B::BitXor
+        )
+    ) {
+        if let Some(v) = set_algebra_fast(&a, &b, op) {
+            return Ok(v);
+        }
+    }
     // Remember whether each operand was originally a `bool`, *before* the
     // `bool`→`int` promotion below. The only operand type rewrite this
     // function applies that a failed-op error message can observe is that
@@ -72959,14 +73091,6 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::new_bytearray(out))
         }
-        // Neither operand holds an element whose hashing or equality runs
-        // Python code: the operation runs under the borrows, with no
-        // snapshot (see `set_algebra_plain`).
-        (
-            O::Set(_) | O::FrozenSet(_),
-            O::Set(_) | O::FrozenSet(_),
-            B::BitOr | B::BitAnd | B::Sub | B::BitXor,
-        ) if set_algebra_plain_ok(&a, &b) => Ok(set_algebra_plain(&a, &b, op)),
         // Set operators accept any mix of `set`/`frozenset` operands; the
         // result kind follows the *left* operand (CPython's `set_and` &
         // co. use `PyAnySet_Check` on the other operand and build a result
