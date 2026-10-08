@@ -137,6 +137,27 @@ caller, several thousand instructions a few calls deep):
   dict stores probe once, and young collections that keep finding no
   cycles back off (`async_tree`: 7%, `comprehensions`: 6%).
 
+**After the checkpoint.** A last round worked down the operations
+`tools/pybench/microops.py` ranks furthest behind CPython, which the suite
+exercises lightly (its instruction geomean stays at 1.67; `coroutines`
+retires 3% fewer). Per operation, in instructions:
+
+- `dict.copy()` of 20 entries no longer searches the collector's young
+  sets to decide the copy's tracking (19,900 to 4,600).
+- An enum member read (`Color.RED`) takes the class-attribute path in
+  frame-JIT code under any metaclass that can't intercept it (2,500 to
+  680), and a Python data descriptor's `__get__` (`Color.RED.value`)
+  runs as an inline activation found through the owner class's cache
+  (9,500 to 4,100).
+- A function stored on an instance, and a static or class method read
+  through one, load in the core loop (`obj.fn(x)`: 2,100 to 1,550;
+  `o.sm(x)`: 2,200 to 1,480).
+- A keyword call in a tier-2 loop binds through the site's keyword
+  permutation instead of the generic binder (4,700 to 1,160).
+- Set algebra checks only the keys it hashes, and exact-set operators and
+  `{1, 2, 3}` displays run in the core loop (`s & {1, 2, 3}` over 100
+  elements: 9,700 to 4,700).
+
 **The round before.** Most of that round moved work out of
 the core loop and into the frame JIT's native code, where a compiled
 function had been leaving for the interpreter at each instruction it
