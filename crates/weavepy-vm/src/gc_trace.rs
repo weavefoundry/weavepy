@@ -414,6 +414,9 @@ pub struct GcState {
     /// collection: deallocations the young-generation count owes (see
     /// [`GcState::maybe_auto_collect`]).
     old_deaths: AtomicUsize,
+    /// Consecutive automatic young collections that reclaimed nothing
+    /// (see [`GcState::maybe_auto_collect`]).
+    idle_collections: AtomicUsize,
     /// Instances born since the last collection, held weakly: most die
     /// young, and registering one with the collector (an index entry and
     /// a handle) costs far more than its life. Their births count toward
@@ -487,6 +490,7 @@ impl GcState {
             deferred_old: RefCell::new(Vec::new()),
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             old_deaths: AtomicUsize::new(0),
+            idle_collections: AtomicUsize::new(0),
             young: RefCell::new(Vec::new()),
             young_fns: RefCell::new(Vec::new()),
             young_gens: RefCell::new(Vec::new()),
@@ -1340,15 +1344,39 @@ impl GcState {
         let deaths = self.old_deaths.load(Ordering::Relaxed).min(survivors);
         self.old_deaths.store(deaths, Ordering::Relaxed);
         let live = survivors - deaths;
-        if live < threshold0 / 2 {
+        // A program whose young collections keep finding no cycles (its
+        // objects die by reference count, or live on) collects less often:
+        // each idle one doubles the survivors the next waits for, up to
+        // eight thresholds' worth, and any that reclaims something resets
+        // the pace. (A young collection costs far more per object than
+        // CPython's, whose candidates sit on intrusive lists.)
+        let idle = self.idle_collections.load(Ordering::Relaxed).min(3);
+        let wanted = if eligible == 0 {
+            (threshold0 / 2) << idle
+        } else {
+            threshold0 / 2
+        };
+        if live < wanted {
+            // The count trips again once the survivors could reach `wanted`
+            // (it must restart below the threshold to trip at all).
+            let restart = if live < threshold0 {
+                live
+            } else {
+                threshold0.saturating_sub(wanted - live)
+            };
             let mut counts = self.counts.borrow_mut();
-            counts[0] = live;
-            self.sync_gen0_gauge(live, None);
+            counts[0] = restart;
+            self.sync_gen0_gauge(restart, None);
             return false;
         }
         // Automatic young collection: a single pass (see `collect_impl`'s
         // `exact` discussion).
-        self.collect_impl(eligible, false);
+        let collected = self.collect_impl(eligible, false);
+        if collected == 0 {
+            self.idle_collections.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.idle_collections.store(0, Ordering::Relaxed);
+        }
         true
     }
 
