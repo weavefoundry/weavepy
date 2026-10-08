@@ -2562,6 +2562,17 @@ fn method_kw(
     }))
 }
 
+/// The leaf half of the `_log_destroy_pending` setter: a `bool`, `int`
+/// or `None` value, whose truth runs no Python code.
+fn log_destroy_pending_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Instance(_), Object::Bool(_) | Object::Int(_) | Object::None] => {
+            Some(taskprop_set_log_destroy_pending(args))
+        }
+        _ => None,
+    }
+}
+
 fn install_getset(
     cls: &Rc<TypeObject>,
     name: &'static str,
@@ -2569,12 +2580,20 @@ fn install_getset(
     setter: Option<fn(&[Object]) -> Result<Object, RuntimeError>>,
 ) {
     let fset = match setter {
-        Some(s) => Object::Builtin(Rc::new(BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(s),
-            call_kw: None,
-        })),
+        Some(s) => {
+            let b = Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(s),
+                call_kw: None,
+            });
+            // A plain value stores into the native state, running no
+            // Python code (anything else may: its truth test).
+            if std::ptr::fn_addr_eq(s, taskprop_set_log_destroy_pending as fn(&[Object]) -> _) {
+                crate::leaf_builtins::register_fast(&b, log_destroy_pending_leaf);
+            }
+            Object::Builtin(b)
+        }
         None => Object::None,
     };
     let prop = Object::Property(Rc::new(PyProperty::new(

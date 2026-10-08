@@ -2664,6 +2664,7 @@ unsafe fn direct_call(
         *sw.last = st.last;
         let saved_last = sw.last;
         let callee = interp.core_bind_plain(sw, pc, start, has_self, fp, act, guard);
+        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
         if let Some(a) = (*sw.inl).last_mut() {
             a.direct = true;

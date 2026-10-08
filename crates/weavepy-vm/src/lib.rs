@@ -4059,6 +4059,7 @@ impl Interpreter {
     // ---------- dispatch ----------
 
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
+        burst_stats::note_call(burst_stats::CALL_GENERAL);
         match self.run_until_yield_or_return(frame, None)? {
             FrameOutcome::Returned(v) => {
                 self.recycle_frame_allocs(frame);
@@ -4349,6 +4350,7 @@ impl Interpreter {
         if !is_resume && !observers_active && frame.pc == 0 && frame.stack.is_empty() {
             match crate::tier2::try_enter(self, frame) {
                 crate::tier2::JitEntry::Ran(v) => {
+                    burst_stats::note_call(burst_stats::CALL_TIER2);
                     self.pop_frame_shell();
                     self.recycle_frame_shell(shell);
                     return Ok(FrameOutcome::Returned(v));
@@ -7797,6 +7799,7 @@ impl Interpreter {
                             self.try_inline_call_kw(frame, shell, cur_pc)
                         };
                         if let Some(act) = inline {
+                            burst_stats::note_call(burst_stats::CALL_QUIET);
                             return FrameEv::Call(act);
                         }
                     }
@@ -7806,6 +7809,7 @@ impl Interpreter {
                         self.try_lean_call_kw(frame, shell, snap_gen, cur_pc)
                     };
                     if let Some(called) = called {
+                        burst_stats::note_call(burst_stats::CALL_LEAN);
                         if let Err(err) = called {
                             let err = match self.quiet_catch(frame, shell, err) {
                                 Ok(()) => {
@@ -9896,6 +9900,48 @@ impl Interpreter {
         let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
         act.discard = true;
         Some(act)
+    }
+
+    /// `obj.name = value` (the `STORE_ATTR` at `frame.pc`) for a `property`
+    /// whose setter is a registered leaf builtin (a native class's
+    /// settable field): the setter runs in place and both operands leave
+    /// the stack. `None` touches nothing.
+    fn try_leaf_setter(&mut self, frame: &mut Frame) -> Option<Result<(), RuntimeError>> {
+        let pc = frame.pc as usize;
+        let ins = frame.code.instructions.get(pc)?;
+        let n = frame.stack.len();
+        if ins.op != OpCode::StoreAttr || n < 2 {
+            return None;
+        }
+        let Object::Instance(inst) = &frame.stack[n - 1] else {
+            return None;
+        };
+        if !Self::default_setattr(inst.cls_raw()) {
+            return None;
+        }
+        let LeafAttr::Property(prop) =
+            Self::leaf_resolve_instance_attr(&frame.code, inst, ins.arg)?
+        else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the setter cell.
+        let Object::Builtin(b) = (unsafe { &*prop.fset.as_ptr() }) else {
+            return None;
+        };
+        let b = b.clone();
+        let args = [frame.stack[n - 1].clone(), frame.stack[n - 2].clone()];
+        let r = match self.leaf_call_kind(&b)? {
+            LeafKind::Fast(f) => f(&args)?,
+            LeafKind::Opaque => (b.call)(&args),
+            _ => return None,
+        };
+        let receiver = frame.stack.pop().expect("checked above");
+        let value = frame.stack.pop().expect("checked above");
+        frame.pc = pc as u32 + 1;
+        drop(args);
+        self.release(receiver);
+        self.release(value);
+        Some(r.map(|v| self.release(v)))
     }
 
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
@@ -13353,7 +13399,11 @@ impl Interpreter {
                             let switched = if python == 1 {
                                 self.core_call(sw, pc) || self.core_gen_call(sw, pc)
                             } else {
-                                self.core_new(sw, pc, snap_gen)
+                                let new = self.core_new(sw, pc, snap_gen);
+                                if new {
+                                    burst_stats::note_call(burst_stats::CALL_NEW);
+                                }
+                                new
                             };
                             if !switched && sw.pending.is_none() {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
@@ -13721,6 +13771,7 @@ impl Interpreter {
                                     sw.depth_cell,
                                 ) {
                                     Some((r, call_pc)) => {
+                                        burst_stats::note_call(burst_stats::CALL_PURE);
                                         // SAFETY: `len < cap`.
                                         unsafe { base.add(len).write(r) };
                                         len += 1;
@@ -13757,6 +13808,7 @@ impl Interpreter {
                                     sw.depth_cell,
                                 ) {
                                     Some((r, call_pc)) => {
+                                        burst_stats::note_call(burst_stats::CALL_PURE);
                                         // SAFETY: `len < cap`.
                                         unsafe { base.add(len).write(r) };
                                         len += 1;
@@ -14586,6 +14638,7 @@ impl Interpreter {
             }
         }
         if self.core_call_plain(sw, pc) {
+            burst_stats::note_call(burst_stats::CALL_CORE);
             return true;
         }
         let mut tmp = None;
@@ -15221,6 +15274,18 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // A native setter vouched for as a leaf runs in place.
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        if let Some(r) = self.try_leaf_setter(unsafe { &mut *sw.cur }) {
+            if let Err(e) = r {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+            } else if unsafe { (*sw.maybe_dead).get() } {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            }
+            // SAFETY: the running activation's last-pc slot.
+            unsafe { *sw.last = (*sw.cur).pc as usize - 1 };
+            return true;
+        }
         let mut tmp = None;
         // SAFETY: see `CoreSwitch` (as in `core_call`).
         let act = unsafe {
@@ -15428,6 +15493,12 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // `f(*gen)`: the spread becomes the tuple the call takes first.
+        match self.core_spread_tuple(sw, pc) {
+            Some(true) => {}
+            Some(false) => return true,
+            None => return false,
+        }
         // A generator function's call makes its generator in place.
         if self.core_gen_call_ex(sw, pc) {
             return true;
@@ -15458,6 +15529,68 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// The `CALL_FUNCTION_EX` at `pc` of `sw`'s (synced) running activation
+    /// with a Python callee and no `**` mapping, spreading a list or a
+    /// generator (`f(*(g(a) for a in args))`, as `copy._reconstruct`
+    /// does): the spread is replaced by the tuple CPython's handler makes
+    /// of it first, a generator's iteration running nested with this
+    /// activation published. `Some(true)` goes on with the call (nothing
+    /// to do, or done), `Some(false)` when the iteration raised (the
+    /// operands consumed and the raise pending, as the full handler
+    /// leaves them), `None` touched nothing.
+    fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let n = frame.stack.len();
+        let callee_slot = n.checked_sub(4)?;
+        let [callee, Object::Unbound, spread, Object::Unbound] = &frame.stack[callee_slot..] else {
+            return Some(true);
+        };
+        if !matches!(callee, Object::Function(_) | Object::BoundMethod(_)) {
+            return Some(true);
+        }
+        let tuple = match spread {
+            Object::Tuple(_) => return Some(true),
+            Object::List(l) => Object::new_tuple(l.try_borrow().ok()?.clone()),
+            Object::Generator(_) => {
+                let spread = frame.stack[callee_slot + 2].clone();
+                let globals = frame.globals.clone();
+                frame.pc = pc as u32 + 1;
+                let pending = self.core_pending_enter(sw, frame, pc);
+                let tuple_ty = Object::Type(builtin_types().tuple_.clone());
+                let r = self.call(&tuple_ty, std::slice::from_ref(&spread), &[], &globals);
+                self.lean_pending_exit(pending);
+                drop(spread);
+                // SAFETY: as in `core_type_lane` (the iteration ran nested
+                // activations of its own, never this one).
+                let frame = unsafe { &mut *sw.cur };
+                match r {
+                    Ok(t) => {
+                        frame.pc = pc as u32;
+                        t
+                    }
+                    Err(e) => {
+                        let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+                        for o in ops {
+                            self.release(o);
+                        }
+                        // SAFETY: the running activation's last-pc slot.
+                        unsafe { *sw.last = pc };
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        return Some(false);
+                    }
+                }
+            }
+            _ => return None,
+        };
+        // SAFETY: as above.
+        let frame = unsafe { &mut *sw.cur };
+        let old = std::mem::replace(&mut frame.stack[callee_slot + 2], tuple);
+        self.release(old);
+        Some(true)
     }
 
     /// The `CALL_FUNCTION_EX` at `pc` of a registered leaf builtin (its
@@ -15724,7 +15857,11 @@ impl Interpreter {
             _ => return None,
         };
         let eff_argc = items.len() + usize::from(receiver.is_some());
-        let (code, missing) = Self::lean_call_shape_cells(f, eff_argc, true)?;
+        let Some((code, missing)) = Self::lean_call_shape_cells(f, eff_argc, true) else {
+            // A shape the positional fill can't bind (`*args` collecting
+            // the surplus, say) binds as a keyword call does.
+            return self.try_inline_call_ex_keywords(frame, shell, pc);
+        };
         // Past the recursion limit the nested lean path raises.
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
@@ -15766,7 +15903,9 @@ impl Interpreter {
     }
 
     /// [`Self::try_inline_call_ex`] for `f(*args, **mapping)` with a
-    /// non-empty dictionary: the parameters bind by name (see
+    /// non-empty dictionary, or for a callee whose parameters the
+    /// positional fill can't bind (`*args` collecting a surplus): the
+    /// parameters bind by name (see
     /// [`Self::lean_bind_keywords`]) before anything is touched. (The
     /// operands are only borrowed until they leave the stack, so their
     /// release is graded with their true owner counts.)
@@ -15785,10 +15924,15 @@ impl Interpreter {
             },
             _ => return None,
         };
-        let (Object::Tuple(items), Object::Dict(mapping)) =
+        let (Object::Tuple(items), mapping) =
             (&frame.stack[callee_slot + 2], &frame.stack[callee_slot + 3])
         else {
             return None;
+        };
+        let mapping = match mapping {
+            Object::Dict(d) => Some(d),
+            Object::Unbound => None,
+            _ => return None,
         };
         let code = f.code();
         if code.is_generator
@@ -15801,7 +15945,10 @@ impl Interpreter {
             return None;
         }
         f.lean_cells_ref(&code)?;
-        let kw = mapping.try_borrow().ok()?;
+        let kw = match mapping {
+            Some(d) => Some(d.try_borrow().ok()?),
+            None => None,
+        };
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
@@ -15809,7 +15956,7 @@ impl Interpreter {
             &f,
             &code,
             receiver.iter().chain(items.iter()),
-            kw.iter().map(|(k, v)| (&k.0, v)),
+            kw.iter().flat_map(|kw| kw.iter()).map(|(k, v)| (&k.0, v)),
             locals,
         );
         drop(kw);
@@ -50622,7 +50769,16 @@ impl Interpreter {
             items.len(),
             crate::fasthash::FxBuildHasher,
         );
+        // While every element is of a kind that hashes and compares
+        // natively (see `LeafProbe`), none can need a Python `__eq__`
+        // against another: they insert directly.
+        let mut exact = true;
         for v in items {
+            if exact && crate::object::LeafProbe::new(&v).is_some() {
+                out.insert(DictKey(v));
+                continue;
+            }
+            exact = false;
             let key = crate::builtins::set_insert_key(&v)?;
             crate::object::key_cmp_scope(|| out.insert(key))?;
         }
@@ -54781,11 +54937,9 @@ impl Interpreter {
         }
         let cells = f.lean_cells_ref(code)?;
         let snap_gen = self.lean_snapshot()?;
-        // Native callers reach here with every lean activation above them
-        // already flushed (a slow step flushes before it runs).
-        if !self.lean_pending.is_empty() {
-            return None;
-        }
+        // (A native caller's own caller may still wait on the pending list,
+        // published by a builtin lane: the activation's first flush pushes
+        // its shell, outermost first, as for any lean caller.)
         let nlocals = code.varnames.len();
         let locals = self.pooled_locals_from_args(positional, nlocals);
         // SAFETY: `f` outlives the frame (the caller holds it across the
@@ -64457,6 +64611,35 @@ pub(crate) mod leaf_builtins {
 mod burst_stats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+    /// The ways a Python function call runs (see [`note_call`]).
+    pub(crate) const CALL_DIRECT: usize = 0;
+    pub(crate) const CALL_CORE: usize = 1;
+    pub(crate) const CALL_NEW: usize = 2;
+    pub(crate) const CALL_QUIET: usize = 3;
+    pub(crate) const CALL_LEAN: usize = 4;
+    pub(crate) const CALL_PURE: usize = 5;
+    pub(crate) const CALL_GENERAL: usize = 6;
+    pub(crate) const CALL_TIER2: usize = 7;
+    const CALL_NAMES: [&str; 8] = [
+        "frame-JIT direct call",
+        "core-loop inline call",
+        "core-loop constructor",
+        "quiet-loop inline call",
+        "nested lean call",
+        "pure leaf evaluated in place",
+        "general frame run",
+        "tier-2 entry from the general run",
+    ];
+    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// Count one call taking path `i` (one of the `CALL_*` constants).
+    #[inline]
+    pub(crate) fn note_call(i: usize) {
+        if enabled() {
+            CALLS[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     static ENABLED: AtomicU8 = AtomicU8::new(2);
     static SLOW: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
@@ -64611,6 +64794,10 @@ mod burst_stats {
             .map(|(k, c)| (k.clone(), *c))
             .collect();
         sites.sort_by_key(|a| std::cmp::Reverse(a.1));
+        out.push_str("\n## Call paths\n\n");
+        for (name, c) in CALL_NAMES.iter().zip(CALLS.iter()) {
+            let _ = writeln!(out, "- {name}: {}", c.load(Ordering::Relaxed));
+        }
         out.push_str("\n## Slow-step sites\n\n");
         for (k, c) in sites.iter().take(40) {
             let _ = writeln!(out, "  slow {k}: {c}");
