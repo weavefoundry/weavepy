@@ -1,9 +1,9 @@
 """Python functions that native code calls back from hot code.
 
-`sorted(key=...)`, `functools.partial`, `lru_cache`, `map`, and `f(*gen)`
-call Python functions from native code while the calling activation runs
-in the core loop. The callbacks must see the whole frame stack, raise
-through it with complete tracebacks, and run in order.
+`sorted(key=...)`, `functools.partial`, `lru_cache`, `map`, `filter`, and
+`f(*gen)` call Python functions from native code while the calling
+activation runs in the core loop. The callbacks must see the whole frame
+stack, raise through it with complete tracebacks, and run in order.
 """
 
 import functools
@@ -76,12 +76,44 @@ def raising(n):
         sorted([1, 2, 3], key=failing_key)
 
 
+def doubled(x):
+    if x == 7:
+        raise ValueError("seven")
+    return x * 2
+
+
+def mapped(n):
+    t = 0
+    for i in range(n):
+        for v in map(doubled, range(5)):
+            t += v
+        for v in filter(lambda q: q % 2, range(5)):
+            t += v
+    return t
+
+
+def mapped_raising(n):
+    for i in range(n):
+        for v in map(doubled, range(10)):
+            pass
+
+
 class NativeCallbacksTest(unittest.TestCase):
     def test_results(self):
         self.assertEqual(keyed(N), sorted(((N - 1) % 7, (N - 1) % 3, (N - 1) % 5), reverse=True))
         self.assertEqual(partials(N), 2 * sum(range(N)))
         self.assertEqual(caches(N), sum(3 * (i % 100) for i in range(N)))
         self.assertEqual(spread(N), sum(2 * i + 6 for i in range(N)))
+
+    def test_map_filter(self):
+        self.assertEqual(mapped(N), N * (20 + 4))
+        try:
+            mapped_raising(N)
+        except ValueError as e:
+            names = [fs.name for fs in traceback.extract_tb(e.__traceback__)]
+        else:
+            self.fail("no ValueError")
+        self.assertEqual(names, ["test_map_filter", "mapped_raising", "doubled"])
 
     def test_frames_seen_from_callback(self):
         seen = via_sorted(N)

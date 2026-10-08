@@ -10763,6 +10763,7 @@ impl Interpreter {
                     let frame = unsafe { &*sw.cur };
                     match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
                         Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => continue,
+                        Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => continue,
                         Some(OpCode::BinaryOp | OpCode::CompareOp)
                             if self.core_operator_lane(sw) =>
                         {
@@ -15405,6 +15406,58 @@ impl Interpreter {
                 unsafe { (*sw.cur).stack.push(v) };
                 // SAFETY: the running activation's last-pc slot.
                 unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// `FOR_ITER` at the running activation's pc over a native adapter
+    /// (`map`, `filter`, an `itertools` object) whose step can run Python
+    /// code (`map(f, xs)` with a Python `f`): the step runs through the
+    /// ordinary protocol with this activation published, as the builtin
+    /// lane runs a builtin, and the loop goes on with its item or takes
+    /// its exhaustion jump. `false` touches nothing.
+    #[inline(never)]
+    fn core_for_iter_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let Some(Object::LazyIter(l)) = frame.stack.last() else {
+            return false;
+        };
+        if ins.op != OpCode::ForIter {
+            return false;
+        }
+        let l = l.clone();
+        let globals = frame.globals.clone();
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let next = self.lazy_iter_next(&l, &globals);
+        self.lean_pending_exit(pending);
+        drop(l);
+        // SAFETY: as in `core_type_lane` (the step ran nested activations
+        // of its own, never this one).
+        let frame = unsafe { &mut *sw.cur };
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        match next {
+            Ok(Some(v)) => frame.stack.push(v),
+            Ok(None) => {
+                let it = frame.stack.pop();
+                frame.pc += ins.arg;
+                frame.skip_end_for();
+                if let Some(it) = it {
+                    self.release(it);
+                }
             }
             Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
         }
