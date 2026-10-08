@@ -11813,6 +11813,17 @@ unsafe fn call_dyn_impl(
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });
+    // An explicit `gc.collect()` ends the activation after the call: its
+    // pinned temporaries (a call's result passed straight to
+    // `weakref.ref`, say) die with the native frame, as they would have
+    // in the interpreter before the collection, so what the code checks
+    // next sees them gone.
+    if matches!(&callee, Object::Builtin(b) if b.name == ".gc.collect") {
+        if let Ok(v) = called {
+            ctx.parked = Some(v);
+            return CallStatus::Boxed as i64;
+        }
+    }
     // SAFETY: as above.
     unsafe { dyn_call_result(jf, ctx, called, native_callee, charged, int_result) }
 }
