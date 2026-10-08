@@ -5462,7 +5462,9 @@ impl Drop for PyGenerator {
             drop(state);
             if matches!(
                 prev,
-                GeneratorState::Suspended(_) | GeneratorState::Created(_)
+                GeneratorState::Suspended(_)
+                    | GeneratorState::Created(_)
+                    | GeneratorState::Delegating(_)
             ) {
                 defer_generator_state_drop(prev);
             }
@@ -5508,6 +5510,12 @@ pub enum GeneratorState {
     Finished,
     /// Currently executing — re-entry would be illegal.
     Running,
+    /// Executing as far as Python can tell, but its frame stays here: a
+    /// generator suspended in a `yield from` or `await` whose innermost
+    /// delegate runs on its behalf (a collapsed chain, see
+    /// `Interpreter::core_send_collapse`). The frame is parked in the
+    /// `SEND` that resumed the delegate.
+    Delegating(Box<crate::Frame>),
 }
 
 thread_local! {
@@ -5557,6 +5565,7 @@ impl fmt::Debug for GeneratorState {
             Self::Suspended(_) => write!(f, "Suspended"),
             Self::Finished => write!(f, "Finished"),
             Self::Running => write!(f, "Running"),
+            Self::Delegating(_) => write!(f, "Delegating"),
         }
     }
 }

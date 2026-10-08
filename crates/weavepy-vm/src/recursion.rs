@@ -171,6 +171,39 @@ pub fn enter_with(cell: *const Cell<usize>) -> Enter {
     Enter::Ok(Guard { depth: cell })
 }
 
+/// Enter `n` activations at once without guards (the suspended levels
+/// of a collapsed `yield from` chain, see
+/// `Interpreter::core_send_collapse`): [`leave_n`] and [`Guard::adopt`]
+/// give them back. `false`, with nothing entered, when the new depth
+/// would exceed the limit.
+#[inline]
+pub(crate) fn enter_n(cell: *const Cell<usize>, n: usize) -> bool {
+    // SAFETY: see `enter_with`.
+    let d = unsafe { &*cell };
+    let depth = d.get() + n;
+    if depth > recursion_limit() {
+        return false;
+    }
+    d.set(depth);
+    true
+}
+
+/// Give back `n` activations [`enter_n`] entered.
+#[inline]
+pub(crate) fn leave_n(cell: *const Cell<usize>, n: usize) {
+    // SAFETY: see `enter_with`.
+    let d = unsafe { &*cell };
+    d.set(d.get().saturating_sub(n));
+}
+
+impl Guard {
+    /// A guard for one activation [`enter_n`] already entered.
+    #[inline]
+    pub(crate) fn adopt(cell: *const Cell<usize>) -> Guard {
+        Guard { depth: cell }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

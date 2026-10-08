@@ -154,7 +154,9 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             && g.state.try_borrow().is_ok_and(|state| match &*state {
                 GeneratorState::Suspended(_) => true,
                 GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
-                GeneratorState::Finished | GeneratorState::Running => false,
+                GeneratorState::Finished
+                | GeneratorState::Running
+                | GeneratorState::Delegating(_) => false,
             });
         // A plain generator suspended outside any handler of its own
         // (CPython's `gen_close` shortcut) just finishes, here: nothing

@@ -467,7 +467,9 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         return;
     };
     let boxed = match &*state {
-        GeneratorState::Created(b) | GeneratorState::Suspended(b) => b,
+        GeneratorState::Created(b)
+        | GeneratorState::Suspended(b)
+        | GeneratorState::Delegating(b) => b,
         _ => return,
     };
     let frame: &Frame = boxed;
@@ -5838,7 +5840,7 @@ impl Interpreter {
         let owner = py.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
         if let Some(g) = owner {
             let state_kind = match &*g.state.borrow() {
-                GeneratorState::Running => 0u8,
+                GeneratorState::Running | GeneratorState::Delegating(_) => 0u8,
                 GeneratorState::Suspended(_) => 1,
                 GeneratorState::Created(_) => 2,
                 GeneratorState::Finished => 3,
@@ -6173,9 +6175,9 @@ impl Interpreter {
             return g.code.clone();
         }
         match &*g.state.borrow() {
-            GeneratorState::Created(frame) | GeneratorState::Suspended(frame) => {
-                Object::Code(frame.code.clone())
-            }
+            GeneratorState::Created(frame)
+            | GeneratorState::Suspended(frame)
+            | GeneratorState::Delegating(frame) => Object::Code(frame.code.clone()),
             GeneratorState::Running | GeneratorState::Finished => Object::None,
         }
     }
@@ -6188,8 +6190,18 @@ impl Interpreter {
     /// the generator has finished.
     fn gen_py_frame(&self, g: &Rc<PyGenerator>) -> Object {
         let mut state = g.state.borrow_mut();
+        // A collapsed chain's generator is executing: its frame is on the
+        // spine once anything flushed it (see `Self::gen_frame_attr`), and
+        // otherwise as a suspended one's would be.
+        if matches!(&*state, GeneratorState::Delegating(_)) {
+            if let Some(py) = self.running_gen_py_frame(g) {
+                return Object::Frame(py);
+            }
+        }
         match &mut *state {
-            GeneratorState::Created(frame) | GeneratorState::Suspended(frame) => {
+            GeneratorState::Created(frame)
+            | GeneratorState::Suspended(frame)
+            | GeneratorState::Delegating(frame) => {
                 // RFC 0073 WS4 — a Python-visible frame shares
                 // the locals storage; write a parked native
                 // activation back before exposing one (park
@@ -6217,21 +6229,23 @@ impl Interpreter {
             // `cr_frame` returns the *executing* frame here, which is what
             // `Task.get_stack()` reads from inside the running coroutine
             // (RFC 0054 WS2, test_tasks.test_get_stack).
-            GeneratorState::Running => {
-                let found_idx = self.frame_stack.borrow().iter().rposition(|shell| {
-                    let owner = shell.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
-                    owner.is_some_and(|o| Rc::ptr_eq(&o, g))
-                });
-                match found_idx
-                    .and_then(|idx| crate::object::materialize_stack_at(&self.frame_stack, idx))
-                {
-                    Some(py) => Object::Frame(py),
-                    None => Object::None,
-                }
-            }
+            GeneratorState::Running => match self.running_gen_py_frame(g) {
+                Some(py) => Object::Frame(py),
+                None => Object::None,
+            },
             // Finished: the frame has been dropped.
             GeneratorState::Finished => Object::None,
         }
+    }
+
+    /// The frame object of `g`'s executing frame, found on the spine by
+    /// its generator backlink.
+    fn running_gen_py_frame(&self, g: &Rc<PyGenerator>) -> Option<Rc<crate::object::PyFrame>> {
+        let found_idx = self.frame_stack.borrow().iter().rposition(|shell| {
+            let owner = shell.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
+            owner.is_some_and(|o| Rc::ptr_eq(&o, g))
+        });
+        found_idx.and_then(|idx| crate::object::materialize_stack_at(&self.frame_stack, idx))
     }
 
     /// The locals and cells of a *running* generator/coroutine's frame,
@@ -7534,6 +7548,38 @@ impl Interpreter {
                     };
                     if done.gen.is_some() {
                         let result = self.inline_gen_finish(&mut done, exit);
+                        if !done.delegates.is_empty() {
+                            if matches!(result, Ok(GenStep::Yielded(_)))
+                                && !Self::collapse_flushed(&done)
+                            {
+                                self.core_uncollapse(&mut done);
+                            } else {
+                                // The chain's innermost level takes the
+                                // result (a yield on the spine, all of
+                                // them in turn).
+                                let all = matches!(result, Ok(GenStep::Yielded(_)));
+                                let mut levels = Vec::new();
+                                let mut level = self.collapse_expand_one(&mut done);
+                                while all && !level.delegates.is_empty() {
+                                    let outer = self.collapse_expand_one(&mut level);
+                                    levels.push(level);
+                                    level = outer;
+                                }
+                                levels.push(level);
+                                inl.extend(levels.into_iter().rev());
+                                let caller = &mut **inl.last_mut().expect("just pushed");
+                                // SAFETY: as above.
+                                let caller_frame = unsafe { &mut *caller.gen_frame };
+                                let mut caller_shell = QuietShell::Lazy(&mut caller.act);
+                                entry = self.inline_gen_deliver(
+                                    caller_frame,
+                                    &mut caller_shell,
+                                    done,
+                                    result,
+                                );
+                                continue;
+                            }
+                        }
                         match inl.last_mut() {
                             None => self.inline_gen_deliver(frame, shell, done, result),
                             Some(caller) => {
@@ -8078,7 +8124,7 @@ impl Interpreter {
     /// Park a finished inline slot (its callable already taken): release
     /// what the activation owned and return the slot to the pool.
     fn inline_park(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(!act.parked);
+        debug_assert!(!act.parked && act.delegates.is_empty());
         let fr: &mut Frame = &mut act.frame;
         // Leftover operands drop before anything is reused (their drop
         // glue is arbitrary Rust code).
@@ -8160,7 +8206,7 @@ impl Interpreter {
     /// only the code handle and the slot's own fields remain.
     #[inline(always)]
     fn inline_park_clean(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(act.clean && act.frame.stack.is_empty());
+        debug_assert!(act.clean && act.frame.stack.is_empty() && act.delegates.is_empty());
         // SAFETY: as `inline_park`: the code handle is owned while active.
         unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         if act.owns_cells {
@@ -18801,8 +18847,26 @@ impl Interpreter {
     /// and made the running one here. `false` touches nothing.
     #[inline(never)]
     fn core_gen_resume(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> bool {
-        if !self.inline_calls_ok() || !self.core_gen_resume_one(sw, pc, mode) {
+        if !self.inline_calls_ok() {
             return false;
+        }
+        // A `SEND` to a suspended generator takes the hop below (which
+        // collapses a chain); a fresh one starts through `try_inline_gen`.
+        match mode {
+            InlineResume::Send => match self.core_send_hop(sw, pc) {
+                SendHop::Collapsed => return true,
+                SendHop::Hopped => {}
+                SendHop::Declined => {
+                    if !self.core_gen_resume_one(sw, pc, mode) {
+                        return false;
+                    }
+                }
+            },
+            _ => {
+                if !self.core_gen_resume_one(sw, pc, mode) {
+                    return false;
+                }
+            }
         }
         // A `yield from` chain: a generator suspended in one resumes at
         // `RESUME; JUMP_BACKWARD_NO_INTERRUPT` back to its `SEND`, which
@@ -18820,7 +18884,7 @@ impl Interpreter {
             }
             // (Left at the `SEND` if it declines: the core loop runs it.)
             gf.pc = send_pc as u32;
-            if !self.core_send_hop(sw, send_pc) {
+            if self.core_send_hop(sw, send_pc) != SendHop::Hopped {
                 break;
             }
         }
@@ -18833,31 +18897,31 @@ impl Interpreter {
     /// it for `InlineResume::Send`, with only the checks a suspended
     /// delegate needs. `false` touches nothing.
     #[inline(always)]
-    fn core_send_hop(&mut self, sw: &mut CoreSwitch, send_pc: usize) -> bool {
+    fn core_send_hop(&mut self, sw: &mut CoreSwitch, send_pc: usize) -> SendHop {
         // SAFETY: see `CoreSwitch`: the running activation is synced, and
         // its stack holds `[.., delegate, sent]` (checked by the caller).
         let frame = unsafe { &mut *sw.cur };
         let jump = frame.code.instructions[send_pc].arg;
         if jump & GEN_SEND != 0 {
-            return false;
+            return SendHop::Declined;
         }
         let n = frame.stack.len();
         let (Object::Generator(g) | Object::Coroutine(g)) = &frame.stack[n - 2] else {
-            return false;
+            return SendHop::Declined;
         };
         let sent_none = matches!(frame.stack[n - 1], Object::None);
         // SAFETY: nothing below reaches the cell again until `state`'s last
         // use (`peek_mut` rejects a live guard or shared cells).
         let Some(state) = (unsafe { g.state.peek_mut() }) else {
-            return false;
+            return SendHop::Declined;
         };
         let GeneratorState::Suspended(boxed) = &*state else {
-            return false;
+            return SendHop::Declined;
         };
         let gf: &Frame = boxed;
         #[cfg(feature = "jit")]
         if gf.parked_native.is_some() {
-            return false;
+            return SendHop::Declined;
         }
         if gf.py_frame.is_some()
             || gf.has_saved_exc_info()
@@ -18868,10 +18932,27 @@ impl Interpreter {
             })
             || !Self::lean_gen_code_ok(&gf.code)
         {
-            return false;
+            return SendHop::Declined;
+        }
+        // A delegate itself suspended in a `yield from` of a generator:
+        // resume the chain's innermost generator directly.
+        if sent_none && !gf.sent_consumed && g.kind != crate::object::CoroutineKind::AsyncGenerator
+        {
+            if let Some((next, next_send)) = Self::collapse_next(gf) {
+                if let Some(next_frame) = Self::collapse_frame(next) {
+                    let (g, gf) = (Rc::as_ptr(g), std::ptr::from_ref(gf).cast_mut());
+                    return if self
+                        .core_send_collapse(sw, send_pc, g, gf, next, next_send, next_frame)
+                    {
+                        SendHop::Collapsed
+                    } else {
+                        SendHop::Declined
+                    };
+                }
+            }
         }
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            return false;
+            return SendHop::Declined;
         };
         // Committed.
         let GeneratorState::Suspended(mut boxed) =
@@ -18918,7 +18999,302 @@ impl Interpreter {
         sw.cur = gen_frame;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
+        SendHop::Hopped
+    }
+
+    /// `g` as a collapsed chain's level or innermost generator (see
+    /// [`Self::core_send_collapse`]): suspended, with nothing a lean resume
+    /// declines (the checks of [`Self::core_send_hop`]). Its frame, or
+    /// `None` when it doesn't qualify.
+    #[inline(always)]
+    fn collapse_frame(g: &PyGenerator) -> Option<*mut Frame> {
+        Self::collapse_frame_with(g, &mut std::ptr::null())
+    }
+
+    /// [`Self::collapse_frame`], skipping the code check for `code_ok`
+    /// (and recording the code it checks there).
+    #[inline(always)]
+    fn collapse_frame_with(g: &PyGenerator, code_ok: &mut *const CodeObject) -> Option<*mut Frame> {
+        if g.kind == crate::object::CoroutineKind::AsyncGenerator {
+            return None;
+        }
+        // SAFETY: a read between instructions; the view ends here.
+        let GeneratorState::Suspended(boxed) = (unsafe { g.state.peek_mut() })? else {
+            return None;
+        };
+        let gf: &mut Frame = boxed;
+        #[cfg(feature = "jit")]
+        if gf.parked_native.is_some() {
+            return None;
+        }
+        if gf.py_frame.is_some()
+            || gf.has_saved_exc_info()
+            || gf.sent_consumed
+            || gf.shell_cache.as_ref().is_some_and(|c| {
+                c.has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        {
+            return None;
+        }
+        let code = Rc::as_ptr(&gf.code);
+        if code != *code_ok {
+            if !Self::lean_gen_code_ok(&gf.code) {
+                return None;
+            }
+            *code_ok = code;
+        }
+        Some(gf)
+    }
+
+    /// The generator a suspended generator's `frame` delegates to, with
+    /// its `SEND`'s pc: `frame` is at the `RESUME` after the `YIELD_VALUE`
+    /// of a `yield from` or `await` of a generator or coroutine.
+    #[inline(always)]
+    fn collapse_next(frame: &Frame) -> Option<(&Rc<PyGenerator>, usize)> {
+        let pc = frame.pc as usize;
+        let instrs = &frame.code.instructions;
+        let send_pc = yield_from_resend(instrs, pc)?;
+        if send_pc + 2 != pc
+            || instrs[send_pc].arg & GEN_SEND != 0
+            || instrs[send_pc + 1].op != OpCode::YieldValue
+        {
+            return None;
+        }
+        match frame.stack.last() {
+            Some(Object::Generator(g) | Object::Coroutine(g)) => Some((g, send_pc)),
+            _ => None,
+        }
+    }
+
+    /// The `SEND` of `None` at `send_pc` of `sw`'s (synced) running
+    /// activation to `first` (frame `first_frame`, both checked by
+    /// [`Self::core_send_hop`]), a generator itself suspended in a
+    /// `yield from` or `await` of `inner` (a recursive generator, a chain
+    /// of coroutines), which `inner_frame` qualifies: instead of resuming
+    /// each level in turn, resume the chain's innermost generator directly
+    /// as the running activation's delegate. The levels between stay
+    /// parked in their own `SEND`s, marked executing
+    /// ([`GeneratorState::Delegating`]), and wait on the pending list, so
+    /// a flush puts them on the spine. A yield comes straight back to
+    /// this `SEND` ([`Self::core_uncollapse`] puts the levels back as
+    /// running them would have left them); a return or a raise resumes
+    /// only the innermost level ([`Self::collapse_expand_one`]). `false`
+    /// touches nothing.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn core_send_collapse(
+        &mut self,
+        sw: &mut CoreSwitch,
+        send_pc: usize,
+        first: *const PyGenerator,
+        first_frame: *mut Frame,
+        mut inner: &Rc<PyGenerator>,
+        mut level_send: usize,
+        mut inner_frame: *mut Frame,
+    ) -> bool {
+        let mut act = self.inline_slot();
+        debug_assert!(act.delegates.is_empty());
+        let (mut g, mut gf) = (first, first_frame);
+        // The code objects whose lean resume a level already vouched for
+        // (a recursive generator's levels share one).
+        let mut code_ok: *const CodeObject = std::ptr::null();
+        loop {
+            // The level delegates from here (`Delegate::suspend` undoes it).
+            // SAFETY: each level is alive (its holder is the level above,
+            // or the running activation) and suspended (checked), with no
+            // borrow of its state live; the box moves between variants
+            // without drop glue.
+            unsafe {
+                let st = (*g).state.as_ptr();
+                let GeneratorState::Suspended(boxed) = std::ptr::read(st) else {
+                    unreachable!("checked by `collapse_frame`");
+                };
+                std::ptr::write(st, GeneratorState::Delegating(boxed));
+            }
+            act.delegates.push(Delegate {
+                gen: g,
+                act: LeanAct {
+                    frame: gf,
+                    shell: None,
+                },
+                send_pc: level_send as u32,
+            });
+            g = Rc::as_ptr(inner);
+            gf = inner_frame;
+            // SAFETY: as above.
+            let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
+                break;
+            };
+            let Some(next_frame) = Self::collapse_frame_with(next, &mut code_ok) else {
+                break;
+            };
+            inner = next;
+            level_send = next_send;
+            inner_frame = next_frame;
+        }
+        // Each level counts against the recursion limit, as when resumed.
+        let levels = act.delegates.len();
+        let guard = if crate::recursion::enter_n(sw.depth_cell, levels) {
+            match crate::recursion::enter_with(sw.depth_cell) {
+                crate::recursion::Enter::Ok(guard) => Some(guard),
+                crate::recursion::Enter::Overflow => {
+                    crate::recursion::leave_n(sw.depth_cell, levels);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let Some(guard) = guard else {
+            for level in act.delegates.drain(..) {
+                // SAFETY: delegating since above.
+                unsafe { level.suspend() };
+            }
+            if self.inline_pool.len() < INLINE_POOL_CAP {
+                self.inline_pool.push(act);
+            }
+            return false;
+        };
+        // Committed: each level is just past its `SEND`.
+        for level in &act.delegates {
+            // SAFETY: the level's frame, in its generator's box.
+            unsafe { (*level.act.frame).pc = level.send_pc + 1 };
+        }
+        let inner = inner.clone();
+        // SAFETY: suspended (checked), no borrow of its state live.
+        let GeneratorState::Suspended(mut boxed) = std::mem::replace(
+            unsafe { &mut *inner.state.as_ptr() },
+            GeneratorState::Running,
+        ) else {
+            unreachable!("checked by `collapse_frame`");
+        };
+        boxed.gen_first_resume = false;
+        // SAFETY: see `CoreSwitch`: the running activation is synced, its
+        // stack `[.., first, None]` (checked by `core_send_hop`).
+        let frame = unsafe { &mut *sw.cur };
+        let jump = frame.code.instructions[send_pc].arg;
+        // The sent `None` goes in.
+        frame.stack.pop();
+        boxed.stack.push(Object::None);
+        frame.pc = send_pc as u32 + 1;
+        let gen_frame: *mut Frame = &raw mut *boxed;
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: a pooled slot holds none of these (see `try_inline_gen`).
+        unsafe {
+            std::ptr::write(&raw mut act.gen, Some(inner));
+            std::ptr::write(&raw mut act.gen_box, Some(boxed));
+            std::ptr::write(&raw mut act.guard, Some(guard));
+        }
+        act.gen_frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.act.frame = gen_frame;
+        act.call_pc = send_pc;
+        act.caller_pending = self.core_pending_enter(sw, frame, send_pc);
+        act.exc_depth = self.exc_info_len();
+        // The levels wait on the pending list, outermost first, as each
+        // would while the next one ran (the buffer stays put from here).
+        for level in &mut act.delegates {
+            self.lean_pending.push(&raw mut level.act as usize);
+        }
+        // SAFETY: see `CoreSwitch`.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = gen_frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// A collapsed chain's innermost generator yielded (`done`, its
+    /// finished activation, still holds the levels; the value goes to the
+    /// consumer): put the levels back as running them would have left
+    /// them, each suspended at its `yield from`. Only for levels without
+    /// a shell (see [`Self::collapse_expand_one`] otherwise).
+    #[inline]
+    fn core_uncollapse(&mut self, done: &mut InlineAct) {
+        let levels = done.delegates.len();
+        debug_assert!(done.delegates.iter().all(|l| l.act.shell.is_none()));
+        // Still pending means nothing flushed (a flush drains the list).
+        if let Some(innermost) = done.delegates.last_mut() {
+            let addr = &raw mut innermost.act as usize;
+            if self.lean_pending.last() == Some(&addr) {
+                let len = self.lean_pending.len();
+                self.lean_pending.truncate(len - levels);
+            }
+        }
+        for level in done.delegates.drain(..).rev() {
+            // SAFETY: the levels are alive and delegating (see
+            // `Delegate::gen`); nothing borrows their state here.
+            unsafe { level.suspend() };
+        }
+        crate::recursion::leave_n(crate::recursion::depth_cell(), levels);
+    }
+
+    /// Whether any level of `act`'s collapsed chain has a shell (a flush
+    /// put the levels on the spine).
+    #[inline]
+    fn collapse_flushed(act: &InlineAct) -> bool {
+        act.delegates.iter().any(|l| l.act.shell.is_some())
+    }
+
+    /// Resume the innermost level of `done`'s collapsed chain for real:
+    /// `done` (its innermost generator's finished activation) becomes the
+    /// level's delegate (`call_pc`, `exhaust_arg` and the pending entry
+    /// are the level's `SEND`'s, for the caller to deliver the result
+    /// to), and the returned activation runs the level, taking over the
+    /// consumer-facing fields and the rest of the chain.
+    fn collapse_expand_one(&mut self, done: &mut InlineAct) -> Box<InlineAct> {
+        let addr = done
+            .delegates
+            .last_mut()
+            .map(|l| &raw mut l.act as usize)
+            .expect("a collapsed chain");
+        let level = done.delegates.pop().expect("a collapsed chain");
+        // The level's pending entry was the innermost generator's caller
+        // entry (the delegate's `lean_pending_exit` takes it).
+        let level_pending = (level.act.shell.is_none()).then_some(addr);
+        // The generator, held by the level above (or the consumer): one
+        // more owner for the activation.
+        // SAFETY: alive, see `Delegate::gen`.
+        let gen = unsafe {
+            Rc::increment_strong_count(level.gen);
+            Rc::from_raw(level.gen)
+        };
+        // SAFETY: delegating (see `Delegate`); nothing borrows the state.
+        let GeneratorState::Delegating(boxed) =
+            std::mem::replace(unsafe { &mut *gen.state.as_ptr() }, GeneratorState::Running)
+        else {
+            unreachable!("a collapsed level is delegating");
+        };
+        let mut act = self.inline_slot();
+        debug_assert!(act.delegates.is_empty());
+        let gen_frame = level.act.frame;
+        // SAFETY: a pooled slot holds none of these (see `try_inline_gen`);
+        // the level's recursion depth was entered by the collapse.
+        unsafe {
+            std::ptr::write(&raw mut act.gen, Some(gen));
+            std::ptr::write(&raw mut act.gen_box, Some(boxed));
+            std::ptr::write(
+                &raw mut act.guard,
+                Some(crate::recursion::Guard::adopt(
+                    crate::recursion::depth_cell(),
+                )),
+            );
+            std::ptr::write(&raw mut act.act.shell, level.act.shell);
+        }
+        act.gen_frame = gen_frame;
+        act.act.frame = gen_frame;
+        act.call_pc = done.call_pc;
+        act.exhaust_arg = done.exhaust_arg;
+        act.caller_pending = done.caller_pending.take();
+        act.exc_depth = done.exc_depth;
+        std::mem::swap(&mut act.delegates, &mut done.delegates);
+        // SAFETY: the level's frame, just past its `SEND`.
+        let jump = unsafe { &*gen_frame }.code.instructions[level.send_pc as usize].arg;
+        done.call_pc = level.send_pc as usize;
+        done.exhaust_arg = jump | GEN_SEND;
+        done.caller_pending = level_pending;
+        act
     }
 
     /// One step of [`Self::core_gen_resume`]: the generator at `pc` of the
@@ -18986,6 +19362,7 @@ impl Interpreter {
                 .shell
                 .as_deref()
                 .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
+            || Self::collapse_flushed(top)
             || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -19020,6 +19397,11 @@ impl Interpreter {
             done.gen_frame = std::ptr::null_mut();
             Self::park_suspended_boxed(&gen, boxed);
             drop(gen);
+            // A collapsed chain's levels suspend again in their `yield
+            // from`s, the value passing them by.
+            if !done.delegates.is_empty() {
+                self.core_uncollapse(&mut done);
+            }
             let call_pc = done.call_pc;
             self.lean_pending_exit(done.caller_pending);
             // SAFETY: the shell was taken above: no drop glue owed.
@@ -19054,6 +19436,7 @@ impl Interpreter {
                             .shell
                             .as_deref()
                             .is_none_or(|s| self.shell_pops_quietly(s, t.exc_depth))
+                        && !Self::collapse_flushed(t)
                 })
                 && unsafe { &*cframe }
                     .code
@@ -19131,6 +19514,12 @@ impl Interpreter {
         Self::release_finished_gen(&gen);
         drop(boxed);
         drop(gen);
+        // A collapsed chain's innermost level takes the return value: it
+        // resumes in its `SEND`, the rest of the chain still collapsed.
+        if !done.delegates.is_empty() {
+            let level = self.collapse_expand_one(&mut done);
+            push_fast(inl, level);
+        }
         let call_pc = done.call_pc;
         let arg = done.exhaust_arg;
         self.lean_pending_exit(done.caller_pending);
@@ -19141,7 +19530,7 @@ impl Interpreter {
         }
         let mut tmp = None;
         // SAFETY: the consumer is the innermost remaining activation.
-        let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        let (cframe, clast, cshell) = unsafe { sw.activation(inl.len(), &mut tmp) };
         // SAFETY: as above.
         let consumer = unsafe { &mut *cframe };
         if arg & GEN_SEND != 0 {
@@ -24591,15 +24980,17 @@ impl Interpreter {
                 if inst.cls_raw().attr_version.get() != ver {
                     return None;
                 }
-                let name = code.names.get(name_idx as usize)?.as_str();
                 let slots = inst.slots.try_borrow().ok()?;
                 let indexed = slots
                     .get_index(key_idx as usize)
-                    .filter(
-                        |(key, _)| matches!(&key.0, Object::Str(stored) if stored.as_ref() == name),
-                    )
+                    .filter(|(key, _)| slot_name_matches(code, name_idx, key))
                     .map(|(_, value)| value);
-                indexed.or_else(|| slots.get(name)).map(Self::clone_operand)
+                match indexed {
+                    Some(v) => Some(Self::clone_operand(v)),
+                    None => slots
+                        .get(code.names.get(name_idx as usize)?.as_str())
+                        .map(Self::clone_operand),
+                }
             }
             (IC::LoadAttrModule { module_id, key_idx }, Object::Module(m)) => {
                 if specialize::rc_id(&m.dict) != module_id {
@@ -30731,12 +31122,19 @@ impl Interpreter {
                         "running" => {
                             return Ok(Object::Bool(matches!(
                                 &*g.state.borrow(),
-                                GeneratorState::Running
+                                GeneratorState::Running | GeneratorState::Delegating(_)
                             )))
                         }
                         // The (stable) Python-visible frame, or None once
                         // the generator has finished.
-                        "frame" => return Ok(self.gen_py_frame(g)),
+                        "frame" => {
+                            // A collapsed chain's generator gets its spine
+                            // entry first, as an executing frame has one.
+                            if matches!(&*g.state.borrow(), GeneratorState::Delegating(_)) {
+                                self.flush_pending_callers();
+                            }
+                            return Ok(self.gen_py_frame(g));
+                        }
                         "suspended" => {
                             return Ok(Object::Bool(matches!(
                                 &*g.state.borrow(),
@@ -40391,7 +40789,10 @@ impl Interpreter {
         let mid_await = matches!(
             &*g.state.borrow(),
             GeneratorState::Suspended(frame) if !frame.agen_yielded_value
-        ) || matches!(&*g.state.borrow(), GeneratorState::Running);
+        ) || matches!(
+            &*g.state.borrow(),
+            GeneratorState::Running | GeneratorState::Delegating(_)
+        );
         if !mid_await {
             return None;
         }
@@ -40713,6 +41114,13 @@ impl Interpreter {
                     gen.kind.word()
                 )));
             }
+            delegating @ GeneratorState::Delegating(_) => {
+                *gen.state.borrow_mut() = delegating;
+                return Err(value_error(format!(
+                    "{} already executing",
+                    gen.kind.word()
+                )));
+            }
         };
         // RFC 0073 WS4 — a parked native activation's locals/stack are
         // stale until written back; the yield-from detection and the
@@ -40998,7 +41406,9 @@ impl Interpreter {
         let (created, boxed) = match &mut *state {
             GeneratorState::Created(boxed) => (true, boxed),
             GeneratorState::Suspended(boxed) => (false, boxed),
-            GeneratorState::Finished | GeneratorState::Running => return None,
+            GeneratorState::Finished | GeneratorState::Running | GeneratorState::Delegating(_) => {
+                return None
+            }
         };
         if !created && crate::trace::any_observers_active() {
             return None;
@@ -41742,6 +42152,13 @@ impl Interpreter {
                 return Err(stop_iteration());
             }
             GeneratorState::Running => {
+                return Err(value_error(format!(
+                    "{} already executing",
+                    gen.kind.word()
+                )));
+            }
+            delegating @ GeneratorState::Delegating(_) => {
+                *gen.state.borrow_mut() = delegating;
                 return Err(value_error(format!(
                     "{} already executing",
                     gen.kind.word()
@@ -54390,12 +54807,17 @@ impl Interpreter {
     /// of `self` alone: the generator, made without the call machinery
     /// (`make_iter`'s instance arm). `None` when anything else applies.
     fn instance_gen_call(&self, v: &Object, name: &str) -> Option<Object> {
+        static ITER_KEY: u8 = 0;
+        static AWAIT_KEY: u8 = 0;
         let Object::Instance(inst) = v else {
             return None;
         };
-        let Some(Object::Function(f)) = inst.cls_raw().lookup(name) else {
-            return None;
+        let key = match name {
+            "__iter__" => std::ptr::addr_of!(ITER_KEY),
+            "__await__" => std::ptr::addr_of!(AWAIT_KEY),
+            _ => return None,
         };
+        let f = Self::instance_dunder_function(inst, key as usize, name)?;
         let code = f.code();
         if !code.is_generator {
             return None;
@@ -62792,6 +63214,51 @@ struct InlineAct {
     /// the operator's `TypeError` (the operator, whether augmented, and
     /// the operands' class).
     binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
+    /// A collapsed `yield from` chain (see
+    /// `Interpreter::core_send_collapse`): the generators between the
+    /// consumer and the one this activation runs, outermost first. The
+    /// activation's consumer-facing fields (`call_pc`, `exhaust_arg`,
+    /// `caller_pending`) are the consumer's. Empty otherwise; a pooled
+    /// slot keeps the buffer.
+    delegates: Vec<Delegate>,
+}
+
+/// One suspended level of a collapsed `yield from` chain (see
+/// [`InlineAct::delegates`]): a generator in [`GeneratorState::Delegating`],
+/// its frame parked just past the `SEND` that resumed its delegate, as
+/// running the chain level by level would leave it.
+struct Delegate {
+    /// The generator (owned by the level above, whose stack holds it, or
+    /// for the outermost by the consumer's).
+    gen: *const PyGenerator,
+    /// The level's spine entry: its frame (in the generator's box), and
+    /// its shell once a flush pushed one. Its address is on the pending
+    /// list while the chain runs unflushed.
+    act: LeanAct,
+    /// The level's `SEND`.
+    send_pc: u32,
+}
+
+impl Delegate {
+    /// Put the level's generator back in `Suspended`, at its `RESUME`.
+    ///
+    /// # Safety
+    ///
+    /// The generator is alive and in `Delegating`, with no borrow of its
+    /// state live.
+    unsafe fn suspend(&self) {
+        // SAFETY: the frame lives in the generator's box (see above).
+        unsafe { (*self.act.frame).pc = self.send_pc + 2 };
+        // SAFETY: the caller's contract; the box moves between variants
+        // without drop glue.
+        unsafe {
+            let st = (*self.gen).state.as_ptr();
+            let GeneratorState::Delegating(boxed) = std::ptr::read(st) else {
+                unreachable!("a collapsed level is delegating");
+            };
+            std::ptr::write(st, GeneratorState::Suspended(boxed));
+        }
+    }
 }
 
 impl InlineAct {
@@ -62838,6 +63305,7 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             binop: None,
+            delegates: Vec::new(),
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -62854,6 +63322,12 @@ unsafe impl Send for InlineAct {}
 
 impl Drop for InlineAct {
     fn drop(&mut self) {
+        // An activation torn down mid-chain leaves its levels suspended.
+        for level in self.delegates.drain(..).rev() {
+            // SAFETY: the levels are alive (see `Delegate::gen`) and
+            // delegating; nothing borrows their state during a drop.
+            unsafe { level.suspend() };
+        }
         if self.owns_cells {
             // SAFETY: owned cells are released once (the frame's own drop
             // forgets the handle).
@@ -62908,6 +63382,18 @@ const GEN_NEXT_CALL: u32 = u32::MAX;
 /// a sub-generator resumed by `yield from` or `await`: exhaustion leaves
 /// its return value on the delegator's stack and takes the jump.
 const GEN_SEND: u32 = 1 << 31;
+
+/// How [`Interpreter::core_send_hop`] went.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendHop {
+    /// Nothing touched.
+    Declined,
+    /// The delegate resumed as the running activation.
+    Hopped,
+    /// The delegate's chain collapsed: its innermost generator resumed
+    /// (see `Interpreter::core_send_collapse`).
+    Collapsed,
+}
 
 /// Which instruction resumes a generator inline (see
 /// [`Interpreter::try_inline_gen`]).
