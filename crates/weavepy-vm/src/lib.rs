@@ -43751,6 +43751,9 @@ impl Interpreter {
         if let Some(r) = native_scalar_compare(a, b, op) {
             return Ok(Object::Bool(r));
         }
+        if let Some(r) = native_seq_compare(a, b, op, 0) {
+            return Ok(Object::Bool(r));
+        }
         // Two instances of one class whose comparison dunder is a Python
         // function: the forward call runs directly, with no bound method
         // and none of the special operand shapes below. A `NotImplemented`
@@ -74403,6 +74406,61 @@ fn native_scalar_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool
         CompareKind::LtE => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
         CompareKind::Gt => ord == Some(Ordering::Greater),
         CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+    })
+}
+
+/// `a <op> b` for two exact tuples (or two exact lists) whose compared
+/// elements are machine ints, floats, `str`s, or such tuples in turn: the
+/// sequence comparison CPython runs (the first unequal pair decides,
+/// else the lengths), with no element able to run Python code. `None`
+/// for any other operands, or nesting past a small depth.
+fn native_seq_compare(a: &Object, b: &Object, op: CompareKind, depth: u32) -> Option<bool> {
+    fn items(o: &Object) -> Option<crate::sync::Ref<'_, Vec<Object>>> {
+        match o {
+            Object::List(l) => l.try_borrow().ok(),
+            _ => None,
+        }
+    }
+    if depth > 8 {
+        return None;
+    }
+    let lists;
+    let (xs, ys): (&[Object], &[Object]) = match (a, b) {
+        (Object::Tuple(x), Object::Tuple(y)) => (x, y),
+        (Object::List(_), Object::List(_)) => {
+            lists = (items(a)?, items(b)?);
+            (&lists.0, &lists.1)
+        }
+        _ => return None,
+    };
+    for (x, y) in xs.iter().zip(ys) {
+        // (Identity first, as CPython's element test.)
+        if x.is_same(y) {
+            continue;
+        }
+        let eq = match native_scalar_compare(x, y, CompareKind::Eq) {
+            Some(eq) => eq,
+            None if matches!((x, y), (Object::Tuple(_), Object::Tuple(_))) => {
+                native_seq_compare(x, y, CompareKind::Eq, depth + 1)?
+            }
+            None => return None,
+        };
+        if !eq {
+            if matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+                return Some(op == CompareKind::NotEq);
+            }
+            return native_scalar_compare(x, y, op)
+                .or_else(|| native_seq_compare(x, y, op, depth + 1));
+        }
+    }
+    let (m, n) = (xs.len(), ys.len());
+    Some(match op {
+        CompareKind::Eq => m == n,
+        CompareKind::NotEq => m != n,
+        CompareKind::Lt => m < n,
+        CompareKind::LtE => m <= n,
+        CompareKind::Gt => m > n,
+        CompareKind::GtE => m >= n,
     })
 }
 
