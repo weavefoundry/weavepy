@@ -2044,11 +2044,7 @@ unsafe extern "C" fn h_stack_attr(
                     .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg))
                 }
             },
-            Object::Type(cls) if Rc::strong_count(cls) > 1 => ext
-                .stamp_slots
-                .get()
-                .and_then(|s| s.get(pc))
-                .and_then(|s| crate::class_attr_hit(s, cls)),
+            Object::Type(cls) if Rc::strong_count(cls) > 1 => type_attr(code, ext, cls, pc, arg),
             Object::Module(m) => Interpreter::core_module_attr(code, m, pc, arg)
                 .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg)),
             _ => None,
@@ -2060,6 +2056,35 @@ unsafe extern "C" fn h_stack_attr(
         crate::drop_hot(std::mem::replace(&mut *at, v));
         0
     }
+}
+
+/// `LOAD_ATTR` (the `pc`th instruction of `code`, name `arg`) on the class
+/// `cls`, as the core loop's arm reads it: the site's remembered value,
+/// or the class's (or, under a metaclass that can't intercept the name,
+/// its MRO's) entry, which a plain class's site then remembers. Runs no
+/// code.
+fn type_attr(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    cls: &Rc<crate::types::TypeObject>,
+    pc: usize,
+    arg: u32,
+) -> Option<Object> {
+    if let Some(v) = ext
+        .stamp_slots
+        .get()
+        .and_then(|s| s.get(pc))
+        .and_then(|s| crate::class_attr_hit(s, cls))
+    {
+        return Some(v);
+    }
+    let v = Interpreter::leaf_load_type_attr(code, cls, pc as u32, arg)?;
+    // (The stamp is keyed by the class's version alone, which a
+    // metaclass's changes don't move.)
+    if Interpreter::plain_metaclass(cls) {
+        crate::class_attr_fill(code, cls, pc, &v);
+    }
+    Some(v)
 }
 
 /// `LOAD_ATTR` (the `pc`th instruction of `code`) on the local at `recv`,
@@ -2091,6 +2116,7 @@ unsafe extern "C" fn h_local_attr(
             Object::Instance(_) | Object::Module(_) => {
                 Interpreter::core_local_attr(Some(ext), code, recv, pc, arg)
             }
+            Object::Type(cls) => type_attr(code, ext, cls, pc, arg),
             _ => None,
         };
         match v {
