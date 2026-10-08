@@ -56,9 +56,8 @@
 # oracle `--all-cpython` schedules; the `cpython/Lib/test/<file>` label
 # spelling is unchanged). Every row below is a 3.14 measurement:
 # `--mode subprocess --jobs 6`, unexpected 0, no `fail`, `error`, or
-# `timeout` rows; the `divergence` rows (test_capi, test_embed,
-# test_marshal, and test_queue's tier-2 temporaries) and the one `skip`
-# enumerate their reasons. Where
+# `timeout` rows; the three `divergence` rows (test_capi, test_embed,
+# test_marshal) and the one `skip` enumerate their 3.14 reasons. Where
 # a 3.14 file grew (test_capi's subinterpreter legs, test_asyncio's
 # free-threading file, the xml.etree files) the per-test budget was
 # raised for parallel-sweep load, not to hide a hang.
@@ -1086,18 +1085,9 @@ status = "pass"
 reason = "measured (RFC 0056 WS3): 60 run, 0 fail, 14 skip — pyexpat is now bindings over vendored expat 2.6.4 (full 22-slot handler table, buffering, subparsers, unknown-encoding handler, live position/error attributes). test_error_path_no_crash skips via the _testcapi.set_nomemory stub (WeavePy has no allocation-failure injection seam)."
 
 [tests."cpython/Lib/test/test_queue.py"]
-status = "divergence"
+status = "pass"
 timeout_seconds = 150
-# PySimpleQueueTest.test_references puts 20 fresh objects in a loop and
-# then expects each `q.get()` to die at once. Tier 2 compiles the put
-# loop, and its native activation keeps every object a dynamic call
-# returned (here `C()`, passed straight to `q.put`) in its pin table
-# until the loop's activation ends, so the objects outlive their last
-# reference. The same pin lifetime exists on `main`, which happened not
-# to compile that loop; releasing a call's temporary arguments once the
-# call consumes them is the fix.
-divergence_tests = ["test.test_queue.PySimpleQueueTest.test_references"]
-reason = "correct but slow (~39s idle); budget raised for parallel-load headroom. One enumerated divergence: tier 2 keeps a compiled loop's call results alive until the loop's activation ends (test_references)."
+reason = "correct but slow (~39s idle); budget raised for parallel-load headroom"
 
 [tests."cpython/Lib/test/test_raise.py"]
 status = "pass"
