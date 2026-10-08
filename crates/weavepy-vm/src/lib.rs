@@ -17038,30 +17038,42 @@ impl Interpreter {
                 if !unique && !Self::core_droppable(seq) {
                     return None;
                 }
-                let items: Vec<Object> = match seq {
-                    Object::Tuple(t) => t.to_vec(),
-                    Object::List(l) => l.try_borrow().ok()?.clone(),
+                let count = match seq {
+                    Object::Tuple(t) => t.len(),
+                    Object::List(l) => l.try_borrow().ok()?.len(),
                     _ => return None,
                 };
-                if items.len() < before + after {
+                if count < before + after {
                     return None;
                 }
-                let mid_end = items.len() - after;
-                let mid = Object::new_list(items[before..mid_end].to_vec());
-                // SAFETY: the sequence leaves its slot, which the last item
-                // (pushed first) takes; `len - 1 + n <= cap`.
+                // SAFETY: the sequence leaves its slot (it is released
+                // below, after its items are read in place), which the last
+                // item (pushed first) takes; `len - 1 + n <= cap`.
                 unsafe {
                     let seq = base.add(len - 1).read();
-                    let mut k = len - 1;
-                    for x in items[mid_end..].iter().rev() {
-                        base.add(k).write(x.clone());
+                    {
+                        let guard;
+                        let items: &[Object] = match &seq {
+                            Object::Tuple(t) => t,
+                            Object::List(l) => {
+                                guard = l.borrow();
+                                &guard
+                            }
+                            _ => unreachable!("checked above"),
+                        };
+                        let mid_end = items.len() - after;
+                        let mid = Object::new_list(items[before..mid_end].to_vec());
+                        let mut k = len - 1;
+                        for x in items[mid_end..].iter().rev() {
+                            base.add(k).write(clone_hot(x));
+                            k += 1;
+                        }
+                        base.add(k).write(mid);
                         k += 1;
-                    }
-                    base.add(k).write(mid);
-                    k += 1;
-                    for x in items[..before].iter().rev() {
-                        base.add(k).write(x.clone());
-                        k += 1;
+                        for x in items[..before].iter().rev() {
+                            base.add(k).write(clone_hot(x));
+                            k += 1;
+                        }
                     }
                     drop_hot(seq);
                 }
