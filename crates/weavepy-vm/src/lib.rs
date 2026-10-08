@@ -25691,12 +25691,10 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || crate::object::exotic_str_keys_possible() {
             return false;
         }
-        let type_call = builtin_types().type_.lookup("__call__");
-        match (meta.lookup("__call__"), type_call) {
-            (None, None) => true,
-            (Some(Object::Builtin(a)), Some(Object::Builtin(b))) => Rc::ptr_eq(&a, &b),
-            _ => false,
-        }
+        // The metaclass inherits `type`'s own `__call__` (memoized per
+        // attribute version).
+        let call = meta.dunder(crate::types::Dunder::Call);
+        !call.present() || call.type_owner()
     }
 
     fn plain_metaclass(cls: &TypeObject) -> bool {

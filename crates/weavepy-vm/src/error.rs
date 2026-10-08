@@ -420,7 +420,10 @@ pub fn stop_async_iteration() -> RuntimeError {
 /// of a `return` statement. The wrapped value is exposed as `.value`
 /// on the exception instance.
 pub fn stop_iteration_with(value: Object) -> RuntimeError {
-    let pe = PyException::from_builtin("StopIteration", "");
+    let pe = PyException::new(crate::builtin_types::make_exception_with_class(
+        crate::builtin_types::builtin_types().stop_iteration.clone(),
+        "",
+    ));
     if let Object::Instance(ref inst) = pe.instance {
         inst.slot_set("value", value.clone());
         // A bare `return` (value None) raises `StopIteration()` with

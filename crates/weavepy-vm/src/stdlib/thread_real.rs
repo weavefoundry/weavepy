@@ -363,7 +363,27 @@ const TIMEOUT_MAX_SECS: f64 = 9_223_372_036.0;
 /// forwards to that instance's own closure, so both the VM's instance-dict
 /// path and a C extension's type-level lookup reach the identical
 /// implementation.
+/// The instance-dict entry `name` of `inst`, probed with `name`'s hash as
+/// `hash` caches it (computed on first use; `0` is "not yet").
+fn instance_closure(
+    inst: &crate::types::PyInstance,
+    name: &'static str,
+    hash: &std::sync::atomic::AtomicI64,
+) -> Option<Object> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut h = hash.load(Relaxed);
+    if h == 0 {
+        h = crate::object::py_str_hash(name);
+        hash.store(h, Relaxed);
+    }
+    inst.dict_cell()
+        .borrow()
+        .get(&crate::object::StrKeyHashed { s: name, hash: h })
+        .cloned()
+}
+
 fn instance_dunder_trampoline(name: &'static str) -> Object {
+    let hash = std::sync::atomic::AtomicI64::new(0);
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: true,
@@ -371,11 +391,7 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
             let Some(Object::Instance(inst)) = args.first() else {
                 return Err(type_error(format!("{name}() requires an instance")));
             };
-            let closure = inst
-                .dict_cell()
-                .borrow()
-                .get(&DictKey(Object::from_static(name)))
-                .cloned();
+            let closure = instance_closure(inst, name, &hash);
             match closure {
                 Some(Object::Builtin(b)) => (b.call)(&args[1..]),
                 _ => Err(type_error(format!("instance has no {name}"))),
@@ -392,6 +408,8 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
 /// `type(lock).acquire(lock, timeout=-1)` — so the methods must be
 /// reachable via the type, not just the instance dict (RFC 0072 WS2).
 fn instance_method_trampoline(name: &'static str) -> Object {
+    // (Shared by both halves below.)
+    let hash = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let forward =
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
             let Some(Object::Instance(inst)) = args.first() else {
@@ -399,11 +417,7 @@ fn instance_method_trampoline(name: &'static str) -> Object {
                     "descriptor '{name}' requires a lock instance"
                 )));
             };
-            let closure = inst
-                .dict_cell()
-                .borrow()
-                .get(&DictKey(Object::from_static(name)))
-                .cloned();
+            let closure = instance_closure(inst, name, &hash);
             match closure {
                 Some(Object::Builtin(b)) => match &b.call_kw {
                     Some(kw) => kw(&args[1..], kwargs),
@@ -413,7 +427,7 @@ fn instance_method_trampoline(name: &'static str) -> Object {
                 _ => Err(type_error(format!("instance has no {name}"))),
             }
         };
-    let forward_pos = forward;
+    let forward_pos = forward.clone();
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: true,

@@ -48,10 +48,11 @@ pub enum Dunder {
     SetItem,
     Missing,
     Iter,
+    Call,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -63,6 +64,7 @@ impl Dunder {
             Self::SetItem => "__setitem__",
             Self::Missing => "__missing__",
             Self::Iter => "__iter__",
+            Self::Call => "__call__",
         }
     }
 }
@@ -78,6 +80,7 @@ impl DunderInfo {
     const FUNCTION: u8 = 1 << 3;
     const BUILTIN_OWNER: u8 = 1 << 4;
     const OBJECT_OWNER: u8 = 1 << 5;
+    const TYPE_OWNER: u8 = 1 << 6;
 
     fn resolve(found: Option<(Object, Rc<TypeObject>)>) -> Self {
         let Some((value, owner)) = found else {
@@ -92,8 +95,11 @@ impl DunderInfo {
         if owner.flags.is_builtin {
             bits |= Self::BUILTIN_OWNER;
         }
-        if Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_) {
+        let bt = crate::builtin_types::builtin_types();
+        if Rc::ptr_eq(&owner, &bt.object_) {
             bits |= Self::OBJECT_OWNER;
+        } else if Rc::ptr_eq(&owner, &bt.type_) {
+            bits |= Self::TYPE_OWNER;
         }
         Self(bits)
     }
@@ -121,6 +127,11 @@ impl DunderInfo {
     /// The defining class is `object`.
     pub fn object_owner(self) -> bool {
         self.0 & Self::OBJECT_OWNER != 0
+    }
+
+    /// The defining class is `type`.
+    pub fn type_owner(self) -> bool {
+        self.0 & Self::TYPE_OWNER != 0
     }
 
     /// A non-`None` definition supplied by a class written in Python.
