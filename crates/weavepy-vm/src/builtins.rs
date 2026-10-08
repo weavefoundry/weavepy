@@ -511,6 +511,12 @@ pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
         Object::Complex(_) => 13,
         Object::Slice(_) => 14,
         Object::Iter(_) => 15,
+        // A native stream's methods follow from its layer and backing (see
+        // `lookup_method_uncached`), unless the stream carries attributes
+        // of its own, which shadow them.
+        Object::File(f) if f.extra_attrs.borrow().is_empty() => {
+            16 + (f.io_kind.get() as u8) * 4 + u8::from(f.binary) * 2 + u8::from(f.is_memory())
+        }
         _ => return None,
     };
     Some(tag)

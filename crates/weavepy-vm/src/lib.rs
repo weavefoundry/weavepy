@@ -11593,7 +11593,12 @@ impl Interpreter {
                                 Some(b) => b,
                                 None => break None,
                             },
-                            _ => break None,
+                            // A foreign object's truth is its extension's,
+                            // a proxy's its mapping's `__len__`.
+                            Object::Foreign(_) | Object::MappingProxyObj(_) => break None,
+                            // Every other kind's is native (the full arm's
+                            // `is_truthy`: a file, bytes, a set, a function).
+                            _ => v.is_truthy(),
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
                         unsafe { drop(std::mem::replace(&mut *top, bool_hot(b))) };
@@ -16200,6 +16205,12 @@ impl Interpreter {
                     && !percent_args_need_bridge(args) =>
             {
                 Object::from_str(percent_format(t, args).ok()?)
+            }
+            // (A dict another owner holds: its release frees nothing.)
+            (Object::Str(t), Object::Dict(d))
+                if kind == BinOpKind::Mod && Rc::strong_count(d) > 1 =>
+            {
+                Object::from_str(percent_format_leaf_mapping(t, b)?)
             }
             _ => return None,
         })
@@ -21506,6 +21517,14 @@ impl Interpreter {
                             match percent_format(a, args) {
                                 Ok(s) => Object::from_str(s),
                                 Err(_) => break,
+                            }
+                        }
+                        (Object::Str(a), args @ Object::Dict(d))
+                            if kind == BinOpKind::Mod && Rc::strong_count(d) > 1 =>
+                        {
+                            match percent_format_leaf_mapping(a, args) {
+                                Some(s) => Object::from_str(s),
+                                None => break,
                             }
                         }
                         _ => break,
@@ -66553,6 +66572,59 @@ fn percent_leaf_args(args: &Object) -> bool {
         Object::Tuple(items) => items.iter().all(leaf),
         other => leaf(other),
     }
+}
+
+/// `template % value` for an exact dict whose every conversion is a mapping
+/// one (`%(key)s`, `%(key)d`, ...) of a `str`, `int`, `float`, `bool` or
+/// `None` value, found by exact native lookup: the rendered text, or
+/// `None` (nothing run) for any other shape, which can run Python code
+/// (a value's `__str__`, a key's `__eq__`) or raise.
+fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String> {
+    let Object::Dict(d) = value else {
+        return None;
+    };
+    let bytes = template.as_bytes();
+    let map = d.try_borrow().ok()?;
+    let mut i = 0;
+    while let Some(off) = bytes[i..].iter().position(|&b| b == b'%') {
+        i += off + 1;
+        match bytes.get(i)? {
+            b'%' => {
+                i += 1;
+                continue;
+            }
+            b'(' => {}
+            // A bare conversion consumes the dict itself.
+            _ => return None,
+        }
+        let close = i + bytes[i..].iter().position(|&b| b == b')')?;
+        let key = Object::from_str(&template[i + 1..close]);
+        let probe = crate::object::LeafProbe::new(&key)?;
+        let v = map.get(&probe)?;
+        if !probe.miss_is_exact()
+            || !matches!(
+                v,
+                Object::Str(_) | Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        {
+            return None;
+        }
+        // Flags, width and precision, then a conversion that renders these
+        // values natively.
+        i = close + 1;
+        while matches!(
+            bytes.get(i),
+            Some(b'#' | b'0' | b'-' | b' ' | b'+' | b'.' | b'0'..=b'9')
+        ) {
+            i += 1;
+        }
+        if !matches!(bytes.get(i), Some(b's' | b'r' | b'd' | b'i' | b'f')) {
+            return None;
+        }
+        i += 1;
+    }
+    drop(map);
+    percent_format(template, value).ok()
 }
 
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {

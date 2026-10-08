@@ -195,10 +195,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("unsetenv")),
             builtin("unsetenv", os_unsetenv),
         );
-        d.insert(
-            DictKey(Object::from_static("getpid")),
-            builtin("getpid", os_getpid),
-        );
+        let getpid = builtin("getpid", os_getpid);
+        // Reads the process id: no Python runs.
+        if let Object::Builtin(f) = &getpid {
+            crate::leaf_builtins::register(f);
+        }
+        d.insert(DictKey(Object::from_static("getpid")), getpid);
         // 3.14 `posix._is_inputhook_installed()` (gh-121886): `_pyrepl`'s
         // console polls it for `PyOS_InputHook`; WeavePy has no C input
         // hook, so it is always `False`.
