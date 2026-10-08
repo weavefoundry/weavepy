@@ -8209,10 +8209,11 @@ fn emit_instr(
             };
             // A method of a local the requesting activation hasn't bound
             // yet (a later loop's receiver, compiled for an entry into an
-            // earlier loop): carved out, so that loop compiles from its
-            // own entry with the receiver live and its methods resolved,
-            // rather than through the generic helpers. (A list element's
-            // residue resolves against its source list below.)
+            // earlier loop): carved out as a retriable miss, so that loop
+            // compiles from its own entry with the receiver live and its
+            // methods resolved rather than through the generic helpers. (A
+            // list element's residue resolves against its source list
+            // below.)
             if path.is_none()
                 && probes.entry_pc.is_some_and(|pc| pc != 0)
                 && !(probes.obj)(slot)
@@ -8221,7 +8222,7 @@ fn emit_instr(
                 && (probes.dict)(slot).is_none()
                 && ctor.elem_root(slot).is_none()
             {
-                return Err(JitVerdict::UnsupportedOpcode(
+                return Err(JitVerdict::ProbeMiss(
                     "method of a local the entry hasn't bound",
                 ));
             }
