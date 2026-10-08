@@ -10748,6 +10748,11 @@ impl Interpreter {
                                     continue
                                 }
                                 Some(OpCode::StoreAttr) if self.core_setter(sw) => continue,
+                                Some(OpCode::CallKw | OpCode::CallEx)
+                                    if self.core_call_lane(sw) =>
+                                {
+                                    continue
+                                }
                                 Some(OpCode::Call)
                                     if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
                                 {
@@ -10764,6 +10769,9 @@ impl Interpreter {
                     match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
                         Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => continue,
                         Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => continue,
+                        Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
+                            continue
+                        }
                         Some(OpCode::BinaryOp | OpCode::CompareOp)
                             if self.core_operator_lane(sw) =>
                         {
@@ -13045,7 +13053,10 @@ impl Interpreter {
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        if !self.core_call_ex(sw, pc, snap_gen) && sw.pending.is_none() {
+                        if !self.core_call_ex(sw, pc, snap_gen)
+                            && sw.pending.is_none()
+                            && !self.core_call_lane(sw)
+                        {
                             sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                         }
                         break Some(CoreExit::Reload);
@@ -13113,7 +13124,7 @@ impl Interpreter {
                             let ran = if builtin {
                                 self.core_builtin_kw_lane(sw, pc)
                             } else {
-                                self.core_call_kw(sw, pc)
+                                self.core_call_kw(sw, pc) || self.core_call_lane(sw)
                             };
                             if !ran && sw.pending.is_none() {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
@@ -15407,6 +15418,122 @@ impl Interpreter {
                 // SAFETY: the running activation's last-pc slot.
                 unsafe { *sw.last = pc };
             }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// `CALL_KW` or `CALL_FUNCTION_EX` (an exact tuple, and no `**` or an
+    /// exact dict of `str` keys) at the running activation's pc, of a
+    /// class or a Python function the inline paths declined (a class with
+    /// its own `__new__`, a callee binding `*args`): the call runs through
+    /// the ordinary protocol with this activation published, as the
+    /// builtin lane runs a builtin. Zero-argument `super` (which reads its
+    /// caller's frame) stays the full handler's. `false` touches nothing.
+    #[inline(never)]
+    fn core_call_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        // The callee's slot and how many operands the call takes.
+        let (callee_at, operands) = match ins.op {
+            OpCode::CallKw => {
+                let Some(Object::Tuple(names)) = frame.stack.last() else {
+                    return false;
+                };
+                let total = ins.arg as usize + names.len() + 3;
+                let Some(at) = n.checked_sub(total) else {
+                    return false;
+                };
+                (at, total)
+            }
+            OpCode::CallEx => {
+                let Some(at) = n.checked_sub(4) else {
+                    return false;
+                };
+                (at, 4)
+            }
+            _ => return false,
+        };
+        let ok = match &frame.stack[callee_at] {
+            Object::Type(t) => !Rc::ptr_eq(t, &builtin_types().super_),
+            Object::Function(_) => true,
+            Object::BoundMethod(bm) => {
+                !bm.redispatch_descriptor && matches!(bm.function, Object::Function(_))
+            }
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+        let ops = &frame.stack[callee_at..];
+        let mut args: Vec<Object> = Vec::new();
+        let mut kwargs: Vec<(String, Object)> = Vec::new();
+        if !matches!(ops[1], Object::Unbound) {
+            args.push(ops[1].clone());
+        }
+        if ins.op == OpCode::CallKw {
+            let Object::Tuple(names) = &ops[operands - 1] else {
+                return false;
+            };
+            let values = &ops[2..operands - 1];
+            let npos = values.len() - names.len();
+            args.extend(values[..npos].iter().cloned());
+            for (name, v) in names.iter().zip(&values[npos..]) {
+                let Object::Str(name) = name else {
+                    return false;
+                };
+                kwargs.push((name.to_string(), v.clone()));
+            }
+        } else {
+            let Object::Tuple(items) = &ops[2] else {
+                return false;
+            };
+            args.extend(items.iter().cloned());
+            match &ops[3] {
+                Object::Unbound => {}
+                Object::Dict(d) => {
+                    let Ok(d) = d.try_borrow() else {
+                        return false;
+                    };
+                    for (k, v) in d.iter() {
+                        let Object::Str(name) = &k.0 else {
+                            return false;
+                        };
+                        kwargs.push((name.to_string(), v.clone()));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // Committed: the operands leave the stack.
+        let callee = frame.stack[callee_at].clone();
+        let operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
+        let globals = frame.globals.clone();
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = self.call(&callee, &args, &kwargs, &globals);
+        self.lean_pending_exit(pending);
+        drop(args);
+        drop(kwargs);
+        drop(callee);
+        for o in operands {
+            self.release(o);
+        }
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        match result {
+            // SAFETY: as in `core_type_lane`.
+            Ok(v) => unsafe { (*sw.cur).stack.push(v) },
             Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
         }
         // SAFETY: the running thread's own flag (see `quiet_run`).
