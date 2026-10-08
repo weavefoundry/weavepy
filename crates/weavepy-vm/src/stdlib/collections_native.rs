@@ -1094,6 +1094,23 @@ fn namedtuple_replace(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(named_tuple_of(&cls, items))
 }
 
+/// [`namedtuple_replace`]'s leaf half: a `kwds` of `str` keys (as `**kwds`
+/// builds it) pops without any Python comparison.
+fn namedtuple_replace_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [_, Object::Dict(kwds), _] = args else {
+        return None;
+    };
+    if !kwds
+        .try_borrow()
+        .ok()?
+        .keys()
+        .all(|k| matches!(k.0, Object::Str(_)))
+    {
+        return None;
+    }
+    Some(namedtuple_replace(args))
+}
+
 // ---------------------------------------------------------------------
 // `ChainMap`.
 
@@ -1631,6 +1648,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ),
             ("rotate", deque_rotate_leaf as crate::leaf_builtins::Fast),
             ("chainmap_getitem", chainmap_getitem_leaf),
+            ("namedtuple_replace", namedtuple_replace_leaf),
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register_fast(b, fast);

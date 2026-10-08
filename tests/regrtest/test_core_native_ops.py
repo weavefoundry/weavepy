@@ -1,12 +1,16 @@
-"""Operations on native objects that hot code runs without leaving the core loop.
+"""Operations that hot code runs without leaving the core loop.
 
 Truth tests of streams and other native objects, method loads on streams
-(cached per stream kind), `str % dict` over plain values, and the clock
-and process builtins must behave as the full handlers do: a stream's own
+(cached per stream kind), `str % dict` over plain values, the clock and
+process builtins, property setters, `del` of list items and dict keys,
+`float()` and `int()` of plain values, `min`/`max` over mixed numbers, and
+namedtuple `_replace` must behave as the full handlers do: a stream's own
 attribute shadows its native method, a dict value with a `__str__` still
-formats through it, and errors are unchanged.
+formats through it, a class's own `__setattr__` still runs, and errors
+are unchanged.
 """
 
+import collections
 import io
 import os
 import subprocess
@@ -54,6 +58,74 @@ def clocks(n):
         stamp = time.strftime("%Y-%m-%d", tm)
         time.gmtime(i)
     return pid, stamp
+
+
+class Box:
+    def __init__(self):
+        self._w = 0
+        self.log = []
+
+    @property
+    def w(self):
+        return self._w
+
+    @w.setter
+    def w(self, value):
+        if value < 0:
+            raise ValueError("negative")
+        self._w = value
+        return "ignored"
+
+    @property
+    def ro(self):
+        return 1
+
+
+class Logged(Box):
+    def __setattr__(self, name, value):
+        if name == "w":
+            self.log.append(value)
+        object.__setattr__(self, name, value)
+
+
+def set_widths(b, n):
+    for i in range(n):
+        b.w = b.w + 1
+    return b.w
+
+
+def deletes(n):
+    xs = list(range(n + 10))
+    d = {i: i for i in range(n)}
+    for i in range(n):
+        del xs[-1]
+        del d[i]
+    return len(xs), len(d)
+
+
+def conversions(texts, n):
+    out = []
+    for i in range(n):
+        for t in texts:
+            out.append((float(t[0]), int(t[1])))
+    return out[-len(texts):]
+
+
+def extremes(n):
+    r = None
+    for i in range(n):
+        r = (max(1.5, 2, 1.0), max(2, 2.0), min(3, 2.5, 7), max(2**60, 1.0), min(-1, -1.0))
+    return r
+
+
+P = collections.namedtuple("P", "x y z")
+
+
+def replaces(n):
+    p = P(1, 2, 3)
+    for i in range(n):
+        p = p._replace(x=i, z=-i)
+    return p
 
 
 class CoreNativeOpsTest(unittest.TestCase):
@@ -105,6 +177,52 @@ class CoreNativeOpsTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             for _ in range(N):
                 time.localtime("x")
+
+    def test_property_setter(self):
+        b = Box()
+        self.assertEqual(set_widths(b, N), N)
+        with self.assertRaisesRegex(ValueError, "negative"):
+            for _ in range(N):
+                b.w = -1
+        with self.assertRaises(AttributeError):
+            for _ in range(N):
+                b.ro = 2
+        lg = Logged()
+        self.assertEqual(set_widths(lg, N), N)
+        self.assertEqual(lg.log, list(range(1, N + 1)))
+
+    def test_deletes(self):
+        self.assertEqual(deletes(N), (10, 0))
+        with self.assertRaises(KeyError):
+            d = {}
+            for i in range(N):
+                del d[i]
+        with self.assertRaises(IndexError):
+            xs = [1]
+            for i in range(N):
+                del xs[0]
+
+    def test_conversions(self):
+        texts = [("1e3", "12"), (" 2.5 ", " -7 "), ("-inf", "1_000"), ("0", "+0")]
+        self.assertEqual(conversions(texts, N), [(1000.0, 12), (2.5, -7), (float("-inf"), 1000), (0.0, 0)])
+        for _ in range(N):
+            self.assertEqual((int(2.9), int(-2.9), int(True), float(True), float(3)), (2, -2, 1, 1.0, 3.0))
+        with self.assertRaises(ValueError):
+            conversions([("bad", "1")], N)
+        with self.assertRaises(ValueError):
+            conversions([("1", "bad")], N)
+
+    def test_extremes(self):
+        r = extremes(N)
+        self.assertEqual(r, (2, 2, 2.5, 2**60, -1))
+        self.assertIs(type(r[1]), int)
+        self.assertIs(type(r[4]), int)
+
+    def test_namedtuple_replace(self):
+        self.assertEqual(replaces(N), P(N - 1, 2, -(N - 1)))
+        with self.assertRaisesRegex(TypeError, "unexpected field"):
+            for _ in range(N):
+                P(1, 2, 3)._replace(w=1)
 
     def test_forced_frame_jit(self):
         if FORCED in sys.argv:

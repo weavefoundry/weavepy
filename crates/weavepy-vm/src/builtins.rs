@@ -5439,7 +5439,7 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `b'…'` framing are preserved, matching CPython, without paying the O(N)
 /// repr cost on the success / digit-limit paths). Unicode decimal digits and
 /// whitespace are normalised to ASCII first.
-fn parse_int_string(
+pub(crate) fn parse_int_string(
     original: &Object,
     raw: &str,
     base_arg: &[Object],
@@ -6735,7 +6735,7 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
 /// whitespace is stripped, `inf`/`nan` spellings are accepted, and PEP 515
 /// underscores are honoured only *between* digits. Returns `None` on any
 /// malformed input (the caller renders the `could not convert` ValueError).
-fn parse_float_text(raw: &str) -> Option<f64> {
+pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
     let transformed = transform_decimal_and_space(raw);
     let s = transformed.trim();
     if s.is_empty() || !valid_float_underscores(s) {

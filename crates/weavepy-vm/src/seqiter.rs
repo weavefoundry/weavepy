@@ -1241,6 +1241,29 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
         return Interpreter::seq_new_pure(ty, args);
     }
     let bt = builtin_types();
+    // `float(x)` and `int(x)` of a plain number or a well-formed `str`
+    // (a malformed one raises through the full constructor).
+    if Rc::ptr_eq(cls, &bt.float_) {
+        return match args {
+            [] => Some(Object::Float(0.0)),
+            [Object::Float(f)] => Some(Object::Float(*f)),
+            [Object::Int(i)] => Some(Object::Float(*i as f64)),
+            [Object::Bool(b)] => Some(Object::Float(f64::from(*b))),
+            [Object::Str(s)] => crate::builtins::parse_float_text(s).map(Object::Float),
+            _ => None,
+        };
+    }
+    if Rc::ptr_eq(cls, &bt.int_) {
+        return match args {
+            [] => Some(Object::Int(0)),
+            [Object::Int(i)] => Some(Object::Int(*i)),
+            [Object::Bool(b)] => Some(Object::Int(i64::from(*b))),
+            // Truncated toward zero, inside the machine range.
+            [Object::Float(f)] if f.is_finite() && f.abs() < 9.0e18 => Some(Object::Int(*f as i64)),
+            [s @ Object::Str(text)] => crate::builtins::parse_int_string(s, text, &[]).ok(),
+            _ => None,
+        };
+    }
     // `type(x)`: the object's class (`b_type`'s one-argument form).
     if Rc::ptr_eq(cls, &bt.type_) {
         return match args {
@@ -1487,7 +1510,7 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
     let (first, rest) = items.split_first()?;
     let mut best = first;
     match first {
-        Object::Int(_) => {
+        Object::Int(_) if rest.iter().all(|x| matches!(x, Object::Int(_))) => {
             for x in rest {
                 let (Object::Int(a), Object::Int(b)) = (x, best) else {
                     return None;
@@ -1497,9 +1520,22 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
                 }
             }
         }
+        // Ints and floats mixed (see the float arm).
+        Object::Int(_) => {
+            for x in rest {
+                let (Some(a), Some(b)) = (exact_f64(x), exact_f64(best)) else {
+                    return None;
+                };
+                if (want_max && a > b) || (!want_max && a < b) {
+                    best = x;
+                }
+            }
+        }
         Object::Float(_) => {
             for x in rest {
-                let (Object::Float(a), Object::Float(b)) = (x, best) else {
+                // An int among floats compares by its exact value: as a
+                // float only while that's exact.
+                let (Some(a), Some(b)) = (exact_f64(x), exact_f64(best)) else {
                     return None;
                 };
                 if (want_max && a > b) || (!want_max && a < b) {
@@ -1521,6 +1557,16 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
         _ => return None,
     }
     Some(Ok(best.clone()))
+}
+
+/// A float's value, or a machine int's when a float holds it exactly
+/// (so comparing the two is comparing the numbers).
+fn exact_f64(x: &Object) -> Option<f64> {
+    match x {
+        Object::Float(f) => Some(*f),
+        Object::Int(i) if i.unsigned_abs() <= 1 << 53 => Some(*i as f64),
+        _ => None,
+    }
 }
 
 /// `abs(x)` of a plain number (an int's magnitude must fit).

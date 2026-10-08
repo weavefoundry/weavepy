@@ -8192,6 +8192,7 @@ impl Interpreter {
         act.clean = false;
         act.direct = false;
         act.binop = None;
+        act.discard = false;
         act.act.shell = None;
         act.guard = None;
         act.caller_pending = None;
@@ -8218,6 +8219,7 @@ impl Interpreter {
         act.clean = false;
         act.direct = false;
         act.binop = None;
+        act.discard = false;
         act.guard = None;
         act.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
@@ -8661,12 +8663,18 @@ impl Interpreter {
             (_, result) => result,
         };
         let call_pc = done.call_pc;
+        let discard = done.discard;
         self.lean_pending_exit(done.caller_pending);
         // SAFETY: the callable is moved out exactly once; the parked slot
         // treats the field as stale until `inline_bind` rewrites it.
         let callable = unsafe { std::ptr::read(&raw const done.callable) };
         self.inline_park(done);
         match result {
+            Ok(v) if discard => {
+                self.release(v);
+                self.release(callable);
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
             Ok(v) => {
                 frame.stack.push(v);
                 self.release(callable);
@@ -9825,6 +9833,71 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(getter), guard))
     }
 
+    /// `obj.name = value` (the `STORE_ATTR` at `pc` of `frame`) for a
+    /// `property` whose setter is a plain Python function of `(self,
+    /// value)`, as an inline activation of the setter (CPython calls it
+    /// from `STORE_ATTR` alike): both operands leave the stack as its
+    /// arguments, and its result is discarded.
+    fn try_inline_setter(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let ins = frame.code.instructions.get(pc)?;
+        let n = frame.stack.len();
+        if ins.op != OpCode::StoreAttr || n < 2 {
+            return None;
+        }
+        let Object::Instance(inst) = &frame.stack[n - 1] else {
+            return None;
+        };
+        if !Self::default_setattr(inst.cls_raw()) {
+            return None;
+        }
+        let LeafAttr::Property(prop) =
+            Self::leaf_resolve_instance_attr(&frame.code, inst, ins.arg)?
+        else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the setter cell; the clone is
+        // taken before anything else runs.
+        let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
+            return None;
+        };
+        let code = f.code();
+        if code.arg_count != 2
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.kwonly_count != 0
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        let f = f.clone();
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let receiver = frame.stack.pop()?;
+        let value = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(receiver);
+        locals.push(value);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
+        act.discard = true;
+        Some(act)
+    }
+
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
     /// class attribute is a descriptor written in Python (an instance of a
     /// class with a plain `__get__(self, instance, owner)` function), as an
@@ -10628,6 +10701,7 @@ impl Interpreter {
                                 {
                                     continue
                                 }
+                                Some(OpCode::StoreAttr) if self.core_setter(sw) => continue,
                                 Some(OpCode::Call)
                                     if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
                                 {
@@ -11486,7 +11560,9 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
-                    OpCode::PopTop => {
+                    // (`POP_ITER`'s release is `POP_TOP`'s: an iterator a
+                    // loop left early, a generator closing as it dies.)
+                    OpCode::PopTop | OpCode::PopIter => {
                         // A scalar needs no drop; a shared heap value is a
                         // plain decrement (see `core_droppable`).
                         // SAFETY: `len > 0` checked.
@@ -11931,6 +12007,7 @@ impl Interpreter {
                     OpCode::BinarySubscr
                     | OpCode::BinarySlice
                     | OpCode::StoreSubscr
+                    | OpCode::DeleteSubscr
                     | OpCode::ListAppend
                     | OpCode::SetAdd
                     | OpCode::MapAdd
@@ -15137,6 +15214,33 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_property`] for a `STORE_ATTR` a property's Python setter
+    /// serves ([`Self::try_inline_setter`]). `false` touches nothing.
+    #[inline(never)]
+    fn core_setter(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_setter(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
     /// [`Self::core_property`] for a `BINARY_SUBSCR` the instance's Python
     /// `__getitem__` serves ([`Self::try_inline_getitem`]), or with
     /// `descr` a `LOAD_ATTR` a Python descriptor's `__get__` serves
@@ -16605,6 +16709,58 @@ impl Interpreter {
                 }
                 drop_hot(old);
                 Some(len - 3)
+            }
+            // `del xs[i]` of an exact list, `del d[k]` of an exact dict by a
+            // key that settles natively; a miss raises through the full arm.
+            OpCode::DeleteSubscr => {
+                if len < 2 {
+                    return None;
+                }
+                // SAFETY: `len >= 2`.
+                let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+                if !Self::core_droppable(c) {
+                    return None;
+                }
+                let removed_ok = |v: &Object| scalar(v) || Self::core_droppable(v);
+                let (removed, key) = match (c, k) {
+                    (Object::List(xs), Object::Int(i)) => {
+                        // SAFETY: a store between two instructions (the
+                        // removed value is released after the view ends).
+                        let xs = unsafe { xs.peek_mut() }?;
+                        let n = xs.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n || !removed_ok(&xs[i as usize]) {
+                            return None;
+                        }
+                        (xs.remove(i as usize), Object::None)
+                    }
+                    (Object::Dict(cell), Object::Str(_) | Object::Int(_)) => {
+                        if crate::capi_watchers::dicts_active() {
+                            return None;
+                        }
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        // SAFETY: as above (the probe runs no code).
+                        let d = unsafe { cell.peek_mut() }?;
+                        let at = d.get_index_of(&probe)?;
+                        if !d.get_index(at).is_some_and(|(_, v)| removed_ok(v)) {
+                            return None;
+                        }
+                        let (key, v) = d.shift_remove_index(at)?;
+                        crate::object::dict_watch_bump(cell);
+                        crate::object::dict_mutation_event(cell);
+                        (v, key.0)
+                    }
+                    _ => return None,
+                };
+                // SAFETY: both operand slots are initialized; each release
+                // is a scalar or a plain decrement.
+                unsafe {
+                    drop_hot(base.add(len - 1).read());
+                    drop_hot(base.add(len - 2).read());
+                }
+                drop_hot(removed);
+                drop_hot(key);
+                Some(len - 2)
             }
             OpCode::UnpackSequence => {
                 let n = ins.arg as usize;
@@ -19650,7 +19806,7 @@ impl Interpreter {
             && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
-        if clean && done.init_inst.is_none() && done.binop.is_none() {
+        if clean && done.init_inst.is_none() && done.binop.is_none() && !done.discard {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -23918,6 +24074,38 @@ impl Interpreter {
             1 => true,
             2 => false,
             _ => Self::default_getattribute_slow(cls),
+        }
+    }
+
+    /// Whether `cls`'s `__setattr__` is `object`'s, cached on the class
+    /// under its attribute version.
+    fn default_setattr(cls: &TypeObject) -> bool {
+        use crate::types::LeafAttrKind as K;
+        /// The cache key for the answer (an address no interned name has).
+        static SETATTR_KEY: u8 = 0;
+        let key = std::ptr::addr_of!(SETATTR_KEY) as usize;
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::InstanceOnly) => true,
+            Some(_) => false,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return false;
+                }
+                let default = match cls.lookup("__setattr__") {
+                    None => true,
+                    Some(Object::Builtin(b)) => builtin_types()
+                        .object_
+                        .dict
+                        .borrow()
+                        .get(&crate::object::StrKey("__setattr__"))
+                        .is_some_and(|o| matches!(o, Object::Builtin(d) if Rc::ptr_eq(d, &b))),
+                    Some(_) => false,
+                };
+                cls.leaf_attrs
+                    .set(key, ver, if default { K::InstanceOnly } else { K::Other });
+                default
+            }
         }
     }
 
@@ -63231,6 +63419,9 @@ struct InlineAct {
     /// the operator's `TypeError` (the operator, whether augmented, and
     /// the operands' class).
     binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
+    /// The caller takes no result (a property setter's activation for a
+    /// `STORE_ATTR`, see `Interpreter::try_inline_setter`).
+    discard: bool,
     /// A collapsed `yield from` chain (see
     /// `Interpreter::core_send_collapse`): the generators between the
     /// consumer and the one this activation runs, outermost first. The
@@ -63322,6 +63513,7 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             binop: None,
+            discard: false,
             delegates: Vec::new(),
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
@@ -64663,9 +64855,11 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::PushNull,
         OpCode::StoreFast,
         OpCode::PopTop,
+        OpCode::PopIter,
         OpCode::BinaryOp,
         OpCode::BinarySubscr,
         OpCode::StoreSubscr,
+        OpCode::DeleteSubscr,
         OpCode::ListAppend,
         OpCode::UnpackSequence,
         OpCode::CompareOp,
