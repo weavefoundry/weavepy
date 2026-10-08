@@ -14053,12 +14053,10 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     dict_view_no_args(args, "copy")?;
     let cloned = d.borrow().clone();
     let out = Object::Dict(Rc::new(RefCell::new(cloned)));
-    // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
-    // iff the source is (test_dict `test_copy_maintains_tracking`).
-    let id = crate::weakref_registry::id_of(&Object::Dict(d));
-    if crate::gc_trace::with_state(|s| s.is_tracked_instance(id)) {
-        crate::gc_trace::track(&out);
-    }
+    // Tracked by its contents, as any new dict is: a copy of scalars stays
+    // deferred, and one that could close a cycle is registered.
+    // (`gc.is_tracked` answers for a dict as CPython does either way.)
+    crate::gc_trace::track(&out);
     Ok(out)
 }
 
