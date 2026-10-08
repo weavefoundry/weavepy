@@ -43754,13 +43754,17 @@ impl Interpreter {
         if let Some(r) = native_seq_compare(a, b, op, 0) {
             return Ok(Object::Bool(r));
         }
-        // Two instances of one class whose comparison dunder is a Python
-        // function: the forward call runs directly, with no bound method
-        // and none of the special operand shapes below. A `NotImplemented`
-        // answer continues the full protocol, past the forward call.
+        // Two instances whose left one's comparison dunder is a Python
+        // function, and whose right one's class doesn't subclass the left's
+        // (which would try its reflected dunder first): the forward call
+        // runs directly, with no bound method and none of the special
+        // operand shapes below. A `NotImplemented` answer continues the
+        // full protocol, past the forward call.
         let mut forward_ran = false;
         if let (Object::Instance(ia), Object::Instance(ib)) = (a, b) {
-            if std::ptr::eq(ia.cls_raw(), ib.cls_raw()) {
+            if std::ptr::eq(ia.cls_raw(), ib.cls_raw())
+                || !ib.cls_raw().is_subclass_of(ia.cls_raw())
+            {
                 /// Class cache keys per comparison (see
                 /// `instance_dunder_function`).
                 static CMP_KEYS: [u8; 8] = [0; 8];
