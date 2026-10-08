@@ -9969,26 +9969,13 @@ impl Interpreter {
         // on the full path.)
         if !Self::default_getattribute(cls)
             || crate::object::exotic_str_keys_possible()
-            || cls.lookup("__getattr__").is_some()
+            || cls.dunder(crate::types::Dunder::GetAttr).present()
         {
             return None;
         }
-        let name = frame.code.names.get(ins.arg as usize)?;
-        if name.starts_with("__") {
-            return None;
-        }
-        let Some(Object::Instance(descr)) = cls.lookup(name) else {
-            return None;
-        };
-        let dcls = descr.cls_raw();
-        let Some(Object::Function(get)) = dcls.lookup("__get__") else {
-            return None;
-        };
         // (A non-data descriptor would yield to the instance's own
-        // attribute; those stay on the full path.)
-        if dcls.lookup("__set__").is_none() && dcls.lookup("__delete__").is_none() {
-            return None;
-        }
+        // attribute; those stay on the full path, as do dunders.)
+        let (descr, get) = Self::leaf_class_data_descr(&frame.code, cls, ins.arg)?;
         let code = get.code();
         if code.arg_count != 3
             || code.kwonly_count != 0
@@ -13984,6 +13971,28 @@ impl Interpreter {
                             pc += 1;
                             continue;
                         }
+                        // An attribute the instance holds itself (a stored
+                        // callable, `self.fn(...)`): the value, with an empty
+                        // self slot, as the helper loads it (whether or not
+                        // the code's method sites have slots yet). The class
+                        // cache answers only for default attribute access.
+                        // SAFETY: as above.
+                        if let Object::Instance(inst) = unsafe { &*top } {
+                            if !Self::default_getattribute(inst.cls_raw()) {
+                                break Some(CoreExit::Helper);
+                            }
+                            if inst_may_shadow(inst, code, ins.arg) {
+                                // SAFETY: `len < cap`: `top` and the slot
+                                // above it.
+                                if unsafe { Self::core_value_method(code, ins.arg, top) } {
+                                    len += 1;
+                                    last = pc;
+                                    pc += 1;
+                                    continue;
+                                }
+                                break Some(CoreExit::Helper);
+                            }
+                        }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
                             break Some(CoreExit::Helper);
                         };
@@ -13991,28 +14000,9 @@ impl Interpreter {
                             Object::Instance(inst) => {
                                 // The site slot and the class cache are keyed
                                 // by the class's (process-unique) attribute
-                                // version, and answer only for default
-                                // attribute access.
+                                // version (the checks above passed).
                                 let cls = inst.cls_raw();
                                 let ver = cls.attr_version.get();
-                                if !Self::default_getattribute(cls) {
-                                    break Some(CoreExit::Helper);
-                                }
-                                // An attribute the instance holds itself (a
-                                // stored callable, `self.fn(...)`): the value,
-                                // with an empty self slot, as the helper
-                                // loads it.
-                                if inst_may_shadow(inst, code, ins.arg) {
-                                    // SAFETY: `len < cap`: `top` and the slot
-                                    // above it.
-                                    if unsafe { Self::core_value_method(code, ins.arg, top) } {
-                                        len += 1;
-                                        last = pc;
-                                        pc += 1;
-                                        continue;
-                                    }
-                                    break Some(CoreExit::Helper);
-                                }
                                 let f = match ms.get_held(ver) {
                                     Some(f) => Object::Function(f),
                                     None => match ms.get_inst_builtin(ver) {
@@ -25934,7 +25924,7 @@ impl Interpreter {
                 K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
-                K::Other => None,
+                K::DataDescr { .. } | K::Other => None,
             };
         }
         if crate::object::exotic_str_keys_possible() {
@@ -26000,7 +25990,7 @@ impl Interpreter {
                     {
                         K::TupleField(ix)
                     } else if i.cls_raw().lookup("__get__").is_some() {
-                        K::Other
+                        Self::data_descr_kind(&i)
                     } else {
                         K::ValueInstance(Rc::downgrade(&i))
                     }
@@ -26021,10 +26011,57 @@ impl Interpreter {
             K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
-            K::Other => None,
+            K::DataDescr { .. } | K::Other => None,
         };
         cls.leaf_attrs.set(name_key, ver, kind);
         out
+    }
+
+    /// The cache entry for `descr`, an instance on a class's MRO whose own
+    /// class defines `__get__`: a data descriptor whose `__get__` is a
+    /// plain function, or `Other`.
+    fn data_descr_kind(descr: &Rc<PyInstance>) -> crate::types::LeafAttrKind {
+        use crate::types::{Dunder, LeafAttrKind as K};
+        let dcls = descr.cls_raw();
+        if !(dcls.dunder(Dunder::Set).present() || dcls.dunder(Dunder::Delete).present()) {
+            return K::Other;
+        }
+        match dcls.lookup("__get__") {
+            Some(Object::Function(get)) => K::DataDescr {
+                descr: Rc::downgrade(descr),
+                get: Rc::downgrade(&get),
+                dver: dcls.attr_version.get(),
+            },
+            _ => K::Other,
+        }
+    }
+
+    /// The Python data descriptor `cls` resolves `co_names[name_idx]` to
+    /// (see [`crate::types::LeafAttrKind::DataDescr`]), and its `__get__`,
+    /// from the class's leaf attribute cache.
+    fn leaf_class_data_descr(
+        code: &CodeObject,
+        cls: &TypeObject,
+        name_idx: u32,
+    ) -> Option<(Rc<PyInstance>, Rc<crate::object::PyFunction>)> {
+        use crate::types::LeafAttrKind as K;
+        let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
+            return None;
+        };
+        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
+        let ver = cls.attr_version.get();
+        if cls.leaf_attrs.get(name_key, ver).is_none() {
+            // (Fills the entry.)
+            Self::leaf_class_attr(code, cls, name_idx);
+        }
+        let K::DataDescr { descr, get, dver } = cls.leaf_attrs.get(name_key, ver)? else {
+            return None;
+        };
+        let descr = descr.upgrade()?;
+        if descr.cls_raw().attr_version.get() != *dver {
+            return None;
+        }
+        Some((descr, get.upgrade()?))
     }
 
     /// `cls.name` for a class with a plain metaclass, when the name is a
@@ -45256,6 +45293,15 @@ impl Interpreter {
     fn core_attr_lane(&mut self, sw: &mut CoreSwitch, pc: usize) -> Result<(), RuntimeError> {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        // A property's or a Python data descriptor's getter runs as an
+        // inline activation, as the core loop's own arm runs it.
+        if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && (self.core_property(sw) || self.core_getitem(sw, true))
+        {
+            return Ok(());
+        }
+        // SAFETY: as above (both declined untouched).
         let frame = unsafe { &mut *sw.cur };
         let arg = frame.code.instructions[pc].arg;
         frame.pc = pc as u32 + 1;
