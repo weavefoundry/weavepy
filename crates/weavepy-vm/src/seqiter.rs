@@ -1260,7 +1260,7 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             [Object::Bool(b)] => Some(Object::Int(i64::from(*b))),
             // Truncated toward zero, inside the machine range.
             [Object::Float(f)] if f.is_finite() && f.abs() < 9.0e18 => Some(Object::Int(*f as i64)),
-            [s @ Object::Str(text)] => crate::builtins::parse_int_string(s, text, &[]).ok(),
+            [Object::Str(text)] => decimal_i64(text).map(Object::Int),
             _ => None,
         };
     }
@@ -1557,6 +1557,18 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
         _ => return None,
     }
     Some(Ok(best.clone()))
+}
+
+/// `int(text)` for plain decimal text (ASCII digits, an optional sign,
+/// surrounding ASCII whitespace) that fits a machine int; `None` for
+/// anything else, which the full constructor parses (or rejects).
+fn decimal_i64(text: &str) -> Option<i64> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
 }
 
 /// A float's value, or a machine int's when a float holds it exactly

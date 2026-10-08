@@ -5439,7 +5439,7 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `b'…'` framing are preserved, matching CPython, without paying the O(N)
 /// repr cost on the success / digit-limit paths). Unicode decimal digits and
 /// whitespace are normalised to ASCII first.
-pub(crate) fn parse_int_string(
+fn parse_int_string(
     original: &Object,
     raw: &str,
     base_arg: &[Object],
