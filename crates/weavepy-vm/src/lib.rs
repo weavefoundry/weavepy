@@ -17532,7 +17532,15 @@ impl Interpreter {
             | Object::Tuple(_)
             | Object::FrozenSet(_)
             | Object::Function(_)
-            | Object::Builtin(_) => true,
+            | Object::Builtin(_)
+            // (A module or container binds to nothing either: the same
+            // object, which a rebinding replaces under a new version.)
+            | Object::Module(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::Long(_)
+            | Object::Complex(_) => true,
             Object::Type(t) => Self::plain_metaclass(t),
             Object::Instance(i) => i.cls_raw().lookup("__get__").is_none(),
             _ => false,
