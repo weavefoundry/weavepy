@@ -4727,7 +4727,7 @@ pub(crate) fn sync_native_locals(locals: &Rc<GilRefCell<Vec<Object>>>) {
 }
 
 /// The size of [`CallCtx::pin_memo`].
-const PIN_MEMO: usize = 16;
+const PIN_MEMO: usize = 32;
 
 /// The identity [`pin_reusing`] keys an object by (`0` for objects whose
 /// pins aren't reused).
@@ -4740,10 +4740,23 @@ fn pin_identity(v: &Object) -> usize {
     }
 }
 
-/// The [`CallCtx::pin_memo`] entry for an object identity.
+/// The [`CallCtx::pin_memo`] pair of entries for an object identity (`s`
+/// and `s ^ 1`). The address is mixed multiplicatively: allocations a
+/// fixed stride apart (a loop's few instances) would otherwise share
+/// entries, and each would evict the other on every read.
 #[inline]
 fn pin_memo_slot(id: usize) -> usize {
-    (id >> 4 ^ id >> 9) % PIN_MEMO
+    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize >> (usize::BITS - 5)
+}
+
+/// The identity of the object `pins[ix]` holds (`0` for none).
+#[inline]
+fn pin_memo_holds(pins: &PinTable, ix: u32) -> usize {
+    match pins.get(ix as usize) {
+        Some(Pin::Obj(p)) => pin_identity(p),
+        Some(Pin::List(l, _)) => Rc::as_ptr(l) as usize,
+        None => 0,
+    }
 }
 
 /// The pin that already holds this very object, when `memo` remembers
@@ -4755,11 +4768,14 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
     if id == 0 {
         return None;
     }
-    let hint = memo[pin_memo_slot(id)] as usize;
-    match pins.get(hint) {
-        Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
-        _ => None,
-    }
+    let s = pin_memo_slot(id);
+    [s, s ^ 1].into_iter().find_map(|k| {
+        let hint = memo[k] as usize;
+        match pins.get(hint) {
+            Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
+            _ => None,
+        }
+    })
 }
 
 /// The pin that already holds this very list (a row of a nested list
@@ -4770,26 +4786,31 @@ fn list_pin_memo_hit(
     pins: &PinTable,
     memo: &[u32; PIN_MEMO],
 ) -> Option<u64> {
-    let id = Rc::as_ptr(l) as usize;
-    let hint = memo[pin_memo_slot(id)] as usize;
-    match pins.get(hint) {
-        Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
-        _ => None,
-    }
+    let s = pin_memo_slot(Rc::as_ptr(l) as usize);
+    [s, s ^ 1].into_iter().find_map(|k| {
+        let hint = memo[k] as usize;
+        match pins.get(hint) {
+            Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
+            _ => None,
+        }
+    })
 }
 
-/// Remember that pin `ix` will hold `p`'s object.
+/// Remember that pin `ix` will hold `p`'s object: in its first entry,
+/// unless that one remembers another live object, then in its second.
 #[inline]
-fn pin_memo_note(p: &Pin, ix: usize, memo: &mut [u32; PIN_MEMO]) {
-    match p {
-        Pin::Obj(v) => {
-            let id = pin_identity(v);
-            if id != 0 {
-                memo[pin_memo_slot(id)] = ix as u32;
-            }
-        }
-        Pin::List(l, _) => memo[pin_memo_slot(Rc::as_ptr(l) as usize)] = ix as u32,
+fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]) {
+    let id = match p {
+        Pin::Obj(v) => pin_identity(v),
+        Pin::List(l, _) => Rc::as_ptr(l) as usize,
+    };
+    if id == 0 {
+        return;
     }
+    let s = pin_memo_slot(id);
+    let held = pin_memo_holds(pins, memo[s]);
+    let k = if held == 0 || held == id { s } else { s ^ 1 };
+    memo[k] = ix as u32;
 }
 
 /// Pin `v` in `pins`, reusing the pin that already holds this very object
@@ -4803,7 +4824,7 @@ fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> O
         return None;
     }
     let p = Pin::Obj(v.clone());
-    pin_memo_note(&p, pins.len(), memo);
+    pin_memo_note(&p, pins.len(), pins, memo);
     pins.push(p);
     Some((pins.len() - 1) as u64)
 }
@@ -8604,7 +8625,7 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
                 return 1;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
+            pin_memo_note(&p, ctx.pins.len(), &ctx.pins, &mut ctx.pin_memo);
             ctx.pins.push(p);
             0
         }
@@ -9540,7 +9561,7 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
     let pinned = match outcome {
         Ok(bits) => Some(bits),
         Err(p) => (ctx.pins.len() < RUNTIME_PIN_CAP).then(|| {
-            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
+            pin_memo_note(&p, ctx.pins.len(), &ctx.pins, &mut ctx.pin_memo);
             ctx.pins.push(p);
             (ctx.pins.len() - 1) as u64
         }),
