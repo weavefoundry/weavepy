@@ -35,7 +35,7 @@
 //! `gc.collect`, finaliser code) can invoke.
 
 use crate::fasthash::ObjectIdHasher;
-use crate::shared_value::{SharedSlice, SharedStr, ThinArc};
+use crate::shared_value::SharedSlice;
 use crate::sync::RefCell;
 use crate::sync::{Rc as Arc, Weak};
 use std::hash::BuildHasherDefault;
@@ -705,10 +705,11 @@ fn id_of_by_variant(obj: &Object) -> ObjectId {
         Object::Bool(true) => 3,
         Object::Int(n) => 0x1000_0000_0000_0000u64 ^ (*n as u64),
         Object::Float(f) => 0x2000_0000_0000_0000u64 ^ f.to_bits(),
-        Object::Str(s) => SharedStr::as_ptr(s).cast::<()>() as usize as u64,
-        Object::WStr(cps) => ThinArc::as_ptr(cps).cast::<()>() as usize as u64,
-        Object::Bytes(b) => ThinArc::as_ptr(b).cast::<()>() as usize as u64,
-        Object::Tuple(t) => ThinArc::as_ptr(t).cast::<()>() as usize as u64,
+        // A thin payload's id is its allocation's address (the header, not
+        // the view its `as_ptr` returns), as `payload_addr` reads it.
+        Object::Str(_) | Object::WStr(_) | Object::Bytes(_) | Object::Tuple(_) => {
+            obj.payload_addr().map_or(0, |a| a as u64)
+        }
         Object::List(l) => Rc::as_ptr(l) as usize as u64,
         Object::Dict(d) => Rc::as_ptr(d) as usize as u64,
         Object::Set(s) => Rc::as_ptr(s) as usize as u64,
