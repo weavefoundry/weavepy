@@ -852,6 +852,7 @@ static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
 /// child then inherits no thread partway through it (holding a lock the
 /// child would wait on forever), and `os.fork` doesn't count it as a
 /// thread of a multi-threaded process.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn join_codegen_prewarm() {
     let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle {
