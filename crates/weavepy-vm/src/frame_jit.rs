@@ -503,6 +503,9 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
                     ins_k.op,
                     OpCode::EndFor | OpCode::PopIter | OpCode::ReturnValue
                 ) => {}
+                // A generator step ends at its yield whether or not the
+                // body runs natively: no round trip to pay for.
+                None if ins_k.op == OpCode::YieldValue && matches!(at, Heat::Step) => {}
                 None => exits += 1,
             }
         }
@@ -538,7 +541,7 @@ struct Tuning {
 fn tuning() -> Tuning {
     static T: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        let mut v = [8usize, 1, 3, 0, 10];
+        let mut v = [9usize, 1, 3, 0, 10];
         if let Ok(s) = std::env::var("WEAVEPY_FRAME_JIT_TUNE") {
             for (slot, x) in v.iter_mut().zip(s.split(',')) {
                 if let Ok(x) = x.trim().parse() {
