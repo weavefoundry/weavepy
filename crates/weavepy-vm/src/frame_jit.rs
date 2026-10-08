@@ -322,6 +322,9 @@ impl Slot {
         let d = self.deferred.load(Ordering::Relaxed).saturating_add(1);
         if !crate::tier2::frame_compile_allowed(d.saturating_mul(hot()), hot()) {
             self.deferred.store(d, Ordering::Relaxed);
+            if stats::enabled() {
+                eprintln!("frame jit: {} deferred ({d})", code.qualname);
+            }
             return;
         }
         // Loops the tier-2 compiler may still take keep their back edges'
@@ -334,6 +337,9 @@ impl Slot {
             || hint.loop_free(code)
             || hint.is_backedge_quiet())
         {
+            if stats::enabled() {
+                eprintln!("frame jit: {} left to tier 2", code.qualname);
+            }
             return;
         }
         if !name_admitted(&code.qualname) {

@@ -75728,6 +75728,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_dynamic_attribute_cache_and_callback_frames() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_DYN_ATTR_CACHE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -76435,6 +76438,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_borrowed_getters_preserve_callback_and_binding_rules() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_GETTER_PATH_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -76499,6 +76505,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_dynamic_attribute_results_keep_their_owners() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_ATTRIBUTE_OWNER_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -76629,6 +76638,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_module_attribute_chains_preserve_guards_and_ownership() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_MODULE_CHAIN_VM_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -76826,6 +76838,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_cached_attribute_chains_preserve_fallbacks_and_lifetimes() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_CACHED_CHAIN_VM_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -81587,6 +81602,9 @@ print(sliced('é😀z', 2))
     #[cfg(feature = "jit")]
     #[test]
     fn jit_native_call_scratch_survives_nested_calls_and_exits() {
+        // Its loops exercise the generic helpers, however much of them
+        // they are.
+        weavepy_jit::admit_generic_loops();
         let source = include_str!("../../../tests/regrtest/test_native_call_scratch.py");
         let (output, calls, _, deopts) = run_jit_native(source);
         assert_eq!(output, "native call scratch: ok\n");

@@ -34,7 +34,9 @@ pub use analyze::{
     returns_none_syntactically, returns_self_syntactically, JitVerdict, MethodResolution,
     PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
-pub use engine::{CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix};
+pub use engine::{
+    admit_generic_loops, CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix,
+};
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,

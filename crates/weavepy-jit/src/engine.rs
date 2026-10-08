@@ -670,6 +670,9 @@ impl JitEngine {
         if calls_dynamically(&tfunc) {
             return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
         }
+        if mostly_generic(&tfunc) {
+            return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
+        }
         for site in &mut tfunc.attr_sites {
             site.slot_member = slot_member(site);
         }
@@ -1136,6 +1139,110 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
     op_mix(tfunc).dyn_calls > 0
 }
 
+/// Whether `tfunc`'s loops run operations generic often enough that
+/// native code would run them slower than the interpreter (see
+/// [`generic_share_limit`]): each generic operation (a dynamic call or
+/// attribute access, an operation on a value of no known type) goes
+/// through a helper that redoes the lookups the interpreter's caches
+/// remember, while each typed one saves only a dispatch. A loop-free
+/// body is left alone: other compiled code calls it directly.
+fn mostly_generic(tfunc: &TFunc) -> bool {
+    let Some((percent, loops_only)) = generic_share_limit() else {
+        return false;
+    };
+    if !has_loop(tfunc) {
+        return false;
+    }
+    let mix = if loops_only {
+        // The blocks some back edge spans (blocks are in instruction
+        // order).
+        let mut in_loop = vec![false; tfunc.blocks.len()];
+        for (i, b) in tfunc.blocks.iter().enumerate() {
+            use crate::ir::TTerm;
+            let back = |t: usize| (t <= i).then_some(t);
+            let top = match b.term {
+                TTerm::Jump(t) => back(t),
+                TTerm::BranchFalse {
+                    target,
+                    fallthrough,
+                }
+                | TTerm::BranchTrue {
+                    target,
+                    fallthrough,
+                } => back(target).into_iter().chain(back(fallthrough)).min(),
+                _ => None,
+            };
+            if let Some(top) = top {
+                in_loop[top..=i].iter_mut().for_each(|x| *x = true);
+            }
+        }
+        mix_of(
+            tfunc
+                .blocks
+                .iter()
+                .zip(&in_loop)
+                .filter(|(_, l)| **l)
+                .map(|(b, _)| b),
+        )
+    } else {
+        op_mix(tfunc)
+    };
+    (mix.dyn_calls + mix.dyn_attrs + mix.dyn_other) * 100 > mix.total * percent
+}
+
+/// The generic share [`mostly_generic`] admits, in percent, and whether it
+/// counts only loop bodies: 20% of the whole frame unless
+/// `WEAVEPY_T2_GENERIC` says otherwise (`off`, or a percent with an
+/// optional `loop` suffix, as in `12loop`) or
+/// [`admit_generic_loops`] turned the rule off.
+fn generic_share_limit() -> Option<(u32, bool)> {
+    static LIMIT: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::new();
+    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("WEAVEPY_T2_GENERIC").unwrap_or_else(|_| "20loop".to_owned());
+        let (num, loops_only) = match v.strip_suffix("loop") {
+            Some(n) => (n, true),
+            None => (v.as_str(), false),
+        };
+        num.parse().ok().map(|p| (p, loops_only))
+    })
+}
+
+/// Set by [`admit_generic_loops`].
+static GENERIC_LOOPS_ADMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compile loops however generic their operations are, from now on in
+/// this process: for tests that exercise the generic helpers in compiled
+/// loops (see [`mostly_generic`]).
+pub fn admit_generic_loops() {
+    GENERIC_LOOPS_ADMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `tfunc` loops (a rewritten loop, or a backward jump).
+fn has_loop(tfunc: &TFunc) -> bool {
+    !tfunc.range_loops.is_empty()
+        || !tfunc.list_loops.is_empty()
+        || !tfunc.iter_loops.is_empty()
+        || tfunc.blocks.iter().enumerate().any(|(i, b)| {
+            use crate::ir::TTerm;
+            match b.term {
+                TTerm::Jump(t) => t <= i,
+                TTerm::BranchFalse {
+                    target,
+                    fallthrough,
+                }
+                | TTerm::BranchTrue {
+                    target,
+                    fallthrough,
+                } => target <= i || fallthrough <= i,
+                _ => false,
+            }
+        })
+}
+
 /// `(generic, total)`: statements that hand an operation to the
 /// interpreter's generic object protocol (dynamic calls and attribute
 /// accesses) against all statements (see [`CompiledFrame::op_mix`]).
@@ -1160,8 +1267,13 @@ fn op_mix(tfunc: &TFunc) -> OpMix {
         }
         eprintln!("jit ops {hist:?}");
     }
+    mix_of(tfunc.blocks.iter())
+}
+
+/// [`op_mix`] over `blocks`' statements.
+fn mix_of<'a>(blocks: impl Iterator<Item = &'a crate::ir::TBlock>) -> OpMix {
     let mut mix = OpMix::default();
-    for b in &tfunc.blocks {
+    for b in blocks {
         for st in &b.stmts {
             mix.total += 1;
             match st.op {
