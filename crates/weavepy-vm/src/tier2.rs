@@ -826,15 +826,37 @@ static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomic
 /// [`prewarm_codegen`]), once per process, when the first code object is
 /// halfway to its compile threshold. Not at start-up: paging the code
 /// generator in costs a program that never compiles anything about 2 MB
-/// of resident memory (a third of an empty script's over CPython's).
+/// of resident memory (a third of an empty script's over CPython's), and
+/// on the development host it slowed start-up more than it saved a short
+/// hot loop's first compile.
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let _ = std::thread::Builder::new()
+    if let Ok(handle) = std::thread::Builder::new()
         .name("weavepy-jit-warm".to_owned())
-        .spawn(prewarm_codegen);
+        .spawn(prewarm_codegen)
+    {
+        if let Ok(mut slot) = PREWARM_THREAD.lock() {
+            *slot = Some(handle);
+        }
+    }
+}
+
+/// The warm-up thread [`spawn_codegen_prewarm`] started, until joined.
+static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Wait for the code generator's warm-up to finish, before `fork()`: the
+/// child then inherits no thread partway through it (holding a lock the
+/// child would wait on forever), and `os.fork` doesn't count it as a
+/// thread of a multi-threaded process.
+pub(crate) fn join_codegen_prewarm() {
+    let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
 }
 
 /// Compile, on a throwaway engine, a small counted loop of the shape hot
