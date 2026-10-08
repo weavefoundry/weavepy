@@ -3400,11 +3400,27 @@ impl<'a> LeafProbe<'a> {
 /// keeps `type`'s `__hash__` and `__eq__` (no Python runs for either).
 #[inline]
 pub(crate) fn type_hash_is_identity(t: &crate::types::TypeObject) -> bool {
-    t.c_ext_ptr.get() == 0
-        && t.metaclass.borrow().as_ref().is_none_or(|m| {
-            !m.dunder(crate::types::Dunder::Hash).user_defined()
-                && !m.dunder(crate::types::Dunder::Eq).user_defined()
-        })
+    if t.c_ext_ptr.get() != 0 {
+        return false;
+    }
+    // SAFETY: a GIL-serialized read of the metaclass cell, ended before
+    // anything runs.
+    let Some(meta) = (unsafe { t.metaclass.peek() }) else {
+        return t
+            .metaclass
+            .borrow()
+            .as_ref()
+            .is_none_or(meta_hash_is_identity);
+    };
+    meta.as_ref().is_none_or(meta_hash_is_identity)
+}
+
+/// Whether metaclass `m` keeps `type`'s `__hash__` and `__eq__`.
+#[inline]
+fn meta_hash_is_identity(m: &crate::Rc<crate::types::TypeObject>) -> bool {
+    crate::Rc::ptr_eq(m, &crate::builtin_types::builtin_types().type_)
+        || (!m.dunder(crate::types::Dunder::Hash).user_defined()
+            && !m.dunder(crate::types::Dunder::Eq).user_defined())
 }
 
 impl Hash for LeafProbe<'_> {
