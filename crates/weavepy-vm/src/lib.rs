@@ -10892,10 +10892,14 @@ impl Interpreter {
     /// remembered in the site's method slot for the core loop. Declines
     /// any other owner or class attribute, touching nothing.
     fn leaf_load_special(frame: &mut Frame, special: u32, pc: usize) -> CoreAttr {
-        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        use weavepy_compiler::bytecode::{
+            SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
+        };
         let name = match special {
             SPECIAL_ENTER => "__enter__",
             SPECIAL_EXIT => "__exit__",
+            SPECIAL_AENTER => "__aenter__",
+            SPECIAL_AEXIT => "__aexit__",
             _ => return CoreAttr::Decline,
         };
         let Some(Object::Instance(inst)) = frame.stack.last() else {
