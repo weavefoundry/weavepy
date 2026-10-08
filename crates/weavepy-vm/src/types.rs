@@ -2183,15 +2183,17 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
 pub(crate) fn slot_key(name: &str) -> DictKey {
-    const COMMON: [&str; 6] = [
+    const COMMON: [&str; 8] = [
         "args",
         "__traceback__",
         "__context__",
         "__cause__",
         "__suppress_context__",
         "message",
+        "value",
+        "msg",
     ];
-    static KEYS: std::sync::OnceLock<[Object; 6]> = std::sync::OnceLock::new();
+    static KEYS: std::sync::OnceLock<[Object; 8]> = std::sync::OnceLock::new();
     if let Some(i) = COMMON.iter().position(|c| *c == name) {
         let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
         return DictKey(keys[i].clone());

@@ -5010,12 +5010,19 @@ impl PyFunction {
         let Some(slots) = self.slots_raw.get() else {
             return (None, None);
         };
+        // The two names' hashes, computed once.
+        static HASHES: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+        let (name_hash, qualname_hash) =
+            *HASHES.get_or_init(|| (py_str_hash("__name__"), py_str_hash("__qualname__")));
         let slots = slots.borrow();
-        let attr_str = |attr: &'static str| match slots.get(&StrKey(attr)) {
+        let attr_str = |s: &'static str, hash: i64| match slots.get(&StrKeyHashed { s, hash }) {
             Some(o @ Object::Str(_)) => Some(o.clone()),
             _ => None,
         };
-        (attr_str("__name__"), attr_str("__qualname__"))
+        (
+            attr_str("__name__", name_hash),
+            attr_str("__qualname__", qualname_hash),
+        )
     }
 
     /// Whether the function's slots are still its definition-time seed
