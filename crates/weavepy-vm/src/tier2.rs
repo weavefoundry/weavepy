@@ -4845,7 +4845,10 @@ fn guards_hold(
     callees: &CalleeTable,
     math: &MathTable,
 ) -> bool {
-    if guard_snapshot.introspected.get() != 0 {
+    // (A call that installed a trace function or monitoring events, as
+    // `pdb.set_trace` does, leaves the rest of the loop to the
+    // interpreter, which reports them.)
+    if guard_snapshot.introspected.get() != 0 || crate::trace::any_observers_active() {
         return false;
     }
     // SAFETY (stamp reads): GIL-serialized raw reads of the dicts'

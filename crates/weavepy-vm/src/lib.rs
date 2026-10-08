@@ -14617,6 +14617,19 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::lean_pending_exit`] after a lane's call: a call that changed
+    /// the observers (`pdb.set_trace` installing its trace function, a
+    /// monitoring tool's events) ends the burst, so the prologue sees them
+    /// before the caller's next instruction runs.
+    #[inline]
+    fn core_pending_exit(&mut self, sw: &mut CoreSwitch, pending: Option<usize>) {
+        self.lean_pending_exit(pending);
+        if crate::trace::observer_gen() != sw.obs_gen && sw.pending.is_none() {
+            sw.obs_gen = crate::trace::observer_gen();
+            sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
+        }
+    }
+
     /// The core loop's `CALL` of a Python callee at `pc` of `sw`'s
     /// (synced) running activation: the quiet loop's inline call
     /// ([`Self::try_inline_call`]), with the callee's activation pushed
@@ -14826,7 +14839,7 @@ impl Interpreter {
                 None => (b.call)(ops),
             }
         };
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         // The operands drop as the full handler's do, after the call.
         // SAFETY: each initialized entry drops exactly once; `buf` itself
         // has no drop glue.
@@ -14903,7 +14916,7 @@ impl Interpreter {
         } else {
             self.compare_op_step(frame, pc as u32, ins.arg)
         };
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         match result {
             // SAFETY: the running activation's last-pc slot.
             Ok(()) => unsafe { *sw.last = pc },
@@ -14948,7 +14961,7 @@ impl Interpreter {
         } else {
             self.call(&exit_func, &[exit_self, ty, exc, tb], &[], &globals)
         };
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         match result {
             Ok(v) => {
                 // SAFETY: as in `core_builtin_lane`.
@@ -15014,7 +15027,7 @@ impl Interpreter {
         let globals = frame.globals.clone();
         let pending = self.core_pending_enter(sw, frame, pc);
         let result = self.call(&Object::Builtin(b), &args, &kwargs, &globals);
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         drop(ops);
         for v in args.into_iter().chain(kwargs.into_iter().map(|(_, v)| v)) {
             self.release(v);
@@ -15411,7 +15424,7 @@ impl Interpreter {
             _ => None,
         }
         .unwrap_or_else(|| self.call(&callee, std::slice::from_ref(&arg), &[], &globals));
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         self.release(arg);
         drop(callee);
         match result {
@@ -15526,7 +15539,7 @@ impl Interpreter {
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
         let result = self.call(&callee, &args, &kwargs, &globals);
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         drop(args);
         drop(kwargs);
         drop(callee);
@@ -15573,7 +15586,7 @@ impl Interpreter {
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
         let next = self.lazy_iter_next(&l, &globals);
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         drop(l);
         // SAFETY: as in `core_type_lane` (the step ran nested activations
         // of its own, never this one).
@@ -45248,7 +45261,7 @@ impl Interpreter {
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
         let r = self.load_attr_step(frame, pc as u32, arg);
-        self.lean_pending_exit(pending);
+        self.core_pending_exit(sw, pending);
         r
     }
 
@@ -64073,6 +64086,9 @@ struct CoreSwitch {
     maybe_dead: *const std::cell::Cell<bool>,
     /// This thread's recursion-depth cell (see `recursion::depth_cell`).
     depth_cell: *const std::cell::Cell<usize>,
+    /// The observer generation the burst started under (see
+    /// [`Interpreter::core_pending_exit`]).
+    obs_gen: u64,
 }
 
 impl CoreSwitch {
@@ -64105,6 +64121,7 @@ impl CoreSwitch {
             scratch: usize::MAX,
             maybe_dead: roots.maybe_dead,
             depth_cell: crate::recursion::depth_cell(),
+            obs_gen: crate::trace::observer_gen(),
         }
     }
 
