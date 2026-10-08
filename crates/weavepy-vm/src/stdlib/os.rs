@@ -8350,6 +8350,14 @@ fn normpath_lexical(s: &str) -> String {
     }
 }
 
+/// `os.fspath`'s leaf half (see `leaf_builtins::register_fast`).
+fn fspath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [x @ (Object::Str(_) | Object::Bytes(_))] => Some(Ok(x.clone())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8413,13 +8421,5 @@ mod tests {
         assert_eq!(nt_splitdrive(r"\\?\C:\x"), (r"\\?\C:", r"\x"));
         assert_eq!(nt_splitdrive(r"\x\y"), ("", r"\x\y"));
         assert_eq!(nt_splitdrive("rel"), ("", "rel"));
-    }
-}
-
-/// `os.fspath`'s leaf half (see `leaf_builtins::register_fast`).
-fn fspath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    match args {
-        [x @ (Object::Str(_) | Object::Bytes(_))] => Some(Ok(x.clone())),
-        _ => None,
     }
 }

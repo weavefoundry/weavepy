@@ -80595,7 +80595,7 @@ assert namespace is exported.__dict__
     #[cfg(feature = "jit")]
     #[test]
     fn jit_inline_method_fields_match_interpreter() {
-        let src = r#"class Box:
+        let src = r"class Box:
     def __init__(self, w, h):
         self.w = w
         self.h = h
@@ -80659,7 +80659,7 @@ try:
 except ZeroDivisionError as e:
     print('ZeroDivisionError', names(e))
 print(run(Box(3, 4), 3000, prop, 1000))
-"#;
+";
         let (out, compiled, _deopts) = run_jit(src);
         assert!(compiled >= 2, "the method kernels never compiled");
         assert_eq!(out, run(src));
