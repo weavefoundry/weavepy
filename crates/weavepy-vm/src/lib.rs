@@ -11228,6 +11228,7 @@ impl Interpreter {
                             err: None,
                             frame: sw.cur,
                             sw: std::ptr::from_mut(sw),
+                            gen_depth: 0,
                         });
                         nst.len = len;
                         nst.pc = pc;

@@ -449,6 +449,7 @@ impl Interpreter {
                         err: None,
                         frame: frame_ptr,
                         sw: std::ptr::null_mut(),
+                        gen_depth: depth,
                     });
                     nst.len = len;
                     nst.pc = pc;

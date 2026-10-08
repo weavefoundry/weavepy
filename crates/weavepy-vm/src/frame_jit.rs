@@ -125,6 +125,9 @@ pub(crate) struct State {
     /// The core loop's activation switch, for calls and returns (null in
     /// a generator's fast step).
     pub(crate) sw: *mut crate::CoreSwitch,
+    /// In a generator's fast step, the fast steps it is nested in (see
+    /// `gen_fast`).
+    pub(crate) gen_depth: u8,
 }
 
 const S_LOCALS: i32 = 0;
@@ -990,6 +993,27 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 }
             }
             return FOR_SWITCHED;
+        }
+        // A generator iterated from another generator's fast step: its own
+        // fast step in place, nested one deeper, as the fast step's
+        // `FOR_ITER` arm takes it (and on the same terms: a body it can't
+        // step leaves the instruction to that arm).
+        Object::Generator(g) => {
+            // SAFETY: as above.
+            let interp = unsafe { &mut *st.interp.cast_mut() };
+            return match interp.gen_fast_next(g, st.snap_gen, st.gen_depth + 1, st.maybe_dead) {
+                crate::gen_fast::GenNext::Yielded(v) => {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(v) };
+                    1
+                }
+                crate::gen_fast::GenNext::Exhausted(_) => {
+                    // SAFETY: the finished generator leaves the stack.
+                    drop(unsafe { it.read() });
+                    2
+                }
+                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => 3,
+            };
         }
         // A native iterator class's `__next__` (a registered leaf builtin)
         // in place; exhaustion is the core loop's, a raise leaves past the
@@ -2288,6 +2312,7 @@ unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
             err: None,
             frame: sw.cur,
             sw: st.sw,
+            gen_depth: 0,
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run(&mut cst);
@@ -2722,6 +2747,7 @@ unsafe fn direct_call(
             err: None,
             frame: callee,
             sw: st.sw,
+            gen_depth: 0,
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run(&mut cst);
