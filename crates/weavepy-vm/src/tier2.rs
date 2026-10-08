@@ -11773,6 +11773,31 @@ unsafe fn call_dyn_impl(
             };
             kwargs.push((s.clone(), v));
         }
+        // A site the interpreter's `CALL_KW` never ran (the loop went
+        // native first) learns its keyword permutation here, as that
+        // handler's would, so its next call binds through
+        // `dyn_kw_site_bind` instead of this generic binder.
+        let (f, bound) = match &callee {
+            Object::Function(f) => (Some(f), false),
+            Object::BoundMethod(bm) => match &bm.function {
+                Object::Function(f) => (Some(f), true),
+                _ => (None, false),
+            },
+            _ => (None, false),
+        };
+        if let Some(f) = f {
+            if matches!(
+                code.caches.get(jf.deopt_pc),
+                weavepy_compiler::InlineCache::Empty
+            ) {
+                let decision = crate::specialize::attempt_specialize_call_kw(
+                    f,
+                    argc as usize + usize::from(bound),
+                    &kwargs,
+                );
+                code.caches.set(jf.deopt_pc, decision);
+            }
+        }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
     // WS1's dirtiness discipline). A keyword call pays the generic
