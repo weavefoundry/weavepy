@@ -89,6 +89,18 @@ fn hot() -> u32 {
     })
 }
 
+/// The IR size above which a body is lowered lean (see `compile_with`;
+/// `WEAVEPY_FRAME_JIT_LEAN` overrides it, a tuning aid).
+fn lean_above() -> usize {
+    static LEAN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEAN.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_LEAN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000)
+    })
+}
+
 /// How many entries at a pc may get nowhere before the core loop stops
 /// entering there.
 const MAX_FAILS: u8 = 32;
@@ -3713,6 +3725,7 @@ fn compile_with(
     let sig = &mut engine.ctx.func.signature;
     sig.params.push(AbiParam::new(ptr));
     sig.returns.push(AbiParam::new(types::I32));
+    let signature = sig.clone();
     let name = format!("wpframe_{}", engine.next);
     engine.next += 1;
     let id = engine
@@ -3725,14 +3738,19 @@ fn compile_with(
     let field_slots: &[FieldSlot] = ext
         .field_slots
         .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
-    let entries: Vec<bool>;
-    let globals: Vec<Box<GlobalCache>>;
-    let slots: Vec<Box<SlotCache>>;
-    let direct: Vec<Box<DirectSite>>;
+    let mut entries: Vec<bool>;
+    let mut globals: Vec<Box<GlobalCache>>;
+    let mut slots: Vec<Box<SlotCache>>;
+    let mut direct: Vec<Box<DirectSite>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
-    let built = {
+    // A body whose code comes out large is lowered again lean: compiling
+    // costs about the same per IR instruction, and a large body's time
+    // goes to its calls more than to the shortcuts in line.
+    let mut lean = false;
+    let built = loop {
         let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
         let mut lower = Lower::new(b, ptr, engine.tags, code, ext, nlocals, depths, field_slots);
+        lower.cold = lean;
         let done = lower.lower();
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
         globals = std::mem::take(&mut lower.global_caches);
@@ -3742,7 +3760,14 @@ fn compile_with(
             lower.b.seal_all_blocks();
             lower.b.finalize();
         }
-        done
+        if done && !lean && engine.ctx.func.dfg.num_insts() > lean_above() {
+            lean = true;
+            engine.fbctx = FunctionBuilderContext::new();
+            engine.module.clear_context(&mut engine.ctx);
+            engine.ctx.func.signature = signature.clone();
+            continue;
+        }
+        break done;
     };
     if !built {
         // An unfinished function leaves the builder's state behind.
@@ -3759,9 +3784,10 @@ fn compile_with(
     let defined = engine.module.define_function(id, &mut engine.ctx);
     if let (Some(t0), Some(t1)) = (t0, t1) {
         eprintln!(
-            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks), compiled in {:?}",
+            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}), compiled in {:?}",
             code.qualname,
             t1 - t0,
+            if lean { ", lean" } else { "" },
             t1.elapsed()
         );
     }
@@ -3873,7 +3899,9 @@ struct Lower<'a> {
     dispatch: Block,
     /// Whether copies are on an exit path (one helper call each, not the
     /// scalar test in line: exits are rare, and code size costs compile
-    /// time).
+    /// time), or the whole body is lowered lean (see `compile_with`):
+    /// global reads and stack operands' arithmetic through their helpers
+    /// too.
     cold: bool,
     /// The virtual stack above the frame's, and the logical depth.
     vs: Vec<Item>,
@@ -5511,6 +5539,9 @@ impl<'a> Lower<'a> {
         // likely a heap value as a number: numbers in line, the result
         // onto the stack, anything else through the helper.
         if matches!(ai, Item::Mem(_)) || matches!(bi, Item::Mem(_)) {
+            if self.cold {
+                return self.binary_helper(pc, kind, ai, bi);
+            }
             return self.binary_on_stack(pc, kind, ai, bi);
         }
         let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
@@ -6794,7 +6825,9 @@ impl<'a> Lower<'a> {
         self.global_caches.push(cache);
         let helper = self.b.create_block();
         let done = self.b.create_block();
-        {
+        if self.cold {
+            self.b.ins().jump(helper, &[]);
+        } else {
             let ptr = self.ptr;
             let c = self.b.ins().iconst(ptr, cache_at);
             let frame = self.b.ins().load(ptr, FLAGS, self.st, S_FRAME);
