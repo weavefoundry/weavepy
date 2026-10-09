@@ -2144,8 +2144,13 @@ fn decode_instructions(
     // A comprehension whose own target is a cell announces itself with
     // `MAKE_CELL s` right after the save and keeps closure semantics.
     // Nested comprehensions re-binding the same name push the slot
-    // again, so each restore pops one entry.
+    // again, so each restore pops one entry. The restore usually
+    // follows a `SWAP`, but the optimizer may move the result's store
+    // ahead of it (`POP_ITER; STORE_FAST result; STORE_FAST s`), so a
+    // store in the run of stores and swaps right after the loop's
+    // `END_FOR`/`POP_ITER` ends the region too.
     let mut plain_shared: Vec<u32> = Vec::new();
+    let mut loop_tail = false;
     let shared_local = |slot: u32| slot < slots.nlocals && slots.is_cellish(slot);
     let end_region = |plain_shared: &mut Vec<u32>, slot: u32| {
         if let Some(p) = plain_shared.iter().rposition(|&s| s == slot) {
@@ -2153,7 +2158,15 @@ fn decode_instructions(
         }
     };
     for (idx, r) in raws.iter().enumerate() {
-        let after_swap = idx > 0 && raws[idx - 1].cp_op == op::SWAP;
+        let in_tail = loop_tail;
+        loop_tail = match r.cp_op {
+            op::END_FOR | op::POP_ITER => true,
+            op::SWAP | op::STORE_FAST | op::STORE_FAST_STORE_FAST | op::POP_TOP | op::NOP => {
+                loop_tail
+            }
+            _ => false,
+        };
+        let after_swap = in_tail || (idx > 0 && raws[idx - 1].cp_op == op::SWAP);
         match r.cp_op {
             op::LOAD_FAST_AND_CLEAR
                 if shared_local(r.arg)

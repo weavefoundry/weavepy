@@ -72,4 +72,20 @@ with tempfile.TemporaryDirectory() as d:
     assert ns2["VALUE"] == 37
     assert ns2["compute"](3) == 10
 
+# ---------- an inlined comprehension's name, later a closure cell ----------
+# `k` is a plain local of the first comprehension and a cell of the
+# second; the optimizer stores the first's result before restoring `k`
+# (`POP_ITER; STORE_FAST counts; STORE_FAST k`), so the decoder must end
+# the first comprehension's region there, or the second's closure reads
+# the plain local.
+src = (
+    "def summarize(widgets, kinds):\n"
+    "    counts = {k: len(v) for k, v in widgets.items()}\n"
+    "    found = {k: sum(1 for w in widgets if w is k) for k in kinds}\n"
+    "    return counts, found\n"
+)
+ns3 = {}
+exec(marshal.loads(marshal.dumps(compile(src, "<pyc-test>", "exec"))), ns3)
+assert ns3["summarize"]({1: [0], 2: []}, [1, 3]) == ({1: 1, 2: 0}, {1: 1, 3: 0})
+
 print("test_pyc_roundtrip: OK")
