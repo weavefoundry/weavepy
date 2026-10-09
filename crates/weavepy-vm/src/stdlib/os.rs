@@ -195,10 +195,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("unsetenv")),
             builtin("unsetenv", os_unsetenv),
         );
-        d.insert(
-            DictKey(Object::from_static("getpid")),
-            builtin("getpid", os_getpid),
-        );
+        let getpid = builtin("getpid", os_getpid);
+        // Reads the process id: no Python runs.
+        if let Object::Builtin(f) = &getpid {
+            crate::leaf_builtins::register(f);
+        }
+        d.insert(DictKey(Object::from_static("getpid")), getpid);
         // 3.14 `posix._is_inputhook_installed()` (gh-121886): `_pyrepl`'s
         // console polls it for `PyOS_InputHook`; WeavePy has no C input
         // hook, so it is always `False`.
@@ -296,10 +298,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("chdir")),
             builtin("chdir", os_chdir),
         );
-        d.insert(
-            DictKey(Object::from_static("fspath")),
-            builtin("fspath", os_fspath),
-        );
+        let fspath = builtin("fspath", os_fspath);
+        // `fspath` of a `str` or `bytes` is the argument itself, run in
+        // place; anything else (a `__fspath__`) takes the full call.
+        if let Object::Builtin(b) = &fspath {
+            crate::leaf_builtins::register_fast(b, fspath_fast);
+        }
+        d.insert(DictKey(Object::from_static("fspath")), fspath);
         d.insert(
             DictKey(Object::from_static("fsdecode")),
             builtin("fsdecode", os_fsdecode),
@@ -6819,9 +6824,16 @@ fn nt_path_splitroot(args: &[Object]) -> Result<Object, RuntimeError> {
 /// recognise it (and apply the `__fspath__` structural check, like CPython's
 /// `PathLike.__subclasshook__`).
 pub fn path_like_type() -> Rc<crate::types::TypeObject> {
-    static CLS: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
-    CLS.get_or_init(|| path_like_type_singleton("PathLike"))
+    PATH_LIKE
+        .get_or_init(|| path_like_type_singleton("PathLike"))
         .clone()
+}
+
+static PATH_LIKE: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
+
+/// Whether `t` is [`path_like_type`] (without taking a reference).
+pub(crate) fn is_path_like(t: &Rc<crate::types::TypeObject>) -> bool {
+    PATH_LIKE.get().is_some_and(|c| Rc::ptr_eq(c, t))
 }
 
 fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
@@ -8335,6 +8347,14 @@ fn normpath_lexical(s: &str) -> String {
         ".".to_owned()
     } else {
         out
+    }
+}
+
+/// `os.fspath`'s leaf half (see `leaf_builtins::register_fast`).
+fn fspath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [x @ (Object::Str(_) | Object::Bytes(_))] => Some(Ok(x.clone())),
+        _ => None,
     }
 }
 

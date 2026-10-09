@@ -50,6 +50,9 @@ pub(crate) const KIND_DATE: u8 = 2;
 pub(crate) const KIND_TIME: u8 = 3;
 pub(crate) const KIND_DATETIME: u8 = 4;
 pub(crate) const KIND_TIMEZONE: u8 = 5;
+/// The `decimal` kind (see `stdlib::decimal_native`): every entry point
+/// here hands it over before reading the `datetime` state.
+use super::decimal_native::KIND_DECIMAL;
 
 const MAX_ORDINAL: i64 = 3_652_059;
 const MAX_DAYS: i128 = 999_999_999;
@@ -149,11 +152,23 @@ fn word_time(w: u64) -> (i64, i64, i64, i64, i64) {
     )
 }
 
+/// The packed kinds of a finite `decimal.Decimal` (see
+/// `stdlib::decimal_native`); the kind carries the sign. A coefficient
+/// that fits in a word is `word`, with `aux` the exponent (as `i64`);
+/// the wide kinds hold a coefficient below 2**96 (every one of the
+/// default context's 28 digits) as `word` and the high half of `aux`,
+/// with a 32-bit exponent in its low half.
+pub(crate) const PK_DECIMAL_POS: u8 = 6;
+pub(crate) const PK_DECIMAL_NEG: u8 = 7;
+pub(crate) const PK_DECIMAL_WIDE_POS: u8 = 3;
+pub(crate) const PK_DECIMAL_WIDE_NEG: u8 = 5;
+
 /// The slot layouts packed values describe themselves with, shared by
-/// every interpreter: `[timedelta, date, datetime]`, in the order the
-/// classes' `__new__` assigns the slots.
-fn layouts() -> &'static [SharedSlice<DictKey>; 3] {
-    static LAYOUTS: std::sync::OnceLock<[SharedSlice<DictKey>; 3]> = std::sync::OnceLock::new();
+/// every interpreter: `[timedelta, date, datetime, Decimal]`, in the
+/// order the classes' `__new__` (for `Decimal`, `_dec_from_triple`)
+/// assigns the slots.
+fn layouts() -> &'static [SharedSlice<DictKey>; 4] {
+    static LAYOUTS: std::sync::OnceLock<[SharedSlice<DictKey>; 4]> = std::sync::OnceLock::new();
     LAYOUTS.get_or_init(|| {
         let layout = |names: &[&str]| -> SharedSlice<DictKey> {
             names
@@ -185,8 +200,14 @@ fn layouts() -> &'static [SharedSlice<DictKey>; 3] {
                 "_hashcode",
                 "_fold",
             ]),
+            layout(&["_sign", "_int", "_exp", "_is_special"]),
         ]
     })
+}
+
+/// The slot layout of natively built `Decimal`s (packed or not).
+pub(crate) fn decimal_layout() -> &'static SharedSlice<DictKey> {
+    &layouts()[3]
 }
 
 #[inline]
@@ -195,6 +216,7 @@ fn layout_of(kind: u8) -> &'static SharedSlice<DictKey> {
     match kind {
         KIND_TIMEDELTA => &l[0],
         KIND_DATE => &l[1],
+        PK_DECIMAL_POS | PK_DECIMAL_NEG | PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG => &l[3],
         _ => &l[2],
     }
 }
@@ -287,6 +309,15 @@ impl PackedSlots {
     fn build_values(&self) -> Vec<Object> {
         let w = self.word;
         match self.kind() {
+            PK_DECIMAL_POS | PK_DECIMAL_NEG | PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG => {
+                let (sign, coef, exp) = self.decimal().expect("a decimal kind");
+                vec![
+                    Object::Int(i64::from(sign)),
+                    super::decimal_native::digits_object(coef),
+                    Object::Int(exp),
+                    Object::Bool(false),
+                ]
+            }
             KIND_TIMEDELTA => {
                 let (d, s, us) = self.td();
                 vec![
@@ -325,6 +356,73 @@ impl PackedSlots {
                 ]
             }
         }
+    }
+
+    /// The packed form of the finite `Decimal` `(sign, coef, exp)`:
+    /// `(kind, word, aux)`, or `None` when it does not pack.
+    #[inline]
+    pub(crate) fn decimal_parts(sign: u8, coef: u128, exp: i64) -> Option<(u8, u64, usize)> {
+        // `aux` holds 64 bits.
+        if usize::BITS != 64 {
+            return None;
+        }
+        if let Ok(w) = u64::try_from(coef) {
+            let kind = if sign == 1 {
+                PK_DECIMAL_NEG
+            } else {
+                PK_DECIMAL_POS
+            };
+            return Some((kind, w, exp as usize));
+        }
+        let hi = u32::try_from(coef >> 64).ok()?;
+        let e = i32::try_from(exp).ok()?;
+        let kind = if sign == 1 {
+            PK_DECIMAL_WIDE_NEG
+        } else {
+            PK_DECIMAL_WIDE_POS
+        };
+        Some((kind, coef as u64, (hi as usize) << 32 | e as u32 as usize))
+    }
+
+    /// A finite `Decimal` packed as [`Self::decimal_parts`] gave.
+    #[inline]
+    pub(crate) fn new_decimal((kind, word, aux): (u8, u64, usize)) -> Self {
+        Self::new(kind, word, aux)
+    }
+
+    /// `(sign, coefficient, exponent)` of a packed `Decimal`.
+    #[inline]
+    pub(crate) fn decimal(&self) -> Option<(u8, u128, i64)> {
+        match self.kind() {
+            PK_DECIMAL_POS => Some((0, u128::from(self.word), self.aux as i64)),
+            PK_DECIMAL_NEG => Some((1, u128::from(self.word), self.aux as i64)),
+            kind @ (PK_DECIMAL_WIDE_POS | PK_DECIMAL_WIDE_NEG) => {
+                let hi = (self.aux >> 32) as u128;
+                Some((
+                    u8::from(kind == PK_DECIMAL_WIDE_NEG),
+                    hi << 64 | u128::from(self.word),
+                    i64::from(self.aux as u32 as i32),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reuse a pooled packed `Decimal`'s storage for a new value, as
+    /// [`Self::decimal_parts`] packs it (the old value's built copy, if
+    /// any, was released by [`Self::clear_decimal`]).
+    #[inline]
+    pub(crate) fn set_decimal(&mut self, (kind, word, aux): (u8, u64, usize)) {
+        *self.meta.get_mut() = kind as usize;
+        self.word = word;
+        self.aux = aux;
+    }
+
+    /// Release a dying packed `Decimal`'s built copy (see
+    /// `decimal_native::recycle`).
+    #[inline]
+    pub(crate) fn clear_decimal(&mut self) {
+        self.free_values();
     }
 
     /// `(days, seconds, microseconds)` of a packed `timedelta`.
@@ -942,6 +1040,9 @@ pub(crate) fn construct(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Option<Result<Object, RuntimeError>> {
+    if cls.native_kind.get() == KIND_DECIMAL {
+        return super::decimal_native::construct(cls, args, kwargs);
+    }
     construct_with(cls, args, kwargs.len(), |i| {
         (kwargs[i].0.as_str(), &kwargs[i].1)
     })
@@ -955,6 +1056,9 @@ pub(crate) fn construct_names(
     names: &[Object],
     values: &[Object],
 ) -> Option<Result<Object, RuntimeError>> {
+    if cls.native_kind.get() == KIND_DECIMAL {
+        return super::decimal_native::construct_names(cls, args, names, values);
+    }
     if names.len() != values.len() {
         return None;
     }
@@ -1201,7 +1305,7 @@ unsafe impl Send for Pool {}
 /// unit-test binary runs interpreters on concurrent threads with no GIL
 /// between them) never pool.
 #[inline]
-fn pool_ok() -> bool {
+pub(crate) fn pool_ok() -> bool {
     #[cfg(debug_assertions)]
     {
         false
@@ -1267,7 +1371,7 @@ pub(crate) fn pooled_kind(i: &PyInstance) -> bool {
     unsafe { i.class.peek() }.is_some_and(|c| {
         matches!(
             c.native_kind.get(),
-            KIND_TIMEDELTA | KIND_DATE | KIND_DATETIME
+            KIND_TIMEDELTA | KIND_DATE | KIND_DATETIME | KIND_DECIMAL
         )
     })
 }
@@ -1279,6 +1383,10 @@ pub(crate) fn pooled_kind(i: &PyInstance) -> bool {
 pub(crate) fn recycle(mut inst: Rc<PyInstance>) -> Result<(), Rc<PyInstance>> {
     if !pool_ok() {
         return Err(inst);
+    }
+    // SAFETY: a read of the dying instance's class.
+    if unsafe { &*inst.class.as_ptr() }.native_kind.get() == KIND_DECIMAL {
+        return super::decimal_native::recycle(inst);
     }
     // While the refcount bias holds, this thread owns every count.
     let unique = if crate::rc::refcounts_biased() {
@@ -2256,6 +2364,7 @@ pub(crate) fn plain_drop_ok(i: &PyInstance) -> bool {
         })
         .unwrap_or(false),
         KIND_TIMEDELTA | KIND_DATE | KIND_TIMEZONE => true,
+        KIND_DECIMAL => super::decimal_native::plain_drop_ok(i),
         _ => false,
     }
 }
@@ -2275,6 +2384,9 @@ pub(crate) fn leaf_binop(
     let kind = cls.native_kind.get();
     if kind == 0 {
         return None;
+    }
+    if kind == KIND_DECIMAL {
+        return super::decimal_native::leaf_binop(op, a, b);
     }
     let st = state_of_cls(cls)?;
     if !verified(st, cls, kind) {
@@ -2317,6 +2429,9 @@ pub(crate) fn leaf_compare(
     let kind = ci.native_kind.get();
     if kind == 0 || cj.native_kind.get() != kind {
         return None;
+    }
+    if kind == KIND_DECIMAL {
+        return super::decimal_native::leaf_compare(op, a, b);
     }
     let st = state_of_cls(ci)?;
     if !verified(st, ci, kind) || !verified(st, cj, kind) {
@@ -2812,7 +2927,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         orig.insert((spec.kind, spec.name), v);
     }
     let names = Names::new();
-    let [td_layout, date_layout, dt_layout] = layouts().clone();
+    let [td_layout, date_layout, dt_layout, _] = layouts().clone();
     let state = Rc::new(State {
         timedelta: Rc::downgrade(td),
         date: Rc::downgrade(date),

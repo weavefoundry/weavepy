@@ -34,6 +34,8 @@ use crate::{FoldSink, Frame, Interpreter};
 pub(crate) enum GenStep {
     /// The body yielded this value; the frame is suspended past the yield.
     Yielded(Object),
+    /// The body returned this value (a step that may finish the body).
+    Returned(Object),
     /// The next instruction needs the general loop.
     Bail,
 }
@@ -41,6 +43,8 @@ pub(crate) enum GenStep {
 /// How a fast `next()` of a generator ended.
 pub(crate) enum GenNext {
     Yielded(Object),
+    /// The generator returned this value, and is finished.
+    Exhausted(Object),
     /// Nothing happened: the generator is as it was.
     Declined,
     /// The generator consumed its sent value and advanced, then stopped
@@ -101,16 +105,25 @@ fn op_supported(op: OpCode) -> bool {
 /// (cached in the code's extension table). The prologue may hold others
 /// (`range(n)` built before the loop): the first resume's step stops at
 /// them, and the general loop runs them once.
+#[inline]
 fn code_ok(code: &CodeObject) -> bool {
     use std::sync::atomic::Ordering;
     let Some(ext) = crate::code_vm_ext(code) else {
         return false;
     };
     match ext.gen_fast.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
+        1 => false,
+        2 => true,
+        _ => code_ok_scan(code, ext),
     }
+}
+
+/// [`code_ok`]'s first verdict for a code object, remembered in its
+/// extension table.
+#[cold]
+#[inline(never)]
+fn code_ok_scan(code: &CodeObject, ext: &crate::CodeConstObjects) -> bool {
+    use std::sync::atomic::Ordering;
     let ok = code.is_generator
         && !code.is_coroutine
         && !code.is_async_generator
@@ -307,7 +320,7 @@ impl Interpreter {
     #[inline]
     pub(crate) fn gen_fast_frame_ok(frame: &Frame) -> bool {
         frame.py_frame.is_none()
-            && frame.saved_exc_info.is_empty()
+            && !frame.has_saved_exc_info()
             && frame.pc != 0
             && !frame.shell_cache.as_ref().is_some_and(|c| {
                 c.has_materialized
@@ -337,6 +350,8 @@ impl Interpreter {
     /// With `fold` (a draining consumer's sink, top level only), a yield
     /// the sink takes resumes the body at once with `None` sent. `dead` is
     /// the thread's queued-finalizer flag (`gc_trace::maybe_dead_flag`).
+    /// With `finish`, the step also runs a `return`, which ends it. The
+    /// native code isn't entered at `handed_at` (where it just stopped).
     pub(crate) fn gen_fast_step(
         &mut self,
         frame: &mut Frame,
@@ -344,7 +359,12 @@ impl Interpreter {
         depth: u8,
         fold: Option<FoldSink>,
         dead: *const std::cell::Cell<bool>,
+        finish: bool,
+        handed_at: usize,
     ) -> GenStep {
+        // The frame, for the native code's namespace reads.
+        #[cfg(feature = "jit")]
+        let frame_ptr: *mut Frame = frame;
         // SAFETY: the frame's code is immutable and outlives the step (the
         // frame holds it, and nothing here replaces it).
         let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
@@ -364,9 +384,31 @@ impl Interpreter {
             return GenStep::Bail;
         }
         let lbase = locals.as_mut_ptr();
+        // The body's native form (see `frame_jit`), run from every pc the
+        // arms below leave it at; a hot body compiles.
+        #[cfg(feature = "jit")]
+        let nlocals = locals.len();
+        #[cfg(feature = "jit")]
+        let mut native = {
+            ext.frame_jit.get(nlocals).or_else(|| {
+                ext.frame_jit
+                    .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
+                ext.frame_jit.get(nlocals)
+            })
+        };
         let stack = &mut frame.stack;
-        if stack.capacity() - stack.len() < 8 {
-            stack.reserve(8);
+        // Room for the body's deepest stack (the frame lives on in its
+        // generator, so no more than that), and the native code writes the
+        // stack at fixed offsets.
+        let deepest = code
+            .stacksize
+            .map_or(stack.len() + 8, |s| (s as usize).max(stack.len() + 1));
+        #[cfg(feature = "jit")]
+        let want = deepest.max(native.map_or(0, |n| n.need()));
+        #[cfg(not(feature = "jit"))]
+        let want = deepest;
+        if stack.capacity() < want {
+            stack.reserve(want - stack.len());
         }
         let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
         let mut len = stack.len();
@@ -374,50 +416,51 @@ impl Interpreter {
         if pc >= ninstrs {
             return GenStep::Bail;
         }
-        // The body's native form (see `frame_jit`), run from every pc the
-        // arms below leave it at; a hot body compiles.
+        // The native code's view of the body, built at its first entry.
         #[cfg(feature = "jit")]
-        let native = {
-            let nlocals = locals.len();
-            if ext.frame_jit.get(nlocals).is_none() {
-                ext.frame_jit
-                    .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
-            }
-            ext.frame_jit.get(nlocals)
-        };
+        let mut nst: Option<crate::frame_jit::State> = None;
         #[cfg(feature = "jit")]
-        let mut nst = crate::frame_jit::State {
-            locals: lbase,
-            stack: base,
-            len,
-            cap,
-            pc,
-            last: pc,
-            countdown: std::ptr::addr_of_mut!(self.gil_countdown),
-            snap_gen,
-            maybe_dead: dead,
-            interp: std::ptr::from_ref(self),
-            out: 0,
-            depth_cell: std::ptr::null(),
-            err: None,
-        };
+        let countdown = std::ptr::addr_of_mut!(self.gil_countdown);
         #[cfg(feature = "jit")]
-        let mut handed = usize::MAX;
+        let interp = std::ptr::from_ref(self);
+        #[cfg(feature = "jit")]
+        let mut handed = handed_at;
+        #[cfg(not(feature = "jit"))]
+        let _ = handed_at;
         // SAFETY (throughout): `base` indexes only below `len` (initialized)
         // or `cap` as checked; `lbase`, `cbase` and `instrs` only at the
         // indices and pcs the eligibility scan proved in range (`in_bounds`:
         // every jump lands on an instruction and the last can't fall
         // through, so `pc < ninstrs` whenever an instruction is read).
+        let mut returned = None;
         let yielded = loop {
             #[cfg(feature = "jit")]
             if pc != handed {
                 if let Some(native) = native.filter(|n| n.enters_at(pc)) {
+                    let nst = nst.get_or_insert_with(|| crate::frame_jit::State {
+                        locals: lbase,
+                        stack: base,
+                        len,
+                        cap,
+                        pc,
+                        last: pc,
+                        countdown,
+                        snap_gen,
+                        maybe_dead: dead,
+                        interp,
+                        out: 0,
+                        depth_cell: std::ptr::null(),
+                        err: None,
+                        frame: frame_ptr,
+                        sw: std::ptr::null_mut(),
+                        gen_depth: depth,
+                    });
                     nst.len = len;
                     nst.pc = pc;
                     // SAFETY: the body's activation state, as this loop
                     // holds it (its locals count checked above). A queued
                     // finalizer waits for the general loop's next check.
-                    let _ = unsafe { native.run(&mut nst) };
+                    let _ = unsafe { native.run(nst) };
                     len = nst.len;
                     pc = nst.pc;
                     handed = pc;
@@ -581,6 +624,15 @@ impl Interpreter {
                     }
                     self.gil_countdown -= 1;
                     pc = (pc + 1).saturating_sub(ins.arg as usize);
+                    // A draining consumer's fold can run the whole body in
+                    // this one step: its loop warms the body as each step
+                    // would, and enters the native form once compiled.
+                    #[cfg(feature = "jit")]
+                    if native.is_none() {
+                        ext.frame_jit
+                            .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
+                        native = ext.frame_jit.get(nlocals);
+                    }
                 }
                 // `iter()` of an iterator or a generator is itself.
                 OpCode::GetIter => {
@@ -652,17 +704,10 @@ impl Interpreter {
                     // into the sink (or is a scalar), and the sent `None`
                     // takes its place.
                     let top = unsafe { base.add(len - 1) };
-                    let folded = match fold {
-                        // SAFETY: the sink is the consumer's own, live and
-                        // untouched while its resume runs (as the core
-                        // loop's fold).
-                        Some(FoldSink::Sum(acc)) => unsafe { (*acc).add_scalar(&*top) },
-                        Some(FoldSink::Collect(out)) => {
-                            unsafe { (*out).push(top.read()) };
-                            true
-                        }
-                        None => false,
-                    };
+                    // SAFETY: the sink is the consumer's own, live and
+                    // untouched while its resume runs (as the core loop's
+                    // fold).
+                    let folded = fold.is_some_and(|sink| unsafe { sink.fold(top) });
                     if folded {
                         unsafe { top.write(Object::None) };
                         continue;
@@ -671,6 +716,12 @@ impl Interpreter {
                     frame.agen_yielded_value = ins.arg == 0;
                     break Some(unsafe { top.read() });
                 }
+                OpCode::ReturnValue if finish && len > 0 => {
+                    len -= 1;
+                    pc += 1;
+                    returned = Some(unsafe { base.add(len).read() });
+                    break None;
+                }
                 _ => break None,
             }
         };
@@ -678,9 +729,83 @@ impl Interpreter {
         // pops moved values out).
         unsafe { frame.stack.set_len(len) };
         frame.pc = pc as u32;
-        match yielded {
-            Some(v) => GenStep::Yielded(v),
-            None => GenStep::Bail,
+        match (yielded, returned) {
+            (Some(v), _) => GenStep::Yielded(v),
+            (None, Some(v)) => GenStep::Returned(v),
+            (None, None) => GenStep::Bail,
+        }
+    }
+
+    /// A resume of a compiled body by its native code alone (see
+    /// `frame_jit`), without the general loop's setup: `Ok` with the value
+    /// the body yielded, the frame suspended past the yield; `Err` with
+    /// the pc the native code stopped at (`usize::MAX` if it didn't run),
+    /// the frame synced there for [`Self::gen_fast_step`] to go on from.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn gen_native_yield(
+        &mut self,
+        frame: &mut Frame,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> Result<Object, usize> {
+        let frame_ptr: *mut Frame = frame;
+        // SAFETY: as in `gen_fast_step`.
+        let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
+        let pc = frame.pc as usize;
+        let Some(ext) = crate::code_vm_ext(code) else {
+            return Err(usize::MAX);
+        };
+        // SAFETY: as in `gen_fast_step`.
+        let Some(locals) = (unsafe { frame.locals.peek_mut() }) else {
+            return Err(usize::MAX);
+        };
+        if locals.len() < code.varnames.len() || pc >= code.instructions.len() {
+            return Err(usize::MAX);
+        }
+        let Some(native) = ext.frame_jit.get(locals.len()) else {
+            return Err(usize::MAX);
+        };
+        let stack = &mut frame.stack;
+        // (A stack short of the room `gen_fast_step` makes takes that path.)
+        let deepest = code
+            .stacksize
+            .map_or(stack.len() + 8, |s| (s as usize).max(stack.len() + 1));
+        if !native.enters_at(pc) || stack.capacity() < deepest.max(native.need()) {
+            return Err(usize::MAX);
+        }
+        let mut st = crate::frame_jit::State {
+            locals: locals.as_mut_ptr(),
+            stack: stack.as_mut_ptr(),
+            len: stack.len(),
+            cap: stack.capacity(),
+            pc,
+            last: pc,
+            countdown: std::ptr::addr_of_mut!(self.gil_countdown),
+            snap_gen,
+            maybe_dead: dead,
+            interp: std::ptr::from_ref(self),
+            out: 0,
+            depth_cell: std::ptr::null(),
+            err: None,
+            frame: frame_ptr,
+            sw: std::ptr::null_mut(),
+            gen_depth: depth,
+        };
+        // SAFETY: the body's activation state, as `gen_fast_step` holds it.
+        let _ = unsafe { native.run(&mut st) };
+        let (len, pc) = (st.len, st.pc);
+        // SAFETY: the native code leaves the first `len` slots initialized.
+        unsafe { frame.stack.set_len(len) };
+        frame.pc = pc as u32;
+        match code.instructions.get(pc) {
+            Some(ins) if ins.op == OpCode::YieldValue && len > 0 => {
+                frame.pc += 1;
+                frame.agen_yielded_value = ins.arg == 0;
+                Ok(frame.stack.pop().expect("a yielded value"))
+            }
+            _ => Err(pc),
         }
     }
 
@@ -750,6 +875,8 @@ impl Interpreter {
             // that could reach this frame.)
             Object::Generator(g) => match self.gen_fast_next(g, snap_gen, depth + 1, dead) {
                 GenNext::Yielded(v) => ForNext::Value(v),
+                // (A `FOR_ITER` discards the return value.)
+                GenNext::Exhausted(_) => ForNext::Exhausted,
                 GenNext::Declined | GenNext::Partial => ForNext::Bail,
             },
             _ => ForNext::Bail,
@@ -769,8 +896,17 @@ impl Interpreter {
         if !Self::gen_fast_frame_ok(frame) {
             return None;
         }
-        match self.gen_fast_step(frame, snap_gen, 0, fold, crate::gc_trace::maybe_dead_flag()) {
+        match self.gen_fast_step(
+            frame,
+            snap_gen,
+            0,
+            fold,
+            crate::gc_trace::maybe_dead_flag(),
+            false,
+            usize::MAX,
+        ) {
             GenStep::Yielded(v) => Some(v),
+            GenStep::Returned(_) => unreachable!("not a finishing step"),
             GenStep::Bail => None,
         }
     }
@@ -819,11 +955,33 @@ impl Interpreter {
         if partial {
             frame.sent_consumed = false;
         } else {
-            frame.stack.push(Object::None);
+            crate::push_fast(&mut frame.stack, Object::None);
         }
         debug_assert!(!frame.stack.is_empty());
-        let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead) {
+        // A compiled body's resume usually runs natively to its next yield.
+        #[cfg(feature = "jit")]
+        let handed = match self.gen_native_yield(frame, snap_gen, depth, dead) {
+            Ok(v) => {
+                Self::park_suspended_boxed(g, boxed);
+                return GenNext::Yielded(v);
+            }
+            Err(pc) => pc,
+        };
+        #[cfg(not(feature = "jit"))]
+        let handed = usize::MAX;
+        let out = match self.gen_fast_step(frame, snap_gen, depth, None, dead, true, handed) {
             GenStep::Yielded(v) => GenNext::Yielded(v),
+            // The general epilogue of a return (`inline_gen_finish`): the
+            // generator finishes and its frame is released (anything that
+            // dies with it queues its finalizer).
+            GenStep::Returned(v) => {
+                *g.state.borrow_mut() = GeneratorState::Finished;
+                let frame: &mut Frame = &mut boxed;
+                self.recycle_frame_allocs(frame);
+                Self::release_finished_gen(g);
+                drop(boxed);
+                return GenNext::Exhausted(v);
+            }
             GenStep::Bail if frame.pc == start => {
                 // Nothing ran: the resume is undone.
                 if partial {

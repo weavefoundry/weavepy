@@ -226,9 +226,6 @@ pub fn default_builtins() -> DictData {
     reg!("sorted", b_sorted);
     reg!("reversed", b_reversed);
     reg_kw!("enumerate", b_enumerate_kw);
-    reg!("zip", b_zip);
-    reg!("map", b_map);
-    reg!("filter", b_filter);
     reg!("all", b_all);
     reg!("any", b_any);
     reg!("isinstance", b_isinstance);
@@ -454,7 +451,79 @@ fn is_exception_like(name: &str) -> bool {
 /// method. The returned [`Object`] is always a [`Object::Builtin`];
 /// the VM wraps it as a [`crate::object::BoundMethod`] so the
 /// receiver flows through as the first argument on call.
+///
+/// For the receiver kinds whose methods depend only on the kind and the
+/// name, the answer is built once and shared, as CPython's type dict holds
+/// one method descriptor per name: each lookup would otherwise allocate a
+/// fresh builtin (and its boxed bodies) and free it after the call.
 pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
+    let Some(tag) = method_memo_tag(obj) else {
+        return lookup_method_uncached(obj, name);
+    };
+    let memo = METHOD_MEMO.get_or_init(|| RefCell::new(Vec::new()));
+    if let Some(hit) = memo
+        .borrow()
+        .get(usize::from(tag))
+        .and_then(|names| names.get(name))
+    {
+        return hit.clone();
+    }
+    // (Built without the memo borrowed: nothing here reaches it, but a
+    // builder is free to.)
+    let found = lookup_method_uncached(obj, name);
+    let mut memo = memo.borrow_mut();
+    if memo.len() <= usize::from(tag) {
+        memo.resize_with(usize::from(tag) + 1, Default::default);
+    }
+    let names = &mut memo[usize::from(tag)];
+    // Arbitrary names (`getattr(s, text)`) mustn't grow it without bound.
+    if names.len() < METHOD_MEMO_CAP {
+        names.insert(name.into(), found.clone());
+    }
+    found
+}
+
+/// Per receiver kind (see [`method_memo_tag`]), each name's method or miss.
+static METHOD_MEMO: std::sync::OnceLock<
+    RefCell<Vec<crate::fasthash::FxHashMap<Box<str>, Option<Object>>>>,
+> = std::sync::OnceLock::new();
+
+/// Names the method memo keeps per receiver kind.
+const METHOD_MEMO_CAP: usize = 1024;
+
+/// The memo key of a receiver kind whose methods are a function of the
+/// kind and the name alone (its variant index), or `None`.
+pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
+    let tag = match obj {
+        Object::Str(_) => 0,
+        Object::List(_) => 1,
+        Object::Range(_) => 2,
+        Object::Dict(_) => 3,
+        Object::Tuple(_) => 4,
+        Object::Set(_) => 5,
+        Object::FrozenSet(_) => 6,
+        Object::Bytes(_) => 7,
+        Object::ByteArray(_) => 8,
+        Object::Int(_) => 9,
+        Object::Long(_) => 10,
+        Object::Bool(_) => 11,
+        Object::Float(_) => 12,
+        Object::Complex(_) => 13,
+        Object::Slice(_) => 14,
+        Object::Iter(_) => 15,
+        // A native stream's methods follow from its layer and backing (see
+        // `lookup_method_uncached`), unless the stream carries attributes
+        // of its own, which shadow them.
+        Object::File(f) if f.extra_attrs.borrow().is_empty() => {
+            16 + (f.io_kind.get() as u8) * 4 + u8::from(f.binary) * 2 + u8::from(f.is_memory())
+        }
+        _ => return None,
+    };
+    Some(tag)
+}
+
+/// [`lookup_method`] without the memo: a fresh method object.
+fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
     let f: Option<BuiltinFn> = match obj {
         Object::Str(_) => match name {
             "upper" => Some(method("upper", str_upper)),
@@ -1242,10 +1311,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                     Err(e) => Err(e),
                 },
                 // An enumerate/reversed *subclass* over a VM-driven source
-                // carries a frozen `_seqtools` iterator instance as its
-                // native payload (`MyEnum(getitem_seq)`) — drive it through
-                // the interpreter's iteration protocol.
-                Some(recv @ Object::Instance(_)) => {
+                // carries a native adapter (or a frozen `_seqtools`
+                // iterator) as its payload (`MyEnum(getitem_seq)`) — drive
+                // it through the interpreter's iteration protocol.
+                Some(recv @ (Object::Instance(_) | Object::LazyIter(_))) => {
                     let interp = reentrant_interp()?;
                     let globals = interp.builtins_dict();
                     match interp.iter_next(recv, &globals)? {
@@ -2697,7 +2766,11 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
 fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
-        let slots = inst.slots_snapshot();
+        let mut slots = inst.slots_snapshot();
+        // Native storage under a name that isn't an identifier (an
+        // `OrderedDict`'s order, `stdlib::collections_odict`) is no
+        // attribute: CPython's C struct fields aren't pickled state.
+        slots.retain(|(name, _)| !name.starts_with('<'));
         let dict_is_empty = inst.dict.get().is_none_or(|dict| dict.borrow().is_empty());
         let dict_state = if dict_is_empty {
             Object::None
@@ -4240,7 +4313,7 @@ pub(crate) fn code_synthetic_attr(
         } else {
             &c.qualname
         })),
-        "co_filename" => Some(Object::from_str(&c.filename)),
+        "co_filename" => Some(Object::from_str(&*c.filename)),
         "co_argcount" => Some(Object::Int(i64::from(c.arg_count))),
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
@@ -4483,7 +4556,7 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         match k.as_str() {
             "co_name" => nc.name = want_str(v, "co_name")?,
             "co_qualname" => nc.qualname = want_str(v, "co_qualname")?,
-            "co_filename" => nc.filename = want_str(v, "co_filename")?,
+            "co_filename" => nc.filename = want_str(v, "co_filename")?.into(),
             "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
             "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
@@ -4557,7 +4630,7 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 let target = want_u32(v, "co_firstlineno")?;
                 if let Some(&first) = nc.linetable.first() {
                     let delta = i64::from(target) - i64::from(first);
-                    for l in &mut nc.linetable {
+                    for l in nc.linetable.iter_mut() {
                         *l = (i64::from(*l) + delta).max(0) as u32;
                     }
                 }
@@ -4641,7 +4714,7 @@ pub fn foreign_code_object(
     let mut nc = weavepy_compiler::CodeObject {
         name,
         qualname,
-        filename,
+        filename: filename.into(),
         varnames,
         arg_count,
         posonly_count,
@@ -4657,7 +4730,7 @@ pub fn foreign_code_object(
         is_nested: flags & 0x0010 != 0,
         ..Default::default()
     };
-    nc.linetable = vec![firstlineno.max(1)];
+    nc.linetable = vec![firstlineno.max(1)].into();
     let w = nc.wire.get_or_insert_with(Default::default);
     w.co_code = Some(Vec::new());
     w.exec_error = Some("cannot execute foreign bytecode".to_owned());
@@ -4680,7 +4753,7 @@ fn install_wire_code(nc: &mut weavepy_compiler::CodeObject, bytes: Vec<u8>) {
             // Keep per-instruction side tables in sync with the new
             // instruction count; line info defaults to the first line.
             let first = nc.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1);
-            nc.linetable = vec![first; instructions.len()];
+            nc.linetable = vec![first; instructions.len()].into();
             nc.coltable = Vec::new().into();
             nc.caches = weavepy_compiler::CacheTable::with_len(instructions.len());
             nc.instructions = instructions;
@@ -4835,7 +4908,7 @@ pub(crate) fn code_type_call(
     let mut nc = weavepy_compiler::CodeObject {
         name,
         qualname,
-        filename,
+        filename: filename.into(),
         constants,
         names,
         varnames,
@@ -4868,17 +4941,17 @@ pub(crate) fn code_type_call(
         Some(decoded) => {
             nc.caches = weavepy_compiler::CacheTable::with_len(decoded.instructions.len());
             nc.instructions = decoded.instructions;
-            nc.linetable = decoded.linetable;
+            nc.linetable = decoded.linetable.into();
             nc.coltable = decoded.coltable.into();
             nc.exception_table = decoded.exception_table;
-            nc.no_interrupt_jumps = decoded.no_interrupt_jumps;
+            nc.rare.get_mut().no_interrupt_jumps = decoded.no_interrupt_jumps;
         }
         None => {
             let msg = match weavepy_compiler::cpython_code::first_unknown_opcode(&codestring) {
                 Some(op) => format!("unknown opcode {op}"),
                 None => "cannot execute foreign bytecode".to_owned(),
             };
-            nc.linetable = vec![firstlineno.max(1)];
+            nc.linetable = vec![firstlineno.max(1)].into();
             nc.wire.get_or_insert_with(Default::default).exec_error = Some(msg);
         }
     }
@@ -5481,7 +5554,9 @@ fn parse_int_string(
         };
 
     let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
-    if cleaned.is_empty() {
+    // (The radix parsers below take a sign of their own: `int('--1')` must
+    // not read as `-(-1)`.)
+    if cleaned.is_empty() || cleaned.starts_with(['+', '-']) {
         return Err(invalid());
     }
 
@@ -5517,6 +5592,15 @@ fn parse_int_string(
 
 fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "bit_length")?;
+    match v {
+        Object::Int(i) => {
+            return Ok(Object::Int(i64::from(
+                64 - i.unsigned_abs().leading_zeros(),
+            )))
+        }
+        Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        _ => {}
+    }
     let n = v.as_bigint().ok_or_else(|| {
         type_error(format!(
             "bit_length: '{}' object is not an integer",
@@ -5529,6 +5613,11 @@ fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn int_bit_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "bit_count")?;
+    match v {
+        Object::Int(i) => return Ok(Object::Int(i64::from(i.unsigned_abs().count_ones()))),
+        Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        _ => {}
+    }
     let n = v.as_bigint().ok_or_else(|| {
         type_error(format!(
             "bit_count: '{}' object is not an integer",
@@ -5577,9 +5666,15 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let n_obj = args
         .first()
         .ok_or_else(|| type_error("to_bytes() requires self"))?;
-    let n = n_obj
-        .as_bigint()
-        .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?;
+    // (A machine int converts only if its fast path below declines.)
+    let big = match n_obj {
+        Object::Int(_) => None,
+        other => Some(
+            other
+                .as_bigint()
+                .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?,
+        ),
+    };
     let length = match arg_or_kw(args, 1, kwargs, "length") {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
         Some(Object::Bool(b)) => usize::from(*b),
@@ -5600,6 +5695,30 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let signed = match arg_or_kw(args, 3, kwargs, "signed") {
         Some(o) => o.is_truthy(),
         None => false,
+    };
+    // A machine int that fits the length: its two's-complement bytes,
+    // without the big-integer conversion (anything else, an overflow
+    // included, takes it).
+    if let (Object::Int(v), 1..=8, "big" | "little") = (n_obj, length, byteorder.as_str()) {
+        let bits = 8 * length as u32;
+        let fits = if signed {
+            let half = 1i128 << (bits - 1);
+            (-half..half).contains(&i128::from(*v))
+        } else {
+            *v >= 0 && (bits == 64 || (*v as u64) >> bits == 0)
+        };
+        if fits {
+            let be = v.to_be_bytes();
+            let mut out = be[8 - length..].to_vec();
+            if byteorder == "little" {
+                out.reverse();
+            }
+            return Ok(Object::new_bytes(out));
+        }
+    }
+    let n = match big {
+        Some(n) => n,
+        None => n_obj.as_bigint().expect("a machine int"),
     };
     let bytes = bigint_to_bytes(&n, length, &byteorder, signed)?;
     Ok(Object::new_bytes(bytes))
@@ -5663,6 +5782,25 @@ fn int_from_bytes_method(
         Some(o) => o.is_truthy(),
         None => false,
     };
+    // Up to seven bytes (eight when signed) make a machine int directly.
+    if (1..=7).contains(&data.len()) || (signed && data.len() == 8) {
+        if let "big" | "little" = byteorder.as_str() {
+            let mut word = [0u8; 8];
+            let k = data.len();
+            if byteorder == "big" {
+                word[8 - k..].copy_from_slice(&data);
+            } else {
+                for (i, b) in data.iter().enumerate() {
+                    word[7 - i] = *b;
+                }
+            }
+            let mut v = i64::from_be_bytes(word);
+            if signed && k < 8 && word[8 - k] & 0x80 != 0 {
+                v -= 1i64 << (8 * k);
+            }
+            return Ok(Object::Int(v));
+        }
+    }
     let n = bytes_to_bigint(&data, &byteorder, signed)?;
     Ok(Object::int_from_bigint(n))
 }
@@ -6597,7 +6735,7 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
 /// whitespace is stripped, `inf`/`nan` spellings are accepted, and PEP 515
 /// underscores are honoured only *between* digits. Returns `None` on any
 /// malformed input (the caller renders the `could not convert` ValueError).
-fn parse_float_text(raw: &str) -> Option<f64> {
+pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
     let transformed = transform_decimal_and_space(raw);
     let s = transformed.trim();
     if s.is_empty() || !valid_float_underscores(s) {
@@ -7128,7 +7266,7 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Type(class_of(arg)))
 }
 
-fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
     // `set()` takes at most one positional argument (the iterable);
     // `set([], 2)` is a `TypeError` (CPython `set_init`, test_new_or_init).
     if args.len() > 1 {
@@ -7191,7 +7329,7 @@ fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
     }
 }
 
-fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
     // `frozenset()` takes at most one positional argument (CPython
     // `frozenset_new`); `frozenset([], 2)` is a `TypeError`.
     if args.len() > 1 {
@@ -7422,7 +7560,9 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
             // the real collection below would then see zero items
             // (`bytes(x for x in …)` returned `b''`). Generators are
             // always iterable; everything else gets the cheap probe.
-            if !matches!(other, Object::Generator(_)) && other.make_iter().is_err() {
+            if !matches!(other, Object::Generator(_) | Object::LazyIter(_))
+                && other.make_iter().is_err()
+            {
                 return Err(type_error(format!(
                     "cannot convert '{}' object to {}",
                     other.type_name(),
@@ -8280,7 +8420,7 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(obj)
 }
 
-fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() > 1 {
         return Err(type_error(format!(
             "reversed expected 1 argument, got {}",
@@ -8307,10 +8447,28 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
         let len = crate::object::range_len_i128(r);
         let current = r.start + (len - 1).max(0) * r.step;
         let stop = r.start - r.step;
+        let current = if len > 0 { current } else { stop };
+        let step = -r.step;
+        // Machine-int bounds take the `Range` shape the loop fast paths
+        // step (as `iter(range(...))` does); `current += step` must not
+        // overflow past the stop.
+        if let (Ok(c), Ok(s), Ok(st)) = (
+            i64::try_from(current),
+            i64::try_from(stop),
+            i64::try_from(step),
+        ) {
+            if s.checked_add(st).is_some() {
+                return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Range {
+                    current: c,
+                    stop: s,
+                    step: st,
+                }))));
+            }
+        }
         return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::RangeHuge {
-            current: if len > 0 { current } else { stop },
+            current,
             stop,
-            step: -r.step,
+            step,
         }))));
     }
     // `dict.__reversed__` / `dict_keys.__reversed__` …: a *live* cursor
@@ -8327,6 +8485,7 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
                 watch: Some(crate::object::DictWatch::new(d)),
                 owner,
                 reverse: true,
+                odict: None,
             })))
         };
     match iterable {
@@ -8369,6 +8528,15 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
                 owner: Some(Box::new(iterable.clone())),
             }))));
         }
+    }
+    if let Object::Tuple(items) = iterable {
+        let buf = items.to_vec();
+        let index = buf.len() as i64 - 1;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+            items: Rc::new(RefCell::new(buf)),
+            index,
+            owner: None,
+        }))));
     }
     // Otherwise materialize the source in *forward* order; the Reversed
     // iterator walks it back-to-front. (CPython's `reversed` uses
@@ -8436,7 +8604,7 @@ fn b_enumerate_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     b_enumerate(&ctor_args)
 }
 
-fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() > 2 {
         return Err(type_error(format!(
             "enumerate() takes at most 2 arguments ({} given)",
@@ -8473,43 +8641,6 @@ fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
         count: start,
         count_big: start_big,
     }))))
-}
-
-fn b_zip(args: &[Object]) -> Result<Object, RuntimeError> {
-    // `zip()` with no iterables is an empty iterator — CPython yields
-    // nothing (`list(zip()) == []`). Without this guard the loop below
-    // never reaches an exhausted iterator and spins forever appending
-    // empty tuples.
-    if args.is_empty() {
-        return Ok(Object::new_list(Vec::new()));
-    }
-    let mut iters: Vec<PyIterator> = args
-        .iter()
-        .map(|a| a.make_iter())
-        .collect::<Result<_, _>>()?;
-    let mut out = Vec::new();
-    loop {
-        let mut tup = Vec::with_capacity(iters.len());
-        for it in iters.iter_mut() {
-            match it.next_value() {
-                Some(v) => tup.push(v),
-                None => return Ok(Object::new_list(out)),
-            }
-        }
-        out.push(Object::new_tuple(tup));
-    }
-}
-
-fn b_map(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(type_error(
-        "map() requires call-into-interpreter support; use a list comprehension instead",
-    ))
-}
-
-fn b_filter(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(type_error(
-        "filter() requires call-into-interpreter support; use a list comprehension instead",
-    ))
 }
 
 fn b_all(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8852,8 +8983,11 @@ pub fn class_matches_classinfo_named(
 /// is *exactly* `os.PathLike`: a user subclass `class A(os.PathLike)` inherits
 /// the hook, which returns `NotImplemented` for `cls is not PathLike`, so it
 /// falls back to a normal MRO check (`test_pathlike_subclasshook`).
-fn type_subclass_match(cls: &crate::types::TypeObject, t: &Rc<crate::types::TypeObject>) -> bool {
-    if Rc::ptr_eq(t, &crate::stdlib::os::path_like_type()) {
+pub(crate) fn type_subclass_match(
+    cls: &crate::types::TypeObject,
+    t: &Rc<crate::types::TypeObject>,
+) -> bool {
+    if crate::stdlib::os::is_path_like(t) {
         return cls
             .lookup("__fspath__")
             .is_some_and(|m| !matches!(m, Object::None));
@@ -9026,10 +9160,22 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
             Ok(crate::object::PyIterator::Reversed { .. }) => bt.reversed_.clone(),
             _ => bt.iterator_.clone(),
         },
-        // Native itertools adapters share the generic iterator type for
-        // now; `type(x).__name__` is "iterator" rather than CPython's
-        // "islice" until they get dedicated TypeObjects.
-        Object::LazyIter(_) => bt.iterator_.clone(),
+        // A native adapter reports its type: the builtin kinds their
+        // native types, an exact `itertools` object its Python class,
+        // and an internal core the generic iterator type.
+        Object::LazyIter(l) => {
+            if let Some(cls) = &l.cls {
+                return cls.clone();
+            }
+            use crate::object::LazyIterKind as K;
+            match l.state.try_borrow().as_deref() {
+                Ok(K::Map { .. }) => bt.map_.clone(),
+                Ok(K::Filter { .. }) => bt.filter_.clone(),
+                Ok(K::Zip { .. }) => bt.zip_.clone(),
+                Ok(K::Enumerate { .. }) => bt.enumerate_.clone(),
+                _ => bt.iterator_.clone(),
+            }
+        }
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
@@ -10457,7 +10603,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: RefCell::new(Some(f.attrs())),
-        slots_raw: RefCell::new(f.slots().borrow().clone()),
+        slots_raw: RefCell::new(f.slots().borrow().clone()).into(),
         slot_seed: RefCell::new(None),
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
@@ -12370,6 +12516,22 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
     }
+    // UTF-8 with no error handler, the common call: a `str` holds valid
+    // UTF-8 (lone surrogates live in `WStr`), so its bytes are the answer,
+    // as CPython's C fast path for the codec gives them.
+    if let Object::Str(text) = recv {
+        let utf8 = kwargs.is_empty()
+            && match args {
+                [_] => true,
+                [_, Object::Str(enc)] => {
+                    matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
+                }
+                _ => false,
+            };
+        if utf8 {
+            return Ok(Object::new_bytes(text.as_bytes().to_vec()));
+        }
+    }
     // The names accept any str-shaped object, not just `Object::Str`:
     // CPython's clinic checks `PyUnicode_Check`, which is subtype-inclusive.
     // numpy's `_vec_string` broadcasts the method args to arrays and hands
@@ -13258,6 +13420,47 @@ pub(crate) fn dict_lookup(
     }
 }
 
+/// [`dict_insert`] for a key that settles by native equality (a `str`,
+/// a machine `int`, ...; see [`crate::object::LeafProbe`]): one probe
+/// finds its entry, or proves no stored key could equal it, and nothing
+/// runs Python. Hands the key and value back when it can't decide so
+/// (another kind of key, a stored key Python would compare, a borrowed
+/// table, dict watchers).
+pub(crate) fn dict_insert_exact(
+    d: &Rc<RefCell<DictData>>,
+    key: Object,
+    value: Object,
+) -> Result<Option<Object>, (Object, Object)> {
+    if crate::capi_watchers::dicts_active() {
+        return Err((key, value));
+    }
+    let Some(probe) = crate::object::LeafProbe::new(&key) else {
+        return Err((key, value));
+    };
+    let Ok(mut m) = d.try_borrow_mut() else {
+        return Err((key, value));
+    };
+    if let Some(slot) = m.get_mut(&probe) {
+        let replaced = !slot.is_same(&value);
+        let old = std::mem::replace(slot, value);
+        drop(m);
+        // (Re-storing the identical object is no change; PEP 509.)
+        if replaced {
+            crate::object::dict_mutation_event(d);
+        }
+        return Ok(Some(old));
+    }
+    if !probe.miss_is_exact() {
+        drop(m);
+        return Err((key, value));
+    }
+    m.insert(DictKey(key), value);
+    drop(m);
+    crate::object::dict_watch_bump(d);
+    crate::object::dict_mutation_event(d);
+    Ok(None)
+}
+
 /// `d[key] = value` honouring re-entrant keys (see [`dict_lookup`]).
 /// Returns the replaced value, if any.
 pub(crate) fn dict_insert(
@@ -13265,6 +13468,10 @@ pub(crate) fn dict_insert(
     key: Object,
     value: Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    let (key, value) = match dict_insert_exact(d, key, value) {
+        Ok(old) => return Ok(old),
+        Err(kv) => kv,
+    };
     if crate::object::dict_key_is_reentrant(&key) {
         return crate::object::dict_reentrant_insert(d, key, value);
     }
@@ -13391,6 +13598,175 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     // `repr(key)`. A `dict` subclass's `__missing__` also receives this
     // exact object when the bound-method path re-raises.
     found.ok_or_else(|| key_error_object(key.clone()))
+}
+
+/// The dict a `dict.__getitem__`/`__setitem__` leaf half serves: an exact
+/// dict, or the native payload of a dict-subclass instance.
+#[inline]
+fn leaf_dict_of(recv: &Object) -> Option<&Rc<RefCell<DictData>>> {
+    match recv {
+        Object::Dict(d) => Some(d),
+        Object::Instance(inst) => match inst.native.get()? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `dict.__getitem__`'s leaf half (see `leaf_builtins::Fast`): a present
+/// `str`/`int` key, found by exact native equality. A miss (which a
+/// subclass may serve through `__missing__`) takes the full path.
+/// The codecs `str.encode` and `bytes.decode` serve without the codec
+/// registry (CPython's own fast paths for them, with strict errors).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlainCodec {
+    Utf8,
+    Latin1,
+    Ascii,
+}
+
+/// `name`'s plain codec, if it is one (`None` names the default, UTF-8).
+fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
+    let Some(name) = name else {
+        return Some(PlainCodec::Utf8);
+    };
+    let Object::Str(n) = name else {
+        return None;
+    };
+    let n: &str = n;
+    if n.len() > 10 {
+        return None;
+    }
+    let n = n.to_ascii_lowercase().replace('_', "-");
+    Some(match n.as_str() {
+        "utf-8" | "utf8" => PlainCodec::Utf8,
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "l1" => PlainCodec::Latin1,
+        "ascii" | "us-ascii" => PlainCodec::Ascii,
+        _ => return None,
+    })
+}
+
+/// `s.encode([encoding])` with a plain codec, when every character
+/// encodes (an unencodable one raises on the full path).
+pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Object::Str(s), rest) = args.split_first()? else {
+        return None;
+    };
+    if rest.len() > 1 {
+        return None;
+    }
+    let s: &str = s;
+    let bytes = match plain_codec(rest.first())? {
+        PlainCodec::Utf8 => s.as_bytes().to_vec(),
+        PlainCodec::Ascii if s.is_ascii() => s.as_bytes().to_vec(),
+        PlainCodec::Latin1 => s
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).ok())
+            .collect::<Option<Vec<u8>>>()?,
+        PlainCodec::Ascii => return None,
+    };
+    Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// `b.decode([encoding])` with a plain codec, when the bytes decode (an
+/// undecodable one raises on the full path).
+pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Object::Bytes(b), rest) = args.split_first()? else {
+        return None;
+    };
+    if rest.len() > 1 {
+        return None;
+    }
+    let text = match plain_codec(rest.first())? {
+        PlainCodec::Utf8 => std::str::from_utf8(b).ok()?.to_owned(),
+        PlainCodec::Ascii if b.is_ascii() => std::str::from_utf8(b).ok()?.to_owned(),
+        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect(),
+        PlainCodec::Ascii => return None,
+    };
+    Some(Ok(Object::from_str(text)))
+}
+
+/// `i.to_bytes([length[, byteorder]])` over plain arguments.
+pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Int(_)]
+        | [Object::Int(_), Object::Int(_)]
+        | [Object::Int(_), Object::Int(_), Object::Str(_)] => Some(int_to_bytes(args, &[])),
+        _ => None,
+    }
+}
+
+/// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
+/// `bytes` buffer.
+pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Type(t), Object::Bytes(_)]
+        | [Object::Type(t), Object::Bytes(_), Object::Str(_)]
+            if crate::sync::Rc::ptr_eq(t, &builtin_types().int_) =>
+        {
+            Some(int_from_bytes_method(args, &[]))
+        }
+        _ => None,
+    }
+}
+
+/// `i.bit_length()` of a machine int.
+pub(crate) fn int_bit_length_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Int(v)] = args else {
+        return None;
+    };
+    Some(Ok(Object::Int(i64::from(
+        64 - v.unsigned_abs().leading_zeros(),
+    ))))
+}
+
+pub(crate) fn dict_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key] = args else {
+        return None;
+    };
+    let probe = crate::object::LeafProbe::new(key)?;
+    let d = leaf_dict_of(recv)?.try_borrow().ok()?;
+    d.get(&probe).map(|v| Ok(v.clone()))
+}
+
+/// `dict.__setitem__`'s leaf half: a `str`/`int` key replacing an
+/// exact-key entry, or inserting one no stored key could equal. Anything
+/// that could run Python (an exotic stored key, a dict watcher) takes the
+/// full path.
+pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key, value] = args else {
+        return None;
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let cell = leaf_dict_of(recv)?;
+    let mut d = cell.try_borrow_mut().ok()?;
+    let (old, changed, added) = match d.get_mut(&probe) {
+        Some(slot) => {
+            let old = std::mem::replace(slot, value.clone());
+            let changed = !old.is_same(value);
+            (Some(old), changed, false)
+        }
+        None => {
+            if !probe.miss_is_exact() {
+                return None;
+            }
+            d.insert(DictKey(key.clone()), value.clone());
+            (None, true, true)
+        }
+    };
+    drop(d);
+    if added {
+        crate::object::dict_watch_bump(cell);
+    }
+    if changed {
+        crate::object::dict_mutation_event(cell);
+    }
+    drop(old);
+    Some(Ok(Object::None))
 }
 
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -13549,7 +13925,7 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     dict_view_no_args(args, "clear")?;
     let evicted: Vec<(DictKey, Object)> = d.borrow_mut().drain(..).collect();
@@ -13626,7 +14002,7 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- dict extras ----------
 
-fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = match args.get(1) {
         Some(k) => DictKey(k.clone()),
@@ -13677,11 +14053,10 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     dict_view_no_args(args, "copy")?;
     let cloned = d.borrow().clone();
     let out = Object::Dict(Rc::new(RefCell::new(cloned)));
-    // CPython's `PyDict_Copy` preserves GC tracking: the copy is tracked
-    // iff the source is (test_dict `test_copy_maintains_tracking`).
-    if crate::gc_trace::is_tracked(crate::weakref_registry::id_of(&Object::Dict(d))) {
-        crate::gc_trace::track(&out);
-    }
+    // Tracked by its contents, as any new dict is: a copy of scalars stays
+    // deferred, and one that could close a cycle is registered.
+    // (`gc.is_tracked` answers for a dict as CPython does either way.)
+    crate::gc_trace::track(&out);
     Ok(out)
 }
 
@@ -17917,6 +18292,16 @@ fn staticmethod_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
 /// Fetch the interpreter published by the enclosing VM frame — the
 /// subscript slot methods below delegate to the VM's own subscript
 /// machinery so their behavior is byte-for-byte `recv[key]`.
+/// Push the shells of lean activations still waiting on the pending list,
+/// so a native reader of this thread's frame stack sees every frame: the
+/// core loop runs some builtins in place, without making the stack whole
+/// first as the full handler does.
+pub(crate) fn sync_frame_spine() {
+    if let Ok(interp) = reentrant_interp() {
+        interp.flush_pending_callers();
+    }
+}
+
 pub(crate) fn reentrant_interp() -> Result<&'static mut crate::Interpreter, RuntimeError> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()
         .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;

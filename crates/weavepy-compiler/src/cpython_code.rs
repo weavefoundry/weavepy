@@ -759,7 +759,7 @@ fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
     }
     for (i, v) in code.varnames.iter().enumerate() {
         let mut kind = CO_FAST_LOCAL | arg_kind_of.get(i).copied().unwrap_or(0);
-        if code.hidden_locals.iter().any(|h| h == v) {
+        if code.hidden_locals().iter().any(|h| h == v) {
             kind |= CO_FAST_HIDDEN;
         }
         if code.cellvars.iter().any(|c| c == v) {
@@ -858,7 +858,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
 
     // The internal stream folds both backward jumps into one opcode;
     // `no_interrupt_jumps` says which ones are `JUMP_NO_INTERRUPT`.
-    for &j in &code.no_interrupt_jumps {
+    for &j in code.no_interrupt_jumps() {
         if let Some(m) = mapped.get_mut(j as usize) {
             if m.cp_op == op::JUMP_BACKWARD {
                 m.cp_op = op::JUMP_BACKWARD_NO_INTERRUPT;
@@ -2112,28 +2112,12 @@ impl SlotMap {
     }
 }
 
-/// Abstract origin of one shadow-stack slot during decode, used to
-/// tell CPython's two CALL shapes apart: a NULL-style call (self slot
-/// fed by PUSH_NULL / a flagged LOAD_GLOBAL / LOAD_ATTR method pair)
-/// maps back to WeavePy's `Call n`; a self-slot call (decorator or
-/// comprehension invocation — a real value in the slot) maps to
-/// `CallSelf n+1`, whose first argument rides that slot.
-#[derive(Clone, Copy, PartialEq)]
-enum SlotKind {
-    Null,
-    Pair,
-    Other,
-    Unknown,
-}
-
 /// Decode the raw wire instructions into WeavePy instructions plus
 /// their [`wire`] marks. Superinstructions and the callable-flagged
 /// `LOAD_GLOBAL` unfuse into their two halves (marked head/tail);
 /// `LOAD_FAST_BORROW`/`LOAD_FAST_CHECK` decode to marked `LoadFast`s.
-/// The other reconstruction is the call shape: CPython's `CALL n` is
-/// WeavePy's `Call n` when the self-or-null slot holds NULL and
-/// `CallSelf n+1` when it holds a bound receiver, which a shadow stack
-/// of slot kinds tracks within each basic block.
+/// CPython's `CALL n` is WeavePy's `Call n` whatever its self-or-null
+/// slot holds (a real value rides as the first argument).
 // Index-driven on purpose: the walk reads `raws[idx]` while consulting
 // its neighbours and the parallel `first` table.
 #[allow(clippy::needless_range_loop)]
@@ -2146,26 +2130,6 @@ fn decode_instructions(
     let first = raw_first_instr(&expansions);
     let total = *first.last().unwrap_or(&0);
     let instr_of_raw = |raw_idx: usize| -> usize { first.get(raw_idx).copied().unwrap_or(total) };
-    // Jump-target units: shadow-stack knowledge resets there (slots
-    // reached from other paths are unknown; unknown self slots decode
-    // as NULL-style calls, which is what every compiler-produced
-    // cross-block call shape actually is).
-    let mut leaders: Vec<usize> = Vec::new();
-    for r in raws {
-        if is_rel_jump(r.cp_op) {
-            let next_unit = r.start_unit + r.size;
-            let t = if is_backward_jump(r.cp_op) {
-                next_unit.saturating_sub(r.arg as usize)
-            } else {
-                next_unit + r.arg as usize
-            };
-            leaders.push(t);
-        }
-    }
-    // Visited in unit order below, through a cursor.
-    leaders.sort_unstable();
-    let mut next_leader = 0usize;
-    let mut shadow: Vec<SlotKind> = Vec::new();
     let mut out = Vec::with_capacity(total);
     let mut marks: Vec<u8> = Vec::with_capacity(total);
     // Shared `LOCAL|CELL` slots currently holding an inlined
@@ -2189,12 +2153,6 @@ fn decode_instructions(
         }
     };
     for (idx, r) in raws.iter().enumerate() {
-        while leaders.get(next_leader).is_some_and(|&t| t < r.start_unit) {
-            next_leader += 1;
-        }
-        if leaders.get(next_leader) == Some(&r.start_unit) {
-            shadow.clear();
-        }
         let after_swap = idx > 0 && raws[idx - 1].cp_op == op::SWAP;
         match r.cp_op {
             op::LOAD_FAST_AND_CLEAR
@@ -2215,11 +2173,9 @@ fn decode_instructions(
             _ => {}
         }
         // Fused wire forms first: they expand to two marked
-        // instructions and drive the shadow stack directly.
+        // instructions.
         match r.cp_op {
             op::LOAD_GLOBAL if r.arg & 1 != 0 => {
-                shadow.push(SlotKind::Other);
-                shadow.push(SlotKind::Null);
                 out.push(Instruction::new(OpCode::LoadGlobal, r.arg >> 1));
                 marks.push(wire::FUSE_HEAD);
                 out.push(Instruction::new(OpCode::PushNull, 0));
@@ -2241,13 +2197,6 @@ fn decode_instructions(
                     op::STORE_FAST_LOAD_FAST => (OpCode::StoreFast, OpCode::LoadFast, wire::PLAIN),
                     _ => (OpCode::StoreFast, OpCode::StoreFast, wire::PLAIN),
                 };
-                for o in [op1, op2] {
-                    if o == OpCode::LoadFast {
-                        shadow.push(SlotKind::Other);
-                    } else {
-                        pop_slot(&mut shadow);
-                    }
-                }
                 out.push(Instruction::new(op1, a1));
                 marks.push(wire::FUSE_HEAD | extra);
                 out.push(Instruction::new(op2, a2));
@@ -2263,14 +2212,10 @@ fn decode_instructions(
             op::LOAD_FAST_CHECK => wire::CHECK,
             _ => wire::PLAIN,
         };
-        // Update the shadow stack (kinds only matter for the
-        // call-shape decisions below; generic ops apply their net
-        // effect, which keeps slot positions honest because nothing
-        // but a call ever consumes a NULL/pair slot).
-        let mut popped_self = SlotKind::Unknown;
-        let pop = |shadow: &mut Vec<SlotKind>| shadow.pop().unwrap_or(SlotKind::Unknown);
-        let kw_names_len = |out: &[Instruction]| -> u32 {
-            match out.last() {
+        // A keyword call's internal arg counts its positionals only (the
+        // names tuple the preceding `LOAD_CONST` loads gives the rest).
+        let call_kw_internal_arg = if r.cp_op == op::CALL_KW {
+            let nkw = match out.last() {
                 Some(prev) if prev.op == OpCode::LoadConst => {
                     match constants.get(prev.arg as usize) {
                         Some(Constant::Tuple(names)) => names.len() as u32,
@@ -2278,109 +2223,14 @@ fn decode_instructions(
                     }
                 }
                 _ => 0,
-            }
+            };
+            r.arg.saturating_sub(nkw)
+        } else {
+            0
         };
-        let mut call_kw_internal_arg = 0u32;
-        match r.cp_op {
-            op::PUSH_NULL => shadow.push(SlotKind::Null),
-            op::LOAD_GLOBAL => {
-                shadow.push(SlotKind::Other);
-                if r.arg & 1 != 0 {
-                    shadow.push(SlotKind::Null);
-                }
-            }
-            // LOAD_SPECIAL is always the method-form pair
-            // (`__exit__`/`__enter__` + self-or-null), so the `CALL 0`
-            // that follows is a NULL-style call.
-            op::LOAD_SPECIAL => {
-                pop(&mut shadow);
-                shadow.push(SlotKind::Other);
-                shadow.push(SlotKind::Pair);
-            }
-            op::LOAD_ATTR if r.arg & 1 != 0 => {
-                pop(&mut shadow);
-                shadow.push(SlotKind::Other);
-                shadow.push(SlotKind::Pair);
-            }
-            op::CALL => {
-                for _ in 0..r.arg {
-                    pop(&mut shadow);
-                }
-                popped_self = pop(&mut shadow);
-                pop(&mut shadow); // callable
-                shadow.push(SlotKind::Other);
-            }
-            op::CALL_KW => {
-                let nkw = kw_names_len(&out);
-                call_kw_internal_arg = r.arg.saturating_sub(nkw);
-                pop(&mut shadow); // kwnames tuple
-                for _ in 0..r.arg {
-                    pop(&mut shadow);
-                }
-                popped_self = pop(&mut shadow);
-                pop(&mut shadow); // callable
-                shadow.push(SlotKind::Other);
-            }
-            op::CALL_FUNCTION_EX => {
-                pop(&mut shadow); // kwargs dict or NULL
-                pop(&mut shadow); // args tuple
-                pop(&mut shadow); // self-or-null (always NULL here)
-                pop(&mut shadow); // callable
-                shadow.push(SlotKind::Other);
-            }
-            // The 3.14 `with` prologue shuffles the `__exit__` pair
-            // under the manager with SWAP 2 / SWAP 3, so slot kinds
-            // have to move with the values for the exit `CALL 3` to
-            // decode as the NULL-style call it is.
-            op::SWAP if r.arg >= 2 => {
-                let n = r.arg as usize;
-                let len = shadow.len();
-                if len >= n {
-                    shadow.swap(len - 1, len - n);
-                } else {
-                    shadow.clear();
-                }
-            }
-            op::COPY if r.arg >= 1 => {
-                let n = r.arg as usize;
-                let len = shadow.len();
-                let k = if len >= n {
-                    shadow[len - n]
-                } else {
-                    SlotKind::Unknown
-                };
-                shadow.push(k);
-            }
-            _ => {
-                let (popped, pushed) = cp_stack_shape(r.cp_op, r.arg);
-                for _ in 0..popped {
-                    pop(&mut shadow);
-                }
-                for _ in 0..pushed {
-                    shadow.push(SlotKind::Other);
-                }
-            }
-        }
-        if matches!(
-            r.cp_op,
-            op::JUMP_FORWARD
-                | op::JUMP_BACKWARD
-                | op::JUMP_BACKWARD_NO_INTERRUPT
-                | op::RETURN_VALUE
-                | op::RERAISE
-                | op::RAISE_VARARGS
-        ) {
-            // Whatever follows starts a fresh block.
-            shadow.clear();
-        }
         marks.push(mark);
         if r.cp_op == op::CALL {
-            let internal = if popped_self == SlotKind::Other {
-                Instruction::new(OpCode::CallSelf, r.arg + 1)
-            } else {
-                Instruction::new(OpCode::Call, r.arg)
-            };
-            out.push(internal);
+            out.push(Instruction::new(OpCode::Call, r.arg));
             continue;
         }
         if r.cp_op == op::CALL_KW {
@@ -2422,10 +2272,6 @@ fn decode_instructions(
     }
     debug_assert_eq!(out.len(), marks.len());
     Some((out, marks))
-}
-
-fn pop_slot(shadow: &mut Vec<SlotKind>) -> SlotKind {
-    shadow.pop().unwrap_or(SlotKind::Unknown)
 }
 
 /// Is `cp_op` outside CPython 3.14's known opcode set (including the
@@ -2949,7 +2795,7 @@ mod tests {
 
     fn code_of(instrs: Vec<Instruction>) -> CodeObject {
         let mut c = CodeObject {
-            linetable: vec![1u32; instrs.len()],
+            linetable: vec![1u32; instrs.len()].into(),
             instructions: instrs,
             ..CodeObject::default()
         };
@@ -3248,7 +3094,7 @@ mod tests {
                 Instruction::new(OpCode::LoadConst, 0),
                 Instruction::new(OpCode::ReturnValue, 0),
             ],
-            linetable: vec![1, 2, 2, 3, 3, 4, 4],
+            linetable: vec![1, 2, 2, 3, 3, 4, 4].into(),
             ..CodeObject::default()
         };
         code.varnames = vec!["a".to_owned(), "b".to_owned()];
@@ -3278,14 +3124,14 @@ mod tests {
         assert_eq!(dc.varnames, code.varnames);
         assert_eq!(dc.cellvars, code.cellvars);
         assert_eq!(dc.freevars, code.freevars);
-        assert_eq!(dc.linetable, code.linetable);
+        assert_eq!(dc.linetable, *code.linetable);
         assert_eq!(dc.exception_table, code.exception_table);
 
         // Re-encoding the decoded form must reproduce the wire bytes
         // exactly — a strong end-to-end inverse invariant.
         let mut code2 = CodeObject {
             instructions: dc.instructions,
-            linetable: dc.linetable,
+            linetable: dc.linetable.into(),
             ..CodeObject::default()
         };
         code2.varnames = dc.varnames;
@@ -3379,7 +3225,7 @@ def body():
             code.exception_table, dc.exception_table,
             "{path}: exception table"
         );
-        assert_eq!(code.linetable, dc.linetable, "{path}: linetable");
+        assert_eq!(*code.linetable, dc.linetable, "{path}: linetable");
         for c in &code.constants {
             if let crate::Constant::Code(inner) = c {
                 walk(inner, format!("{path}/{}", inner.name));

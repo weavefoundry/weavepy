@@ -88,8 +88,8 @@ fn warnings_lock_held() -> bool {
 }
 
 /// `PyContextVar_New("_warnings_context", NULL)` — built through the
-/// (pure-Python) `_contextvars` module, so it is the very `ContextVar`
-/// type `_py_warnings` hands out.
+/// `_contextvars` module, so it is the very `ContextVar` type
+/// `_py_warnings` hands out.
 fn new_context_var() -> Option<Object> {
     let ip = interp().ok()?;
     let module = ip.import_path("_contextvars").ok()?;
@@ -172,7 +172,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         // The ContextVar is created once per process (like the rest of
         // the state), on first access (see the `__getattr__` below: the
-        // pure-Python `_contextvars` it is built from imports
+        // frozen `_contextvars` it is built from imports
         // `_collections_abc`, which interpreter start-up — the first
         // import of `_warnings` — has no other use for), and re-exposed by
         // every later (re-)import.
@@ -948,6 +948,7 @@ fn setup_context(
     stacklevel: i64,
     skip_file_prefixes: &[String],
 ) -> Result<(String, i64, Object, Object), RuntimeError> {
+    crate::builtins::sync_frame_spine();
     // Per-thread frame stack, with the interpreter's own as a fallback
     // (shutdown finalizers run `__del__` without re-activating handles —
     // same fallback `sys._getframe` keeps).
@@ -1000,7 +1001,7 @@ fn setup_context(
 
     let (globals, filename, lineno) = match frame {
         Some(f) => {
-            let filename = f.code.filename.clone();
+            let filename = f.code.filename.to_string();
             let lineno = i64::from(f.current_lineno());
             (f.globals.clone(), filename, lineno)
         }

@@ -307,8 +307,15 @@ fn conn_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 
     let path = database_path(ip, &database)?;
     let c_path = std::ffi::CString::new(path).map_err(|_| value_error("embedded null byte"))?;
-    let mut flags =
-        ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_FULLMUTEX;
+    // Every call into the connection holds the GIL (none releases it), so
+    // SQLite's own per-call connection mutex only matters when threads run
+    // free of it.
+    let threading = if crate::gil::free_threading_enabled() {
+        ffi::SQLITE_OPEN_FULLMUTEX
+    } else {
+        ffi::SQLITE_OPEN_NOMUTEX
+    };
+    let mut flags = ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | threading;
     if uri {
         flags |= ffi::SQLITE_OPEN_URI;
     }

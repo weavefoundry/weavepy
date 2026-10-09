@@ -99,6 +99,13 @@ pub(crate) fn loop_gen_ptr() -> *const u64 {
     LOOP_GEN.as_ptr()
 }
 
+/// The gate word's address, for native code that reads it in line where
+/// it would call [`load`].
+#[cfg(feature = "jit")]
+pub(crate) fn hot_ptr() -> *const u32 {
+    HOT.as_ptr()
+}
+
 /// Invalidate every dispatch loop's cached prologue snapshot
 /// (RFC 0065 WS1). Cheap (one relaxed RMW); call from any mutation
 /// site whose state the loop prologue consults.

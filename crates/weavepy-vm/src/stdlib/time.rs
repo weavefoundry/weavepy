@@ -92,7 +92,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("strftime")),
-            b("strftime", time_strftime),
+            leaf(b("strftime", time_strftime)),
         );
         d.insert(
             DictKey(Object::from_static("ctime")),
@@ -104,11 +104,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("localtime")),
-            b("localtime", time_localtime),
+            leaf(b("localtime", time_localtime)),
         );
         d.insert(
             DictKey(Object::from_static("gmtime")),
-            b("gmtime", time_gmtime),
+            leaf(b("gmtime", time_gmtime)),
         );
         d.insert(
             DictKey(Object::from_static("mktime")),
@@ -257,6 +257,16 @@ fn compute_timezone() -> (i64, i64, i64, String, String) {
     };
     let daylight = i64::from(jan_east != jul_east);
     (-std_east, -dst_east, daylight, std_name, dst_name)
+}
+
+/// `f`, vouched for as a leaf (see `leaf_builtins::register`): its body
+/// reads the clock or converts plain numbers and tuples, and runs no
+/// Python code.
+fn leaf(f: Object) -> Object {
+    if let Object::Builtin(b) = &f {
+        crate::leaf_builtins::register(b);
+    }
+    f
 }
 
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {

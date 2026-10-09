@@ -8,8 +8,6 @@
 
 mod lru_order;
 
-use indexmap::map::RawEntryApiV1;
-
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -32,10 +30,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_partial_call")),
             Object::Builtin(Rc::new(BuiltinFn {
-                name: "__call__",
+                name: PARTIAL_CALL_NAME,
                 binds_instance: false,
                 call: Box::new(|args| partial_call(args, &[])),
                 call_kw: Some(Box::new(partial_call)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("_partial_new_for")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_partial_new_for",
+                binds_instance: false,
+                call: Box::new(partial_new_for),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -73,9 +80,169 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
+/// What a `partial` class's native `__new__` knows about it (see
+/// [`partial_new_for`]): the class, the `Placeholder` singleton, and the
+/// pure-Python `__new__` that serves every shape [`partial_new`] doesn't.
+struct PartialReg {
+    cls: crate::sync::Weak<crate::types::TypeObject>,
+    placeholder: Object,
+    py_new: Object,
+}
+
+/// `_partial_new_for(partial, Placeholder, _partial_new)`: the native
+/// `__new__` for this `functools` module's `partial` class (a fresh
+/// import of `functools` makes its own).
+fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls), placeholder, py_new] = args else {
+        return Err(type_error(
+            "_partial_new_for expected (partial, Placeholder, __new__)",
+        ));
+    };
+    let reg = Rc::new(PartialReg {
+        cls: Rc::downgrade(cls),
+        placeholder: placeholder.clone(),
+        py_new: py_new.clone(),
+    });
+    let reg_kw = reg.clone();
+    Ok(Object::Builtin(Rc::new(BuiltinFn {
+        name: "__new__",
+        binds_instance: false,
+        call: Box::new(move |args| partial_new(&reg, args, &[])),
+        call_kw: Some(Box::new(move |args, kwargs| {
+            partial_new(&reg_kw, args, kwargs)
+        })),
+    })))
+}
+
+/// The native `partial.__call__`'s name (the dispatch loop recognizes
+/// it; the visible name is `__call__`).
+pub(crate) const PARTIAL_CALL_NAME: &str = ".partial.__call__";
+
+/// The call a `partial` instance stands for, as the dispatch loop can make
+/// it directly: its function, and the one stored positional argument to
+/// pass first (`Unbound` for none). `None` when the partial has keywords,
+/// placeholders, or more than one stored argument.
+pub(crate) fn partial_inline(inst: &crate::types::PyInstance) -> Option<(Object, Object)> {
+    with_partial_fields(inst, |[func, args, kw, phcount]| {
+        if !matches!(phcount, Object::Int(0)) {
+            return None;
+        }
+        let Object::Dict(kw) = kw else {
+            return None;
+        };
+        // SAFETY: a read that runs no code.
+        if !unsafe { kw.peek() }?.is_empty() {
+            return None;
+        }
+        let Object::Tuple(args) = args else {
+            return None;
+        };
+        let first = match &args[..] {
+            [] => Object::Unbound,
+            [a] => a.clone(),
+            _ => return None,
+        };
+        Some((func.clone(), first))
+    })
+    .flatten()
+}
+
+thread_local! {
+    /// The interned names of a partial's first four slots.
+    static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]
+        .iter()
+        .map(|name| match crate::stdlib::sys::intern_name(name) {
+            Object::Str(s) => s,
+            _ => unreachable!("interned names are strs"),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("four names"));
+}
+
+/// `f` over a partial instance's `_func`, `_args`, `_keywords`, and
+/// `_phcount` slots, read in place when they lead its slot store (as
+/// both constructors lay them out): `None` otherwise.
+fn with_partial_fields<R>(
+    inst: &crate::types::PyInstance,
+    f: impl FnOnce([&Object; 4]) -> R,
+) -> Option<R> {
+    PARTIAL_KEYS.with(|keys| {
+        // SAFETY: a read; `f` runs no code that could borrow the slots.
+        let slots = unsafe { inst.slots.peek() }?;
+        let fields = slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]])?;
+        Some(f(fields))
+    })
+}
+
+/// The slots of a `partial` instance, in the order [`partial_new`]
+/// stores them.
+const PARTIAL_SLOTS: [&str; 5] = ["_func", "_args", "_keywords", "_phcount", "_merger"];
+
+/// `partial.__new__(cls, func, /, *args, **keywords)` for the common
+/// shape: a callable that isn't itself a partial, and no `Placeholder`.
+/// Everything else (merging a partial's arguments, placeholders, and
+/// every error) runs the pure-Python `__new__`.
+fn partial_new(
+    reg: &PartialReg,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let interp = crate::builtins::reentrant_interp()?;
+    let (placeholder, py_new) = (&reg.placeholder, &reg.py_new);
+    let Some(cls) = reg.cls.upgrade() else {
+        let globals = interp.builtins_dict();
+        return interp.call(py_new, args, kwargs, &globals);
+    };
+    if let [Object::Type(sub)] = args {
+        return Err(type_error(format!(
+            "type '{}' takes at least one argument",
+            sub.name
+        )));
+    }
+    let simple = match args {
+        [Object::Type(sub), func, rest @ ..] => {
+            sub.is_subclass_of(&cls)
+                && crate::builtins::object_is_callable(func)
+                && !matches!(func, Object::Instance(i) if i.cls().is_subclass_of(&cls))
+                && !rest.iter().any(|a| a.is_same(placeholder))
+                && !kwargs.iter().any(|(_, v)| v.is_same(placeholder))
+        }
+        _ => false,
+    };
+    if !simple {
+        let globals = interp.builtins_dict();
+        return interp.call(py_new, args, kwargs, &globals);
+    }
+    let Object::Type(sub) = &args[0] else {
+        unreachable!("checked above");
+    };
+    let mut kw = DictData::default();
+    for (k, v) in kwargs {
+        kw.insert(DictKey(Object::from_str(k.clone())), v.clone());
+    }
+    let keywords = Object::Dict(Rc::new(RefCell::new(kw)));
+    crate::gc_trace::track(&keywords);
+    let values = [
+        args[1].clone(),
+        Object::new_tuple(args[2..].to_vec()),
+        keywords,
+        Object::Int(0),
+        Object::None,
+    ];
+    let inst = crate::types::PyInstance::new(sub.clone());
+    for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
+        inst.slot_set(name, v);
+    }
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Ok(obj)
+}
+
 /// `partial.__call__(self, /, *args, **keywords)` without a Python
 /// frame: merge stored args/keywords with the call's and tail-call
-/// `self.func` through the interpreter.
+/// `self.func` through the interpreter. Like CPython's `partial_call`, it
+/// reads the instance's own fields, never the (overridable) attributes.
 fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
         return Err(type_error(
@@ -87,27 +254,57 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let slf = args.first().ok_or_else(|| {
         type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
     })?;
+    let fields = match slf {
+        Object::Instance(inst) => with_partial_fields(inst, |[f, a, k, p]| {
+            (f.clone(), a.clone(), k.clone(), p.clone())
+        })
+        .or_else(|| {
+            let slots = inst.slots.borrow();
+            let mut out: [Option<Object>; 4] = Default::default();
+            for (slot, name) in out.iter_mut().zip(PARTIAL_SLOTS) {
+                *slot = slots.get(name).cloned();
+            }
+            match out {
+                [Some(f), Some(a), Some(k), Some(p)] => Some((f, a, k, p)),
+                _ => None,
+            }
+        }),
+        _ => None,
+    };
+    let (func, stored_args, stored_kw, phcount) = match fields {
+        Some(f) => f,
+        None => (
+            interp.load_attr_public(slf, "func")?,
+            interp.load_attr_public(slf, "args")?,
+            interp.load_attr_public(slf, "keywords")?,
+            interp.load_attr_public(slf, "_phcount")?,
+        ),
+    };
     // 3.14 `functools.Placeholder`: a partial with placeholders merges
     // call-site positionals into the stored tuple. That path stays in
     // the frozen `functools.py` (`_partial_call_py`); the native fast
     // path covers the common placeholder-free case.
-    if let Ok(phcount) = interp.load_attr_public(slf, "_phcount") {
-        if !matches!(phcount, Object::Int(0)) {
-            let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
-            let globals = interp.builtins_dict();
-            return interp.call(&py_call, &args[1..], kwargs, &globals);
-        }
+    if !matches!(phcount, Object::Int(0)) {
+        let py_call = interp.load_attr_public(slf, "_partial_call_py")?;
+        let globals = interp.builtins_dict();
+        return interp.call(&py_call, &args[1..], kwargs, &globals);
     }
-    let func = interp.load_attr_public(slf, "func")?;
-    let stored_args = interp.load_attr_public(slf, "args")?;
-    let stored_kw = interp.load_attr_public(slf, "keywords")?;
 
-    let mut call_args: Vec<Object> = match &stored_args {
-        Object::Tuple(xs) => xs.to_vec(),
-        _ => return Err(type_error("partial 'args' must be a tuple")),
+    let Object::Tuple(stored) = &stored_args else {
+        return Err(type_error("partial 'args' must be a tuple"));
     };
+    let mut call_args: Vec<Object> = Vec::with_capacity(stored.len() + args.len() - 1);
+    call_args.extend(stored.iter().cloned());
     call_args.extend_from_slice(&args[1..]);
 
+    let globals = interp.builtins_dict();
+    let stored_empty = match &stored_kw {
+        Object::Dict(d) => d.borrow().is_empty(),
+        _ => false,
+    };
+    if stored_empty {
+        return interp.call(&func, &call_args, kwargs, &globals);
+    }
     let mut call_kwargs: Vec<(String, Object)> = Vec::new();
     if let Object::Dict(d) = &stored_kw {
         for (k, v) in d.borrow().iter() {
@@ -128,8 +325,6 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             call_kwargs.push((k.clone(), v.clone()));
         }
     }
-
-    let globals = interp.builtins_dict();
     interp.call(&func, &call_args, &call_kwargs, &globals)
 }
 
@@ -263,14 +458,92 @@ fn lru_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeErro
     }
 }
 
-fn lru_get(inst: &crate::types::PyInstance, name: &'static str) -> Option<Object> {
-    inst.dict_cell().borrow().get(&StrKey(name)).cloned()
+/// The wrapper's own entries in its instance dictionary, in the order
+/// [`lru_cache_wrapper_new`] inserts them: each is found at its position
+/// (checked by name) without hashing the name, unless the dictionary was
+/// rearranged.
+#[derive(Clone, Copy)]
+enum LruField {
+    Wrapped,
+    Maxsize,
+    State,
+    Cache,
+    Hits,
+    Misses,
+    InfoCls,
 }
 
-fn lru_set(inst: &crate::types::PyInstance, name: &'static str, v: Object) {
-    inst.dict_cell()
-        .borrow_mut()
-        .insert(DictKey(Object::from_static(name)), v);
+impl LruField {
+    const ALL: [LruField; 7] = [
+        LruField::Wrapped,
+        LruField::Maxsize,
+        LruField::State,
+        LruField::Cache,
+        LruField::Hits,
+        LruField::Misses,
+        LruField::InfoCls,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            LruField::Wrapped => "__wrapped__",
+            LruField::Maxsize => "_lru_maxsize",
+            LruField::State => "_lru_state",
+            LruField::Cache => "_lru_cache",
+            LruField::Hits => "_lru_hits",
+            LruField::Misses => "_lru_misses",
+            LruField::InfoCls => "_lru_cache_info_cls",
+        }
+    }
+
+    /// Whether `key` names this field.
+    #[inline]
+    fn is(self, key: &DictKey) -> bool {
+        matches!(&key.0, Object::Str(s) if name_eq(s, self.name()))
+    }
+}
+
+/// `a == b` for a field name `b` of 8 to 24 bytes, as three word compares
+/// (the general comparison calls `memcmp`, which showed in the profile).
+#[inline]
+fn name_eq(a: &str, b: &'static str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let n = b.len();
+    debug_assert!((8..=24).contains(&n));
+    let word = |s: &[u8], at: usize| u64::from_ne_bytes(s[at..at + 8].try_into().expect("8 bytes"));
+    a.len() == n
+        && word(a, 0) == word(b, 0)
+        && word(a, (n - 8).min(8)) == word(b, (n - 8).min(8))
+        && word(a, n - 8) == word(b, n - 8)
+}
+
+fn lru_slot(dict: &DictData, field: LruField) -> Option<&Object> {
+    match dict.get_index(field as usize) {
+        Some((key, value)) if field.is(key) => Some(value),
+        _ => dict.get(&StrKey(field.name())),
+    }
+}
+
+fn lru_slot_mut(dict: &mut DictData, field: LruField) -> Option<&mut Object> {
+    let at = field as usize;
+    if dict.get_index(at).is_some_and(|(key, _)| field.is(key)) {
+        return dict.get_index_mut(at).map(|(_, value)| value);
+    }
+    dict.get_mut(&StrKey(field.name()))
+}
+
+fn lru_get(inst: &crate::types::PyInstance, field: LruField) -> Option<Object> {
+    lru_slot(&inst.dict_cell().borrow(), field).cloned()
+}
+
+fn lru_set(inst: &crate::types::PyInstance, field: LruField, v: Object) {
+    let mut dict = inst.dict_cell().borrow_mut();
+    match lru_slot_mut(&mut dict, field) {
+        Some(slot) => *slot = v,
+        None => {
+            dict.insert(DictKey(Object::from_static(field.name())), v);
+        }
+    }
 }
 
 /// `_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo)`.
@@ -283,28 +556,31 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("maxsize should be integer or None")),
     }
     let inst = Rc::new(crate::types::PyInstance::new(lru_type()));
-    lru_set(&inst, "__wrapped__", user_function.clone());
-    lru_set(&inst, "_lru_maxsize", maxsize.clone());
-    // Reuse this field for recency state. An immediate sentinel keeps empty
-    // typed wrappers allocation-free; their active links get a tuple tag.
-    // Another field would grow a normally decorated wrapper's dictionary.
-    lru_set(
-        &inst,
-        "_lru_state",
-        if typed.is_truthy() {
-            Object::Int(1)
-        } else {
-            Object::Bool(false)
-        },
-    );
-    lru_set(
-        &inst,
-        "_lru_cache",
-        Object::Dict(Rc::new(RefCell::new(DictData::default()))),
-    );
-    lru_set(&inst, "_lru_hits", Object::Int(0));
-    lru_set(&inst, "_lru_misses", Object::Int(0));
-    lru_set(&inst, "_lru_cache_info_cls", cache_info_cls.clone());
+    // Reuse the state field for recency state. An immediate sentinel keeps
+    // empty typed wrappers allocation-free; their active links get a tuple
+    // tag. Another field would grow a normally decorated wrapper's
+    // dictionary.
+    let state = if typed.is_truthy() {
+        Object::Int(1)
+    } else {
+        Object::Bool(false)
+    };
+    let cache = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+    let values = [
+        user_function.clone(),
+        maxsize.clone(),
+        state,
+        cache,
+        Object::Int(0),
+        Object::Int(0),
+        cache_info_cls.clone(),
+    ];
+    {
+        let mut dict = inst.dict_cell().borrow_mut();
+        for (field, value) in LruField::ALL.into_iter().zip(values) {
+            dict.insert(DictKey(Object::from_static(field.name())), value);
+        }
+    }
     // CPython's `lru_cache_new` GC-tracks the wrapper: its `__wrapped__`
     // edge closes the `module dict -> wrapper -> function -> __globals__`
     // cycle of every `@lru_cache` at module level, and an untracked
@@ -344,17 +620,16 @@ fn lru_make_key(call_args: &[Object], kwargs: &[(String, Object)], typed: bool) 
     Object::new_tuple(parts)
 }
 
-fn lru_counter_bump(inst: &crate::types::PyInstance, name: &'static str) {
+fn lru_counter_bump(inst: &crate::types::PyInstance, field: LruField) {
     // Keep the read and increment under one lock. Separate get/set borrows
     // lose updates when multiple threads hit a shared cache under gil=0.
     let mut dict = inst.dict_cell().borrow_mut();
-    let (_, count) = dict
-        .raw_entry_mut_v1()
-        .from_key(&StrKey(name))
-        .or_insert_with(|| (DictKey(Object::from_static(name)), Object::Int(0)));
-    match count {
-        Object::Int(n) => *n += 1,
-        _ => *count = Object::Int(1),
+    match lru_slot_mut(&mut dict, field) {
+        Some(Object::Int(n)) => *n += 1,
+        Some(count) => *count = Object::Int(1),
+        None => {
+            dict.insert(DictKey(Object::from_static(field.name())), Object::Int(1));
+        }
     }
 }
 
@@ -466,11 +741,11 @@ fn lru_state_links(state: &Object) -> Option<&Rc<RefCell<Vec<u8>>>> {
     }
 }
 
-fn lru_mode(inst: &crate::types::PyInstance) -> Result<(bool, bool), RuntimeError> {
-    // Read the tag without cloning active recency storage. Release this
-    // borrow before hashing the key or calling the wrapped function.
-    let dict = inst.dict_cell().borrow();
-    match dict.get(&StrKey("_lru_state")) {
+fn lru_mode(dict: &DictData) -> Result<(bool, bool), RuntimeError> {
+    // Read the tag without cloning active recency storage. The caller
+    // releases its borrow before hashing the key or calling the wrapped
+    // function.
+    match lru_slot(dict, LruField::State) {
         Some(Object::Bool(true)) => Ok((true, false)),
         Some(Object::Int(1)) => Ok((true, true)),
         Some(state @ Object::Tuple(_)) => {
@@ -492,15 +767,15 @@ fn scalar_lru_links(
     scalar: bool,
 ) -> Result<Option<Rc<RefCell<Vec<u8>>>>, RuntimeError> {
     let mut dict = inst.dict_cell().borrow_mut();
-    let (_, state) = dict
-        .raw_entry_mut_v1()
-        .from_key(&StrKey("_lru_state"))
-        .or_insert_with(|| {
-            (
-                DictKey(Object::from_static("_lru_state")),
-                Object::Bool(false),
-            )
-        });
+    if lru_slot(&dict, LruField::State).is_none() {
+        dict.insert(
+            DictKey(Object::from_static(LruField::State.name())),
+            Object::Bool(false),
+        );
+    }
+    let Some(state) = lru_slot_mut(&mut dict, LruField::State) else {
+        unreachable!("just inserted")
+    };
     // False/Int(1) are uninitialized untyped/typed states. None/True retain
     // permanent fallback. A one-element tuple tags typed active links.
     let typed = matches!(state, Object::Int(1));
@@ -572,12 +847,12 @@ fn scalar_lru_operation(
             // Demotion is serialized by the cache lock. Read its stable
             // typed tag here instead of carrying it through every call.
             let typed = matches!(
-                inst.dict_cell().borrow().get(&StrKey("_lru_state")),
+                lru_slot(&inst.dict_cell().borrow(), LruField::State),
                 Some(Object::Tuple(_))
             );
             lru_set(
                 inst,
-                "_lru_state",
+                LruField::State,
                 if typed {
                     Object::Bool(true)
                 } else {
@@ -590,9 +865,8 @@ fn scalar_lru_operation(
         }
         // Deferral also protects against private-cache tampering: a foreign
         // key must not invoke Python inside the paired borrow.
-        let (found, deferred) = crate::object::with_key_eq_deferred(|| {
-            crate::object::key_cmp_scope(|| data.get_index_of(&DictKey(key.clone())))
-        });
+        let (found, deferred) =
+            crate::object::key_cmp_deferred(|| data.get_index_of(&DictKey(key.clone())));
         let found = found?;
         if deferred {
             return Err(invalid_lru_order());
@@ -645,19 +919,32 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     };
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
-    let func = lru_get(&inst, "__wrapped__")
-        .ok_or_else(|| type_error("lru_cache wrapper lost its function"))?;
-    let maxsize = lru_get(&inst, "_lru_maxsize").unwrap_or(Object::None);
+    let func = || {
+        lru_get(&inst, LruField::Wrapped)
+            .ok_or_else(|| type_error("lru_cache wrapper lost its function"))
+    };
+    // One borrow reads the size, the mode, and the cache.
+    let (maxsize, mode, cache) = {
+        let dict = inst.dict_cell().borrow();
+        let cache = match lru_slot(&dict, LruField::Cache) {
+            Some(Object::Dict(cache)) => Some(cache.clone()),
+            _ => None,
+        };
+        let maxsize = lru_slot(&dict, LruField::Maxsize)
+            .cloned()
+            .unwrap_or(Object::None);
+        (maxsize, lru_mode(&dict), cache)
+    };
     let call_args = &args[1..];
     let globals = interp.builtins_dict();
 
     // maxsize == 0: no caching, statistics only.
     if matches!(maxsize, Object::Int(0)) {
-        lru_counter_bump(&inst, "_lru_misses");
-        return interp.call(&func, call_args, kwargs, &globals);
+        lru_counter_bump(&inst, LruField::Misses);
+        return interp.call(&func()?, call_args, kwargs, &globals);
     }
 
-    let (typed, scalar_enabled) = lru_mode(&inst)?;
+    let (typed, scalar_enabled) = mode?;
     let key = lru_make_key(call_args, kwargs, typed);
     // Compute a tuple key's hash before touching the cache. Successful
     // hashes are retained by the tuple, so lookup, recency updates, and
@@ -667,7 +954,7 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     if matches!(key, Object::Tuple(_)) {
         interp.do_hash_call(&key, &globals)?;
     }
-    let Some(Object::Dict(cache)) = lru_get(&inst, "_lru_cache") else {
+    let Some(cache) = cache else {
         return Err(type_error("lru_cache wrapper lost its cache"));
     };
     let bounded = matches!(maxsize, Object::Int(m) if m > 0);
@@ -700,11 +987,11 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         ),
     };
     if let Some(v) = hit {
-        lru_counter_bump(&inst, "_lru_hits");
+        lru_counter_bump(&inst, LruField::Hits);
         return Ok(v);
     }
-    lru_counter_bump(&inst, "_lru_misses");
-    let result = interp.call(&func, call_args, kwargs, &globals)?;
+    lru_counter_bump(&inst, LruField::Misses);
+    let result = interp.call(&func()?, call_args, kwargs, &globals)?;
     if scalar {
         let Object::Int(limit) = maxsize else {
             unreachable!()
@@ -772,12 +1059,12 @@ fn lru_cache_info(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Objec
     };
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
-    let cls = lru_get(&inst, "_lru_cache_info_cls")
+    let cls = lru_get(&inst, LruField::InfoCls)
         .ok_or_else(|| type_error("lru_cache wrapper lost its CacheInfo class"))?;
-    let hits = lru_get(&inst, "_lru_hits").unwrap_or(Object::Int(0));
-    let misses = lru_get(&inst, "_lru_misses").unwrap_or(Object::Int(0));
-    let maxsize = lru_get(&inst, "_lru_maxsize").unwrap_or(Object::None);
-    let currsize = match lru_get(&inst, "_lru_cache") {
+    let hits = lru_get(&inst, LruField::Hits).unwrap_or(Object::Int(0));
+    let misses = lru_get(&inst, LruField::Misses).unwrap_or(Object::Int(0));
+    let maxsize = lru_get(&inst, LruField::Maxsize).unwrap_or(Object::None);
+    let currsize = match lru_get(&inst, LruField::Cache) {
         Some(Object::Dict(c)) => Object::Int(c.borrow().len() as i64),
         _ => Object::Int(0),
     };
@@ -787,12 +1074,12 @@ fn lru_cache_info(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Objec
 
 fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
-    if let Some(Object::Dict(c)) = lru_get(&inst, "_lru_cache") {
+    if let Some(Object::Dict(c)) = lru_get(&inst, LruField::Cache) {
         let retired = {
             // Read the mode after locking the cache: a concurrent first call
             // may initialize recency storage before we acquire this lock.
             let mut cache = c.borrow_mut();
-            let state = lru_get(&inst, "_lru_state");
+            let state = lru_get(&inst, LruField::State);
             if let Some(links) = state.as_ref().and_then(lru_state_links) {
                 let mut bytes = links.borrow_mut();
                 if bytes.is_empty() {
@@ -810,8 +1097,8 @@ fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Obje
         };
         drop(retired);
     }
-    lru_set(&inst, "_lru_hits", Object::Int(0));
-    lru_set(&inst, "_lru_misses", Object::Int(0));
+    lru_set(&inst, LruField::Hits, Object::Int(0));
+    lru_set(&inst, LruField::Misses, Object::Int(0));
     Ok(Object::None)
 }
 
@@ -880,11 +1167,18 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
     };
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
-    let function = args[0].clone();
-    let it = interp.iter_object(args[1].clone())?;
+    let function = &args[0];
+    let globals = interp.builtins_dict();
+    let it = match interp.make_iter(&args[1], &globals) {
+        Ok(it) => it,
+        Err(e) if crate::is_type_error(&e) => {
+            return Err(type_error("reduce() arg 2 must support iteration"))
+        }
+        Err(e) => return Err(e),
+    };
     let mut acc = match args.get(2) {
         Some(initial) => initial.clone(),
-        None => match interp.iter_next_object(it.clone())? {
+        None => match interp.iter_next(&it, &globals)? {
             Some(first) => first,
             None => {
                 return Err(type_error(
@@ -893,9 +1187,8 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
             }
         },
     };
-    let globals = interp.builtins_dict();
-    while let Some(x) = interp.iter_next_object(it.clone())? {
-        acc = interp.call(&function, &[acc, x], &[], &globals)?;
+    while let Some(x) = interp.iter_next(&it, &globals)? {
+        acc = interp.call(function, &[acc, x], &[], &globals)?;
     }
     Ok(acc)
 }

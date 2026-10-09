@@ -275,28 +275,24 @@ class attrgetter:
     After h = attrgetter('name.first', 'name.last'), the call h(r) returns
     (r.name.first, r.name.last).
     """
-    __slots__ = ('_attrs', '_call')
+    __slots__ = ('_attrs',)
 
     def __init__(self, attr, /, *attrs):
-        if not attrs:
-            if not isinstance(attr, str):
+        attrs = (attr,) + attrs
+        for name in attrs:
+            if not isinstance(name, str):
                 raise TypeError('attribute name must be a string')
-            self._attrs = (attr,)
-            names = attr.split('.')
-            def func(obj):
-                for name in names:
-                    obj = getattr(obj, name)
-                return obj
-            self._call = func
-        else:
-            self._attrs = (attr,) + attrs
-            getters = tuple(map(attrgetter, self._attrs))
-            def func(obj):
-                return tuple(getter(obj) for getter in getters)
-            self._call = func
+        self._attrs = attrs
 
     def __call__(self, obj, /):
-        return self._call(obj)
+        def get(obj, attr):
+            for name in attr.split('.'):
+                obj = getattr(obj, name)
+            return obj
+        attrs = self._attrs
+        if len(attrs) == 1:
+            return get(obj, attrs[0])
+        return tuple(get(obj, attr) for attr in attrs)
 
     def __repr__(self):
         return '%s.%s(%s)' % (self.__class__.__module__,
@@ -312,22 +308,16 @@ class itemgetter:
     After f = itemgetter(2), the call f(r) returns r[2].
     After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])
     """
-    __slots__ = ('_items', '_call')
+    __slots__ = ('_items',)
 
     def __init__(self, item, /, *items):
-        if not items:
-            self._items = (item,)
-            def func(obj):
-                return obj[item]
-            self._call = func
-        else:
-            self._items = items = (item,) + items
-            def func(obj):
-                return tuple(obj[i] for i in items)
-            self._call = func
+        self._items = (item,) + items
 
     def __call__(self, obj, /):
-        return self._call(obj)
+        items = self._items
+        if len(items) == 1:
+            return obj[items[0]]
+        return tuple(obj[i] for i in items)
 
     def __repr__(self):
         return '%s.%s(%s)' % (self.__class__.__module__,

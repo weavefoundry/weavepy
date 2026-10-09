@@ -15,27 +15,30 @@
 //! - The per-thread running-loop slot (`_get_running_loop` /
 //!   `_set_running_loop` / `get_running_loop` / `get_event_loop`)
 //!   lives in Rust.
-//! - The task registries (`_scheduled_tasks` WeakSet, `_eager_tasks`
-//!   set, `_current_tasks` dict) are module attributes shared with the
-//!   pure-Python `tasks.py` helpers, so `asyncio.all_tasks()` sees
-//!   native and duck-typed tasks alike.
+//! - Native tasks register in the state slab (as 3.14's C tasks join a
+//!   per-thread list); other task-likes go to the module's
+//!   `_scheduled_tasks` WeakSet and `_eager_tasks` set, and
+//!   `asyncio.all_tasks()` reads all three. `_current_tasks` maps each
+//!   loop to its running task.
 //!
 //! ## Storage
 //!
-//! Future/Task state lives in a process-global registry keyed by an
-//! integer handle stored on the instance dict (the `socket_mod`
-//! pattern; `Rc`/`RefCell` alias `Arc`/`GilCell` under RFC 0025, so
-//! the cells are Send + Sync and the GIL serialises access). All
-//! re-entry into Python (loop.call_soon, coro.send, callbacks) happens
-//! with no state borrow held.
+//! Future/Task state lives in a process-global slab indexed by an
+//! integer handle stored in a hidden instance slot (`Rc`/`RefCell` alias
+//! `Arc`/`GilCell` under RFC 0025, so the cells are Send + Sync and the
+//! GIL serialises access). An exact `Future` or `Task` with nothing to
+//! log releases its state as it dies, without queueing its `__del__`
+//! (see [`finalizer_is_noop`]). All re-entry into Python
+//! (loop.call_soon, coro.send, callbacks) happens with no state borrow
+//! held.
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 
 use crate::error::{type_error, value_error, PyException, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BoundMethod, BuiltinFn, DictData, DictKey, Object, PyModule, PyProperty};
+use crate::stdlib::asyncio_events::call_soon;
 use crate::types::{PyInstance, TypeObject};
 
 // ---- interpreter re-entry ----
@@ -107,6 +110,14 @@ fn import_module(interp: &mut Interp, name: &str) -> Result<Object, RuntimeError
 }
 
 fn import_attr(interp: &mut Interp, module: &str, attr: &str) -> Result<Object, RuntimeError> {
+    // An already-imported module's plain global needs no `__import__`
+    // round trip (the hot paths fetch `CancelledError` and friends).
+    if let Some(Object::Module(m)) = interp.module_cache().get(module) {
+        let hit = m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
+        if let Some(v) = hit {
+            return Ok(v);
+        }
+    }
     let m = import_module(interp, module)?;
     interp.load_attr_public(&m, attr)
 }
@@ -224,18 +235,10 @@ impl FutStatus {
 struct FutState {
     status: FutStatus,
     result: Object,
-    exception: Object,
-    /// `exception.__traceback__` as of `set_exception` — restored on every
-    /// raise so re-awaiting the same future doesn't accumulate awaiter
-    /// frames (CPython's `fut_exception_tb`, test_futures2).
-    exception_tb: Object,
-    cancelled_exc: Object,
     loop_: Object,
-    callbacks: Vec<(Object, Object)>,
-    cancel_message: Object,
+    callbacks: Vec<(Object, CbContext)>,
     log_traceback: bool,
     blocking: bool,
-    source_traceback: Object,
     initialized: bool,
     /// 3.14 `fut_awaited_by`: the native futures/tasks currently awaiting
     /// this one (identity set; `_asyncio_awaited_by` exposes a frozenset).
@@ -244,14 +247,118 @@ struct FutState {
     /// emptied) set, so `_asyncio_awaited_by` then reports `frozenset()`
     /// rather than `None`.
     awaited_by_touched: bool,
+    /// The state few futures carry (see [`FutCold`]), allocated when
+    /// first set.
+    cold: Option<Box<FutCold>>,
     // Task-only fields.
     coro: Object,
     name: Object,
     context: Object,
     must_cancel: bool,
     fut_waiter: Object,
-    num_cancels_requested: i64,
     log_destroy_pending: bool,
+    /// The instance (for `all_tasks`), and whether this task is in the
+    /// scheduled or eager registry: native tasks register here instead of
+    /// in `tasks.py`'s `WeakSet`, as 3.14's C tasks join a per-thread
+    /// list instead.
+    this: crate::sync::Weak<PyInstance>,
+    scheduled: bool,
+    eager: bool,
+}
+
+/// A done callback's context: the one it was added with, or a copy of
+/// the context current when it was added, which becomes a `Context` only
+/// once the callback is scheduled (or the callback list is read). A
+/// pending future's callback (`gather`'s, for each child) so holds no
+/// `Context` of its own.
+#[derive(Clone)]
+enum CbContext {
+    Given(Object),
+    /// The copied context's mapping (see
+    /// [`crate::stdlib::contextvars_native::current_data`]).
+    Copied(Rc<RefCell<DictData>>),
+}
+
+const _: () = assert!(std::mem::size_of::<CbContext>() == std::mem::size_of::<Object>());
+
+impl CbContext {
+    /// The context, built if need be.
+    fn into_context(self) -> Result<Object, RuntimeError> {
+        match self {
+            Self::Given(ctx) => Ok(ctx),
+            Self::Copied(data) => crate::stdlib::contextvars_native::context_over(data),
+        }
+    }
+
+    /// The object this holds (the copied context's mapping, if unbuilt).
+    fn into_held(self) -> Object {
+        match self {
+            Self::Given(ctx) => ctx,
+            Self::Copied(data) => Object::Dict(data),
+        }
+    }
+}
+
+/// The state of a [`FutState`] that few futures carry: a failed or
+/// cancelled one's outcome and debug-mode records.
+struct FutCold {
+    exception: Object,
+    /// `exception.__traceback__` as of `set_exception` — restored on every
+    /// raise so re-awaiting the same future doesn't accumulate awaiter
+    /// frames (CPython's `fut_exception_tb`, test_futures2).
+    exception_tb: Object,
+    cancelled_exc: Object,
+    cancel_message: Object,
+    source_traceback: Object,
+    num_cancels_requested: i64,
+}
+
+impl Default for FutCold {
+    fn default() -> Self {
+        Self {
+            exception: Object::None,
+            exception_tb: Object::None,
+            cancelled_exc: Object::None,
+            cancel_message: Object::None,
+            source_traceback: Object::None,
+            num_cancels_requested: 0,
+        }
+    }
+}
+
+impl FutState {
+    /// The future's [`FutCold`] state, allocated if need be (to set it).
+    fn cold_mut(&mut self) -> &mut FutCold {
+        self.cold.get_or_insert_with(Box::default)
+    }
+
+    fn exception(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.exception.clone())
+    }
+
+    fn exception_tb(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.exception_tb.clone())
+    }
+
+    fn cancel_message(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.cancel_message.clone())
+    }
+
+    fn source_traceback(&self) -> Object {
+        self.cold
+            .as_ref()
+            .map_or(Object::None, |c| c.source_traceback.clone())
+    }
+
+    fn num_cancels_requested(&self) -> i64 {
+        self.cold.as_ref().map_or(0, |c| c.num_cancels_requested)
+    }
 }
 
 impl Default for FutState {
@@ -259,63 +366,113 @@ impl Default for FutState {
         Self {
             status: FutStatus::Pending,
             result: Object::None,
-            exception: Object::None,
-            exception_tb: Object::None,
-            cancelled_exc: Object::None,
             loop_: Object::None,
             callbacks: Vec::new(),
-            cancel_message: Object::None,
             log_traceback: false,
             blocking: false,
-            source_traceback: Object::None,
             initialized: false,
             awaited_by: Vec::new(),
             awaited_by_touched: false,
+            cold: None,
             coro: Object::None,
             name: Object::None,
             context: Object::None,
             must_cancel: false,
             fut_waiter: Object::None,
-            num_cancels_requested: 0,
             log_destroy_pending: true,
+            this: crate::sync::Weak::new(),
+            scheduled: false,
+            eager: false,
         }
     }
 }
 
-fn registry() -> &'static parking_lot::Mutex<HashMap<i64, Rc<RefCell<FutState>>>> {
-    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<HashMap<i64, Rc<RefCell<FutState>>>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+/// Every live Future/Task state, indexed by handle - 1 (a slab with a
+/// free list, so attaching, finding and releasing a state are O(1)).
+#[derive(Default)]
+struct Registry {
+    entries: Vec<Option<Rc<RefCell<FutState>>>>,
+    free: Vec<usize>,
 }
 
-const HANDLE_KEY: &str = "__weavepy_fut_handle__";
+impl Registry {
+    fn insert(&mut self, st: Rc<RefCell<FutState>>) -> i64 {
+        let index = match self.free.pop() {
+            Some(i) => {
+                self.entries[i] = Some(st);
+                i
+            }
+            None => {
+                self.entries.push(Some(st));
+                self.entries.len() - 1
+            }
+        };
+        index as i64 + 1
+    }
+
+    fn get(&self, handle: i64) -> Option<&Rc<RefCell<FutState>>> {
+        let index = usize::try_from(handle - 1).ok()?;
+        self.entries.get(index)?.as_ref()
+    }
+
+    fn remove(&mut self, handle: i64) -> Option<Rc<RefCell<FutState>>> {
+        let index = usize::try_from(handle - 1).ok()?;
+        let st = self.entries.get_mut(index)?.take()?;
+        self.free.push(index);
+        Some(st)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Rc<RefCell<FutState>>> {
+        self.entries.iter().flatten()
+    }
+}
+
+fn registry() -> &'static parking_lot::Mutex<Registry> {
+    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<Registry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(Registry::default()))
+}
+
+/// The hidden slot holding an instance's registry handle. Slot storage
+/// (rather than the instance dict) keeps a future dict-less, and no
+/// slot descriptor exposes the name to Python code.
+const HANDLE_KEY: &str = "__wp_fut__";
 
 fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static NEXT: AtomicI64 = AtomicI64::new(1);
-    let handle = NEXT.fetch_add(1, Ordering::Relaxed);
-    let st = Rc::new(RefCell::new(FutState::default()));
-    registry().lock().insert(handle, st.clone());
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(HANDLE_KEY)),
-        Object::Int(handle),
-    );
+    let st = Rc::new(RefCell::new(FutState {
+        this: Rc::downgrade(inst),
+        ..FutState::default()
+    }));
+    let handle = registry().lock().insert(st.clone());
+    inst.slots
+        .borrow_mut()
+        .insert(HANDLE_KEY, Object::Int(handle));
     st
+}
+
+/// [`HANDLE_KEY`], interned: the slot key shares its storage, so the
+/// hinted lookup settles on a pointer compare.
+fn handle_key() -> &'static str {
+    static KEY: std::sync::OnceLock<crate::shared_value::SharedStr> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| match crate::stdlib::sys::intern_name(HANDLE_KEY) {
+        Object::Str(s) => s,
+        _ => unreachable!("names intern as strings"),
+    })
+}
+
+/// The registry handle stored on `inst`, if a state is attached.
+#[inline]
+fn handle_of(inst: &PyInstance) -> Option<i64> {
+    match inst.slots.try_borrow().ok()?.get_hinted(0, handle_key()) {
+        Some(Object::Int(h)) => Some(*h),
+        _ => None,
+    }
 }
 
 /// The already-attached state cell of a Future/Task instance, without
 /// creating one. Safe to call from GC callbacks.
 fn existing_state_of(inst: &PyInstance) -> Option<Rc<RefCell<FutState>>> {
-    let existing = inst
-        .dict_cell()
-        .try_borrow()
-        .ok()?
-        .get(&DictKey(Object::from_static(HANDLE_KEY)))
-        .cloned();
-    if let Some(Object::Int(h)) = existing {
-        return registry().lock().get(&h).cloned();
-    }
-    None
+    let h = handle_of(inst)?;
+    registry().lock().get(h).cloned()
 }
 
 /// The state cell for a Future/Task instance, creating a default
@@ -358,6 +515,18 @@ fn is_native_future(obj: &Object) -> bool {
     }
 }
 
+/// `Future_CheckExact || Task_CheckExact`: an instance of exactly the
+/// native `Future` or `Task`, whose methods no subclass overrides.
+fn is_exact_native(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(inst) => {
+            let cls = inst.class.borrow();
+            Rc::ptr_eq(&cls, future_class_ref()) || Rc::ptr_eq(&cls, task_class_ref())
+        }
+        _ => false,
+    }
+}
+
 /// 3.14 `future_awaited_by_add`: record that `waiter` awaits `fut`. Only
 /// native futures take part (foreign future-likes are ignored, matching
 /// the C accelerator and the pure-Python `_PyFuture`-only fallback).
@@ -370,6 +539,8 @@ fn awaited_by_add(fut: &Object, waiter: &Object) {
     let mut s = st.borrow_mut();
     s.awaited_by_touched = true;
     if !s.awaited_by.iter().any(|w| same_object(w, waiter)) {
+        // (Most futures have one awaiter.)
+        s.awaited_by.reserve_exact(1);
         s.awaited_by.push(waiter.clone());
     }
 }
@@ -392,15 +563,57 @@ fn awaited_by_discard(fut: &Object, waiter: &Object) {
 /// The instance dict entry keeps the handle alive; without an explicit
 /// drop hook we accept the state living until process exit for leaked
 /// futures — bounded by the same lifetime CPython gives them.
-fn release_state(inst: &Rc<PyInstance>) {
-    let existing = inst
-        .dict_cell()
-        .borrow()
-        .get(&DictKey(Object::from_static(HANDLE_KEY)))
-        .cloned();
-    if let Some(Object::Int(h)) = existing {
-        registry().lock().remove(&h);
+fn release_state(inst: &PyInstance) {
+    let Some(h) = handle_of(inst) else { return };
+    // Unhook the handle first: a resurrected instance must attach a fresh
+    // state rather than find whatever later reuses this slab entry.
+    if let Ok(mut slots) = inst.slots.try_borrow_mut() {
+        if let Some(slot) = slots.get_hinted_mut(0, handle_key()) {
+            *slot = Object::None;
+        }
     }
+    let released = registry().lock().remove(h);
+    drop(released);
+}
+
+/// Whether the finalizer of a dying instance can be skipped: an exact
+/// native `Future` or `Task` with nothing to log (CPython's
+/// `FutureObj_finalize` and `TaskObj_finalize` return early in that
+/// case). Its state is released here. Called by the VM before it queues
+/// the `__del__` of an instance whose class has one.
+pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
+    let (Some(fut_cls), Some(task_cls)) = (FUTURE_CLASS.get(), TASK_CLASS.get()) else {
+        return false;
+    };
+    let is_task = {
+        let Ok(cls) = inst.class.try_borrow() else {
+            return false;
+        };
+        if Rc::ptr_eq(&cls, task_cls) {
+            true
+        } else if Rc::ptr_eq(&cls, fut_cls) {
+            false
+        } else {
+            return false;
+        }
+    };
+    if let Some(st) = existing_state_of(inst) {
+        let Ok(s) = st.try_borrow() else {
+            return false;
+        };
+        let has_loop = !matches!(s.loop_, Object::None);
+        let log_exc = s.log_traceback && !matches!(s.exception(), Object::None) && has_loop;
+        let log_pending = is_task
+            && s.status == FutStatus::Pending
+            && s.initialized
+            && s.log_destroy_pending
+            && has_loop;
+        if log_exc || log_pending {
+            return false;
+        }
+    }
+    release_state(inst);
+    true
 }
 
 // ---- cycle-collector integration (RFC 0044 pattern) ----
@@ -413,10 +626,7 @@ fn release_state(inst: &Rc<PyInstance>) {
 
 fn fut_gc_matches(obj: &Object) -> bool {
     match obj {
-        Object::Instance(i) => i
-            .dict_cell()
-            .try_borrow()
-            .is_ok_and(|d| d.get(&DictKey(Object::from_static(HANDLE_KEY))).is_some()),
+        Object::Instance(i) => handle_of(i).is_some(),
         _ => false,
     }
 }
@@ -429,12 +639,7 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     let Ok(s) = st.try_borrow() else { return };
     for o in [
         &s.result,
-        &s.exception,
-        &s.exception_tb,
-        &s.cancelled_exc,
         &s.loop_,
-        &s.cancel_message,
-        &s.source_traceback,
         &s.coro,
         &s.name,
         &s.context,
@@ -444,13 +649,24 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
     for (cb, ctx) in &s.callbacks {
         visit(cb);
-        visit(ctx);
+        visit(&ctx.clone().into_held());
     }
     // 3.14 `FutureObj_traverse` visits `fut_awaited_by`: the strong
     // waiter references it holds close the `task -> coro frame -> future
     // -> awaited_by -> task` loop (test_log_destroyed_pending_task).
     for w in &s.awaited_by {
         visit(w);
+    }
+    if let Some(cold) = &s.cold {
+        for o in [
+            &cold.exception,
+            &cold.exception_tb,
+            &cold.cancelled_exc,
+            &cold.cancel_message,
+            &cold.source_traceback,
+        ] {
+            visit(o);
+        }
     }
 }
 
@@ -464,14 +680,9 @@ fn fut_gc_clear(obj: &Object) {
     let mut dropped: Vec<Object> = Vec::new();
     if let Ok(mut s) = st.try_borrow_mut() {
         let s = &mut *s;
-        let fields: [&mut Object; 11] = [
+        let fields: [&mut Object; 6] = [
             &mut s.result,
-            &mut s.exception,
-            &mut s.exception_tb,
-            &mut s.cancelled_exc,
             &mut s.loop_,
-            &mut s.cancel_message,
-            &mut s.source_traceback,
             &mut s.coro,
             &mut s.name,
             &mut s.context,
@@ -482,9 +693,21 @@ fn fut_gc_clear(obj: &Object) {
         }
         for (cb, ctx) in s.callbacks.drain(..) {
             dropped.push(cb);
-            dropped.push(ctx);
+            dropped.push(ctx.into_held());
         }
         dropped.append(&mut s.awaited_by);
+        if let Some(cold) = s.cold.as_mut() {
+            let fields: [&mut Object; 5] = [
+                &mut cold.exception,
+                &mut cold.exception_tb,
+                &mut cold.cancelled_exc,
+                &mut cold.cancel_message,
+                &mut cold.source_traceback,
+            ];
+            for o in fields {
+                dropped.push(std::mem::replace(o, Object::None));
+            }
+        }
     }
     // The registry entry itself dies too — the instance dict (and with it
     // the handle) is cleared right after this hook runs.
@@ -539,7 +762,22 @@ pub fn clear_current_tasks_after_fork_in_child() {
     current_tasks_dict().borrow_mut().clear();
 }
 
+/// The state of a native `Task` (or subclass) instance, for the
+/// registries: other objects go to the Python-level sets.
+fn native_task_state(task: &Object) -> Option<Rc<RefCell<FutState>>> {
+    match task {
+        Object::Instance(inst) if inst.cls().is_subclass_of(&task_class()) => {
+            Some(state_of_instance(inst))
+        }
+        _ => None,
+    }
+}
+
 fn register_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeError> {
+    if let Some(st) = native_task_state(task) {
+        st.borrow_mut().scheduled = true;
+        return Ok(());
+    }
     if let Some(ws) = scheduled_tasks_obj().get() {
         call_method(interp, &ws.clone(), "add", std::slice::from_ref(task))?;
     }
@@ -547,6 +785,10 @@ fn register_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeE
 }
 
 fn unregister_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeError> {
+    if let Some(st) = native_task_state(task) {
+        st.borrow_mut().scheduled = false;
+        return Ok(());
+    }
     if let Some(ws) = scheduled_tasks_obj().get() {
         call_method(interp, &ws.clone(), "discard", std::slice::from_ref(task))?;
     }
@@ -554,6 +796,10 @@ fn unregister_task_impl(interp: &mut Interp, task: &Object) -> Result<(), Runtim
 }
 
 fn register_eager_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeError> {
+    if let Some(st) = native_task_state(task) {
+        st.borrow_mut().eager = true;
+        return Ok(());
+    }
     if let Some(s) = eager_tasks_obj().get() {
         call_method(interp, &s.clone(), "add", std::slice::from_ref(task))?;
     }
@@ -561,10 +807,36 @@ fn register_eager_task_impl(interp: &mut Interp, task: &Object) -> Result<(), Ru
 }
 
 fn unregister_eager_task_impl(interp: &mut Interp, task: &Object) -> Result<(), RuntimeError> {
+    if let Some(st) = native_task_state(task) {
+        st.borrow_mut().eager = false;
+        return Ok(());
+    }
     if let Some(s) = eager_tasks_obj().get() {
         call_method(interp, &s.clone(), "discard", std::slice::from_ref(task))?;
     }
     Ok(())
+}
+
+/// The registered native tasks that are still alive (eager ones first).
+fn registered_native_tasks() -> Vec<Object> {
+    let states: Vec<Rc<RefCell<FutState>>> = registry().lock().values().cloned().collect();
+    let mut eager = Vec::new();
+    let mut scheduled = Vec::new();
+    for st in states {
+        let Ok(s) = st.try_borrow() else { continue };
+        if !(s.eager || s.scheduled) {
+            continue;
+        }
+        if let Some(inst) = s.this.upgrade() {
+            if s.eager {
+                eager.push(Object::Instance(inst));
+            } else {
+                scheduled.push(Object::Instance(inst));
+            }
+        }
+    }
+    eager.extend(scheduled);
+    eager
 }
 
 fn enter_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result<(), RuntimeError> {
@@ -656,13 +928,13 @@ fn schedule_callbacks(
         let mut s = st.borrow_mut();
         (s.loop_.clone(), std::mem::take(&mut s.callbacks))
     };
+    let _ = interp;
     for (cb, ctx) in callbacks {
-        call_method_kw(
-            interp,
+        call_soon(
             &loop_,
-            "call_soon",
-            &[cb, self_obj.clone()],
-            &[("context".to_owned(), ctx)],
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
         )?;
     }
     Ok(())
@@ -682,8 +954,10 @@ fn make_cancelled_error(
 ) -> Result<Object, RuntimeError> {
     let (saved, msg) = {
         let mut s = st.borrow_mut();
-        let saved = std::mem::replace(&mut s.cancelled_exc, Object::None);
-        (saved, s.cancel_message.clone())
+        let saved = s.cold.as_mut().map_or(Object::None, |c| {
+            std::mem::replace(&mut c.cancelled_exc, Object::None)
+        });
+        (saved, s.cancel_message())
     };
     if !matches!(saved, Object::None) {
         return Ok(saved);
@@ -721,11 +995,7 @@ fn future_result_impl(
             let (exc, tb, result) = {
                 let mut s = st.borrow_mut();
                 s.log_traceback = false;
-                (
-                    s.exception.clone(),
-                    s.exception_tb.clone(),
-                    s.result.clone(),
-                )
+                (s.exception(), s.exception_tb(), s.result.clone())
             };
             if matches!(exc, Object::None) {
                 Ok(result)
@@ -758,7 +1028,7 @@ fn future_exception_impl(
         FutStatus::Finished => {
             let mut s = st.borrow_mut();
             s.log_traceback = false;
-            Ok(s.exception.clone())
+            Ok(s.exception())
         }
     }
 }
@@ -829,8 +1099,8 @@ fn future_set_exception_impl(
     };
     {
         let mut s = st.borrow_mut();
-        s.exception_tb = exc_traceback_of(&exc_inst);
-        s.exception = exc_inst;
+        s.cold_mut().exception_tb = exc_traceback_of(&exc_inst);
+        s.cold_mut().exception = exc_inst;
         s.status = FutStatus::Finished;
         s.log_traceback = true;
     }
@@ -859,7 +1129,7 @@ fn future_cancel_impl(
             return Ok(false);
         }
         s.status = FutStatus::Cancelled;
-        s.cancel_message = msg;
+        s.cold_mut().cancel_message = msg;
     }
     schedule_callbacks(interp, self_obj, st)?;
     Ok(true)
@@ -874,22 +1144,25 @@ fn future_add_done_callback_impl(
 ) -> Result<(), RuntimeError> {
     ensure_initialized(interp, st)?;
     let ctx = if matches!(context, Object::None) {
-        let copy_context = import_attr(interp, "contextvars", "copy_context")?;
-        call(interp, &copy_context, &[])?
+        CbContext::Copied(crate::stdlib::contextvars_native::current_data()?)
     } else {
-        context
+        CbContext::Given(context)
     };
     if future_done_st(st) {
         let loop_ = st.borrow().loop_.clone();
-        call_method_kw(
-            interp,
+        call_soon(
             &loop_,
-            "call_soon",
-            &[cb, self_obj.clone()],
-            &[("context".to_owned(), ctx)],
+            cb,
+            std::slice::from_ref(self_obj),
+            ctx.into_context()?,
         )?;
     } else {
-        st.borrow_mut().callbacks.push((cb, ctx));
+        let mut s = st.borrow_mut();
+        // (Most futures get one callback.)
+        if s.callbacks.is_empty() {
+            s.callbacks.reserve_exact(1);
+        }
+        s.callbacks.push((cb, ctx));
     }
     Ok(())
 }
@@ -936,9 +1209,7 @@ fn fut_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     } else {
         loop_
     };
-    let debug = call_method(interp, &loop_, "get_debug", &[])
-        .map(|v| truthy(&v))
-        .unwrap_or(false);
+    let debug = crate::stdlib::asyncio_events::get_debug(&loop_).unwrap_or(false);
     {
         let mut s = st.borrow_mut();
         s.loop_ = loop_;
@@ -947,7 +1218,7 @@ fn fut_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     if debug {
         let extract_stack = import_attr(interp, "asyncio.format_helpers", "extract_stack")?;
         let stack = call(interp, &extract_stack, &[])?;
-        st.borrow_mut().source_traceback = stack;
+        st.borrow_mut().cold_mut().source_traceback = stack;
     }
     let _ = inst;
     Ok(Object::None)
@@ -1017,7 +1288,7 @@ fn fut_remove_done_callback(args: &[Object]) -> Result<Object, RuntimeError> {
         type_error("remove_done_callback() missing 1 required positional argument: 'fn'")
     })?;
     let callbacks = st.borrow().callbacks.clone();
-    let mut kept: Vec<(Object, Object)> = Vec::with_capacity(callbacks.len());
+    let mut kept: Vec<(Object, CbContext)> = Vec::with_capacity(callbacks.len());
     let mut removed = 0i64;
     for (cb, ctx) in callbacks {
         if py_eq(interp, &cb, &target) {
@@ -1096,7 +1367,7 @@ fn fut_del(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state_of_instance(&inst);
     let (log, exc, loop_) = {
         let s = st.borrow();
-        (s.log_traceback, s.exception.clone(), s.loop_.clone())
+        (s.log_traceback, s.exception(), s.loop_.clone())
     };
     if log && !matches!(exc, Object::None) && !matches!(loop_, Object::None) {
         if let Ok(interp) = interp() {
@@ -1111,7 +1382,7 @@ fn fut_del(args: &[Object]) -> Result<Object, RuntimeError> {
             );
             ctx.insert(DictKey(Object::from_static("exception")), exc);
             ctx.insert(DictKey(Object::from_static("future")), self_obj);
-            let source_tb = st.borrow().source_traceback.clone();
+            let source_tb = st.borrow().source_traceback();
             if !matches!(source_tb, Object::None) {
                 ctx.insert(DictKey(Object::from_static("source_traceback")), source_tb);
             }
@@ -1155,12 +1426,22 @@ fn futprop_loop(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_callbacks(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let cbs: Vec<Object> = st
-        .borrow()
+    // Build the copied contexts once, so each reads back as the same
+    // object.
+    let mut s = st.borrow_mut();
+    for (_, ctx) in &mut s.callbacks {
+        if let CbContext::Copied(data) = ctx {
+            *ctx = CbContext::Given(crate::stdlib::contextvars_native::context_over(
+                data.clone(),
+            )?);
+        }
+    }
+    let cbs: Vec<Object> = s
         .callbacks
         .iter()
-        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone()]))
+        .map(|(cb, ctx)| Object::new_tuple_array([cb.clone(), ctx.clone().into_held()]))
         .collect();
+    drop(s);
     // The C getter reports `None` for an empty callback list (a fresh copy
     // otherwise) — `test_callbacks_copy` pins this.
     if cbs.is_empty() {
@@ -1177,7 +1458,7 @@ fn futprop_result(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_exception(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().exception.clone();
+    let out = st.borrow().exception();
     Ok(out)
 }
 
@@ -1199,19 +1480,19 @@ fn futprop_set_log_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn futprop_source_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().source_traceback.clone();
+    let out = st.borrow().source_traceback();
     Ok(out)
 }
 
 fn futprop_cancel_message(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = st.borrow().cancel_message.clone();
+    let out = st.borrow().cancel_message();
     Ok(out)
 }
 
 fn futprop_set_cancel_message(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    st.borrow_mut().cancel_message = args.get(1).cloned().unwrap_or(Object::None);
+    st.borrow_mut().cold_mut().cancel_message = args.get(1).cloned().unwrap_or(Object::None);
     Ok(Object::None)
 }
 
@@ -1283,14 +1564,44 @@ fn taskprop_set_log_destroy_pending(args: &[Object]) -> Result<Object, RuntimeEr
 
 fn taskprop_num_cancels(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = Object::Int(st.borrow().num_cancels_requested);
+    let out = Object::Int(st.borrow().num_cancels_requested());
     Ok(out)
 }
 
 // ---- FutureIter ----
 
-const FI_FUT_KEY: &str = "__weavepy_fi_fut__";
-const FI_DONE_KEY: &str = "__weavepy_fi_done__";
+/// A `FutureIter`'s fields, in slot storage (no instance dict): the
+/// future, and whether the iterator is exhausted.
+fn fi_layout() -> &'static crate::shared_value::SharedSlice<DictKey> {
+    static CELL: std::sync::OnceLock<crate::shared_value::SharedSlice<DictKey>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        ["__weavepy_fi_fut__", "__weavepy_fi_done__"]
+            .iter()
+            .map(|n| crate::types::slot_key(n))
+            .collect::<Vec<_>>()
+            .into()
+    })
+}
+
+/// The iterator's future (`None` once exhausted or if malformed).
+fn fi_future(inst: &PyInstance) -> Object {
+    match inst.slots.borrow().values_for_layout(fi_layout()) {
+        Some([fut, Object::Bool(false)]) => fut.clone(),
+        _ => Object::None,
+    }
+}
+
+fn fi_mark_done(inst: &PyInstance) {
+    let released = match inst.slots.borrow_mut().values_for_layout_mut(fi_layout()) {
+        Some([fut, done]) => {
+            *done = Object::Bool(true);
+            std::mem::replace(fut, Object::None)
+        }
+        _ => Object::None,
+    };
+    drop(released);
+}
 
 fn future_iter_class() -> Rc<TypeObject> {
     static CELL: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
@@ -1328,15 +1639,12 @@ fn future_iter_class() -> Rc<TypeObject> {
 }
 
 fn future_iter_new(fut: &Object) -> Object {
-    let inst = Rc::new(PyInstance::new(future_iter_class()));
-    inst.dict_cell()
-        .borrow_mut()
-        .insert(DictKey(Object::from_static(FI_FUT_KEY)), fut.clone());
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(FI_DONE_KEY)),
-        Object::Bool(false),
-    );
-    let out = Object::Instance(inst);
+    let mut inst = PyInstance::new(future_iter_class());
+    inst.slots = RefCell::new(crate::types::SlotStorage::from_layout(
+        fi_layout().clone(),
+        vec![fut.clone(), Object::Bool(false)],
+    ));
+    let out = Object::Instance(Rc::new(inst));
     // Built outside the ordinary instantiation path, so enrol with the
     // collector by hand: a suspended `await` parks this iterator on the
     // coroutine's value stack, and its strong `fut` edge must be
@@ -1358,19 +1666,8 @@ fn fi_iter(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn fi_next(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = fi_self(args)?;
-    let (fut, done) = {
-        let d = inst.dict_cell().borrow();
-        (
-            d.get(&DictKey(Object::from_static(FI_FUT_KEY)))
-                .cloned()
-                .unwrap_or(Object::None),
-            matches!(
-                d.get(&DictKey(Object::from_static(FI_DONE_KEY))),
-                Some(Object::Bool(true))
-            ),
-        )
-    };
-    if done || matches!(fut, Object::None) {
+    let fut = fi_future(&inst);
+    if matches!(fut, Object::None) {
         return Err(crate::error::stop_iteration_with(Object::None));
     }
     let st = state_of_obj(&fut)?;
@@ -1385,10 +1682,7 @@ fn fi_next(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         return Err(runtime_err("await wasn't used with future"));
     }
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(FI_DONE_KEY)),
-        Object::Bool(true),
-    );
+    fi_mark_done(&inst);
     let interp = interp()?;
     let value = future_result_impl(interp, &fut, &st)?;
     Err(crate::error::stop_iteration_with(value))
@@ -1456,19 +1750,13 @@ fn fi_throw(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(FI_DONE_KEY)),
-        Object::Bool(true),
-    );
+    fi_mark_done(&inst);
     Err(RuntimeError::PyException(PyException::new(exc_inst)))
 }
 
 fn fi_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = fi_self(args)?;
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(FI_DONE_KEY)),
-        Object::Bool(true),
-    );
+    fi_mark_done(&inst);
     Ok(Object::None)
 }
 
@@ -1531,7 +1819,14 @@ fn task_wakeup_callable(task: Object) -> Object {
                     .ok_or_else(|| type_error("__wakeup() missing future"))?;
                 let interp = interp()?;
                 awaited_by_discard(&future, &task);
-                match call_method(interp, &future, "result", &[]) {
+                let outcome = match &future {
+                    Object::Instance(fi) if is_exact_native(&future) => {
+                        let fst = state_of_instance(fi);
+                        future_result_impl(interp, &future, &fst)
+                    }
+                    _ => call_method(interp, &future, "result", &[]),
+                };
+                match outcome {
                     Ok(_) => task_step(&task, None)?,
                     Err(RuntimeError::PyException(pe)) => task_step(&task, Some(pe.instance))?,
                     Err(other) => return Err(other),
@@ -1575,9 +1870,7 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     } else {
         loop_
     };
-    let debug = call_method(interp, &loop_, "get_debug", &[])
-        .map(|v| truthy(&v))
-        .unwrap_or(false);
+    let debug = crate::stdlib::asyncio_events::get_debug(&loop_).unwrap_or(false);
     {
         let mut s = st.borrow_mut();
         s.loop_ = loop_.clone();
@@ -1590,19 +1883,23 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         // `extract_stack(sys._getframe(1))` (no pop needed;
         // `test_task_source_traceback` checks `[-2]` is the test body).
         let stack = call(interp, &extract_stack, &[])?;
-        st.borrow_mut().source_traceback = stack;
+        st.borrow_mut().cold_mut().source_traceback = stack;
     }
-    // Coroutine validation.
-    let iscoroutine = import_attr(interp, "asyncio.coroutines", "iscoroutine")?;
-    let is_coro = call(interp, &iscoroutine, std::slice::from_ref(&coro))?;
-    if !truthy(&is_coro) {
+    // Coroutine validation (a native coroutine needs no Python call).
+    let is_coro = matches!(coro, Object::Coroutine(_)) || {
+        let iscoroutine = import_attr(interp, "asyncio.coroutines", "iscoroutine")?;
+        truthy(&call(interp, &iscoroutine, std::slice::from_ref(&coro))?)
+    };
+    if !is_coro {
         st.borrow_mut().log_destroy_pending = false;
         let r = py_repr(interp, &coro);
         // C Task's wording ("expected"), not the Python Task's ("required").
         return Err(type_error(format!("a coroutine was expected, got {r}")));
     }
     let name_obj = if matches!(name, Object::None) {
-        Object::from_str(format!("Task-{}", task_name_counter()))
+        // The counter's value; `get_name` formats `Task-N` on first use
+        // (as the C Task does).
+        Object::Int(task_name_counter())
     } else if matches!(name, Object::Str(_)) {
         name
     } else {
@@ -1612,8 +1909,7 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         call(interp, &str_type, &[name])?
     };
     let ctx = if matches!(context, Object::None) {
-        let copy_context = import_attr(interp, "contextvars", "copy_context")?;
-        call(interp, &copy_context, &[])?
+        crate::stdlib::contextvars_native::copy_current()?
     } else {
         context
     };
@@ -1622,23 +1918,20 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         s.coro = coro;
         s.name = name_obj;
         s.context = ctx.clone();
-        s.num_cancels_requested = 0;
+        if let Some(cold) = s.cold.as_mut() {
+            cold.num_cancels_requested = 0;
+        }
         s.must_cancel = false;
         s.fut_waiter = Object::None;
     }
-    let loop_running = call_method(interp, &loop_, "is_running", &[])
-        .map(|v| truthy(&v))
-        .unwrap_or(false);
-    if eager_start && loop_running {
+    let loop_running = eager_start
+        && call_method(interp, &loop_, "is_running", &[])
+            .map(|v| truthy(&v))
+            .unwrap_or(false);
+    if loop_running {
         task_eager_start(interp, &self_obj, &st)?;
     } else {
-        call_method_kw(
-            interp,
-            &loop_,
-            "call_soon",
-            &[task_step_callable(self_obj.clone())],
-            &[("context".to_owned(), ctx)],
-        )?;
+        call_soon(&loop_, task_step_callable(self_obj.clone()), &[], ctx)?;
         register_task_impl(interp, &self_obj)?;
     }
     Ok(Object::None)
@@ -1668,7 +1961,7 @@ fn task_eager_start(
             call_kw: None,
         }))
     };
-    let run_result = call_method(interp, &ctx, "run", &[step_fn]);
+    let run_result = crate::stdlib::contextvars_native::run_in_context(&ctx, &step_fn, &[]);
     let unregister_result = unregister_eager_task_impl(interp, self_obj);
     swap_current_task_impl(&loop_, &prev);
     run_result?;
@@ -1727,18 +2020,25 @@ fn task_step_inner(
     if manage_current {
         enter_task_impl(interp, &loop_, task)?;
     }
-    let send_result = match &exc {
-        Some(e) => {
-            let throw_m = interp.load_attr_public(&coro, "throw");
-            match throw_m {
-                Ok(m) => call(interp, &m, std::slice::from_ref(e)),
-                Err(err) => Err(err),
-            }
+    let send_result = match (&exc, &coro) {
+        // A native coroutine is driven directly, as the C Task's
+        // `PyIter_Send` does: a return needs no `StopIteration`.
+        (None, Object::Coroutine(g)) => match interp.generator_resume(g, Object::None) {
+            Ok(crate::GenResume::Yielded(v)) => SendOutcome::Yield(v),
+            Ok(crate::GenResume::Returned(v)) => SendOutcome::Return(v),
+            Err(e) => SendOutcome::from_result(Err(e)),
+        },
+        (Some(e), Object::Coroutine(_)) => {
+            SendOutcome::from_result(interp.gen_method_throw(&coro, std::slice::from_ref(e)))
         }
-        None => match interp.load_attr_public(&coro, "send") {
+        (Some(e), _) => SendOutcome::from_result(match interp.load_attr_public(&coro, "throw") {
+            Ok(m) => call(interp, &m, std::slice::from_ref(e)),
+            Err(err) => Err(err),
+        }),
+        (None, _) => SendOutcome::from_result(match interp.load_attr_public(&coro, "send") {
             Ok(m) => call(interp, &m, &[Object::None]),
             Err(err) => Err(err),
-        },
+        }),
     };
     let step_result = task_step_handle_result(interp, task, &st, &loop_, &context, send_result);
     if manage_current {
@@ -1757,14 +2057,34 @@ fn schedule_step_with_exc(
     context: &Object,
     exc: Object,
 ) -> Result<(), RuntimeError> {
-    call_method_kw(
-        interp,
+    let _ = interp;
+    call_soon(
         loop_,
-        "call_soon",
-        &[task_step_callable(task.clone()), exc],
-        &[("context".to_owned(), context.clone())],
+        task_step_callable(task.clone()),
+        &[exc],
+        context.clone(),
     )?;
     Ok(())
+}
+
+/// How one `send`/`throw` into a task's coroutine concluded.
+enum SendOutcome {
+    Yield(Object),
+    Return(Object),
+    Raise(RuntimeError),
+}
+
+impl SendOutcome {
+    /// From a `send`/`throw` call's result (`StopIteration` is a return).
+    fn from_result(r: Result<Object, RuntimeError>) -> Self {
+        match r {
+            Ok(v) => SendOutcome::Yield(v),
+            Err(RuntimeError::PyException(pe)) if is_builtin_exc(&pe.instance, "StopIteration") => {
+                SendOutcome::Return(stop_iteration_value(&pe.instance))
+            }
+            Err(e) => SendOutcome::Raise(e),
+        }
+    }
 }
 
 fn task_step_handle_result(
@@ -1773,34 +2093,34 @@ fn task_step_handle_result(
     st: &Rc<RefCell<FutState>>,
     loop_: &Object,
     context: &Object,
-    send_result: Result<Object, RuntimeError>,
+    send_result: SendOutcome,
 ) -> Result<(), RuntimeError> {
     match send_result {
-        Err(RuntimeError::PyException(pe)) => {
-            let inst = pe.instance.clone();
-            if is_builtin_exc(&inst, "StopIteration") {
-                // Coroutine completed.
-                let value = stop_iteration_value(&inst);
-                let must_cancel = st.borrow().must_cancel;
-                if must_cancel {
-                    st.borrow_mut().must_cancel = false;
-                    let msg = st.borrow().cancel_message.clone();
-                    future_cancel_impl(interp, task, st, msg)?;
-                } else {
-                    // Internal set_result (bypasses Task's override).
-                    if future_done_st(st) {
-                        return Err(invalid_state_already(interp, "invalid state", task));
-                    }
-                    {
-                        let mut s = st.borrow_mut();
-                        s.result = value;
-                        s.status = FutStatus::Finished;
-                    }
-                    schedule_callbacks(interp, task, st)?;
+        SendOutcome::Return(value) => {
+            // Coroutine completed.
+            let must_cancel = st.borrow().must_cancel;
+            if must_cancel {
+                st.borrow_mut().must_cancel = false;
+                let msg = st.borrow().cancel_message();
+                future_cancel_impl(interp, task, st, msg)?;
+            } else {
+                // Internal set_result (bypasses Task's override).
+                if future_done_st(st) {
+                    return Err(invalid_state_already(interp, "invalid state", task));
                 }
-                Ok(())
-            } else if is_instance_of_named(interp, &inst, "asyncio.exceptions", "CancelledError") {
-                st.borrow_mut().cancelled_exc = inst;
+                {
+                    let mut s = st.borrow_mut();
+                    s.result = value;
+                    s.status = FutStatus::Finished;
+                }
+                schedule_callbacks(interp, task, st)?;
+            }
+            Ok(())
+        }
+        SendOutcome::Raise(RuntimeError::PyException(pe)) => {
+            let inst = pe.instance.clone();
+            if is_instance_of_named(interp, &inst, "asyncio.exceptions", "CancelledError") {
+                st.borrow_mut().cold_mut().cancelled_exc = inst;
                 future_cancel_impl(interp, task, st, Object::None)?;
                 Ok(())
             } else if is_builtin_exc(&inst, "KeyboardInterrupt")
@@ -1813,8 +2133,67 @@ fn task_step_handle_result(
                 Ok(())
             }
         }
-        Err(other) => Err(other),
-        Ok(result) => {
+        SendOutcome::Raise(other) => Err(other),
+        SendOutcome::Yield(result) if is_exact_native(&result) => {
+            // The coroutine suspended on an exact native Future or Task:
+            // its state is read and its callback list appended directly
+            // (the C Task's `Future_CheckExact` fast path).
+            let Object::Instance(rinst) = &result else {
+                unreachable!("is_exact_native checks for an instance")
+            };
+            let rst = state_of_instance(rinst);
+            let (blocking, result_loop) = {
+                let r = rst.borrow();
+                (r.blocking, r.loop_.clone())
+            };
+            if !same_object(&result_loop, loop_) {
+                let t = py_repr(interp, task);
+                let r = py_repr(interp, &result);
+                let new_exc = crate::builtin_types::make_exception(
+                    "RuntimeError",
+                    format!("Task {t} got Future {r} attached to a different loop"),
+                );
+                return schedule_step_with_exc(interp, task, loop_, context, new_exc);
+            }
+            if !blocking {
+                let t = py_repr(interp, task);
+                let r = py_repr(interp, &result);
+                let new_exc = crate::builtin_types::make_exception(
+                    "RuntimeError",
+                    format!("yield was used instead of yield from in task {t} with {r}"),
+                );
+                return schedule_step_with_exc(interp, task, loop_, context, new_exc);
+            }
+            if same_object(&result, task) {
+                let t = py_repr(interp, task);
+                let new_exc = crate::builtin_types::make_exception(
+                    "RuntimeError",
+                    format!("Task cannot await on itself: {t}"),
+                );
+                return schedule_step_with_exc(interp, task, loop_, context, new_exc);
+            }
+            rst.borrow_mut().blocking = false;
+            future_add_done_callback_impl(
+                interp,
+                &result,
+                &rst,
+                task_wakeup_callable(task.clone()),
+                context.clone(),
+            )?;
+            st.borrow_mut().fut_waiter = result.clone();
+            awaited_by_add(&result, task);
+            let must_cancel = st.borrow().must_cancel;
+            if must_cancel {
+                let msg = st.borrow().cancel_message();
+                let cancelled =
+                    call_method_kw(interp, &result, "cancel", &[], &[("msg".to_owned(), msg)])?;
+                if truthy(&cancelled) {
+                    st.borrow_mut().must_cancel = false;
+                }
+            }
+            Ok(())
+        }
+        SendOutcome::Yield(result) => {
             // The coroutine suspended, yielding `result`.
             let blocking_attr = interp
                 .load_attr_public(&result, "_asyncio_future_blocking")
@@ -1851,7 +2230,7 @@ fn task_step_handle_result(
                         awaited_by_add(&result, task);
                         let must_cancel = st.borrow().must_cancel;
                         if must_cancel {
-                            let msg = st.borrow().cancel_message.clone();
+                            let msg = st.borrow().cancel_message();
                             let cancelled = call_method_kw(
                                 interp,
                                 &result,
@@ -1876,12 +2255,11 @@ fn task_step_handle_result(
                 }
             } else if matches!(result, Object::None) {
                 // Bare `yield` — reschedule.
-                call_method_kw(
-                    interp,
+                call_soon(
                     loop_,
-                    "call_soon",
-                    &[task_step_callable(task.clone())],
-                    &[("context".to_owned(), context.clone())],
+                    task_step_callable(task.clone()),
+                    &[],
+                    context.clone(),
                 )?;
                 Ok(())
             } else if matches!(result, Object::Generator(_)) {
@@ -1919,8 +2297,8 @@ fn task_internal_set_exception(
     }
     {
         let mut s = st.borrow_mut();
-        s.exception_tb = exc_traceback_of(&exc_inst);
-        s.exception = exc_inst;
+        s.cold_mut().exception_tb = exc_traceback_of(&exc_inst);
+        s.cold_mut().exception = exc_inst;
         s.status = FutStatus::Finished;
         s.log_traceback = true;
     }
@@ -1956,13 +2334,8 @@ fn get_loop_of(interp: &mut Interp, fut: &Object) -> Object {
 fn set_future_blocking_false(interp: &mut Interp, fut: &Object) -> Result<(), RuntimeError> {
     // Fast path for native futures; foreign future-likes get a setattr.
     if let Object::Instance(inst) = fut {
-        if inst
-            .dict_cell()
-            .borrow()
-            .get(&DictKey(Object::from_static(HANDLE_KEY)))
-            .is_some()
-        {
-            state_of_instance(inst).borrow_mut().blocking = false;
+        if let Some(st) = existing_state_of(inst) {
+            st.borrow_mut().blocking = false;
             return Ok(());
         }
     }
@@ -1990,7 +2363,7 @@ fn task_cancel(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     if future_done_st(&st) {
         return Ok(Object::Bool(false));
     }
-    st.borrow_mut().num_cancels_requested += 1;
+    st.borrow_mut().cold_mut().num_cancels_requested += 1;
     let fut_waiter = st.borrow().fut_waiter.clone();
     if !matches!(fut_waiter, Object::None) {
         let cancelled = call_method_kw(
@@ -2007,27 +2380,27 @@ fn task_cancel(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     {
         let mut s = st.borrow_mut();
         s.must_cancel = true;
-        s.cancel_message = msg;
+        s.cold_mut().cancel_message = msg;
     }
     Ok(Object::Bool(true))
 }
 
 fn task_cancelling(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
-    let out = Object::Int(st.borrow().num_cancels_requested);
+    let out = Object::Int(st.borrow().num_cancels_requested());
     Ok(out)
 }
 
 fn task_uncancel(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let mut s = st.borrow_mut();
-    if s.num_cancels_requested > 0 {
-        s.num_cancels_requested -= 1;
-        if s.num_cancels_requested == 0 {
+    if s.num_cancels_requested() > 0 {
+        s.cold_mut().num_cancels_requested -= 1;
+        if s.num_cancels_requested() == 0 {
             s.must_cancel = false;
         }
     }
-    Ok(Object::Int(s.num_cancels_requested))
+    Ok(Object::Int(s.num_cancels_requested()))
 }
 
 fn task_get_coro(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2045,10 +2418,14 @@ fn task_get_context(args: &[Object]) -> Result<Object, RuntimeError> {
 fn task_get_name(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let name = st.borrow().name.clone();
-    Ok(if matches!(name, Object::None) {
-        Object::from_static("")
-    } else {
-        name
+    Ok(match name {
+        Object::None => Object::from_static(""),
+        Object::Int(n) => {
+            let formatted = Object::from_str(format!("Task-{n}"));
+            st.borrow_mut().name = formatted.clone();
+            formatted
+        }
+        name => name,
     })
 }
 
@@ -2142,7 +2519,7 @@ fn task_del(args: &[Object]) -> Result<Object, RuntimeError> {
                 Object::from_static("Task was destroyed but it is pending!"),
             );
             ctx.insert(DictKey(Object::from_static("task")), self_obj);
-            let source_tb = st.borrow().source_traceback.clone();
+            let source_tb = st.borrow().source_traceback();
             if !matches!(source_tb, Object::None) {
                 ctx.insert(DictKey(Object::from_static("source_traceback")), source_tb);
             }
@@ -2185,6 +2562,17 @@ fn method_kw(
     }))
 }
 
+/// The leaf half of the `_log_destroy_pending` setter: a `bool`, `int`
+/// or `None` value, whose truth runs no Python code.
+fn log_destroy_pending_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Instance(_), Object::Bool(_) | Object::Int(_) | Object::None] => {
+            Some(taskprop_set_log_destroy_pending(args))
+        }
+        _ => None,
+    }
+}
+
 fn install_getset(
     cls: &Rc<TypeObject>,
     name: &'static str,
@@ -2192,12 +2580,20 @@ fn install_getset(
     setter: Option<fn(&[Object]) -> Result<Object, RuntimeError>>,
 ) {
     let fset = match setter {
-        Some(s) => Object::Builtin(Rc::new(BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(s),
-            call_kw: None,
-        })),
+        Some(s) => {
+            let b = Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(s),
+                call_kw: None,
+            });
+            // A plain value stores into the native state, running no
+            // Python code (anything else may: its truth test).
+            if std::ptr::fn_addr_eq(s, taskprop_set_log_destroy_pending as fn(&[Object]) -> _) {
+                crate::leaf_builtins::register_fast(&b, log_destroy_pending_leaf);
+            }
+            Object::Builtin(b)
+        }
         None => Object::None,
     };
     let prop = Object::Property(Rc::new(PyProperty::new(
@@ -2223,9 +2619,56 @@ fn install_getset(
         .insert(DictKey(Object::from_static(name)), prop);
 }
 
+/// Whether `obj` is the native `Future` class itself.
+pub(crate) fn is_future_class(obj: &Object) -> bool {
+    matches!(obj, Object::Type(t) if Rc::ptr_eq(t, future_class_ref()))
+}
+
+/// Whether `obj` is the native `Task` class itself.
+pub(crate) fn is_task_class(obj: &Object) -> bool {
+    matches!(obj, Object::Type(t) if Rc::ptr_eq(t, task_class_ref()))
+}
+
+/// A tracked, uninitialized instance of the native class `cls`.
+fn new_instance(cls: Rc<TypeObject>) -> Object {
+    let obj = Object::Instance(Rc::new(PyInstance::new(cls)));
+    crate::gc_trace::track(&obj);
+    obj
+}
+
+/// `Future(loop=loop_)`, built natively.
+pub(crate) fn new_future(loop_: &Object) -> Result<Object, RuntimeError> {
+    let fut = new_instance(future_class());
+    fut_init(
+        std::slice::from_ref(&fut),
+        &[("loop".to_owned(), loop_.clone())],
+    )?;
+    Ok(fut)
+}
+
+/// `Task(coro, loop=loop_, **kwargs)`, built natively.
+pub(crate) fn new_task(
+    loop_: &Object,
+    coro: Object,
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let task = new_instance(task_class());
+    let mut kw = Vec::with_capacity(kwargs.len() + 1);
+    kw.push(("loop".to_owned(), loop_.clone()));
+    kw.extend_from_slice(kwargs);
+    task_init(&[task.clone(), coro], &kw)?;
+    Ok(task)
+}
+
 fn future_class() -> Rc<TypeObject> {
-    static CELL: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
+    future_class_ref().clone()
+}
+
+static FUTURE_CLASS: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
+static TASK_CLASS: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
+
+fn future_class_ref() -> &'static Rc<TypeObject> {
+    FUTURE_CLASS.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::default();
         dict.insert(
@@ -2329,12 +2772,14 @@ fn future_class() -> Rc<TypeObject> {
         install_getset(&cls, "_asyncio_awaited_by", futprop_awaited_by, None);
         cls
     })
-    .clone()
 }
 
 fn task_class() -> Rc<TypeObject> {
-    static CELL: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
+    task_class_ref().clone()
+}
+
+fn task_class_ref() -> &'static Rc<TypeObject> {
+    TASK_CLASS.get_or_init(|| {
         let mut dict = DictData::default();
         dict.insert(
             DictKey(Object::from_static("__module__")),
@@ -2414,7 +2859,6 @@ fn task_class() -> Rc<TypeObject> {
         install_getset(&cls, "_num_cancels_requested", taskprop_num_cancels, None);
         cls
     })
-    .clone()
 }
 
 // ---- module functions ----
@@ -2580,7 +3024,7 @@ fn mod_all_tasks(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     };
     // Snapshot the eager set first (a task may graduate from eager to
     // scheduled on another thread; snapshotting eager first cannot miss it).
-    let mut candidates: Vec<Object> = Vec::new();
+    let mut candidates: Vec<Object> = registered_native_tasks();
     for registry in [eager_tasks_obj().get(), scheduled_tasks_obj().get()] {
         let Some(reg) = registry else { continue };
         let it = interp.iter_object(reg.clone())?;
@@ -2625,10 +3069,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("get_running_loop")),
             modfn("get_running_loop", mod_get_running_loop),
-        );
-        d.insert(
-            DictKey(Object::from_static("_get_running_loop")),
-            modfn("_get_running_loop", mod_get_running_loop_raw),
         );
         d.insert(
             DictKey(Object::from_static("_set_running_loop")),
@@ -2684,22 +3124,31 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: Some(Box::new(mod_all_tasks)),
             })),
         );
-        d.insert(
-            DictKey(Object::from_static("future_add_to_awaited_by")),
-            modfn("future_add_to_awaited_by", mod_future_add_to_awaited_by),
-        );
-        d.insert(
-            DictKey(Object::from_static("future_discard_from_awaited_by")),
-            modfn(
+        // These run no Python code (identity checks on native futures, the
+        // running loop's slot) and release nothing: the core loop calls
+        // them in place.
+        for (name, body) in [
+            (
+                "future_add_to_awaited_by",
+                mod_future_add_to_awaited_by as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            (
                 "future_discard_from_awaited_by",
                 mod_future_discard_from_awaited_by,
             ),
-        );
+            ("_get_running_loop", mod_get_running_loop_raw),
+        ] {
+            let f = modfn(name, body);
+            if let Object::Builtin(b) = &f {
+                crate::leaf_builtins::register(b);
+            }
+            d.insert(DictKey(Object::from_static(name)), f);
+        }
     }
-    // The task registries shared with `tasks.py`: a `weakref.WeakSet` for
-    // scheduled tasks (so leaked tasks don't accumulate) and a plain `set`
-    // for eager ones — created through the interpreter so they are real
-    // Python objects the frozen helpers can iterate.
+    // The registries for task-likes that aren't native tasks: a
+    // `weakref.WeakSet` for scheduled ones (so leaked tasks don't
+    // accumulate) and a plain `set` for eager ones, created through the
+    // interpreter so they are real Python objects.
     if let Ok(interp) = interp() {
         let scheduled = import_attr(interp, "weakref", "WeakSet")
             .and_then(|ws| call(interp, &ws, &[]))

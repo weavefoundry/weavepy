@@ -11,6 +11,27 @@ pub struct FrozenSource {
     pub is_package: bool,
 }
 
+/// The hash the frozen code cache checks a module's source against:
+/// FNV-1a over 8-byte words (the tail zero-padded). Tiny,
+/// dependency-free, and plenty for cache validation (collisions only
+/// matter combined with an equal length). build.rs computes it for every
+/// row of [`frozen_sources`], so a cache hit never reads the source text.
+pub(crate) fn source_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let (words, rest) = s.as_bytes().as_chunks::<8>();
+    let mut mix = |w: u64| {
+        h ^= w;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for w in words {
+        mix(u64::from_le_bytes(*w));
+    }
+    let mut tail = [0u8; 8];
+    tail[..rest.len()].copy_from_slice(rest);
+    mix(u64::from_le_bytes(tail));
+    h
+}
+
 pub(crate) fn frozen_sources() -> &'static [FrozenSource] {
     // A `static`, not a promoted local: the table is far past clippy's
     // stack-array budget (`large_stack_arrays`).

@@ -27,13 +27,15 @@ mod sealed {
 /// Implementations must have an initialized, immutable `usize` length at
 /// offset zero. `pointer` must reconstruct exactly the original Arc pointee,
 /// including slice metadata, size, alignment, and element destruction.
-/// Constructors must preserve this invariant for every live strong reference.
+/// Constructors must preserve this invariant for every live strong reference,
+/// and dropping the payload must leave the length in place: it still sizes
+/// the allocation for the weak owners (see [`ThinWeak`]).
 pub unsafe trait ThinPayload: sealed::Sealed {
     type View: ?Sized;
     /// Release the last reference to a payload. A payload whose release
     /// can release more containers goes through `rc::release_nested`.
     fn release_last(last: Arc<Self>) {
-        drop(last);
+        crate::rc::drop_arc(last);
     }
     fn pointer(data: *const usize, len: usize) -> *const Self;
     fn view(&self) -> &Self::View;
@@ -50,12 +52,21 @@ pub struct ThinArc<T: ?Sized + ThinPayload> {
 unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Send for ThinArc<T> {}
 unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Sync for ThinArc<T> {}
 
-/// A weak owner retaining its full metadata after the payload is destroyed.
-pub struct ThinWeak<T: ?Sized + ThinPayload>(Weak<T>);
+/// A single-word weak owner of a length-prefixed Arc payload. The length
+/// word outlives the payload (see [`ThinPayload`]), so it rebuilds the
+/// full pointer after the payload is destroyed too.
+pub struct ThinWeak<T: ?Sized + ThinPayload> {
+    data: NonNull<usize>,
+    ownership: PhantomData<Weak<T>>,
+}
+
+// SAFETY: as for `ThinArc`, with `Weak`'s requirements, which are `Arc`'s.
+unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Send for ThinWeak<T> {}
+unsafe impl<T: ?Sized + ThinPayload + Send + Sync> Sync for ThinWeak<T> {}
 
 impl<T: ?Sized + ThinPayload> fmt::Debug for ThinWeak<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        f.write_str("(Weak)")
     }
 }
 
@@ -93,6 +104,13 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
         this.data == other.data
     }
 
+    /// The owner's one word: equal for every owner of the same allocation
+    /// (what [`Self::ptr_eq`] compares), and never reused while one exists.
+    #[inline]
+    pub fn word(this: &Self) -> usize {
+        this.data.as_ptr() as usize
+    }
+
     pub fn strong_count(this: &Self) -> usize {
         Arc::strong_count(&this.arc_view())
     }
@@ -102,7 +120,13 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
     }
 
     pub fn downgrade(this: &Self) -> ThinWeak<T> {
-        ThinWeak(Arc::downgrade(&this.arc_view()))
+        let weak = Weak::into_raw(Arc::downgrade(&this.arc_view()));
+        ThinWeak {
+            // SAFETY: a weak pointer from a live Arc is its non-null payload
+            // address, the same one this owner holds.
+            data: unsafe { NonNull::new_unchecked(weak.cast::<usize>().cast_mut()) },
+            ownership: PhantomData,
+        }
     }
 
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
@@ -203,19 +227,44 @@ where
     }
 }
 impl<T: ?Sized + ThinPayload> ThinWeak<T> {
+    #[inline]
+    fn weak_view(&self) -> ManuallyDrop<Weak<T>> {
+        // SAFETY: this owner holds a weak reference, which keeps the
+        // allocation, and so its length word, in place (see `ThinPayload`).
+        let len = unsafe { self.data.as_ptr().read() };
+        // SAFETY: the pointer `Weak::into_raw` gave, rebuilt with its
+        // original metadata; the view neither adds nor releases a reference.
+        ManuallyDrop::new(unsafe { Weak::from_raw(T::pointer(self.data.as_ptr(), len)) })
+    }
+
+    /// The payload's address, as [`ThinArc::addr`] reports it for a strong
+    /// owner of the same allocation.
+    pub fn addr(&self) -> usize {
+        self.data.as_ptr() as usize
+    }
     pub fn upgrade(&self) -> Option<ThinArc<T>> {
-        self.0.upgrade().map(ThinArc::from_arc)
+        self.weak_view().upgrade().map(ThinArc::from_arc)
     }
     pub fn strong_count(&self) -> usize {
-        self.0.strong_count()
+        self.weak_view().strong_count()
     }
     pub fn weak_count(&self) -> usize {
-        self.0.weak_count()
+        self.weak_view().weak_count()
     }
 }
 impl<T: ?Sized + ThinPayload> Clone for ThinWeak<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        // The copy accounts for the added weak reference.
+        let _ = Weak::into_raw((*self.weak_view()).clone());
+        Self {
+            data: self.data,
+            ownership: PhantomData,
+        }
+    }
+}
+impl<T: ?Sized + ThinPayload> Drop for ThinWeak<T> {
+    fn drop(&mut self) {
+        drop(ManuallyDrop::into_inner(self.weak_view()));
     }
 }
 
@@ -541,6 +590,11 @@ pub struct SharedStr(ThinArc<StrStorage>);
 #[derive(Debug)]
 pub struct WeakStr(ThinWeak<StrStorage>);
 impl SharedStr {
+    /// The allocation's address: equal for every strong and weak owner of
+    /// the same string, and never reused while one exists.
+    pub fn addr(this: &Self) -> usize {
+        this.0.data.as_ptr() as usize
+    }
     pub fn as_ptr(this: &Self) -> *const str {
         ptr::from_ref(&**this)
     }
@@ -662,7 +716,16 @@ impl SharedStr {
         } else {
             suffix.chars().count()
         };
-        ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars)
+        if ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars) {
+            return true;
+        }
+        // This thread's indexing cursor (see `object::str_byte_offset`) may
+        // hold the only weak reference to a string that's otherwise ours
+        // alone: forget it rather than copy the whole string.
+        Self::strong_count(this) == 1
+            && Self::weak_count(this) == 1
+            && crate::object::release_str_cursor(this)
+            && ThinArc::<StrStorage>::try_extend_unique(&mut this.0, suffix.as_bytes(), extra_chars)
     }
 
     /// The concatenation of `parts`, in one allocation.
@@ -750,9 +813,65 @@ impl Deref for SharedStr {
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 }
+impl SharedStr {
+    /// The shared empty string, or the shared one-character string for a
+    /// Latin-1 character (CPython caches the same 257): `None` for
+    /// anything longer. Indexing and iterating a string then allocate
+    /// nothing for these characters.
+    #[inline]
+    pub fn small(value: &str) -> Option<Self> {
+        let code = match value.as_bytes() {
+            [] => return Some(small_table()[256].clone()),
+            [b] => usize::from(*b),
+            // U+0080..U+00FF encode as two bytes led by 0xC2 or 0xC3.
+            [lead @ (0xC2 | 0xC3), cont] => usize::from((lead & 0x1F) << 6 | (cont & 0x3F)),
+            _ => return None,
+        };
+        Some(small_table()[code].clone())
+    }
+}
+
+/// [`SharedStr::small`]'s strings: the 256 Latin-1 characters by code
+/// point, then the empty string.
+fn small_table() -> &'static [SharedStr; 257] {
+    static TABLE: std::sync::OnceLock<[SharedStr; 257]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let mut buf = [0; 4];
+            let text: &str = if i == 256 {
+                ""
+            } else {
+                char::from(i as u8).encode_utf8(&mut buf)
+            };
+            SharedStr::fresh(text)
+        })
+    })
+}
+
+impl SharedStr {
+    /// A newly allocated string holding `value` (see [`SharedStr::small`]
+    /// for the shared ones).
+    #[inline]
+    fn fresh(value: &str) -> Self {
+        let len = value.len();
+        // SAFETY: exactly `len` bytes of UTF-8 are copied; the count is
+        // left for first use.
+        Self(unsafe {
+            StrStorage::alloc(len, if len == 0 { 0 } else { CHARS_UNKNOWN }, |dst| {
+                copy_text(value.as_ptr(), dst, len);
+            })
+        })
+    }
+}
+
 impl From<&str> for SharedStr {
     #[inline]
     fn from(value: &str) -> Self {
+        if value.len() <= 2 {
+            if let Some(small) = Self::small(value) {
+                return small;
+            }
+        }
         let len = value.len();
         // SAFETY: exactly `len` bytes of UTF-8 are copied; the count is
         // left for first use.
@@ -804,6 +923,10 @@ impl fmt::Display for SharedStr {
     }
 }
 impl WeakStr {
+    /// The string's allocation address (see [`SharedStr::addr`]).
+    pub fn addr(&self) -> usize {
+        self.0.addr()
+    }
     pub fn upgrade(&self) -> Option<SharedStr> {
         self.0.upgrade().map(SharedStr)
     }
@@ -823,7 +946,7 @@ impl sealed::Sealed for crate::tuple_storage::TupleStorage {}
 // unique mutation changes elements/hash, never slice length or metadata.
 unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
     fn release_last(last: Arc<Self>) {
-        crate::rc::release_nested(last);
+        crate::rc::release_nested_arc(last);
     }
     type View = Self;
     fn pointer(data: *const usize, len: usize) -> *const Self {
@@ -842,8 +965,17 @@ mod tests {
 
     #[test]
     fn strings_preserve_utf8_hash_lookup_and_data_identity() {
-        for text in ["", "a", "x\0y", "mañana", "日本語", "🧶🙂", "e\u{301}"] {
-            let value = SharedStr::from(text);
+        for text in ["", "a", "é", "x\0y", "mañana", "日本語", "🧶🙂", "e\u{301}"] {
+            // The empty and one-character Latin-1 strings are shared (see
+            // `SharedStr::small`); the ownership checks below need an
+            // allocation of their own.
+            let shared = SharedStr::small(text).is_some();
+            assert_eq!(shared, text.chars().count() <= 1);
+            assert_eq!(
+                SharedStr::ptr_eq(&SharedStr::from(text), &SharedStr::from(text)),
+                shared
+            );
+            let value = SharedStr::fresh(text);
             assert_eq!(&*value, text);
             assert_eq!(SharedStr::as_ptr(&value).cast::<u8>(), value.as_ptr());
             assert_eq!(
@@ -864,6 +996,24 @@ mod tests {
             assert!(weak.upgrade().is_none());
             assert_eq!(weak.strong_count(), 0);
         }
+    }
+
+    #[test]
+    fn indexing_cursor_does_not_block_in_place_appends() {
+        let mut text = SharedStr::from("mañana mañana");
+        assert_eq!(crate::object::str_char_at(&text, 9), Some('ñ'));
+        assert_eq!(SharedStr::weak_count(&text), 1);
+        assert!(SharedStr::try_append(&mut text, "ñ"));
+        assert_eq!(&*text, "mañana mañanañ");
+        assert_eq!(crate::object::str_char_at(&text, 13), Some('ñ'));
+        assert_eq!(crate::object::str_char_at(&text, 9), Some('ñ'));
+        // Another strong owner still keeps the text in place.
+        let other = text.clone();
+        assert!(!SharedStr::try_append(&mut text, "x"));
+        assert!(SharedStr::ptr_eq(&text, &other));
+        drop(other);
+        assert!(SharedStr::try_append(&mut text, "x"));
+        assert_eq!(crate::object::str_char_at(&text, 14), Some('x'));
     }
 
     #[test]
@@ -926,7 +1076,10 @@ mod tests {
             "🧶🙂",
             "e\u{301}",
         ] {
-            let value = SharedStr::from(text);
+            // A fresh allocation: a shared small string (see
+            // `SharedStr::small`) has other owners, and its count may
+            // already be known.
+            let value = SharedStr::fresh(text);
             assert_eq!(
                 SharedStr::known_char_count(&value),
                 text.is_empty().then_some(0)
@@ -951,6 +1104,10 @@ mod tests {
                 crate::object::py_str_hash(&expected)
             );
         }
+        // The shared small strings never grow in place.
+        let mut small = SharedStr::from("a");
+        assert!(!SharedStr::try_append(&mut small, "b"));
+        assert_eq!(&*SharedStr::from("a"), "a");
         let ascii = SharedStr::from_ascii("abc");
         assert_eq!(SharedStr::known_char_count(&ascii), Some(3));
         // SAFETY: ASCII parts and their count.

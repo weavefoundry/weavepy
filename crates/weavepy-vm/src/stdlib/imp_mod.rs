@@ -947,21 +947,23 @@ fn fix_co_filename(args: &[Object]) -> Result<Object, RuntimeError> {
             "_fix_co_filename: second argument must be a str",
         ));
     };
-    fix_co_filename_rec(code, path.as_ref());
+    // One copy of the path for every code object the call rewrites.
+    let path: std::sync::Arc<str> = std::sync::Arc::from(path.as_ref());
+    fix_co_filename_rec(code, &path);
     Ok(Object::None)
 }
 
-fn fix_co_filename_rec(code: &weavepy_compiler::CodeObject, path: &str) {
-    if code.filename != path {
+fn fix_co_filename_rec(code: &weavepy_compiler::CodeObject, path: &std::sync::Arc<str>) {
+    if *code.filename != **path {
         // SAFETY: `co_filename` is mutated in place through the shared
         // handle, exactly like CPython's `update_compiled_module`. The
         // VM is single-threaded per interpreter and nothing reads the
         // field concurrently with this import-time call; the write is a
-        // plain field replacement (the old `String` is dropped by the
+        // plain field replacement (the old handle is dropped by the
         // assignment).
         unsafe {
             let f = std::ptr::addr_of!(code.filename).cast_mut();
-            *f = path.to_owned();
+            *f = path.clone();
         }
     }
     for c in &code.constants {
@@ -969,7 +971,7 @@ fn fix_co_filename_rec(code: &weavepy_compiler::CodeObject, path: &str) {
     }
 }
 
-fn fix_constant_filename(c: &weavepy_compiler::Constant, path: &str) {
+fn fix_constant_filename(c: &weavepy_compiler::Constant, path: &std::sync::Arc<str>) {
     use weavepy_compiler::Constant;
     match c {
         Constant::Code(inner) => fix_co_filename_rec(inner, path),

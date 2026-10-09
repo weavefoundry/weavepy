@@ -374,6 +374,162 @@ fn abc_register(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(subclass)
 }
 
+/// The native check `abc.ABCMeta`'s `__instancecheck__` or
+/// `__subclasscheck__` (`hook`) forwards to, when `hook` is that method:
+/// the function `abc` defines as `return _abc_instancecheck(cls,
+/// instance)` (or `_abc_subclasscheck`), whose module global still names
+/// this module's native. `isinstance`/`issubclass` call the native
+/// directly instead of entering the forwarding frame.
+pub(crate) fn forwarded_check(
+    hook: &Object,
+    subclass: bool,
+) -> Option<fn(&[Object]) -> Result<Object, RuntimeError>> {
+    let Object::Function(f) = hook else {
+        return None;
+    };
+    let (method, native, body): (_, _, fn(&[Object]) -> Result<Object, RuntimeError>) = if subclass
+    {
+        ("__subclasscheck__", "_abc_subclasscheck", abc_subclasscheck)
+    } else {
+        ("__instancecheck__", "_abc_instancecheck", abc_instancecheck)
+    };
+    if f.name != method {
+        return None;
+    }
+    // The last positive verdict per check, keyed by the function, its code,
+    // its globals' mutation stamp and the in-place rebinding epoch (any
+    // rebinding of the native name advances one of them).
+    thread_local! {
+        static LAST: [std::cell::Cell<(usize, usize, u64, u64)>; 2] = const {
+            [std::cell::Cell::new((0, 0, 0, 0)), std::cell::Cell::new((0, 0, 0, 0))]
+        };
+    }
+    let key = (
+        Rc::as_ptr(f) as usize,
+        // SAFETY: GIL-serialized raw read of the code cell; only the
+        // pointer is kept.
+        unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize,
+        f.globals.try_borrow().ok()?.mutation_stamp(),
+        crate::object::global_value_epoch(),
+    );
+    if LAST.with(|l| l[usize::from(subclass)].get() == key) {
+        return Some(body);
+    }
+    let code = f.code();
+    if code.arg_count != 2
+        || code.has_varargs
+        || code.has_varkeywords
+        || code.kwonly_count != 0
+        || code.names.len() != 1
+        || code.names[0] != native
+        || code.qualname.strip_prefix("ABCMeta.") != Some(method)
+    {
+        return None;
+    }
+    let globals = f.globals.try_borrow().ok()?;
+    let module_ok = matches!(
+        globals.get(&crate::object::StrKey("__name__")),
+        Some(Object::Str(s)) if s.as_ref() == "abc"
+    );
+    let native_ok = matches!(
+        globals.get(&crate::object::StrKey(native)),
+        Some(Object::Builtin(b)) if b.name == native && !b.binds_instance
+    );
+    if !(module_ok && native_ok) {
+        return None;
+    }
+    LAST.with(|l| l[usize::from(subclass)].set(key));
+    Some(body)
+}
+
+/// `isinstance(instance, cls)` for the ABC `cls` and an instance of
+/// `inst_cls` when it's known without running anything: `cls`'s metaclass
+/// checks instances with `abc`'s own forwarding `__instancecheck__` (see
+/// [`forwarded_check`]), the instance reports its class as `__class__`
+/// (`object`'s descriptor), and `cls`'s positive cache, or its current
+/// negative cache, already holds that class, as [`abc_instancecheck`]
+/// would find first. `None` leaves the question to the full check.
+pub(crate) fn abc_instance_cached(cls: &TypeObject, inst_cls: &Rc<TypeObject>) -> Option<bool> {
+    // SAFETY: GIL-serialized read of the metaclass cell, finished before
+    // anything else runs.
+    let meta = (unsafe { cls.metaclass.peek() }).and_then(|m| m.clone())?;
+    let hook = instancecheck_hook(&meta)?;
+    if forwarded_check(&hook, false).is_none() || !default_class_attr(inst_cls) {
+        return None;
+    }
+    let held = Object::Type(inst_cls.clone());
+    let verdict = |owner: &TypeObject| {
+        let data = state(owner);
+        if data.cache.borrow().contains(&held) {
+            Some(true)
+        } else if data.negative_cache_version.get() == INVALIDATION_COUNTER.load(Ordering::Relaxed)
+            && data.negative_cache.borrow().contains(&held)
+        {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    if cls.abc_state.get().is_some() {
+        return verdict(cls);
+    }
+    let mro = cls.mro.borrow();
+    verdict(mro.iter().find(|base| base.abc_state.get().is_some())?)
+}
+
+/// `meta.__instancecheck__` off the metaclass's MRO, remembered under its
+/// attribute version.
+fn instancecheck_hook(meta: &TypeObject) -> Option<Object> {
+    use crate::types::LeafAttrKind as K;
+    /// The cache key (an address no interned name has).
+    static HOOK_KEY: u8 = 0;
+    let key = std::ptr::addr_of!(HOOK_KEY) as usize;
+    let ver = meta.attr_version.get();
+    match meta.leaf_attrs.get(key, ver) {
+        Some(K::Value(hook)) => Some(hook.clone()),
+        Some(_) => None,
+        None => {
+            let hook = meta.lookup("__instancecheck__");
+            let kind = match &hook {
+                Some(h @ Object::Function(_)) => K::Value(h.clone()),
+                _ => K::Other,
+            };
+            meta.leaf_attrs.set(key, ver, kind);
+            hook.filter(|h| matches!(h, Object::Function(_)))
+        }
+    }
+}
+
+/// Whether instances of `cls` report their class through `object`'s own
+/// `__class__` descriptor, remembered under the class's attribute version.
+fn default_class_attr(cls: &TypeObject) -> bool {
+    use crate::types::LeafAttrKind as K;
+    /// The cache key (an address no interned name has).
+    static CLASS_KEY: u8 = 0;
+    let key = std::ptr::addr_of!(CLASS_KEY) as usize;
+    let ver = cls.attr_version.get();
+    match cls.leaf_attrs.get(key, ver) {
+        Some(K::InstanceOnly) => true,
+        Some(_) => false,
+        None => {
+            let object_own = crate::builtin_types::builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("__class__"))
+                .cloned();
+            let default = match (cls.lookup("__class__"), object_own) {
+                (None, _) => true,
+                (Some(found), Some(own)) => found.is_same(&own),
+                (Some(_), None) => false,
+            };
+            cls.leaf_attrs
+                .set(key, ver, if default { K::InstanceOnly } else { K::Other });
+            default
+        }
+    }
+}
+
 /// `_abc_instancecheck(cls, instance)`.
 fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
     let [cls, instance] = args_exact::<2>(args, "_abc_instancecheck")?;

@@ -56,15 +56,24 @@ fn random_type() -> Rc<TypeObject> {
         ("getstate", random_getstate),
         ("setstate", random_setstate),
     ] {
-        td.insert(
-            DictKey(Object::from_static(name)),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name,
-                binds_instance: true,
-                call: Box::new(fn_),
-                call_kw: None,
-            })),
-        );
+        let b = Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(fn_),
+            call_kw: None,
+        });
+        // `random()` runs no Python code, so the dispatch loop and
+        // compiled callers call it in place; `getrandbits` does for a
+        // plain `int` count (an index-protocol argument runs Python).
+        match name {
+            "random" => {
+                crate::leaf_builtins::register(&b);
+                crate::leaf_builtins::register_jit_method(&b, OP_RANDOM);
+            }
+            "getrandbits" => crate::leaf_builtins::register_fast(&b, getrandbits_leaf),
+            _ => {}
+        }
+        td.insert(DictKey(Object::from_static(name)), Object::Builtin(b));
     }
     TypeObject::new_with_flags(
         "Random",
@@ -236,14 +245,15 @@ fn self_instance(args: &[Object], what: &str) -> Result<Rc<PyInstance>, RuntimeE
 /// is missing (a subclass skipping `__init__`), as CPython does at
 /// allocation time.
 fn state_buffer(inst: &Rc<PyInstance>) -> Rc<RefCell<Vec<u8>>> {
-    let found = match inst
-        .dict_cell()
-        .borrow()
-        .get(&crate::object::StrKey(STATE_KEY))
-    {
+    thread_local! {
+        /// The state key as a `str` object, whose hash it caches (every
+        /// draw looks the state up).
+        static KEY: DictKey = DictKey(Object::from_static(STATE_KEY));
+    }
+    let found = KEY.with(|key| match inst.dict_cell().borrow().get(key) {
         Some(Object::ByteArray(b)) if b.borrow().len() == STATE_LEN => Some(b.clone()),
         _ => None,
-    };
+    });
     found.unwrap_or_else(|| store_mt(inst, &seed_from_entropy()))
 }
 
@@ -351,14 +361,30 @@ fn random_seed(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// `genrand_res53`: 53-bit resolution double in [0, 1).
-fn random_random(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = self_instance(args, "random()")?;
-    let v = with_mt(&inst, |mt| {
+/// The JIT's direct operation for `random()` (a native method lane op,
+/// distinct from `collections_native`'s).
+pub(crate) const OP_RANDOM: u8 = 32;
+
+/// `random()` on an instance receiver, as the JIT's native method lane
+/// calls it directly (`None` declines: the full call raises exactly).
+pub(crate) fn random_fast(recv: &Object) -> Option<Object> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    Some(Object::Float(random_from(inst)))
+}
+
+fn random_from(inst: &Rc<PyInstance>) -> f64 {
+    with_mt(inst, |mt| {
         let a = mt.genrand_u32() >> 5;
         let b = mt.genrand_u32() >> 6;
         (f64::from(a) * 67_108_864.0 + f64::from(b)) * (1.0 / 9_007_199_254_740_992.0)
-    });
-    Ok(Object::Float(v))
+    })
+}
+
+fn random_random(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = self_instance(args, "random()")?;
+    Ok(Object::Float(random_from(&inst)))
 }
 
 /// `getrandbits(k)`: k random bits as a non-negative int, assembled
@@ -436,6 +462,15 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
         Sign::Plus,
         big,
     )))
+}
+
+/// `getrandbits`'s leaf half: an exact `int` or `bool` count never runs
+/// Python code.
+fn getrandbits_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Instance(_), Object::Int(_) | Object::Bool(_)] => Some(random_getrandbits(args)),
+        _ => None,
+    }
 }
 
 /// `randbytes(n)` — CPython implements this on the C class.

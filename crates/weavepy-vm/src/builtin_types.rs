@@ -53,6 +53,11 @@ pub struct BuiltinTypes {
     pub enumerate_: Rc<TypeObject>,
     /// `reversed` — likewise a real type in CPython.
     pub reversed_: Rc<TypeObject>,
+    /// `map`, `filter`, and `zip`: real, subclassable types whose exact
+    /// instances are native adapters (see `crate::seqiter`).
+    pub map_: Rc<TypeObject>,
+    pub filter_: Rc<TypeObject>,
+    pub zip_: Rc<TypeObject>,
     pub none_type: Rc<TypeObject>,
     pub ellipsis_: Rc<TypeObject>,
     pub not_implemented_type_: Rc<TypeObject>,
@@ -372,6 +377,9 @@ impl BuiltinTypes {
         }
         let enumerate_ = mk("enumerate", vec![object_.clone()]);
         let reversed_ = mk("reversed", vec![object_.clone()]);
+        let map_ = mk("map", vec![object_.clone()]);
+        let filter_ = mk("filter", vec![object_.clone()]);
+        let zip_ = mk("zip", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
         let ellipsis_ = mk("ellipsis", vec![object_.clone()]);
         let not_implemented_type_ = mk("NotImplementedType", vec![object_.clone()]);
@@ -981,6 +989,9 @@ impl BuiltinTypes {
             iterator_,
             enumerate_,
             reversed_,
+            map_,
+            filter_,
+            zip_,
             none_type,
             ellipsis_,
             not_implemented_type_,
@@ -1108,6 +1119,7 @@ impl BuiltinTypes {
         // the final, fully-populated descriptor type dicts.
         install_builtin_descriptor_get(&bt.method_descriptor_);
         install_builtin_descriptor_get(&bt.wrapper_descriptor_);
+        crate::seqiter::install(&bt);
         install_classmethod_descriptor_get(&bt.classmethod_descriptor_);
         // NOT on `builtin_function_or_method`: CPython's PyCFunction type
         // has no `tp_descr_get` — a bound builtin stored as a class attr
@@ -1147,6 +1159,9 @@ impl BuiltinTypes {
             pair!(memoryview_, "memoryview"),
             pair!(enumerate_, "enumerate"),
             pair!(reversed_, "reversed"),
+            pair!(map_, "map"),
+            pair!(filter_, "filter"),
+            pair!(zip_, "zip"),
             // `super` is a real type (`super(C, obj)`, `class mysuper(super)`).
             // The `Interpreter::default` seed overrides the function-flavoured
             // `super` entry with this type; construction routes through
@@ -1252,6 +1267,9 @@ impl BuiltinTypes {
             "memoryview" => Some(self.memoryview_.clone()),
             "enumerate" => Some(self.enumerate_.clone()),
             "reversed" => Some(self.reversed_.clone()),
+            "map" => Some(self.map_.clone()),
+            "filter" => Some(self.filter_.clone()),
+            "zip" => Some(self.zip_.clone()),
             "mappingproxy" => Some(self.mappingproxy_.clone()),
             "dict_keys" => Some(self.dict_keys_.clone()),
             "dict_values" => Some(self.dict_values_.clone()),
@@ -2103,10 +2121,10 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
         }
     }
     fn get_name(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(gen_of(args)?.name.borrow().clone())
+        Ok(gen_of(args)?.name())
     }
     fn get_qualname(args: &[Object]) -> Result<Object, RuntimeError> {
-        Ok(gen_of(args)?.qualname.borrow().clone())
+        Ok(gen_of(args)?.qualname())
     }
     let docs = [
         (
@@ -4448,7 +4466,7 @@ fn syntax_basename(filename: &Object) -> String {
 /// on the instance so every subclass — built-in or user-defined
 /// — exposes `e.args` automatically. Module-scope so the docs surface
 /// pass (RFC 0056 WS4) can mint per-exception-type mirrors of it.
-fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let inst = args
             .first()

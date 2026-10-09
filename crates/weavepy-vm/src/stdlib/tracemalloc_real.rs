@@ -176,7 +176,7 @@ fn capture_frames(nframe: usize) -> (Vec<(String, i64)>, u16) {
         .iter()
         .rev()
         .take(nframe.max(1))
-        .map(|f| (f.code.filename.clone(), i64::from(f.current_lineno())))
+        .map(|f| (f.code.filename.to_string(), i64::from(f.current_lineno())))
         .collect();
     (frames, total.min(u16::MAX as usize) as u16)
 }

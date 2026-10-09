@@ -60,6 +60,13 @@ pub fn recursion_limit() -> usize {
     RECURSION_LIMIT.load(Ordering::Relaxed)
 }
 
+/// The recursion limit's address, for native code that reads it in line
+/// where it would call [`recursion_limit`].
+#[cfg(feature = "jit")]
+pub(crate) fn recursion_limit_ptr() -> *const usize {
+    RECURSION_LIMIT.as_ptr()
+}
+
 /// Live Python call depth on the calling thread.
 pub fn current_depth() -> usize {
     DEPTH.with(|d| d.get())
@@ -162,6 +169,39 @@ pub fn enter_with(cell: *const Cell<usize>) -> Enter {
     }
     d.set(n);
     Enter::Ok(Guard { depth: cell })
+}
+
+/// Enter `n` activations at once without guards (the suspended levels
+/// of a collapsed `yield from` chain, see
+/// `Interpreter::core_send_collapse`): [`leave_n`] and [`Guard::adopt`]
+/// give them back. `false`, with nothing entered, when the new depth
+/// would exceed the limit.
+#[inline]
+pub(crate) fn enter_n(cell: *const Cell<usize>, n: usize) -> bool {
+    // SAFETY: see `enter_with`.
+    let d = unsafe { &*cell };
+    let depth = d.get() + n;
+    if depth > recursion_limit() {
+        return false;
+    }
+    d.set(depth);
+    true
+}
+
+/// Give back `n` activations [`enter_n`] entered.
+#[inline]
+pub(crate) fn leave_n(cell: *const Cell<usize>, n: usize) {
+    // SAFETY: see `enter_with`.
+    let d = unsafe { &*cell };
+    d.set(d.get().saturating_sub(n));
+}
+
+impl Guard {
+    /// A guard for one activation [`enter_n`] already entered.
+    #[inline]
+    pub(crate) fn adopt(cell: *const Cell<usize>) -> Guard {
+        Guard { depth: cell }
+    }
 }
 
 #[cfg(test)]

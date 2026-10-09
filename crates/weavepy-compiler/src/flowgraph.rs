@@ -3091,17 +3091,20 @@ impl Cfg {
             });
         }
         co.instructions = instructions;
-        co.linetable = linetable;
+        co.linetable = linetable.into();
         co.coltable = coltable.into();
         co.exception_table = table;
         co.constants = self.consts;
         no_interrupt.sort_unstable();
-        co.no_interrupt_jumps = no_interrupt;
+        let mut rare = co.rare.take();
+        rare.no_interrupt_jumps = no_interrupt;
+        co.rare.set(rare);
         co.wire_marks = if marks.iter().all(|&m| m == wire::PLAIN) {
             Vec::new()
         } else {
             marks
-        };
+        }
+        .into();
     }
 }
 

@@ -358,6 +358,22 @@ try:
 except ImportError:
     _tuplegetter = lambda index, doc: property(_itemgetter(index), doc=doc)
 
+try:
+    from _collections import _chainmap_contains, _chainmap_getitem
+except ImportError:
+    _chainmap_contains = _chainmap_getitem = None
+
+try:
+    from _collections import (
+        _namedtuple_make,
+        _namedtuple_register,
+        _namedtuple_register_make,
+        _namedtuple_replace,
+    )
+except ImportError:
+    _namedtuple_register = _namedtuple_register_make = None
+    _namedtuple_make = _namedtuple_replace = None
+
 def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
     """Returns a new subclass of tuple with named fields.
 
@@ -449,9 +465,16 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
     __new__.__doc__ = f'Create new instance of {typename}({arg_list})'
     if defaults is not None:
         __new__.__defaults__ = defaults
+    if _namedtuple_register is not None:
+        _namedtuple_register(__new__, num_fields)
 
     @classmethod
     def _make(cls, iterable):
+        # WeavePy: a tuple or list argument is served natively.
+        if _namedtuple_make is not None:
+            result = _namedtuple_make(cls, iterable, num_fields)
+            if result is not None:
+                return result
         result = tuple_new(cls, iterable)
         if _len(result) != num_fields:
             raise TypeError(f'Expected {num_fields} arguments, got {len(result)}')
@@ -459,9 +482,16 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
 
     _make.__func__.__doc__ = (f'Make a new {typename} object from a sequence '
                               'or iterable')
+    if _namedtuple_register_make is not None:
+        _namedtuple_register_make(_make.__func__, num_fields)
 
     def _replace(self, /, **kwds):
-        result = self._make(_map(kwds.pop, field_names, self))
+        # WeavePy: served natively while `type(self)._make` is this one.
+        result = None
+        if _namedtuple_replace is not None:
+            result = _namedtuple_replace(self, kwds, field_names)
+        if result is None:
+            result = self._make(_map(kwds.pop, field_names, self))
         if kwds:
             raise TypeError(f'Got unexpected field names: {list(kwds)!r}')
         return result
@@ -1027,6 +1057,10 @@ class ChainMap(_collections_abc.MutableMapping):
                 pass
         return self.__missing__(key)            # support subclasses that define __missing__
 
+    # WeavePy: the same loop, native (an exact dict's miss raises nothing).
+    if _chainmap_getitem is not None:
+        __getitem__ = _chainmap_getitem
+
     def get(self, key, default=None):
         return self[key] if key in self else default    # needs to make use of __contains__
 
@@ -1044,6 +1078,9 @@ class ChainMap(_collections_abc.MutableMapping):
             if key in mapping:
                 return True
         return False
+
+    if _chainmap_contains is not None:
+        __contains__ = _chainmap_contains
 
     def __bool__(self):
         return any(self.maps)

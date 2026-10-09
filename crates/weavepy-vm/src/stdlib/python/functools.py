@@ -482,11 +482,14 @@ except ImportError:
 # (the pure-Python definition above stays as the Placeholder path the
 # native delegates to, and as documentation/fallback).
 try:
-    from _functools import _partial_call
+    from _functools import _partial_call, _partial_new_for
 
     partial._partial_call_py = partial.__call__
     partial.__call__ = _partial_call
-    del _partial_call
+    # The common construction shape natively; `_partial_new` serves the
+    # rest (merging a partial's arguments, placeholders, errors).
+    partial.__new__ = _partial_new_for(partial, Placeholder, _partial_new)
+    del _partial_call, _partial_new_for
 except ImportError:
     pass
 

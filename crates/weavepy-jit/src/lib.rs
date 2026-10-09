@@ -32,14 +32,16 @@ mod value;
 pub use analyze::{
     analyze, analyze_for_ret, analyze_frame, analyze_with_probe, analyze_with_probes,
     returns_none_syntactically, returns_self_syntactically, JitVerdict, MethodResolution,
-    PathArena, Probes, ELEM_SENTINEL,
+    PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
-pub use engine::{CompiledFrame, DirectLeaf, JitEngine, OpMix};
+pub use engine::{
+    admit_generic_loops, CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix,
+};
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,
     GlobalGuard, IterLoopMeta, ListLoopMeta, MathFunc, MathGuardMeta, MethodRet, MethodSiteMeta,
     MethodSpanMeta, OsrEntry, RangeLoopMeta, ResolvedGlobal, SliceOrigin, StrMethod, TBlock, TFunc,
-    TOp, TStmt, TTerm,
+    TOp, TStmt, TTerm, UNBOX_FLOAT_ARITH, UNBOX_FLOAT_CMP, UNBOX_FLOAT_EXACT,
 };
 pub use runtime::{
     global_obj_list_elem, register_attr_get_chain_helper, register_attr_helpers,
@@ -48,23 +50,25 @@ pub use runtime::{
     register_call_native_method_helper, register_call_py_helper, register_cell_helpers,
     register_const_str_helper, register_contains_dyn_helper, register_dict_del_helper,
     register_dict_helpers, register_dict_iter_helper, register_dyn_attr_helpers,
-    register_float_pow_helper, register_global_obj_helper, register_guard_method_helper,
-    register_is_obj_helper, register_iter_helpers, register_iter_new_helper,
-    register_iter_next_pair_helper, register_list_extra_helpers, register_list_from_range_helper,
-    register_list_helpers, register_list_next_helper, register_math_helpers,
+    register_dyn_item_helpers, register_dyn_op_helpers, register_float_pow_helper,
+    register_global_obj_helper, register_guard_method_helper, register_is_obj_helper,
+    register_iter_helpers, register_iter_new_helper, register_iter_next_pair_helper,
+    register_list_extra_helpers, register_list_from_range_helper, register_list_helpers,
+    register_list_next_helper, register_math_helpers, register_method_enter_helper,
     register_obj_getitem_helper, register_poll_helper, register_self_call_helpers,
     register_str_format_helpers, register_str_helpers, register_str_method_helper,
     register_str_write_helpers, register_truth_helper, register_tuple_read_helpers,
-    register_unbox_int_helper, set_obj_layout, AttrGetChainHelper, AttrGetHelper, AttrSetHelper,
-    BuildListHelper, BuildTupleHelper, BytesGetHelper, CachedAttrChainHelper, CallDynHelper,
-    CallMethodHelper, CallPyHelper, CallStatus, CellGetHelper, CellSetHelper, DictAccessHelper,
-    DynAttrHelper, GetIterHelper, GuardMethodHelper, IterNextHelper, IterNextPairHelper, JitFrame,
-    JitStatus, ListAppendHelper, ListFromRangeHelper, ListGetHelper, ListLenHelper, ListNextHelper,
-    ListRepeatHelper, ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, ObjLayout,
-    PollHelper, SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper,
+    register_unbox_float_helper, register_unbox_int_helper, set_obj_layout, AttrGetChainHelper,
+    AttrGetHelper, AttrSetHelper, BuildListHelper, BuildTupleHelper, BytesGetHelper,
+    CachedAttrChainHelper, CallDynHelper, CallMethodHelper, CallPyHelper, CallStatus,
+    CellGetHelper, CellSetHelper, DictAccessHelper, DynAttrHelper, GetIterHelper,
+    GuardMethodHelper, IterNextHelper, IterNextPairHelper, JitFrame, JitStatus, ListAppendHelper,
+    ListFromRangeHelper, ListGetHelper, ListLenHelper, ListNextHelper, ListRepeatHelper,
+    ListSetHelper, ListSliceHelper, MathBinaryHelper, MathUnaryHelper, MethodEnterHelper,
+    ObjLayout, PollHelper, SelfEnterHelper, SelfExitHelper, SelfSlowHelper, SlotTag, StrEqHelper,
     StrLenHelper, StrModHelper, CALL_GAPS, DICT_KEY_INT, DICT_KEY_STR, DICT_VAL_FLOAT,
     DICT_VAL_INT, DICT_VAL_OBJ, ITER_ELEM_STR, JIT_POLL_STRIDE, MAX_ATTR_CHAIN_LEN,
-    MAX_CACHED_ATTR_CHAIN_LEN, METHOD_GUARD_AT_CALL, METHOD_NATIVE,
+    MAX_CACHED_ATTR_CHAIN_LEN, METHOD_GUARD_AT_CALL, METHOD_NATIVE, SLOT_FIELD,
 };
 pub use value::JitType;
 

@@ -28,13 +28,32 @@ mod frozen_index {
 /// the generated sorted name index (see build.rs) so a lookup never
 /// reads the name literals laid out beside each module's source text.
 pub(crate) fn frozen_lookup(name: &str) -> Option<frozen_sources::FrozenSource> {
+    frozen_sources().get(frozen_row(name)?).copied()
+}
+
+/// The row of [`frozen_sources`] registered under `name` (see
+/// [`frozen_lookup`]).
+fn frozen_row(name: &str) -> Option<usize> {
     use frozen_index::{FROZEN_INDEX, FROZEN_NAMES};
     let at = FROZEN_INDEX
         .binary_search_by(|&(off, len, _)| {
             FROZEN_NAMES[off as usize..off as usize + len as usize].cmp(name)
         })
         .ok()?;
-    frozen_sources().get(FROZEN_INDEX[at].2 as usize).copied()
+    Some(FROZEN_INDEX[at].2 as usize)
+}
+
+/// [`frozen_sources::source_hash`] of `source`, the source of the frozen
+/// module `name`: build.rs's precomputed value when it is that module's
+/// table row (compared by address, so the text isn't read), else
+/// computed.
+pub(crate) fn frozen_source_hash(name: &str, source: &str) -> u64 {
+    if let Some(row) = frozen_row(name) {
+        if std::ptr::eq(frozen_sources()[row].source, source) {
+            return frozen_index::FROZEN_HASHES[row];
+        }
+    }
+    frozen_sources::source_hash(source)
 }
 
 pub(crate) mod ast_build;
@@ -52,6 +71,8 @@ pub mod csv_mod;
 pub mod datetime_accel;
 pub mod datetime_mod;
 pub(crate) mod datetime_native;
+pub(crate) mod decimal_native;
+pub(crate) mod elementtree_native;
 pub mod errno_mod;
 pub mod faulthandler_mod;
 #[cfg(unix)]
@@ -147,7 +168,10 @@ pub mod ssl_real;
 pub mod string_mod;
 pub mod warnings_mod;
 
+pub mod asyncio_events;
 pub mod collections_native;
+pub mod collections_odict;
+pub mod contextvars_native;
 pub mod gc_real;
 pub mod multiprocessing_mod;
 pub mod queue_native;
@@ -191,6 +215,9 @@ pub fn register_all(cache: &ModuleCache) {
     // `asyncio/{futures,tasks,events}.py` adoption hooks bind these exactly
     // as CPython's do.
     cache.register_builtin("_asyncio", asyncio_mod::build);
+    // Native `Handle._run` and `BaseEventLoop.call_soon` (see
+    // `asyncio_events.rs`).
+    cache.register_builtin("_weave_asyncio", asyncio_events::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
@@ -290,7 +317,11 @@ pub fn register_all(cache: &ModuleCache) {
     // stand-in (CPython documents append/pop from either side as
     // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
     cache.register_builtin("_weave_collections", collections_native::build);
+    // Native bodies of the frozen `contextvars` classes (PEP 567).
+    cache.register_builtin("_weave_contextvars", contextvars_native::build);
     cache.register_builtin("_weave_datetime", datetime_accel::build);
+    cache.register_builtin("_weave_decimal", decimal_native::build);
+    cache.register_builtin("_weave_elementtree", elementtree_native::build);
     cache.register_builtin("_weave_pickle", pickle_accel::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
@@ -321,7 +352,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("mmap", mmap_mod::build);
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
-    // `_contextvars` is the frozen alias of the pure-Python `contextvars`
+    // `_contextvars` is the frozen alias of the frozen `contextvars`
     // (see `python/_contextvars.py`): 3.14's `threading` and
     // `_py_warnings` import the accelerator name directly and must see
     // the same `Context`/`ContextVar` types `contextvars` hands out.

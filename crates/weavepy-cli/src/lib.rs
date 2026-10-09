@@ -53,6 +53,12 @@ mod alloc_profile;
 #[global_allocator]
 static GLOBAL_ALLOC: alloc_profile::Profiled = alloc_profile::Profiled;
 
+/// The allocator set-up an executable runs before its first allocation
+/// (see `alloc::configure`): the bin targets list it among their
+/// initializers. (The profiling allocator forwards to mimalloc, so it
+/// applies there too.)
+pub use alloc::configure as configure_allocator;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opt-in in-process PC sampler (`WEAVEPY_PCPROF=<file>`): a `SIGPROF`
@@ -1080,7 +1086,6 @@ fn real_main() -> Result<i32> {
 
     if let Some(module) = cli.module.clone() {
         let extra = cli.args.clone();
-        weavepy::vm::spawn_jit_codegen_prewarm();
         run_module(&module, extra, &flags, &extra_path)?;
         return Ok(0);
     }
@@ -1093,9 +1098,6 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Some(path) => {
-            // A program file: warm the JIT's code generator off the main
-            // thread while it starts.
-            weavepy::vm::spawn_jit_codegen_prewarm();
             run_path(path, trailing.clone(), &flags, &extra_path)?;
             Ok(0)
         }

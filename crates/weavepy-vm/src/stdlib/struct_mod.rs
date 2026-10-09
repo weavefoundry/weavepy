@@ -909,6 +909,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "calcsize", b_calcsize);
         register(&mut d, "_value_codes", b_value_codes);
         register(&mut d, "pack", b_pack);
+        register(&mut d, "_pack_plain", b_pack_plain);
+        register(&mut d, "_clearcache", b_clearcache);
         register(&mut d, "unpack", b_unpack);
         register(&mut d, "pack_into", b_pack_into);
         register(&mut d, "unpack_from", b_unpack_from);
@@ -926,16 +928,71 @@ fn register(
     name: &'static str,
     body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
-    let bf = BuiltinFn {
+    let bf = Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(body),
         call_kw: None,
-    };
-    d.insert(
-        DictKey(Object::from_static(name)),
-        Object::Builtin(Rc::new(bf)),
-    );
+    });
+    // The core reads and writes plain values only (the Python wrapper
+    // coerces first): no Python runs, so the dispatch loop calls it in
+    // place.
+    crate::leaf_builtins::register(&bf);
+    d.insert(DictKey(Object::from_static(name)), Object::Builtin(bf));
+}
+
+thread_local! {
+    /// Compiled formats by their text (CPython's `_struct` cache, flushed
+    /// by `_clearcache` and bounded as CPython bounds its own).
+    static FORMATS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<CompiledFormat>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// How many compiled formats [`FORMATS`] keeps before starting over.
+const MAX_FORMATS: usize = 100;
+
+/// `fmt` compiled, from the cache when it was compiled before.
+fn compiled(fmt: &str) -> Result<std::rc::Rc<CompiledFormat>, RuntimeError> {
+    if let Some(cf) = FORMATS.with(|c| c.borrow().get(fmt).cloned()) {
+        return Ok(cf);
+    }
+    let cf = std::rc::Rc::new(CompiledFormat::parse(fmt)?);
+    FORMATS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= MAX_FORMATS {
+            c.clear();
+        }
+        c.insert(fmt.to_owned(), cf.clone());
+    });
+    Ok(cf)
+}
+
+/// `_clearcache()`: flush the compiled formats.
+fn b_clearcache(_args: &[Object]) -> Result<Object, RuntimeError> {
+    FORMATS.with(|c| c.borrow_mut().clear());
+    Ok(Object::None)
+}
+
+/// `pack(fmt, *values)` when every value is one the packer reads directly
+/// (a plain int, float, complex, bool, str, bytes or bytearray), else
+/// `None` for the wrapper's coercing path, having done nothing.
+fn b_pack_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.get(1..).unwrap_or(&[]).iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+        )
+    }) {
+        return Ok(Object::None);
+    }
+    b_pack(args)
 }
 
 fn fmt_arg(args: &[Object], idx: usize) -> Result<String, RuntimeError> {
@@ -953,7 +1010,7 @@ fn buffer_arg(o: &Object) -> Result<Vec<u8>, RuntimeError> {
 
 fn b_calcsize(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     Ok(Object::Int(cf.size as i64))
 }
 
@@ -966,7 +1023,7 @@ fn b_calcsize(args: &[Object]) -> Result<Object, RuntimeError> {
 /// has no interpreter access of its own.
 fn b_value_codes(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     let mut s = String::new();
     for f in &cf.fields {
         match f.code {
@@ -984,16 +1041,19 @@ fn b_value_codes(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_pack(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     let bytes = cf.pack(&args[1..])?;
     Ok(Object::new_bytes(bytes))
 }
 
 fn b_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
-    let buf = buffer_arg(&args[1])?;
-    let vals = cf.unpack(&buf)?;
+    let cf = compiled(&fmt)?;
+    // (A `bytes` buffer is read in place.)
+    let vals = match &args[1] {
+        Object::Bytes(b) => cf.unpack(b)?,
+        other => cf.unpack(&buffer_arg(other)?)?,
+    };
     Ok(Object::new_tuple(vals))
 }
 
@@ -1020,7 +1080,7 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("pack_into() requires at least 3 arguments"));
     }
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     let offset = ssize_offset(&args[2])?;
     let bytes = cf.pack(&args[3..])?;
     match &args[1] {
@@ -1105,7 +1165,7 @@ fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("unpack_from() requires at least 2 arguments"));
     }
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     let buf = buffer_arg(&args[1])?;
     let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0);
     let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false)?;
@@ -1115,7 +1175,7 @@ fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_iter_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
-    let cf = CompiledFormat::parse(&fmt)?;
+    let cf = compiled(&fmt)?;
     let buf = buffer_arg(&args[1])?;
     let groups = cf.iter_unpack(&buf)?;
     let items: Vec<Object> = groups.into_iter().map(Object::new_tuple).collect();

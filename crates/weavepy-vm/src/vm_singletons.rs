@@ -139,11 +139,13 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             && inst
                 .class
                 .try_borrow()
-                .is_ok_and(|cls| cls.instances_need_finalize());
+                .is_ok_and(|cls| cls.instances_need_finalize())
+            // An asyncio future with nothing to log needs no `__del__`.
+            && !crate::stdlib::asyncio_mod::finalizer_is_noop(&inst);
         if owes {
             try_push_pending_finalizer(Object::Instance(Rc::from_arc(inst)));
         } else {
-            drop(inst);
+            crate::rc::drop_arc(inst);
         }
     } else if t == TypeId::of::<PyGenerator>() {
         // SAFETY: as above, for `PyGenerator`.
@@ -152,9 +154,25 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             && g.state.try_borrow().is_ok_and(|state| match &*state {
                 GeneratorState::Suspended(_) => true,
                 GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
-                GeneratorState::Finished | GeneratorState::Running => false,
+                GeneratorState::Finished
+                | GeneratorState::Running
+                | GeneratorState::Delegating(_) => false,
             });
-        if owes {
+        // A plain generator suspended outside any handler of its own
+        // (CPython's `gen_close` shortcut) just finishes, here: nothing
+        // could observe the `GeneratorExit` its finalizer would throw.
+        let closed = owes
+            && g.kind == CoroutineKind::Generator
+            && crate::Interpreter::gen_close_quiet_detached(&g).is_some_and(|frame| {
+                drop(frame);
+                true
+            });
+        if closed {
+            let g = Rc::from_arc(g);
+            crate::Interpreter::release_finished_gen(&g);
+            // (As a plain handle: this is the release being finalized.)
+            crate::rc::drop_arc(Rc::into_arc(g));
+        } else if owes {
             let kind = g.kind;
             let g = Rc::from_arc(g);
             try_push_pending_finalizer(match kind {
@@ -163,10 +181,10 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
                 CoroutineKind::AsyncGenerator => Object::AsyncGenerator(g),
             });
         } else {
-            drop(g);
+            crate::rc::drop_arc(g);
         }
     } else {
-        drop(arc);
+        crate::rc::drop_arc(arc);
     }
 }
 
@@ -367,6 +385,16 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
 
 static INTERPRETER_SEED: OnceLock<Mutex<Option<crate::Interpreter>>> = OnceLock::new();
 static WORKER_THREAD_ID: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> = OnceLock::new();
+
+/// Advanced by every change to the worker map: a thread's cached
+/// [`current_worker_thread_id`] answer is good while the generation it
+/// was computed at is current.
+static WORKER_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    /// `(generation, id)`: this thread's last [`current_worker_thread_id`].
+    static WORKER_ID_CACHE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
 /// The seed thread's built-in type registry. Workers adopt it (see
 /// [`snapshot_interpreter`]) so `type`/`object`/… compare pointer-equal
 /// across threads — class statements check metaclasses by identity.
@@ -450,6 +478,7 @@ pub fn install_seed_builtin_types() {
 pub fn install_worker_thread_id(id: u64) {
     let native = crate::gil::current_native_thread_id();
     worker_map().lock().insert(native, id);
+    WORKER_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// Clear the worker thread id on exit. Called by the worker body
@@ -457,6 +486,7 @@ pub fn install_worker_thread_id(id: u64) {
 pub fn clear_worker_thread_id() {
     let native = crate::gil::current_native_thread_id();
     worker_map().lock().remove(&native);
+    WORKER_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// Drop every Python object held in this thread's TLS *now*, while the
@@ -500,11 +530,19 @@ pub fn clear_thread_python_tls() {
 /// falling back to the raw OS thread id if no override is set
 /// (i.e. we're on the main thread).
 pub fn current_worker_thread_id() -> u64 {
-    let native = crate::gil::current_native_thread_id();
-    if let Some(id) = worker_map().lock().get(&native).copied() {
-        return id;
+    // `_thread.get_ident()` and `decimal`'s context lookup run this per
+    // call: a thread's answer changes only with the map, so it is cached
+    // per thread until the map's generation moves.
+    let generation = WORKER_MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if let Ok((g, id)) = WORKER_ID_CACHE.try_with(std::cell::Cell::get) {
+        if g == generation {
+            return id;
+        }
     }
-    native
+    let native = crate::gil::current_native_thread_id();
+    let id = worker_map().lock().get(&native).copied().unwrap_or(native);
+    let _ = WORKER_ID_CACHE.try_with(|c| c.set((generation, id)));
+    id
 }
 
 /// `True` when the calling OS thread was spawned by WeavePy's own thread

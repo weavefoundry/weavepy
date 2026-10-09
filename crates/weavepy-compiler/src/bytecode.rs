@@ -1479,12 +1479,14 @@ impl CacheSlot {
         }
     }
 
+    // (A plain match, with the decode in line: the call sites test one
+    // variant, so the decode folds down to that variant's tag check.)
     #[inline(always)]
     pub fn get(&self) -> InlineCache {
-        self.inner
-            .load()
-            .map(InlineCache::decode)
-            .unwrap_or(InlineCache::Empty)
+        match self.inner.load() {
+            Some(bits) => InlineCache::decode(bits),
+            None => InlineCache::Empty,
+        }
     }
 
     #[inline(always)]
@@ -1548,10 +1550,10 @@ impl CacheTable {
     /// Read a cache, returning `Empty` for cold tables or out-of-range indices.
     #[inline(always)]
     pub fn get(&self, pc: u32) -> InlineCache {
-        self.initialized()
-            .and_then(|slots| slots.get(pc as usize))
-            .map(CacheSlot::get)
-            .unwrap_or(InlineCache::Empty)
+        match self.initialized().and_then(|slots| slots.get(pc as usize)) {
+            Some(slot) => slot.get(),
+            None => InlineCache::Empty,
+        }
     }
 
     #[cold]

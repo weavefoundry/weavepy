@@ -32,7 +32,7 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,30 +73,33 @@ pub struct GilCell<T: ?Sized> {
     /// cross-thread access exclusive, but within a single OS thread
     /// the lock is reentrant — the counter prevents undefined
     /// behaviour on nested `borrow_mut()`.
-    /// 32-bit, and placed next to the 32-bit `depth` below, so the two
-    /// share one word: `GilCell` is embedded by value in every
-    /// instance, list, dict and set, where each word of header is a
-    /// word per object on the heap.
+    /// 32-bit, like `owner` below, so the two share one word: `GilCell`
+    /// is embedded by value in every instance, list, dict and set,
+    /// where each word of header is a word per object on the heap.
     borrow: AtomicI32,
     /// The cross-thread reentrant lock, hand-rolled for the hot path.
-    /// `0` means unowned; otherwise it holds the owning thread's id
-    /// ([`crate::gil::current_thread_id`]). The uncontended borrow —
-    /// the only case bytecode execution under the GIL ever sees — is
-    /// one relaxed load (same-thread reentry) or one compare-exchange
-    /// (fresh acquire), versus the `parking_lot::ReentrantMutex` +
-    /// thread-local bookkeeping this replaced, which dominated
-    /// interpreter profiles (RFC 0047 wave 5: every `Cell::get` on an
-    /// object field paid ~10× the cost of the field read itself).
-    /// Recursion depth. Only ever touched by the thread that owns
-    /// [`Self::owner`], so a plain (unsafe) cell is sound. Declared
-    /// next to `borrow` so the two 32-bit fields share one word.
-    depth: UnsafeCell<u32>,
-    owner: AtomicU64,
+    /// `0` means unowned; otherwise it holds the owning thread's
+    /// [`CellTls::cell_id`]. The uncontended borrow — the only case
+    /// bytecode execution under the GIL ever sees — is one relaxed load
+    /// (same-thread reentry) or one compare-exchange (fresh acquire),
+    /// versus the `parking_lot::ReentrantMutex` + thread-local
+    /// bookkeeping this replaced, which dominated interpreter profiles
+    /// (RFC 0047 wave 5: every `Cell::get` on an object field paid ~10×
+    /// the cost of the field read itself).
+    ///
+    /// The lock keeps no recursion depth: whoever took it fresh releases
+    /// it, which is the guard that brings the borrow counter back to
+    /// zero, or a [`Self::get`] / [`Self::set`] that found it unowned. A
+    /// reentrant acquire leaves it to the outer holder.
+    owner: AtomicU32,
     /// The guarded payload. Access is gated by holding the owner
     /// lock; the borrow counter rules out aliasing `&mut T` within a
     /// thread. Last field so `T: ?Sized` cells stay layout-legal.
     data: UnsafeCell<T>,
 }
+
+// The borrow counter and the lock word share one word of header.
+const _: () = assert!(std::mem::size_of::<GilCell<u64>>() == 16);
 
 // SAFETY: `GilCell<T>` is `Send` whenever `T: Send` — moving a cell
 // across threads is fine because we move the payload too.
@@ -282,9 +285,32 @@ std::thread_local! {
     pub(crate) static CELL_TLS: CellTls = const {
         CellTls {
             thread_id: std::cell::Cell::new(0),
+            cell_id: std::cell::Cell::new(0),
             live_guards: std::cell::Cell::new(0),
         }
     };
+}
+
+/// The next [`CellTls::cell_id`] to hand out. Ids count up from 1 and are
+/// never reused, so no two threads ever share one; a process that has
+/// started [`CELL_ID_HASHED`] threads takes hashed ids from then on.
+static NEXT_CELL_ID: AtomicU32 = AtomicU32::new(1);
+
+/// The bit that marks a hashed cell id (see [`NEXT_CELL_ID`]).
+const CELL_ID_HASHED: u32 = 1 << 31;
+
+/// The calling thread's [`CellTls::cell_id`].
+#[inline]
+fn current_cell_id() -> u32 {
+    CELL_TLS
+        .try_with(CellTls::cell_id)
+        .unwrap_or_else(|_| hashed_cell_id())
+}
+
+/// A cell id derived from the thread's identity, outside the counted range.
+fn hashed_cell_id() -> u32 {
+    let id = crate::gil::derive_thread_id();
+    ((id ^ (id >> 32)) as u32) | CELL_ID_HASHED
 }
 
 /// The per-thread state [`GilCell`] consults on every borrow.
@@ -293,6 +319,9 @@ pub(crate) struct CellTls {
     /// a valid id: pthread ids are pointers, Windows ids are non-zero for
     /// live threads, and the hash fallback re-derives on collision).
     pub(crate) thread_id: std::cell::Cell<u64>,
+    /// This thread's id in [`GilCell`]'s lock word: a 32-bit number
+    /// unique to the thread (see [`NEXT_CELL_ID`]), `0` until assigned.
+    cell_id: std::cell::Cell<u32>,
     /// Live [`Ref`]/[`RefMut`] guards on this thread.
     live_guards: std::cell::Cell<usize>,
 }
@@ -308,6 +337,31 @@ impl CellTls {
             self.thread_id.set(id);
             id
         }
+    }
+
+    #[inline]
+    fn cell_id(&self) -> u32 {
+        let id = self.cell_id.get();
+        if id != 0 {
+            id
+        } else {
+            self.assign_cell_id()
+        }
+    }
+
+    #[cold]
+    fn assign_cell_id(&self) -> u32 {
+        let n = NEXT_CELL_ID.fetch_add(1, Ordering::Relaxed);
+        let id = if n != 0 && n < CELL_ID_HASHED {
+            n
+        } else {
+            // Out of counted ids: pin the counter so it never wraps back
+            // into ids live threads hold.
+            NEXT_CELL_ID.store(CELL_ID_HASHED, Ordering::Relaxed);
+            hashed_cell_id()
+        };
+        self.cell_id.set(id);
+        id
     }
 }
 
@@ -346,6 +400,16 @@ pub(crate) fn cells_unguarded() -> bool {
     CELLS_UNGUARDED.load(Ordering::Relaxed)
 }
 
+/// The byte offsets of a `GilCell<Vec<Object>>`'s borrow counter and of
+/// its vector, for compiled code that reads a list in place.
+pub(crate) fn object_vec_cell_offsets() -> (usize, usize) {
+    type Cell = GilCell<Vec<crate::object::Object>>;
+    (
+        std::mem::offset_of!(Cell, borrow),
+        std::mem::offset_of!(Cell, data),
+    )
+}
+
 /// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
 /// nonzero once cells are shared between threads).
 pub(crate) fn cells_unguarded_flag() -> *const bool {
@@ -356,6 +420,12 @@ pub(crate) fn cells_unguarded_flag() -> *const bool {
 /// cell bias is revoked, and also before spawning a thread that may touch
 /// objects before it registers (see [`crate::rc`]). Never cleared.
 static RC_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The flag [`bias_held`] reads (native code that takes references in
+/// line reads it too).
+pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
+    &RC_SHARED
+}
 
 /// True while one thread owns every reference count (see [`crate::rc`]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
@@ -676,8 +746,7 @@ impl<T> GilCell<T> {
     pub const fn new(value: T) -> Self {
         Self {
             borrow: AtomicI32::new(0),
-            owner: AtomicU64::new(0),
-            depth: UnsafeCell::new(0),
+            owner: AtomicU32::new(0),
             data: UnsafeCell::new(value),
         }
     }
@@ -714,38 +783,35 @@ impl<T> GilCell<T> {
 }
 
 impl<T: ?Sized> GilCell<T> {
-    /// Acquire the cross-thread reentrant lock.
+    /// Acquire the cross-thread reentrant lock; `true` if this call took
+    /// it (and so must release it), `false` on a same-thread reentry.
     ///
     /// The two hot cases are branch-one: *fresh acquire* (owner is 0 —
     /// one compare-exchange) and *same-thread reentry* (owner is us —
-    /// one relaxed load plus a depth bump). Cross-thread contention
-    /// and `fork(2)` recovery live in the cold path.
+    /// one relaxed load). Cross-thread contention and `fork(2)` recovery
+    /// live in the cold path.
     #[inline]
-    fn lock_acquire(&self) {
-        self.lock_acquire_as(crate::gil::current_thread_id());
+    fn lock_acquire(&self) -> bool {
+        self.lock_acquire_as(current_cell_id())
     }
 
-    /// [`Self::lock_acquire`] with the caller's thread id in hand.
+    /// [`Self::lock_acquire`] with the caller's cell id in hand.
     #[inline]
-    fn lock_acquire_as(&self, me: u64) {
+    fn lock_acquire_as(&self, me: u32) -> bool {
         // Same-thread reentry: the owner field can only equal `me` if
         // this thread stored it, so the relaxed load is authoritative.
         if self.owner.load(Ordering::Relaxed) == me {
-            // SAFETY: this thread owns the lock; `depth` is only ever
-            // touched by the owner.
-            unsafe { *self.depth.get() += 1 };
-            return;
+            return false;
         }
         if self
             .owner
             .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            // SAFETY: we just became the owner.
-            unsafe { *self.depth.get() = 1 };
-            return;
+            return true;
         }
         self.lock_contended(me);
+        true
     }
 
     /// Contended / fork-recovery acquire.
@@ -762,7 +828,7 @@ impl<T: ?Sized> GilCell<T> {
     /// owner — steal it and reset the borrow counter. With two or more
     /// live threads the contention is genuine; keep waiting.
     #[cold]
-    fn lock_contended(&self, me: u64) {
+    fn lock_contended(&self, me: u32) {
         let mut spins = 0u32;
         loop {
             if self
@@ -770,8 +836,6 @@ impl<T: ?Sized> GilCell<T> {
                 .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                // SAFETY: we just became the owner.
-                unsafe { *self.depth.get() = 1 };
                 return;
             }
             spins += 1;
@@ -784,8 +848,6 @@ impl<T: ?Sized> GilCell<T> {
                     // Fork orphan: no living owner. Steal.
                     self.borrow.store(0, Ordering::Release);
                     self.owner.store(me, Ordering::Release);
-                    // SAFETY: sole surviving thread of the fork child.
-                    unsafe { *self.depth.get() = 1 };
                     return;
                 }
                 std::thread::yield_now();
@@ -793,18 +855,11 @@ impl<T: ?Sized> GilCell<T> {
         }
     }
 
-    /// Release one level of the reentrant lock.
+    /// Release the lock, which the caller took fresh (see
+    /// [`Self::owner`]).
     #[inline]
     fn lock_release(&self) {
-        // SAFETY: only the owner thread calls release (guards are
-        // `!Send`), so the depth cell is ours.
-        unsafe {
-            let d = &mut *self.depth.get();
-            *d -= 1;
-            if *d == 0 {
-                self.owner.store(0, Ordering::Release);
-            }
-        }
+        self.owner.store(0, Ordering::Release);
     }
 
     /// Replace the cross-thread lock state with a pristine one, leaving the
@@ -817,8 +872,6 @@ impl<T: ?Sized> GilCell<T> {
     unsafe fn rebuild_lock(&self) {
         self.borrow.store(0, Ordering::Release);
         self.owner.store(0, Ordering::Release);
-        // SAFETY: see method contract — sole thread.
-        unsafe { *self.depth.get() = 0 };
     }
 
     /// Borrow the cell immutably. Multiple immutable borrows can
@@ -872,6 +925,7 @@ impl<T: ?Sized> GilCell<T> {
     #[inline(never)]
     fn try_borrow_locked(&self) -> Result<Ref<'_, T>, BorrowError> {
         let locked = true;
+        let mut fresh = false;
         // One thread-local access covers the lock word's owner id and
         // the live-guard count. If the block is already torn down (a
         // guard taken from a TLS destructor) fall back to the uncached
@@ -885,9 +939,9 @@ impl<T: ?Sized> GilCell<T> {
                 // before it can reach the data.
                 note_vm_thread(t.thread_id());
                 if locked {
-                    self.lock_acquire_as(t.thread_id());
+                    fresh = self.lock_acquire_as(t.cell_id());
                 }
-                if self.borrow_shared(locked) {
+                if self.borrow_shared(fresh) {
                     t.live_guards.set(t.live_guards.get() + 1);
                     (true, std::ptr::from_ref(t))
                 } else {
@@ -896,9 +950,9 @@ impl<T: ?Sized> GilCell<T> {
             })
             .unwrap_or_else(|_| {
                 if locked {
-                    self.lock_acquire();
+                    fresh = self.lock_acquire();
                 }
-                (self.borrow_shared(locked), std::ptr::null())
+                (self.borrow_shared(fresh), std::ptr::null())
             });
         if !ok {
             return Err(BorrowError);
@@ -920,9 +974,10 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Bump the borrow counter under the held lock. If we observed a
     /// negative value (a mutable borrow is live on this thread — the
-    /// reentrant lock let us in), unwind, release, and report failure.
+    /// reentrant lock let us in), unwind, release the lock if this
+    /// attempt took it (`fresh`), and report failure.
     #[inline]
-    fn borrow_shared(&self, locked: bool) -> bool {
+    fn borrow_shared(&self, fresh: bool) -> bool {
         // A real read-modify-write, on both the locked and the biased
         // path. The lock word serializes the locked path against itself,
         // but the biased thread borrows without it, so a plain
@@ -930,7 +985,7 @@ impl<T: ?Sized> GilCell<T> {
         // updates and hand out a `&mut T` alongside a live `&T`.
         let prev = self.borrow.load(Ordering::Relaxed);
         if prev < 0 || prev == i32::MAX {
-            if locked {
+            if fresh {
                 self.lock_release();
             }
             return false;
@@ -941,11 +996,12 @@ impl<T: ?Sized> GilCell<T> {
 
     /// Claim the exclusive borrow under the held lock: only succeeds if
     /// the counter is exactly zero (no shared borrow and no nested
-    /// mutable borrow); releases the lock and reports failure otherwise.
+    /// mutable borrow); releases the lock if this attempt took it
+    /// (`fresh`) and reports failure otherwise.
     #[inline]
-    fn borrow_exclusive(&self, locked: bool) -> bool {
+    fn borrow_exclusive(&self, fresh: bool) -> bool {
         if self.borrow.load(Ordering::Relaxed) != 0 {
-            if locked {
+            if fresh {
                 self.lock_release();
             }
             return false;
@@ -985,14 +1041,15 @@ impl<T: ?Sized> GilCell<T> {
     #[inline(never)]
     fn try_borrow_mut_locked(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         let locked = true;
+        let mut fresh = false;
         let (ok, tls) = CELL_TLS
             .try_with(|t| {
                 // Registers the caller — see `try_borrow_locked`.
                 note_vm_thread(t.thread_id());
                 if locked {
-                    self.lock_acquire_as(t.thread_id());
+                    fresh = self.lock_acquire_as(t.cell_id());
                 }
-                if self.borrow_exclusive(locked) {
+                if self.borrow_exclusive(fresh) {
                     t.live_guards.set(t.live_guards.get() + 1);
                     (true, std::ptr::from_ref(t))
                 } else {
@@ -1001,9 +1058,9 @@ impl<T: ?Sized> GilCell<T> {
             })
             .unwrap_or_else(|_| {
                 if locked {
-                    self.lock_acquire();
+                    fresh = self.lock_acquire();
                 }
-                (self.borrow_exclusive(locked), std::ptr::null())
+                (self.borrow_exclusive(fresh), std::ptr::null())
             });
         if !ok {
             return Err(BorrowMutError);
@@ -1136,7 +1193,7 @@ impl<T: Copy> GilCell<T> {
         }
         #[cfg(not(debug_assertions))]
         {
-            self.lock_acquire();
+            let fresh = self.lock_acquire();
             // SAFETY: the owner lock is held, so no other thread can
             // touch the payload; a `T: Copy` read cannot re-enter
             // Python, so no GIL hand-off (and thus no cross-thread
@@ -1146,7 +1203,9 @@ impl<T: Copy> GilCell<T> {
             // guard drop without going through a call boundary, and
             // `Copy` cells are never borrowed across call boundaries.
             let v = unsafe { *self.data.get() };
-            self.lock_release();
+            if fresh {
+                self.lock_release();
+            }
             v
         }
     }
@@ -1163,11 +1222,13 @@ impl<T: Copy> GilCell<T> {
         }
         #[cfg(not(debug_assertions))]
         {
-            self.lock_acquire();
+            let fresh = self.lock_acquire();
             // SAFETY: as in `get`; the write is a plain `Copy` store
             // under the owner lock.
             unsafe { *self.data.get() = value };
-            self.lock_release();
+            if fresh {
+                self.lock_release();
+            }
         }
     }
 }
@@ -1232,8 +1293,8 @@ impl<T: Hash> Hash for GilCell<T> {
 /// counter and the cell's reentrant lock on drop.
 ///
 /// `!Send` (via the `PhantomData<*mut ()>` marker): the lock's
-/// release must run on the acquiring thread because the reentrancy
-/// accounting (owner id + depth) is per-thread.
+/// release must run on the acquiring thread because the lock word
+/// names the owning thread.
 pub struct Ref<'a, T: ?Sized + 'a> {
     cell: &'a GilCell<T>,
     value: &'a T,
@@ -1271,7 +1332,9 @@ impl<T: ?Sized> Drop for Ref<'_, T> {
         // retires it.
         let count = self.cell.borrow.load(Ordering::Relaxed);
         self.cell.borrow.store(count - 1, Ordering::Relaxed);
-        if self.locked {
+        // The last of this thread's guards on the cell releases the lock
+        // (all of them hold it, so they are all this thread's).
+        if self.locked && count == 1 {
             self.cell.lock_release();
         }
         note_cell_guard_released(self.tls);
@@ -1311,7 +1374,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RefMut<'_, T> {
 impl<T: ?Sized> Drop for RefMut<'_, T> {
     fn drop(&mut self) {
         // From -1 back to 0 — there's only ever one outstanding
-        // mutable borrow at a time.
+        // mutable borrow at a time, and no other guard holds the lock.
         self.cell.borrow.store(0, Ordering::Relaxed);
         if self.locked {
             self.cell.lock_release();

@@ -144,6 +144,11 @@ pub const METHOD_GUARD_AT_CALL: u32 = 1 << 31;
 /// the locals back itself), so the call skips the locals write-back.
 pub const METHOD_NATIVE: u32 = 1 << 30;
 
+/// Set in an attribute guard's index (see [`ObjLayout::guard_split_idx`])
+/// when it names a member slot's position in its class's slot layout
+/// rather than a split field's.
+pub const SLOT_FIELD: u32 = 1 << 31;
+
 impl SlotTag {
     /// Decode a raw tag written by native code.
     #[inline]
@@ -184,10 +189,13 @@ pub struct ObjLayout {
     pub ctx_guards: i32,
     pub guards_buf: i32,
     /// A guard: its size, its class version (`u64`), and the split-values
-    /// index its name sits at (`u32`, `u32::MAX` for none).
+    /// index its name sits at (`u32`, `u32::MAX` for none), or, with
+    /// [`SLOT_FIELD`] set, its member slot's position in the class's slot
+    /// layout, whose address is then the guard's layout word.
     pub guard_size: i32,
     pub guard_ver: i32,
     pub guard_split_idx: i32,
+    pub guard_slot_layout: i32,
     /// Object tags (the first byte of a value); a word payload is at 8, a
     /// `bool`'s at 1.
     pub tag_instance: u8,
@@ -241,7 +249,9 @@ pub struct ObjLayout {
     /// shadowing the method (`u32`), whether the increment is the call's
     /// argument (`u32`: `1`, else `0`), the literal increment (`i64`),
     /// where the function keeps its code pointer and the code pointer that
-    /// must be there (words).
+    /// must be there (words). The shadow bound and the code pair also
+    /// guard a direct method call in line (the code address is null while
+    /// they don't).
     pub method_size: i32,
     pub method_ver: i32,
     pub method_upd_idx: i32,
@@ -256,6 +266,27 @@ pub struct ObjLayout {
     pub observers: usize,
     pub dict_watchers: usize,
     pub exotic_keys: usize,
+    /// The interpreter's gate word (a `u32`, nonzero while it has work
+    /// pending), the recursion limit (a word), and [`JitFrame::ctx`] →
+    /// the pointer to this thread's call depth (a word), for a call
+    /// compiled code runs in line.
+    pub hot_gates: usize,
+    pub recursion_limit: usize,
+    pub ctx_depth_cell: i32,
+    /// An instance value's payload pointer → its member slots' borrow
+    /// counter (`i32`), the byte that reads [`Self::slots_laid_out`] while
+    /// they are laid out over a class's names, and then the names' pointer
+    /// and the values' pointer (words). `slots_ok` is false when the
+    /// embedder couldn't measure them (no slot reads run in line).
+    pub slots_ok: bool,
+    pub inst_slots_borrow: i32,
+    pub inst_slots_tag: i32,
+    pub slots_laid_out: u8,
+    pub inst_slots_layout: i32,
+    pub inst_slots_values: i32,
+    /// An unset member slot holds the "no value" object, whose tag this
+    /// is.
+    pub tag_unbound: u8,
 }
 
 static OBJ_LAYOUT: std::sync::OnceLock<ObjLayout> = std::sync::OnceLock::new();
@@ -319,6 +350,11 @@ pub struct JitFrame {
     pub call_args: *mut u64,
     /// Matching [`SlotTag`]s for [`Self::call_args`].
     pub call_tags: *mut u32,
+    /// The loop-header poll countdown at the last exit (see
+    /// [`JIT_POLL_STRIDE`]): with the activation's poll count, how many
+    /// loop iterations it ran natively. Left as seeded by code without
+    /// loops.
+    pub poll_left: i64,
 }
 
 impl JitFrame {
@@ -940,6 +976,22 @@ pub(crate) fn unbox_int_helper_addr() -> usize {
     UNBOX_INT_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static UNBOX_FLOAT_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `float` pin guard ([`crate::ir::TOp::UnboxFloat`]). Its
+/// argument packs the pin (low 32 bits) with the promotion mode (high
+/// bits; a negative argument is the `None` pin). On success it writes
+/// the `f64` bits to frame.ret_bits and returns zero; a nonzero status
+/// deopts without invoking Python code.
+pub fn register_unbox_float_helper(f: StrLenHelper) {
+    UNBOX_FLOAT_HELPER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn unbox_float_helper_addr() -> usize {
+    UNBOX_FLOAT_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static DICT_ITER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the process-wide dict-iterator capture helper (RFC 0073
@@ -1195,6 +1247,30 @@ pub(crate) fn guard_method_helper_addr() -> usize {
     GUARD_METHOD_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The enter helper of a direct method call (see
+/// [`crate::CompiledFrame::direct_method_leaf`]): the method site's
+/// guard against the receiver pin plus the [`SelfEnterHelper`]'s charge
+/// (GIL countdown, observer gate, recursion tick). `0` when the call may
+/// enter the compiled method directly (the charge is then released by the
+/// [`SelfExitHelper`]); anything else leaves the call to the
+/// [`CallMethodHelper`] with nothing charged.
+pub type MethodEnterHelper =
+    unsafe extern "C" fn(frame: *mut JitFrame, pin: i64, token: i64) -> i64;
+
+static METHOD_ENTER_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the process-wide direct method-call enter helper. Frames
+/// compiled before it is registered call their methods through the
+/// [`CallMethodHelper`] alone.
+pub fn register_method_enter_helper(helper: MethodEnterHelper) {
+    METHOD_ENTER_HELPER.store(helper as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn method_enter_helper_addr() -> usize {
+    METHOD_ENTER_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static CALL_NATIVE_METHOD_HELPER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -1447,6 +1523,65 @@ pub fn register_contains_dyn_helper(f: DynAttrHelper) {
 #[must_use]
 pub(crate) fn contains_dyn_helper_addr() -> usize {
     CONTAINS_DYN_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static DYN_BINOP_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_COMPARE_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic binary-operation and comparison helpers
+/// ([`crate::ir::TOp::DynBinary`], [`crate::ir::TOp::DynCompare`]).
+/// Shape: `(frame, oparg, 0) -> status`, the two operands staged in the
+/// marshal buffer (slots 0 and 1, with tags). Status `0` writes the
+/// result to `frame.ret_bits` (an object pin, or `0`/`1` for a to-`bool`
+/// comparison); `1` raised; `2` completed but parked (deopt after the
+/// pc); `3` declined before running anything (deopt at the pc).
+pub fn register_dyn_op_helpers(binop: DynAttrHelper, compare: DynAttrHelper) {
+    DYN_BINOP_HELPER.store(binop as usize, std::sync::atomic::Ordering::Release);
+    DYN_COMPARE_HELPER.store(compare as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_binop_helper_addr() -> usize {
+    DYN_BINOP_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_compare_helper_addr() -> usize {
+    DYN_COMPARE_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static DYN_GETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_SETITEM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DYN_UNARY_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the generic subscript and unary helpers
+/// ([`crate::ir::TOp::DynGetItem`], [`crate::ir::TOp::DynSetItem`],
+/// [`crate::ir::TOp::DynUnary`]), with the generic binary operation's
+/// shape and statuses: operands staged in the marshal buffer (a store
+/// stages value, container, index), `(frame, oparg, 0) -> status`.
+pub fn register_dyn_item_helpers(
+    getitem: DynAttrHelper,
+    setitem: DynAttrHelper,
+    unary: DynAttrHelper,
+) {
+    DYN_GETITEM_HELPER.store(getitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_SETITEM_HELPER.store(setitem as usize, std::sync::atomic::Ordering::Release);
+    DYN_UNARY_HELPER.store(unary as usize, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn dyn_getitem_helper_addr() -> usize {
+    DYN_GETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_setitem_helper_addr() -> usize {
+    DYN_SETITEM_HELPER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[must_use]
+pub(crate) fn dyn_unary_helper_addr() -> usize {
+    DYN_UNARY_HELPER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 static BUILD_SET_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

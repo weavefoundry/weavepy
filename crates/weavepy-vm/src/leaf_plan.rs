@@ -857,6 +857,15 @@ impl Pending {
         unsafe { self.buf[k].assume_init_ref() }
     }
 
+    /// Whether a buffered store targets `recv.name`.
+    fn stores_to(&self, recv: &Object, name: u32) -> bool {
+        (0..self.n).any(|k| {
+            let (r, _, n, _) = self.get(k);
+            // SAFETY: stable receivers (see `Store`).
+            *n == name && unsafe { (**r).is_same(recv) }
+        })
+    }
+
     /// Whether entry `k` is the last store to its attribute.
     fn latest(&self, k: usize) -> bool {
         let (r0, _, n0, _) = self.get(k);
@@ -894,14 +903,16 @@ impl Pending {
     }
 }
 
-/// A leaf call's callee: a Python function to evaluate in place, or a
-/// builtin (with its owner, when a namespace holds one).
+/// A leaf call's callee: a Python function to evaluate in place, a
+/// builtin (with its owner, when a namespace holds one), or a builtin
+/// class whose construction is pure (see `seqiter::builtin_ctor_pure`).
 enum Callee<'a> {
     Py(*const crate::object::PyFunction),
     Native(
         *const crate::object::BuiltinFn,
         Option<&'a Rc<crate::object::BuiltinFn>>,
     ),
+    Ctor(&'a Rc<crate::types::TypeObject>),
 }
 
 /// A leaf evaluation's result: a value the caller may borrow for the rest
@@ -1102,6 +1113,7 @@ impl Interpreter {
                         get!(src),
                         pc,
                         name,
+                        nest + depth as u8,
                     )?;
                     set!(dst, v);
                 }
@@ -1154,6 +1166,7 @@ impl Interpreter {
                         V::R(p) => match unsafe { &*p } {
                             Object::Function(func) => Callee::Py(Rc::as_ptr(func)),
                             Object::Builtin(b) => Callee::Native(Rc::as_ptr(b), Some(b)),
+                            Object::Type(t) if t.flags.is_builtin => Callee::Ctor(t),
                             _ => return None,
                         },
                         _ => return None,
@@ -1169,7 +1182,7 @@ impl Interpreter {
                     }
                     let fp = match callee {
                         Callee::Py(fp) => fp,
-                        Callee::Native(b, rc) => {
+                        Callee::Native(..) | Callee::Ctor(_) => {
                             // A read-only builtin, on borrowed copies of the
                             // arguments: never dropped, so no reference moves.
                             let mut staged =
@@ -1191,7 +1204,13 @@ impl Interpreter {
                             let args = unsafe {
                                 std::slice::from_raw_parts(staged.as_ptr().cast::<Object>(), n)
                             };
-                            let r = self.leaf_pure_builtin(code, usize::from(pc), b, rc, args)?;
+                            let r = match callee {
+                                Callee::Native(b, rc) => {
+                                    self.leaf_pure_builtin(code, usize::from(pc), b, rc, args)?
+                                }
+                                Callee::Ctor(t) => crate::seqiter::builtin_ctor_pure(t, args)?,
+                                Callee::Py(_) => return None,
+                            };
                             set!(at, owned.own(r)?);
                             continue;
                         }
@@ -1596,6 +1615,7 @@ impl Interpreter {
         src: V,
         pc: u16,
         name: u16,
+        nest: u8,
     ) -> Option<V> {
         let V::R(p) = src else {
             return None;
@@ -1624,8 +1644,13 @@ impl Interpreter {
                 match unsafe { Self::leaf_cached_instance_field(ext, code, inst, pc, name) } {
                     Some(v) => Some(norm(v)),
                     // A stale or absent site cache resolves through the
-                    // site's own entries.
-                    None => owned.own(Self::leaf_attr_resolve_site(code, inst, recv, pc, name)?),
+                    // site's own entries (a property through its getter).
+                    None => match self.plan_getter::<EFFECT>(ext, pend, inst, recv, pc, nest) {
+                        Some(v) => owned.own(v),
+                        None => {
+                            owned.own(Self::leaf_attr_resolve_site(code, inst, recv, pc, name)?)
+                        }
+                    },
                 }
             }
             Object::Type(cls) => {
@@ -1656,8 +1681,46 @@ impl Interpreter {
                 }
                 owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?)
             }
+            Object::Function(_) => owned.own(Self::leaf_load_attr_recv(code, recv, pc, name)?),
             _ => None,
         }
+    }
+
+    /// `recv.name` through the property getter the `LOAD_ATTR` site at `pc`
+    /// remembers for the receiver's class (see [`crate::MethodSlot`]): a
+    /// pure-leaf getter, evaluated one level down as a pure-leaf call is,
+    /// at call-nesting depth `nest`.
+    #[inline(never)]
+    fn plan_getter<const EFFECT: bool>(
+        &self,
+        ext: &CodeConstObjects,
+        pend: &Pending,
+        inst: &crate::types::PyInstance,
+        recv: &Object,
+        pc: u32,
+        nest: u8,
+    ) -> Option<Object> {
+        // Only while no store is buffered (the getter would not see one).
+        if (EFFECT && pend.n > 0) || nest >= NEST {
+            return None;
+        }
+        let slot = ext.method_slots.get()?.get(pc as usize)?;
+        let cls = inst.cls_raw();
+        // SAFETY: GIL-serialized; nothing here runs Python, so nothing
+        // rebinds the getter or its code, or changes the class.
+        let (f, fcode) = unsafe { slot.getter_peek(cls.attr_version.get()) }?;
+        if !Self::default_getattribute(cls)
+            || !crate::code_is_pure_leaf(fcode)
+            || !Self::leaf_code_ok(fcode)
+            || crate::leaf_arity(fcode) != 1
+            || fcode.has_varkeywords
+            || crate::recursion::current_depth() + usize::from(nest) + 1
+                >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        self.leaf_eval_nested(fcode, f, &[std::ptr::from_ref(recv)], nest + 1)?
+            .into_object()
     }
 
     /// The method-form load of `src.name` off the site's slot: the function
@@ -1678,8 +1741,15 @@ impl Interpreter {
         src: V,
         name: u16,
     ) -> Option<(V, V)> {
-        let V::R(p) = src else {
-            return None;
+        let p = match src {
+            V::R(p) => p,
+            // An `int` held unboxed (`x.bit_length()`): its type's method,
+            // the receiver staying unboxed (the call stages it).
+            V::I(i) => {
+                let b = self.leaf_builtin_method_ptr(ms, &Object::Int(i), code, name)?;
+                return Some((V::Bi(b), src));
+            }
+            _ => return None,
         };
         // SAFETY: as `norm`.
         match unsafe { &*p } {

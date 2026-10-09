@@ -2080,3 +2080,15 @@ class BaseEventLoop(events.AbstractEventLoop):
 
         if self.is_running():
             self.call_soon_threadsafe(self._set_coroutine_origin_tracking, enabled)
+
+
+# WeavePy: native `call_soon`, `create_task` and `create_future` serve
+# stock loops (see `_weave_asyncio`), falling back to the Python methods
+# above.
+try:
+    import _weave_asyncio
+except ImportError:
+    pass
+else:
+    _weave_asyncio.install_loop(BaseEventLoop, globals())
+    del _weave_asyncio

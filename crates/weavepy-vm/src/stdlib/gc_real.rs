@@ -506,18 +506,20 @@ fn object_is_tracked(target: &Object) -> bool {
             inst.ensure_gc_tracked();
             gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
         }
-        // A function may still be young.
-        Object::Function(_) => gc_trace::with_state(|s| s.is_tracked_instance(id_of(target))),
+        // A function, generator or coroutine may still be young.
+        Object::Function(_) | Object::Generator(_) | Object::Coroutine(_) => {
+            gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
+        }
         // A list/dict/set born holding only scalars has its tracking
         // deferred; CPython tracks it from birth, so answer as CPython
         // does and hand it to the collector from here on.
         Object::List(_) | Object::Dict(_) | Object::Set(_) => {
             let id = id_of(target);
             gc_trace::with_state(|s| {
-                if !s.is_tracked(id) {
+                if !s.is_tracked_instance(id) {
                     s.track_now(target);
                 }
-                s.is_tracked(id)
+                s.is_tracked_instance(id)
             })
         }
         other => {

@@ -1891,6 +1891,8 @@ fn spawn_child(args: &[Object]) -> Result<Object, RuntimeError> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    #[cfg(feature = "jit")]
+    crate::tier2::join_codegen_prewarm();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = std::io::Error::last_os_error();

@@ -881,11 +881,31 @@ fn mod_complete_statement(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(complete != 0))
 }
 
+/// Set once `register_adapter` has adapted `int`, `float`, `str` or
+/// `bytearray` (CPython's `BaseTypeAdapted`): until then, values of those
+/// exact types bind without adaptation.
+static BASE_TYPE_ADAPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a value of an exact base type must still be adapted (see
+/// [`BASE_TYPE_ADAPTED`]).
+pub(crate) fn base_type_adapted() -> bool {
+    BASE_TYPE_ADAPTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn mod_register_adapter(args: &[Object]) -> Result<Object, RuntimeError> {
     let (ty, caster) = match (args.first(), args.get(1)) {
         (Some(t @ Object::Type(_)), Some(c)) => (t.clone(), c.clone()),
         _ => return Err(type_error("register_adapter(type, callable)")),
     };
+    if let Object::Type(t) = &ty {
+        let bt = crate::builtin_types::builtin_types();
+        if [&bt.int_, &bt.float_, &bt.str_, &bt.bytearray_]
+            .iter()
+            .any(|b| Rc::ptr_eq(b, t))
+        {
+            BASE_TYPE_ADAPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let key = DictKey(Object::new_tuple_array([
         ty,
         Object::Type(prepare_protocol_class()),

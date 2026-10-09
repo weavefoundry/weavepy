@@ -51,12 +51,110 @@ pub(crate) fn str_char_len(s: &SharedStr) -> usize {
     SharedStr::char_count(s)
 }
 
+/// `s[index]` (a code-point index) as a `char`, `None` past the end (see
+/// [`str_byte_offset`]).
+pub(crate) fn str_char_at(s: &SharedStr, index: usize) -> Option<char> {
+    let bytes = s.as_bytes();
+    if SharedStr::char_count(s) == bytes.len() {
+        return bytes.get(index).map(|&b| b as char);
+    }
+    s.get(str_byte_offset(s, index)?..)?.chars().next()
+}
+
+/// The byte offset of code point `index` of `s` (`s.len()` for the
+/// index just past the end), `None` beyond that. A pure-ASCII string's
+/// offsets are its indices; any other walks its UTF-8 from a per-thread
+/// cursor, the code point and byte offset of this thread's last lookup
+/// in the same string, so a scanner stepping through non-ASCII text
+/// (`src[pos]`, `src[start:pos]`, `pos += 1`) pays O(1) per step rather
+/// than O(pos). The cursor holds a weak reference to its string, which
+/// keeps the allocation (and so its address) from being reused while the
+/// cursor names it.
+pub(crate) fn str_byte_offset(s: &SharedStr, index: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let count = SharedStr::char_count(s);
+    if count == bytes.len() || index == 0 {
+        return (index <= bytes.len()).then_some(index);
+    }
+    if index >= count {
+        return (index == count).then_some(bytes.len());
+    }
+    STR_CURSOR.with(|cell| {
+        let mut cursor = cell.borrow_mut();
+        let known = cursor
+            .as_ref()
+            .filter(|(w, ..)| w.addr() == SharedStr::addr(s))
+            .map(|&(_, ci, bo)| (ci, bo));
+        let (mut ci, mut bo) = match known {
+            Some((ci, bo)) if index >= ci || index >= ci / 2 => (ci, bo),
+            _ => (0, 0),
+        };
+        // Walk back from the cursor over continuation bytes, or forward.
+        while ci > index {
+            bo -= 1;
+            while bytes[bo] & 0xC0 == 0x80 {
+                bo -= 1;
+            }
+            ci -= 1;
+        }
+        while ci < index {
+            bo += utf8_width(bytes[bo]);
+            ci += 1;
+        }
+        match cursor.as_mut() {
+            Some((w, c0, b0)) if w.addr() == SharedStr::addr(s) => {
+                *c0 = ci;
+                *b0 = bo;
+            }
+            _ => *cursor = Some((SharedStr::downgrade(s), ci, bo)),
+        }
+        Some(bo)
+    })
+}
+
+thread_local! {
+    /// [`str_byte_offset`]'s cursor: its string, code point, and byte
+    /// offset.
+    static STR_CURSOR: std::cell::RefCell<Option<(crate::shared_value::WeakStr, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Forget this thread's [`str_byte_offset`] cursor if it names `s`, so a
+/// sole owner can grow `s` in place (see `SharedStr::try_append`).
+/// Returns whether it did.
+pub(crate) fn release_str_cursor(s: &SharedStr) -> bool {
+    STR_CURSOR
+        .try_with(|cell| {
+            let Ok(mut cursor) = cell.try_borrow_mut() else {
+                return false;
+            };
+            if !matches!(&*cursor, Some((w, ..)) if w.addr() == SharedStr::addr(s)) {
+                return false;
+            }
+            *cursor = None;
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// The byte length of the UTF-8 sequence that `lead` starts.
+#[inline]
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
 /// A Python value as seen by the interpreter.
 ///
 /// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
 /// the variant's index in a tag byte at offset 0, and each payload at its
 /// natural alignment after it (every payload is one word or smaller).
-#[derive(Clone)]
+/// Every variant but the scalars holds one counted pointer in its second
+/// word, which `Clone` and [`Object::strong_word`] rely on.
 #[repr(u8)]
 pub enum Object {
     None,
@@ -189,8 +287,9 @@ pub enum Object {
     /// `sys.implementation`, `argparse.Namespace`-shaped fixtures, and
     /// the conformance harness.
     SimpleNamespace(Rc<RefCell<DictData>>),
-    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object
-    /// CPython implements in C. Wraps an arbitrary VM iterable, so it
+    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object or
+    /// a builtin `map`/`filter`/`zip`/`enumerate`, which CPython
+    /// implements in C. Wraps an arbitrary VM iterable, so it
     /// is stepped by the *interpreter* (`Interpreter::iter_next`),
     /// never by `PyIterator::next_value`: advancing the source may
     /// resume a generator or call a user-defined `__next__`. Being
@@ -294,10 +393,10 @@ impl fmt::Debug for Object {
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.cls().name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
-            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow().to_str()),
-            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow().to_str()),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name().to_str()),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name().to_str()),
             Object::AsyncGenerator(g) => {
-                write!(f, "<async_generator object {}>", g.name.borrow().to_str())
+                write!(f, "<async_generator object {}>", g.name().to_str())
             }
             Object::AsyncGenAwait(a) => write!(f, "<{} object>", a.kind.type_name()),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
@@ -3246,8 +3345,11 @@ pub struct LeafProbe<'a> {
 }
 
 impl<'a> LeafProbe<'a> {
-    /// `None` unless `key` is a `str`, a machine `int`, or a plain
-    /// instance hashed by identity (its `__hash__` is `object`'s).
+    /// `None` unless `key` is a `str`, a machine `int`, a plain instance
+    /// hashed by identity (its `__hash__` is `object`'s), a class whose
+    /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
+    /// generator-family object or module, or a tuple of machine ints and
+    /// strings.
     #[inline]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3259,6 +3361,21 @@ impl<'a> LeafProbe<'a> {
             {
                 identity_hash(key)
             }
+            Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
+            // A tuple of machine ints and strings: its (cached) hash, with
+            // no item's `__hash__` to run.
+            Object::Tuple(t)
+                if t.iter()
+                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_))) =>
+            {
+                py_hash_value(key)?
+            }
+            // Kinds that hash and compare by identity alone.
+            Object::Function(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+            | Object::Module(_) => identity_hash(key),
             _ => return None,
         };
         Some(Self {
@@ -3279,6 +3396,33 @@ impl<'a> LeafProbe<'a> {
     }
 }
 
+/// Whether class `t` hashes and compares by identity: its metaclass
+/// keeps `type`'s `__hash__` and `__eq__` (no Python runs for either).
+#[inline]
+pub(crate) fn type_hash_is_identity(t: &crate::types::TypeObject) -> bool {
+    if t.c_ext_ptr.get() != 0 {
+        return false;
+    }
+    // SAFETY: a GIL-serialized read of the metaclass cell, ended before
+    // anything runs.
+    let Some(meta) = (unsafe { t.metaclass.peek() }) else {
+        return t
+            .metaclass
+            .borrow()
+            .as_ref()
+            .is_none_or(meta_hash_is_identity);
+    };
+    meta.as_ref().is_none_or(meta_hash_is_identity)
+}
+
+/// Whether metaclass `m` keeps `type`'s `__hash__` and `__eq__`.
+#[inline]
+fn meta_hash_is_identity(m: &crate::Rc<crate::types::TypeObject>) -> bool {
+    crate::Rc::ptr_eq(m, &crate::builtin_types::builtin_types().type_)
+        || (!m.dunder(crate::types::Dunder::Hash).user_defined()
+            && !m.dunder(crate::types::Dunder::Eq).user_defined())
+}
+
 impl Hash for LeafProbe<'_> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -3290,11 +3434,37 @@ impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
         match (self.key, &key.0) {
-            (Object::Str(a), Object::Str(b)) => a.as_bytes() == b.as_bytes(),
+            // (The same string object, an interned name's usual case,
+            // settles before any byte compare.)
+            (Object::Str(a), Object::Str(b)) => {
+                std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.as_bytes() == b.as_bytes()
+            }
             (Object::Int(a), Object::Int(b)) => a == b,
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
+            (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
+            (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
+            (Object::Generator(a), Object::Generator(b))
+            | (Object::Coroutine(a), Object::Coroutine(b))
+            | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
+            (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            // Item by item; any item pairing other than int-int or str-str
+            // (an equal `True` or `1.0`, say) may need Python's equality.
+            (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
+                let mut equal = true;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match (x, y) {
+                        (Object::Int(p), Object::Int(q)) => equal &= p == q,
+                        (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
+                        _ => {
+                            self.foreign.set(true);
+                            return false;
+                        }
+                    }
+                }
+                equal
+            }
             _ => {
                 self.foreign.set(true);
                 false
@@ -3631,6 +3801,13 @@ impl PartialEq for DictKey {
         if self.0.is_same(&other.0) {
             return true;
         }
+        // Two plain strings or machine ints, the common keys, are equal by
+        // value alone.
+        match (&self.0, &other.0) {
+            (Object::Str(a), Object::Str(b)) => return a.as_bytes() == b.as_bytes(),
+            (Object::Int(a), Object::Int(b)) => return a == b,
+            _ => {}
+        }
         // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
         // which is the `a is b` half of CPython's dict-key comparison.
         if self.0.eq_value(&other.0) {
@@ -3756,9 +3933,18 @@ fn key_cmp_error_pending() -> bool {
 /// nor steals the outer operation's error.
 pub(crate) fn key_cmp_scope<T>(f: impl FnOnce() -> T) -> Result<T, RuntimeError> {
     KEY_COMPARISON.with(|state| {
-        let saved = state.error.borrow_mut().take();
+        // (An error is rarely parked: the large value moves only then.)
+        let saved = if state.error.borrow().is_some() {
+            state.error.borrow_mut().take()
+        } else {
+            None
+        };
         let out = f();
-        let mine = state.error.replace(saved);
+        let mine = if state.error.borrow().is_some() || saved.is_some() {
+            state.error.replace(saved)
+        } else {
+            None
+        };
         match mine {
             Some(err) => Err(err),
             None => Ok(out),
@@ -3782,6 +3968,30 @@ pub(crate) fn with_key_eq_deferred<T>(f: impl FnOnce() -> T) -> (T, bool) {
         let deferred = state.deferred.replace(saved);
         state.defer_depth.set(state.defer_depth.get() - 1);
         (out, deferred)
+    })
+}
+
+/// [`with_key_eq_deferred`] around [`key_cmp_scope`], in one visit to the
+/// thread's comparison state.
+pub(crate) fn key_cmp_deferred<T>(f: impl FnOnce() -> T) -> (Result<T, RuntimeError>, bool) {
+    KEY_COMPARISON.with(|state| {
+        state.defer_depth.set(state.defer_depth.get() + 1);
+        let saved_deferred = state.deferred.replace(false);
+        // (An error is rarely parked: the large value moves only then.)
+        let saved_error = if state.error.borrow().is_some() {
+            state.error.borrow_mut().take()
+        } else {
+            None
+        };
+        let out = f();
+        let mine = if state.error.borrow().is_some() || saved_error.is_some() {
+            state.error.replace(saved_error)
+        } else {
+            None
+        };
+        let deferred = state.deferred.replace(saved_deferred);
+        state.defer_depth.set(state.defer_depth.get() - 1);
+        (mine.map_or(Ok(out), Err), deferred)
     })
 }
 
@@ -3987,6 +4197,24 @@ pub(crate) fn dict_reentrant_get(
             .raw_entry_v1()
             .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
             .map(|(_, v)| v.clone())),
+        None => Ok(None),
+    }
+}
+
+/// The position of `key` in `d`, honouring keys whose `__hash__`/`__eq__`
+/// run Python (the borrow-free probe, then an identity match on the stored
+/// key).
+pub(crate) fn dict_index_of(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<Option<usize>, RuntimeError> {
+    use indexmap::map::raw_entry_v1::RawEntryApiV1;
+    let probe = dict_reentrant_probe(d, key)?;
+    match probe.stored {
+        Some(stored) => Ok(d
+            .borrow()
+            .raw_entry_v1()
+            .index_from_hash(probe.table_hash, |k| k.0.is_same(&stored))),
         None => Ok(None),
     }
 }
@@ -4586,12 +4814,16 @@ pub struct PyFunction {
     /// must never appear in `f.__dict__` (functools.update_wrapper
     /// copies `__dict__` and asserts the wrapper's annotations are
     /// untouched by the wrapped function's slots). Read through
-    /// [`Self::slots`], which first copies in [`Self::slot_seed`].
-    pub slots_raw: RefCell<DictData>,
-    /// The slots a new function starts with, shared by every function
-    /// one `def` makes (see `new_function`), until the first access to
-    /// [`Self::slots`] copies them in: most functions never read theirs.
-    pub slot_seed: RefCell<Option<Rc<DictMap>>>,
+    /// [`Self::slots`], which first copies in [`Self::slot_seed`]. Boxed
+    /// on first use: most functions never have their slots read, and an
+    /// inline table made every function 80 bytes larger.
+    pub slots_raw: crate::sync::OnceBox<RefCell<DictData>>,
+    /// The slots a new function starts with, built on first access to
+    /// [`Self::slots`] (most functions never read theirs): `__module__`
+    /// from the defining globals' `__name__`, kept here, and `__name__`
+    /// and `__qualname__` from the code's interned names, which every
+    /// function one `def` makes shares, as CPython's do.
+    pub slot_seed: RefCell<Option<LazySlots>>,
     /// The frame `cells` vector for a function whose code has free
     /// variables but no cell variables: exactly `closure`'s cells, built
     /// once (the closure is immutable) for the lean call paths.
@@ -4602,6 +4834,11 @@ pub struct PyFunction {
     /// had them overridden.
     pub defaults_override: OverrideFlag,
 }
+
+/// A function's getset slots before their first read (see
+/// [`PyFunction::slot_seed`]): the defining globals' `__name__`, if set.
+#[derive(Debug, Clone)]
+pub struct LazySlots(pub Option<Object>);
 
 /// A dying PyFunction clears the weak references watching it.
 impl Drop for PyFunction {
@@ -4735,20 +4972,80 @@ impl PyFunction {
         if unsafe { (*self.slot_seed.as_ptr()).is_some() } {
             self.plant_slot_seed();
         }
-        &self.slots_raw
+        self.slots_cell()
+    }
+
+    /// [`Self::slots_raw`]'s table, made empty on first use.
+    #[inline]
+    fn slots_cell(&self) -> &RefCell<DictData> {
+        if let Some(slots) = self.slots_raw.get() {
+            return slots;
+        }
+        let _ = self.slots_raw.set(RefCell::new(DictData::default()));
+        self.slots_raw.get().expect("set above")
     }
 
     #[cold]
     #[inline(never)]
     fn plant_slot_seed(&self) {
-        let Some(seed) = self.slot_seed.borrow_mut().take() else {
+        let Some(LazySlots(module)) = self.slot_seed.borrow_mut().take() else {
             return;
         };
-        let mut slots = self.slots_raw.borrow_mut();
+        let code = self.code();
+        let [module_key, name_key, qualname_key, _] = crate::fn_slot_keys();
+        let mut map = DictMap::with_capacity_and_hasher(3, crate::fasthash::FxBuildHasher);
+        if let Some(m) = module {
+            map.insert(DictKey(module_key.clone()), m);
+        }
+        map.insert(
+            DictKey(name_key.clone()),
+            crate::stdlib::sys::intern_name(&code.name),
+        );
+        map.insert(
+            DictKey(qualname_key.clone()),
+            crate::stdlib::sys::intern_name(&code.qualname),
+        );
+        let mut slots = self.slots_cell().borrow_mut();
         // Every store goes through `slots()`, which plants the seed
         // first: nothing is there yet to keep.
         debug_assert!(slots.is_empty());
-        *slots = DictData::from((*seed).clone());
+        *slots = DictData::from(map);
+    }
+
+    /// The function's current `__name__` and `__qualname__` objects (a
+    /// generator snapshots them at call time); a function whose slots
+    /// were never touched still has its code's interned names.
+    pub fn name_objects(&self) -> (Option<Object>, Option<Object>) {
+        if self.names_seeded() {
+            let code = self.code();
+            return (
+                Some(crate::stdlib::sys::intern_name(&code.name)),
+                Some(crate::stdlib::sys::intern_name(&code.qualname)),
+            );
+        }
+        let Some(slots) = self.slots_raw.get() else {
+            return (None, None);
+        };
+        // The two names' hashes, computed once.
+        static HASHES: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+        let (name_hash, qualname_hash) =
+            *HASHES.get_or_init(|| (py_str_hash("__name__"), py_str_hash("__qualname__")));
+        let slots = slots.borrow();
+        let attr_str = |s: &'static str, hash: i64| match slots.get(&StrKeyHashed { s, hash }) {
+            Some(o @ Object::Str(_)) => Some(o.clone()),
+            _ => None,
+        };
+        (
+            attr_str("__name__", name_hash),
+            attr_str("__qualname__", qualname_hash),
+        )
+    }
+
+    /// Whether the function's slots are still its definition-time seed
+    /// (so `__name__` and `__qualname__` are its code's).
+    pub fn names_seeded(&self) -> bool {
+        // SAFETY: a read of the seed's presence with nothing running.
+        unsafe { (*self.slot_seed.as_ptr()).is_some() }
     }
 
     /// Read a slot value if one has been stored (explicitly assigned or
@@ -4960,17 +5257,6 @@ pub struct PySlice {
 /// itself is opaque to outside code — it's owned by the VM module via
 /// `state` and only legal to inspect via interpreter methods.
 pub struct PyGenerator {
-    /// `gi_name`. Seeded from the function's `__name__` at call time;
-    /// user code may reassign it (`gen.__name__ = ...`). Held as the
-    /// *string object* so repeated reads return the identical object —
-    /// CPython stores `gi_name` as a `PyObject*` and
-    /// `gen.__name__ is gen.__name__` holds (test_types
-    /// CoroutineTests.test_gen reads it through two paths and
-    /// asserts `is`).
-    pub name: RefCell<Object>,
-    /// `gi_qualname` (PEP 3155). Seeded from the function's
-    /// `__qualname__` at call time; reassignable like `name`.
-    pub qualname: RefCell<Object>,
     /// Whether this is a plain generator, a coroutine, or an async
     /// generator. Needed so the shared send/throw machinery can apply
     /// PEP 479 (a `StopIteration` escaping the *body* becomes a
@@ -4981,43 +5267,165 @@ pub struct PyGenerator {
     /// finishes and the frame is dropped.
     pub code: Object,
     pub state: RefCell<GeneratorState>,
-    /// `cr_origin` — for coroutines created while
-    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
-    /// of `(filename, lineno, funcname)` triples for the creation call
-    /// stack (most recent first). `None` when tracking is off.
-    pub origin: RefCell<Object>,
+    /// [`Self::name`] and [`Self::qualname`] when they aren't the code's,
+    /// [`Self::origin`] and [`Self::finalizer`]: the state few generators
+    /// carry, allocated when first set.
+    extras: RefCell<Option<Box<GenExtras>>>,
     /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
     /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
     /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
-    /// is captured here so finalization can route through the event
-    /// loop that first iterated the generator.
+    /// is captured (see [`Self::finalizer`]) so finalization can route
+    /// through the event loop that first iterated the generator.
     pub hooks_inited: crate::sync::Cell<bool>,
-    pub finalizer: RefCell<Object>,
     /// CPython's "tp_finalize already ran" GC bit: `invoke_finalizer`
     /// sets it before finalizing so a generator left suspended by its
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
+    /// Whether the cycle collector's index holds an entry for this
+    /// generator (one still in a young set has none).
+    pub gc_registered: crate::sync::Cell<bool>,
+}
+
+/// The state of a [`PyGenerator`] that few carry.
+struct GenExtras {
+    name: Option<Object>,
+    qualname: Option<Object>,
+    origin: Object,
+    finalizer: Object,
+}
+
+/// A [`GenExtras`] field.
+trait ExtraField {
+    /// Whether this is the field's unset value.
+    fn is_unset(&self) -> bool;
+}
+
+impl ExtraField for Object {
+    fn is_unset(&self) -> bool {
+        matches!(self, Object::None)
+    }
+}
+
+impl ExtraField for Option<Object> {
+    fn is_unset(&self) -> bool {
+        self.is_none()
+    }
+}
+
+impl Default for GenExtras {
+    fn default() -> Self {
+        Self {
+            name: None,
+            qualname: None,
+            origin: Object::None,
+            finalizer: Object::None,
+        }
+    }
 }
 
 impl PyGenerator {
-    pub fn new(
-        name: impl Into<String>,
-        qualname: impl Into<String>,
-        kind: CoroutineKind,
-        code: Object,
-        frame: Box<crate::Frame>,
-    ) -> Self {
+    /// `gi_name`. Seeded from the function's `__name__` at call time;
+    /// user code may reassign it (`gen.__name__ = ...`). Held as the
+    /// *string object* so repeated reads return the identical object —
+    /// CPython stores `gi_name` as a `PyObject*` and
+    /// `gen.__name__ is gen.__name__` holds (test_types
+    /// CoroutineTests.test_gen reads it through two paths and
+    /// asserts `is`). Unless set otherwise, the code's interned name.
+    pub fn name(&self) -> Object {
+        if let Some(name) = self.extras.borrow().as_ref().and_then(|e| e.name.clone()) {
+            return name;
+        }
+        self.code_names().0
+    }
+
+    /// `gi_qualname` (PEP 3155). Seeded from the function's
+    /// `__qualname__` at call time; reassignable like [`Self::name`].
+    pub fn qualname(&self) -> Object {
+        if let Some(name) = self
+            .extras
+            .borrow()
+            .as_ref()
+            .and_then(|e| e.qualname.clone())
+        {
+            return name;
+        }
+        self.code_names().1
+    }
+
+    /// Set [`Self::name`].
+    pub fn set_name(&self, name: Object) {
+        self.set_extra(Some(name), |e| &mut e.name);
+    }
+
+    /// Set [`Self::qualname`].
+    pub fn set_qualname(&self, qualname: Object) {
+        self.set_extra(Some(qualname), |e| &mut e.qualname);
+    }
+
+    /// The code's interned name and qualified name, the default
+    /// [`Self::name`] and [`Self::qualname`].
+    fn code_names(&self) -> (Object, Object) {
+        match &self.code {
+            Object::Code(code) => crate::code_gen_names(code),
+            _ => (Object::from_static(""), Object::from_static("")),
+        }
+    }
+
+    /// `cr_origin` — for coroutines created while
+    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
+    /// of `(filename, lineno, funcname)` triples for the creation call
+    /// stack (most recent first). `None` when tracking is off.
+    pub fn origin(&self) -> Object {
+        self.extras
+            .borrow()
+            .as_ref()
+            .map_or(Object::None, |e| e.origin.clone())
+    }
+
+    /// Set [`Self::origin`].
+    pub fn set_origin(&self, origin: Object) {
+        self.set_extra(origin, |e| &mut e.origin);
+    }
+
+    /// The PEP 525 finalizer hook captured at the first iteration (see
+    /// [`Self::hooks_inited`]); `None` when there was none.
+    pub fn finalizer(&self) -> Object {
+        self.extras
+            .borrow()
+            .as_ref()
+            .map_or(Object::None, |e| e.finalizer.clone())
+    }
+
+    /// Set [`Self::finalizer`].
+    pub fn set_finalizer(&self, finalizer: Object) {
+        self.set_extra(finalizer, |e| &mut e.finalizer);
+    }
+
+    fn set_extra<T: ExtraField>(&self, value: T, field: impl FnOnce(&mut GenExtras) -> &mut T) {
+        let old = {
+            let mut extras = self.extras.borrow_mut();
+            if extras.is_none() && value.is_unset() {
+                return;
+            }
+            let extras = extras.get_or_insert_with(Box::default);
+            std::mem::replace(field(extras), value)
+        };
+        // (Released outside the borrow: dropping it can run code.)
+        drop(old);
+    }
+
+    /// A generator of `kind` over `frame`, running `code`, named after
+    /// its code.
+    pub fn new(kind: CoroutineKind, code: Object, frame: Box<crate::Frame>) -> Self {
         Self {
-            name: RefCell::new(Object::from_str(name.into())),
-            qualname: RefCell::new(Object::from_str(qualname.into())),
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
-            origin: RefCell::new(Object::None),
+            extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
-            finalizer: RefCell::new(Object::None),
             finalize_ran: crate::sync::Cell::new(false),
+            gc_registered: crate::sync::Cell::new(false),
         }
     }
 
@@ -5030,17 +5438,16 @@ impl PyGenerator {
         code: Object,
         frame: Box<crate::Frame>,
     ) -> Self {
-        Self {
-            name: RefCell::new(name),
-            qualname: RefCell::new(qualname),
-            kind,
-            code,
-            state: RefCell::new(GeneratorState::Created(frame)),
-            origin: RefCell::new(Object::None),
-            hooks_inited: crate::sync::Cell::new(false),
-            finalizer: RefCell::new(Object::None),
-            finalize_ran: crate::sync::Cell::new(false),
+        let gen = Self::new(kind, code, frame);
+        // (The code's own names, the common case, aren't stored.)
+        let (code_name, code_qualname) = gen.code_names();
+        if !name.is_same(&code_name) {
+            gen.set_name(name);
         }
+        if !qualname.is_same(&code_qualname) {
+            gen.set_qualname(qualname);
+        }
+        gen
     }
 
     pub fn is_finished(&self) -> bool {
@@ -5060,7 +5467,7 @@ impl PyGenerator {
 
 impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<generator {}>", self.name.borrow().to_str())
+        write!(f, "<generator {}>", self.name().to_str())
     }
 }
 
@@ -5078,7 +5485,9 @@ impl Drop for PyGenerator {
             drop(state);
             if matches!(
                 prev,
-                GeneratorState::Suspended(_) | GeneratorState::Created(_)
+                GeneratorState::Suspended(_)
+                    | GeneratorState::Created(_)
+                    | GeneratorState::Delegating(_)
             ) {
                 defer_generator_state_drop(prev);
             }
@@ -5124,6 +5533,12 @@ pub enum GeneratorState {
     Finished,
     /// Currently executing — re-entry would be illegal.
     Running,
+    /// Executing as far as Python can tell, but its frame stays here: a
+    /// generator suspended in a `yield from` or `await` whose innermost
+    /// delegate runs on its behalf (a collapsed chain, see
+    /// `Interpreter::core_send_collapse`). The frame is parked in the
+    /// `SEND` that resumed the delegate.
+    Delegating(Box<crate::Frame>),
 }
 
 thread_local! {
@@ -5173,6 +5588,7 @@ impl fmt::Debug for GeneratorState {
             Self::Suspended(_) => write!(f, "Suspended"),
             Self::Finished => write!(f, "Finished"),
             Self::Running => write!(f, "Running"),
+            Self::Delegating(_) => write!(f, "Delegating"),
         }
     }
 }
@@ -8050,12 +8466,166 @@ impl fmt::Debug for FileBackend {
 #[derive(Debug)]
 pub struct PyLazyIter {
     pub state: RefCell<LazyIterKind>,
+    /// The Python class an exact `itertools` object reports
+    /// (`type(chain(...)) is itertools.chain`). `None` for the builtin
+    /// kinds (`map`, `filter`, `zip`, `enumerate`), whose types are
+    /// native, and for the cores held by subclass instances.
+    pub cls: Option<Rc<crate::types::TypeObject>>,
 }
 
 impl PyLazyIter {
+    /// A classless adapter in `kind`'s initial state.
+    pub fn new(kind: LazyIterKind) -> Self {
+        Self {
+            state: RefCell::new(kind),
+            cls: None,
+        }
+    }
+
+    /// Whether this is one of the builtin adapters (`map`, `filter`,
+    /// `zip`, `enumerate`) rather than an `itertools` object.
+    pub fn is_builtin_kind(&self) -> bool {
+        matches!(
+            self.state.try_borrow().as_deref(),
+            Ok(LazyIterKind::Map { .. }
+                | LazyIterKind::Filter { .. }
+                | LazyIterKind::Zip { .. }
+                | LazyIterKind::Enumerate { .. })
+        )
+    }
+
+    /// Visit every object the adapter keeps alive (the cycle GC's
+    /// `tp_traverse`).
+    pub fn gc_referents(&self, visit: &mut dyn FnMut(&Object)) {
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        let opt = |o: &Option<Object>, visit: &mut dyn FnMut(&Object)| {
+            if let Some(o) = o {
+                visit(o);
+            }
+        };
+        match &*state {
+            LazyIterKind::Islice { source, .. } => visit(source),
+            LazyIterKind::Compress { data, selectors } => {
+                visit(data);
+                visit(selectors);
+            }
+            LazyIterKind::Repeat { obj, .. } => visit(obj),
+            LazyIterKind::TeeBranch { data, .. } => visit(data),
+            LazyIterKind::Count { current, step } => {
+                visit(current);
+                visit(step);
+            }
+            LazyIterKind::Cycle { source, saved, .. } => {
+                opt(source, visit);
+                visit(&Object::List(saved.clone()));
+            }
+            LazyIterKind::Chain { source, active } => {
+                opt(source, visit);
+                opt(active, visit);
+            }
+            LazyIterKind::DropWhile { func, source, .. }
+            | LazyIterKind::TakeWhile { func, source, .. }
+            | LazyIterKind::FilterFalse { func, source }
+            | LazyIterKind::StarMap { func, source }
+            | LazyIterKind::Filter { func, source } => {
+                visit(func);
+                visit(source);
+            }
+            LazyIterKind::Pairwise { source, old } => {
+                opt(source, visit);
+                opt(old, visit);
+            }
+            LazyIterKind::ZipLongest {
+                iters, fillvalue, ..
+            } => {
+                for it in iters {
+                    opt(it, visit);
+                }
+                visit(fillvalue);
+            }
+            LazyIterKind::Accumulate {
+                source,
+                func,
+                total,
+                initial,
+            } => {
+                visit(source);
+                opt(func, visit);
+                opt(total, visit);
+                opt(initial, visit);
+            }
+            LazyIterKind::Product { pools, .. } => {
+                for p in pools {
+                    for v in p.iter() {
+                        visit(v);
+                    }
+                }
+            }
+            LazyIterKind::Permutations { pool, .. }
+            | LazyIterKind::Combinations { pool, .. }
+            | LazyIterKind::Cwr { pool, .. } => {
+                for v in pool.iter() {
+                    visit(v);
+                }
+            }
+            LazyIterKind::Batched { source, .. } => opt(source, visit),
+            LazyIterKind::Map { func, iters, .. } => {
+                visit(func);
+                for it in iters {
+                    visit(it);
+                }
+            }
+            LazyIterKind::Zip { iters, result, .. } => {
+                for it in iters {
+                    visit(it);
+                }
+                if let Some(t) = result {
+                    for v in t.iter() {
+                        visit(v);
+                    }
+                }
+            }
+            LazyIterKind::Enumerate {
+                source, count_big, ..
+            } => {
+                visit(source);
+                opt(count_big, visit);
+            }
+            LazyIterKind::GroupBy {
+                source,
+                keyfunc,
+                tgtkey,
+                currkey,
+                currvalue,
+                ..
+            } => {
+                visit(source);
+                visit(keyfunc);
+                opt(tgtkey, visit);
+                opt(currkey, visit);
+                opt(currvalue, visit);
+            }
+            LazyIterKind::Grouper { parent, tgtkey } => {
+                visit(&Object::LazyIter(parent.clone()));
+                visit(tgtkey);
+            }
+        }
+    }
+
     /// Python-visible type name (`type(islice(...)).__name__`).
     pub fn type_name(&self) -> &'static str {
-        match &*self.state.borrow() {
+        // A step in progress holds the state borrowed; the kind of a
+        // builtin adapter never changes, so any name is as good there.
+        let Ok(state) = self.state.try_borrow() else {
+            return "iterator";
+        };
+        match &*state {
+            LazyIterKind::Map { .. } => "map",
+            LazyIterKind::Filter { .. } => "filter",
+            LazyIterKind::Zip { .. } => "zip",
+            LazyIterKind::Enumerate { .. } => "enumerate",
             LazyIterKind::Islice { .. } => "islice",
             LazyIterKind::Repeat { .. } => "repeat",
             LazyIterKind::TeeBranch { .. } => "_tee",
@@ -8075,6 +8645,8 @@ impl PyLazyIter {
             LazyIterKind::Combinations { .. } => "combinations",
             LazyIterKind::Cwr { .. } => "combinations_with_replacement",
             LazyIterKind::Batched { .. } => "batched",
+            LazyIterKind::GroupBy { .. } => "groupby",
+            LazyIterKind::Grouper { .. } => "_grouper",
         }
     }
 }
@@ -8217,6 +8789,50 @@ pub enum LazyIterKind {
         n: usize,
         strict: bool,
     },
+    /// The builtin `map(func, *iterables)`: `iters` holds each
+    /// argument's iterator; `strict` is 3.14's `strict=True`.
+    Map {
+        func: Object,
+        iters: Vec<Object>,
+        strict: bool,
+    },
+    /// The builtin `filter(func_or_None, iterable)`.
+    Filter { func: Object, source: Object },
+    /// The builtin `zip(*iterables, strict=...)`. `result` is the last
+    /// tuple produced, refilled in place when nothing else holds it
+    /// (CPython's `zip_next` reuses its result tuple the same way).
+    Zip {
+        iters: Vec<Object>,
+        strict: bool,
+        result: Option<SharedTuple>,
+    },
+    /// The builtin `enumerate(iterable, start)` over a source only the
+    /// interpreter can step (a generator, a user iterator); a native
+    /// source is a `PyIterator::Enumerate`. `count_big` is engaged once
+    /// the counter leaves `i64` (it then holds the next index).
+    Enumerate {
+        source: Object,
+        count: i64,
+        count_big: Option<Object>,
+    },
+    /// `itertools.groupby(source, key)`. `None` fields are CPython's
+    /// cleared (NULL) ones; `currgrouper` identifies the live group
+    /// (held weakly: a grouper holds its parent). `grouper_cls` is the
+    /// class new groupers report.
+    GroupBy {
+        source: Object,
+        keyfunc: Object,
+        tgtkey: Option<Object>,
+        currkey: Option<Object>,
+        currvalue: Option<Object>,
+        currgrouper: Option<crate::sync::Weak<PyLazyIter>>,
+        grouper_cls: Option<Rc<crate::types::TypeObject>>,
+    },
+    /// One group of a `groupby` (`itertools._grouper`).
+    Grouper {
+        parent: Rc<PyLazyIter>,
+        tgtkey: Object,
+    },
 }
 
 /// State of an active iterator. Slim by design — every iterable
@@ -8304,6 +8920,14 @@ pub enum PyIterator {
         /// `di_pos >= dk_nentries` bail-out
         /// (test_dict.test_reversed_dict_after_clear_and_restore).
         reverse: bool,
+        /// An `OrderedDict` iterator (see `stdlib::collections_odict`):
+        /// `dict` is the od's order (keys only) and this its dict payload,
+        /// from which the values and items kinds read each key's value (a
+        /// key the payload lost raises `KeyError`, as in CPython). The
+        /// watch is taken at creation, and a structural change of the
+        /// order raises `OrderedDict mutated during iteration` in either
+        /// direction.
+        odict: Option<Rc<RefCell<DictData>>>,
     },
     Bytes {
         data: SharedSlice<u8>,
@@ -8497,9 +9121,37 @@ impl PyIterator {
                 dict,
                 owner,
                 reverse,
+                odict,
                 ..
             } => {
                 let d = dict.as_ref()?;
+                // An `OrderedDict`'s values or items: each value comes from
+                // the payload by key (unchecked, a lost key ends the walk;
+                // the checked step raises instead — `od_step`).
+                if let (Some(payload), DictViewKind::Values | DictViewKind::Items) = (odict, *kind)
+                {
+                    let i = if *reverse {
+                        index.checked_sub(1)
+                    } else {
+                        Some(*index)
+                    };
+                    let key = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+                    let Some(key) = key else {
+                        *dict = None;
+                        *owner = None;
+                        return None;
+                    };
+                    let value = crate::builtins::dict_lookup(payload, &key).ok().flatten()?;
+                    if *reverse {
+                        *index -= 1;
+                    } else {
+                        *index += 1;
+                    }
+                    return Some(match kind {
+                        DictViewKind::Values => value,
+                        _ => Object::new_tuple_array([key, value]),
+                    });
+                }
                 let entry = if *reverse {
                     if *index == 0 {
                         None
@@ -8647,6 +9299,79 @@ impl PyIterator {
         }
     }
 
+    /// Whether the next step yields an item without running code or
+    /// failing: no mutation guard to trip, no subclass keepalive or
+    /// container to release, no stream to read, and an item left.
+    pub fn pure_ready(&self) -> bool {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => items.try_borrow().is_ok_and(|v| *index < v.len()),
+            PyIterator::Tuple { items, index } => *index < items.len(),
+            PyIterator::Str { s, index } => *index < s.len(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => (*step > 0 && current < stop) || (*step < 0 && current > stop),
+            PyIterator::Bytes { data, index } => *index < data.len(),
+            PyIterator::ByteArray { data, index } => {
+                data.try_borrow().is_ok_and(|d| *index < d.len())
+            }
+            PyIterator::Reversed {
+                items,
+                index,
+                owner: None,
+            } => {
+                *index >= 0
+                    && items
+                        .try_borrow()
+                        .is_ok_and(|v| (*index as usize) < v.len())
+            }
+            PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
+                inner.try_borrow().is_ok_and(|i| i.pure_ready())
+            }
+            _ => false,
+        }
+    }
+
+    /// The item [`Self::pure_ready`] promises, without taking it: the
+    /// plain sequence cursors only (`None` for any other iterator).
+    pub fn pure_peek(&self) -> Option<Object> {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                // SAFETY: a read that runs no code.
+                unsafe { items.peek() }?.get(*index).cloned()
+            }
+            PyIterator::Tuple { items, index } => items.get(*index).cloned(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => ((*step > 0 && current < stop) || (*step < 0 && current > stop))
+                .then_some(Object::Int(*current)),
+            PyIterator::Str { s, index } => s
+                .get(*index..)
+                .and_then(|rest| rest.chars().next())
+                .map(Object::from_char),
+            PyIterator::Reversed {
+                items,
+                index,
+                owner: None,
+            } if *index >= 0 => {
+                // SAFETY: as above.
+                unsafe { items.peek() }?.get(*index as usize).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this iterator can participate in a reference cycle and so
     /// should be enrolled with the cycle GC when created (CPython tracks
     /// these `*_iterator` objects). Scalar iterators (`range`, `str`,
@@ -8757,6 +9482,34 @@ impl PyIterator {
     /// changed under it. Nothing for any other iterator.
     fn dict_iter_guard(&mut self) -> Result<bool, RuntimeError> {
         if let PyIterator::DictKeys {
+            dict: dict @ Some(_),
+            len,
+            watch,
+            index,
+            reverse,
+            owner,
+            odict: Some(_),
+            ..
+        } = self
+        {
+            // An `OrderedDict` order (see `stdlib::collections_odict`): its
+            // watch was taken at creation and counts every structural
+            // change (CPython's `od_state`), which ends the iterator; a size
+            // change the order didn't see is sticky.
+            let d = dict.as_ref().expect("matched above");
+            if watch.as_ref().is_some_and(DictWatch::changed) {
+                *dict = None;
+                *owner = None;
+                return Err(runtime_error("OrderedDict mutated during iteration"));
+            }
+            if d.borrow().len() != *len {
+                *len = usize::MAX;
+                *index = if *reverse { 0 } else { usize::MAX };
+                return Err(runtime_error("OrderedDict changed size during iteration"));
+            }
+            return Ok(false);
+        }
+        if let PyIterator::DictKeys {
             dict: Some(d),
             len,
             watch,
@@ -8807,6 +9560,7 @@ impl PyIterator {
             PyIterator::DictKeys {
                 kind: DictViewKind::Items,
                 reverse: false,
+                odict: None,
                 ..
             }
         ) {
@@ -8840,6 +9594,54 @@ impl PyIterator {
         Some(Ok(entry))
     }
 
+    /// The checked step of an `OrderedDict` values or items iterator (see
+    /// `PyIterator::DictKeys::odict`): the next key's value read from the
+    /// payload, or the `KeyError` CPython's `odictiter_iternext` raises
+    /// for a key the payload lost. `None` for any other iterator.
+    fn od_step(&mut self) -> Option<Result<Option<Object>, RuntimeError>> {
+        let PyIterator::DictKeys {
+            kind: kind @ (DictViewKind::Values | DictViewKind::Items),
+            index,
+            dict,
+            owner,
+            reverse,
+            odict: Some(payload),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let Some(d) = dict.as_ref() else {
+            return Some(Ok(None));
+        };
+        let i = if *reverse {
+            index.checked_sub(1)
+        } else {
+            Some(*index)
+        };
+        let key = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+        let Some(key) = key else {
+            *dict = None;
+            *owner = None;
+            return Some(Ok(None));
+        };
+        if *reverse {
+            *index -= 1;
+        } else {
+            *index += 1;
+        }
+        let kind = *kind;
+        let payload = payload.clone();
+        Some(match crate::builtins::dict_lookup(&payload, &key) {
+            Ok(Some(value)) => Ok(Some(match kind {
+                DictViewKind::Values => value,
+                _ => Object::new_tuple_array([key, value]),
+            })),
+            Ok(None) => Err(crate::error::key_error_object(key)),
+            Err(e) => Err(e),
+        })
+    }
+
     /// Like [`next_value`], but enforces CPython's "container changed
     /// size during iteration" invariant before yielding. Used on the
     /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
@@ -8861,6 +9663,9 @@ impl PyIterator {
         }
         if self.dict_iter_guard()? {
             return Ok(None);
+        }
+        if let Some(step) = self.od_step() {
+            return step;
         }
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
@@ -9004,8 +9809,34 @@ impl PyIterator {
                 index,
                 dict,
                 reverse,
+                odict,
                 ..
             } => match dict {
+                // An `OrderedDict`'s values or items, read from its payload.
+                Some(d) if odict.is_some() && !matches!(kind, DictViewKind::Keys) => {
+                    let payload = odict.as_ref().expect("checked");
+                    let keys: Vec<Object> = {
+                        let d = d.borrow();
+                        let range: Box<dyn Iterator<Item = usize>> = if *reverse {
+                            Box::new((0..(*index).min(d.len())).rev())
+                        } else {
+                            Box::new((*index).min(d.len())..d.len())
+                        };
+                        range
+                            .filter_map(|i| d.get_index(i))
+                            .map(|(k, _)| k.0.clone())
+                            .collect()
+                    };
+                    keys.into_iter()
+                        .filter_map(|k| {
+                            let v = crate::builtins::dict_lookup(payload, &k).ok().flatten()?;
+                            Some(match kind {
+                                DictViewKind::Values => v,
+                                _ => Object::new_tuple_array([k, v]),
+                            })
+                        })
+                        .collect()
+                }
                 Some(d) => {
                     let d = d.borrow();
                     let range: Box<dyn Iterator<Item = usize>> = if *reverse {
@@ -9202,7 +10033,75 @@ impl PyIterator {
 
 // ---------- behavior ----------
 
+/// The variants whose second word is not a counted pointer (`None`,
+/// `Unbound`, `Bool`, `Int`, `Float`), by tag.
+const SCALAR_TAGS: u64 = 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 5;
+
+/// The variants whose pointer is a [`ThinArc`]'s (`Str`, `WStr`, `Tuple`,
+/// `Bytes`): it addresses the payload, 16 bytes past the strong count
+/// (every payload is aligned to at most 16). Every other counted variant
+/// holds an `Rc`, whose `Arc` addresses its `ArcInner`, strong count first.
+const THIN_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 27;
+
+impl Clone for Object {
+    /// A new owner: the strong count (if any) bumped in place and the two
+    /// words copied, with no per-variant dispatch.
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        if let Some(word) = self.strong_word() {
+            // SAFETY: `self` owns a reference to the live allocation.
+            unsafe { crate::rc::increment_word(word) };
+        }
+        // SAFETY: the count now accounts for the copy.
+        unsafe { std::ptr::read(self) }
+    }
+}
+
 impl Object {
+    /// The variant's tag byte.
+    #[inline(always)]
+    pub(crate) fn tag(&self) -> u8 {
+        // SAFETY: `repr(u8)`: the tag is the first byte.
+        unsafe { *std::ptr::from_ref(self).cast::<u8>() }
+    }
+
+    /// The strong count of the allocation a counted variant holds; `None`
+    /// for a scalar.
+    #[inline(always)]
+    pub(crate) fn strong_word(&self) -> Option<*const std::sync::atomic::AtomicUsize> {
+        let tag = u64::from(self.tag());
+        if (SCALAR_TAGS >> tag) & 1 != 0 {
+            return None;
+        }
+        // SAFETY: a counted variant's second word is its pointer.
+        let p = unsafe { *std::ptr::from_ref(self).cast::<*const u8>().add(1) };
+        let back = ((THIN_TAGS >> tag) & 1) as usize * 16;
+        Some(p.wrapping_sub(back).cast())
+    }
+
+    /// The address of a counted variant's payload (what `id()` reports):
+    /// a [`ThinArc`] points at it, and an `Rc`'s `ArcInner` holds it
+    /// after the two counts. `None` for a scalar.
+    #[inline(always)]
+    pub(crate) fn payload_addr(&self) -> Option<usize> {
+        let tag = u64::from(self.tag());
+        if (SCALAR_TAGS >> tag) & 1 != 0 {
+            return None;
+        }
+        // SAFETY: a counted variant's second word is its pointer.
+        let p = unsafe { *std::ptr::from_ref(self).cast::<usize>().add(1) };
+        Some(p + (((THIN_TAGS >> tag) & 1) ^ 1) as usize * 16)
+    }
+
+    /// Whether the value is one the cycle collector never holds as a
+    /// candidate: a scalar, or a string or bytes (which have no weak
+    /// handle to track them by).
+    #[inline(always)]
+    pub(crate) fn never_gc_candidate(&self) -> bool {
+        const NEVER: u64 = SCALAR_TAGS | (THIN_TAGS & !(1 << 9));
+        (NEVER >> self.tag()) & 1 != 0
+    }
+
     /// Whether the value can never (transitively) reference another
     /// object — so a container holding only such values cannot be part
     /// of a reference cycle. Used by deferred instance tracking.
@@ -10052,6 +10951,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
+                    odict: None,
                 })
             }
             Object::Set(s) => {
@@ -10117,6 +11017,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: v.owner.clone(),
+                    odict: None,
                 })
             }
             Object::MappingProxy(d) => {
@@ -10129,6 +11030,7 @@ impl Object {
                     watch: None,
                     reverse: false,
                     owner: None,
+                    odict: None,
                 })
             }
             // Static fallback; the VM's iteration dispatch delegates to
@@ -10170,7 +11072,8 @@ impl Object {
             Object::Instance(_)
             | Object::Foreign(_)
             | Object::Generator(_)
-            | Object::Coroutine(_) => {
+            | Object::Coroutine(_)
+            | Object::LazyIter(_) => {
                 let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                     type_error(format!(
                         "'{}' object is not iterable",
@@ -10624,17 +11527,17 @@ impl Object {
             // CPython's repr shows the qualified name (PEP 3155).
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::Coroutine(g) => format!(
                 "<coroutine object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenerator(g) => format!(
                 "<async_generator object {} at 0x{:x}>",
-                g.qualname.borrow().to_str(),
+                g.qualname().to_str(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenAwait(a) => format!(
@@ -10783,7 +11686,7 @@ impl Object {
             Object::Frame(fr) => format!(
                 "<frame at 0x{:x}, file {}, line {}, code {}>",
                 Rc::as_ptr(fr) as usize,
-                Object::from_str(fr.code.filename.clone()).repr(),
+                Object::from_str(&*fr.code.filename).repr(),
                 fr.current_lineno(),
                 fr.code.name
             ),
@@ -10830,11 +11733,13 @@ impl Object {
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
             }
             Object::LazyIter(l) => {
-                format!(
-                    "<itertools.{} object at {:#x}>",
-                    l.type_name(),
-                    Rc::as_ptr(l) as usize
-                )
+                let name = l.type_name();
+                let module = if l.is_builtin_kind() {
+                    ""
+                } else {
+                    "itertools."
+                };
+                format!("<{module}{name} object at {:#x}>", Rc::as_ptr(l) as usize)
             }
             Object::Capsule(c) => match &c.name {
                 Some(n) => format!("<capsule object \"{n}\" at 0x{:x}>", c.handle),
@@ -11471,7 +12376,13 @@ fn fresh_nan_bits(v: f64) -> f64 {
 /// used at every seam where CPython would allocate a new float object.
 #[inline]
 pub fn fresh_float(v: f64) -> Object {
-    Object::Float(tag_nan(v))
+    // Built as two whole words: the enum's constructor writes the tag as
+    // a byte, and the 16-byte move that reads the value back stalls on
+    // store forwarding. `repr(u8)`: `Float` is variant 5, its payload in
+    // the second word.
+    const FLOAT_TAG: u64 = 5;
+    // SAFETY: two initialized words in exactly `Object::Float`'s layout.
+    unsafe { std::mem::transmute::<[u64; 2], Object>([FLOAT_TAG, tag_nan(v).to_bits()]) }
 }
 
 /// Strip a WeavePy identity tag, restoring the canonical quiet NaN (sign
@@ -11584,8 +12495,16 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
 /// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
 /// with the reserved `-1` remapped to `-2`.
 pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
-    const MOD: u128 = (1u128 << PY_HASH_BITS) - 1;
-    let mut x = (i128::from(n).unsigned_abs() % MOD) as i64;
+    // The modulus is the Mersenne prime `2**61 - 1`, so `|n| mod P` folds
+    // the high bits onto the low ones instead of dividing: `|n| < 2**64`
+    // leaves at most one subtraction.
+    const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    let a = n.unsigned_abs();
+    let mut r = (a & MOD) + (a >> PY_HASH_BITS);
+    if r >= MOD {
+        r -= MOD;
+    }
+    let mut x = r as i64;
     if n < 0 {
         x = -x;
     }
@@ -12261,6 +13180,13 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             {
                 return Some(identity_hash(obj));
             }
+            // An exact `decimal.Decimal` hashes natively (see
+            // `stdlib::decimal_native`).
+            if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+                if let Some(h) = crate::stdlib::decimal_native::leaf_hash(inst) {
+                    return Some(h);
+                }
+            }
             // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),
             // computed natively and memoised so the hot `DictKey` path never
             // pays a reentrant `__hash__` dispatch — see `weakref_native_hash`.
@@ -12706,16 +13632,7 @@ impl Object {
     /// allocates nothing for them.
     #[inline]
     pub fn from_char(ch: char) -> Self {
-        static LATIN1: std::sync::OnceLock<Box<[SharedStr]>> = std::sync::OnceLock::new();
-        let code = ch as u32;
-        if code < 256 {
-            let table = LATIN1.get_or_init(|| {
-                (0u8..=255)
-                    .map(|b| SharedStr::from(&*char::from(b).encode_utf8(&mut [0; 4])))
-                    .collect()
-            });
-            return Object::Str(table[code as usize].clone());
-        }
+        // (Latin-1 characters come out of `SharedStr::small`'s table.)
         Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 
@@ -12990,6 +13907,85 @@ const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int_hash_folds_like_the_modulus() {
+        let reference = |n: i64| -> i64 {
+            let m = (1u128 << 61) - 1;
+            let mut x = (i128::from(n).unsigned_abs() % m) as i64;
+            if n < 0 {
+                x = -x;
+            }
+            if x == -1 {
+                -2
+            } else {
+                x
+            }
+        };
+        let p = (1i64 << 61) - 1;
+        let mut cases = vec![0, 1, -1, -2, 2, i64::MAX, i64::MIN, i64::MIN + 1];
+        for base in [p, 2 * p, 3 * p, 1 << 61, 1 << 62, i64::MAX] {
+            for d in -3..=3 {
+                cases.push(base.wrapping_add(d));
+                cases.push(base.wrapping_add(d).wrapping_neg());
+            }
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            cases.push(x as i64);
+        }
+        for n in cases {
+            assert_eq!(super::py_hash_long_i64(n), reference(n), "hash({n})");
+        }
+    }
+
+    #[test]
+    fn clone_counts_every_layout() {
+        use crate::object::Object;
+        let tags = [
+            (Object::None, 0),
+            (Object::Unbound, 1),
+            (Object::Bool(true), 2),
+            (Object::Int(7), 3),
+            (Object::Float(1.5), 5),
+            (Object::from_str("a fresh string".to_owned()), 7),
+            (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
+            (Object::new_bytes(vec![1, 2, 3]), 27),
+            (Object::new_list(vec![Object::Int(1)]), 10),
+            (Object::new_dict(), 11),
+            (
+                Object::int_from_bigint(num_bigint::BigInt::from(1u8) << 100),
+                4,
+            ),
+        ];
+        for (v, tag) in &tags {
+            assert_eq!(v.tag(), *tag);
+        }
+        let count = |v: &Object| -> usize {
+            match v {
+                Object::Str(s) => SharedStr::strong_count(s),
+                Object::Tuple(t) => ThinArc::strong_count(t),
+                Object::Bytes(b) => ThinArc::strong_count(b),
+                Object::List(l) => Rc::strong_count(l),
+                Object::Dict(d) => Rc::strong_count(d),
+                Object::Long(b) => Rc::strong_count(b),
+                _ => 0,
+            }
+        };
+        for (v, _) in &tags {
+            let before = count(v);
+            let c = v.clone();
+            assert!(c.is_same(v) || before == 0);
+            if before != 0 {
+                assert_eq!(count(v), before + 1);
+                drop(c);
+                assert_eq!(count(v), before);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

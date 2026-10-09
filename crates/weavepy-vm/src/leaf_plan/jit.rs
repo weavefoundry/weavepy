@@ -86,16 +86,23 @@ pub(super) struct Native {
 /// a site several classes reach (methods a base class shares) keeps one
 /// for each. A version names one class in one state, and a class's shared
 /// names never move, so a hit needs only the instance to hold the field.
+///
+/// An entry may instead name a `__slots__` member's position in its
+/// class's slot layout (see [`SLOT_FIELD`]), with the layout's word in
+/// the parallel `layouts` entry.
 #[derive(Default)]
 pub(super) struct FieldCache {
     entries: [std::cell::Cell<(u64, u32)>; 4],
+    layouts: [std::cell::Cell<usize>; 4],
     next: std::cell::Cell<u8>,
 }
 
-/// A module global site's value as register words, with the globals
-/// stamp it was read under (process-unique, so it names the dict and its
-/// key layout: the entry stays put) and the global value epoch (which an
-/// in-place rebinding advances). Native code reads it in line.
+/// A global site's value as register words, with the globals stamp it
+/// was read under (process-unique, so it names the dict and its key
+/// layout: the entry stays put) and the global value epoch (which an
+/// in-place rebinding advances). A builtin's also records the builtins
+/// stamp (`0` for a module global): the name must still be missing from
+/// the globals, and the builtins unchanged. Native code reads it in line.
 #[derive(Default)]
 #[repr(C)]
 pub(super) struct GlobalCache {
@@ -103,12 +110,18 @@ pub(super) struct GlobalCache {
     epoch: std::cell::Cell<u64>,
     tag: std::cell::Cell<u64>,
     pay: std::cell::Cell<u64>,
+    bstamp: std::cell::Cell<u64>,
 }
 
 const GC_STAMP: i32 = std::mem::offset_of!(GlobalCache, stamp) as i32;
 const GC_EPOCH: i32 = std::mem::offset_of!(GlobalCache, epoch) as i32;
 const GC_TAG: i32 = std::mem::offset_of!(GlobalCache, tag) as i32;
 const GC_PAY: i32 = std::mem::offset_of!(GlobalCache, pay) as i32;
+const GC_BSTAMP: i32 = std::mem::offset_of!(GlobalCache, bstamp) as i32;
+/// Where native code finds the interpreter, and in it the flag a builtin's
+/// cached read also requires clear.
+const CTX_INTERP: i32 = std::mem::offset_of!(Ctx<'static>, interp) as i32;
+const I_MISSING: i32 = std::mem::offset_of!(Interpreter, globals_missing_any) as i32;
 /// Where native code finds the evaluation's own function.
 const TOP_F_OFFSET: i32 = TOP_OFFSET + std::mem::offset_of!(Frame, f) as i32;
 
@@ -255,6 +268,7 @@ const FIELD_VER_OFFSET: i32 =
     (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 0)) as i32;
 const FIELD_IDX_OFFSET: i32 =
     (std::mem::offset_of!(FieldCache, entries) + std::mem::offset_of!((u64, u32), 1)) as i32;
+const FIELD_LAYOUT_OFFSET: i32 = std::mem::offset_of!(FieldCache, layouts) as i32;
 const _: () = assert!(std::mem::offset_of!(Ctx<'static>, top) == TOP_OFFSET as usize);
 
 /// Run `plan`'s native code for one evaluation, compiling it once it is
@@ -403,13 +417,18 @@ unsafe extern "C" fn h_global(
     let Some(v) = c.interp.plan_global_at(code, slot, f, pc as u16) else {
         return 1;
     };
-    // A module global's value is remembered for the in-line read (a
-    // builtin's also depends on the globals not gaining the name, which
-    // the helper checks).
-    if matches!(
-        code.caches.get(pc),
-        weavepy_compiler::InlineCache::LoadGlobalModule { .. }
-    ) {
+    // The value is remembered for the in-line read, a builtin's with the
+    // builtins stamp too (the read also requires the globals not to have
+    // gained the name, which their own stamp shows).
+    let bstamp = match code.caches.get(pc) {
+        weavepy_compiler::InlineCache::LoadGlobalModule { .. } => Some(0),
+        // SAFETY (raw dict read): nothing runs code here.
+        weavepy_compiler::InlineCache::LoadGlobalBuiltin { .. } => {
+            Some(unsafe { (*f.builtins.as_ptr()).mutation_stamp() })
+        }
+        _ => None,
+    };
+    if let Some(bstamp) = bstamp {
         // SAFETY (raw dict read): nothing runs code here.
         let gs = unsafe { (*f.globals.as_ptr()).mutation_stamp() };
         let [t, p] = words(v);
@@ -417,6 +436,7 @@ unsafe extern "C" fn h_global(
         cache.epoch.set(crate::object::global_value_epoch());
         cache.tag.set(t);
         cache.pay.set(p);
+        cache.bstamp.set(bstamp);
     }
     c.put(v);
     0
@@ -453,6 +473,7 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
         value(t, p),
         pc,
         name,
+        c.nest,
     ) {
         Some(v) => {
             c.put(v);
@@ -481,14 +502,28 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         Some(Object::Instance(inst)) => Some(inst),
         _ => None,
     };
-    if let Some(inst) = inst.filter(|_| !EFFECT || c.pend.n == 0) {
+    // A buffered store to this very attribute answers through the general
+    // read; one to anything else leaves the instance's field current.
+    let pending = EFFECT
+        && c.pend.n > 0
+        && inst.is_some()
+        // SAFETY: as above.
+        && c.pend.stores_to(unsafe { &*(p as *const Object) }, pc_name >> 16);
+    if let Some(inst) = inst.filter(|_| !pending) {
         let ver = inst.cls_raw().attr_version.get();
         for e in &cache.entries {
             let (v, idx) = e.get();
             if v == ver && v != 0 {
                 // SAFETY: the receiver is rooted and nothing runs code
                 // while the view is read.
-                if let Some(v) = unsafe { inst.split_field(idx as usize) } {
+                let hit = unsafe {
+                    if idx & SLOT_FIELD != 0 {
+                        inst.laid_out_slot((idx & !SLOT_FIELD) as usize)
+                    } else {
+                        inst.split_field(idx as usize)
+                    }
+                };
+                if let Some(v) = hit {
                     c.put(norm(v));
                     return 0;
                 }
@@ -498,23 +533,65 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
     }
     // SAFETY: forwarded.
     let status = unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) };
-    if let (0, Some(inst)) = (status, inst) {
+    if let (0, Some(inst)) = (status, inst.filter(|_| !pending)) {
         // SAFETY: a live frame.
-        let (code, _, _) = unsafe { (*fr).parts() };
+        let (code, ext, _) = unsafe { (*fr).parts() };
         let ver = inst.cls_raw().attr_version.get();
+        // A property's getter answered (see `plan_getter`): nothing to
+        // remember.
+        let site = ext
+            .method_slots
+            .get()
+            .and_then(|s| s.get((pc_name & 0xffff) as usize));
+        // SAFETY: GIL-serialized; the references don't outlive the check.
+        if site.is_some_and(|s| unsafe { s.getter_peek(ver) }.is_some()) {
+            return status;
+        }
         // The instance's own field (not a class value or descriptor),
         // from its split layout.
-        if let Some((_, Some(idx))) =
-            Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16)
-        {
-            if ver != 0 && inst.dict.published().is_none() {
-                let k = usize::from(cache.next.get()) % cache.entries.len();
-                cache.entries[k].set((ver, idx));
-                cache.next.set(cache.next.get().wrapping_add(1));
+        let found = match Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16) {
+            Some((_, Some(idx))) => inst.dict.published().is_none().then_some((idx, 0)),
+            // A class value or descriptor.
+            Some(_) => None,
+            // A `__slots__` member laid out over its class's names.
+            None => {
+                laid_out_member(code, inst, pc_name >> 16, ver).map(|(i, l)| (i | SLOT_FIELD, l))
             }
+        };
+        if let Some((idx, layout)) = found.filter(|_| ver != 0) {
+            let k = usize::from(cache.next.get()) % cache.entries.len();
+            cache.entries[k].set((ver, idx));
+            cache.layouts[k].set(layout);
+            cache.next.set(cache.next.get().wrapping_add(1));
         }
     }
     status
+}
+
+/// A [`FieldCache`] position naming a `__slots__` member's place in its
+/// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
+/// rather than a split field's.
+const SLOT_FIELD: u32 = 1 << 31;
+
+/// Where `inst` keeps the attribute `code.names[name]` when reading it
+/// means reading a `__slots__` member its class (at version `ver`) lays
+/// out (see [`crate::types::TypeObject::fresh_slots`]): the member's
+/// position in the layout, and the layout's word.
+#[cold]
+fn laid_out_member(
+    code: &CodeObject,
+    inst: &Rc<crate::types::PyInstance>,
+    name: u32,
+    ver: u64,
+) -> Option<(u32, usize)> {
+    use weavepy_compiler::InlineCache as IC;
+    inst.cls_raw().slot_layout.get()?.as_ref()?;
+    let name = code.names.get(name as usize)?;
+    let obj = Object::Instance(inst.clone());
+    match crate::specialize::attempt_specialize_load_attr(&obj, name) {
+        IC::LoadAttrSlot { ver: v, .. } if v == ver => inst.laid_out_position(name),
+        _ => None,
+    }
 }
 
 unsafe extern "C" fn h_method(
@@ -535,6 +612,10 @@ unsafe extern "C" fn h_method(
     let [a, b] = words(func);
     let [d, e] = words(recv);
     c.out = [a, b, d, e];
+    // (An unboxed `int`'s builtin method has no in-line check.)
+    if t != T_R {
+        return 0;
+    }
     // Remember the resolution for the in-line check.
     // SAFETY: the method load succeeded on a heap receiver (as `norm`).
     match (func, unsafe { &*(p as *const Object) }) {
@@ -1083,11 +1164,41 @@ impl Lower<'_> {
         self.b.switch_to_block(ok);
     }
 
+    /// The member slots of the instance at `inst` (its payload pointer),
+    /// as [`crate::types::PyInstance::laid_out_slot`] reads them: their
+    /// values' pointer, and whether they're unreadable here (borrowed for
+    /// a write, or not laid out over the layout whose word is `layout`).
+    /// The caller checks that cells are unshared.
+    fn laid_out_slots(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        inst: Value,
+        layout: Value,
+    ) -> (Value, Value) {
+        let f = MemFlags::trusted();
+        let borrow = self.b.ins().sload32(f, inst, l.inst_slots_borrow);
+        let form = self.b.ins().uload8(types::I32, f, inst, l.inst_slots_tag);
+        let names = self.b.ins().load(self.ptr, f, inst, l.inst_slots_layout);
+        let vals = self.b.ins().load(self.ptr, f, inst, l.inst_slots_values);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
+        let bad = self.b.ins().bor(busy, other);
+        let bad = self.b.ins().bor(bad, foreign);
+        (vals, bad)
+    }
+
     /// [`h_field`]'s first cache entry in line: the receiver register
     /// `(t, p)` is a plain instance whose class has the entry's version
     /// and whose values are split over its class's names, holding the
-    /// entry's position; the field's value as register words. Anything
-    /// else (and, with buffered stores, everything) branches to `miss`.
+    /// entry's position (or, for a slot entry, whose member slots are laid
+    /// out over the entry's layout, the one there set, at a `slot_site`);
+    /// the field's value as register words. Anything else (and, with
+    /// buffered stores, everything) branches to `miss`.
+    #[allow(clippy::too_many_arguments)]
     fn inline_field(
         &mut self,
         l: &weavepy_jit::ObjLayout,
@@ -1095,6 +1206,7 @@ impl Lower<'_> {
         p: Value,
         cache: i64,
         effect: bool,
+        slot_site: bool,
         miss: Block,
     ) -> (Value, Value) {
         let f = MemFlags::trusted();
@@ -1136,7 +1248,13 @@ impl Lower<'_> {
         let bad = self.b.ins().bor(bad, busy);
         let bad = self.b.ins().bor(bad, empty);
         let bad = self.b.ins().bor(bad, other);
-        self.miss_if(bad, miss);
+        // A slot entry fails the split checks (its position is out of any
+        // split range), so the slot read waits behind them; it's compiled
+        // only for a site that has read member slots (the helper reads one
+        // otherwise).
+        let slots = l.slots_ok && slot_site;
+        let slot = if slots { self.b.create_block() } else { miss };
+        self.miss_if(bad, slot);
         // A block over the class's names that holds the position.
         let keys = self.b.ins().load(ptr, f, block, l.split_keys);
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
@@ -1147,10 +1265,53 @@ impl Lower<'_> {
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
-        self.miss_if(bad, miss);
+        self.miss_if(bad, slot);
         let off = self.b.ins().ishl_imm(idx, 4);
         let v = self.b.ins().iadd(block, off);
         let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+        let v = if slots {
+            let read = self.b.create_block();
+            self.b.append_block_param(read, ptr);
+            self.b.ins().jump(read, &[v.into()]);
+            // A member slot laid out over the entry's layout, and set, with
+            // the class checked and cells unshared. (Past the entry's kind,
+            // everything is read again here: values the split path reads
+            // stay unneeded past it.)
+            self.b.switch_to_block(slot);
+            let split_miss = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
+            let split_miss = self.b.ins().icmp_imm(IntCC::Equal, split_miss, 0);
+            self.miss_if(split_miss, miss);
+            let inst = self.b.ins().load(ptr, f, p, 8);
+            let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
+            let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
+            let at = self.b.ins().iconst(ptr, cache);
+            let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
+            let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+            let shared = self.b.ins().uload8(types::I64, f, flag, 0);
+            let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+            let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+            let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(unset, stale);
+            let bad = self.b.ins().bor(bad, shared);
+            self.miss_if(bad, miss);
+            let layout = self.b.ins().load(ptr, f, at, FIELD_LAYOUT_OFFSET);
+            let (vals, bad) = self.laid_out_slots(l, inst, layout);
+            self.miss_if(bad, miss);
+            let i = self.b.ins().band_imm(idx, i64::from(!SLOT_FIELD));
+            let off = self.b.ins().ishl_imm(i, 4);
+            let v = self.b.ins().iadd(vals, off);
+            let vt = self.b.ins().uload8(types::I32, f, v, 0);
+            let none = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, vt, i64::from(l.tag_unbound));
+            self.miss_if(none, miss);
+            self.b.ins().jump(read, &[v.into()]);
+            self.b.switch_to_block(read);
+            self.b.block_params(read)[0]
+        } else {
+            v
+        };
         // `norm`: the scalars by value, anything else by reference.
         let vt = self.b.ins().uload8(types::I64, f, v, 0);
         let word = self.b.ins().load(types::I64, f, v, 8);
@@ -1298,6 +1459,22 @@ impl Lower<'_> {
         let moved = self.b.ins().icmp(IntCC::NotEqual, epoch, want_epoch);
         let bad = self.b.ins().bor(unset, stale);
         let bad = self.b.ins().bor(bad, moved);
+        // A builtin's: the builtins unchanged, and no globals missing
+        // their `__builtins__` (the helper's own conditions).
+        // SAFETY: as for the globals.
+        let bstamp_at = unsafe { (*fl.func).builtins.as_ptr() } as usize
+            + crate::object::DictData::STAMP_OFFSET;
+        let bstamp_at = self.b.ins().iconst(ptr, bstamp_at as i64);
+        let bstamp = self.b.ins().load(types::I64, f, bstamp_at, 0);
+        let bwant = self.b.ins().load(types::I64, f, at, GC_BSTAMP);
+        let interp = self.b.ins().load(ptr, f, self.ctx, CTX_INTERP);
+        let missing = self.b.ins().uload8(types::I64, f, interp, I_MISSING);
+        let bstale = self.b.ins().icmp(IntCC::NotEqual, bstamp, bwant);
+        let missing = self.b.ins().icmp_imm(IntCC::NotEqual, missing, 0);
+        let bbad = self.b.ins().bor(bstale, missing);
+        let builtin = self.b.ins().icmp_imm(IntCC::NotEqual, bwant, 0);
+        let bbad = self.b.ins().band(bbad, builtin);
+        let bad = self.b.ins().bor(bad, bbad);
         self.miss_if(bad, slow);
         self.b.ins().jump(done, &[t.into(), p.into()]);
     }
@@ -1740,7 +1917,13 @@ impl Lower<'_> {
                 self.b.append_block_param(done, types::I64);
                 if let Some(l) = crate::tier2::published_obj_layout() {
                     let slow = self.b.create_block();
-                    let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slow);
+                    // A site the interpreter has seen read a member slot
+                    // reads one in line too.
+                    let slot_site = matches!(
+                        fl.code.caches.get(u32::from(pc)),
+                        weavepy_compiler::InlineCache::LoadAttrSlot { .. }
+                    );
+                    let (vt, vp) = self.inline_field(l, t, p, cache_at, effect, slot_site, slow);
                     self.b.ins().jump(done, &[vt.into(), vp.into()]);
                     self.b.switch_to_block(slow);
                     if let Some(slot) = crate::code_stamp_slot(fl.code, u32::from(pc)) {
