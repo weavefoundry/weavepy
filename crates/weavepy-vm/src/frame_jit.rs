@@ -515,9 +515,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
                     ins_k.op,
                     OpCode::EndFor | OpCode::PopIter | OpCode::ReturnValue
                 ) => {}
-                // A generator step ends at its yield whether or not the
-                // body runs natively: no round trip to pay for.
-                None if ins_k.op == OpCode::YieldValue && matches!(at, Heat::Step) => {}
+                // A resume ends at its yield whether or not the body runs
+                // natively: no round trip to pay for.
+                None if ins_k.op == OpCode::YieldValue
+                    && (matches!(at, Heat::Step) || code.is_generator) => {}
                 None => exits += 1,
             }
         }

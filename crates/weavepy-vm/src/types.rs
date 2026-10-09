@@ -858,6 +858,11 @@ pub struct InstancePlan {
     /// its field count. A call with exactly that many positional arguments builds
     /// the tuple directly while the function still runs that code.
     pub tuple_new: Option<(usize, usize)>,
+    /// `C()` with no arguments is the allocation alone: the default
+    /// `__new__` and `object.__init__`, no native payload, not abstract,
+    /// and not a module or generic-alias subclass (whose allocators
+    /// differ).
+    pub bare_alloc: bool,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
@@ -1242,6 +1247,17 @@ impl TypeObject {
         match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
             Some(layout) => SlotStorage::unset_over(layout.clone()),
             None => SlotStorage::default(),
+        }
+    }
+
+    /// Make `slots` this class's [`Self::fresh_slots`], leaving storage
+    /// that is already the empty default alone.
+    #[inline]
+    pub(crate) fn reset_slots(&self, slots: &mut SlotStorage) {
+        match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
+            Some(layout) => *slots = SlotStorage::unset_over(layout.clone()),
+            None if slots.is_empty_default() => {}
+            None => *slots = SlotStorage::default(),
         }
     }
 
@@ -2290,6 +2306,19 @@ impl SlotStorage {
         }
     }
 
+    /// Whether this is the empty [`Default`] storage, which a reset to the
+    /// default would only rebuild (through the enum's drop glue).
+    #[inline(always)]
+    pub(crate) fn is_empty_default(&self) -> bool {
+        matches!(
+            self.data,
+            SlotData::Single {
+                key: None,
+                value: Object::None
+            }
+        )
+    }
+
     /// Storage holding a natively packed value (see [`SlotData::Packed`]).
     pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
         Self {
@@ -2376,6 +2405,12 @@ impl SlotStorage {
     /// Empty storage (the 64-bit variant lays the slots out).
     pub(crate) fn unset_over(_layout: SharedSlice<DictKey>) -> Self {
         Self::default()
+    }
+
+    /// Never skipped here (see the 64-bit variant).
+    #[inline(always)]
+    pub(crate) fn is_empty_default(&self) -> bool {
+        false
     }
 
     /// [`Self::index_of`] (never laid out here; see the 64-bit variant).
@@ -3107,7 +3142,7 @@ impl PyInstance {
             // class changes. A pooled instance keeps whatever dict it
             // was retired with, already cleared and carrying the record.
             if let Some(m) = Rc::get_mut(&mut inst) {
-                *m.slots.get_mut() = class.fresh_slots();
+                class.reset_slots(m.slots.get_mut());
                 *m.class.get_mut() = class;
                 m.deferred.set(true);
                 if hint > 0 {
@@ -3211,7 +3246,9 @@ impl PyInstance {
             d.map_mut_atomic_store().clear();
             d.reset_deferred_owner(owner);
         }
-        *m.slots.get_mut() = SlotStorage::default();
+        if !m.slots.get_mut().is_empty_default() {
+            *m.slots.get_mut() = SlotStorage::default();
+        }
         m.inline_values.set(true);
         m.deferred.set(true);
         m.hash_cache = crate::sync::CachedHash::new(None);

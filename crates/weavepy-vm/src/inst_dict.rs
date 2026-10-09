@@ -664,8 +664,37 @@ impl SplitValues {
     }
 
     /// Drop every value, keeping the allocation, and forget the names.
+    ///
+    /// The values leave the block before any of them drops (a drop can run
+    /// code that reaches this instance), staged on the stack when there
+    /// are few rather than in a fresh vector.
     pub fn reset(&mut self) {
-        drop(self.take());
+        const STAGE: usize = 8;
+        let Some(b) = self.block else {
+            return;
+        };
+        let h = b.as_ptr();
+        // SAFETY: as `take`: the first `len` values move out exactly once
+        // (the length is zeroed before anything can observe it), and the
+        // names' strong count is released once.
+        unsafe {
+            let n = (*h).len as usize;
+            if n > STAGE {
+                drop(self.take());
+                return;
+            }
+            let mut staged = [const { std::mem::MaybeUninit::<Object>::uninit() }; STAGE];
+            std::ptr::copy_nonoverlapping(Self::values_ptr(h), staged.as_mut_ptr().cast(), n);
+            (*h).len = 0;
+            let keys = std::mem::replace(&mut (*h).keys, std::ptr::null());
+            if !keys.is_null() {
+                drop(Rc::from_raw(keys));
+            }
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                staged.as_mut_ptr().cast::<Object>(),
+                n,
+            ));
+        }
     }
 }
 

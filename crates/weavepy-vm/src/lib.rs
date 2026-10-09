@@ -16467,6 +16467,36 @@ impl Interpreter {
         {
             return false;
         }
+        // `C()` of a class whose memoized plan is the bare allocation: the
+        // class moves off the stack (the self slot owns nothing) and the
+        // instance takes its place.
+        if argc == 0
+            && ty.native_kind.get() == 0
+            // SAFETY: a guard-free read of the memoized plan; nothing runs
+            // before its last use.
+            && unsafe { ty.instance_plan.peek() }
+                .and_then(Option::as_ref)
+                .is_some_and(|(v, plan)| *v == ty.attr_version.get() && plan.bare_alloc)
+        {
+            // SAFETY: the class's slot is initialized and leaves the stack
+            // with the (`Unbound`) self slot, which has no drop glue.
+            let ty = unsafe {
+                let ty = frame.stack.as_ptr().add(callee_slot).read();
+                frame.stack.set_len(callee_slot);
+                ty
+            };
+            let Object::Type(cls) = &ty else {
+                unreachable!("checked above")
+            };
+            let (inst, tracked) = self.alloc_plain_instance_obj(cls);
+            frame.stack.push(inst);
+            frame.pc = pc as u32 + 1;
+            drop(ty);
+            if tracked && gc_trace::maybe_auto_collect() {
+                self.run_pending_finalizers();
+            }
+            return true;
+        }
         let ty = ty.clone();
         let plan = self.instance_plan(&ty);
         // A named tuple: the tuple of the arguments is the whole call (see
@@ -16511,19 +16541,7 @@ impl Interpreter {
             }
             // `C()` for a class with the default `__new__` and
             // `object.__init__`: the allocation is the whole call.
-            if argc == 0
-                && plan.is_object_new
-                && plan.init_from_object
-                && plan.user_new.is_none()
-                && plan.abstract_error.is_none()
-                && !plan.seeds_exception_args
-                && matches!(plan.native, crate::types::NativeKind::Plain)
-                && ty.native_kind.get() == 0
-            {
-                let bt = builtin_types();
-                if ty.is_subclass_of(&bt.module_) || ty.is_subclass_of(&bt.generic_alias_) {
-                    return false;
-                }
+            if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
                 let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
                 frame.stack.truncate(callee_slot);
                 frame.stack.push(inst);
@@ -53861,6 +53879,15 @@ impl Interpreter {
                 _ => false,
             };
 
+        let bare_alloc = is_object_new
+            && init_from_object
+            && user_new.is_none()
+            && abstract_error.is_none()
+            && !seeds_exception_args
+            && matches!(native, NativeKind::Plain)
+            && !cls.is_subclass_of(&bt.module_)
+            && !cls.is_subclass_of(&bt.generic_alias_);
+
         crate::types::InstancePlan {
             abstract_error,
             user_new,
@@ -53873,6 +53900,7 @@ impl Interpreter {
             only_object_init,
             lean_init,
             tuple_new,
+            bare_alloc,
         }
     }
 
