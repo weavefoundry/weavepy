@@ -468,18 +468,23 @@ impl<V> Table<V> {
     /// fast paths, where the call would cost a fair share of the probe.
     #[inline(always)]
     pub fn get_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&V> {
+        let i = self.get_index_hot(key)?;
+        // SAFETY: a found position is in bounds.
+        Some(unsafe { &self.entries.get_unchecked(i).value })
+    }
+
+    /// [`Self::get_index_of`], always in line (see [`Self::get_hot`]).
+    #[inline(always)]
+    pub fn get_index_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
         if self.slots.is_empty() {
             if self.entries.is_empty() {
                 return None;
             }
             if let Some(found) = self.scan_unhashed(key) {
-                // SAFETY: a found position is in bounds.
-                return found.map(|i| unsafe { &self.entries.get_unchecked(i).value });
+                return found;
             }
         }
-        let i = self.find_hashed(key.probe_hash(), key).ok()?;
-        // SAFETY: a found position is in bounds.
-        Some(unsafe { &self.entries.get_unchecked(i).value })
+        self.find_hashed(key.probe_hash(), key).ok()
     }
 
     #[inline]
@@ -1396,6 +1401,13 @@ impl SetMap {
     #[inline]
     pub fn contains<Q: Probe + ?Sized>(&self, key: &Q) -> bool {
         self.find(key).is_some()
+    }
+
+    /// [`Self::contains`], always in line, for a probe whose hash runs no
+    /// code (the interpreter's membership fast paths).
+    #[inline(always)]
+    pub fn contains_hot<Q: Probe + ?Sized>(&self, key: &Q) -> bool {
+        self.0.get_index_hot(key).is_some()
     }
 
     #[inline]

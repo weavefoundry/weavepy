@@ -25007,6 +25007,32 @@ impl Interpreter {
     /// hands the instruction to the full handler (which restarts the scan:
     /// nothing observable happened here).
     fn leaf_contains(container: &Object, item: &Object) -> Option<bool> {
+        // A `str` or machine `int` in a set or dict, the commonest test,
+        // probed in line.
+        if let (
+            Object::Set(_) | Object::FrozenSet(_) | Object::Dict(_),
+            Object::Str(_) | Object::Int(_),
+        ) = (container, item)
+        {
+            if let Some(probe) = crate::object::LeafProbe::new(item) {
+                let found = match container {
+                    // SAFETY: a read between two instructions (the probe
+                    // runs no code).
+                    Object::Set(st) => unsafe { st.peek() }.map(|m| m.contains_hot(&probe)),
+                    Object::FrozenSet(fs) => Some(fs.contains_hot(&probe)),
+                    // SAFETY: as above.
+                    Object::Dict(d) => {
+                        unsafe { d.peek() }.map(|m| m.get_index_hot(&probe).is_some())
+                    }
+                    _ => None,
+                };
+                if let Some(found) = found {
+                    if found || probe.miss_is_exact() {
+                        return Some(found);
+                    }
+                }
+            }
+        }
         let member = Self::leaf_member_eq;
         match container {
             Object::List(l) => {
