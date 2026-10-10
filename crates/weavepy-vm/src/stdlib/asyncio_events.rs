@@ -358,8 +358,9 @@ fn fast_call_soon(
     // The class the loop's module would build (`events.Handle`, looked up
     // at call time: it may have been replaced, or come from another
     // import of `asyncio.events` than the one `hs` describes).
-    let current = global_module_attr(&ls.globals, &names().events, &names().handle)
-        .is_some_and(|h| matches!(h, Object::Type(t) if Rc::ptr_eq(&t, &hs.cls)));
+    let current =
+        global_module_type_ptr(&ls.globals, &names().events, &names().handle, &HANDLE_MEMO)
+            == Rc::as_ptr(&hs.cls) as usize;
     if !current {
         return Ok(None);
     }
@@ -477,21 +478,55 @@ fn plain_loop(ls: &LoopState, loop_: &Object) -> bool {
         && inst_attr_unset(li, &n.get_debug)
 }
 
-/// `module.attr`, for the module bound to global `module` in `globals`.
-fn global_module_attr(
+/// Where [`global_module_type_ptr`] last found its class: the globals
+/// dict's address and mutation stamp, the module dict's, the global
+/// value epoch, and the class's address.
+type ModuleAttrMemo = std::cell::Cell<(usize, u64, usize, u64, u64, usize)>;
+
+thread_local! {
+    static HANDLE_MEMO: ModuleAttrMemo = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+    static TASK_MEMO: ModuleAttrMemo = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+    static FUTURE_MEMO: ModuleAttrMemo = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+}
+
+/// The address of the class `module.attr` is, for the module bound to
+/// global `module` in `globals` (`0` for anything else), remembered in
+/// `memo` with the states of the two dicts it read:
+/// while neither changed (every store to a dict draws it a new stamp, and
+/// a global rebound in place moves the value epoch), the module the
+/// globals bind is the same one and binds the same class, so the answer
+/// stands without either probe.
+fn global_module_type_ptr(
     globals: &Rc<RefCell<DictData>>,
     module: &AttrName,
     attr: &AttrName,
-) -> Option<Object> {
-    let m = globals
+    memo: &'static std::thread::LocalKey<ModuleAttrMemo>,
+) -> usize {
+    let epoch = crate::object::global_value_epoch();
+    let gptr = Rc::as_ptr(globals) as usize;
+    let Ok(g) = globals.try_borrow() else {
+        return 0;
+    };
+    let gstamp = g.mutation_stamp();
+    drop(g);
+    let (mg, mgs, mm, mms, me, found) = memo.with(std::cell::Cell::get);
+    if mg == gptr && mgs == gstamp && me == epoch && mm != 0 {
+        // SAFETY: the globals are as they were, so they still bind the
+        // module that owns this dict, which they keep alive.
+        let mdict = unsafe { &*(mm as *const RefCell<DictData>) };
+        if mdict.try_borrow().is_ok_and(|d| d.mutation_stamp() == mms) {
+            return found;
+        }
+    }
+    let Some(Object::Module(m)) = globals
         .borrow()
         .get(&crate::object::StrKeyHashed {
             s: module.name,
             hash: module.hash,
         })
-        .cloned()?;
-    let Object::Module(m) = m else {
-        return None;
+        .cloned()
+    else {
+        return 0;
     };
     let v = m
         .dict
@@ -501,7 +536,24 @@ fn global_module_attr(
             hash: attr.hash,
         })
         .cloned();
-    v
+    let found = match &v {
+        Some(Object::Type(t)) => Rc::as_ptr(t) as usize,
+        _ => 0,
+    };
+    if found != 0 {
+        let mstamp = m.dict.borrow().mutation_stamp();
+        memo.with(|c| {
+            c.set((
+                gptr,
+                gstamp,
+                Rc::as_ptr(&m.dict) as usize,
+                mstamp,
+                epoch,
+                found,
+            ));
+        });
+    }
+    found
 }
 
 /// `BaseEventLoop.create_task(self, coro, **kwargs)`.
@@ -522,8 +574,9 @@ fn loop_create_task_method(
                 inst_attr(li, &names().task_factory),
                 Some(Object::None)
             );
-            let native = global_module_attr(&ls.globals, &names().tasks, &names().task)
-                .is_some_and(|t| crate::stdlib::asyncio_mod::is_task_class(&t));
+            let native =
+                global_module_type_ptr(&ls.globals, &names().tasks, &names().task, &TASK_MEMO)
+                    == crate::stdlib::asyncio_mod::task_class_addr();
             if no_factory && native {
                 return crate::stdlib::asyncio_mod::new_task(loop_, coro.clone(), kwargs);
             }
@@ -535,8 +588,9 @@ fn loop_create_task_method(
 /// `BaseEventLoop.create_future(self)`.
 fn loop_create_future_method(ls: &LoopState, args: &[Object]) -> Result<Object, RuntimeError> {
     if let [loop_] = args {
-        let native = global_module_attr(&ls.globals, &names().futures, &names().future)
-            .is_some_and(|f| crate::stdlib::asyncio_mod::is_future_class(&f));
+        let native =
+            global_module_type_ptr(&ls.globals, &names().futures, &names().future, &FUTURE_MEMO)
+                == crate::stdlib::asyncio_mod::future_class_addr();
         // (Not in debug mode: there the Python method's frame shows in
         // the future's `_source_traceback`.)
         if native && plain_loop(ls, loop_) {

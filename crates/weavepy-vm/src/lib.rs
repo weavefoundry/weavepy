@@ -11000,7 +11000,13 @@ impl Interpreter {
             } else {
                 "__iter__"
             };
-            let Some(gen) = self.instance_gen_call(v, name) else {
+            // (`await fut` of a native asyncio future: its `FutureIter`.)
+            let made = if ins.op == OpCode::GetAwaitable {
+                crate::stdlib::asyncio_mod::native_future_await(v)
+            } else {
+                None
+            };
+            let Some(gen) = made.or_else(|| self.instance_gen_call(v, name)) else {
                 return CoreAttr::Decline;
             };
             let top = frame.stack.last_mut().expect("checked above");
@@ -12625,6 +12631,30 @@ impl Interpreter {
                                 Object::Generator(_) | Object::Coroutine(_)
                             )
                         {
+                            // `await fut` of a native asyncio future: its
+                            // iterator's step, the sent value replaced by
+                            // what it yields, or by the result as the
+                            // `SEND` exits (see `future_iter_send`).
+                            // SAFETY: `len >= 2` (checked first).
+                            let step = (len >= 2 && ins.arg & GEN_SEND == 0)
+                                .then(|| unsafe { &*base.add(len - 2) })
+                                .and_then(crate::stdlib::asyncio_mod::future_iter_send);
+                            if let Some(step) = step {
+                                use crate::stdlib::asyncio_mod::FutureIterStep;
+                                let (v, exit) = match step {
+                                    FutureIterStep::Yield(v) => (v, false),
+                                    FutureIterStep::Return(v) => (v, true),
+                                };
+                                // SAFETY: `len >= 2`: the sent value's slot.
+                                unsafe { drop_hot(std::mem::replace(&mut *base.add(len - 1), v)) };
+                                last = pc;
+                                pc += 1;
+                                if exit {
+                                    pc += ins.arg as usize;
+                                }
+                                after_release!();
+                                continue;
+                            }
                             break Some(CoreExit::Stop(LeafStop::Step));
                         }
                         // SAFETY: `len <= cap`, every slot initialized.
@@ -71385,6 +71415,8 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "_getframe" | "_getframemodulename"
             // warnings (which reads the whole stack, lean activations included)
             | "warn"
+            // asyncio (`gather` reads the running loop's current task)
+            | "current_task"
     )
 }
 

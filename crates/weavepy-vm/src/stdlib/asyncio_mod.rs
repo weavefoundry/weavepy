@@ -1629,6 +1629,10 @@ fn fi_mark_done(inst: &PyInstance) {
 }
 
 fn future_iter_class() -> Rc<TypeObject> {
+    future_iter_class_ref().clone()
+}
+
+fn future_iter_class_ref() -> &'static Rc<TypeObject> {
     static CELL: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
@@ -1660,7 +1664,6 @@ fn future_iter_class() -> Rc<TypeObject> {
         TypeObject::new_user("FutureIter", vec![bt.object_.clone()], dict)
             .expect("FutureIter class must linearise")
     })
-    .clone()
 }
 
 fn future_iter_new(fut: &Object) -> Object {
@@ -1716,6 +1719,92 @@ fn fi_next(args: &[Object]) -> Result<Object, RuntimeError> {
 fn fi_send(args: &[Object]) -> Result<Object, RuntimeError> {
     // `send(value)` ignores the value (CPython `futureiter_send`).
     fi_next(&args[..1])
+}
+
+/// How [`future_iter_send`] stepped a `FutureIter`.
+pub(crate) enum FutureIterStep {
+    /// The pending future, yielded to the task driving the `await`.
+    Yield(Object),
+    /// The finished future's result: the `await`'s value.
+    Return(Object),
+}
+
+/// A `SEND` (of any value, which a `FutureIter` ignores) to `it`, when it
+/// is a native `FutureIter` over a pending future, or over a future that
+/// finished with a result: [`fi_next`]'s step, the result returned without
+/// the `StopIteration` that carries it there (CPython's `am_send`).
+/// `None` for anything else (the general `SEND` raises what's owed),
+/// touching nothing. Runs no Python code.
+pub(crate) fn future_iter_send(it: &Object) -> Option<FutureIterStep> {
+    let Object::Instance(inst) = it else {
+        return None;
+    };
+    if !std::ptr::eq(inst.cls_raw(), Rc::as_ptr(future_iter_class_ref())) {
+        return None;
+    }
+    let fut = fi_future(inst);
+    let Object::Instance(fut_inst) = &fut else {
+        return None;
+    };
+    let st = existing_state_of(fut_inst)?;
+    let status = st.try_borrow().ok()?.status;
+    match status {
+        FutStatus::Pending => {
+            let mut s = st.try_borrow_mut().ok()?;
+            if s.blocking {
+                return None;
+            }
+            s.blocking = true;
+            drop(s);
+            Some(FutureIterStep::Yield(fut))
+        }
+        FutStatus::Finished => {
+            let result = {
+                let mut s = st.try_borrow_mut().ok()?;
+                if !matches!(s.exception(), Object::None) {
+                    return None;
+                }
+                s.log_traceback = false;
+                s.result.clone()
+            };
+            fi_mark_done(inst);
+            Some(FutureIterStep::Return(result))
+        }
+        FutStatus::Cancelled => None,
+    }
+}
+
+/// `await fut`'s iterator, when `obj` is an instance whose class's
+/// `__await__` is the native `Future`'s or `Task`'s (a `FutureIter`, as
+/// [`fut_await`] makes it); `None` for anything else.
+pub(crate) fn native_future_await(obj: &Object) -> Option<Object> {
+    thread_local! {
+        /// The last class found to resolve `__await__` natively, and its
+        /// attribute version then.
+        static NATIVE_AWAIT: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let Object::Instance(inst) = obj else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    let key = (std::ptr::from_ref(cls) as usize, cls.attr_version.get());
+    if NATIVE_AWAIT.with(std::cell::Cell::get) != key {
+        let native = |c: &Rc<TypeObject>| {
+            c.dict
+                .try_borrow()
+                .ok()
+                .and_then(|d| d.get(&crate::object::StrKey("__await__")).cloned())
+        };
+        let found = cls.lookup("__await__");
+        let ok = matches!(&found, Some(Object::Builtin(b)) if [future_class_ref(), task_class_ref()]
+            .into_iter()
+            .any(|c| matches!(native(c), Some(Object::Builtin(n)) if Rc::ptr_eq(&n, b))));
+        if !ok {
+            return None;
+        }
+        NATIVE_AWAIT.with(|c| c.set(key));
+    }
+    Some(future_iter_new(obj))
 }
 
 fn fi_throw(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2648,14 +2737,14 @@ fn install_getset(
         .insert(DictKey(Object::from_static(name)), prop);
 }
 
-/// Whether `obj` is the native `Future` class itself.
-pub(crate) fn is_future_class(obj: &Object) -> bool {
-    matches!(obj, Object::Type(t) if Rc::ptr_eq(t, future_class_ref()))
+/// The native `Task` class's address.
+pub(crate) fn task_class_addr() -> usize {
+    Rc::as_ptr(task_class_ref()) as usize
 }
 
-/// Whether `obj` is the native `Task` class itself.
-pub(crate) fn is_task_class(obj: &Object) -> bool {
-    matches!(obj, Object::Type(t) if Rc::ptr_eq(t, task_class_ref()))
+/// The native `Future` class's address.
+pub(crate) fn future_class_addr() -> usize {
+    Rc::as_ptr(future_class_ref()) as usize
 }
 
 /// A tracked, uninitialized instance of the native class `cls`.
