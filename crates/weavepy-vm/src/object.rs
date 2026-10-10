@@ -1522,12 +1522,15 @@ impl Drop for PyTraceback {
         // is a `tb_next` linked list one node per stack level, so a
         // ~1000-deep traceback (a `RecursionError`) would drop recursively
         // and overflow the native stack. Tear the chain down iteratively.
+        // (The last owner of each link detaches its successor in place,
+        // then frees a node with nothing left to chain to.)
         let mut link = self.next.borrow_mut().take();
         while let Some(tb) = link {
-            match Rc::try_unwrap(tb) {
-                Ok(inner) => link = inner.next.borrow_mut().take(),
-                Err(_) => break,
+            if Rc::strong_count(&tb) != 1 {
+                break;
             }
+            link = tb.next.borrow_mut().take();
+            drop(tb);
         }
     }
 }
@@ -4021,7 +4024,7 @@ pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
 
 /// The table-level (Fx-mixed) hash for a Python hash value, matching what
 /// `DictKey::hash` feeds the [`DictData`] hasher.
-fn dict_table_hash(py_hash: i64) -> u64 {
+pub(crate) fn dict_table_hash(py_hash: i64) -> u64 {
     use std::hash::BuildHasher;
     crate::fasthash::FxBuildHasher.hash_one(py_hash)
 }

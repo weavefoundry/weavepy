@@ -254,6 +254,90 @@ for _ in range(200):
     assert t is ValueError and isinstance(v, ValueError) and tb is v.__traceback__
 
 
+# `raise ... from None` clears an earlier cause and suppresses the context.
+class AppError(Exception):
+    pass
+
+
+def chained(e):
+    try:
+        {}["k"]
+    except KeyError:
+        raise e from None
+
+
+for _ in range(300):
+    err = AppError("x")
+    assert err.__cause__ is None and err.__suppress_context__ is False
+    try:
+        chained(err)
+    except AppError as caught:
+        assert caught.__cause__ is None
+        assert caught.__suppress_context__ is True
+        assert isinstance(caught.__context__, KeyError)
+    err.__cause__ = ValueError("old")
+    try:
+        chained(err)
+    except AppError as caught:
+        assert caught.__cause__ is None, caught.__cause__
+
+
+# The `as` name's cleanup (`e = None; del e`) unbinds it.
+def bound_after():
+    try:
+        raise ValueError
+    except ValueError as e:
+        pass
+    try:
+        e
+    except UnboundLocalError:
+        return True
+    return False
+
+
+for _ in range(300):
+    assert bound_after()
+
+
+# A traceback chain across frames survives its exception's handler while
+# referenced, and goes when the last reference does.
+def deep(n):
+    if n == 0:
+        raise KeyError("deep")
+    deep(n - 1)
+
+
+kept = []
+for i in range(200):
+    try:
+        deep(3)
+    except KeyError as e:
+        if i % 50 == 0:
+            kept.append(e.__traceback__)
+for tb in kept:
+    depth = 0
+    while tb is not None:
+        depth += 1
+        tb = tb.tb_next
+    assert depth == 5, depth
+
+
+# An instance's `__dict__` after its split layout keeps names and order.
+class Many:
+    def __init__(self):
+        for i in range(20):
+            setattr(self, "a%d" % i, i)
+
+
+for _ in range(200):
+    m = Many()
+    d = m.__dict__
+    assert list(d) == ["a%d" % i for i in range(20)]
+    assert d["a7"] == 7 and m.a19 == 19
+    d["a7"] = 70
+    assert m.a7 == 70
+
+
 @contextlib.contextmanager
 def tagged(log, tag):
     log.append(tag)

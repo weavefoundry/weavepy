@@ -11639,6 +11639,39 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // `del x` of a bound plain local (an `except ... as e:`
+                    // clause's cleanup, after its `e = None`), as the full
+                    // arm runs it: an unbound local raises there, and a slot
+                    // shared with a cell is the full handler's.
+                    OpCode::DeleteFast => {
+                        let i = ins.arg as usize;
+                        if i >= nlocals
+                            || (!code.cellvars.is_empty()
+                                && Self::shared_cell_index(code, i).is_some())
+                        {
+                            break None;
+                        }
+                        // SAFETY: `i < nlocals`.
+                        unsafe {
+                            let slot = lbase.add(i);
+                            if matches!(*slot, Object::Unbound) {
+                                break None;
+                            }
+                            if !scalar(&*slot) {
+                                if !Self::core_droppable(&*slot) {
+                                    break None;
+                                }
+                                self.release(std::mem::replace(&mut *slot, Object::Unbound));
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
+                            slot.write(Object::Unbound);
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
                     // A list literal, tracked like the full handler's (an
                     // allocation due to trigger a collection is left to it).
                     OpCode::BuildList => {
@@ -14569,6 +14602,19 @@ impl Interpreter {
                     // leaf arms' shapes, which the full handlers' match).
                     // An `except` clause's entry, test and exit (see
                     // `core_exc_op`).
+                    // `del obj.attr` of a plain instance's own attribute (see
+                    // `core_delete_attr`); anything else is the full arm's.
+                    OpCode::DeleteAttr => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack.
+                        match unsafe { self.core_delete_attr(code, ins, base, len) } {
+                            Some(n) => len = n,
+                            None => break None,
+                        }
+                        last = pc;
+                        pc += 1;
+                        after_release!();
+                    }
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
@@ -17179,6 +17225,66 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// `del obj.attr` (`DELETE_ATTR` `ins` of `code`) of the instance atop
+    /// the `len` stack slots at `base`, as the full leaf arm runs it: an
+    /// ordinary instance's own attribute, by the default `__delattr__`,
+    /// with no class attribute of that name. The value and the instance
+    /// leave as the full arm releases them (which may queue a finalizer:
+    /// the caller checks). Returns the new stack length, or `None`, having
+    /// touched nothing (a missing attribute raises through the full arm).
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    #[inline(never)]
+    unsafe fn core_delete_attr(
+        &mut self,
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        let Object::Instance(inst) = (unsafe { &*base.add(len - 1) }) else {
+            return None;
+        };
+        let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        // (The full arm's conditions; see there.)
+        if inst.native.get().is_some()
+            || key.starts_with("__")
+            || &**key == "_CHUNK_SIZE"
+            || cls.flags.is_exception
+            || cls.forbids_dict
+            || crate::capi_watchers::dicts_active()
+            || !Self::default_delattr(cls)
+            || !matches!(
+                Self::leaf_class_attr(code, cls, ins.arg),
+                Some(LeafAttr::InstanceOnly)
+            )
+        {
+            return None;
+        }
+        let removed = match inst.split_remove(key) {
+            Some(removed) => removed?,
+            None => inst
+                .dict_cell()
+                .borrow_mut()
+                .shift_remove(&DictKey(Object::Str(key.clone())))?,
+        };
+        // SAFETY: the instance leaves its slot.
+        let owner = unsafe { base.add(len - 1).read() };
+        // Released at once, as CPython's decref is.
+        self.release(removed);
+        self.release(owner);
+        Some(len - 1)
     }
 
     /// Zero-argument `super().name` (`LOAD_SUPER_ATTR` `ins` at `pc` over
@@ -31598,7 +31704,11 @@ impl Interpreter {
             if matches!(c, Object::None) {
                 pe.cause = None;
                 if let Object::Instance(ref inst_rc) = pe.instance {
-                    inst_rc.slot_set("__cause__", Object::None);
+                    // An unset `__cause__` already reads None (a re-raised
+                    // instance's earlier cause is cleared).
+                    if inst_rc.slots.borrow().get("__cause__").is_some() {
+                        inst_rc.slot_set("__cause__", Object::None);
+                    }
                     inst_rc.slot_set("__suppress_context__", Object::Bool(true));
                 }
             } else {

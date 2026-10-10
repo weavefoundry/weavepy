@@ -610,6 +610,18 @@ impl SplitValues {
             .filter_map(move |(i, v)| Some((keys?.get(i)?, v)))
     }
 
+    /// A new strong handle on the names, while any value is (or was) set.
+    fn keys_rc(&self) -> Option<Rc<SharedKeys>> {
+        self.block.and_then(|b| {
+            // SAFETY: a non-null `keys` is a live strong reference.
+            let k = unsafe { (*b.as_ptr()).keys };
+            (!k.is_null()).then(|| unsafe {
+                Rc::increment_strong_count(k);
+                Rc::from_raw(k)
+            })
+        })
+    }
+
     /// A copy of the names and values (for a materialization that can't
     /// move them).
     fn snapshot(&self) -> (Option<Rc<SharedKeys>>, Vec<Object>) {
@@ -967,7 +979,7 @@ impl InstDict {
         let owner = self.owner();
         let (keys, values) = match self.split.try_borrow_mut() {
             Ok(mut s) => {
-                let keys = s.snapshot().0;
+                let keys = s.keys_rc();
                 (keys, s.take())
             }
             // A live view of the values (nothing in the VM holds one across
@@ -988,12 +1000,22 @@ impl InstDict {
             DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher)
         };
         if let Some(keys) = keys {
+            use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
             // A deferred owner holds only atomic values, and a tracked
-            // one needs no barrier: insert without either.
+            // one needs no barrier: insert without either. The names are
+            // distinct `str`s whose hashes the table kept, so each goes
+            // straight into its bucket, without hashing or comparing.
             let map = d.map_mut_atomic_store();
             for (i, v) in values.into_iter().enumerate() {
                 if let Some(k) = keys.get(i) {
-                    map.insert(k.clone(), v);
+                    // SAFETY: slot `i` is published (`get` found its name).
+                    let hash = crate::object::dict_table_hash(unsafe { *keys.hashes[i].get() });
+                    match map.raw_entry_mut_v1().from_hash(hash, |_| false) {
+                        RawEntryMut::Vacant(e) => {
+                            e.insert_hashed_nocheck(hash, k.clone(), v);
+                        }
+                        RawEntryMut::Occupied(_) => unreachable!("never matches"),
+                    }
                 }
             }
         }
