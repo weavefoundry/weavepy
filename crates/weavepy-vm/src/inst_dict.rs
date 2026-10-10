@@ -1156,24 +1156,32 @@ impl InstDict {
         // are distinct `str`s whose hashes the shared table kept, so the
         // entries go down in order and are indexed once, without hashing
         // or comparing.
+        let mut values = values;
         let map = match keys {
             Some(keys) => {
                 let n = values.len().min(keys.len());
-                crate::dictmap::DictMap::from_unique_hashed(
-                    values.into_iter().take(n).enumerate().map(|(i, v)| {
-                        // SAFETY: slot `i` is published (below the length).
-                        let (k, hash) = unsafe {
-                            (
-                                (*keys.keys[i].get()).assume_init_ref(),
-                                *keys.hashes[i].get(),
-                            )
-                        };
-                        (hash, k.clone(), v)
-                    }),
-                )
+                let src = values.as_ptr();
+                let map = crate::dictmap::DictMap::from_unique_hashed(n, |i| {
+                    // SAFETY: slot `i` is published (below the length),
+                    // and value `i` moves out once (the vector forgets the
+                    // first `n` below).
+                    unsafe {
+                        let k = (*keys.keys[i].get()).assume_init_ref();
+                        (*keys.hashes[i].get(), k.clone(), src.add(i).read())
+                    }
+                });
+                // SAFETY: the first `n` values moved into the table; any
+                // past the names (none in practice) drop with the vector.
+                unsafe {
+                    let rest = values.len() - n;
+                    std::ptr::copy(src.add(n), values.as_mut_ptr(), rest);
+                    values.set_len(rest);
+                }
+                map
             }
             None => crate::dictmap::DictMap::default(),
         };
+        drop(values);
         let deferred = if owner.deferred.get() {
             std::ptr::from_ref(owner) as usize
         } else {

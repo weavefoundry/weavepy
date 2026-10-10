@@ -17314,7 +17314,7 @@ impl Interpreter {
         // layout positions the stores then fill. A site that recorded
         // anything else for this version never will.
         let laid_out = ty.slot_layout.get().and_then(Option::as_ref);
-        let mut members = [0u8; 16];
+        let mut members = [0u8; crate::inst_dict::SHARED_KEYS_CAP];
         if laid_out.is_some() {
             let mut seen = 0u64;
             for (k, &(pc, _)) in shape.stores.iter().enumerate() {
@@ -74199,7 +74199,10 @@ fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
             {
                 // The final `return None`: the shape holds when nothing
                 // else follows it.
-                if pc + 2 != ins.len() || stores.is_empty() || stores.len() > 16 {
+                if pc + 2 != ins.len()
+                    || stores.is_empty()
+                    || stores.len() > crate::inst_dict::SHARED_KEYS_CAP
+                {
                     return None;
                 }
                 return Some(StoreInit {

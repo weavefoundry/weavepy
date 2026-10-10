@@ -215,17 +215,25 @@ impl DictMap {
         m
     }
 
-    /// A table of the entries `items` yields, whose keys are distinct and
-    /// each paired with its Python hash, built in one pass: the entries
-    /// are laid down in order, then indexed once (no probe compares a
+    /// A table of the `n` entries `entry(i)` gives in order, whose keys are
+    /// distinct and each paired with its Python hash, built in one pass:
+    /// the entries are laid down, then indexed once (no probe compares a
     /// key).
+    #[inline]
     pub fn from_unique_hashed(
-        items: impl ExactSizeIterator<Item = (i64, DictKey, Object)>,
+        n: usize,
+        mut entry: impl FnMut(usize) -> (i64, DictKey, Object),
     ) -> Self {
-        let mut entries = Vec::with_capacity(items.len());
-        for (hash, key, value) in items {
-            entries.push(Bucket { hash, key, value });
+        let mut entries: Vec<Bucket> = Vec::with_capacity(n);
+        let dst = entries.as_mut_ptr();
+        for i in 0..n {
+            let (hash, key, value) = entry(i);
+            // SAFETY: `i < n`, inside the capacity; the length is set once
+            // every slot below `n` is written.
+            unsafe { dst.add(i).write(Bucket { hash, key, value }) };
         }
+        // SAFETY: the first `n` buckets were written above.
+        unsafe { entries.set_len(n) };
         let mut m = Self {
             entries,
             slots: Box::new([]),
