@@ -4758,7 +4758,7 @@ unsafe fn direct_run<const PUSHED: bool>(
                 if done.owns_cells {
                     done.clean = true;
                     interp.inline_park_clean(done);
-                } else if !PUSHED && (*site).act.is_none() {
+                } else if !PUSHED && !site.is_null() && (*site).act.is_none() {
                     // The slot stays with its call site, still bound to
                     // the callee's code, for its next call.
                     (*site).act = Some(interp.inline_park_warm(done));
@@ -5382,6 +5382,123 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
     }
 }
 
+/// The `CALL_KW` at `pc` of `code` (its operands from `start` up a
+/// `len`-deep stack: the callee, its self slot, `argc` positionals, `kwc`
+/// keyword values and the names tuple) of a plain function whose body has
+/// native code, called directly as [`direct_call`] calls one: the site's
+/// verified `CallPyKwNames` permutation binds the keywords
+/// (`Interpreter::core_bind_kw_direct`), and the callee's return comes
+/// back here. `None` touched nothing (the core loop's keyword call takes
+/// it, filling the site's slot).
+///
+/// # Safety
+///
+/// As [`direct_call`]'s.
+#[inline(never)]
+unsafe fn direct_call_kw(
+    st: &mut State,
+    code: &CodeObject,
+    pc: usize,
+    start: usize,
+    len: usize,
+    argc: usize,
+    kwc: usize,
+) -> Option<u32> {
+    use weavepy_compiler::InlineCache as IC;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Function(f) = &*st.stack.add(start) else {
+            return None;
+        };
+        let IC::CallPyKwNames {
+            func_id,
+            perm,
+            argc: ca,
+            kwc: ck,
+        } = code.caches.get(pc as u32)
+        else {
+            return None;
+        };
+        let has_self = !matches!(&*st.stack.add(start + 1), Object::Unbound);
+        let eff_argc = argc + usize::from(has_self);
+        if ca as usize != eff_argc || ck as usize != kwc {
+            return None;
+        }
+        let fp = Rc::as_ptr(f);
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        // The binding the site verified for this function and code (see
+        // `Interpreter::kw_names_bind_cached`, whose slow half fills it).
+        if crate::specialize::rc_id(f) != func_id || f.defaults_maybe_overridden() {
+            return None;
+        }
+        let (covered, _) = crate::code_call_slot(code, pc)?.hit(fp, Rc::as_ptr(code_rc))?;
+        let callee: &CodeObject = code_rc;
+        if callee.is_generator
+            || callee.is_coroutine
+            || callee.is_async_generator
+            || callee.has_varargs
+            || callee.has_varkeywords
+            || !callee.cellvars.is_empty()
+            || !callee.freevars.is_empty()
+            || !f.closure.is_empty()
+            || !Interpreter::lean_code_ok(callee)
+        {
+            return None;
+        }
+        let ext = crate::code_vm_ext(callee)?;
+        let native = ext.frame_jit.get(callee.varnames.len())?;
+        let interp = &mut *st.interp.cast_mut();
+        let nested = interp.direct_calls.get();
+        if nested >= DIRECT_CALL_DEPTH
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || !native.enters_at(0)
+            || !(*st.sw).calls_ok
+            || (callee.jit_hint.is_compiled()
+                && !callee.jit_hint.is_not_jitable()
+                && !crate::tier2::jit_off_for_process())
+        {
+            return None;
+        }
+        let act = interp.inline_pool.pop()?;
+        let sw = &mut *st.sw;
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            interp.inline_pool.push(act);
+            return None;
+        };
+        // Committed: the caller synced as the core loop's arm syncs it, and
+        // the callee's activation made the running one.
+        let caller = &mut *st.frame;
+        caller.stack.set_len(len);
+        caller.pc = pc as u32;
+        *sw.last = st.last;
+        let saved_last = sw.last;
+        let cframe = interp.core_bind_kw_direct(
+            sw,
+            pc,
+            has_self,
+            fp,
+            (perm, covered, kwc, argc),
+            act,
+            guard,
+        );
+        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
+        let depth = (*sw.inl).len();
+        Some(direct_run::<false>(
+            st,
+            pc,
+            start,
+            cframe,
+            depth,
+            native,
+            saved_last,
+            nested,
+            None,
+            0,
+            std::ptr::null_mut(),
+        ))
+    }
+}
+
 /// `CALL_KW` (the `pc`th instruction of `code`) on a stack `len` deep, as
 /// the core loop's arm runs it: a natively served class's constructor, a
 /// native method or builtin that takes keywords, or a pure leaf callee in
@@ -5429,6 +5546,11 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             // A plain Python callee switches in place, as `CALL`'s does.
             if !matches!(&ops[0], Object::Function(_)) || st.sw.is_null() {
                 return CALL_DECLINED;
+            }
+            // A compiled one whose keywords the site's permutation places
+            // runs directly, as `CALL`'s does.
+            if let Some(r) = direct_call_kw(st, code, pc, start, len, argc, kwc) {
+                return r;
             }
             let frame = &mut *st.frame;
             frame.stack.set_len(len);

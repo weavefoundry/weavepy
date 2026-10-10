@@ -3988,7 +3988,7 @@ impl Interpreter {
             // bookkeeping), which must not observe a held pool borrow.
             // SAFETY: sole owner (checked above) — no other path can
             // reach this vector, including the drop glue of its elements.
-            unsafe { (*frame.locals.as_ptr()).clear() };
+            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.clone());
@@ -8162,21 +8162,8 @@ impl Interpreter {
         if Rc::strong_count(&fr.locals) == 1 {
             // SAFETY: sole owner — no other path reaches this vector.
             let v = unsafe { &mut *fr.locals.as_ptr() };
-            if v.iter().all(|o| {
-                matches!(
-                    o,
-                    Object::Int(_)
-                        | Object::Float(_)
-                        | Object::Bool(_)
-                        | Object::None
-                        | Object::Unbound
-                )
-            }) {
-                // SAFETY: scalars own nothing; no drop glue is skipped.
-                unsafe { v.set_len(0) };
-            } else {
-                v.clear();
-            }
+            // SAFETY: sole owner (checked above).
+            unsafe { release_locals(v) };
         } else {
             // The storage escaped (a materialized frame shares it): the
             // slot takes fresh storage.
@@ -8698,7 +8685,7 @@ impl Interpreter {
                     && Rc::strong_count(&frame.locals) == 1
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    unsafe { (*frame.locals.as_ptr()).clear() };
+                    unsafe { release_locals(&mut *frame.locals.as_ptr()) };
                     drop(done.guard.take());
                     return Ok(v);
                 }
@@ -10379,7 +10366,7 @@ impl Interpreter {
         }
         if Rc::strong_count(&locals) == 1 {
             // SAFETY: sole owner — no other path reaches this vector.
-            unsafe { (*locals.as_ptr()).clear() };
+            unsafe { release_locals(&mut *locals.as_ptr()) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(locals);
@@ -15735,7 +15722,7 @@ impl Interpreter {
         missing: usize,
         cells: bool,
         fp: *const crate::object::PyFunction,
-        mut act: Box<InlineAct>,
+        act: Box<InlineAct>,
         guard: crate::recursion::Guard,
         held: bool,
     ) -> *mut Frame {
@@ -15782,6 +15769,90 @@ impl Interpreter {
             frame.stack.set_len(callee_slot);
             callable
         };
+        // SAFETY: as above.
+        unsafe {
+            self.core_bind_act::<DIRECT>(sw, frame, pc, fp, code_rc, act, guard, held, cells, callable)
+        }
+    }
+
+    /// [`Self::core_bind_plain`] for the `CALL_KW` at `pc` of `sw`'s
+    /// running activation (a direct call's, see `frame_jit::h_call_kw`):
+    /// the site's verified `CallPyKwNames` permutation `perm` places the
+    /// `kwc` keyword values, the `argc` positionals (after the receiver
+    /// when `has_self`) take the first slots, and the parameters `covered`
+    /// doesn't name take their defaults (see `kw_names_fill_locals`).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s, with the names tuple on the stack's
+    /// top and a callee with no cells and no `**kwargs`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn core_bind_kw_direct(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        has_self: bool,
+        fp: *const crate::object::PyFunction,
+        (perm, covered, kwc, argc): (u32, u32, usize, usize),
+        act: Box<InlineAct>,
+        guard: crate::recursion::Guard,
+    ) -> *mut Frame {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let frame = &mut *sw.cur;
+            let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
+            // A parked slot's locals storage is its own, and empty.
+            let locals = &mut *act.frame.locals.as_ptr();
+            let names = frame.stack.pop().expect("the names tuple");
+            let items: &[Object] = match &names {
+                Object::Tuple(t) => t,
+                _ => &[],
+            };
+            Self::kw_names_fill_locals(
+                locals,
+                &mut frame.stack,
+                items,
+                &*fp,
+                code_rc,
+                perm,
+                covered,
+                kwc,
+                argc + usize::from(has_self),
+            );
+            drop_hot(names);
+            if !has_self {
+                // The empty self slot owns nothing.
+                let n = frame.stack.len();
+                frame.stack.set_len(n - 1);
+            }
+            let callable = frame.stack.pop().expect("the callee");
+            self.core_bind_act::<true>(sw, frame, pc, fp, code_rc, act, guard, false, false, callable)
+        }
+    }
+
+    /// The common half of [`Self::core_bind_plain`] and
+    /// [`Self::core_bind_kw_direct`]: `act`, its locals filled and
+    /// `callable` off the caller's stack, bound to `fp` and pushed as the
+    /// running activation, the caller (`frame`) waiting past its call.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_bind_act<const DIRECT: bool>(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+        fp: *const crate::object::PyFunction,
+        code_rc: &Rc<CodeObject>,
+        mut act: Box<InlineAct>,
+        guard: crate::recursion::Guard,
+        held: bool,
+        cells: bool,
+        callable: Object,
+    ) -> *mut Frame {
         frame.pc = pc as u32 + 1;
         // SAFETY: the slot is parked (see `inline_bind_cells`): its handles
         // are stale copies, overwritten without a drop. `fp` stays alive
