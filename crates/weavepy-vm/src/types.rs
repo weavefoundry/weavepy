@@ -573,7 +573,7 @@ impl LeafAttrCache {
     }
 
     /// The table, if one was allocated.
-    #[inline]
+    #[cfg(test)]
     fn table(&self) -> Option<&[LeafAttrEntry]> {
         let t = self.0.get();
         if t == 0 {
@@ -666,14 +666,26 @@ impl LeafAttrCache {
     /// The cached kind for `name` under `ver`, if present.
     #[inline]
     pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
-        let t = self.table()?;
+        let t = self.0.get();
+        if t == 0 {
+            return None;
+        }
         // (Both table lengths are powers of two.)
-        let mask = t.len() - 1;
-        let e = &t[Self::index(name) & mask];
+        let mask = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL - 1
+        } else {
+            LEAF_ATTRS_LARGE - 1
+        };
+        let base = (t & !LEAF_ATTRS_SMALL_TAG) as *const LeafAttrEntry;
+        // SAFETY: a nonzero address (tag removed) is a live table of
+        // `mask + 1` entries, indexed below within the mask; GIL-serialized,
+        // and no `&mut` escapes `set`.
+        let e = unsafe { &*base.add(Self::index(name) & mask) };
         if e.name == name && e.ver == ver {
             return Some(&e.kind);
         }
-        let e = &t[Self::alt(name) & mask];
+        // SAFETY: as above.
+        let e = unsafe { &*base.add(Self::alt(name) & mask) };
         (e.name == name && e.ver == ver).then_some(&e.kind)
     }
 

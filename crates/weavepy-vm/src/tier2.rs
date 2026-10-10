@@ -1098,6 +1098,16 @@ fn compile_allowed(counter: u32, threshold: u32) -> bool {
 /// attempt costs milliseconds.
 const IMPORT_THRESHOLD_FACTOR: u32 = 64;
 
+/// The work at which the current phase admits compiling code whose
+/// threshold is `threshold` (see [`compile_allowed`]).
+fn admit_at(threshold: u32) -> u32 {
+    if compile_allowed(0, threshold) {
+        threshold
+    } else {
+        threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
+    }
+}
+
 /// Bodies longer than this many instructions need proportionally more
 /// work before start-up or an import analyzes them (see
 /// [`import_size_budget`]).
@@ -1335,18 +1345,20 @@ impl JitState {
                         entry.calls = entry.calls.wrapping_add(1);
                     }
                     // Halfway to the work this phase admits a compile at
-                    // (start-up and imports need far more first).
-                    let admit_at = if compile_allowed(0, self.threshold) {
-                        self.threshold
-                    } else {
-                        self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
-                    };
-                    if entry.counter == admit_at / 2 && self.engine.is_none() {
+                    // (start-up and imports need far more first). (The
+                    // phase is read only at the two counts it can be.)
+                    let half = self.threshold / 2;
+                    if (entry.counter == half
+                        || entry.counter
+                            == self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR) / 2)
+                        && entry.counter == admit_at(self.threshold) / 2
+                        && self.engine.is_none()
+                    {
                         spawn_codegen_prewarm();
                     }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
-                        || entry.counter < import_size_budget(code, admit_at)
+                        || entry.counter < import_size_budget(code, admit_at(self.threshold))
                     {
                         return None;
                     }
