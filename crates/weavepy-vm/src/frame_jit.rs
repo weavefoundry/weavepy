@@ -5532,8 +5532,12 @@ fn compile_with(
     let blocks = engine.ctx.func.dfg.num_blocks();
     let defined = engine.module.define_function(id, &mut engine.ctx);
     if let (Some(t0), Some(t1)) = (t0, t1) {
+        let bytes = engine
+            .ctx
+            .compiled_code()
+            .map_or(0, |c| c.code_buffer().len());
         eprintln!(
-            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}), compiled in {:?}",
+            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}, {bytes} bytes), compiled in {:?}",
             code.qualname,
             t1 - t0,
             if lean { ", lean" } else { "" },
@@ -7467,13 +7471,13 @@ impl<'a> Lower<'a> {
             .band_imm(bit, self.tags.rc_counted | self.tags.rc_counted_hdr);
         let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
         // The single-thread bias, and the release observers, all off.
-        let mut quiet = rc;
-        for flag in crate::plain_release_flags() {
-            let addr = self.b.ins().iconst(self.ptr, flag as i64);
-            let on = self.b.ins().load(types::I8, FLAGS, addr, 0);
-            let off = self.b.ins().icmp_imm(IntCC::Equal, on, 0);
-            quiet = self.b.ins().band(quiet, off);
-        }
+        let addr = self
+            .b
+            .ins()
+            .iconst(self.ptr, crate::plain_release_gate() as i64);
+        let on = self.b.ins().load(types::I32, FLAGS, addr, 0);
+        let off = self.b.ins().icmp_imm(IntCC::Equal, on, 0);
+        let quiet = self.b.ins().band(rc, off);
         self.b.ins().brif(quiet, counted, &[], slow, &[]);
         self.b.switch_to_block(counted);
         let w = self.count_addr(local, bit);

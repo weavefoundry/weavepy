@@ -71940,18 +71940,12 @@ pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
         .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The bytes compiled code tests before releasing a shared value in line:
+/// The word compiled code tests before releasing a shared value in line:
 /// the reference-count bias's shared flag and every observer
-/// [`Interpreter::core_drops_plain`] consults; all zero for a plain
-/// decrement.
-pub(crate) fn plain_release_flags() -> [*const u8; 4] {
-    let [dicts, funcs] = crate::capi_watchers::release_flags();
-    [
-        crate::sync::rc_shared_flag().as_ptr().cast_const().cast(),
-        dicts,
-        funcs,
-        crate::stdlib::testinternalcapi_mod::reftrace_print_flag(),
-    ]
+/// [`Interpreter::core_drops_plain`] consults, one byte each; zero for a
+/// plain decrement.
+pub(crate) fn plain_release_gate() -> *const u32 {
+    std::ptr::from_ref(&crate::sync::RELEASE_GATES).cast()
 }
 
 /// `v.clone()`, in line (see `Object`'s `Clone`).

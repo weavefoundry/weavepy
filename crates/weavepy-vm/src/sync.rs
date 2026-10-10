@@ -416,15 +416,33 @@ pub(crate) fn cells_unguarded_flag() -> *const bool {
     CELLS_UNGUARDED.as_ptr()
 }
 
+/// The flags a plain in-line release must find all clear (see
+/// [`crate::plain_release_gate`]), side by side so that compiled code
+/// tests them with one 32-bit load.
+#[repr(C, align(4))]
+pub(crate) struct ReleaseGates {
+    pub(crate) rc_shared: std::sync::atomic::AtomicBool,
+    pub(crate) dicts_watched: std::sync::atomic::AtomicBool,
+    pub(crate) funcs_watched: std::sync::atomic::AtomicBool,
+    pub(crate) reftrace_print: std::sync::atomic::AtomicBool,
+}
+
+pub(crate) static RELEASE_GATES: ReleaseGates = ReleaseGates {
+    rc_shared: std::sync::atomic::AtomicBool::new(false),
+    dicts_watched: std::sync::atomic::AtomicBool::new(false),
+    funcs_watched: std::sync::atomic::AtomicBool::new(false),
+    reftrace_print: std::sync::atomic::AtomicBool::new(false),
+};
+
 /// Whether reference counts must be updated atomically: set whenever the
 /// cell bias is revoked, and also before spawning a thread that may touch
 /// objects before it registers (see [`crate::rc`]). Never cleared.
-static RC_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RC_SHARED: &std::sync::atomic::AtomicBool = &RELEASE_GATES.rc_shared;
 
 /// The flag [`bias_held`] reads (native code that takes references in
 /// line reads it too).
 pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
-    &RC_SHARED
+    RC_SHARED
 }
 
 /// True while one thread owns every reference count (see [`crate::rc`]).
