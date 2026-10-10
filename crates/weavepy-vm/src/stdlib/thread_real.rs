@@ -363,27 +363,44 @@ const TIMEOUT_MAX_SECS: f64 = 9_223_372_036.0;
 /// forwards to that instance's own closure, so both the VM's instance-dict
 /// path and a C extension's type-level lookup reach the identical
 /// implementation.
-/// The instance-dict entry `name` of `inst`, probed with `name`'s hash as
-/// `hash` caches it (computed on first use; `0` is "not yet").
+/// Where a trampoline last found its instance-dict entry: the name's hash
+/// (computed on first use; `0` is "not yet") and the entry's position.
+/// Every lock's dict is built in the same order, so the position settles a
+/// lookup with one key comparison.
+#[derive(Default)]
+struct ClosureSite {
+    hash: std::sync::atomic::AtomicI64,
+    at: std::sync::atomic::AtomicUsize,
+}
+
+/// The instance-dict entry `name` of `inst`, at the position `site` last
+/// found it in, else probed with `name`'s hash.
 fn instance_closure(
     inst: &crate::types::PyInstance,
     name: &'static str,
-    hash: &std::sync::atomic::AtomicI64,
+    site: &ClosureSite,
 ) -> Option<Object> {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut h = hash.load(Relaxed);
+    let d = inst.dict_cell().borrow();
+    if let Some((DictKey(Object::Str(k)), v)) = d.get_index(site.at.load(Relaxed)) {
+        let k: &str = k;
+        // (The dict's keys are the same static names.)
+        if std::ptr::eq(k.as_ptr(), name.as_ptr()) && k.len() == name.len() || k == name {
+            return Some(v.clone());
+        }
+    }
+    let mut h = site.hash.load(Relaxed);
     if h == 0 {
         h = crate::object::py_str_hash(name);
-        hash.store(h, Relaxed);
+        site.hash.store(h, Relaxed);
     }
-    inst.dict_cell()
-        .borrow()
-        .get(&crate::object::StrKeyHashed { s: name, hash: h })
-        .cloned()
+    let (i, _, v) = d.get_full(&crate::object::StrKeyHashed { s: name, hash: h })?;
+    site.at.store(i, Relaxed);
+    Some(v.clone())
 }
 
 fn instance_dunder_trampoline(name: &'static str) -> Object {
-    let hash = std::sync::atomic::AtomicI64::new(0);
+    let site = ClosureSite::default();
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: true,
@@ -391,7 +408,7 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
             let Some(Object::Instance(inst)) = args.first() else {
                 return Err(type_error(format!("{name}() requires an instance")));
             };
-            let closure = instance_closure(inst, name, &hash);
+            let closure = instance_closure(inst, name, &site);
             match closure {
                 Some(Object::Builtin(b)) => (b.call)(&args[1..]),
                 _ => Err(type_error(format!("instance has no {name}"))),
@@ -409,7 +426,7 @@ fn instance_dunder_trampoline(name: &'static str) -> Object {
 /// reachable via the type, not just the instance dict (RFC 0072 WS2).
 fn instance_method_trampoline(name: &'static str) -> Object {
     // (Shared by both halves below.)
-    let hash = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let site = std::sync::Arc::new(ClosureSite::default());
     let forward =
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
             let Some(Object::Instance(inst)) = args.first() else {
@@ -417,7 +434,7 @@ fn instance_method_trampoline(name: &'static str) -> Object {
                     "descriptor '{name}' requires a lock instance"
                 )));
             };
-            let closure = instance_closure(inst, name, &hash);
+            let closure = instance_closure(inst, name, &site);
             match closure {
                 Some(Object::Builtin(b)) => match &b.call_kw {
                     Some(kw) => kw(&args[1..], kwargs),
