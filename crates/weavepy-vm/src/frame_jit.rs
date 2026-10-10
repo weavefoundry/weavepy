@@ -1198,6 +1198,18 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
             Some(v) => v,
             None => return 3,
         },
+        // An exhausted string's or bytes' cursor leaves the stack, as a
+        // range's does: releasing it runs no code.
+        PyIterator::Str { s, index } if unique && *index >= s.len() => {
+            // SAFETY: as above.
+            drop(unsafe { it.read() });
+            return 2;
+        }
+        PyIterator::Bytes { data, index } if unique && *index >= data.len() => {
+            // SAFETY: as above.
+            drop(unsafe { it.read() });
+            return 2;
+        }
         _ => return 3,
     };
     if let Object::Int(i) = v {
@@ -1824,27 +1836,28 @@ unsafe extern "C" fn h_load_global(
                     return fused(st, c, pc + 1);
                 }
             }
-            // A value no fused shape takes: the native code reads it in
-            // line while the dicts' stamps hold (a stamp changes with every
-            // mutation, so the value stays where it is).
-            _ => {
-                let c = &mut *cache;
-                // (A namespace handle's bits: one pointer-sized word.)
-                c.value = 0;
-                c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
-                c.gstamp = g_stamp;
-                c.gdata = gdict as u64;
-                (c.builtins, c.bstamp, c.bdata) = if builtin {
-                    let b = std::ptr::addr_of!((*st.frame).builtins)
-                        .cast::<u64>()
-                        .read();
-                    (b, b_stamp, bdict as u64)
-                } else {
-                    (0, 0, 0)
-                };
-                c.value = std::ptr::from_ref(v) as u64;
-            }
+            _ => {}
         }
+        // The value itself: the native code reads it in line while the
+        // dicts' stamps hold (a stamp changes with every mutation, so the
+        // value stays where it is). A fused shape that declined fills the
+        // cache too: the next read tries the shape again only through a
+        // miss.
+        let c = &mut *cache;
+        // (A namespace handle's bits: one pointer-sized word.)
+        c.value = 0;
+        c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
+        c.gstamp = g_stamp;
+        c.gdata = gdict as u64;
+        (c.builtins, c.bstamp, c.bdata) = if builtin {
+            let b = std::ptr::addr_of!((*st.frame).builtins)
+                .cast::<u64>()
+                .read();
+            (b, b_stamp, bdict as u64)
+        } else {
+            (0, 0, 0)
+        };
+        c.value = std::ptr::from_ref(v) as u64;
         dst.write(crate::clone_hot(v));
         PUSHED
     }
@@ -6849,9 +6862,9 @@ impl<'a> Lower<'a> {
         self.global_caches.push(cache);
         let helper = self.b.create_block();
         let done = self.b.create_block();
-        if self.cold {
-            self.b.ins().jump(helper, &[]);
-        } else {
+        // (In line even in a lean body: the cached read is a few loads
+        // and compares, the helper's a full call.)
+        {
             let ptr = self.ptr;
             let c = self.b.ins().iconst(ptr, cache_at);
             let frame = self.b.ins().load(ptr, FLAGS, self.st, S_FRAME);
