@@ -4771,11 +4771,19 @@ unsafe extern "C" fn h_call(
             if st.sw.is_null() {
                 return CALL_DECLINED;
             }
+            // A generator function's call makes its generator in place
+            // (`core_call` admits none).
+            let gen_fn = matches!(&ops[0], Object::Function(f) if {
+                let c = &*f.code.as_ptr();
+                c.is_generator || c.is_coroutine || c.is_async_generator
+            });
             sync(st);
             let sw = &mut *st.sw;
             let saved_last = sw.last;
             let interp = &mut *st.interp.cast_mut();
-            let switched = if python == 1 {
+            let switched = if gen_fn {
+                interp.core_gen_call(sw, pc)
+            } else if python == 1 {
                 interp.core_call(sw, pc) || interp.core_gen_call(sw, pc)
             } else {
                 interp.core_new(sw, pc, st.snap_gen)
