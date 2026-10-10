@@ -11218,9 +11218,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         // execution. Watched instance dicts deopt so the generic path
         // fires the exact watcher events.
         AttrStorage::NewKey => {
-            use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
-            use std::hash::BuildHasher;
-
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
@@ -11249,25 +11246,22 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 &mut **dict
             };
             let probe = crate::object::LeafNameProbe::new(&g.name, g.name_hash);
-            let hash = crate::fasthash::FxBuildHasher.hash_one(g.name_hash);
-            let entry = dict
-                .raw_entry_mut_v1()
-                .from_key_hashed_nocheck(hash, &probe);
+            let entry = dict.probe_entry(&probe);
             // A hash-colliding user key could run Python during equality.
             // Resume before the store so the interpreter owns that callback.
             if probe.saw_exotic() {
                 return 1;
             }
             let old = match entry {
-                RawEntryMut::Occupied(mut entry) => {
+                crate::dictmap::ProbeEntry::Occupied(mut entry) => {
                     let dst = entry.get_mut();
                     // The displaced-value discipline of the indexed arm.
                     Some(std::mem::replace(dst, v))
                 }
-                RawEntryMut::Vacant(entry) => {
+                crate::dictmap::ProbeEntry::Vacant(entry) => {
                     // The guard already owns the interned key. Reuse the
-                    // probe's hash and vacant entry instead of probing again.
-                    entry.insert_hashed_nocheck(hash, DictKey(Object::Str(g.name.clone())), v);
+                    // probe's hash and vacant slot instead of probing again.
+                    entry.insert(DictKey(Object::Str(g.name.clone())), v);
                     None
                 }
             };

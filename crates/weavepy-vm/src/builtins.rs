@@ -13506,21 +13506,25 @@ pub(crate) fn dict_insert_exact(
     let Ok(mut m) = d.try_borrow_mut() else {
         return Err((key, value));
     };
-    if let Some(slot) = m.get_mut(&probe) {
-        let replaced = !slot.is_same(&value);
-        let old = std::mem::replace(slot, value);
-        drop(m);
-        // (Re-storing the identical object is no change; PEP 509.)
-        if replaced {
-            crate::object::dict_mutation_event(d);
+    let vacancy = match m.probe_entry(&probe) {
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            let slot = e.into_mut();
+            let replaced = !slot.is_same(&value);
+            let old = std::mem::replace(slot, value);
+            drop(m);
+            // (Re-storing the identical object is no change; PEP 509.)
+            if replaced {
+                crate::object::dict_mutation_event(d);
+            }
+            return Ok(Some(old));
         }
-        return Ok(Some(old));
-    }
+        crate::dictmap::ProbeEntry::Vacant(e) => e,
+    };
     if !probe.miss_is_exact() {
         drop(m);
         return Err((key, value));
     }
-    m.insert(DictKey(key), value);
+    vacancy.insert(DictKey(key), value);
     drop(m);
     crate::object::dict_watch_bump(d);
     crate::object::dict_mutation_event(d);
@@ -13810,17 +13814,17 @@ pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     let probe = crate::object::LeafProbe::new(key)?;
     let cell = leaf_dict_of(recv)?;
     let mut d = cell.try_borrow_mut().ok()?;
-    let (old, changed, added) = match d.get_mut(&probe) {
-        Some(slot) => {
-            let old = std::mem::replace(slot, value.clone());
+    let (old, changed, added) = match d.probe_entry(&probe) {
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            let old = std::mem::replace(e.into_mut(), value.clone());
             let changed = !old.is_same(value);
             (Some(old), changed, false)
         }
-        None => {
+        crate::dictmap::ProbeEntry::Vacant(e) => {
             if !probe.miss_is_exact() {
                 return None;
             }
-            d.insert(DictKey(key.clone()), value.clone());
+            e.insert(DictKey(key.clone()), value.clone());
             (None, true, true)
         }
     };

@@ -14,10 +14,8 @@
 mod classes;
 mod encode;
 
-use std::hash::BuildHasher;
 
 use crate::shared_value::{SharedSlice, SharedStr};
-use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
 use num_bigint::BigInt;
 use weavepy_compiler::CodeObject;
 
@@ -1149,15 +1147,15 @@ impl<'c> Decoder<'c> {
             };
             // `insert` for a string key, which equals only another string:
             // the cached hash and a direct comparison, in line.
-            let hash = crate::fasthash::FxBuildHasher.hash_one(SharedStr::hash_cached(&name));
-            match map.raw_entry_mut_v1().from_hash(hash, |key| {
+            let hash = SharedStr::hash_cached(&name);
+            match map.find_by_hash(hash, |key| {
                 matches!(&key.0, Object::Str(other) if SharedStr::ptr_eq(other, &name) || *other == name)
             }) {
-                RawEntryMut::Occupied(mut entry) => {
-                    entry.insert(value);
+                Some(i) => {
+                    *map.get_index_mut(i).expect("found above").1 = value;
                 }
-                RawEntryMut::Vacant(entry) => {
-                    entry.insert_hashed_nocheck(hash, DictKey(Object::Str(name)), value);
+                None => {
+                    map.insert_unique_hashed(hash, DictKey(Object::Str(name)), value);
                 }
             }
         }
@@ -1273,7 +1271,7 @@ impl<'c> Decoder<'c> {
             let table: &mut DictMap = &mut state;
             // An interned key is equal to the key it replaces and has the
             // same hash, so the table stays valid.
-            for (key, _) in indexmap::map::MutableKeys::iter_mut2(&mut *table) {
+            for (key, _) in table.iter_mut2() {
                 let Object::Str(name) = &key.0 else {
                     return None;
                 };

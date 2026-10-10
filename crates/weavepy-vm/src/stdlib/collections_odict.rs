@@ -6,7 +6,7 @@
 //! CPython's C `odict` keeps a linked list of nodes next to its dict: a
 //! second, keys-only dict in a hidden slot (see [`order_of`]). The order
 //! dict is insertion-ordered like every WeavePy dict, so appending a key,
-//! moving one (`IndexMap::move_index`), and removing one are its own
+//! moving one (`DictMap::move_index`), and removing one are its own
 //! operations. Values are always read from the payload by key, so a
 //! payload changed behind the order's back (`dict.__delitem__(od, k)`)
 //! surfaces as a `KeyError` on the next ordered read, as it does in

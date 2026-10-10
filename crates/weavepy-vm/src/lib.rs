@@ -47,6 +47,7 @@ pub mod builtins;
 pub mod capi_watchers;
 pub mod cpython_headers;
 pub mod descr_registry;
+pub mod dictmap;
 pub mod error;
 pub mod ext_loader;
 pub mod fasthash;
@@ -17609,8 +17610,9 @@ impl Interpreter {
                         // SAFETY: as above (the probe and the insert run
                         // no code).
                         let d = unsafe { cell.peek_mut() }?;
-                        let (old, changed) = match d.get_mut(&probe) {
-                            Some(slot) => {
+                        let (old, changed) = match d.probe_entry(&probe) {
+                            crate::dictmap::ProbeEntry::Occupied(e) => {
+                                let slot = e.into_mut();
                                 if !displaced_ok(slot) {
                                     return None;
                                 }
@@ -17620,12 +17622,12 @@ impl Interpreter {
                                 let changed = !old.is_same(slot);
                                 (old, changed)
                             }
-                            None => {
+                            crate::dictmap::ProbeEntry::Vacant(e) => {
                                 if !probe.miss_is_exact() {
                                     return None;
                                 }
                                 // SAFETY: as above.
-                                d.insert(DictKey(clone_hot(k)), unsafe {
+                                e.insert(DictKey(clone_hot(k)), unsafe {
                                     base.add(len - 3).read()
                                 });
                                 (Object::None, true)
@@ -17913,8 +17915,9 @@ impl Interpreter {
                         // SAFETY: as above.
                         let d = unsafe { cell.peek_mut() }?;
                         let (k, v) = (base.wrapping_add(len - 2), base.wrapping_add(len - 1));
-                        match d.get_mut(&probe) {
-                            Some(slot) => {
+                        match d.probe_entry(&probe) {
+                            crate::dictmap::ProbeEntry::Occupied(e) => {
+                                let slot = e.into_mut();
                                 if !Self::core_droppable(slot) || !Self::core_droppable(key) {
                                     return None;
                                 }
@@ -17926,11 +17929,11 @@ impl Interpreter {
                                     drop_hot(k.read());
                                 }
                             }
-                            None if probe.miss_is_exact() => {
+                            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
                                 // SAFETY: as above.
-                                unsafe { d.insert(DictKey(k.read()), v.read()) };
+                                unsafe { e.insert(DictKey(k.read()), v.read()) };
                             }
-                            None => return None,
+                            crate::dictmap::ProbeEntry::Vacant(_) => return None,
                         }
                     }
                     _ => return None,
@@ -21689,9 +21692,7 @@ impl Interpreter {
         // SAFETY: as above; the shared view above is no longer used.
         if let Some(d) = unsafe { m.dict.peek_mut() } {
             let map: &mut crate::object::DictMap = &mut *d;
-            if let Some((key, _)) =
-                indexmap::map::MutableKeys::get_index_mut2(map, key_idx as usize)
-            {
+            if let Some((key, _)) = map.get_index_mut2(key_idx as usize) {
                 key.0 = Object::Str(name);
             }
         }
@@ -23326,14 +23327,16 @@ impl Interpreter {
                                 break;
                             };
                             let value = stack[n - 1].clone();
-                            if let Some(slot) = d.get_mut(&probe) {
-                                drop(std::mem::replace(slot, value));
-                                true
-                            } else if probe.miss_is_exact() {
-                                d.insert(DictKey(key.clone()), value);
-                                true
-                            } else {
-                                false
+                            match d.probe_entry(&probe) {
+                                crate::dictmap::ProbeEntry::Occupied(e) => {
+                                    drop(std::mem::replace(e.into_mut(), value));
+                                    true
+                                }
+                                crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                                    e.insert(DictKey(key.clone()), value);
+                                    true
+                                }
+                                crate::dictmap::ProbeEntry::Vacant(_) => false,
                             }
                         }
                         _ => false,
@@ -23714,19 +23717,20 @@ impl Interpreter {
                             let Ok(mut d) = cell.try_borrow_mut() else {
                                 break;
                             };
-                            let (old, changed) = match d.get_mut(&probe) {
-                                Some(slot) => {
+                            let (old, changed) = match d.probe_entry(&probe) {
+                                crate::dictmap::ProbeEntry::Occupied(e) => {
+                                    let slot = e.into_mut();
                                     let v = std::mem::replace(value_slot, Object::Unbound);
                                     let old = std::mem::replace(slot, v);
                                     let changed = !old.is_same(slot);
                                     (old, changed)
                                 }
-                                None => {
+                                crate::dictmap::ProbeEntry::Vacant(e) => {
                                     if !probe.miss_is_exact() {
                                         break;
                                     }
                                     let v = std::mem::replace(value_slot, Object::Unbound);
-                                    d.insert(DictKey(key.clone()), v);
+                                    e.insert(DictKey(key.clone()), v);
                                     (Object::Unbound, true)
                                 }
                             };
@@ -45769,7 +45773,7 @@ impl Interpreter {
                 if let Some((k, v)) = g.get_index(key_idx as usize) {
                     // Verify the key at the cached slot still matches the
                     // expected name. `del` of an earlier global shift-removes
-                    // an IndexMap entry, renumbering every later slot without
+                    // a table entry, renumbering every later slot without
                     // changing the dict's Rc identity — so the cached index
                     // would otherwise alias a *different* global's value.
                     if let Object::Str(s) = &k.0 {

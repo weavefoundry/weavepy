@@ -628,6 +628,12 @@ impl SharedStr {
         storage.hash.store(h, Ordering::Relaxed);
         h
     }
+    /// The memoised `hash(s)` if it has been computed.
+    #[inline]
+    pub fn known_hash(this: &Self) -> Option<i64> {
+        let h = this.0.storage().hash.load(Ordering::Relaxed);
+        (h != -1).then_some(h)
+    }
     /// `len(s)` in code points, memoised in the string itself.
     #[inline]
     pub fn char_count(this: &Self) -> usize {

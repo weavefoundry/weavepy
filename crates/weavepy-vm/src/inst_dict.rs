@@ -1123,7 +1123,6 @@ impl InstDict {
             DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher)
         };
         if let Some(keys) = keys {
-            use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
             // A deferred owner holds only atomic values, and a tracked
             // one needs no barrier: insert without either. The names are
             // distinct `str`s whose hashes the table kept, so each goes
@@ -1132,13 +1131,8 @@ impl InstDict {
             for (i, v) in values.into_iter().enumerate() {
                 if let Some(k) = keys.get(i) {
                     // SAFETY: slot `i` is published (`get` found its name).
-                    let hash = crate::object::dict_table_hash(unsafe { *keys.hashes[i].get() });
-                    match map.raw_entry_mut_v1().from_hash(hash, |_| false) {
-                        RawEntryMut::Vacant(e) => {
-                            e.insert_hashed_nocheck(hash, k.clone(), v);
-                        }
-                        RawEntryMut::Occupied(_) => unreachable!("never matches"),
-                    }
+                    let hash = unsafe { *keys.hashes[i].get() };
+                    map.insert_unique_hashed(hash, k.clone(), v);
                 }
             }
         }

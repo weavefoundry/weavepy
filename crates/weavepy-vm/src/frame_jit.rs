@@ -2386,8 +2386,10 @@ unsafe fn store_subscr_fast(
                 let Some(d) = cell.peek_mut() else {
                     return 1;
                 };
-                let (old, changed) = match d.get_mut(&probe) {
-                    Some(slot) => {
+                // One probe finds the entry or the slot a new key takes.
+                let (old, changed) = match d.probe_entry(&probe) {
+                    crate::dictmap::ProbeEntry::Occupied(e) => {
+                        let slot = e.into_mut();
                         if !displaced_ok(slot) {
                             return 1;
                         }
@@ -2395,11 +2397,11 @@ unsafe fn store_subscr_fast(
                         let changed = !old.is_same(slot);
                         (old, changed)
                     }
-                    None => {
+                    crate::dictmap::ProbeEntry::Vacant(e) => {
                         if !probe.miss_is_exact() {
                             return 1;
                         }
-                        d.insert(crate::object::DictKey(crate::clone_hot(k)), value());
+                        e.insert(crate::object::DictKey(crate::clone_hot(k)), value());
                         (Object::None, true)
                     }
                 };

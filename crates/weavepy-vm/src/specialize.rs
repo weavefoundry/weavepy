@@ -223,7 +223,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
 ///
 /// The fast path takes advantage of two facts:
 ///
-/// 1. The `IndexMap` underneath `DictData` exposes O(1) lookup
+/// 1. The table underneath `DictData` exposes O(1) lookup
 ///    by integer index once we know the slot. So caching the
 ///    slot index lets us skip the hash lookup.
 /// 2. Builtins and globals are stable across dispatches in steady

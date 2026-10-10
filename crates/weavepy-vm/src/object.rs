@@ -2390,7 +2390,7 @@ impl DictViewKind {
 }
 
 /// Live view over a backing `dict`. Iteration order mirrors the
-/// underlying `IndexMap`. Mutations to the dict propagate through
+/// underlying table. Mutations to the dict propagate through
 /// the view (CPython invariant).
 #[derive(Debug)]
 pub struct PyDictView {
@@ -3280,7 +3280,8 @@ pub fn module_class(m: &Rc<PyModule>) -> Option<Rc<crate::types::TypeObject>> {
 }
 
 /// Dictionary key: a hashable [`Object`] wrapped to satisfy the
-/// `Hash + Eq` requirements imposed by `HashMap` / `IndexMap`.
+/// `Hash + Eq` requirements of `HashMap` / `IndexSet`, and the stored key
+/// type of a dict's [`crate::dictmap::DictMap`].
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
@@ -3305,21 +3306,36 @@ pub struct DictKey(pub Object);
 #[derive(Debug, Clone, Copy)]
 pub struct StrKey<'a>(pub &'a str);
 
-impl Hash for StrKey<'_> {
+impl crate::dictmap::Probe for StrKey<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
+    fn probe_hash(&self) -> i64 {
         // Bit-for-bit the `DictKey` hash of `Object::Str(self.0)`.
-        py_str_hash(self.0).hash(state);
+        py_str_hash(self.0)
     }
-}
 
-impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
+    fn probe_eq_unhashed(&self, key: &DictKey) -> Option<bool> {
+        // Comparing a name with a small table's stored strings costs less
+        // than hashing it.
+        match &key.0 {
+            Object::Str(s) => Some(
+                std::ptr::eq(s.as_ptr(), self.0.as_ptr())
+                    || crate::dictmap::key_bytes_eq(s.as_bytes(), self.0.as_bytes()),
+            ),
+            Object::WStr(_) => Some(false),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match &key.0 {
             // Interned names probe with the stored key's own bytes: the
             // pointer settles it before any byte compare.
-            Object::Str(s) => std::ptr::eq(s.as_ptr(), self.0.as_ptr()) || &**s == self.0,
+            Object::Str(s) => {
+                std::ptr::eq(s.as_ptr(), self.0.as_ptr())
+                    || crate::dictmap::key_bytes_eq(s.as_bytes(), self.0.as_bytes())
+            }
             // A `WStr` always carries a lone surrogate (module invariant),
             // so it can never equal a valid `&str`.
             Object::WStr(_) => false,
@@ -3345,17 +3361,15 @@ pub struct StrKeyHashed<'a> {
     pub hash: i64,
 }
 
-impl Hash for StrKeyHashed<'_> {
+impl crate::dictmap::Probe for StrKeyHashed<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+    fn probe_hash(&self) -> i64 {
+        self.hash
     }
-}
 
-impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
-        indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    fn probe_eq(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(&StrKey(self.s), key)
     }
 }
 
@@ -3388,18 +3402,19 @@ impl<'a> LeafNameProbe<'a> {
     }
 }
 
-impl Hash for LeafNameProbe<'_> {
+impl crate::dictmap::Probe for LeafNameProbe<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+    fn probe_hash(&self) -> i64 {
+        self.hash
     }
-}
 
-impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match &key.0 {
-            Object::Str(k) => std::ptr::eq(k.as_ptr(), self.s.as_ptr()) || &**k == self.s,
+            Object::Str(k) => {
+                std::ptr::eq(k.as_ptr(), self.s.as_ptr())
+                    || crate::dictmap::key_bytes_eq(k.as_bytes(), self.s.as_bytes())
+            }
             // A lone surrogate never equals a valid `&str`.
             Object::WStr(_) => false,
             _ => {
@@ -3431,11 +3446,24 @@ impl<'a> LeafProbe<'a> {
     /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
     /// generator-family object or module, or a tuple of machine ints and
     /// strings.
-    #[inline]
+    #[inline(always)]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
             Object::Str(s) => SharedStr::hash_cached(s),
             Object::Int(i) => py_hash_long_i64(*i),
+            _ => Self::other_hash(key)?,
+        };
+        Some(Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        })
+    }
+
+    /// [`Self::new`]'s hash for a key other than a `str` or an `int`.
+    #[inline(never)]
+    fn other_hash(key: &Object) -> Option<i64> {
+        Some(match key {
             Object::Instance(i)
                 if i.native.get().is_none()
                     && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
@@ -3458,11 +3486,6 @@ impl<'a> LeafProbe<'a> {
             | Object::AsyncGenerator(_)
             | Object::Module(_) => identity_hash(key),
             _ => return None,
-        };
-        Some(Self {
-            key,
-            hash,
-            foreign: std::cell::Cell::new(false),
         })
     }
 
@@ -3514,13 +3537,36 @@ impl Hash for LeafProbe<'_> {
 impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(self, key)
+    }
+}
+
+impl crate::dictmap::Probe for LeafProbe<'_> {
+    #[inline(always)]
+    fn probe_hash(&self) -> i64 {
+        self.hash
+    }
+
+    #[inline(always)]
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match (self.key, &key.0) {
             // (The same string object, an interned name's usual case,
             // settles before any byte compare.)
             (Object::Str(a), Object::Str(b)) => {
-                std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.as_bytes() == b.as_bytes()
+                SharedStr::ptr_eq(a, b) || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
             }
             (Object::Int(a), Object::Int(b)) => a == b,
+            _ => self.other_eq(key),
+        }
+    }
+}
+
+impl LeafProbe<'_> {
+    /// [`crate::dictmap::Probe::probe_eq`] for any pairing but two `str`s
+    /// or two `int`s.
+    #[inline(never)]
+    fn other_eq(&self, key: &DictKey) -> bool {
+        match (self.key, &key.0) {
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
@@ -3885,7 +3931,9 @@ impl PartialEq for DictKey {
         // Two plain strings or machine ints, the common keys, are equal by
         // value alone.
         match (&self.0, &other.0) {
-            (Object::Str(a), Object::Str(b)) => return a.as_bytes() == b.as_bytes(),
+            (Object::Str(a), Object::Str(b)) => {
+                return crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
+            }
             (Object::Int(a), Object::Int(b)) => return a == b,
             _ => {}
         }
@@ -3920,7 +3968,8 @@ impl PartialEq for DictKey {
             }
             // CPython dispatches `__eq__` only between keys in the *same
             // hash bucket*; unequal hashes mean "not equal" without any
-            // user code. indexmap's small-table linear scan compares every
+            // user code. A dict's table compares stored hashes first, but
+            // a set's (`indexmap`'s) small-table linear scan compares every
             // entry through this `eq` with no hash check at all, so enforce
             // the bucket precondition here — sqlalchemy's
             // `constraints.discard(ColumnSet())` probes a 1-element set
@@ -4100,17 +4149,10 @@ pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     }
 }
 
-/// The table-level (Fx-mixed) hash for a Python hash value, matching what
-/// `DictKey::hash` feeds the [`DictData`] hasher.
-pub(crate) fn dict_table_hash(py_hash: i64) -> u64 {
-    use std::hash::BuildHasher;
-    crate::fasthash::FxBuildHasher.hash_one(py_hash)
-}
-
-/// Probe result of [`dict_reentrant_probe`]: the key's table-level hash
-/// plus the equal *stored* key, if any.
+/// Probe result of [`dict_reentrant_probe`]: the key's Python hash plus
+/// the equal *stored* key, if any.
 pub(crate) struct ReentrantProbe {
-    table_hash: u64,
+    hash: i64,
     stored: Option<Object>,
 }
 
@@ -4129,9 +4171,7 @@ pub(crate) fn dict_reentrant_probe(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<ReentrantProbe, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let kh = key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key));
-    let table_hash = dict_table_hash(kh);
     let mut memo: Vec<(Object, bool)> = Vec::new();
     loop {
         // Same-hash candidates, collected under a short borrow with a
@@ -4139,7 +4179,7 @@ pub(crate) fn dict_reentrant_probe(
         let mut cands: Vec<Object> = Vec::new();
         {
             let m = d.borrow();
-            let _ = m.raw_entry_v1().from_hash(table_hash, |k| {
+            let _ = m.find_by_hash(kh, |k| {
                 cands.push(k.0.clone());
                 false
             });
@@ -4164,19 +4204,8 @@ pub(crate) fn dict_reentrant_probe(
                 }
                 continue;
             }
-            // Same-bucket precondition: indexmap's small-table linear scan
-            // hands `from_hash` every entry regardless of hash, but CPython
-            // only ever dispatches `__eq__` between keys whose hashes match.
-            // The stored key's hash comes from its record (CPython reads the
-            // entry's `me_hash`); only a record-less key pays a dispatch.
-            let sh = match recorded_key_hash(stored) {
-                Some(h) => h,
-                None => key_cmp_scope(|| py_hash_value(stored))?
-                    .unwrap_or_else(|| identity_hash(stored)),
-            };
-            if sh != kh {
-                continue;
-            }
+            // (The table hands over only keys whose stored hash equals the
+            // probe's, CPython's `me_hash` check, so no hash is recomputed.)
             // Python `__eq__` (stored first, CPython's argument order) with
             // no borrow held; it may mutate `d` re-entrantly.
             let eq = key_cmp_scope(|| current_interp_eq(stored, key))?.unwrap_or(false);
@@ -4186,7 +4215,7 @@ pub(crate) fn dict_reentrant_probe(
         }
         if found.is_some() || !fresh_call {
             return Ok(ReentrantProbe {
-                table_hash,
+                hash: kh,
                 stored: found,
             });
         }
@@ -4211,25 +4240,22 @@ pub(crate) fn dict_reentrant_insert(
     key: Object,
     value: Object,
 ) -> Result<Option<Object>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, &key)?;
     let target = probe.stored.as_ref().unwrap_or(&key);
     let mut m = d.borrow_mut();
-    match m
-        .raw_entry_mut_v1()
-        .from_hash(probe.table_hash, |k| k.0.is_same(target))
-    {
-        RawEntryMut::Occupied(mut e) => {
-            let same = e.get().is_same(&value);
-            let old = e.insert(value);
+    match m.find_by_hash(probe.hash, |k| k.0.is_same(target)) {
+        Some(i) => {
+            let (_, slot) = m.get_index_mut(i).expect("found above");
+            let same = slot.is_same(&value);
+            let old = std::mem::replace(slot, value);
             drop(m);
             if !same {
                 dict_mutation_event(d);
             }
             Ok(Some(old))
         }
-        RawEntryMut::Vacant(e) => {
-            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), value);
+        None => {
+            m.insert_unique_hashed(probe.hash, DictKey(key), value);
             drop(m);
             dict_watch_bump(d);
             dict_mutation_event(d);
@@ -4246,17 +4272,13 @@ pub(crate) fn dict_reentrant_setdefault(
     key: Object,
     default: Object,
 ) -> Result<Object, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, &key)?;
     let target = probe.stored.as_ref().unwrap_or(&key);
     let mut m = d.borrow_mut();
-    match m
-        .raw_entry_mut_v1()
-        .from_hash(probe.table_hash, |k| k.0.is_same(target))
-    {
-        RawEntryMut::Occupied(e) => Ok(e.get().clone()),
-        RawEntryMut::Vacant(e) => {
-            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), default.clone());
+    match m.find_by_hash(probe.hash, |k| k.0.is_same(target)) {
+        Some(i) => Ok(m.get_index(i).expect("found above").1.clone()),
+        None => {
+            m.insert_unique_hashed(probe.hash, DictKey(key), default.clone());
             drop(m);
             dict_watch_bump(d);
             dict_mutation_event(d);
@@ -4270,14 +4292,14 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
-        Some(stored) => Ok(d
-            .borrow()
-            .raw_entry_v1()
-            .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
-            .map(|(_, v)| v.clone())),
+        Some(stored) => {
+            let m = d.borrow();
+            Ok(m.find_by_hash(probe.hash, |k| k.0.is_same(&stored))
+                .and_then(|i| m.get_index(i))
+                .map(|(_, v)| v.clone()))
+        }
         None => Ok(None),
     }
 }
@@ -4289,13 +4311,11 @@ pub(crate) fn dict_index_of(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<usize>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => Ok(d
             .borrow()
-            .raw_entry_v1()
-            .index_from_hash(probe.table_hash, |k| k.0.is_same(&stored))),
+            .find_by_hash(probe.hash, |k| k.0.is_same(&stored))),
         None => Ok(None),
     }
 }
@@ -4305,23 +4325,19 @@ pub(crate) fn dict_reentrant_remove(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<(Object, Object)>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
             let mut m = d.borrow_mut();
-            match m
-                .raw_entry_mut_v1()
-                .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
-            {
-                RawEntryMut::Occupied(e) => {
-                    let (k, v) = e.shift_remove_entry();
+            match m.find_by_hash(probe.hash, |k| k.0.is_same(&stored)) {
+                Some(i) => {
+                    let (k, v) = m.shift_remove_index(i).expect("found above");
                     drop(m);
                     dict_watch_bump(d);
                     dict_mutation_event(d);
                     Ok(Some((k.0, v)))
                 }
-                RawEntryMut::Vacant(_) => Ok(None),
+                None => Ok(None),
             }
         }
         None => Ok(None),
@@ -4335,7 +4351,7 @@ pub(crate) fn dict_reentrant_remove(
 // same `ma_used`, so the size trip-wire stays silent — because the delete
 // leaves a tombstone and the reinsert *appends*: the iterator then finds an
 // entry beyond the `di->len` elements it expected and raises `RuntimeError:
-// dictionary keys changed during iteration`. Our `IndexMap` has no
+// dictionary keys changed during iteration`. Our table has no
 // tombstones (`shift_remove` compacts in place), so the layout carries no
 // trace of the churn. Instead, dict iterators register a *watch* on their
 // source dict; the centralized structural mutators (`dict_insert` on a new
@@ -4452,8 +4468,8 @@ pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
 // `_testcapi.dict_get_version` exposes it and `test_dict_version` asserts
 // the full semantics.
 //
-// WeavePy's `DictData` is a bare `IndexMap` with no room for a per-dict
-// field, so versions live in a side registry keyed by the dict's heap
+// WeavePy's `DictData` has no room for a per-dict PEP 509 field, so
+// versions live in a side registry keyed by the dict's heap
 // address and assigned lazily: the first `dict_version_get` on a dict
 // registers it with a fresh tag; the centralized mutators
 // (`dict_insert`/`dict_remove`/`clear`/`popitem`/`setdefault` and the
@@ -4537,13 +4553,20 @@ impl Hash for DictKey {
         // (functions, types, plain instances, …) fold in their allocation
         // identity; truly unhashable keys share a constant bucket and the
         // runtime raises lazily when used.
-        let h = match &self.0 {
-            // (The commonest keys, without the general dispatch.)
-            Object::Str(s) => SharedStr::hash_cached(s),
-            Object::Int(i) => py_hash_long_i64(*i),
-            other => py_hash_value(other).unwrap_or_else(|| identity_hash(other)),
-        };
-        h.hash(state);
+        dict_key_hash(&self.0).hash(state);
+    }
+}
+
+/// The Python hash a dict or set stores for key `k`: its `hash()`, or its
+/// identity hash for an unhashable key (the runtime raises before such a
+/// key is stored).
+#[inline]
+pub(crate) fn dict_key_hash(k: &Object) -> i64 {
+    match k {
+        // (The commonest keys, without the general dispatch.)
+        Object::Str(s) => SharedStr::hash_cached(s),
+        Object::Int(i) => py_hash_long_i64(*i),
+        other => py_hash_value(other).unwrap_or_else(|| identity_hash(other)),
     }
 }
 
@@ -4555,7 +4578,7 @@ impl Hash for DictKey {
 /// (one multiply) instead of SipHash, which profiled as a top-ten CPU
 /// consumer under pandas. Not attacker-relevant: collision resistance
 /// comes from the Python-level hash, exactly as in CPython's own tables.
-pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+pub type DictMap = crate::dictmap::DictMap;
 
 /// The global source of [`DictData::mutation_stamp`] values: one
 /// monotonically increasing counter for every dict in the process, so a
@@ -4839,7 +4862,7 @@ impl Extend<(DictKey, Object)> for DictData {
 
 impl IntoIterator for DictData {
     type Item = (DictKey, Object);
-    type IntoIter = indexmap::map::IntoIter<DictKey, Object>;
+    type IntoIter = crate::dictmap::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.into_iter()
@@ -4848,7 +4871,7 @@ impl IntoIterator for DictData {
 
 impl<'a> IntoIterator for &'a DictData {
     type Item = (&'a DictKey, &'a Object);
-    type IntoIter = indexmap::map::Iter<'a, DictKey, Object>;
+    type IntoIter = crate::dictmap::Iter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.iter()
@@ -4857,7 +4880,7 @@ impl<'a> IntoIterator for &'a DictData {
 
 impl<'a> IntoIterator for &'a mut DictData {
     type Item = (&'a DictKey, &'a mut Object);
-    type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
+    type IntoIter = crate::dictmap::IterMut<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         (**self).iter_mut()
@@ -8969,7 +8992,7 @@ pub enum PyIterator {
         step: Box<BigInt>,
     },
     /// Live iterator over a dict (CPython's `dictiterobject`): walks the
-    /// `IndexMap` by entry index rather than snapshotting, so it pins no
+    /// table by entry index rather than snapshotting, so it pins no
     /// key/value `Rc`s of its own — an overwritten value is freed promptly
     /// even mid-loop (`test_oob_indexing_dictiter_iternextitem` relies on
     /// `d[k] = None` firing the old value's `__del__` during iteration),
