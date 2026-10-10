@@ -458,10 +458,20 @@ pub struct PyFrame {
     pub code: Rc<CodeObject>,
     pub globals: Rc<RefCell<DictData>>,
     pub builtins: Rc<RefCell<DictData>>,
-    /// Index of the current instruction inside [`Self::code`]. Updated
-    /// per-instruction by the dispatch loop while this frame is the
-    /// active one.
+    /// Index of the current instruction inside [`Self::code`]. While the
+    /// activation is live its shell's mirror is the current one (see
+    /// [`Self::live`]): read through [`Self::lasti_now`] and write through
+    /// [`Self::set_lasti`].
     pub lasti: Cell<u32>,
+    /// The spine shell of this frame's activation while it is live, null
+    /// otherwise. The dispatch loops keep the shell's `lasti` current at
+    /// every point where code may look at the frame (each call, each
+    /// out-of-line attribute load, each hand-back to the general loop),
+    /// so a frame object reads it from there instead of making its
+    /// activation sync the object instruction by instruction. Set when
+    /// the shell takes the object, cleared when the shell leaves the
+    /// spine or dies.
+    pub(crate) live: std::sync::atomic::AtomicPtr<FrameShell>,
     /// The enclosing frame (the next-outer in the call stack), `None`
     /// for the module frame.
     pub back: RefCell<Option<Rc<PyFrame>>>,
@@ -639,8 +649,50 @@ impl PyFrame {
         if let Some(v) = self.override_lineno.get() {
             return v;
         }
-        let pc = self.lasti.get() as usize;
+        let pc = self.lasti_now() as usize;
         self.code.linetable.get(pc).copied().unwrap_or(0)
+    }
+
+    /// The current instruction index: the live shell's mirror while the
+    /// activation runs (see [`Self::live`]), unless a trace function's
+    /// line jump or `f_lineno` override owns the value.
+    pub fn lasti_now(&self) -> u32 {
+        let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        if !live.is_null()
+            && self.override_lineno.get().is_none()
+            && self.pending_jump.try_borrow().is_ok_and(|j| j.is_none())
+        {
+            // SAFETY: a linked shell is alive: the link is cleared when the
+            // shell leaves its spine and again when it is dropped.
+            let at = unsafe { (*live).lasti.load(std::sync::atomic::Ordering::Relaxed) };
+            self.lasti.set(at);
+            return at;
+        }
+        self.lasti.get()
+    }
+
+    /// Set the current instruction index, in the live shell's mirror too.
+    pub fn set_lasti(&self, at: u32) {
+        self.lasti.set(at);
+        let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        if !live.is_null() {
+            // SAFETY: as in `lasti_now`.
+            unsafe {
+                (*live)
+                    .lasti
+                    .store(at, std::sync::atomic::Ordering::Relaxed)
+            };
+        }
+    }
+
+    /// Settle the frame as its activation leaves the spine on `shell`:
+    /// the shell's last instruction becomes the object's own.
+    pub(crate) fn unlink_live(&self, shell: &FrameShell) {
+        if std::ptr::eq(self.live.load(std::sync::atomic::Ordering::Relaxed), shell) {
+            shell.refresh_materialized(self);
+            self.live
+                .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Compute a fresh locals mapping from the live frame state —
@@ -1163,6 +1215,16 @@ impl<T> std::ops::Deref for FrameSlot<T> {
     }
 }
 
+impl Drop for FrameShell {
+    fn drop(&mut self) {
+        // A frame object outliving its shell (a spine dropped whole) must
+        // not read through a dead link.
+        if let Some(py) = self.materialized.get_mut().take() {
+            py.unlink_live(self);
+        }
+    }
+}
+
 impl FrameShell {
     /// Make every borrowed slot own its value (see [`FrameSlot`]).
     pub(crate) fn upgrade_slots(&self) {
@@ -1199,14 +1261,8 @@ impl FrameShell {
         }
     }
 
-    /// Build the real [`PyFrame`] for this shell with the given
-    /// `back` pointer, caching it. Bumps `on_stack` exactly once per
-    /// materialisation — the pop path decrements it for shells whose
-    /// `materialized` is set.
-    /// Bring an existing frame object's `lasti` up to this live shell's.
-    /// The executing frame's quiet loops sync only the shell while nothing
-    /// else holds the object (see `Interpreter::frame_object_observed`);
-    /// every path that hands the object out calls this first. A trace
+    /// Bring an existing frame object's `lasti` up to this shell's: the
+    /// dispatch loops sync only the shell (see [`PyFrame::live`]). A trace
     /// function's pending line jump owns the value and is left alone.
     pub fn refresh_materialized(&self, py: &PyFrame) {
         if py.pending_jump.borrow().is_none() && py.override_lineno.get().is_none() {
@@ -1215,23 +1271,26 @@ impl FrameShell {
         }
     }
 
-    pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
-        let py = self.materialize_departing(back);
-        // RFC 0065 (WS1): a freshly materialized frame must kick its
-        // dispatch loop off the quiet path so the per-instruction
-        // `lasti`-cell sync resumes.
-        crate::hot_gates::bump_loop_gen();
-        py
+    /// Make `py` read its `lasti` from this shell, which is on its spine
+    /// and keeps `py` as its frame object (see [`PyFrame::live`]).
+    pub(crate) fn link(&self, py: &PyFrame) {
+        py.live.store(
+            std::ptr::from_ref(self).cast_mut(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
-    /// [`Self::materialize`] for an activation that is leaving the spine:
-    /// no dispatch loop will run it again, so none needs kicking off its
-    /// quiet path.
+    /// Build the real [`PyFrame`] for this shell, which is on its spine,
+    /// with the given `back` pointer, caching it. Bumps `on_stack` exactly
+    /// once per materialisation — the pop path decrements it for shells
+    /// whose `materialized` is set.
+    pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        self.materialize_departing(back)
+    }
+
+    /// [`Self::materialize`] for an activation that is leaving the spine.
     pub fn materialize_departing(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
-            // (`materialize` still bumps: the new holder may keep it, and
-            // a quiet loop running this activation re-derives, finding it
-            // observed if so.)
             self.refresh_materialized(existing);
             return existing.clone();
         }
@@ -1259,7 +1318,9 @@ impl FrameShell {
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
             lazy_back: RefCell::new(None),
+            live: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         });
+        self.link(&py);
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1326,13 +1387,12 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
         return None;
     }
     let mut back: Option<Rc<PyFrame>> = None;
-    let mut refreshed = false;
     for shell in &s[..=idx] {
         let existing = shell.materialized.borrow().clone();
         let py = match existing {
             Some(py) => {
                 shell.refresh_materialized(&py);
-                refreshed = true;
+                shell.link(&py);
                 py.set_back(back);
                 py
             }
@@ -1343,11 +1403,6 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
             }
         };
         back = Some(py);
-    }
-    if refreshed {
-        // See `FrameShell::materialize`: the objects handed out (the
-        // frame and its `f_back` chain) may be kept.
-        crate::hot_gates::bump_loop_gen();
     }
     back
 }
@@ -1368,10 +1423,10 @@ pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<Py
         return materialize_stack_at(stack, idx);
     }
     let existing = shell.materialized.borrow().clone();
-    let mut refreshed = existing.is_some();
     let py = match existing {
         Some(py) => {
             shell.refresh_materialized(&py);
+            shell.link(&py);
             py
         }
         // Counted as live on the stack, as the eager walk counts it.
@@ -1384,7 +1439,7 @@ pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<Py
             match caller_py {
                 Some(back) => {
                     c.refresh_materialized(&back);
-                    refreshed = true;
+                    c.link(&back);
                     let linked = py.lazy_back.borrow().is_none()
                         && py
                             .back
@@ -1409,10 +1464,6 @@ pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<Py
                 }
             }
         }
-    }
-    if refreshed {
-        // As in `materialize_stack_at`: a new holder of existing objects.
-        crate::hot_gates::bump_loop_gen();
     }
     Some(py)
 }

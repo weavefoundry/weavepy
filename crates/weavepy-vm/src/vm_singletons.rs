@@ -668,6 +668,12 @@ pub fn current_thread_handles() -> Option<ThreadHandles> {
     CURRENT_THREAD_HANDLES.with(|cell| cell.borrow().last().cloned())
 }
 
+/// The current thread's frame stack alone (see [`current_thread_handles`],
+/// whose other handles `sys._getframe` and its kin never read).
+pub fn current_frame_stack() -> Option<crate::object::FrameStack> {
+    CURRENT_THREAD_HANDLES.with(|cell| cell.borrow().last().map(|h| h.frame_stack.clone()))
+}
+
 /// RFC 0066 WS4 — swap the *entire* handles stack, returning the old
 /// one. Greenlet switches use this: handle guards live on whichever
 /// native stack pushed them, so once greenlets multiplex several

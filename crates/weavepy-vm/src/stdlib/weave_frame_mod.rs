@@ -209,6 +209,7 @@ fn frame_new(args: &[Object]) -> Result<Object, RuntimeError> {
         extra_locals: RefCell::new(None),
         cleared: Cell::new(false),
         lazy_back: RefCell::new(None),
+        live: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     });
     Ok(Object::Frame(frame))
 }

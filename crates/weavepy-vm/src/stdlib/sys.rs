@@ -54,8 +54,8 @@ pub fn build_with_state(
                 name: "_getframe",
                 binds_instance: false,
                 call: Box::new(move |args| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_getframe(args, &h.frame_stack)
+                    if let Some(fs) = crate::vm_singletons::current_frame_stack() {
+                        sys_getframe(args, &fs)
                     } else {
                         sys_getframe(args, &fs_fallback)
                     }
@@ -70,8 +70,8 @@ pub fn build_with_state(
                 name: "_getframemodulename",
                 binds_instance: false,
                 call: Box::new(move |args| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_getframemodulename(args, &h.frame_stack)
+                    if let Some(fs) = crate::vm_singletons::current_frame_stack() {
+                        sys_getframemodulename(args, &fs)
                     } else {
                         sys_getframemodulename(args, &fs_fallback_modname)
                     }
@@ -1589,7 +1589,9 @@ fn sys_getframe(
     match crate::object::materialize_stack_at_lazy(frame_stack, idx) {
         Some(py) => {
             // PEP 578: `sys._getframe` audits with the frame object.
-            audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
+            if crate::trace::any_audit_active() {
+                audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
+            }
             Ok(Object::Frame(py))
         }
         None => Err(value_error("call stack is not deep enough")),

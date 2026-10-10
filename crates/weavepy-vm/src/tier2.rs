@@ -4667,6 +4667,10 @@ struct CallCtx {
     /// activation shell the inspection found (a framed activation's are
     /// its frame's own).
     inspected_locals: std::cell::RefCell<Option<Rc<GilRefCell<Vec<Object>>>>>,
+    /// A frameless activation's frame object, made for its activation
+    /// shell while a call ran (`sys._getframe()`): the interpreter
+    /// continuation adopts it (see [`call_with_activation_shell`]).
+    inspected_frame: std::cell::RefCell<Option<Rc<crate::object::PyFrame>>>,
 }
 
 /// A framed native activation running on this thread, registered so
@@ -6463,6 +6467,7 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     })
 }
@@ -6840,9 +6845,23 @@ fn finish_deopted(
     // An inspected activation's shell holds its locals, plus whatever the
     // inspection wrote (see `sync_native_locals`).
     let inspected = nctx.inspected_locals.borrow_mut().take();
+    // A frame object made for the activation's shell stands for this
+    // frame: the frame runs on in it, on the storage its `f_locals` reads.
+    let adopted = nctx.inspected_frame.borrow_mut().take();
+    let mut shared_locals = None;
     if let Some(shell) = inspected.filter(|_| nctx.introspected.get()) {
-        locals_v.extend(shell.borrow().iter().take(n_real).cloned());
-        locals_v.resize(n_real, Object::Unbound);
+        if adopted.as_ref().is_some_and(|py| {
+            py.locals_mirror
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| Rc::ptr_eq(m, &shell))
+        }) {
+            shell.borrow_mut().resize(n_real, Object::Unbound);
+            shared_locals = Some(shell);
+        } else {
+            locals_v.extend(shell.borrow().iter().take(n_real).cloned());
+            locals_v.resize(n_real, Object::Unbound);
+        }
     } else {
         for slot in 0..n_real {
             match entry.cf.local_types.get(slot).copied().flatten() {
@@ -6855,9 +6874,10 @@ fn finish_deopted(
             }
         }
     }
+    let py_frame = shared_locals.as_ref().and(adopted);
     let mut frame = super::Frame {
         code: code.clone(),
-        locals: Rc::new(GilRefCell::new(locals_v)),
+        locals: shared_locals.unwrap_or_else(|| Rc::new(GilRefCell::new(locals_v))),
         cells: crate::object::empty_cells(),
         stack: Vec::new(),
         globals: func.globals.clone(),
@@ -6866,7 +6886,7 @@ fn finish_deopted(
         exc: None,
         agen_yielded_value: true,
         pc: 0,
-        py_frame: None,
+        py_frame,
         gen_owner: None,
         suppress_call_event: true,
         gen_first_resume: false,
@@ -6960,9 +6980,26 @@ fn call_with_activation_shell<T>(
         materialized: GilRefCell::new(None),
         tb_refs: std::sync::atomic::AtomicU32::new(0),
     });
-    interp.frame_stack.borrow_mut().push(shell);
+    interp.frame_stack.borrow_mut().push(shell.clone());
     // Inspection of the shell's frame finds this activation's locals.
-    let out = with_native_frame(&shell_locals, jf, || f(interp));
+    let out = with_native_frame(&shell_locals, jf, || {
+        let out = f(interp);
+        // The call made the activation's frame object (`sys._getframe()`
+        // in a callee, or the native code's own call of it): one object
+        // stands for the activation from now on, so the rest of it runs
+        // in the interpreter (the inspection mark ends the native run
+        // after this call), whose frame adopts the object and these
+        // locals (see `finish_deopted`).
+        // (An inspection of its `f_locals` synced them already, and may
+        // have written them since.)
+        if let Some(py) = shell.materialized.borrow().as_ref() {
+            if !ctx.introspected.get() {
+                sync_native_locals(&shell_locals);
+            }
+            *ctx.inspected_frame.borrow_mut() = Some(py.clone());
+        }
+        out
+    });
     // The general pop: a traceback entry or a callee frame's `f_back` may
     // hold the shell lazily, and gets its frame object on the way out.
     interp.pop_frame_shell();
@@ -13772,6 +13809,7 @@ pub(crate) fn try_call_native_direct(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
@@ -14729,6 +14767,7 @@ fn enter_compiled(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
@@ -15650,6 +15689,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {

@@ -905,6 +905,9 @@ pub struct Interpreter {
     /// Finalizer drains left before the next prune of
     /// `globals_missing_hooks` while `globals_missing_any` is set.
     globals_missing_prune_in: Cell<u32>,
+    /// Builtin lookups that asked for a `__missing__` owner since the
+    /// last forced prune (see `globals_missing_owner`).
+    globals_missing_asks: Cell<u32>,
     /// Non-zero while the VM is lazily loading one of its own machinery
     /// modules (e.g. `importlib._bootstrap` for `module.__repr__`). In
     /// CPython those are frozen and fully initialized before user code
@@ -985,11 +988,6 @@ pub struct Interpreter {
     /// exact per-instruction event stream. Refreshed from the dispatch
     /// loop's [`crate::trace::ObserverSnapshot`] every iteration.
     fuse_off: bool,
-    /// A handled exception was just released (`POP_EXCEPT`): the running
-    /// frame's object may have lost its last outside holder (the
-    /// traceback), so the dispatch loop re-probes it on the next
-    /// instruction instead of waiting for its stride.
-    recheck_frame_observed: bool,
     /// `WEAVEPY_NO_QUIET`: pin every dispatch-loop iteration to the full
     /// prologue (RFC 0065 bisection aid). Read once at construction so a
     /// frame entry does not pay a `OnceLock` probe for it (RFC 0077 WS3).
@@ -1238,6 +1236,7 @@ impl Default for Interpreter {
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
             globals_missing_prune_in: Cell::new(0),
+            globals_missing_asks: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
@@ -1250,7 +1249,6 @@ impl Default for Interpreter {
             direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
-            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
@@ -1368,6 +1366,7 @@ impl Interpreter {
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
             globals_missing_prune_in: Cell::new(0),
+            globals_missing_asks: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
@@ -1380,7 +1379,6 @@ impl Interpreter {
             direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
-            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
@@ -4368,7 +4366,7 @@ impl Interpreter {
                     shell
                         .lasti
                         .store(pc as u32, std::sync::atomic::Ordering::Relaxed);
-                    py_frame.lasti.set(pc as u32);
+                    py_frame.set_lasti(pc as u32);
                 }
             }
             if let Err(e) = self.fire_call_event(&py_frame, mon_event, Object::None) {
@@ -4571,11 +4569,6 @@ impl Interpreter {
         let quiet_off = self.quiet_off;
         let mut loop_snap_gen: u64 = 0; // stale → first iteration derives
         let mut loop_quiet = false;
-        // The loops are off only because a frame object is observed (see
-        // `frame_object_observed`): re-derive once nothing outside the
-        // activation holds it any more (an `except` clause dropped the
-        // traceback).
-        let mut frame_blocks_quiet = false;
         let result = 'activation: loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
@@ -4592,25 +4585,13 @@ impl Interpreter {
             // a prologue input changed. The observer snapshot refresh
             // rides the same generation (observer mutation bumps it).
             let lgen = crate::hot_gates::loop_gen();
-            // The frame object's holder (a live traceback, a
-            // `sys._getframe` handle) is re-probed on a stride, not per
-            // instruction: the probe reads a cell and a reference count,
-            // and an exception handler paid it for every instruction it
-            // ran. A few extra instructions on the full path after the
-            // holder goes away cost far less.
-            let rederive = frame_blocks_quiet
-                && (std::mem::take(&mut self.recheck_frame_observed)
-                    || self.gil_countdown.trailing_zeros() >= 4)
-                && !Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
-            if lgen != loop_snap_gen || rederive {
+            if lgen != loop_snap_gen {
                 loop_snap_gen = lgen;
                 obs.refresh();
                 self.fuse_off = obs.any;
-                let unobserved = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
-                let frame_observed =
-                    Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
-                frame_blocks_quiet = unobserved && frame_observed;
-                loop_quiet = unobserved && !frame_observed;
+                // A frame object of this activation doesn't keep the loops
+                // off: it reads `lasti` from the shell (see `PyFrame::live`).
+                loop_quiet = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
             }
             // The leaf burst: while the loop is quiet, run the straight
             // run of leaf instructions at `frame.pc` in one tight loop
@@ -4645,27 +4626,11 @@ impl Interpreter {
                 } else {
                     None
                 };
-                // A frame object only this activation holds skipped the
-                // per-instruction `lasti` sync: bring it current before the
-                // prologue (or a raise's traceback) reads it.
-                if quiet_exit.is_some()
-                    && shell
-                        .has_materialized
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    // The instruction that just ran (or raised), as the
-                    // per-instruction sync would have left it; after a
-                    // yield back to the prologue, the next one.
-                    let at = match &quiet_exit {
-                        Some(QuietExit::Outcome { cur_pc, .. }) => *cur_pc as u32,
-                        _ => frame.pc,
-                    };
-                    if let Some(py) = shell.materialized.borrow().as_ref() {
-                        py.lasti.set(at);
-                    }
-                } else if let Some(exit) = &quiet_exit {
-                    // Likewise the shell a lazy traceback entry will
-                    // materialize from (see `pop_frame_shell`).
+                // The shell a frame object reads its `lasti` from, or a lazy
+                // traceback entry will materialize from (see
+                // `pop_frame_shell`), at the instruction that just ran (or
+                // raised); a yield back to the prologue left it at the next.
+                if let Some(exit) = &quiet_exit {
                     Self::sync_lazy_tb_lasti(Some(&shell), &frame.code, exit);
                 }
                 match quiet_exit {
@@ -4683,37 +4648,10 @@ impl Interpreter {
                         shell
                             .lasti
                             .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                        if shell
-                            .has_materialized
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            if let Some(py) = shell.materialized.borrow().as_ref() {
-                                py.lasti.set(frame.pc);
-                            }
-                        }
                         instruction_ran = true;
                         self.step_hot(frame)
                     }
                 }
-            } else if frame_blocks_quiet {
-                // Quiet but for a frame object something outside holds (an
-                // exception's traceback, while its handler runs): nothing
-                // the full prologue serves is pending, so each instruction
-                // only brings the frame's `lasti` current before it runs.
-                cur_pc = frame.pc as usize;
-                shell
-                    .lasti
-                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                if shell
-                    .has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.ensure_top_py_frame(&mut py_frame_slot)
-                        .lasti
-                        .set(frame.pc);
-                }
-                instruction_ran = true;
-                self.step_hot(frame)
             } else {
                 // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
                 // load answers "is *any* deferred work pending?" for the six
@@ -4805,7 +4743,7 @@ impl Interpreter {
                 self.fuse_off = obs.any;
                 if obs.any && !is_gen_bootstrap {
                     let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                    py_frame.lasti.set(frame.pc);
+                    py_frame.set_lasti(frame.pc);
                     let line = py_frame.current_lineno();
                     // RFC 0051 (WS4): CPython 3.13 line-event semantics.
                     // A `'line'` event fires when execution reaches an
@@ -5279,7 +5217,7 @@ impl Interpreter {
                                 // fires at the handler entry.
                                 if let Some(inst) = handled_arg {
                                     let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                                    py_frame.lasti.set(frame.pc);
+                                    py_frame.set_lasti(frame.pc);
                                     if let Err(mon_e) = self.fire_monitoring_event(
                                         &py_frame,
                                         crate::trace::EVENT_EXCEPTION_HANDLED,
@@ -5488,7 +5426,7 @@ impl Interpreter {
             }
             let materialized = frame.py_frame.clone();
             if let Some(existing) = &materialized {
-                existing.lasti.set(frame.pc);
+                existing.set_lasti(frame.pc);
                 existing.invalidate_locals();
                 existing.on_stack.set(existing.on_stack.get() + 1);
             }
@@ -5503,6 +5441,9 @@ impl Interpreter {
             cached
                 .has_materialized
                 .store(materialized.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if let Some(py) = &materialized {
+                cached.link(py);
+            }
             *cached.materialized.borrow_mut() = materialized;
             let shell = cached.clone();
             self.frame_stack.borrow_mut().push(shell.clone());
@@ -5512,7 +5453,7 @@ impl Interpreter {
             frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator;
         let materialized = frame.py_frame.clone();
         if let Some(existing) = &materialized {
-            existing.lasti.set(frame.pc);
+            existing.set_lasti(frame.pc);
             existing.invalidate_locals();
             existing.on_stack.set(existing.on_stack.get() + 1);
         }
@@ -5565,6 +5506,9 @@ impl Interpreter {
                 *m.gen_owner.get_mut() = gen_owner;
                 m.lasti = std::sync::atomic::AtomicU32::new(frame.pc);
                 m.has_materialized = std::sync::atomic::AtomicBool::new(materialized.is_some());
+                if let Some(py) = &materialized {
+                    m.link(py);
+                }
                 *m.materialized.get_mut() = materialized;
                 self.frame_stack.borrow_mut().push(pooled.clone());
                 return pooled;
@@ -5586,6 +5530,9 @@ impl Interpreter {
             materialized: RefCell::new(materialized),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
         });
+        if let Some(py) = shell.materialized.borrow().as_ref() {
+            shell.link(py);
+        }
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
     }
@@ -5627,6 +5574,7 @@ impl Interpreter {
     fn push_materialized_frame(&self, py: &Rc<PyFrame>) {
         py.on_stack.set(py.on_stack.get() + 1);
         let shell = Rc::new(crate::object::FrameShell::from_py_frame(py));
+        shell.link(py);
         self.frame_stack.borrow_mut().push(shell);
     }
 
@@ -5669,40 +5617,6 @@ impl Interpreter {
 
     /// Dispatch-loop helper: materialise the current activation's
     /// `PyFrame` once and cache it in the loop-local slot.
-    /// Whether this activation's frame object (if one was materialized)
-    /// is reachable from anything but the activation's own bookkeeping —
-    /// the shell's cell, the loop's slot, the frame's link: a traceback
-    /// or a Python reference that may read `f_lineno` at any moment, so
-    /// the loop keeps its `lasti` current instruction by instruction.
-    /// Otherwise the quiet loops may run, syncing it whenever they hand
-    /// back and whenever the object is fetched again (see
-    /// `FrameShell::materialize`).
-    fn frame_object_observed(
-        shell: &crate::object::FrameShell,
-        slot: Option<&Rc<PyFrame>>,
-        frame: &Frame,
-    ) -> bool {
-        if !shell
-            .has_materialized
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-        // Borrowed, not cloned: this runs per instruction while a
-        // traceback holds the frame object, and the clone's own count
-        // would be two more atomics each time.
-        let Ok(cell) = shell.materialized.try_borrow() else {
-            return true;
-        };
-        let Some(py) = cell.as_ref() else {
-            return false;
-        };
-        let own = 1
-            + usize::from(slot.is_some_and(|s| Rc::ptr_eq(s, py)))
-            + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, py)));
-        Rc::strong_count(py) > own
-    }
-
     fn ensure_top_py_frame(&self, slot: &mut Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(py) = slot {
             return py.clone();
@@ -5757,6 +5671,7 @@ impl Interpreter {
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
             lazy_back: RefCell::new(None),
+            live: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         })
     }
 
@@ -5775,7 +5690,7 @@ impl Interpreter {
             self.exc_info_stack.borrow_mut().pop();
         }
         frame.pc = jump.target_pc;
-        py_frame.lasti.set(jump.target_pc);
+        py_frame.set_lasti(jump.target_pc);
         py_frame.override_lineno.set(None);
         // Force a fresh 'line' event at the landing site.
         py_frame.last_line.set(None);
@@ -5831,7 +5746,7 @@ impl Interpreter {
         }
         let suspended = event == TraceEvent::Yield;
         let (jump, resolved_line) =
-            crate::linejump::compute_jump(&fr.code, fr.lasti.get(), new_lineno, suspended)?;
+            crate::linejump::compute_jump(&fr.code, fr.lasti_now(), new_lineno, suspended)?;
         // CPython binds `None` to any still-unbound local at the target
         // (rather than crashing on a LOAD_FAST of a name the compiler
         // "proved" bound), warning first so an escalating filter can
@@ -6118,9 +6033,10 @@ impl Interpreter {
     }
 
     /// A quiet loop leaves its shell's `lasti` behind the instruction it
-    /// stopped on. A lazy traceback entry materializes from the shell
-    /// once the activation leaves the spine (see `pop_frame_shell`), so
-    /// bring it current for the frame object's final `f_lineno`.
+    /// stopped on. A frame object reads it from there (see
+    /// `PyFrame::live`), and a lazy traceback entry materializes from the
+    /// shell once the activation leaves the spine (see `pop_frame_shell`),
+    /// so bring it current for the frame object's final `f_lineno`.
     /// A `RERAISE` leaves the restored raise site there itself (PEP 626).
     #[inline]
     fn sync_lazy_tb_lasti(
@@ -6129,12 +6045,11 @@ impl Interpreter {
         exit: &QuietExit,
     ) {
         if let (Some(shell), QuietExit::Outcome { cur_pc, stepped }) = (shell, exit) {
-            if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && !(stepped.is_err()
-                    && code
-                        .instructions
-                        .get(*cur_pc)
-                        .is_some_and(|i| i.op == OpCode::Reraise))
+            if !(stepped.is_err()
+                && code
+                    .instructions
+                    .get(*cur_pc)
+                    .is_some_and(|i| i.op == OpCode::Reraise))
             {
                 shell
                     .lasti
@@ -6165,11 +6080,8 @@ impl Interpreter {
         let existing = caller.materialized.borrow().clone();
         match existing {
             Some(back) => {
-                // A new holder of the caller's frame object: its loop
-                // re-derives whether the object is observed.
                 caller.refresh_materialized(&back);
                 py.set_back(Some(back));
-                crate::hot_gates::bump_loop_gen();
             }
             None => {
                 *py.lazy_back.borrow_mut() = Some(crate::object::LazyShellRef::new(caller));
@@ -6207,6 +6119,7 @@ impl Interpreter {
                 return popped;
             }
             if let Some(py) = shell.materialized.borrow().as_ref() {
+                py.unlink_live(shell);
                 py.on_stack.set(py.on_stack.get().saturating_sub(1));
                 // A generator-family frame that just suspended (yielded)
                 // or finished is no longer reachable from a live caller.
@@ -6762,7 +6675,7 @@ impl Interpreter {
             let tb = PyTraceback::new(
                 py_frame.clone(),
                 py_frame.last_line.get().unwrap_or(1),
-                py_frame.lasti.get(),
+                py_frame.lasti_now(),
                 None,
             );
             *tb.next.borrow_mut() = inherited_tb.clone();
@@ -7033,7 +6946,7 @@ impl Interpreter {
         if crate::trace::monitoring_union_mask_cached() & crate::trace::event_mask(event_idx) == 0 {
             return Ok(());
         }
-        let pc = py_frame.lasti.get();
+        let pc = py_frame.lasti_now();
         let code = py_frame.code.clone();
         let code_obj = Object::Code(code.clone());
         let offset = Object::Int(i64::from(code.cpython_lasti(pc)));
@@ -15015,8 +14928,8 @@ impl Interpreter {
     /// body must be reached through [`Self::call`]'s interpreter-aware
     /// dispatch. A method must be bound to its exact builtin receiver; a
     /// function must be one of the common builtins that never look at the
-    /// calling frame (`locals()`, `sys._getframe()` and the like keep the
-    /// full handler, which makes the frame stack whole first).
+    /// calling frame, or make the frame stack whole themselves (`locals()`
+    /// and the like keep the full handler, which makes it whole first).
     fn builtin_lane(
         &self,
         b: &Rc<crate::object::BuiltinFn>,
@@ -17432,7 +17345,6 @@ impl Interpreter {
                 let top = self.exc_info_stack.borrow_mut().pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
-                self.recheck_frame_observed = true;
                 if let Some(pe) = top {
                     self.release(pe.instance);
                 }
@@ -21335,28 +21247,7 @@ impl Interpreter {
         let recv = recv?;
         let name = code.names.get(name_idx as usize)?.as_str();
         match recv {
-            // A code object's fields and a frame's plain ones (neither type
-            // can be subclassed, and no getter here runs Python); the full
-            // path keeps the deprecated `co_lnotab`, a generator frame's
-            // re-derived `f_back`, and a line-0 `f_lineno`.
-            Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
-            Object::Frame(fr) => match name {
-                "f_code" => Some(Object::Code(fr.code.clone())),
-                "f_globals" => Some(Object::Dict(fr.globals.clone())),
-                "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
-                "f_lineno" => match fr.current_lineno() {
-                    0 => None,
-                    line => Some(Object::Int(i64::from(line))),
-                },
-                "f_back"
-                    if !(fr.code.is_generator
-                        || fr.code.is_coroutine
-                        || fr.code.is_async_generator) =>
-                {
-                    Some(fr.back_frame().map_or(Object::None, Object::Frame))
-                }
-                _ => None,
-            },
+            Object::Code(_) | Object::Frame(_) => Self::frame_plain_attr(recv, name, false),
             // `x.__class__` of a builtin value: its exact type (no instance
             // or class can override it there).
             Object::Generator(_)
@@ -21377,6 +21268,49 @@ impl Interpreter {
             {
                 Some(Object::Type(crate::builtins::class_of(recv)))
             }
+            _ => self.leaf_plain_attr_value_rest(recv, name),
+        }
+    }
+
+    /// A code object's fields and a frame's plain ones (neither type can
+    /// be subclassed, and no getter here runs Python); the full path keeps
+    /// the deprecated `co_lnotab`, a generator frame's re-derived
+    /// `f_back`, and a line-0 `f_lineno`. A live frame's line needs its
+    /// activation's `lasti` current (see `PyFrame::live`), which the
+    /// running one's is only once it waits on the pending list: `synced`
+    /// says it does.
+    #[inline]
+    fn frame_plain_attr(recv: &Object, name: &str, synced: bool) -> Option<Object> {
+        match recv {
+            Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
+            Object::Frame(fr) => match name {
+                "f_code" => Some(Object::Code(fr.code.clone())),
+                "f_globals" => Some(Object::Dict(fr.globals.clone())),
+                "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
+                "f_lineno"
+                    if synced || fr.live.load(std::sync::atomic::Ordering::Relaxed).is_null() =>
+                {
+                    match fr.current_lineno() {
+                        0 => None,
+                        line => Some(Object::Int(i64::from(line))),
+                    }
+                }
+                "f_back"
+                    if !(fr.code.is_generator
+                        || fr.code.is_coroutine
+                        || fr.code.is_async_generator) =>
+                {
+                    Some(fr.back_frame().map_or(Object::None, Object::Frame))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The rest of [`Self::leaf_plain_attr_value`]'s shapes.
+    fn leaf_plain_attr_value_rest(&self, recv: &Object, name: &str) -> Option<Object> {
+        match recv {
             Object::List(_)
             | Object::Dict(_)
             | Object::Set(_)
@@ -24384,7 +24318,6 @@ impl Interpreter {
                     let top = self.exc_info_stack.borrow_mut().pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
-                    self.recheck_frame_observed = true;
                     last = pc;
                     pc += 1;
                     if let Some(pe) = top {
@@ -30549,7 +30482,6 @@ impl Interpreter {
                 // `except` block (the implicit `del` of the bound name plus
                 // the per-frame exc-state pop): it dies here unless something
                 // else holds it.
-                self.recheck_frame_observed = true;
                 if let Some(pe) = popped {
                     self.release(pe.instance);
                 }
@@ -30624,7 +30556,7 @@ impl Interpreter {
                             .lasti
                             .store(orig, std::sync::atomic::Ordering::Relaxed);
                         if let Some(py_frame) = shell.materialized.borrow().as_ref() {
-                            py_frame.lasti.set(orig);
+                            py_frame.set_lasti(orig);
                         }
                     }
                 }
@@ -31536,12 +31468,10 @@ impl Interpreter {
         frame: &Frame,
         cur_pc: usize,
     ) {
-        if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            // See `sync_lazy_tb_lasti`.
-            shell
-                .lasti
-                .store(cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
-        }
+        // See `sync_lazy_tb_lasti`.
+        shell
+            .lasti
+            .store(cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
         self.pop_frame_shell();
         Self::settle_exited_frame_object(&shell, frame, true);
         self.recycle_frame_shell(shell);
@@ -31723,7 +31653,7 @@ impl Interpreter {
                                 // Cache it on generator-family frames so
                                 // `gi_frame` keeps a stable identity.
                                 let py = self.build_py_frame(frame, None);
-                                py.lasti.set(lasti);
+                                py.set_lasti(lasti);
                                 if frame.code.is_generator
                                     || frame.code.is_coroutine
                                     || frame.code.is_async_generator
@@ -31793,7 +31723,7 @@ impl Interpreter {
         let new_tb = Rc::new(PyTraceback::new(
             py_frame.clone(),
             py_frame.last_line.get().unwrap_or(1),
-            py_frame.lasti.get(),
+            py_frame.lasti_now(),
             None,
         ));
         inst.slot_set("__traceback__", Object::Traceback(new_tb));
@@ -32317,6 +32247,18 @@ impl Interpreter {
     /// The dict-subclass instance registered (by `exec`/`eval`) as the
     /// owner of `globals`, if any.
     fn globals_missing_owner(&self, globals: &Rc<RefCell<DictData>>) -> Option<Object> {
+        // While the gate is up every builtin `LOAD_GLOBAL` asks here, and
+        // a program that runs no finalizers may never drain them to notice
+        // the last owner die: every so often, have the next safe point
+        // drain and prune (see `prune_globals_missing_hooks_sometimes`).
+        let n = self.globals_missing_asks.get();
+        if n >= 1024 {
+            self.globals_missing_asks.set(0);
+            self.globals_missing_prune_in.set(0);
+            gc_trace::mark_maybe_dead();
+        } else {
+            self.globals_missing_asks.set(n + 1);
+        }
         let hooks = self.globals_missing_hooks.borrow();
         if hooks.is_empty() {
             return None;
@@ -33325,7 +33267,7 @@ impl Interpreter {
                     // lineno_matches_lasti at the exec 'call' event).
                     let line = fr.current_lineno();
                     if line == 0 {
-                        let at_module_resume = fr.lasti.get() == 0
+                        let at_module_resume = fr.lasti_now() == 0
                             && fr.code.name == "<module>"
                             && fr.code.instructions.first().map(|x| x.op)
                                 == Some(weavepy_compiler::bytecode::OpCode::Resume);
@@ -33345,7 +33287,7 @@ impl Interpreter {
                     }
                 }
                 "f_lasti" => Ok(Object::Int(i64::from(
-                    fr.code.cpython_lasti(fr.lasti.get()),
+                    fr.code.cpython_lasti(fr.lasti_now()),
                 ))),
                 "f_back" => {
                     // A generator-family frame drops its resumer link when
@@ -42722,7 +42664,7 @@ impl Interpreter {
                 frame.py_frame = Some(py.clone());
                 py
             });
-            py.lasti.set(frame.pc);
+            py.set_lasti(frame.pc);
             let line = frame
                 .code
                 .linetable
@@ -42972,7 +42914,7 @@ impl Interpreter {
                         let tb = Rc::new(PyTraceback::new(
                             pf.clone(),
                             pf.last_line.get().unwrap_or(1),
-                            pf.lasti.get(),
+                            pf.lasti_now(),
                             None,
                         ));
                         inst.slot_set("__traceback__", Object::Traceback(tb));
@@ -43099,7 +43041,7 @@ impl Interpreter {
             frame.py_frame = Some(py.clone());
             py
         });
-        py.lasti.set(frame.pc);
+        py.set_lasti(frame.pc);
         py.set_back(self.materialize_top_py_frame());
         self.push_materialized_frame(&py);
         let hook_result =
@@ -46166,6 +46108,24 @@ impl Interpreter {
         let ins = frame.code.instructions[pc];
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
+        // A frame's or code object's plain field, now that this
+        // activation's `lasti` is current for its own frame's line.
+        if ins.op == OpCode::LoadAttr
+            && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)))
+        {
+            let v = match (frame.stack.last(), frame.code.names.get(ins.arg as usize)) {
+                (Some(recv), Some(name)) => Self::frame_plain_attr(recv, name, true),
+                _ => None,
+            };
+            if let Some(v) = v {
+                if let Some(top) = frame.stack.last_mut() {
+                    let recv = std::mem::replace(top, v);
+                    self.release(recv);
+                }
+                self.core_pending_exit(sw, pending);
+                return Ok(());
+            }
+        }
         let r = match ins.op {
             OpCode::LoadAttr => match self.load_attr_certain_miss(frame, ins.arg) {
                 Some(err) => Err(err),
@@ -71076,7 +71036,10 @@ fn builtin_method_via_call(name: &str) -> bool {
 /// Builtin functions the core loop may call in place (see
 /// `Interpreter::builtin_lane`): common ones that never look at the
 /// calling frame, so the frame stack needn't be whole while they run.
-/// (Python code they call makes it whole as it needs to.)
+/// (Python code they call makes it whole as it needs to.) The `sys`
+/// frame readers make it whole themselves (`sync_frame_spine`), the
+/// calling activation waiting on the pending list with its `lasti` at the
+/// call.
 fn builtin_fn_lane_ok(name: &str) -> bool {
     matches!(
         name,
@@ -71104,6 +71067,8 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "monotonic_ns" | "heappush" | "heappop" | "heapify" | "heapreplace"
             | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
+            // sys
+            | "_getframe" | "_getframemodulename"
     )
 }
 
