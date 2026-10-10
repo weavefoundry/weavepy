@@ -162,12 +162,19 @@ fn disk_path(name: &str) -> Option<PathBuf> {
 /// path may differ from the writer's), installed into the in-memory
 /// cache, and returned. Any mismatch or decode failure is a miss.
 pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> {
-    let bytes = std::fs::read(disk_path(name)?).ok()?;
-    if bytes.len() < FROZEN_HEADER_LEN || &bytes[0..4] != FROZEN_MAGIC {
+    use std::io::Read;
+    use weavepy_compiler::native_code;
+    let mut file = std::fs::File::open(disk_path(name)?).ok()?;
+    let size = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    // The header and the payload's first bytes, which say where its table
+    // section starts.
+    let mut head = [0u8; FROZEN_HEADER_LEN + 5];
+    file.read_exact(&mut head).ok()?;
+    if &head[0..4] != FROZEN_MAGIC {
         return None;
     }
-    let len = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    let hash = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    let len = u32::from_le_bytes(head[8..12].try_into().ok()?);
+    let hash = u64::from_le_bytes(head[12..20].try_into().ok()?);
     // An embedded module's hash comes from the build: computing it here
     // would page in the whole source text the cached code stands for.
     if len as usize != source.len() || hash != crate::stdlib::frozen_source_hash(name, source) {
@@ -177,8 +184,41 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     // same artifact again, and a resident clone of every loaded module's
     // code would double its footprint in the (usual) single-interpreter
     // process.
-    weavepy_compiler::native_code::decode(&bytes[FROZEN_HEADER_LEN..], filename)
+    let at = native_code::tables_at(&head[FROZEN_HEADER_LEN..])?;
+    let tables_start = FROZEN_HEADER_LEN.checked_add(at).filter(|&t| t <= size)?;
+    let mut payload = Vec::with_capacity(size - FROZEN_HEADER_LEN);
+    payload.extend_from_slice(&head[FROZEN_HEADER_LEN..]);
+    if size - tables_start < MAP_TABLES_FROM {
+        file.read_to_end(&mut payload).ok()?;
+        return native_code::decode(&payload, filename);
+    }
+    // A large table section is mapped rather than read: most of its
+    // tables (column spans, wire marks) are never read, and pages never
+    // touched take no memory.
+    (&mut file)
+        .take((at - payload.len()) as u64)
+        .read_to_end(&mut payload)
+        .ok()?;
+    // SAFETY: the cache's writers replace an artifact by renaming a new
+    // file over it, never by changing it in place, so the mapped bytes
+    // keep the contents just validated (a replaced or removed file keeps
+    // them while mapped).
+    let tables = unsafe {
+        memmap2::MmapOptions::new()
+            .offset(tables_start as u64)
+            .len(size - tables_start)
+            .map(&file)
+    }
+    .ok()?;
+    native_code::decode_split(
+        &payload,
+        weavepy_compiler::TableBuffer::new(tables),
+        filename,
+    )
 }
+
+/// The shortest table section [`get_disk`] maps rather than reads.
+const MAP_TABLES_FROM: usize = 8 * 1024;
 
 /// Persist a freshly-compiled frozen module to the disk cache.
 /// Best-effort: any I/O or marshal failure is silently ignored (a

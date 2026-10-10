@@ -109,25 +109,43 @@ pub(crate) fn decode_wire_marks(bytes: &[u8]) -> Option<Vec<u8>> {
 /// holds all their line and column tables and wire marks (see
 /// `LineTable`).
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
+    let at = tables_at(bytes)?;
+    let tables = crate::TableBuffer::new(Box::<[u8]>::from(bytes.get(at..)?));
+    decode_split(&bytes[..at], tables, filename)
+}
+
+/// Where the table section of what [`encode`] wrote starts, from its
+/// first five bytes (or more); `None` for input it didn't write.
+pub fn tables_at(bytes: &[u8]) -> Option<usize> {
     if bytes.first() != Some(&VERSION) {
         return None;
     }
     let at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
-    let code_bytes = bytes.get(5..at)?;
-    let tables = &bytes[at..];
+    (at >= 5).then_some(at)
+}
+
+/// [`decode`] for input split at [`tables_at`]: `code` is what comes
+/// before the table section and `tables` holds the section, which the
+/// decoded code objects keep, reading a table from it only when
+/// something asks for that table.
+pub fn decode_split(code: &[u8], tables: crate::TableBuffer, filename: &str) -> Option<CodeObject> {
+    if tables_at(code)? != code.len() {
+        return None;
+    }
+    let tables_len = tables.bytes().len();
     let mut r = Reader {
-        bytes: code_bytes,
+        bytes: &code[5..],
         pos: 0,
     };
     let mut module = Module {
         filename: Arc::from(filename),
-        buffer: Arc::new(std::sync::OnceLock::from(Box::from(tables))),
-        tables_len: tables.len(),
+        buffer: Arc::new(tables),
+        tables_len,
         next: 0,
         names: Vec::new(),
     };
-    let code = r.code(&mut module, 0)?;
-    (r.pos == code_bytes.len() && module.next == tables.len()).then_some(code)
+    let decoded = r.code(&mut module, 0)?;
+    (r.pos == r.bytes.len() && module.next == tables_len).then_some(decoded)
 }
 
 /// What the code objects of one module decoded by [`decode`] share.

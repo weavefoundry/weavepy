@@ -844,9 +844,26 @@ struct LazyTable<T> {
     _items: std::marker::PhantomData<Vec<T>>,
 }
 
-/// A module's encoded position tables, filled once the decoding is done
-/// (see `native_code::decode`).
-pub(crate) type TableBuffer = std::sync::OnceLock<Box<[u8]>>;
+/// The table section of a module in the code cache's native form (see
+/// `native_code`): its own bytes, or, say, a mapping of the cache file
+/// that only the tables something reads ever page in.
+pub struct TableBuffer(Box<dyn AsRef<[u8]> + Send + Sync>);
+
+impl TableBuffer {
+    pub fn new(bytes: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+        TableBuffer(Box::new(bytes))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
+impl std::fmt::Debug for TableBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TableBuffer({} bytes)", self.bytes().len())
+    }
+}
 
 /// The tag of an encoded [`LazyTable`]'s state.
 const LAZY_ENCODED: usize = 1;
@@ -916,8 +933,8 @@ impl<T> LazyTable<T> {
             // published table keeps alive for any racing reader).
             let source = unsafe { std::sync::Arc::from_raw(buffer) };
             let items = source
-                .get()
-                .and_then(|b| b.get(self.start as usize..self.end as usize))
+                .bytes()
+                .get(self.start as usize..self.end as usize)
                 .and_then(decode)
                 .unwrap_or_default();
             (items, Some(source))
@@ -1072,7 +1089,6 @@ impl LineTable {
 /// module shares (see `native_code::decode`), so a module's tables take
 /// one allocation rather than three per code object.
 pub(crate) struct Encoded {
-    /// Set once the module's decoding finishes, before any table is read.
     buffer: std::sync::Arc<TableBuffer>,
     start: u32,
     end: u32,
