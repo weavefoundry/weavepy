@@ -684,7 +684,7 @@ impl Interpreter {
                 OpCode::JumpForward => pc += 1 + ins.arg as usize,
                 OpCode::JumpBackward => {
                     // The back edge is the eval-breaker (as the core loop's).
-                    if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
+                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
                         break None;
                     }
                     self.gil_countdown -= 1;

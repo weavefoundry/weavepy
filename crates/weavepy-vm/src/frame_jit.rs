@@ -577,7 +577,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         // A call runs through its helpers (`call_op`), as the core loop's
         // arm runs it: a compiled callee is called directly, any other
         // activation switched to without a round trip through the loop.
-        if helped[k] || matches!(op, OpCode::Call | OpCode::CallKw) {
+        if helped[k] || matches!(op, OpCode::Call | OpCode::CallKw | OpCode::CallEx) {
             return Some(1);
         }
         if !native_at(code, k) {
@@ -812,6 +812,26 @@ mod stats {
             }
             on
         })
+    }
+
+    /// [`super::run_pushed_directly`] declined, for `why`: `None`.
+    #[inline(always)]
+    pub(super) fn declined(why: &'static str) -> Option<u32> {
+        if enabled() {
+            note_declined(why);
+        }
+        None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_declined(why: &'static str) {
+        let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = counts
+            .get_or_insert_with(HashMap::new)
+            .entry(("<pushed call declined>".to_owned(), why.to_owned()))
+            .or_default();
+        e[0] += 1;
     }
 
     #[cold]
@@ -4325,7 +4345,7 @@ unsafe fn run_pushed_directly(
     unsafe {
         let sw = &mut *st.sw;
         if sw.pending.is_some() || std::ptr::eq(sw.cur, st.frame) {
-            return None;
+            return stats::declined("pending or in place");
         }
         let inl = &mut *sw.inl;
         let depth = inl.len();
@@ -4337,23 +4357,23 @@ unsafe fn run_pushed_directly(
             || top.direct
             || !std::ptr::eq(&raw const *top.frame, callee)
         {
-            return None;
+            return stats::declined("shape");
         }
         let interp = &*st.interp;
         let nested = interp.direct_calls.get();
         if nested >= DIRECT_CALL_DEPTH || crate::hot_gates::loop_gen() != st.snap_gen {
-            return None;
+            return stats::declined("depth or generation");
         }
         let cframe = &*callee;
         let ext = crate::code_vm_ext(&cframe.code)?;
         let nlocals = (*cframe.locals.as_ptr()).len();
         let Some(native) = ext.frame_jit.get(nlocals) else {
             ext.frame_jit.warm_switched(&cframe.code, ext, nlocals);
-            return None;
+            return stats::declined("no body");
         };
         let from = cframe.pc as usize;
         if from >= ext.dispatch_len || !native.enters_at(from) {
-            return None;
+            return stats::declined("no entry");
         }
         top.direct = true;
         Some(direct_run::<true>(
@@ -5102,6 +5122,51 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
         }
         base.add(start).write(r);
         0
+    }
+}
+
+/// `CALL_FUNCTION_EX` (the `pc`th instruction of `code`) on a stack `len`
+/// deep, as the core loop's arm runs it (`Interpreter::core_call_ex`, else
+/// its lane), the frame synced first: `0` the result in place (a compiled
+/// callee run from here, as for `CALL`, or a call finished in place),
+/// `RELOAD` the core loop goes on.
+unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state, its own code, one of its
+    // `CALL_FUNCTION_EX`s and its stack depth.
+    unsafe {
+        let _ = code;
+        let st = &mut *st;
+        let (pc, len) = (pc as usize, len as usize);
+        if st.sw.is_null() || len < 4 {
+            return CALL_DECLINED;
+        }
+        let start = len - 4;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        let saved_last = sw.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_call_ex(sw, pc, st.snap_gen) {
+            if sw.pending.is_none() && !interp.core_call_lane(sw) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return if finished_in_place(st, start) { 0 } else { RELOAD };
+        }
+        if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+            if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                return r;
+            }
+            if run_callee_directly(st, start) {
+                st.len = start + 1;
+                return 0;
+            }
+        }
+        if finished_in_place(st, start) {
+            return 0;
+        }
+        RELOAD
     }
 }
 
@@ -7237,6 +7302,7 @@ impl<'a> Lower<'a> {
             // helper; a generator body's return isn't a switch.)
             OpCode::Call => return self.call_op(pc, ins.arg as usize),
             OpCode::CallKw => return self.call_kw(pc),
+            OpCode::CallEx => return self.call_ex(pc),
             // `await`'s and `yield from`'s delegate, through `h_await_iter`.
             OpCode::GetAwaitable | OpCode::GetYieldFromIter if self.depth > 0 => {
                 let s = self.top_to_mem();
@@ -9631,6 +9697,17 @@ impl<'a> Lower<'a> {
     /// `CALL_KW` through [`h_call_kw`] (as [`Self::call_op`]; the depth
     /// after is the static one).
     fn call_kw(&mut self, pc: usize) -> bool {
+        self.call_with(pc, h_call_kw as *const () as usize)
+    }
+
+    /// `CALL_FUNCTION_EX` through [`h_call_ex`] (as [`Self::call_kw`]).
+    fn call_ex(&mut self, pc: usize) -> bool {
+        self.call_with(pc, h_call_ex as *const () as usize)
+    }
+
+    /// A call instruction through `helper` (`h_call_kw`'s signature): the
+    /// result in place when it ran, anything else the core loop's.
+    fn call_with(&mut self, pc: usize, helper: usize) -> bool {
         let after = self.depths.get(pc + 1).copied().unwrap_or(-1);
         if after < 0 || self.depth == 0 {
             self.exit(INTERP, pc);
@@ -9642,11 +9719,7 @@ impl<'a> Lower<'a> {
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
         let r = self
-            .call(
-                h_call_kw as *const () as usize,
-                &[self.st, code, pcv, len],
-                true,
-            )
+            .call(helper, &[self.st, code, pcv, len], true)
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         let ran = self.b.create_block();

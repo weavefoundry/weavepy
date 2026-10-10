@@ -71,6 +71,37 @@ def kw_calls():
     assert t == sum(2 * i for i in range(N)) + 123 * N, t
 
 
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+def spread_target(a, b, c=0):
+    if c == -1:
+        raise KeyError(a)
+    return a + b + c
+
+
+def spread_calls():
+    t = 0
+    for i in range(N):
+        args = (i, 1)
+        t += spread_target(*args)
+        t += spread_target(*args, **{"c": 2})
+        t += max(*[i, 3, 1])
+        p = Point(*args)
+        t += p.x + p.y
+    expect = sum((i + 1) + (i + 3) + max(i, 3) + (i + 1) for i in range(N))
+    assert t == expect, (t, expect)
+    try:
+        spread_target(*(5, 1), c=-1)
+    except KeyError as e:
+        assert e.args == (5,)
+    else:
+        raise AssertionError("no raise")
+
+
 class Dying:
     log = []
 
@@ -178,6 +209,7 @@ def busy_thread_hand_off():
 
 closures()
 kw_calls()
+spread_calls()
 del_timing()
 frames_through_closures()
 raising_closure()
