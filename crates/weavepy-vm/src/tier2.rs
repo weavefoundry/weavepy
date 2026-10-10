@@ -6323,6 +6323,20 @@ unsafe fn try_native_call(
             }
             child.pins.clear();
             ctx.child = Some(child);
+            // An argument the callee held last died with its pins: the
+            // caller leaves native code after the call, so the queued
+            // finalizer runs before its next instruction, as the
+            // interpreter's own call runs it.
+            if finalizer_queued() {
+                ctx.parked = Some(match expect {
+                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => unpack(bits, expect_tag),
+                    SlotTag::ObjPin if bits != u64::MAX => {
+                        unpack_pins(bits, expect_tag, &ctx.pins)
+                    }
+                    _ => Object::None,
+                });
+                return Some(CallStatus::Boxed as i64);
+            }
             jf.ret_bits = bits;
             jf.ret_tag = expect_tag;
             return Some(CallStatus::Ok as i64);
@@ -6626,6 +6640,19 @@ unsafe fn finish_native_call(
     }
     ctx.child = Some(child);
     ctx.dirty |= child_dirty;
+    // A finalizer the callee's releases queued runs before the caller's
+    // next instruction: the caller leaves native code after the call.
+    if finalizer_queued() {
+        match done {
+            Done::Raised(e) => {
+                ctx.raised = Some(e);
+                return CallStatus::Raised as i64;
+            }
+            Done::Scalar(bits, tag) => ctx.parked = Some(unpack(bits, tag)),
+            Done::Obj(v) => ctx.parked = Some(v),
+        }
+        return CallStatus::Boxed as i64;
+    }
 
     match done {
         Done::Raised(e) => {

@@ -13695,6 +13695,8 @@ impl Interpreter {
                                     len = start + 1;
                                     last = pc;
                                     pc += 1;
+                                    // (An argument the call held last died.)
+                                    after_release!();
                                     continue;
                                 }
                             }
@@ -13725,6 +13727,7 @@ impl Interpreter {
                                 len = start + 1;
                                 last = pc;
                                 pc += 1;
+                                after_release!();
                                 continue;
                             }
                         }
@@ -13865,6 +13868,7 @@ impl Interpreter {
                                 len -= 1;
                                 last = pc;
                                 pc += 1;
+                                after_release!();
                             }
                             // `append(x)` of a local `append = lst.append` on an
                             // exact list (the site's leaf kind, likewise): the
@@ -13959,6 +13963,7 @@ impl Interpreter {
                                         len = callee_at + 1;
                                         last = pc;
                                         pc += 1;
+                                        after_release!();
                                     }
                                     // As the helper's raise: the operands drop
                                     // wholesale and the pc moves past the call.
