@@ -202,3 +202,30 @@ assert time.mktime(t) == 1700000000.0
 assert hasattr(os, "getpid") and not hasattr(os, "no_such_name")
 assert getattr(os, "sep") == "/" and getattr(os, "no_such_name", 5) == 5
 assert hasattr(os, "__dict__") and getattr(os, "__name__") == "os"
+
+
+# --- Plain %-formatting -------------------------------------------------
+
+assert "%s %s" % ("a", 1) == "a 1"
+assert "%s-%d-%i" % ("x", 2, 3) == "x-2-3"
+assert "a%%b%s" % ("c",) == "a%bc"
+assert "%s|%d|%s" % (True, True, None) == "True|1|None"
+assert "%(a)s %(b)d" % {"a": "x", "b": 2} == "x 2"
+assert "%(a(b))s" % {"a(b)": 1} == "1"
+assert "%s" % {"a": 1} == "{'a': 1}"
+assert "%(x)i%%" % {"x": False} == "0%"
+assert "%5s|%-3d|" % ("a", 4) == "    a|4  |"
+assert "%s" % (2 ** 70,) == str(2 ** 70)
+for template, args, exc in (("%s", ("a", "b"), TypeError), ("%s %s", ("a",), TypeError),
+                            ("%d", "x", TypeError), ("%(a)s", {}, KeyError),
+                            ("%", (), ValueError)):
+    try:
+        template % args
+    except exc:
+        pass
+    else:
+        raise AssertionError((template, args))
+record = {"asctime": "t", "levelname": "WARNING", "name": "n", "message": "m", "extra": 1}
+for i in range(2000):
+    assert "%(asctime)s %(levelname)s %(name)s: %(message)s" % record == "t WARNING n: m"
+    assert "%s/%d" % ("p", i) == "p/" + str(i)

@@ -700,13 +700,10 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
         Some(Object::Tuple(t)) => t.to_vec(),
         Some(Object::Instance(inst)) => {
             let d = inst.dict_cell().borrow();
+            let keys = crate::stdlib::os::static_name_keys(&STRUCT_TIME_FIELDS);
             let mut v = Vec::with_capacity(9);
-            for f in STRUCT_TIME_FIELDS {
-                v.push(
-                    d.get(&crate::stdlib::os::static_name_key(f))
-                        .cloned()
-                        .ok_or_else(illegal)?,
-                );
+            for key in keys.iter() {
+                v.push(d.get(key).cloned().ok_or_else(illegal)?);
             }
             v
         }

@@ -44385,6 +44385,11 @@ impl Interpreter {
         b: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Object::Str(t) = a {
+            if let Some(out) = percent_render_plain_value(t, b) {
+                return Ok(Object::from_str(out));
+            }
+        }
         if a.is_str() {
             // Surrogate-aware printf: a `WStr` template (and any `WStr`
             // argument resolved via `%s`) bridges its lone surrogates into
@@ -68244,6 +68249,11 @@ fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String>
     };
     let bytes = template.as_bytes();
     let map = d.try_borrow().ok()?;
+    // The plain shape (`logging`'s `%(asctime)s %(levelname)s ...`), in
+    // one pass.
+    if let Some(out) = percent_render_plain(template, PercentArgs::Mapping(&map)) {
+        return Some(out);
+    }
     let mut i = 0;
     while let Some(off) = bytes[i..].iter().position(|&b| b == b'%') {
         i += off + 1;
@@ -68286,7 +68296,97 @@ fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String>
     percent_format(template, value).ok()
 }
 
+/// The arguments [`percent_render_plain`] renders from.
+enum PercentArgs<'a> {
+    Positional(&'a [Object]),
+    Mapping(&'a DictData),
+}
+
+/// `template % args` in one pass when every conversion is a plain `%s`,
+/// `%d` or `%i` (no flags, width or precision; a mapping key for a
+/// mapping, none for positional arguments) of an exact `str`, `int`,
+/// `bool` or `None` (`%s` only for `str`, `None`), and every positional
+/// argument is consumed: the text `percent_format_with` renders for that
+/// shape. `None` for anything else (the general path then renders it, or
+/// raises), including a mapping key the dictionary lacks.
+fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String> {
+    use std::fmt::Write as _;
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len() + 32);
+    let (mut i, mut lit, mut next) = (0, 0, 0);
+    while let Some(off) = memchr::memchr(b'%', &bytes[i..]) {
+        let at = i + off;
+        out.push_str(&template[lit..at]);
+        let mut k = at + 1;
+        let v = match (bytes.get(k)?, &args) {
+            (b'%', _) => {
+                out.push('%');
+                i = k + 1;
+                lit = i;
+                continue;
+            }
+            (b'(', PercentArgs::Mapping(map)) => {
+                let close = k + 1 + memchr::memchr(b')', &bytes[k + 1..])?;
+                let key = &template[k + 1..close];
+                if key.contains('(') {
+                    return None;
+                }
+                k = close + 1;
+                map.get(&crate::object::StrKey(key))?
+            }
+            (_, PercentArgs::Positional(items)) => {
+                let v = items.get(next)?;
+                next += 1;
+                v
+            }
+            _ => return None,
+        };
+        match (bytes.get(k)?, v) {
+            (b's', Object::Str(s)) => out.push_str(s),
+            (b's' | b'd' | b'i', Object::Int(n)) => {
+                let _ = write!(out, "{n}");
+            }
+            (b's', Object::Bool(b)) => out.push_str(if *b { "True" } else { "False" }),
+            (b'd' | b'i', Object::Bool(b)) => out.push(if *b { '1' } else { '0' }),
+            (b's', Object::None) => out.push_str("None"),
+            _ => return None,
+        }
+        i = k + 1;
+        lit = i;
+    }
+    if let PercentArgs::Positional(items) = args {
+        if next != items.len() {
+            return None;
+        }
+    }
+    out.push_str(&template[lit..]);
+    Some(out)
+}
+
+/// [`percent_render_plain`] of `template % value` for an argument tuple,
+/// a lone scalar argument or an exact dict.
+fn percent_render_plain_value(template: &str, value: &Object) -> Option<String> {
+    let one;
+    let items: &[Object] = match value {
+        Object::Tuple(items) if !items.is_empty() => items,
+        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None => {
+            one = [value.clone()];
+            &one
+        }
+        Object::Dict(d) => {
+            let map = d.try_borrow().ok()?;
+            return percent_render_plain(template, PercentArgs::Mapping(&map));
+        }
+        _ => return None,
+    };
+    percent_render_plain(template, PercentArgs::Positional(items))
+}
+
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
+    // The plain shape (`"warning number %d of %s" % (i, s)`).
+    if let Some(out) = percent_render_plain_value(template, value) {
+        return Ok(out);
+    }
     let mut noop = |_: &Object, _: char| Ok(None);
     percent_format_with(template, value, PercentMode::Str, &mut noop)
 }

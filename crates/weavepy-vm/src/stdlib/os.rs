@@ -7708,8 +7708,9 @@ pub(crate) fn struct_seq_instance(
         let mut d = inst.dict_cell().borrow_mut();
         // (Room for the hidden extras `time.struct_time` adds.)
         d.reserve(fields.len() + 2);
-        for (field, value) in fields.iter().zip(values.iter()) {
-            d.insert(static_name_key(field), value.clone());
+        let keys = static_name_keys(fields);
+        for (key, value) in keys.iter().zip(values.iter()) {
+            d.insert(key.clone(), value.clone());
         }
     }
     // Struct sequences subclass `tuple`, so give the instance a native tuple
@@ -7719,6 +7720,22 @@ pub(crate) fn struct_seq_instance(
     // overrides expose — without us re-implementing every sequence method.
     let _ = inst.native.set(Object::new_tuple(values));
     Object::Instance(Rc::new(inst))
+}
+
+/// [`static_name_key`] for each of a struct sequence's `fields`, looked up
+/// once per instance.
+pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[DictKey]> {
+    thread_local! {
+        static KEYS: RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>> =
+            RefCell::new(std::collections::HashMap::default());
+    }
+    let id = (fields.as_ptr() as usize, fields.len());
+    if let Some(keys) = KEYS.with(|k| k.borrow().get(&id).cloned()) {
+        return keys;
+    }
+    let keys: std::rc::Rc<[DictKey]> = fields.iter().map(|f| static_name_key(f)).collect();
+    KEYS.with(|k| k.borrow_mut().insert(id, keys.clone()));
+    keys
 }
 
 /// The dictionary key for a static field name, built once per thread with
