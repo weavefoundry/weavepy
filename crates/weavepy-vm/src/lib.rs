@@ -46979,10 +46979,16 @@ impl Interpreter {
                 // descriptor from one); that side effect must not run ahead
                 // of the lookup it's meant to accelerate.
                 specialize::record_specialize_attempt(op_idx);
+                // A site cools down two steps at a time from an odd count
+                // when its load failed, an even one otherwise (see the
+                // `Cooldown` arm).
                 let decision = if result.is_ok() {
-                    specialize::attempt_specialize_load_attr(&obj, &name)
+                    match specialize::attempt_specialize_load_attr(&obj, &name) {
+                        IC::Cooldown(n) => IC::Cooldown(n.saturating_mul(2) & !1),
+                        decision => decision,
+                    }
                 } else {
-                    IC::Cooldown(COOLDOWN)
+                    IC::Cooldown(2 * COOLDOWN + 1)
                 };
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
@@ -46993,12 +46999,23 @@ impl Interpreter {
                 result
             }
             IC::Cooldown(n) => {
-                let next = if n > 0 {
-                    IC::Cooldown(n - 1)
+                let next = if n >= 2 {
+                    IC::Cooldown(n - 2)
                 } else {
                     IC::Empty
                 };
                 frame.code.caches.set(cache_pc, next);
+                // A site cooling down after a failed load (an odd count; `try:
+                // o.x except AttributeError:`): an attribute certainly missing
+                // raises the `AttributeError` the default lookup ends with,
+                // without its resolution passes.
+                if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
+                    if attr_certainly_missing(&receiver, name) {
+                        let err = crate::error::attribute_error_named(&receiver, name);
+                        self.release(receiver);
+                        return Err(err);
+                    }
+                }
                 let name = self.name_at(&frame.code, name_idx)?;
                 self.load_attr(&receiver, &name)
             }
@@ -47021,10 +47038,11 @@ impl Interpreter {
         receiver: Object,
     ) -> Result<Object, RuntimeError> {
         specialize::record_miss(OpCode::LoadAttr as u8);
+        // (An even count: see `specialized_load_attr`'s `Cooldown` arm.)
         frame
             .code
             .caches
-            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(2 * COOLDOWN));
         let name = self.name_at(&frame.code, name_idx)?;
         self.load_attr(&receiver, &name)
     }
