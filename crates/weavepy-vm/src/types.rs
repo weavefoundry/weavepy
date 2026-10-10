@@ -51,10 +51,11 @@ pub enum Dunder {
     Call,
     Set,
     Delete,
+    Class,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -69,6 +70,7 @@ impl Dunder {
             Self::Call => "__call__",
             Self::Set => "__set__",
             Self::Delete => "__delete__",
+            Self::Class => "__class__",
         }
     }
 }
@@ -1879,6 +1881,16 @@ impl TypeObject {
         let info = DunderInfo::resolve(self.lookup_with_owner(dunder.name()));
         slot.set(version << 8 | u64::from(info.0));
         info
+    }
+
+    /// Whether `inst.__class__` on an instance of this type is
+    /// `object`'s descriptor answering the real class: neither
+    /// `__class__` nor `__getattribute__` is overridden anywhere in the
+    /// MRO. An `isinstance` miss then needs no `__class__` read.
+    #[inline]
+    pub fn class_attr_is_plain(&self) -> bool {
+        self.dunder(Dunder::Class).object_owner()
+            && self.dunder(Dunder::GetAttribute).object_owner()
     }
 
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {

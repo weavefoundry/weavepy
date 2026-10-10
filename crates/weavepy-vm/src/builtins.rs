@@ -6040,6 +6040,33 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
     let sign = if (bits >> 63) & 1 == 1 { -1i32 } else { 1 };
     let exp_field = ((bits >> 52) & 0x7FF) as i32;
     let mantissa_field = bits & ((1u64 << 52) - 1);
+    // Machine-word answer when both terms fit an `i64` (every float of
+    // magnitude below 2**10 with few fraction bits, the statistics
+    // module's common case): the denominator is a power of two, so
+    // lowest terms only strip the mantissa's trailing zeros.
+    {
+        let (m, e) = if exp_field == 0 {
+            (mantissa_field, -1074)
+        } else {
+            ((1u64 << 52) | mantissa_field, exp_field - 1075)
+        };
+        if m == 0 {
+            return Ok(Object::new_tuple_array([Object::Int(0), Object::Int(1)]));
+        }
+        let small = if e >= 0 {
+            // `m < 2**53`, so the shift stays below 2**63 while `e <= 9`.
+            (e <= 9).then(|| (i64::try_from(m << e).ok(), Some(1i64)))
+        } else {
+            let shift = m.trailing_zeros().min(e.unsigned_abs());
+            let m = m >> shift;
+            let e = e + shift as i32;
+            (e > -63).then(|| (i64::try_from(m).ok(), Some(1i64 << -e)))
+        };
+        if let Some((Some(num), Some(den))) = small {
+            let num = if sign < 0 { -num } else { num };
+            return Ok(Object::new_tuple_array([Object::Int(num), Object::Int(den)]));
+        }
+    }
     let (mantissa, exponent): (BigInt, i32) = if exp_field == 0 {
         // Subnormal.
         (BigInt::from(mantissa_field), -1074)
@@ -12624,6 +12651,9 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
                 [_, Object::Str(enc)] => {
                     matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
                 }
+                [_, Object::Str(enc), errors] if is_builtin_error_handler(errors) => {
+                    matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
+                }
                 _ => false,
             };
         if utf8 {
@@ -13760,6 +13790,13 @@ fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
     if n.len() > 10 {
         return None;
     }
+    // The spellings code writes, without the normalizing copy.
+    match n {
+        "utf-8" | "utf8" => return Some(PlainCodec::Utf8),
+        "ascii" => return Some(PlainCodec::Ascii),
+        "latin-1" | "latin1" => return Some(PlainCodec::Latin1),
+        _ => {}
+    }
     let n = n.to_ascii_lowercase().replace('_', "-");
     Some(match n.as_str() {
         "utf-8" | "utf8" => PlainCodec::Utf8,
@@ -13769,13 +13806,31 @@ fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
     })
 }
 
+/// One of the codec error handlers every interpreter registers. A
+/// conversion that meets no error never consults its handler, so a leaf
+/// half that only serves error-free conversions may accept any of these
+/// (an unknown name is left to the full path, which owns its checks).
+fn is_builtin_error_handler(o: &Object) -> bool {
+    matches!(o, Object::Str(e) if matches!(
+        &**e,
+        "strict"
+            | "ignore"
+            | "replace"
+            | "surrogateescape"
+            | "surrogatepass"
+            | "backslashreplace"
+            | "xmlcharrefreplace"
+            | "namereplace"
+    ))
+}
+
 /// `s.encode([encoding])` with a plain codec, when every character
 /// encodes (an unencodable one raises on the full path).
 pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (Object::Str(s), rest) = args.split_first()? else {
         return None;
     };
-    if rest.len() > 1 {
+    if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
     let s: &str = s;
@@ -13797,7 +13852,7 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     let (Object::Bytes(b), rest) = args.split_first()? else {
         return None;
     };
-    if rest.len() > 1 {
+    if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
     let text = match plain_codec(rest.first())? {

@@ -18823,7 +18823,11 @@ impl Interpreter {
                 return crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
                     .map(|b| Ok(Object::Bool(b)));
             }
-            return ic.is_subclass_of(cls).then_some(Ok(Object::Bool(true)));
+            if ic.is_subclass_of(cls) {
+                return Some(Ok(Object::Bool(true)));
+            }
+            // A miss is final when `__class__` can't answer otherwise.
+            return ic.class_attr_is_plain().then_some(Ok(Object::Bool(false)));
         }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).
@@ -38996,8 +39000,12 @@ impl Interpreter {
         }
         // Only `Instance`s can carry a custom `__class__`; for every other
         // object the real type *is* `__class__`, so skip the (observable)
-        // attribute access on the negative path.
-        if let Object::Instance(_) = obj {
+        // attribute access on the negative path. So is it for an instance
+        // whose class overrides neither `__class__` nor `__getattribute__`.
+        if let Object::Instance(inst) = obj {
+            if inst.cls().class_attr_is_plain() {
+                return Ok(Object::Bool(false));
+            }
             match self.load_attr(obj, "__class__") {
                 Ok(Object::Type(c)) => {
                     if !Rc::ptr_eq(&c, &real) && c.is_subclass_of(cls) {
@@ -52093,6 +52101,11 @@ impl Interpreter {
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
         if let ([arg], []) = (args, kwargs) {
+            // `type(x)`: the class itself (`b_type`), without the
+            // constructor dispatch `instantiate` runs first.
+            if Rc::ptr_eq(ty, &builtin_types().type_) {
+                return Ok(Object::Type(builtins::class_of(arg)));
+            }
             if let Some(r) = self.container_ctor1(ty, arg) {
                 return r;
             }
