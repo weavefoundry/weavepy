@@ -2988,7 +2988,7 @@ unsafe extern "C" fn h_load_global(
         if frame.builtins_obj().is_some() {
             return DECLINED;
         }
-        let Some(slot) = ext.stamp_slots.get().and_then(|s| s.get(pc)) else {
+        let Some(slot) = ext.stamp_slot(pc) else {
             return DECLINED;
         };
         let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
@@ -3083,9 +3083,7 @@ unsafe extern "C" fn h_load_global(
                     && crate::simple_args_prefix(ins, pc + 2) =>
             {
                 let fp = ext
-                    .method_slots
-                    .get()
-                    .and_then(|s| s.get(pc + 1))
+                    .method_slot(pc + 1)
                     .and_then(|ms| ms.peek_unbound(cls.attr_version.get()))
                     .filter(|&fp| crate::fn_is_pure_leaf(&*fp));
                 if let Some(fp) = fp {
@@ -3106,9 +3104,7 @@ unsafe extern "C" fn h_load_global(
             // the `LOAD_ATTR` site's stamp.
             Object::Type(cls) if op_at(pc + 1) == Some(OpCode::LoadAttr) => {
                 if let Some(c) = ext
-                    .stamp_slots
-                    .get()
-                    .and_then(|s| s.get(pc + 1))
+                    .stamp_slot(pc + 1)
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
                     return fused(st, c, pc + 1);
@@ -3261,7 +3257,7 @@ unsafe extern "C" fn h_load_method(
                 }
             }
         }
-        let Some(ms) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
+        let Some(ms) = ext.method_slot(pc) else {
             return 1;
         };
         let f = match &*top {
@@ -3537,7 +3533,7 @@ unsafe extern "C" fn h_stack_attr(
                                 Some((k, v)) if crate::slot_name_matches(code, arg, k) => {
                                     crate::field_slot_note(
                                         ext,
-                                        code.instructions.len(),
+                                        code,
                                         pc,
                                         inst,
                                         key_idx,
@@ -3590,9 +3586,7 @@ fn type_attr(
     arg: u32,
 ) -> Option<Object> {
     if let Some(v) = ext
-        .stamp_slots
-        .get()
-        .and_then(|s| s.get(pc))
+        .stamp_slot(pc)
         .and_then(|s| crate::class_attr_hit(s, cls))
     {
         return Some(v);
@@ -4117,8 +4111,7 @@ unsafe extern "C" fn h_property(
             return attr_lane(st, pc, slot, recv, local);
         };
         let Some((getter, gcode)) = crate::code_vm_ext(&*code)
-            .and_then(|ext| ext.method_slots.get())
-            .and_then(|s| s.get(pc))
+            .and_then(|ext| ext.method_slot(pc))
             .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
         else {
             return attr_lane(st, pc, slot, recv, local);
@@ -4698,9 +4691,7 @@ unsafe extern "C" fn h_call(
         // through to them untouched.
         if let Object::Builtin(b) = &*base.add(start) {
             let kind = ext
-                .method_slots
-                .get()
-                .and_then(|s| s.get(pc))
+                .method_slot(pc)
                 .and_then(|s| s.get_leaf(b));
             if matches!(kind, Some(LeafKind::Isinstance | LeafKind::Fast(_)))
                 && Rc::strong_count(b) > 1
@@ -4818,7 +4809,7 @@ unsafe extern "C" fn h_call(
         }
         // A builtin the site has settled as a leaf (one it hasn't runs
         // through the core loop's builtin lane).
-        let Some(slot) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
+        let Some(slot) = ext.method_slot(pc) else {
             return CALL_DECLINED;
         };
         // A builtin the site settled on running in the core loop's lane (a
@@ -4974,9 +4965,7 @@ unsafe extern "C" fn h_call_leaf(
             let start = lenu - argc - 2;
             if let Object::Builtin(b) = &*base.add(start) {
                 let kind = x
-                    .method_slots
-                    .get()
-                    .and_then(|m| m.get(pcu))
+                    .method_slot(pcu)
                     .and_then(|m| m.get_leaf(b));
                 // A container's or string's method with a kernel, on the
                 // receiver in the self slot.
@@ -5837,9 +5826,7 @@ fn compile_with(
     let ninstrs = code.instructions.len();
     // The attribute sites' field caches (allocated here if no read has
     // recorded one yet: the code addresses them).
-    let field_slots: &[FieldSlot] = ext
-        .field_slots
-        .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
+    let field_slots = ext.alloc_field_sites(code);
     let mut entries: Vec<bool>;
     let mut globals: Vec<Box<GlobalCache>>;
     let mut slots: Vec<Box<SlotCache>>;
@@ -5995,7 +5982,7 @@ struct Lower<'a> {
     ext: &'a CodeConstObjects,
     nlocals: usize,
     depths: &'a [i64],
-    field_slots: &'a [FieldSlot],
+    field_slots: crate::Sites<'a, FieldSlot>,
     st: Value,
     locals: Value,
     stack: Value,
@@ -6164,7 +6151,7 @@ impl<'a> Lower<'a> {
         ext: &'a CodeConstObjects,
         nlocals: usize,
         depths: &'a [i64],
-        field_slots: &'a [FieldSlot],
+        field_slots: crate::Sites<'a, FieldSlot>,
     ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);

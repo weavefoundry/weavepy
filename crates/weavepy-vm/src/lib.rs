@@ -9844,7 +9844,7 @@ impl Interpreter {
         let Some(Object::Instance(inst)) = frame.stack.last() else {
             return None;
         };
-        let slot = code_vm_ext(&frame.code)?.method_slots.get()?.get(pc)?;
+        let slot = code_vm_ext(&frame.code)?.method_slot(pc)?;
         slot.getter(inst.cls_raw().attr_version.get())
     }
 
@@ -11130,9 +11130,7 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<(Result<Object, RuntimeError>, usize)> {
         let next = *code.instructions.get(pc + 1)?;
-        let mslots: &[MethodSlot] = ext
-            .and_then(|e| e.method_slots.get())
-            .map_or(&[][..], |s| &s[..]);
+        let mslots: Sites<'_, MethodSlot> = ext.map_or(Sites::empty(), |e| e.method_sites());
         match other {
             Object::Instance(_) | Object::Module(_) => {
                 // A site that verified its pure callee for this class version
@@ -11292,10 +11290,9 @@ impl Interpreter {
             ($cache:ident, $frame:expr, $ext:expr) => {
                 *$cache.get_or_insert_with(|| {
                     if $frame.builtins_obj().is_none() {
-                        $ext.and_then(|e| e.stamp_slots.get())
-                            .map_or(&[][..], |s| &s[..])
+                        $ext.map_or(Sites::empty(), |e| e.stamp_sites())
                     } else {
-                        &[][..]
+                        Sites::empty()
                     }
                 })
             };
@@ -11303,8 +11300,7 @@ impl Interpreter {
         macro_rules! mslots {
             ($cache:ident, $ext:expr) => {
                 *$cache.get_or_insert_with(|| {
-                    $ext.and_then(|e| e.method_slots.get())
-                        .map_or(&[][..], |s| &s[..])
+                    $ext.map_or(Sites::empty(), |e| e.method_sites())
                 })
             };
         }
@@ -11335,8 +11331,8 @@ impl Interpreter {
             // attribute stamps, the method slots) is derived at its first
             // use: every call, return and helper handoff runs this prologue
             // again, and most activations never read it.
-            let mut cold_stamps: Option<&[StampSlot]> = None;
-            let mut cold_mslots: Option<&[MethodSlot]> = None;
+            let mut cold_stamps: Option<Sites<'_, StampSlot>> = None;
+            let mut cold_mslots: Option<Sites<'_, MethodSlot>> = None;
             //
             // The fused local pairs below, one byte per instruction (empty
             // for code that has none).
@@ -14491,7 +14487,7 @@ impl Interpreter {
                             break Some(CoreExit::Helper);
                         }
                         if let Some(e) = ext {
-                            field_slot_note(e, ninstrs, pc, inst, key_idx);
+                            field_slot_note(e, code, pc, inst, key_idx);
                         }
                         let v = Self::clone_operand(v);
                         // SAFETY: the receiver (droppable) is replaced in place.
@@ -17094,7 +17090,10 @@ impl Interpreter {
         let Some(shape) = code_store_init(code) else {
             return false;
         };
-        let Some(slots) = code_vm_ext(code).and_then(|e| e.field_slots.get()) else {
+        let Some(slots) = code_vm_ext(code)
+            .filter(|e| e.field_slots.is_allocated())
+            .map(|e| e.field_slots.view())
+        else {
             return false;
         };
         let ver = ty.attr_version.get();
@@ -19027,9 +19026,7 @@ impl Interpreter {
             return None;
         }
         let fast = code_vm_ext(code)?
-            .method_slots
-            .get()?
-            .get(pc)?
+            .method_slot(pc)?
             .get_native_subscript(cls.attr_version.get(), leaf_builtins::generation())?;
         #[cfg(test)]
         NATIVE_SUBSCRIPT_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -19051,7 +19048,7 @@ impl Interpreter {
         recv: &Object,
         attr_pc: usize,
         name_idx: u32,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -19119,7 +19116,7 @@ impl Interpreter {
         code: &CodeObject,
         recv: &Object,
         attr_pc: usize,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -19219,7 +19216,7 @@ impl Interpreter {
         recv: &Object,
         attr_pc: usize,
         name_idx: u32,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -19265,14 +19262,15 @@ impl Interpreter {
         let callee: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let ver = cls.attr_version.get();
         if nargs + 1 == callee.arg_count as usize {
-            let held = mslots[attr_pc]
+            let held = mslots
+                .get(attr_pc)?
                 .get_held(ver)
                 .filter(|h| std::ptr::eq(Rc::as_ptr(h), fp));
             if let (Some(ext), Some(held)) = (code_vm_ext(code), held) {
                 let func = Rc::downgrade(&held);
                 leaf_site_set(
                     ext,
-                    code.instructions.len(),
+                    code,
                     attr_pc,
                     Some(LeafSiteData {
                         ver,
@@ -19346,7 +19344,7 @@ impl Interpreter {
         let r = self.pure_leaf_call(code_rc, f, &args[..total], effect, depth);
         let Some(v) = r else {
             if let Some(ext) = code_vm_ext(code) {
-                leaf_site_set(ext, code.instructions.len(), attr_pc, None);
+                leaf_site_set(ext, code, attr_pc, None);
             }
             return SiteCall::Missed;
         };
@@ -19786,7 +19784,7 @@ impl Interpreter {
             }
             field_slot_note(
                 ext,
-                code.instructions.len(),
+                code,
                 cache_pc as usize,
                 inst,
                 key_idx,
@@ -21896,7 +21894,7 @@ impl Interpreter {
             }
             // A scalar class attribute the instance doesn't shadow, or a
             // named tuple field (see `leaf_attr_resolve_site`).
-            if let Some(slot) = ext.stamp_slots.get().and_then(|s| s.get(attr_pc)) {
+            if let Some(slot) = ext.stamp_slot(attr_pc) {
                 if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
                     if !inst_may_shadow(inst, code, name_idx) {
                         return Some(v);
@@ -21921,7 +21919,7 @@ impl Interpreter {
                 return None;
             }
             if let Some(ext) = ext {
-                field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+                field_slot_note(ext, code, attr_pc, inst, key_idx);
             }
             return Some(Self::clone_operand(v));
         }
@@ -22009,14 +22007,14 @@ impl Interpreter {
                         } if ver == cached => {
                             let hit = indexed(key_idx);
                             if let (Some(_), Some(ext)) = (hit, ext) {
-                                field_slot_note(ext, code.instructions.len(), pc, inst, key_idx);
+                                field_slot_note(ext, code, pc, inst, key_idx);
                             }
                             hit
                         }
                         _ => None,
                     };
                     primary.or_else(|| {
-                        let poly = code_vm_ext(code)?.attr_poly.get()?.get(pc)?;
+                        let poly = code_vm_ext(code)?.attr_poly_slot(pc)?;
                         indexed(poly.index(ver)?)
                     })
                 }
@@ -22073,8 +22071,7 @@ impl Interpreter {
         let cls = inst.cls_raw();
         let ext = code_vm_ext(code);
         if let Some((ver, idx)) = ext
-            .and_then(|e| e.field_slots.get())
-            .and_then(|slots| slots.get(attr_pc))
+            .and_then(|e| e.field_slot(attr_pc))
             .map(FieldSlot::get)
         {
             if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
@@ -22123,7 +22120,7 @@ impl Interpreter {
                 let old = std::mem::replace(slot, unsafe { std::ptr::read(value) });
                 drop(old);
                 if let Some(ext) = ext {
-                    field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+                    field_slot_note(ext, code, attr_pc, inst, key_idx);
                 }
                 true
             }
@@ -22232,7 +22229,7 @@ impl Interpreter {
         attr_pc: usize,
         cursor: &mut Option<usize>,
     ) -> Option<bool> {
-        let (ver, idx) = ext.field_slots.get()?.get(attr_pc)?.get();
+        let (ver, idx) = ext.field_slot(attr_pc)?.get();
         if inst.cls_raw().attr_version.get() != ver || crate::capi_watchers::dicts_active() {
             return None;
         }
@@ -22354,7 +22351,7 @@ impl Interpreter {
                         // SAFETY: a read between two instructions.
                         let pos = unsafe { inst.dict.split_peek() }.and_then(|s| s.position(name));
                         if let Some(pos) = pos.and_then(|p| u32::try_from(p).ok()) {
-                            field_slot_note(ext, code.instructions.len(), attr_pc, inst, pos);
+                            field_slot_note(ext, code, attr_pc, inst, pos);
                         }
                     }
                     return true;
@@ -25110,8 +25107,7 @@ impl Interpreter {
         // Inspect an existing table first. A Python-defined subscript
         // must not allocate a native cache or pay the temporary probe.
         let cached = code_vm_ext(code)
-            .and_then(|ext| ext.method_slots.get())
-            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|ext| ext.method_slot(cache_pc as usize))
             .and_then(|slot| slot.get_native_subscript(version, generation));
         let fast = match cached {
             Some(fast) => {
@@ -25177,8 +25173,7 @@ impl Interpreter {
         let version = cls.attr_version.get();
         let generation = leaf_builtins::generation();
         let cached = code_vm_ext(code)
-            .and_then(|ext| ext.method_slots.get())
-            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|ext| ext.method_slot(cache_pc as usize))
             .and_then(|slot| slot.get_native_subscript(version, generation));
         if cached.is_some() {
             return cached;
@@ -26540,10 +26535,7 @@ impl Interpreter {
         receiver: &Object,
         depth: usize,
     ) -> Option<Object> {
-        let slot = code_vm_ext(code)?
-            .method_slots
-            .get()?
-            .get(cache_pc as usize)?;
+        let slot = code_vm_ext(code)?.method_slot(cache_pc as usize)?;
         let cls = inst.cls_raw();
         // SAFETY: GIL-serialized (the caller declines free threading); the
         // getter evaluation runs no Python, so nothing rebinds either.
@@ -71375,21 +71367,25 @@ struct CodeConstObjects {
     /// before falling back to a byte compare, and `STORE_ATTR` inserts
     /// the pooled key without a per-store pool lookup.
     name_objs: Vec<Object>,
+    /// Each instruction's rank among the code's *sites* (see
+    /// [`site_ranks`]), which index the per-site tables below, or
+    /// [`NO_SITE`]; built with the first of those tables.
+    site_ranks: std::sync::OnceLock<std::sync::Arc<[u16]>>,
     /// RFC 0077 WS4: the resolved method per `LoadAttrMethod` site (see
     /// [`MethodSlot`]). Allocated on the first method-shape hit in this
-    /// code object, one slot per instruction so `cache_pc` indexes it.
-    method_slots: std::sync::OnceLock<Box<[MethodSlot]>>,
+    /// code object.
+    method_slots: SiteSlots<MethodSlot>,
     /// The dict stamps a `LOAD_GLOBAL` site last validated against (see
     /// [`StampSlot`]); allocated on the first global hit in this code
-    /// object, one slot per instruction.
-    stamp_slots: std::sync::OnceLock<Box<[StampSlot]>>,
+    /// object.
+    stamp_slots: SiteSlots<StampSlot>,
     /// Polymorphic instance-attribute entries per `LOAD_ATTR` site (see
     /// [`AttrPoly`]); allocated on the first polymorphic resolution in
-    /// this code object, one slot per instruction.
-    attr_poly: std::sync::OnceLock<Box<[AttrPoly]>>,
+    /// this code object.
+    attr_poly: SiteSlots<AttrPoly>,
     /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
     /// on the first inline call in this code object.
-    call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
+    call_slots: SiteSlots<CallSlot>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
     /// `4` constant return, `5` small-int return, `6` attribute return,
@@ -71418,7 +71414,7 @@ struct CodeConstObjects {
     gen_start: std::sync::atomic::AtomicU32,
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
-    field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
+    field_slots: SiteSlots<FieldSlot>,
     /// The `BINARY_OP` and `COMPARE_OP` sites the core loop has run on a
     /// natively served operand (see `stdlib::datetime_native`), for the
     /// frame compiler to send through its helpers instead of the scalar
@@ -71431,7 +71427,7 @@ struct CodeConstObjects {
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
-    leaf_sites: std::sync::OnceLock<Box<[LeafSite]>>,
+    leaf_sites: SiteSlots<LeafSite>,
     /// A leaf body's translation for the frameless evaluator (see
     /// [`leaf_plan`]), or `None` when the body has none.
     leaf_plan: std::sync::OnceLock<Option<Box<leaf_plan::LeafPlan>>>,
@@ -71472,6 +71468,205 @@ struct CodeConstObjects {
 
 /// [`CodeConstObjects::gen_start`]'s mark of a body with a `SEND`.
 const GEN_DELEGATES: u32 = 1 << 31;
+
+/// The rank [`site_ranks`] gives an instruction that isn't a site (or one
+/// past the 65,535th): no per-site table has an entry at it.
+const NO_SITE: u16 = u16::MAX;
+
+/// Whether instructions of `op` are *sites*: the instructions whose pcs
+/// the per-site tables of [`CodeConstObjects`] are read and written at.
+/// An access at any other instruction finds no entry, as an unallocated
+/// table does.
+#[inline]
+fn is_site_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::LoadGlobal
+            | OpCode::LoadAttr
+            | OpCode::LoadMethodAttr
+            | OpCode::LoadSuperAttr
+            | OpCode::StoreAttr
+            | OpCode::LoadSpecial
+            | OpCode::BinarySubscr
+            | OpCode::StoreSubscr
+            | OpCode::Call
+            | OpCode::CallSelf
+            | OpCode::CallKw
+            | OpCode::CallEx
+    )
+}
+
+/// Each instruction's rank among `code`'s sites (see [`is_site_op`]), in
+/// order, or [`NO_SITE`].
+///
+/// The per-site tables hold an entry per site rather than per
+/// instruction: most instructions (local and constant loads, stores,
+/// jumps) never read one, and entries tens of bytes each for every
+/// instruction made the warm code of a few imports hold megabytes of
+/// tables.
+fn site_ranks(code: &CodeObject) -> std::sync::Arc<[u16]> {
+    let mut next = 0u16;
+    code.instructions
+        .iter()
+        .map(|i| {
+            if is_site_op(i.op) && next < NO_SITE {
+                next += 1;
+                next - 1
+            } else {
+                NO_SITE
+            }
+        })
+        .collect()
+}
+
+/// A per-site table of [`CodeConstObjects`]: an entry per site (see
+/// [`site_ranks`]), allocated on first use. [`Self::get`] and
+/// [`Self::view`] map an instruction's pc to its entry.
+struct SiteSlots<T>(std::sync::OnceLock<SiteTable<T>>);
+
+/// An allocated [`SiteSlots`]: the code's site ranks (shared by its
+/// tables, and kept here so that a lookup checks one initialization) and
+/// the entries.
+struct SiteTable<T> {
+    ranks: std::sync::Arc<[u16]>,
+    slots: Box<[T]>,
+}
+
+impl<T> SiteSlots<T> {
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    /// Whether the table is allocated.
+    #[inline]
+    fn is_allocated(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// The entry of the instruction at `pc`, if the table is allocated
+    /// and the instruction is a site.
+    #[inline(always)]
+    fn get(&self, pc: usize) -> Option<&T> {
+        let t = self.0.get()?;
+        // (`NO_SITE` is past the end of every table, which has at most
+        // `NO_SITE` entries.)
+        t.slots.get(usize::from(*t.ranks.get(pc)?))
+    }
+
+    /// The pc-indexed view of the table (empty while unallocated).
+    #[inline(always)]
+    fn view(&self) -> Sites<'_, T> {
+        match self.0.get() {
+            Some(t) => Sites {
+                ranks: &t.ranks,
+                slots: &t.slots,
+            },
+            None => Sites::empty(),
+        }
+    }
+}
+
+/// A view of a per-site table that takes instruction pcs (see
+/// [`SiteSlots`]); empty when the table isn't allocated.
+pub(crate) struct Sites<'a, T> {
+    ranks: &'a [u16],
+    slots: &'a [T],
+}
+
+impl<T> Clone for Sites<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Sites<'_, T> {}
+
+impl<'a, T> Sites<'a, T> {
+    /// The view of no table.
+    pub(crate) const fn empty() -> Self {
+        Sites {
+            ranks: &[],
+            slots: &[],
+        }
+    }
+
+    /// The entry of the instruction at `pc`, if it is a site.
+    #[inline(always)]
+    pub(crate) fn get(&self, pc: usize) -> Option<&'a T> {
+        // (`NO_SITE` is past the end of every table, which has at most
+        // `NO_SITE` entries.)
+        self.slots.get(usize::from(*self.ranks.get(pc)?))
+    }
+}
+
+impl CodeConstObjects {
+    /// The view of `table` (one of this object's per-site tables),
+    /// allocated (with an entry per site of `code`, this object's code) if
+    /// it isn't yet.
+    fn alloc_sites<'a, T>(
+        &'a self,
+        code: &CodeObject,
+        table: &'a SiteSlots<T>,
+        empty: impl Fn() -> T,
+    ) -> Sites<'a, T> {
+        table.0.get_or_init(|| {
+            let ranks = self.site_ranks.get_or_init(|| site_ranks(code)).clone();
+            let n = ranks.iter().filter(|&&r| r != NO_SITE).count();
+            SiteTable {
+                ranks,
+                slots: (0..n).map(|_| empty()).collect(),
+            }
+        });
+        table.view()
+    }
+
+    /// The method slot of the instruction at `pc` (see
+    /// [`Self::method_slots`]).
+    #[inline(always)]
+    pub(crate) fn method_slot(&self, pc: usize) -> Option<&MethodSlot> {
+        self.method_slots.get(pc)
+    }
+
+    /// The stamp slot of the instruction at `pc` (see
+    /// [`Self::stamp_slots`]).
+    #[inline(always)]
+    pub(crate) fn stamp_slot(&self, pc: usize) -> Option<&StampSlot> {
+        self.stamp_slots.get(pc)
+    }
+
+    /// The field slot of the instruction at `pc` (see
+    /// [`Self::field_slots`]).
+    #[inline(always)]
+    pub(crate) fn field_slot(&self, pc: usize) -> Option<&FieldSlot> {
+        self.field_slots.get(pc)
+    }
+
+    /// The polymorphic attribute entries of the instruction at `pc` (see
+    /// [`Self::attr_poly`]).
+    #[inline(always)]
+    pub(crate) fn attr_poly_slot(&self, pc: usize) -> Option<&AttrPoly> {
+        self.attr_poly.get(pc)
+    }
+
+    /// The method slots by pc (see [`Self::method_slots`]).
+    #[inline(always)]
+    pub(crate) fn method_sites(&self) -> Sites<'_, MethodSlot> {
+        self.method_slots.view()
+    }
+
+    /// The stamp slots by pc (see [`Self::stamp_slots`]).
+    #[inline(always)]
+    pub(crate) fn stamp_sites(&self) -> Sites<'_, StampSlot> {
+        self.stamp_slots.view()
+    }
+
+    /// The field slots by pc (see [`Self::field_slots`]), allocated if
+    /// they aren't yet; `code` is this object's code.
+    #[cfg(feature = "jit")]
+    pub(crate) fn alloc_field_sites(&self, code: &CodeObject) -> Sites<'_, FieldSlot> {
+        self.alloc_sites(code, &self.field_slots, FieldSlot::empty)
+    }
+}
 
 /// The bound the core loop checks a code object's entry pc against, so it
 /// dispatches each instruction without a bounds check: the instruction
@@ -71519,10 +71714,10 @@ fn code_dispatch_len(code: &CodeObject) -> usize {
 }
 
 /// Whether `ext`'s code (of `ninstrs` instructions) may allocate its
-/// per-instruction side tables, after one more site execution found one
+/// per-site side tables, after one more site execution found one
 /// unallocated.
 ///
-/// Each table holds an entry per instruction, tens of bytes each, while
+/// Each table holds an entry per site, tens of bytes each, while
 /// most code runs only a few times (a function an import calls once or
 /// twice): allocating the tables at a site's first run cost a small
 /// program's start-up about 1.5 MB. So the tables wait until the code's
@@ -71538,6 +71733,39 @@ fn site_tables_warm(ext: &CodeConstObjects, ninstrs: usize) -> bool {
     let n = ext.cold_sites.load(Relaxed).saturating_add(1);
     ext.cold_sites.store(n, Relaxed);
     n as usize >= ninstrs
+}
+
+/// The entry of `table` (one of `ext`'s per-site tables) for the
+/// instruction at `pc`, allocating the table once `code` (`ext`'s code) is
+/// warm (see [`site_tables_warm`]).
+#[inline(always)]
+fn warm_site<'a, T>(
+    ext: &'a CodeConstObjects,
+    code: &CodeObject,
+    table: &'a SiteSlots<T>,
+    pc: usize,
+    empty: fn() -> T,
+) -> Option<&'a T> {
+    match table.0.get() {
+        Some(t) => t.slots.get(usize::from(*t.ranks.get(pc)?)),
+        None => warm_site_alloc(ext, code, table, pc, empty),
+    }
+}
+
+/// [`warm_site`] for a table not yet allocated.
+#[cold]
+#[inline(never)]
+fn warm_site_alloc<'a, T>(
+    ext: &'a CodeConstObjects,
+    code: &CodeObject,
+    table: &'a SiteSlots<T>,
+    pc: usize,
+    empty: fn() -> T,
+) -> Option<&'a T> {
+    if !site_tables_warm(ext, code.instructions.len()) {
+        return None;
+    }
+    ext.alloc_sites(code, table, empty).get(pc)
 }
 
 /// Let `code`'s side tables be allocated from now on (see
@@ -71690,15 +71918,7 @@ fn builtin_recv_tag(recv: &Object) -> Option<u64> {
 #[inline]
 fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.call_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .call_slots
-            .get_or_init(|| (0..n).map(|_| CallSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(pc)
+    warm_site(ext, code, &ext.call_slots, pc, CallSlot::empty)
 }
 
 /// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to
@@ -71758,15 +71978,7 @@ impl AttrPoly {
 #[inline]
 fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.attr_poly.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .attr_poly
-            .get_or_init(|| (0..n).map(|_| AttrPoly::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(ext, code, &ext.attr_poly, cache_pc as usize, AttrPoly::empty)
 }
 
 /// The state a `LOAD_GLOBAL` site last proved its cached slot against:
@@ -71819,7 +72031,7 @@ pub(crate) const FIELD_SLOT_IDX: usize = std::mem::offset_of!((u64, u32), 1);
 /// The [`FieldSlot`] of the attribute site at `pc` of `code`, if the code
 /// has any (native code reads it in line).
 pub(crate) fn code_field_slot(code: &CodeObject, pc: usize) -> Option<*const u8> {
-    let slot = code_vm_ext(code)?.field_slots.get()?.get(pc)?;
+    let slot = code_vm_ext(code)?.field_slot(pc)?;
     Some(std::ptr::from_ref(slot).cast())
 }
 
@@ -71950,7 +72162,7 @@ fn leaf_site_hit(
     pc: usize,
     ver: u64,
 ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
-    let site = ext.leaf_sites.get()?.get(pc)?;
+    let site = ext.leaf_sites.get(pc)?;
     // SAFETY: GIL-serialized; the borrow ends before any refill.
     match unsafe { &*site.0.get() } {
         Some(d) if d.ver == ver && d.func.strong_count() > 0 => {
@@ -71971,7 +72183,7 @@ pub(crate) fn builtin_method_site(
     attr_pc: usize,
     call_pc: usize,
 ) -> Option<(u64, LeafKind, Rc<crate::object::BuiltinFn>)> {
-    let slots = ext.method_slots.get()?;
+    let slots = ext.method_sites();
     // SAFETY: GIL-serialized; the borrow ends before any refill.
     let (ver, f) = unsafe { &*slots.get(attr_pc)?.0.get() };
     let MethodSlotFn::Builtin(b) = f else {
@@ -71991,7 +72203,7 @@ pub(crate) fn builtin_method_site(
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.
 #[cfg(feature = "jit")]
 pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKind> {
-    let slot = ext.method_slots.get()?.get(pc)?;
+    let slot = ext.method_slot(pc)?;
     // SAFETY: GIL-serialized; the borrow ends here.
     match unsafe { &(*slot.0.get()).1 } {
         MethodSlotFn::Leaf(_, kind) => Some(*kind),
@@ -72017,17 +72229,13 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
     // SAFETY: GIL-serialized; the borrows end before any refill; a live
     // site's code is its live function's.
     let leaf = ext
-        .leaf_sites
-        .get()
-        .and_then(|s| s.get(pc))
+        .leaf_sites.get(pc)
         .and_then(|s| unsafe { &*s.0.get() }.as_ref())
         .is_some_and(|site| {
             site.func.strong_count() > 0 && !(site.effect && code_calls(unsafe { &*site.code }))
         });
     leaf || ext
-        .method_slots
-        .get()
-        .and_then(|s| s.get(pc))
+        .method_slot(pc)
         .is_some_and(|slot| match unsafe { &(*slot.0.get()).1 } {
             MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
             MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
@@ -72043,13 +72251,13 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 
 /// Record (or, with `data` `None`, forget) the site at `pc`'s callee.
 #[inline(never)]
-fn leaf_site_set(ext: &CodeConstObjects, ninstrs: usize, pc: usize, data: Option<LeafSiteData>) {
-    if ext.leaf_sites.get().is_none() && (data.is_none() || !site_tables_warm(ext, ninstrs)) {
+fn leaf_site_set(ext: &CodeConstObjects, code: &CodeObject, pc: usize, data: Option<LeafSiteData>) {
+    if !ext.leaf_sites.is_allocated()
+        && (data.is_none() || !site_tables_warm(ext, code.instructions.len()))
+    {
         return;
     }
-    let sites = ext
-        .leaf_sites
-        .get_or_init(|| (0..ninstrs).map(|_| LeafSite::empty()).collect());
+    let sites = ext.alloc_sites(code, &ext.leaf_sites, LeafSite::empty);
     if let Some(site) = sites.get(pc) {
         site.set(data);
     }
@@ -72080,7 +72288,7 @@ unsafe fn field_slot_hit<'a>(
     pc: usize,
     inst: &'a PyInstance,
 ) -> Option<&'a Object> {
-    let (ver, idx) = ext.field_slots.get()?.get(pc)?.get();
+    let (ver, idx) = ext.field_slot(pc)?.get();
     if inst.cls_raw().attr_version.get() != ver {
         return None;
     }
@@ -72093,17 +72301,15 @@ unsafe fn field_slot_hit<'a>(
 /// (whose class passed the site's version check): kept only when that
 /// position is the split layout's, over the class's own names.
 #[inline(never)]
-fn field_slot_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize, inst: &PyInstance, idx: u32) {
+fn field_slot_note(ext: &CodeConstObjects, code: &CodeObject, pc: usize, inst: &PyInstance, idx: u32) {
     // SAFETY: a read with nothing running (the caller's own guarded read).
     if unsafe { inst.split_field(idx as usize) }.is_none() {
         return;
     }
-    if ext.field_slots.get().is_none() && !site_tables_warm(ext, ninstrs) {
+    if !ext.field_slots.is_allocated() && !site_tables_warm(ext, code.instructions.len()) {
         return;
     }
-    let slots = ext
-        .field_slots
-        .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
+    let slots = ext.alloc_sites(code, &ext.field_slots, FieldSlot::empty);
     if let Some(slot) = slots.get(pc) {
         slot.set((inst.cls_raw().attr_version.get(), idx));
     }
@@ -72131,10 +72337,7 @@ fn native_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
 /// Whether the `LOAD_ATTR` at `pc` has recorded a split-layout field (see
 /// [`FieldSlot`]).
 pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
-    ext.field_slots
-        .get()
-        .and_then(|s| s.get(pc))
-        .is_some_and(|s| s.get().0 != 0)
+    ext.field_slot(pc).is_some_and(|s| s.get().0 != 0)
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
@@ -72155,10 +72358,7 @@ fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
 /// method slot holds one).
 #[cfg(feature = "jit")]
 pub(crate) fn property_site(ext: &CodeConstObjects, pc: usize) -> bool {
-    ext.method_slots
-        .get()
-        .and_then(|s| s.get(pc))
-        .is_some_and(MethodSlot::holds_getter)
+    ext.method_slot(pc).is_some_and(MethodSlot::holds_getter)
 }
 
 /// Whether the `BINARY_OP` at `pc` has run on an instance operand.
@@ -72261,15 +72461,7 @@ fn drop_hot(v: Object) {
 #[inline]
 fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.stamp_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .stamp_slots
-            .get_or_init(|| (0..n).map(|_| StampSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(ext, code, &ext.stamp_slots, cache_pc as usize, StampSlot::empty)
 }
 
 /// Tags of a `LOAD_ATTR` site's class-attribute stamp (`[attr_version,
@@ -72907,15 +73099,7 @@ impl MethodSlot {
 #[inline]
 fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.method_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .method_slots
-            .get_or_init(|| (0..n).map(|_| MethodSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(ext, code, &ext.method_slots, cache_pc as usize, MethodSlot::empty)
 }
 
 /// The plain function class `cls` (at attribute version `ver`) resolves
@@ -73604,19 +73788,20 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
                 .collect(),
-            method_slots: std::sync::OnceLock::new(),
-            stamp_slots: std::sync::OnceLock::new(),
-            attr_poly: std::sync::OnceLock::new(),
-            call_slots: std::sync::OnceLock::new(),
+            site_ranks: std::sync::OnceLock::new(),
+            method_slots: SiteSlots::new(),
+            stamp_slots: SiteSlots::new(),
+            attr_poly: SiteSlots::new(),
+            call_slots: SiteSlots::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             leaf_tries: std::sync::atomic::AtomicU64::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             gen_start: std::sync::atomic::AtomicU32::new(0),
-            field_slots: std::sync::OnceLock::new(),
+            field_slots: SiteSlots::new(),
             native_sites: std::sync::OnceLock::new(),
             instance_sites: std::sync::OnceLock::new(),
-            leaf_sites: std::sync::OnceLock::new(),
+            leaf_sites: SiteSlots::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
             store_init: std::sync::OnceLock::new(),

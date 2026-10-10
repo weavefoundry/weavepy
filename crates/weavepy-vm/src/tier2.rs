@@ -10924,11 +10924,7 @@ unsafe fn cached_chain_peek<'a>(
                         .or_else(|| slots.get(name.as_ref()))
                 }
                 _ => {
-                    let index = extension
-                        .attr_poly
-                        .get()?
-                        .get(pc as usize)?
-                        .index(version)?;
+                    let index = extension.attr_poly_slot(pc as usize)?.index(version)?;
                     // SAFETY: the same callback-free, rooted interval.
                     let (key, value) = unsafe { inst.attr_peek_index(index as usize) }?;
                     key_is(key, name).then_some(value)

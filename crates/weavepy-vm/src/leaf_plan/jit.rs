@@ -400,8 +400,8 @@ unsafe fn cx<'a>(ctx: *mut Ctx<'static>) -> &'a mut Ctx<'a> {
 
 /// A frame's stamp slots (its global and class attribute caches).
 #[inline(always)]
-fn stamps(ext: &CodeConstObjects) -> &[crate::StampSlot] {
-    ext.stamp_slots.get().map_or(&[], |s| &s[..])
+fn stamps(ext: &CodeConstObjects) -> crate::Sites<'_, crate::StampSlot> {
+    ext.stamp_sites()
 }
 
 unsafe extern "C" fn h_global(
@@ -539,10 +539,7 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         let ver = inst.cls_raw().attr_version.get();
         // A property's getter answered (see `plan_getter`): nothing to
         // remember.
-        let site = ext
-            .method_slots
-            .get()
-            .and_then(|s| s.get((pc_name & 0xffff) as usize));
+        let site = ext.method_slot((pc_name & 0xffff) as usize);
         // SAFETY: GIL-serialized; the references don't outlive the check.
         if site.is_some_and(|s| unsafe { s.getter_peek(ver) }.is_some()) {
             return status;
