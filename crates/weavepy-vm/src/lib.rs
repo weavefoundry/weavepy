@@ -15179,7 +15179,13 @@ impl Interpreter {
         let Some(slot) = code_call_slot(&frame.code, pc) else {
             return false;
         };
-        if slot.hit(fp, Rc::as_ptr(code_rc)) != Some((0, has_self))
+        let Some((missing, true)) = slot
+            .hit(fp, Rc::as_ptr(code_rc))
+            .map(|(missing, s)| (missing as usize, s == has_self))
+        else {
+            return false;
+        };
+        if (missing > 0 && !Self::defaults_cover(f, missing))
             || !code_rc.cellvars.is_empty()
             || !code_rc.freevars.is_empty()
             || !f.closure.is_empty()
@@ -15197,8 +15203,15 @@ impl Interpreter {
             return false;
         };
         // SAFETY: as above; the checks above hold.
-        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, fp, act, guard) };
+        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, missing, fp, act, guard) };
         true
+    }
+
+    /// Whether `f`'s compiled positional defaults (`__defaults__` never
+    /// rebound) cover the last `missing` parameters.
+    #[inline]
+    fn defaults_cover(f: &PyFunction, missing: usize) -> bool {
+        f.defaults.len() >= missing && !f.defaults_maybe_overridden()
     }
 
     /// The committed half of [`Self::core_call_plain`]: the arguments of
@@ -15206,12 +15219,14 @@ impl Interpreter {
     /// `callee_slot`, its self slot filled when `has_self`) move into the
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
     /// `fp` (with exactly its arity) under the recursion `guard`, is
-    /// pushed and made the running activation.
+    /// pushed and made the running activation. The last `missing`
+    /// parameters take `fp`'s positional defaults.
     ///
     /// # Safety
     ///
     /// The running activation is synced and unborrowed, and the call's
-    /// shape is one `core_call_plain` admits.
+    /// shape is one `core_call_plain` admits (the defaults cover
+    /// `missing`, see [`Self::defaults_cover`]).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn core_bind_plain(
@@ -15220,6 +15235,7 @@ impl Interpreter {
         pc: usize,
         callee_slot: usize,
         has_self: bool,
+        missing: usize,
         fp: *const crate::object::PyFunction,
         mut act: Box<InlineAct>,
         guard: crate::recursion::Guard,
@@ -15242,7 +15258,7 @@ impl Interpreter {
             callee_slot + 2
         };
         let nargs = n - first;
-        locals.reserve(nlocals.max(nargs));
+        locals.reserve(nlocals.max(nargs + missing));
         // SAFETY: the `nargs` operands above `first` move into the locals
         // (reserved above) and the stack forgets them; the callable moves
         // out of its slot, and an empty self slot owns nothing.
@@ -15256,6 +15272,13 @@ impl Interpreter {
             frame.stack.set_len(callee_slot);
             callable
         };
+        if missing > 0 {
+            // SAFETY: as above.
+            let defaults = unsafe { &(*fp).defaults };
+            for d in &defaults[defaults.len() - missing..] {
+                push_fast(locals, clone_hot(d));
+            }
+        }
         fill_unbound(locals, nlocals);
         frame.pc = pc as u32 + 1;
         // SAFETY: the slot is parked (see `inline_bind_cells`): its handles

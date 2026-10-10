@@ -425,7 +425,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
     // a round trip.
     let gain = |k: usize| -> Option<usize> {
         let op = ins[k].op;
-        if helped[k] {
+        // A call runs through its helpers (`call_op`), as the core loop's
+        // arm runs it: a compiled callee is called directly, any other
+        // activation switched to without a round trip through the loop.
+        if helped[k] || matches!(op, OpCode::Call | OpCode::CallKw) {
             return Some(1);
         }
         if !native_at(code, k) {
@@ -1122,13 +1125,21 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 None => return 3,
             }
         }
-        PyIterator::Tuple { items, index } => {
-            let Some(v) = items.get(*index).cloned() else {
-                return 3;
-            };
-            *index += 1;
-            v
-        }
+        PyIterator::Tuple { items, index } => match items.get(*index) {
+            Some(v) => {
+                let v = v.clone();
+                *index += 1;
+                v
+            }
+            // The exhausted iterator leaves the stack, as for a list: its
+            // tuple has another owner, so nothing dies with it.
+            None if unique && crate::object::SharedTuple::strong_count(items) > 1 => {
+                // SAFETY: as above.
+                drop(unsafe { it.read() });
+                return 2;
+            }
+            None => return 3,
+        },
         // `reversed(xs)`: the item below the cursor.
         PyIterator::Reversed { items, index, .. } => {
             if *index < 0 {
@@ -2391,6 +2402,8 @@ pub(crate) struct DirectSite {
     code: usize,
     native: usize,
     retry: u32,
+    /// How many trailing parameters take the function's defaults.
+    missing: u32,
     has_self: bool,
 }
 
@@ -2409,7 +2422,7 @@ impl Drop for DirectSite {
 impl DirectSite {
     /// Record a call of `code` (with or without its self slot): its native
     /// body if it qualifies, or none until `retry` more calls.
-    fn fill(&mut self, code: &Rc<CodeObject>, has_self: bool, native: usize) {
+    fn fill(&mut self, code: &Rc<CodeObject>, has_self: bool, native: usize, missing: usize) {
         if Rc::as_ptr(code) as usize != self.code {
             let old = std::mem::replace(&mut self.code, Rc::into_raw(code.clone()) as usize);
             if old != 0 {
@@ -2418,6 +2431,7 @@ impl DirectSite {
             }
         }
         self.has_self = has_self;
+        self.missing = missing as u32;
         self.native = native;
         self.retry = if native == 0 { 64 } else { 0 };
     }
@@ -2425,12 +2439,14 @@ impl DirectSite {
 
 /// Whether a call of `f` (running `code`) with `nargs` positional
 /// arguments binds as [`Interpreter::core_call_plain`] binds it, and
-/// `code`'s native body runs from its start: that body.
+/// `code`'s native body runs from its start: that body, and how many
+/// trailing parameters take `f`'s defaults.
 fn direct_body<'a>(
     f: &crate::object::PyFunction,
     code: &'a CodeObject,
     nargs: usize,
-) -> Option<&'a Native> {
+) -> Option<(&'a Native, usize)> {
+    let missing = (code.arg_count as usize).checked_sub(nargs)?;
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
@@ -2438,7 +2454,7 @@ fn direct_body<'a>(
         || !code.freevars.is_empty()
         || !f.closure.is_empty()
         || Interpreter::has_extended_params(code)
-        || code.arg_count as usize != nargs
+        || (missing > 0 && !Interpreter::defaults_cover(f, missing))
         || code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
     {
         return None;
@@ -2447,7 +2463,7 @@ fn direct_body<'a>(
     if ext.dispatch_len == 0 {
         return None;
     }
-    ext.frame_jit.get(code.varnames.len().max(nargs))
+    Some((ext.frame_jit.get(code.varnames.len().max(nargs))?, missing))
 }
 
 /// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
@@ -2701,12 +2717,19 @@ unsafe fn direct_call(
             || site.native == 0
         {
             let nargs = len - start - 2 + usize::from(has_self);
-            let native = direct_body(f, code_rc, nargs)
-                .map_or(0, |n| std::ptr::from_ref::<Native>(n) as usize);
-            site.fill(code_rc, has_self, native);
+            let (native, missing) = direct_body(f, code_rc, nargs).map_or((0, 0), |(n, m)| {
+                (std::ptr::from_ref::<Native>(n) as usize, m)
+            });
+            site.fill(code_rc, has_self, native, missing);
             if native == 0 {
                 return None;
             }
+        }
+        // (Another function running the same code may have rebound its
+        // defaults.)
+        let missing = site.missing as usize;
+        if missing > 0 && !Interpreter::defaults_cover(f, missing) {
+            return None;
         }
         let native = &*(site.native as *const Native);
         let interp = &mut *st.interp.cast_mut();
@@ -2736,7 +2759,7 @@ unsafe fn direct_call(
         caller.pc = pc as u32;
         *sw.last = st.last;
         let saved_last = sw.last;
-        let callee = interp.core_bind_plain(sw, pc, start, has_self, fp, act, guard);
+        let callee = interp.core_bind_plain(sw, pc, start, has_self, missing, fp, act, guard);
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
         if let Some(a) = (*sw.inl).last_mut() {
