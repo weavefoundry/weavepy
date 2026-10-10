@@ -552,9 +552,10 @@ impl ModuleCache {
             return false;
         };
         let candidate = names.contains(std::ffi::OsStr::new(LANDMARK))
-            || names
-                .iter()
-                .any(|n| n.as_encoded_bytes().eq_ignore_ascii_case(LANDMARK.as_bytes()));
+            || names.iter().any(|n| {
+                n.as_encoded_bytes()
+                    .eq_ignore_ascii_case(LANDMARK.as_bytes())
+            });
         candidate && dir.join(LANDMARK).is_file()
     }
 

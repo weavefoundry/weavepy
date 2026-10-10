@@ -11299,9 +11299,7 @@ impl Interpreter {
         }
         macro_rules! mslots {
             ($cache:ident, $ext:expr) => {
-                *$cache.get_or_insert_with(|| {
-                    $ext.map_or(Sites::empty(), |e| e.method_sites())
-                })
+                *$cache.get_or_insert_with(|| $ext.map_or(Sites::empty(), |e| e.method_sites()))
             };
         }
         'reload: loop {
@@ -19782,13 +19780,7 @@ impl Interpreter {
             if !slot_name_matches_in(names, code, name_idx, key) {
                 return None;
             }
-            field_slot_note(
-                ext,
-                code,
-                cache_pc as usize,
-                inst,
-                key_idx,
-            );
+            field_slot_note(ext, code, cache_pc as usize, inst, key_idx);
             Some(value)
         } else {
             // SAFETY: the same rooted read as the dictionary path.
@@ -22070,10 +22062,7 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let cls = inst.cls_raw();
         let ext = code_vm_ext(code);
-        if let Some((ver, idx)) = ext
-            .and_then(|e| e.field_slot(attr_pc))
-            .map(FieldSlot::get)
-        {
+        if let Some((ver, idx)) = ext.and_then(|e| e.field_slot(attr_pc)).map(FieldSlot::get) {
             if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
                 // SAFETY: a store between two instructions (see `peek_mut`).
                 if let Some(slot) =
@@ -71978,7 +71967,13 @@ impl AttrPoly {
 #[inline]
 fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
     let ext = code_vm_ext(code)?;
-    warm_site(ext, code, &ext.attr_poly, cache_pc as usize, AttrPoly::empty)
+    warm_site(
+        ext,
+        code,
+        &ext.attr_poly,
+        cache_pc as usize,
+        AttrPoly::empty,
+    )
 }
 
 /// The state a `LOAD_GLOBAL` site last proved its cached slot against:
@@ -72229,7 +72224,8 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
     // SAFETY: GIL-serialized; the borrows end before any refill; a live
     // site's code is its live function's.
     let leaf = ext
-        .leaf_sites.get(pc)
+        .leaf_sites
+        .get(pc)
         .and_then(|s| unsafe { &*s.0.get() }.as_ref())
         .is_some_and(|site| {
             site.func.strong_count() > 0 && !(site.effect && code_calls(unsafe { &*site.code }))
@@ -72301,7 +72297,13 @@ unsafe fn field_slot_hit<'a>(
 /// (whose class passed the site's version check): kept only when that
 /// position is the split layout's, over the class's own names.
 #[inline(never)]
-fn field_slot_note(ext: &CodeConstObjects, code: &CodeObject, pc: usize, inst: &PyInstance, idx: u32) {
+fn field_slot_note(
+    ext: &CodeConstObjects,
+    code: &CodeObject,
+    pc: usize,
+    inst: &PyInstance,
+    idx: u32,
+) {
     // SAFETY: a read with nothing running (the caller's own guarded read).
     if unsafe { inst.split_field(idx as usize) }.is_none() {
         return;
@@ -72461,7 +72463,13 @@ fn drop_hot(v: Object) {
 #[inline]
 fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
     let ext = code_vm_ext(code)?;
-    warm_site(ext, code, &ext.stamp_slots, cache_pc as usize, StampSlot::empty)
+    warm_site(
+        ext,
+        code,
+        &ext.stamp_slots,
+        cache_pc as usize,
+        StampSlot::empty,
+    )
 }
 
 /// Tags of a `LOAD_ATTR` site's class-attribute stamp (`[attr_version,
@@ -73099,7 +73107,13 @@ impl MethodSlot {
 #[inline]
 fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
     let ext = code_vm_ext(code)?;
-    warm_site(ext, code, &ext.method_slots, cache_pc as usize, MethodSlot::empty)
+    warm_site(
+        ext,
+        code,
+        &ext.method_slots,
+        cache_pc as usize,
+        MethodSlot::empty,
+    )
 }
 
 /// The plain function class `cls` (at attribute version `ver`) resolves

@@ -3531,13 +3531,7 @@ unsafe extern "C" fn h_stack_attr(
                         IC::LoadAttrInstance { key_idx, ver } if cls.attr_version.get() == ver => {
                             match inst.attr_peek_index(key_idx as usize) {
                                 Some((k, v)) if crate::slot_name_matches(code, arg, k) => {
-                                    crate::field_slot_note(
-                                        ext,
-                                        code,
-                                        pc,
-                                        inst,
-                                        key_idx,
-                                    );
+                                    crate::field_slot_note(ext, code, pc, inst, key_idx);
                                     Some(Interpreter::clone_operand(v))
                                 }
                                 _ => None,
@@ -4690,9 +4684,7 @@ unsafe extern "C" fn h_call(
         // fast half), without the shape checks below; a decline falls
         // through to them untouched.
         if let Object::Builtin(b) = &*base.add(start) {
-            let kind = ext
-                .method_slot(pc)
-                .and_then(|s| s.get_leaf(b));
+            let kind = ext.method_slot(pc).and_then(|s| s.get_leaf(b));
             if matches!(kind, Some(LeafKind::Isinstance | LeafKind::Fast(_)))
                 && Rc::strong_count(b) > 1
                 && !st.sw.is_null()
@@ -4964,9 +4956,7 @@ unsafe extern "C" fn h_call_leaf(
             let base = s.stack;
             let start = lenu - argc - 2;
             if let Object::Builtin(b) = &*base.add(start) {
-                let kind = x
-                    .method_slot(pcu)
-                    .and_then(|m| m.get_leaf(b));
+                let kind = x.method_slot(pcu).and_then(|m| m.get_leaf(b));
                 // A container's or string's method with a kernel, on the
                 // receiver in the self slot.
                 if let (Some(k), false) = (kind, matches!(&*base.add(start + 1), Object::Unbound)) {
