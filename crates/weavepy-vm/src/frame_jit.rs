@@ -5942,7 +5942,7 @@ fn compile_with(
         nlocals,
         fails: entries.iter().map(|_| AtomicU8::new(0)).collect(),
         entries: entries.into_iter().map(AtomicBool::new).collect(),
-        name: code.qualname.clone(),
+        name: code.qualname.to_string(),
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
         need: stack_need(depths),

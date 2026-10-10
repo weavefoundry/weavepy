@@ -52410,7 +52410,7 @@ impl Interpreter {
         };
         let name = match args.get(2) {
             Some(Object::Str(s)) => s.to_string(),
-            Some(Object::None) | None => code.name.clone(),
+            Some(Object::None) | None => code.name.to_string(),
             Some(other) => {
                 return Err(type_error(format!(
                     "function() argument 'name' must be str or None, not {}",
@@ -56423,7 +56423,7 @@ impl Interpreter {
             f.slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| code.qualname.clone())
+                .unwrap_or_else(|| code.qualname.to_string())
         };
         if !missing_positional.is_empty() {
             return Err(type_error(format_missing_arguments(
@@ -56445,7 +56445,7 @@ impl Interpreter {
                 .slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| code.qualname.clone());
+                .unwrap_or_else(|| code.qualname.to_string());
             return Err(type_error(format_missing_arguments(
                 &error_name,
                 "keyword-only",
@@ -67020,7 +67020,7 @@ pub(crate) fn callable_function_str(callable: &Object) -> Option<String> {
                 .slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| f.code().qualname.clone());
+                .unwrap_or_else(|| f.code().qualname.to_string());
             let module = f.slot("__module__").as_ref().map(Object::to_str);
             match module {
                 Some(m) if !m.is_empty() && m != "builtins" => Some(format!("{m}.{qual}()")),
@@ -74350,7 +74350,7 @@ fn set_function_attribute(func: Object, value: Object, flag: u32) -> Result<Obje
                     let owner_qualname = f
                         .slot("__qualname__")
                         .map(|q| q.to_str())
-                        .unwrap_or_else(|| f.code.borrow().qualname.clone());
+                        .unwrap_or_else(|| f.code.borrow().qualname.to_string());
                     annotate.set_slot(
                         "__qualname__",
                         Object::from_str(format!("{owner_qualname}.__annotate__")),
@@ -74454,7 +74454,7 @@ fn new_function(
         .get(&DictKey(fn_slot_keys()[1].clone()))
         .cloned();
     let f = PyFunction {
-        name: code.name.clone(),
+        name: code.name.to_string(),
         code: RefCell::new(code),
         globals: globals.clone(),
         // The defining frame's builtins, not a fresh resolution: the same

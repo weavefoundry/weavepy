@@ -4566,8 +4566,8 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let mut requested_nlocals: Option<u32> = None;
     for (k, v) in kwargs {
         match k.as_str() {
-            "co_name" => nc.name = want_str(v, "co_name")?,
-            "co_qualname" => nc.qualname = want_str(v, "co_qualname")?,
+            "co_name" => nc.name = want_str(v, "co_name")?.into(),
+            "co_qualname" => nc.qualname = want_str(v, "co_qualname")?.into(),
             "co_filename" => nc.filename = want_str(v, "co_filename")?.into(),
             "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
@@ -4724,8 +4724,8 @@ pub fn foreign_code_object(
     const CO_ITERABLE_COROUTINE: u32 = 0x0100;
     const CO_ASYNC_GENERATOR: u32 = 0x0200;
     let mut nc = weavepy_compiler::CodeObject {
-        name,
-        qualname,
+        name: name.into(),
+        qualname: qualname.into(),
         filename: filename.into(),
         varnames: names_of(varnames),
         arg_count,
@@ -4923,8 +4923,8 @@ pub(crate) fn code_type_call(
     const CO_ITERABLE_COROUTINE: u32 = 0x0100;
     const CO_ASYNC_GENERATOR: u32 = 0x0200;
     let mut nc = weavepy_compiler::CodeObject {
-        name,
-        qualname,
+        name: name.into(),
+        qualname: qualname.into(),
         filename: filename.into(),
         constants,
         names: names_of(names),

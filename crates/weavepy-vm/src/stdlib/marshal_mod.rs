@@ -1192,8 +1192,8 @@ impl Scan {
         {
             self.identifiers.insert(name.to_owned());
         }
-        self.identifiers.insert(co.name.clone());
-        self.qualnames_done.insert(co.qualname.clone());
+        self.identifiers.insert(co.name.to_string());
+        self.qualnames_done.insert(co.qualname.to_string());
     }
 
     /// Strings nested in tuple/frozenset constants: plain literals,
@@ -1738,8 +1738,8 @@ impl<'a> MarshalReader<'a> {
         // (test_capi.test_eval_code_ex test_custom_locals).
         let is_class_body = flags & CO_OPTIMIZED == 0 && co_name != "<module>";
         let mut co = CodeObject {
-            name: co_name,
-            qualname: co_qualname,
+            name: co_name.into(),
+            qualname: co_qualname.into(),
             filename: string_of(&filename, "co_filename")?.into(),
             caches: CacheTable::with_len(decoded.instructions.len()),
             vm_ext: weavepy_compiler::VmExt::default(),

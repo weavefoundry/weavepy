@@ -18,7 +18,7 @@ use crate::bytecode::{CacheTable, Instruction, OpCode};
 use crate::{CodeObject, ColSpan, Constant, ExcHandler, Name};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
@@ -173,20 +173,24 @@ impl Writer {
         }
     }
 
-    /// A name table: its length, then per name its number plus one when
-    /// the module wrote it before, else a zero and its text (which gives
-    /// it the next number).
+    /// An identifier: its number plus one when the module wrote it
+    /// before, else a zero and its text (which gives it the next number).
+    fn name(&mut self, s: &Name) {
+        if let Some(&i) = self.1.get(s.as_str()) {
+            self.uint(u64::from(i) + 1);
+        } else {
+            let i = self.1.len() as u32;
+            self.1.insert(s.as_str().to_owned(), i);
+            self.uint(0);
+            self.bytes(s.as_bytes());
+        }
+    }
+
+    /// A name table: its length, then its identifiers (see [`Self::name`]).
     fn names(&mut self, v: &[Name]) {
         self.uint(v.len() as u64);
         for s in v {
-            if let Some(&i) = self.1.get(s.as_str()) {
-                self.uint(u64::from(i) + 1);
-            } else {
-                let i = self.1.len() as u32;
-                self.1.insert(s.as_str().to_owned(), i);
-                self.uint(0);
-                self.bytes(s.as_bytes());
-            }
+            self.name(s);
         }
     }
 
@@ -248,8 +252,8 @@ impl Writer {
         if c.wire.is_some() {
             return None;
         }
-        self.bytes(c.name.as_bytes());
-        self.bytes(c.qualname.as_bytes());
+        self.name(&c.name);
+        self.name(&c.qualname);
         self.uint(c.instructions.len() as u64);
         for ins in &c.instructions {
             self.byte(ins.op as u8);
@@ -453,20 +457,24 @@ impl Reader<'_> {
         Some(v)
     }
 
+    /// An identifier [`Writer::name`] wrote.
+    fn name(&mut self, module: &mut Module) -> Option<Name> {
+        Some(match self.uint()? {
+            0 => {
+                let name = Name::new(std::str::from_utf8(self.raw()?).ok()?);
+                module.names.push(name.clone());
+                name
+            }
+            i => module.names.get(usize::try_from(i - 1).ok()?)?.clone(),
+        })
+    }
+
     /// A name table [`Writer::names`] wrote.
     fn names(&mut self, module: &mut Module) -> Option<Vec<Name>> {
         let n = self.len()?;
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            let name = match self.uint()? {
-                0 => {
-                    let name = Name::new(std::str::from_utf8(self.raw()?).ok()?);
-                    module.names.push(name.clone());
-                    name
-                }
-                i => module.names.get(usize::try_from(i - 1).ok()?)?.clone(),
-            };
-            v.push(name);
+            v.push(self.name(module)?);
         }
         Some(v)
     }
@@ -534,8 +542,8 @@ impl Reader<'_> {
         if depth > MAX_NESTING {
             return None;
         }
-        let name = self.string()?;
-        let qualname = self.string()?;
+        let name = self.name(module)?;
+        let qualname = self.name(module)?;
         let n = self.len()?;
         let mut instructions = Vec::with_capacity(n);
         for _ in 0..n {
@@ -661,8 +669,8 @@ mod tests {
     #[test]
     fn round_trips_constants_and_metadata() {
         let inner = CodeObject {
-            name: "f".to_owned(),
-            qualname: "C.f".to_owned(),
+            name: "f".into(),
+            qualname: "C.f".into(),
             filename: "m.py".into(),
             instructions: vec![
                 Instruction::new(OpCode::Resume, 0),
@@ -680,8 +688,8 @@ mod tests {
             ..CodeObject::default()
         };
         let mut code = CodeObject {
-            name: "<module>".to_owned(),
-            qualname: "<module>".to_owned(),
+            name: "<module>".into(),
+            qualname: "<module>".into(),
             filename: "m.py".into(),
             instructions: vec![Instruction::new(OpCode::Nop, 0)],
             constants: vec![
@@ -732,6 +740,37 @@ mod tests {
     }
 
     #[test]
+    fn encoded_tables_clone_and_mutate_independently() {
+        let code = CodeObject {
+            instructions: vec![Instruction::new(OpCode::Nop, 0); 3],
+            linetable: vec![1, 2, 2].into(),
+            coltable: vec![ColSpan::default(); 3].into(),
+            wire_marks: vec![0, 3, 0].into(),
+            ..CodeObject::default()
+        };
+        let back = decode(&encode(&code).expect("encodable"), "m.py").expect("decodable");
+        // A clone of a table still encoded shares the encoding.
+        let copy = back.clone();
+        assert_eq!(*copy.linetable, [1, 2, 2]);
+        assert_eq!(*back.linetable, [1, 2, 2]);
+        // Mutating a table decodes it first, and leaves the others alone.
+        let mut owned = back.clone();
+        owned.linetable.push(3);
+        owned.coltable.pop();
+        assert_eq!(*owned.linetable, [1, 2, 2, 3]);
+        assert_eq!(owned.coltable.len(), 2);
+        assert_eq!(*back.linetable, [1, 2, 2]);
+        assert_eq!(back.coltable.len(), 3);
+        assert_eq!(&*copy.wire_marks, &[0, 3, 0]);
+        // A clone of a decoded table copies it.
+        let again = owned.clone();
+        drop(owned);
+        assert_eq!(*again.linetable, [1, 2, 2, 3]);
+        // A default table reads as empty.
+        assert!(CodeObject::default().linetable.is_empty());
+    }
+
+    #[test]
     fn round_trips_position_runs() {
         let span = |end_lineno, col, end_col| ColSpan {
             end_lineno,
@@ -773,7 +812,7 @@ mod tests {
     #[test]
     fn rejects_truncated_or_foreign_input() {
         let code = CodeObject {
-            name: "<module>".to_owned(),
+            name: "<module>".into(),
             instructions: vec![Instruction::new(OpCode::Nop, 0)],
             constants: vec![Constant::Str("x".repeat(40))],
             ..CodeObject::default()

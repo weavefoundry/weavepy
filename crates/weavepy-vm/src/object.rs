@@ -11671,7 +11671,7 @@ impl Object {
                     .slot("__qualname__")
                     .as_ref()
                     .map(Object::to_str)
-                    .unwrap_or_else(|| f.code().qualname.clone());
+                    .unwrap_or_else(|| f.code().qualname.to_string());
                 format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => {
@@ -11717,7 +11717,7 @@ impl Object {
                         .slot("__qualname__")
                         .as_ref()
                         .map(Object::to_str)
-                        .unwrap_or_else(|| f.code().qualname.clone()),
+                        .unwrap_or_else(|| f.code().qualname.to_string()),
                     // A C function bound to its receiver is CPython's
                     // `builtin_function_or_method`, whose repr is
                     // `<built-in method split of str object at 0x…>`
@@ -12084,7 +12084,7 @@ impl Object {
                                 .slot("__qualname__")
                                 .as_ref()
                                 .map(Object::to_str)
-                                .unwrap_or_else(|| f.code().qualname.clone());
+                                .unwrap_or_else(|| f.code().qualname.to_string());
                             let module = f
                                 .slot("__module__")
                                 .or_else(|| {

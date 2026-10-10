@@ -231,7 +231,7 @@ mod tests {
     fn cache_returns_fresh_copies() {
         clear();
         let mut code = CodeObject::default();
-        code.name = "foo".to_owned();
+        code.name = "foo".into();
         insert("foo", &code);
         let got = get("foo").expect("hit");
         assert_eq!(got.name, "foo");
@@ -243,7 +243,7 @@ mod tests {
         use weavepy_compiler::{CacheTable, InlineCache};
         clear();
         let mut code = CodeObject::default();
-        code.name = "warmed".to_owned();
+        code.name = "warmed".into();
         code.caches = CacheTable::with_len(2);
         code.caches.set(0, InlineCache::BinOpAddInt);
         insert("warmed", &code);
