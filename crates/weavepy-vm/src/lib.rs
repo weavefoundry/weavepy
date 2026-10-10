@@ -20226,6 +20226,25 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::collapse_next`], skipping the instruction checks for a
+    /// frame at the code and pc `memo` holds (and recording them there).
+    #[inline(always)]
+    fn collapse_next_memo<'f>(
+        frame: &'f Frame,
+        memo: &mut (*const CodeObject, u32, usize),
+    ) -> Option<(&'f Rc<PyGenerator>, usize)> {
+        let code = Rc::as_ptr(&frame.code);
+        if code == memo.0 && frame.pc == memo.1 {
+            return match frame.stack.last() {
+                Some(Object::Generator(g) | Object::Coroutine(g)) => Some((g, memo.2)),
+                _ => None,
+            };
+        }
+        let found = Self::collapse_next(frame)?;
+        *memo = (code, frame.pc, found.1);
+        Some(found)
+    }
+
     /// The `SEND` of `None` at `send_pc` of `sw`'s (synced) running
     /// activation to `first` (frame `first_frame`, both checked by
     /// [`Self::core_send_hop`]), a generator itself suspended in a
@@ -20258,6 +20277,9 @@ impl Interpreter {
         // The code objects whose lean resume a level already vouched for
         // (a recursive generator's levels share one).
         let mut code_ok: *const CodeObject = std::ptr::null();
+        // The last level's code, pc and `SEND` (a recursive generator's
+        // levels mostly share all three).
+        let mut resend: (*const CodeObject, u32, usize) = (std::ptr::null(), u32::MAX, 0);
         loop {
             // The level delegates from here (`Delegate::suspend` undoes it).
             // SAFETY: each level is alive (its holder is the level above,
@@ -20282,7 +20304,8 @@ impl Interpreter {
             g = Rc::as_ptr(inner);
             gf = inner_frame;
             // SAFETY: as above.
-            let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
+            let Some((next, next_send)) = Self::collapse_next_memo(unsafe { &*gf }, &mut resend)
+            else {
                 break;
             };
             let Some(next_frame) = Self::collapse_frame_with(next, &mut code_ok) else {
@@ -56224,7 +56247,33 @@ impl Interpreter {
         if !code.is_generator {
             return None;
         }
-        self.start_generator_fast(&f, &code, vec![v.clone()])
+        let start = self.generator_start(&f, &code, 1)?;
+        // A body without cells of its own: `self` goes straight into the
+        // locals, as `core_gen_call` passes a call's arguments.
+        if let Some(cells) = f.lean_cells_ref(&code) {
+            let nlocals = code.varnames.len();
+            let locals = self.pooled_locals_empty(nlocals);
+            {
+                // SAFETY: sole owner (see `pooled_locals_empty`).
+                let l = unsafe { &mut *locals.as_ptr() };
+                l.push(v.clone());
+                let missing = (code.arg_count as usize).saturating_sub(1);
+                if missing > 0 {
+                    l.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+                }
+                l.resize(nlocals, Object::Unbound);
+            }
+            let mut frame = Self::gen_frame_lean(&f, code.clone(), locals, cells.clone(), start);
+            frame.stack = self.pooled_stack();
+            return Some(Self::wrap_started_generator(
+                &f,
+                &code,
+                self.box_gen_frame(frame),
+            ));
+        }
+        let mut positional = self.pooled_scratch();
+        positional.push(v.clone());
+        Some(self.start_generator_at(&f, &code, positional, start))
     }
 
     /// The generator-family object a call of `f` (its code `code`) with
