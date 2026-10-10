@@ -3555,10 +3555,17 @@ unsafe extern "C" fn h_stack_attr(
             Object::Type(cls) if Rc::strong_count(cls) > 1 => type_attr(code, ext, cls, pc, arg),
             Object::Module(m) => Interpreter::core_module_attr(code, m, pc, arg)
                 .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg)),
-            Object::Code(_) | Object::Frame(_) => code
-                .names
-                .get(arg as usize)
-                .and_then(|name| Interpreter::frame_plain_attr(recv, name, None)),
+            Object::Code(_) | Object::Frame(_) => {
+                let Some(v) = code
+                    .names
+                    .get(arg as usize)
+                    .and_then(|name| Interpreter::frame_plain_attr(recv, name, None))
+                else {
+                    return 1;
+                };
+                crate::drop_hot(std::mem::replace(&mut *at, v));
+                return 0;
+            }
             _ => None,
         };
         let Some(v) = v else {
@@ -3631,10 +3638,19 @@ unsafe extern "C" fn h_local_attr(
             Object::Type(cls) => type_attr(code, ext, cls, pc, arg),
             // A frame's or code object's plain field (a live frame's line
             // needs the full lane, which makes its `lasti` current).
-            Object::Code(_) | Object::Frame(_) => code
-                .names
-                .get(arg as usize)
-                .and_then(|name| Interpreter::frame_plain_attr(recv, name, None)),
+            Object::Code(_) | Object::Frame(_) => {
+                return match code
+                    .names
+                    .get(arg as usize)
+                    .and_then(|name| Interpreter::frame_plain_attr(recv, name, None))
+                {
+                    Some(v) => {
+                        dst.write(v);
+                        0
+                    }
+                    None => 1,
+                };
+            }
             _ => None,
         };
         match v {

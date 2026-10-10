@@ -4306,14 +4306,26 @@ pub(crate) fn code_synthetic_attr(
     c: &Rc<weavepy_compiler::CodeObject>,
     name: &str,
 ) -> Option<Object> {
+    let ident = |k: usize| {
+        crate::code_vm_ext(c).map(|ext| {
+            ext.ident_strs.get_or_init(|| {
+                [
+                    Object::from_str(&c.name),
+                    Object::from_str(if c.qualname.is_empty() {
+                        &c.name
+                    } else {
+                        &c.qualname
+                    }),
+                    Object::from_str(&*c.filename),
+                ]
+            })[k]
+                .clone()
+        })
+    };
     match name {
-        "co_name" | "__name__" => Some(Object::from_str(&c.name)),
-        "co_qualname" | "__qualname__" => Some(Object::from_str(if c.qualname.is_empty() {
-            &c.name
-        } else {
-            &c.qualname
-        })),
-        "co_filename" => Some(Object::from_str(&*c.filename)),
+        "co_name" | "__name__" => ident(0),
+        "co_qualname" | "__qualname__" => ident(1),
+        "co_filename" => ident(2),
         "co_argcount" => Some(Object::Int(i64::from(c.arg_count))),
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
@@ -17030,8 +17042,10 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             // Text writes commit fully and report the *character* count
             // (CPython `TextIOWrapper.write`), never a partial byte tally.
-            f.write_text_all(&f.encode_text(s)?)?;
-            s.chars().count()
+            if !f.mem_text_append(s) {
+                f.write_text_all(&f.encode_text(s)?)?;
+            }
+            crate::object::str_char_len(s)
         }
         // A surrogate-bearing `str`. For an in-memory `StringIO` the lone
         // surrogates ride through the PUA bridge so they round-trip; a real

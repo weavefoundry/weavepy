@@ -5546,13 +5546,30 @@ impl Interpreter {
     /// nothing may stay pinned until reuse.
     fn recycle_frame_shell(&self, mut shell: Rc<crate::object::FrameShell>) {
         const FRAME_SHELL_POOL_CAP: usize = 64;
-        if shell.is_gen
-            || shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-            || self.frame_shell_pool.borrow().len() >= FRAME_SHELL_POOL_CAP
-        {
+        if shell.is_gen || self.frame_shell_pool.borrow().len() >= FRAME_SHELL_POOL_CAP {
             return;
+        }
+        if shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // A frame object nothing but the shell holds (a `sys._getframe`
+            // handle since dropped) dies with the activation, as CPython's
+            // does; one anything else holds keeps the shell too.
+            let Some(m) = Rc::get_mut(&mut shell) else {
+                return;
+            };
+            if !m
+                .materialized
+                .get_mut()
+                .as_ref()
+                .is_some_and(|py| Rc::strong_count(py) == 1)
+            {
+                return;
+            }
+            let py = m.materialized.get_mut().take();
+            *m.has_materialized.get_mut() = false;
+            drop(py);
         }
         if let Some(m) = Rc::get_mut(&mut shell) {
             m.code.clear();
@@ -71398,6 +71415,9 @@ struct CodeConstObjects {
     /// generator's `gi_name` and `gi_qualname` while its function's names
     /// are untouched.
     gen_names: std::sync::OnceLock<(Object, Object)>,
+    /// `co_name`, `co_qualname` and `co_filename` as the str objects every
+    /// read returns (CPython stores them; logging reads two per record).
+    ident_strs: std::sync::OnceLock<[Object; 3]>,
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
@@ -73564,6 +73584,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             calls: std::sync::atomic::AtomicU8::new(0),
             name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
+            ident_strs: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
             cold_sites: std::sync::atomic::AtomicU32::new(0),

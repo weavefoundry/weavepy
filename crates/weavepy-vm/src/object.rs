@@ -6746,6 +6746,46 @@ impl PyFile {
     /// rewritten to the configured line ending. Universal mode maps `\n`→
     /// `os.linesep` (a no-op on WeavePy's Unix targets); `''`/`'\n'` are
     /// pass-through.
+    /// `StringIO.write(s)` at the end of the buffer with nothing to
+    /// translate or encode (the common logging-handler shape): appends `s`
+    /// and returns `true`. `false` touches nothing; the general path then
+    /// runs (overwrites, newline translation, an explicit codec).
+    pub fn mem_text_append(&self, s: &str) -> bool {
+        if self.encoding.borrow().is_some()
+            || self
+                .errors
+                .borrow()
+                .as_deref()
+                .is_some_and(|e| e != "strict")
+        {
+            return false;
+        }
+        let collapse = match self.newline.borrow().as_deref() {
+            Some("\n" | "") => false,
+            None if self.io_kind.get() == IoKind::StringIO => true,
+            _ => return false,
+        };
+        if collapse && s.as_bytes().contains(&b'\r') {
+            return false;
+        }
+        let Ok(mut backend) = self.backend.try_borrow_mut() else {
+            return false;
+        };
+        let FileBackend::MemText { data, pos } = &mut *backend else {
+            return false;
+        };
+        if *pos != data.len() {
+            return false;
+        }
+        data.push_str(s);
+        *pos = data.len();
+        drop(backend);
+        if collapse {
+            self.record_seen_newlines(s);
+        }
+        true
+    }
+
     fn translate_newlines_write(&self, s: &str) -> String {
         match self.newline.borrow().as_deref() {
             Some("\r") => s.replace('\n', "\r"),
