@@ -7728,7 +7728,8 @@ impl Interpreter {
                 let stop = match pending.take() {
                     Some(stop) => stop,
                     None => {
-                        let mut sw = CoreSwitch::enter(roots, frame, shell, last);
+                        let calls_ok = self.inline_calls_ok();
+                        let mut sw = CoreSwitch::enter(roots, frame, shell, last, calls_ok);
                         let stop = self.leaf_burst(&mut sw, snap_gen);
                         if sw.switched() {
                             return FrameEv::Switched(stop);
@@ -65991,6 +65992,11 @@ struct CoreSwitch {
     /// The observer generation the burst started under (see
     /// [`Interpreter::core_pending_exit`]).
     obs_gen: u64,
+    /// `Interpreter::inline_calls_ok` when the burst started: its inputs
+    /// hold for a burst (a native stack's greenlet, the process's flags)
+    /// or bump the loop generation when they change (the eval-frame
+    /// recorder), which every direct call compares first.
+    calls_ok: bool,
 }
 
 impl CoreSwitch {
@@ -66000,6 +66006,7 @@ impl CoreSwitch {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         last: &mut usize,
+        calls_ok: bool,
     ) -> Self {
         let frame: *mut Frame = frame;
         let shell: *mut QuietShell<'static> = std::ptr::from_mut(shell).cast();
@@ -66024,6 +66031,7 @@ impl CoreSwitch {
             maybe_dead: roots.maybe_dead,
             depth_cell: crate::recursion::depth_cell(),
             obs_gen: crate::trace::observer_gen(),
+            calls_ok,
         }
     }
 
@@ -66485,8 +66493,41 @@ unsafe fn release_locals(locals: &mut Vec<Object>) {
     // SAFETY: the first `n` values are initialized.
     unsafe {
         locals.set_len(0);
+        release_run(base, n);
+    }
+}
+
+/// Release the `n` values from `base` on (each read out once), as
+/// [`drop_hot`] releases one: the bias is tested once for the run, and a
+/// shared owner's decrement reads only the tag and the pointer (a moved
+/// out copy of each value showed in every return's profile).
+///
+/// # Safety
+///
+/// The `n` values are initialized, owned by the caller, and never read
+/// again.
+#[inline(always)]
+unsafe fn release_run(base: *const Object, n: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if !crate::rc::refcounts_biased() {
+            for k in 0..n {
+                drop(base.add(k).read());
+            }
+            return;
+        }
         for k in 0..n {
-            drop_hot(base.add(k).read());
+            let at = base.add(k);
+            if let Some(word) = (*at).strong_word() {
+                // While the bias holds this thread alone updates counts.
+                let w = &*word;
+                let c = w.load(std::sync::atomic::Ordering::Relaxed);
+                if c != 1 {
+                    w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    drop(at.read());
+                }
+            }
         }
     }
 }

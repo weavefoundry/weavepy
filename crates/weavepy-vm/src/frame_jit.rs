@@ -783,12 +783,25 @@ mod stats {
 
     type Counts = HashMap<(String, String), [u64; 2]>;
 
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    /// `0` until decided, then `1` off or `2` on (one load per test: every
+    /// direct call's return tests it).
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     static COUNTS: Mutex<Option<Counts>> = Mutex::new(None);
 
     #[inline(always)]
     pub(super) fn enabled() -> bool {
-        *ON.get_or_init(|| {
+        match ON.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => decide(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decide() -> bool {
+        static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ONCE.get_or_init(|| {
             let on = std::env::var_os("WEAVEPY_FRAME_JIT_STATS").is_some();
             if on {
                 extern "C" fn dump() {
@@ -815,7 +828,9 @@ mod stats {
                 unsafe { libc::atexit(dump) };
             }
             on
-        })
+        });
+        ON.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        on
     }
 
     /// [`super::run_pushed_directly`] declined, for `why`: `None`.
@@ -3963,6 +3978,17 @@ pub(crate) struct DirectSite {
     alt_native: usize,
     alt_missing: u32,
     alt_has_self: bool,
+    /// The hit keys: each callee's code address with the self slot in its
+    /// low bit, `0` while it has no body (one compare per lookup).
+    key: usize,
+    alt_key: usize,
+}
+
+/// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
+/// (code objects are word-aligned).
+#[inline(always)]
+fn site_key(code: usize, has_self: bool) -> usize {
+    code | usize::from(has_self)
 }
 
 const DS_NATIVE: i32 = std::mem::offset_of!(DirectSite, native) as i32;
@@ -3994,6 +4020,11 @@ impl DirectSite {
         self.missing = missing as u32;
         self.native = native;
         self.retry = if native == 0 { 64 } else { 0 };
+        self.key = if native == 0 {
+            0
+        } else {
+            site_key(self.code, has_self)
+        };
     }
 
     /// Record a call of `code` with a native body as the site's first
@@ -4010,6 +4041,8 @@ impl DirectSite {
             self.alt_native = self.native;
             self.alt_missing = self.missing;
             self.alt_has_self = self.has_self;
+            self.alt_key = self.key;
+            self.key = 0;
         }
         self.fill(code, has_self, native, missing);
     }
@@ -4278,16 +4311,20 @@ unsafe extern "C" fn h_call_direct(
     st: *mut State,
     code: *const CodeObject,
     ext: *const CodeConstObjects,
-    pc: u64,
+    pc_argc: u64,
     len: u64,
     site: *mut DirectSite,
 ) -> u32 {
-    // SAFETY: as `h_call`'s; `site` is this `CALL`'s own cache.
+    // SAFETY: as `h_call`'s; `site` is this `CALL`'s own cache, and the
+    // `CALL`'s argument count (the high half of `pc_argc`) fits the stack
+    // (the native code checked its depth).
     unsafe {
         let s = &mut *st;
-        let argc = (&(*code).instructions)[pc as usize].arg as usize;
+        let pc = pc_argc & u64::from(u32::MAX);
+        let argc = (pc_argc >> 32) as usize;
         let len_u = len as usize;
-        if len_u >= argc + 2 && !s.sw.is_null() {
+        debug_assert!(len_u >= argc + 2);
+        if !s.sw.is_null() {
             let start = len_u - argc - 2;
             if let Some(r) = direct_call(s, pc as usize, start, len_u, &mut *site, None) {
                 return r;
@@ -4343,10 +4380,10 @@ unsafe fn direct_call(
         // `def` binds the same way, and code without free variables takes
         // no closure.)
         let at = Rc::as_ptr(code_rc) as usize;
-        let (native, packed) = if site.code == at && site.has_self == has_self && site.native != 0
-        {
+        let key = site_key(at, has_self);
+        let (native, packed) = if site.key == key {
             (site.native, site.missing as usize)
-        } else if site.alt_code == at && site.alt_has_self == has_self && site.alt_native != 0 {
+        } else if site.alt_key == key {
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
@@ -4382,13 +4419,14 @@ unsafe fn direct_call(
         let code: &CodeObject = code_rc;
         // (Native code runs only in a burst, which free-threaded mode
         // never starts.)
+        // (Tier 2's compiled code is the commonest test's rare answer.)
         if nested >= DIRECT_CALL_DEPTH
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
-            || !interp.inline_calls_ok()
-            || !(crate::tier2::jit_off_for_process()
-                || code.jit_hint.is_not_jitable()
-                || !code.jit_hint.is_compiled())
+            || !(*st.sw).calls_ok
+            || (code.jit_hint.is_compiled()
+                && !code.jit_hint.is_not_jitable()
+                && !crate::tier2::jit_off_for_process())
         {
             return None;
         }
@@ -4592,8 +4630,12 @@ unsafe fn direct_run<const PUSHED: bool>(
                 }
                 st.stack.add(start).write(v);
                 caller.stack.set_len(start + 1);
+                // A function something else still holds (its class, its
+                // module) can't die here: a plain decrement.
                 match callable {
-                    Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
+                    Object::Function(f) if crate::rc::try_release_shared(Rc::as_ptr(&f)) => {
+                        std::mem::forget(f);
+                    }
                     callable => interp.release(callable),
                 }
                 sw.cur = st.frame;
@@ -4611,6 +4653,10 @@ unsafe fn direct_run<const PUSHED: bool>(
                     sw.scratch = usize::MAX;
                 }
                 *sw.last = pc;
+                // (A return raised nothing: the callee's state holds no
+                // error to drop.)
+                debug_assert!(cst.err.is_none());
+                std::mem::forget(cst);
                 if sw.pending.is_some() {
                     return RELOAD;
                 }
@@ -9871,10 +9917,15 @@ impl<'a> Lower<'a> {
         self.b.ins().store(FLAGS, left, site_at, DS_RETRY);
         self.b.ins().jump(general, &[]);
         self.b.switch_to_block(direct);
+        // (The direct helper takes the argument count with the pc.)
+        let pc_argc = self
+            .b
+            .ins()
+            .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
         let r = self
             .call(
                 h_call_direct as *const () as usize,
-                &[self.st, code, ext, pcv, len, site_at],
+                &[self.st, code, ext, pc_argc, len, site_at],
                 true,
             )
             .expect("returns");

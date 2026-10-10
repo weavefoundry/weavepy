@@ -482,11 +482,15 @@ static EVAL_FRAME_RECORD: Mutex<Option<Object>> = Mutex::new(None);
 pub fn set_eval_frame_record(list: Object) {
     *EVAL_FRAME_RECORD.lock().unwrap() = Some(list);
     EVAL_FRAME_RECORD_ACTIVE.store(true, Ordering::Release);
+    // A running burst's direct calls test the gate once per burst (see
+    // `CoreSwitch::calls_ok`): the new generation ends it.
+    crate::hot_gates::bump_loop_gen();
 }
 
 pub fn set_eval_frame_default() {
     EVAL_FRAME_RECORD_ACTIVE.store(false, Ordering::Release);
     *EVAL_FRAME_RECORD.lock().unwrap() = None;
+    crate::hot_gates::bump_loop_gen();
 }
 
 #[inline]
