@@ -15223,7 +15223,7 @@ impl Interpreter {
             std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), first + argc)
         };
         // The body may run Python code that looks up the stack.
-        let pending = self.core_pending_enter(sw, frame, pc);
+        let pending = self.core_pending_enter_fast(sw, frame, pc);
         let result = if via_call {
             let globals = frame.globals.clone();
             match &callable {

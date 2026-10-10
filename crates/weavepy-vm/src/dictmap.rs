@@ -215,6 +215,28 @@ impl DictMap {
         m
     }
 
+    /// A table of the entries `items` yields, whose keys are distinct and
+    /// each paired with its Python hash, built in one pass: the entries
+    /// are laid down in order, then indexed once (no probe compares a
+    /// key).
+    pub fn from_unique_hashed(
+        items: impl ExactSizeIterator<Item = (i64, DictKey, Object)>,
+    ) -> Self {
+        let mut entries = Vec::with_capacity(items.len());
+        for (hash, key, value) in items {
+            entries.push(Bucket { hash, key, value });
+        }
+        let mut m = Self {
+            entries,
+            slots: Box::new([]),
+            shift: 64,
+        };
+        if m.entries.len() > SMALL {
+            m.rebuild_slots(slots_for(m.entries.len()));
+        }
+        m
+    }
+
     /// [`Self::with_capacity`]; the hasher is implied (the table mixes
     /// Python hashes itself).
     #[inline]

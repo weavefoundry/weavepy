@@ -4784,6 +4784,17 @@ impl DictData {
         }
     }
 
+    /// An instance `__dict__` holding `map`, guarding the deferred
+    /// tracking of the instance at `owner` (`0`: none).
+    pub(crate) fn from_map_for(owner: usize, map: DictMap) -> Self {
+        Self {
+            map,
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     /// Re-arm the owner record on a recycled (empty) instance dict.
     #[inline]
     pub(crate) fn reset_deferred_owner(&mut self, owner: usize) {

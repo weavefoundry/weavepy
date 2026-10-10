@@ -1151,26 +1151,35 @@ impl InstDict {
                 s.snapshot()
             }
         };
-        let n = values.len();
-        let mut d = if owner.deferred.get() {
-            DictData::deferred_for_capacity(std::ptr::from_ref(owner) as usize, n)
-        } else {
-            DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher)
-        };
-        if let Some(keys) = keys {
-            // A deferred owner holds only atomic values, and a tracked
-            // one needs no barrier: insert without either. The names are
-            // distinct `str`s whose hashes the table kept, so each goes
-            // straight into its bucket, without hashing or comparing.
-            let map = d.map_mut_atomic_store();
-            for (i, v) in values.into_iter().enumerate() {
-                if let Some(k) = keys.get(i) {
-                    // SAFETY: slot `i` is published (`get` found its name).
-                    let hash = unsafe { *keys.hashes[i].get() };
-                    map.insert_unique_hashed(hash, k.clone(), v);
-                }
+        // A deferred owner holds only atomic values, and a tracked one
+        // needs no barrier: the table is built without either. The names
+        // are distinct `str`s whose hashes the shared table kept, so the
+        // entries go down in order and are indexed once, without hashing
+        // or comparing.
+        let map = match keys {
+            Some(keys) => {
+                let n = values.len().min(keys.len());
+                crate::dictmap::DictMap::from_unique_hashed(
+                    values.into_iter().take(n).enumerate().map(|(i, v)| {
+                        // SAFETY: slot `i` is published (below the length).
+                        let (k, hash) = unsafe {
+                            (
+                                (*keys.keys[i].get()).assume_init_ref(),
+                                *keys.hashes[i].get(),
+                            )
+                        };
+                        (hash, k.clone(), v)
+                    }),
+                )
             }
-        }
+            None => crate::dictmap::DictMap::default(),
+        };
+        let deferred = if owner.deferred.get() {
+            std::ptr::from_ref(owner) as usize
+        } else {
+            0
+        };
+        let d = DictData::from_map_for(deferred, map);
         self.lazy.get_or_init(|| Rc::new(RefCell::new(d)))
     }
 }

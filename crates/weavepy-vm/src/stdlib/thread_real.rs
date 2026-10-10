@@ -385,8 +385,9 @@ fn instance_closure(
     // SAFETY: a read under the GIL that ends before anything else runs.
     if let Some(d) = inst.dict.published().and_then(|d| unsafe { d.peek() }) {
         if let Some((DictKey(Object::Str(k)), v)) = d.get_index(at) {
-            let k: &str = k;
-            if k == name {
+            // (A short name compared in line, without `memcmp`.)
+            let (k, n) = (k.as_bytes(), name.as_bytes());
+            if k.len() == n.len() && k.iter().zip(n).all(|(a, b)| a == b) {
                 return Some(v.clone());
             }
         }
