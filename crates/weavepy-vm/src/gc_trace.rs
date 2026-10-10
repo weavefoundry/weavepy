@@ -2659,6 +2659,20 @@ pub fn track(obj: &Object) {
     with_state(|s| s.track(obj));
 }
 
+/// [`track`] for a fresh generator, coroutine or async generator: it joins
+/// its young set (see [`GcState::nurse`]), or is registered at once.
+pub fn track_generator(obj: &Object) {
+    let (Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)) = obj else {
+        track(obj);
+        return;
+    };
+    with_state(|s| {
+        if !s.nurse(&s.young_gens, g) {
+            s.track_now(obj);
+        }
+    });
+}
+
 /// Track a list or dict that native code filled before publishing it (the
 /// unpickler's results) as if it had been tracked at birth, while still
 /// empty: it joins the deferred containers. Every collection promotes the

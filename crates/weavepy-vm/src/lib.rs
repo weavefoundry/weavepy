@@ -8292,6 +8292,14 @@ impl Interpreter {
                         _ => return None,
                     }
                 }
+                // The method form `gen.send` loads (see `core_gen_method`).
+                (
+                    Some(Object::Builtin(b)),
+                    Some(Object::Generator(g) | Object::Coroutine(g)),
+                    Some(v),
+                ) if matches!(b.name, ".u.gen_send" | ".u.cor_send") => {
+                    (g, matches!(v, Object::None))
+                }
                 _ => return None,
             }
         } else if send {
@@ -8374,13 +8382,14 @@ impl Interpreter {
         match mode {
             // `next`, its empty self slot and the generator (held above).
             InlineResume::NextCall => {
-                let n = frame.stack.len();
-                drop(frame.stack.drain(n - 3..));
+                let (a, b, c) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                drop((a, b, c));
             }
-            // The bound `send` and its empty self slot (the value went in).
+            // The bound `send` and its empty self slot, or the method and
+            // the generator (the value went in).
             InlineResume::SendCall => {
-                let n = frame.stack.len();
-                drop(frame.stack.drain(n - 2..));
+                let (a, b) = (frame.stack.pop(), frame.stack.pop());
+                drop((a, b));
             }
             _ => {}
         }
@@ -13431,12 +13440,9 @@ impl Interpreter {
                         // SAFETY: `len >= argc + 2 == 3`.
                         if argc == 1
                             && !plain_fn
-                            && matches!(
-                                unsafe { (&*base.add(len - 3), &*base.add(len - 2)) },
-                                (Object::BoundMethod(bm), Object::Unbound)
-                                    if matches!(&bm.function, Object::Builtin(b)
-                                        if matches!(b.name, ".gen_send" | ".cor_send"))
-                            )
+                            && Self::gen_send_call(unsafe { &*base.add(len - 3) }, unsafe {
+                                &*base.add(len - 2)
+                            })
                         {
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
@@ -49861,10 +49867,13 @@ impl Interpreter {
                         })?;
                         let rest: &[Object] = if args.is_empty() { &[] } else { &args[1..] };
                         return match b.name {
-                            ".u.gen_send" | ".u.cor_send" => self.gen_method_send(
-                                &receiver,
-                                rest.first().cloned().unwrap_or(Object::None),
-                            ),
+                            ".u.gen_send" | ".u.cor_send" => {
+                                gen_send_arity(&receiver, rest.len())?;
+                                self.gen_method_send(
+                                    &receiver,
+                                    rest.first().cloned().unwrap_or(Object::None),
+                                )
+                            }
                             ".u.gen_throw" | ".u.cor_throw" => {
                                 self.gen_method_throw(&receiver, rest)
                             }
@@ -51090,6 +51099,7 @@ impl Interpreter {
                             return Err(type_error("__subclasses__() requires a type receiver"));
                         }
                         ".gen_send" | ".cor_send" => {
+                            gen_send_arity(&bm.receiver, args.len())?;
                             let value = args.first().cloned().unwrap_or(Object::None);
                             return self.gen_method_send(&bm.receiver, value);
                         }
@@ -56055,7 +56065,7 @@ impl Interpreter {
         // RFC 0024: generator frames can participate in reference cycles
         // (a local that holds the generator itself), so track them like
         // instances.
-        gc_trace::track(&obj);
+        gc_trace::track_generator(&obj);
         obj
     }
 
@@ -56104,12 +56114,14 @@ impl Interpreter {
     /// call of `f` (its code `code`) with `given` positional arguments:
     /// the `RETURN_GENERATOR` it starts past, if so.
     fn generator_start(&self, f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
+        let ext = code_vm_ext(code)?;
+        let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext)?,
+            u32::MAX => return None,
+            at => at as usize - 1,
+        };
         let nargs = code.arg_count as usize;
-        if !(code.is_generator || code.is_coroutine || code.is_async_generator)
-            || code.kwonly_count != 0
-            || code.has_varargs
-            || code.has_varkeywords
-            || given > nargs
+        if given > nargs
             || (code.is_coroutine && crate::stdlib::sys::coroutine_origin_tracking_depth() > 0)
             || crate::trace::eval_frame_record_active()
             || crate::trace::any_observers_active()
@@ -56121,24 +56133,25 @@ impl Interpreter {
         if missing > 0 && (missing > f.defaults.len() || f.defaults_maybe_overridden()) {
             return None;
         }
-        let ext = code_vm_ext(code)?;
-        match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => Self::generator_start_scan(code, ext),
-            u32::MAX => None,
-            at => Some(at as usize - 1),
-        }
+        Some(start)
     }
 
-    /// [`Self::generator_start`]'s scan of `code`'s prologue, remembered
-    /// in its extension table.
+    /// [`Self::generator_start`]'s verdict on `code`'s shape and prologue,
+    /// remembered in its extension table: a generator-family body with
+    /// positional parameters only, and the `RETURN_GENERATOR` it starts
+    /// past.
     #[cold]
     #[inline(never)]
     fn generator_start_scan(code: &CodeObject, ext: &CodeConstObjects) -> Option<usize> {
+        let shaped = (code.is_generator || code.is_coroutine || code.is_async_generator)
+            && code.kwonly_count == 0
+            && !code.has_varargs
+            && !code.has_varkeywords;
         let start = code
             .instructions
             .iter()
             .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
-            .filter(|&start| code.instructions[start].op == OpCode::ReturnGenerator);
+            .filter(|&start| shaped && code.instructions[start].op == OpCode::ReturnGenerator);
         ext.gen_start.store(
             start.map_or(u32::MAX, |at| at as u32 + 1),
             std::sync::atomic::Ordering::Relaxed,
@@ -56213,6 +56226,23 @@ impl Interpreter {
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
+        }
+    }
+
+    /// Whether a `CALL` of one argument with `callee` and `slot` below it
+    /// is `gen.send(v)` or `coro.send(v)`: the bound method with an empty
+    /// self slot, or the method form `gen.send` loads (see
+    /// `core_gen_method`).
+    #[inline(always)]
+    pub(crate) fn gen_send_call(callee: &Object, slot: &Object) -> bool {
+        match (callee, slot) {
+            (Object::BoundMethod(bm), Object::Unbound) => {
+                matches!(&bm.function, Object::Builtin(b) if matches!(b.name, ".gen_send" | ".cor_send"))
+            }
+            (Object::Builtin(b), Object::Generator(_) | Object::Coroutine(_)) => {
+                matches!(b.name, ".u.gen_send" | ".u.cor_send")
+            }
+            _ => false,
         }
     }
 
@@ -66710,6 +66740,20 @@ unsafe fn core_gen_method(code: &CodeObject, name_idx: u32, top: *mut Object) ->
     else {
         return false;
     };
+    // `gen.send(v)`: the unbound method and the generator as its self (the
+    // `CALL` passes it as the first argument), with no bound method made;
+    // the `CALL` arms resume the generator inline.
+    if name == "send" {
+        // SAFETY: the caller's contract.
+        let coro = matches!(unsafe { &*top }, Object::Coroutine(_));
+        // SAFETY: the generator moves up to the self slot, which is free.
+        unsafe {
+            let gen = top.read();
+            top.write(gen_send_unbound(coro));
+            top.add(1).write(gen);
+        }
+        return true;
+    }
     // SAFETY: the caller's contract.
     let bm = make_gen_method(name, unsafe { &*top });
     // SAFETY: the generator (held by the bound method too) is replaced in
@@ -66719,6 +66763,43 @@ unsafe fn core_gen_method(code: &CodeObject, name_idx: u32, top: *mut Object) ->
         top.add(1).write(Object::Unbound);
     }
     true
+}
+
+/// `send`'s one argument (CPython's `METH_O`): `n` given to `receiver`'s.
+fn gen_send_arity(receiver: &Object, n: usize) -> Result<(), RuntimeError> {
+    if n == 1 {
+        return Ok(());
+    }
+    let kind = match receiver {
+        Object::Coroutine(_) => "coroutine",
+        _ => "generator",
+    };
+    Err(type_error(format!(
+        "{kind}.send() takes exactly one argument ({n} given)"
+    )))
+}
+
+/// The unbound `send` of generators (or coroutines) that a method load of
+/// `gen.send` pushes (see [`core_gen_method`]): the `.u.` sentinel a
+/// type's attribute gives (`type(gen).send`), which `Interpreter::call`
+/// runs with its first argument as the receiver. One per kind, shared.
+fn gen_send_unbound(coro: bool) -> Object {
+    static METHODS: [std::sync::OnceLock<Object>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    METHODS[usize::from(coro)]
+        .get_or_init(|| {
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: if coro { ".u.cor_send" } else { ".u.gen_send" },
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    Err(RuntimeError::Internal(
+                        "unbound generator method must be dispatched via Interpreter::call"
+                            .to_owned(),
+                    ))
+                }),
+                call_kw: None,
+            }))
+        })
+        .clone()
 }
 
 fn make_gen_method(name: &str, receiver: &Object) -> Object {

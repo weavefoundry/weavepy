@@ -3112,6 +3112,19 @@ unsafe extern "C" fn h_call(
             frame.pc = pc as u32;
             *(*st.sw).last = st.last;
         };
+        // `gen.send(v)`: likewise, with the value sent in.
+        if argc == 1
+            && !st.sw.is_null()
+            && Interpreter::gen_send_call(&*base.add(start), &*base.add(start + 1))
+        {
+            sync(st);
+            let sw = &mut *st.sw;
+            let interp = &mut *st.interp.cast_mut();
+            if !interp.core_gen_resume(sw, pc, crate::InlineResume::SendCall) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
+        }
         // `next(gen)`: the generator resumes inline, as for `FOR_ITER`,
         // with the yield as the call's result.
         if argc == 1
