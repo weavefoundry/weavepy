@@ -20036,6 +20036,13 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         // SAFETY: forwarded contract.
         if let Some(v) = unsafe { field_slot_hit(ext, cache_pc as usize, inst) } {
+            #[cfg(test)]
+            if ext
+                .field_slot(cache_pc as usize)
+                .is_some_and(|s| s.get().1 & SLOT_FIELD != 0)
+            {
+                note_pure_slot_field_read(code);
+            }
             return Some(v);
         }
         let names: &[Object] = &ext.name_objs;
@@ -20069,18 +20076,7 @@ impl Interpreter {
             // Slot order can vary by instance or after deletion.
             let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
             #[cfg(test)]
-            PURE_SLOT_FIELD_READS.with(|hits| {
-                let mut counts = hits.get();
-                let shape = code_vm_ext(code)
-                    .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
-                let index = match shape {
-                    Some(6) => 0,
-                    Some(7) => 1,
-                    _ => 2,
-                };
-                counts[index] += 1;
-                hits.set(counts);
-            });
+            note_pure_slot_field_read(code);
             Some(value)
         }
     }
@@ -72852,6 +72848,24 @@ unsafe fn field_slot_hit<'a>(
     }
     // SAFETY: forwarded contract.
     unsafe { inst.split_field(idx as usize) }
+}
+
+/// Count a frameless slot read by the shape of the leaf `code` reading it
+/// (the unit tests' path coverage).
+#[cfg(test)]
+fn note_pure_slot_field_read(code: &CodeObject) {
+    PURE_SLOT_FIELD_READS.with(|hits| {
+        let mut counts = hits.get();
+        let shape =
+            code_vm_ext(code).map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+        let index = match shape {
+            Some(6) => 0,
+            Some(7) => 1,
+            _ => 2,
+        };
+        counts[index] += 1;
+        hits.set(counts);
+    });
 }
 
 /// A [`FieldSlot`] position naming a `__slots__` member's place in its
