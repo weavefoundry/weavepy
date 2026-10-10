@@ -14767,7 +14767,7 @@ impl Interpreter {
                     OpCode::DeleteAttr => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack.
-                        match unsafe { self.core_delete_attr(code, ins, base, len) } {
+                        match unsafe { self.core_delete_attr(code, ins, pc, base, len) } {
                             Some(n) => len = n,
                             None => break None,
                         }
@@ -17555,6 +17555,7 @@ impl Interpreter {
         &mut self,
         code: &CodeObject,
         ins: weavepy_compiler::Instruction,
+        pc: usize,
         base: *mut Object,
         len: usize,
     ) -> Option<usize> {
@@ -17570,19 +17571,29 @@ impl Interpreter {
         };
         let cls = inst.cls_raw();
         // (The full arm's conditions; see there.)
-        if inst.native.get().is_some()
-            || key.starts_with("__")
-            || &**key == "_CHUNK_SIZE"
-            || cls.flags.is_exception
-            || cls.forbids_dict
-            || crate::capi_watchers::dicts_active()
-            || !Self::default_delattr(cls)
-            || !matches!(
-                Self::leaf_class_attr(code, cls, ins.arg),
-                Some(LeafAttr::InstanceOnly)
-            )
-        {
+        if inst.native.get().is_some() || crate::capi_watchers::dicts_active() {
             return None;
+        }
+        // The rest depend on the name and the class alone, settled once
+        // per class version at the site (versions are process-unique).
+        let ver = cls.attr_version.get();
+        let stamp = code_stamp_slot(code, pc as u32);
+        if !stamp.is_some_and(|s| s.get() == [ver, DELETE_OWN_ATTR, 0]) {
+            if key.starts_with("__")
+                || &**key == "_CHUNK_SIZE"
+                || cls.flags.is_exception
+                || cls.forbids_dict
+                || !Self::default_delattr(cls)
+                || !matches!(
+                    Self::leaf_class_attr(code, cls, ins.arg),
+                    Some(LeafAttr::InstanceOnly)
+                )
+            {
+                return None;
+            }
+            if let Some(s) = stamp {
+                s.set([ver, DELETE_OWN_ATTR, 0]);
+            }
         }
         let removed = match inst.split_remove(key) {
             Some(removed) => removed?,
@@ -72599,6 +72610,12 @@ const TUPLE_FIELD: u64 = 0x5ca1_a770_0000_0005;
 /// layout (see [`Interpreter::core_laid_out_attr`]). A slot member is a
 /// data descriptor, so no instance dictionary shadows it.
 const LAID_OUT_SLOT: u64 = 0x5ca1_a770_0000_0006;
+
+/// A `DELETE_ATTR` site's stamp tag: the class at that version deletes the
+/// site's name from an instance's own dictionary by the default
+/// `__delattr__`, with no class attribute of that name in the way (see
+/// [`Interpreter::core_delete_attr`]).
+const DELETE_OWN_ATTR: u64 = 0x5ca1_a770_0000_0007;
 
 /// The named tuple field a `LOAD_ATTR` site's stamp remembers for
 /// `inst`'s class at its current version (see [`TUPLE_FIELD`]): the item

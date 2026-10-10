@@ -41,6 +41,10 @@ pub struct SharedKeys {
     keys: [UnsafeCell<MaybeUninit<DictKey>>; SHARED_KEYS_CAP],
     /// Each published name's Python hash.
     hashes: [UnsafeCell<i64>; SHARED_KEYS_CAP],
+    /// Tables made from this one by a deletion (see
+    /// [`Self::without`]): `(n, i, table)` for the first `n` names less
+    /// the `i`th. Touched only under the GIL.
+    derived: UnsafeCell<Vec<(u32, u32, Rc<SharedKeys>)>>,
 }
 
 // SAFETY: names are published with release/acquire ordering and are
@@ -64,6 +68,7 @@ impl Default for SharedKeys {
             filter: AtomicU64::new(0),
             keys: [const { UnsafeCell::new(MaybeUninit::uninit()) }; SHARED_KEYS_CAP],
             hashes: [const { UnsafeCell::new(0) }; SHARED_KEYS_CAP],
+            derived: UnsafeCell::new(Vec::new()),
         }
     }
 }
@@ -149,6 +154,39 @@ impl SharedKeys {
             filter |= 1 << (*h.get_mut() & 63);
         }
         *self.filter.get_mut() = filter;
+        // The tables derived from the old names no longer derive from these.
+        self.derived.get_mut().clear();
+    }
+
+    /// The first `n` names less the `i`th (`i + 1 < n <= len`), as a table
+    /// of their own: the one an earlier deletion of the same shape made,
+    /// when this table remembers it, so instances that delete the same
+    /// attributes in the same order share their tables, as they share
+    /// their class's (deletions in `__enter__`, say). A remembered table
+    /// may have grown since (appends of later stores), but its first
+    /// `n - 1` names stay these. The caller holds the GIL.
+    fn without(&self, n: usize, i: usize) -> Rc<SharedKeys> {
+        const DERIVED_CAP: usize = 8;
+        // SAFETY: GIL-serialized; nothing below reaches this list again
+        // (building a table runs no code).
+        let derived = unsafe { &mut *self.derived.get() };
+        if let Some((_, _, t)) = derived
+            .iter()
+            .find(|&&(dn, di, _)| dn as usize == n && di as usize == i)
+        {
+            return t.clone();
+        }
+        let fresh = SharedKeys::default();
+        for k in (0..n).filter(|&k| k != i) {
+            let key = self.get(k).expect("a set value's name").clone();
+            // SAFETY: slot `k` is published (below the length).
+            fresh.push_key(key, unsafe { *self.hashes[k].get() });
+        }
+        let fresh = Rc::new(fresh);
+        if derived.len() < DERIVED_CAP {
+            derived.push((n as u32, i as u32, fresh.clone()));
+        }
+        fresh
     }
 
     /// [`Self::push`] of a name key whose Python hash is `hash`.
@@ -811,7 +849,10 @@ impl SplitValues {
     /// Remove attribute `name`, returning its value (`None` when it is not
     /// set). The last value simply leaves (the instance then holds one
     /// name fewer of the same table); removing any other lays the rest out
-    /// over a private copy of their names, in order. Compiled code checks
+    /// over a table of their names, in order (the one other instances that
+    /// deleted the same way share, see [`SharedKeys::without`], or one
+    /// private to this instance, which closes up in place on the next
+    /// deletion). Compiled code checks
     /// an instance's names against its class's before using a position, so
     /// such an instance takes the general paths from then on, as one with
     /// a real dictionary does, without materializing one (CPython's split
@@ -832,14 +873,8 @@ impl SplitValues {
                     // Names already private to this instance (an earlier
                     // deletion's) close up in place.
                     Some(own) => own.remove_at(i),
-                    None => {
-                        let fresh = SharedKeys::default();
-                        for k in (0..n).filter(|&k| k != i) {
-                            let key = keys.get(k).expect("a set value's name").clone();
-                            fresh.push_key(key, *keys.hashes[k].get());
-                        }
-                        keys = Rc::new(fresh);
-                    }
+                    // Shared names: the table for the rest of them.
+                    None => keys = keys.without(n, i),
                 }
                 (*h).keys = Rc::into_raw(keys);
                 std::ptr::copy(values.add(i + 1), values.add(i), n - i - 1);
