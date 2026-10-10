@@ -15466,11 +15466,8 @@ impl Interpreter {
         // nothing.
         let callable = unsafe {
             let (src, dst) = (frame.stack.as_ptr().add(first), locals.as_mut_ptr());
-            let mut k = 0;
-            while k < nargs {
-                dst.add(k).write(src.add(k).read());
-                k += 1;
-            }
+            move_objects(src, dst, nargs);
+            let mut k = nargs;
             if missing > 0 {
                 let defaults = &(*fp).defaults;
                 for d in &defaults[defaults.len() - missing..] {
@@ -15478,10 +15475,7 @@ impl Interpreter {
                     k += 1;
                 }
             }
-            while k < total {
-                dst.add(k).write(Object::Unbound);
-                k += 1;
-            }
+            fill_unbound_raw(dst.add(k), total - k);
             locals.set_len(total);
             let callable = frame.stack.as_ptr().add(callee_slot).read();
             frame.stack.set_len(callee_slot);
@@ -65979,6 +65973,60 @@ fn is_object_new(b: &Rc<crate::object::BuiltinFn>) -> bool {
         p
     });
     Rc::as_ptr(b) as usize == want
+}
+
+/// Move `n` objects from `src` to `dst` (non-overlapping): a call's few
+/// arguments in straight-line code, without the unrolled loop's
+/// prologue and remainder.
+///
+/// # Safety
+///
+/// `src` holds `n` initialized objects the caller forgets; `dst` has room
+/// for `n`.
+#[inline(always)]
+unsafe fn move_objects(src: *const Object, dst: *mut Object, n: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match n {
+            0 => {}
+            1 => dst.write(src.read()),
+            2 => {
+                dst.write(src.read());
+                dst.add(1).write(src.add(1).read());
+            }
+            3 => {
+                dst.write(src.read());
+                dst.add(1).write(src.add(1).read());
+                dst.add(2).write(src.add(2).read());
+            }
+            _ => std::ptr::copy_nonoverlapping(src, dst, n),
+        }
+    }
+}
+
+/// Write `n` unbound markers from `dst` (a frame's unset locals).
+///
+/// # Safety
+///
+/// `dst` has room for `n` objects, whose old contents need no drop.
+#[inline(always)]
+unsafe fn fill_unbound_raw(dst: *mut Object, n: usize) {
+    // SAFETY: the caller's contract; `Unbound` owns nothing.
+    unsafe {
+        match n {
+            0 => {}
+            1 => dst.write(Object::Unbound),
+            2 => {
+                dst.write(Object::Unbound);
+                dst.add(1).write(Object::Unbound);
+            }
+            _ => {
+                for k in 0..n {
+                    dst.add(k).write(Object::Unbound);
+                }
+            }
+        }
+    }
 }
 
 /// Extend `v` to `n` slots with `Unbound` (the fresh locals of an
