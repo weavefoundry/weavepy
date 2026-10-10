@@ -1442,7 +1442,21 @@ unsafe extern "C" fn h_for_iter_rest(
                 // loop's arm retires it), when its release can't free the
                 // tuple (whose items could queue finalizers): a shared
                 // iterator stays exhausted, the tuple immutable.
-                if unique && crate::shared_value::ThinArc::strong_count(items) == 1 {
+                // (Items that finalize nothing free in place: a temporary
+                // tuple of names, `for k in key[:-1]`.)
+                if unique
+                    && crate::shared_value::ThinArc::strong_count(items) == 1
+                    && !items.iter().all(|x| {
+                        matches!(
+                            x,
+                            Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::None
+                                | Object::Str(_)
+                        )
+                    })
+                {
                     return 3;
                 }
                 // SAFETY: the iterator leaves the stack.
@@ -6139,7 +6153,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
     let ins = code.instructions[pc];
     match ins.op {
         OpCode::BuildTuple => (1..=3).contains(&ins.arg),
-        OpCode::BuildMap => (1..=8).contains(&ins.arg),
+        OpCode::BuildMap => (0..=8).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
         // A prologue `MAKE_CELL`: the activation's cells are built with it.
@@ -7205,7 +7219,7 @@ impl<'a> Lower<'a> {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
-            OpCode::BuildMap if (1..=8).contains(&ins.arg) => {
+            OpCode::BuildMap if (0..=8).contains(&ins.arg) => {
                 return self.build_map(pc, ins.arg as usize)
             }
             // PEP 709: the local's value (`Unbound` included) moves onto

@@ -58471,6 +58471,15 @@ impl Interpreter {
     /// Import `module` and fetch one of its top-level attributes by name.
     /// Returns `None` if the module can't be imported or lacks the name.
     pub(crate) fn module_attr(&mut self, module: &str, attr: &str) -> Option<Object> {
+        // An imported top-level module that no thread is initializing: its
+        // attribute straight off the `sys.modules` entry (what `load_one`
+        // returns for it), without the dotted walk's bookkeeping.
+        // `object.__reduce_ex__` reads `copyreg.__newobj__` this way.
+        if !module.contains('.') && self.cache.initializing_holder(module).is_none() {
+            if let Some(Object::Module(m)) = self.cache.get(module) {
+                return m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
+            }
+        }
         let m = self.import_path(module).ok()?;
         if let Object::Module(m) = m {
             return m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
