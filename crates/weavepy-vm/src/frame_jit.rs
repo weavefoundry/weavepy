@@ -193,6 +193,9 @@ pub(crate) struct Native {
     _globals: Vec<Box<GlobalCache>>,
     #[allow(clippy::vec_box)]
     _slots: Vec<Box<SlotCache>>,
+    /// The method-load sites' in-line caches.
+    #[allow(clippy::vec_box)]
+    _methods: Vec<Box<MethodCache>>,
     /// The `CALL` sites' direct-call caches.
     #[allow(clippy::vec_box)]
     _direct: Vec<Box<DirectSite>>,
@@ -781,6 +784,18 @@ fn tags() -> Option<Tags> {
         unsafe { *std::ptr::from_ref(v).cast::<u8>().add(1) }
     };
     let cell = Object::Cell(Rc::new(crate::sync::RefCell::new(Object::None)));
+    let func = {
+        let dict = Rc::new(crate::sync::RefCell::new(crate::object::DictData::default()));
+        crate::new_function(
+            Rc::new(CodeObject::default()),
+            &dict,
+            &dict,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+    };
     let inst = Object::Instance(Rc::new(crate::types::PyInstance::new(
         crate::builtin_types::builtin_types().object_.clone(),
     )));
@@ -802,18 +817,7 @@ fn tags() -> Option<Tags> {
         float: tag(&Object::Float(1.0)),
         cell: tag(&cell),
         instance: tag(&inst),
-        function: {
-            let dict = Rc::new(crate::sync::RefCell::new(crate::object::DictData::default()));
-            tag(&crate::new_function(
-                Rc::new(CodeObject::default()),
-                &dict,
-                &dict,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            ))
-        },
+        function: tag(&func),
         list: tag(&Object::new_list(Vec::new())),
         list_layout: list_layout(),
         tuple: tag(&Object::new_tuple_array([Object::None])),
@@ -827,6 +831,7 @@ fn tags() -> Option<Tags> {
                 &Object::new_list(Vec::new()),
                 &Object::new_dict(),
                 &Object::Type(crate::builtin_types::builtin_types().object_.clone()),
+                &func,
             ]
             .into_iter()
             .filter(|o| tag(o) < 64 && counted_at_payload(o, word(o)))
@@ -1957,6 +1962,7 @@ unsafe extern "C" fn h_load_method(
     ext: *const CodeConstObjects,
     pc: u64,
     len: u64,
+    cache: *mut MethodCache,
 ) -> u32 {
     // SAFETY: the code passes its live state, its own code and extension,
     // one of its method loads, and its stack depth (at least one, with
@@ -2001,7 +2007,12 @@ unsafe extern "C" fn h_load_method(
                     return u32::from(!Interpreter::core_value_method(code, name, top));
                 }
                 let f = match ms.get_held(ver) {
-                    Some(f) => Object::Function(f),
+                    Some(f) => {
+                        if !cache.is_null() {
+                            fill_method_cache(&mut *cache, cls, ver, &f, ext, name);
+                        }
+                        Object::Function(f)
+                    }
                     None => match ms.get_inst_builtin(ver) {
                         Some(b) => Object::Builtin(b),
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
@@ -2050,6 +2061,64 @@ unsafe extern "C" fn h_load_method(
         st.stack.add(len).write(Object::Unbound);
         0
     }
+}
+
+/// A method-load site's in-line cache (see `Lower::load_method`): the
+/// class version (`0` empty) whose plain function `func` (its payload
+/// word) the site loaded, and what proves an instance doesn't shadow it:
+/// the class's shared names `keys` (`0` none) and the name's position
+/// among them (an instance holding fewer values can't hold the name).
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct MethodCache {
+    ver: u64,
+    func: u64,
+    keys: u64,
+    before: u32,
+}
+
+const MC_VER: i32 = std::mem::offset_of!(MethodCache, ver) as i32;
+const MC_FUNC: i32 = std::mem::offset_of!(MethodCache, func) as i32;
+const MC_KEYS: i32 = std::mem::offset_of!(MethodCache, keys) as i32;
+const MC_BEFORE: i32 = std::mem::offset_of!(MethodCache, before) as i32;
+
+/// Record in `cache` that instances of `cls` at version `ver` load the
+/// plain function `f` for the name `co_names[name]` (the caller proved
+/// this instance doesn't shadow it, and that `cls` keeps the default
+/// `__getattribute__`).
+fn fill_method_cache(
+    cache: &mut MethodCache,
+    cls: &crate::types::TypeObject,
+    ver: u64,
+    f: &Rc<crate::object::PyFunction>,
+    ext: &CodeConstObjects,
+    name: u32,
+) {
+    let (keys, before) = match cls.shared_keys.get() {
+        Some(keys) => {
+            let (Some(Object::Str(n)), Some(&hash)) = (
+                ext.name_objs.get(name as usize),
+                ext.name_hashes.get(name as usize),
+            ) else {
+                return;
+            };
+            (
+                std::ptr::from_ref(keys) as u64,
+                u32::try_from(keys.names_before(n, hash)).unwrap_or(u32::MAX),
+            )
+        }
+        None => (0, 0),
+    };
+    let obj = Object::Function(f.clone());
+    // SAFETY: an `Object` is 16 bytes; its second word is the payload.
+    let word = unsafe { std::ptr::from_ref(&obj).cast::<u64>().add(1).read() };
+    drop(obj);
+    *cache = MethodCache {
+        ver,
+        func: word,
+        keys,
+        before,
+    };
 }
 
 /// A `LOAD_ATTR` site's `__slots__` member shortcut: the class version and
@@ -3826,6 +3895,7 @@ fn compile_with(
     let mut entries: Vec<bool>;
     let mut globals: Vec<Box<GlobalCache>>;
     let mut slots: Vec<Box<SlotCache>>;
+    let mut methods: Vec<Box<MethodCache>>;
     let mut direct: Vec<Box<DirectSite>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
@@ -3840,6 +3910,7 @@ fn compile_with(
         entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
         globals = std::mem::take(&mut lower.global_caches);
         slots = std::mem::take(&mut lower.slot_caches);
+        methods = std::mem::take(&mut lower.method_caches);
         direct = std::mem::take(&mut lower.direct_sites);
         if done {
             lower.b.seal_all_blocks();
@@ -3900,6 +3971,7 @@ fn compile_with(
         need: stack_need(depths),
         _globals: globals,
         _slots: slots,
+        _methods: methods,
         _direct: direct,
     })
 }
@@ -4001,6 +4073,7 @@ struct Lower<'a> {
     global_caches: Vec<Box<GlobalCache>>,
     #[allow(clippy::vec_box)]
     slot_caches: Vec<Box<SlotCache>>,
+    method_caches: Vec<Box<MethodCache>>,
     #[allow(clippy::vec_box)]
     direct_sites: Vec<Box<DirectSite>>,
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
@@ -4161,6 +4234,7 @@ impl<'a> Lower<'a> {
             side_exits: Vec::new(),
             global_caches: Vec::new(),
             slot_caches: Vec::new(),
+            method_caches: Vec::new(),
             direct_sites: Vec::new(),
             catch: None,
         }
@@ -7009,19 +7083,103 @@ impl<'a> Lower<'a> {
             return false;
         }
         self.flush();
+        let helper = self.b.create_block();
+        let done = self.b.create_block();
+        let fn_counted = self.tags.rc_counted & (1i64 << self.tags.function) != 0;
+        let cache: Box<MethodCache> = Box::default();
+        let cache_at = std::ptr::from_ref::<MethodCache>(&cache) as i64;
+        self.method_caches.push(cache);
+        match self.layout {
+            // An instance of the class the site last saw, which holds no
+            // dictionary and fewer values than the name's position among
+            // its class's names: the cached function, the receiver above
+            // it.
+            Some(l) if fn_counted => {
+                let l = *l;
+                let ptr = self.ptr;
+                let recv = self.slot_addr(self.depth - 1);
+                let above = self.slot_addr(self.depth);
+                let c = self.b.ins().iconst(ptr, cache_at);
+                let tag = self.tag_at(recv);
+                let not_inst =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+                self.branch_out(not_inst, helper);
+                let inst = self.b.ins().load(ptr, FLAGS, recv, 8);
+                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+                let ver = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, cls, l.type_attr_version);
+                let want = self.b.ins().load(types::I64, FLAGS, c, MC_VER);
+                let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+                let unguarded = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+                let rflag = self.b.ins().iconst(
+                    ptr,
+                    std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+                );
+                let rshared = self.b.ins().uload8(types::I64, FLAGS, rflag, 0);
+                let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+                let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+                let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                let other = self.b.ins().bor(lazy, unguarded);
+                let other = self.b.ins().bor(other, rshared);
+                let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+                let bad = self.b.ins().bor(unset, stale);
+                let bad = self.b.ins().bor(bad, busy);
+                let bad = self.b.ins().bor(bad, other);
+                self.branch_out(bad, helper);
+                let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+                let check = self.b.create_block();
+                let hit = self.b.create_block();
+                self.b.ins().brif(block, check, &[], hit, &[]);
+                self.b.switch_to_block(check);
+                let n = self.b.ins().uload32(FLAGS, block, l.split_len);
+                let keys = self.b.ins().load(types::I64, FLAGS, block, l.split_keys);
+                let ckeys = self.b.ins().load(types::I64, FLAGS, c, MC_KEYS);
+                let before = self.b.ins().uload32(FLAGS, c, MC_BEFORE);
+                let empty = self.b.ins().icmp_imm(IntCC::Equal, n, 0);
+                let same = self.b.ins().icmp(IntCC::Equal, keys, ckeys);
+                let short = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, n, before);
+                let held = self.b.ins().band(same, short);
+                let ok = self.b.ins().bor(empty, held);
+                self.b.ins().brif(ok, hit, &[], helper, &[]);
+                self.b.switch_to_block(hit);
+                // The function's count, then the receiver up and the
+                // function in its place.
+                let f = self.b.ins().load(types::I64, FLAGS, c, MC_FUNC);
+                let count = self.b.ins().load(types::I64, FLAGS, f, 0);
+                let count = self.b.ins().iadd_imm(count, 1);
+                self.b.ins().store(FLAGS, count, f, 0);
+                self.copy16(above, recv);
+                self.write_tag(recv, self.tags.function);
+                self.b.ins().store(FLAGS, f, recv, 8);
+                self.b.ins().jump(done, &[]);
+            }
+            _ => {
+                self.b.ins().jump(helper, &[]);
+            }
+        }
+        self.b.switch_to_block(helper);
         let code = self.code_ptr();
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let c = self.b.ins().iconst(self.ptr, cache_at);
         let r = self
             .call(
                 h_load_method as *const () as usize,
-                &[self.st, code, ext, pcv, len],
+                &[self.st, code, ext, pcv, len, c],
                 true,
             )
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
         self.depth += 1;
         self.set_last(pc);
         self.check_released(pc + 1);
