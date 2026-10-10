@@ -295,6 +295,20 @@ fn builtin_kw(
 /// named attribute — `get_warnings_attr` in `_warnings.c`. Attribute
 /// misses and import failures both come back as `None`; the caller falls
 /// back to the internal state.
+/// Key strings the warning pipeline probes dicts with on every call, made
+/// once so each probe reuses the string's memoized hash.
+const K_VERSION: usize = 0;
+const K_REGISTRY: usize = 1;
+const K_NAME: usize = 2;
+const K_WARNINGS: usize = 3;
+
+fn wkey(k: usize) -> &'static Object {
+    static KEYS: std::sync::OnceLock<[Object; 4]> = std::sync::OnceLock::new();
+    &KEYS.get_or_init(|| {
+        ["version", "__warningregistry__", "__name__", "warnings"].map(Object::from_static)
+    })[k]
+}
+
 fn get_warnings_attr(attr: &str, try_import: bool) -> Option<Object> {
     let ip = interp().ok()?;
     let module = if try_import {
@@ -303,7 +317,7 @@ fn get_warnings_attr(attr: &str, try_import: bool) -> Option<Object> {
         ip.module_cache()
             .modules
             .borrow()
-            .get(&StrKey("warnings"))
+            .get(&DictKey(wkey(K_WARNINGS).clone()))
             .cloned()?
     };
     match &module {
@@ -505,7 +519,7 @@ fn already_warned(
     should_set: bool,
 ) -> Result<bool, RuntimeError> {
     let version = with_state(|st| st.filters_version);
-    let version_key = DictKey(Object::from_static("version"));
+    let version_key = DictKey(wkey(K_VERSION).clone());
     let stale = match registry.borrow().get(&version_key) {
         Some(Object::Int(v)) => *v != version,
         _ => true,
@@ -648,6 +662,13 @@ fn normalize_module(filename: &Object) -> Object {
     }
 }
 
+/// `category(message)`: a fresh warning instance.
+fn new_warning(category: &Object, message: &Object) -> Result<Object, RuntimeError> {
+    let ip = interp()?;
+    let globals = ip.builtins_dict();
+    ip.call_object_with_globals(category, &[message.clone()], &[], &globals)
+}
+
 fn is_warning_instance(obj: &Object) -> Option<Rc<TypeObject>> {
     if let Object::Instance(inst) = obj {
         let warning = crate::builtin_types::builtin_types().warning.clone();
@@ -710,11 +731,14 @@ fn warn_explicit_locked(
 
     // Normalise: a Warning *instance* supplies both text (str(message))
     // and category (its class); otherwise the message is the text and a
-    // fresh instance is built by calling the category.
-    let (text, message, category_cls) = match is_warning_instance(&message) {
+    // fresh instance is built by calling the category. A built-in
+    // category's instance is built only once something uses it (an
+    // ignored or already-issued warning never does): its construction
+    // runs no code anyone could observe.
+    let (text, instance, category_cls) = match is_warning_instance(&message) {
         Some(cls) => {
             let text = Object::from_str(interp()?.str_object(&message)?);
-            (text, message, cls)
+            (text, Some(message), cls)
         }
         None => {
             let Object::Type(cls) = &category else {
@@ -724,12 +748,17 @@ fn warn_explicit_locked(
                 )));
             };
             let cls = cls.clone();
-            let ip = interp()?;
-            let globals = ip.builtins_dict();
-            let instance =
-                ip.call_object_with_globals(&category, &[message.clone()], &[], &globals)?;
-            (message, instance, cls)
+            if cls.flags.is_builtin {
+                (message, None, cls)
+            } else {
+                let instance = new_warning(&category, &message)?;
+                (message, Some(instance), cls)
+            }
         }
+    };
+    let message = || match &instance {
+        Some(m) => Ok(m.clone()),
+        None => new_warning(&category, &text),
     };
 
     let key = Object::new_tuple_array([
@@ -747,7 +776,7 @@ fn warn_explicit_locked(
     let action = action_str(&action_obj).unwrap_or_default();
 
     if action == "error" {
-        return Err(RuntimeError::PyException(PyException::new(message)));
+        return Err(RuntimeError::PyException(PyException::new(message()?)));
     }
     if action == "ignore" {
         return Ok(Object::None);
@@ -799,7 +828,7 @@ fn warn_explicit_locked(
         call_show_warning(
             &category_cls,
             &text,
-            &message,
+            &message()?,
             filename,
             lineno,
             sourceline,
@@ -947,63 +976,88 @@ fn is_internal_filename(filename: &str) -> bool {
 fn setup_context(
     stacklevel: i64,
     skip_file_prefixes: &[String],
-) -> Result<(String, i64, Object, Object), RuntimeError> {
-    crate::builtins::sync_frame_spine();
+) -> Result<(Object, i64, Object, Object), RuntimeError> {
     // Per-thread frame stack, with the interpreter's own as a fallback
     // (shutdown finalizers run `__del__` without re-activating handles —
     // same fallback `sys._getframe` keeps).
-    let frames: Option<crate::object::FrameStack> =
-        match crate::vm_singletons::current_thread_handles() {
-            Some(h) => Some(h.frame_stack.clone()),
-            None => interp().ok().map(|ip| ip.frame_stack.clone()),
-        };
-    // The walk only needs filename / lineno / globals, all present on
-    // the cheap shells — no `PyFrame` materialisation (RFC 0058).
-    let frame: Option<Rc<crate::object::FrameShell>> = frames.and_then(|fs| {
-        let stack = fs.borrow();
-        if stack.is_empty() {
-            return None;
+    let frames: Option<crate::object::FrameStack> = crate::vm_singletons::current_frame_stack()
+        .or_else(|| interp().ok().map(|ip| ip.frame_stack.clone()));
+    // The walk only needs filename / lineno / globals: the running
+    // interpreter's whole stack (lean activations included) answers
+    // without pushing shells or materialising frames (RFC 0058); another
+    // stack's spine is made whole first.
+    let ip = interp().ok();
+    let whole = match (&ip, &frames) {
+        (Some(ip), Some(fs)) if Rc::ptr_eq(&ip.frame_stack, fs) => true,
+        _ => {
+            crate::builtins::sync_frame_spine();
+            false
         }
-        let is_internal =
-            |f: &Rc<crate::object::FrameShell>| is_internal_filename(&f.code.filename);
-        let to_skip = |f: &Rc<crate::object::FrameShell>| {
-            is_internal(f)
+    };
+    type Ctx = (Rc<weavepy_compiler::CodeObject>, u32, Rc<RefCell<DictData>>);
+    let at = |d: usize| -> Option<Ctx> {
+        if whole {
+            return ip.as_ref()?.frame_context_at(d);
+        }
+        let fs = frames.as_ref()?;
+        let stack = fs.borrow();
+        let shell = stack.get(stack.len().checked_sub(1 + d)?)?;
+        Some((
+            (*shell.code).clone(),
+            shell.current_lineno(),
+            (*shell.globals).clone(),
+        ))
+    };
+    let total = match (whole, &ip, &frames) {
+        (true, Some(ip), _) => ip.stack_depth(),
+        (_, _, Some(fs)) => fs.borrow().len(),
+        _ => 0,
+    };
+    let is_internal =
+        |d: usize| at(d).is_some_and(|(code, _, _)| is_internal_filename(&code.filename));
+    let to_skip = |d: usize| {
+        at(d).is_some_and(|(code, _, _)| {
+            is_internal_filename(&code.filename)
                 || skip_file_prefixes
                     .iter()
-                    .any(|p| f.code.filename.starts_with(p.as_str()))
-        };
-        let mut idx: isize = stack.len() as isize - 1;
+                    .any(|p| code.filename.starts_with(p.as_str()))
+        })
+    };
+    let frame = if total == 0 {
+        None
+    } else {
+        let mut d = 0usize;
         let mut level = stacklevel;
-        if level <= 0 || is_internal(&stack[idx as usize]) {
-            while level > 1 && idx >= 0 {
-                idx -= 1;
+        if level <= 0 || is_internal(0) {
+            while level > 1 && d < total {
+                d += 1;
                 level -= 1;
             }
         } else {
-            while level > 1 && idx >= 0 {
+            while level > 1 && d < total {
                 // next_external_frame: hop to the next non-internal,
                 // non-skipped frame.
                 loop {
-                    idx -= 1;
-                    if idx < 0 || !to_skip(&stack[idx as usize]) {
+                    d += 1;
+                    if d >= total || !to_skip(d) {
                         break;
                     }
                 }
                 level -= 1;
             }
         }
-        if idx < 0 {
+        if d >= total {
             None
         } else {
-            Some(stack[idx as usize].clone())
+            at(d)
         }
-    });
+    };
 
     let (globals, filename, lineno) = match frame {
-        Some(f) => {
-            let filename = f.code.filename.to_string();
-            let lineno = i64::from(f.current_lineno());
-            (f.globals.clone(), filename, lineno)
+        Some((code, line, globals)) => {
+            let filename = crate::builtins::code_synthetic_attr(&code, "co_filename")
+                .unwrap_or_else(|| Object::from_str(&*code.filename));
+            (globals, filename, i64::from(line))
         }
         None => {
             // Late-shutdown / no-frame warning: attributed to `<sys>:0`,
@@ -1016,11 +1070,11 @@ fn setup_context(
                     _ => Rc::new(RefCell::new(DictData::default())),
                 }
             };
-            (sysdict, "<sys>".to_owned(), 0)
+            (sysdict, Object::from_static("<sys>"), 0)
         }
     };
 
-    let registry_key = DictKey(Object::from_static("__warningregistry__"));
+    let registry_key = DictKey(wkey(K_REGISTRY).clone());
     let registry = match globals.borrow().get(&registry_key) {
         Some(r) => Some(r.clone()),
         None => None,
@@ -1033,7 +1087,7 @@ fn setup_context(
             fresh
         }
     };
-    let module = match globals.borrow().get(&StrKey("__name__")) {
+    let module = match globals.borrow().get(&DictKey(wkey(K_NAME).clone())) {
         Some(Object::None) | None => Object::from_static("<string>"),
         Some(m) => m.clone(),
     };
@@ -1079,7 +1133,7 @@ fn warn_with_context(
     warn_explicit_core(
         Object::Type(category_cls),
         message,
-        &Object::from_str(filename),
+        &filename,
         lineno,
         Some(module),
         registry,

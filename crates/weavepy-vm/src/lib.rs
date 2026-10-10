@@ -10587,6 +10587,40 @@ impl Interpreter {
         0
     }
 
+    /// How many activations the whole stack holds (see
+    /// [`Self::flush_pending_through`]).
+    pub(crate) fn stack_depth(&self) -> usize {
+        self.lean_pending.len() + self.frame_stack.borrow().len()
+    }
+
+    /// The code, current line and globals of the activation `depth` levels
+    /// up the whole stack (see [`Self::flush_pending_through`]), without
+    /// pushing any shell. A pending activation is suspended in a call, its
+    /// `pc` past it.
+    pub(crate) fn frame_context_at(
+        &self,
+        depth: usize,
+    ) -> Option<(Rc<CodeObject>, u32, Rc<RefCell<DictData>>)> {
+        let n = self.lean_pending.len();
+        if depth < n {
+            // SAFETY: as in `frame_globals_at`.
+            let frame = unsafe {
+                let act = &*(self.lean_pending[n - 1 - depth] as *const LeanAct);
+                &*act.frame
+            };
+            let lasti = frame.pc.saturating_sub(1) as usize;
+            let line = frame.code.linetable.get(lasti).copied().unwrap_or(0);
+            return Some((frame.code.clone(), line, frame.globals.clone()));
+        }
+        let stack = self.frame_stack.borrow();
+        let shell = stack.get(stack.len().checked_sub(1 + depth - n)?)?;
+        Some((
+            (*shell.code).clone(),
+            shell.current_lineno(),
+            (*shell.globals).clone(),
+        ))
+    }
+
     /// The globals of the activation `depth` levels up the whole stack
     /// (see [`Self::flush_pending_through`]), without pushing any shell.
     pub(crate) fn frame_globals_at(&self, depth: usize) -> Option<Rc<RefCell<DictData>>> {
@@ -71152,6 +71186,8 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "insort_left" | "insort_right"
             // sys
             | "_getframe" | "_getframemodulename"
+            // warnings (which reads the whole stack, lean activations included)
+            | "warn"
     )
 }
 
