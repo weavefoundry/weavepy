@@ -642,6 +642,19 @@ fn fut_gc_matches(obj: &Object) -> bool {
     }
 }
 
+/// [`fut_gc_matches`]'s cheap superset for the traverse hook, which every
+/// instance a collection walks is offered: an instance with slot storage
+/// (a future's handle lives in a slot). [`fut_gc_traverse`] finds the
+/// state itself, so the precise lookup runs once.
+fn fut_gc_may_match(obj: &Object) -> bool {
+    match obj {
+        // SAFETY: a read that runs no code. (A borrowed cell answers
+        // "maybe".)
+        Object::Instance(i) => unsafe { i.slots.peek() }.is_none_or(|s| !s.is_empty_default()),
+        _ => false,
+    }
+}
+
 fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     let Object::Instance(inst) = obj else { return };
     let Some(st) = existing_state_of(inst) else {
@@ -730,7 +743,7 @@ fn register_gc_hooks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let kind = crate::gc_trace::hook_kind::INSTANCE;
-        crate::gc_trace::register_traverse_for(kind, fut_gc_matches, fut_gc_traverse);
+        crate::gc_trace::register_traverse_for(kind, fut_gc_may_match, fut_gc_traverse);
         crate::gc_trace::register_clear_for(kind, fut_gc_matches, fut_gc_clear);
     });
 }
