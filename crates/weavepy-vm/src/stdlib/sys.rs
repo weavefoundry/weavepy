@@ -96,20 +96,24 @@ pub fn build_with_state(
             })),
         );
         let es_fallback_exc = exc_info_stack.clone();
+        let exception = Rc::new(BuiltinFn {
+            name: "exception",
+            binds_instance: false,
+            call: Box::new(move |_| {
+                if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                    sys_exception(&h.exc_info_stack)
+                } else {
+                    sys_exception(&es_fallback_exc)
+                }
+            }),
+            call_kw: None,
+        });
+        // Reads the handled-exception stack: no Python runs, and no frame
+        // is looked at (`ExitStack.__exit__` calls it every time).
+        crate::leaf_builtins::register(&exception);
         d.insert(
             DictKey(Object::from_static("exception")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "exception",
-                binds_instance: false,
-                call: Box::new(move |_| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_exception(&h.exc_info_stack)
-                    } else {
-                        sys_exception(&es_fallback_exc)
-                    }
-                }),
-                call_kw: None,
-            })),
+            Object::Builtin(exception),
         );
         d.insert(
             DictKey(Object::from_static("__excepthook__")),

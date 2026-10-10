@@ -16027,7 +16027,8 @@ impl Interpreter {
     /// `CALL_KW` or `CALL_FUNCTION_EX` (an exact tuple, and no `**` or an
     /// exact dict of `str` keys) at the running activation's pc, of a
     /// class or a Python function the inline paths declined (a class with
-    /// its own `__new__`, a callee binding `*args`): the call runs through
+    /// its own `__new__`, a callee binding `*args`), or of a builtin the
+    /// builtin lane takes, spread without keywords: the call runs through
     /// the ordinary protocol with this activation published, as the
     /// builtin lane runs a builtin. Zero-argument `super` (which reads its
     /// caller's frame) stays the full handler's. `false` touches nothing.
@@ -16061,11 +16062,26 @@ impl Interpreter {
             }
             _ => return false,
         };
+        // (A builtin the `CALL` arm's builtin lane takes, spread from a
+        // tuple without keywords: `callback(*args, **kwds)` of a bound
+        // `list.clear`.)
+        let mut builtin = false;
         let ok = match &frame.stack[callee_at] {
             Object::Type(t) => !Rc::ptr_eq(t, &builtin_types().super_),
             Object::Function(_) => true,
-            Object::BoundMethod(bm) => {
-                !bm.redispatch_descriptor && matches!(bm.function, Object::Function(_))
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(_) => true,
+                Object::Builtin(b) if ins.op == OpCode::CallEx => {
+                    builtin = true;
+                    matches!(frame.stack[callee_at + 1], Object::Unbound)
+                        && self.builtin_lane(b, Some(&bm.receiver)).is_some()
+                }
+                _ => false,
+            },
+            Object::Builtin(b) if ins.op == OpCode::CallEx => {
+                builtin = true;
+                matches!(frame.stack[callee_at + 1], Object::Unbound)
+                    && self.builtin_lane(b, None).is_some()
             }
             _ => false,
         };
@@ -16111,6 +16127,9 @@ impl Interpreter {
                 }
                 _ => return false,
             }
+        }
+        if builtin && !kwargs.is_empty() {
+            return false;
         }
         // Committed: the operands leave the stack.
         let callee = frame.stack[callee_at].clone();
@@ -21646,7 +21665,17 @@ impl Interpreter {
         let Some(name @ Object::Str(n)) = code_name_obj(code, ins.arg) else {
             return None;
         };
-        if n.starts_with("__") {
+        // The names the function type (and `object`) define as data
+        // descriptors are the full handler's; any other lands in the
+        // function's `__dict__` (`wrapper.__wrapped__ = f`).
+        if n.starts_with("__")
+            && (crate::object::is_function_slot(n)
+                || matches!(
+                    &**n,
+                    "__code__" | "__globals__" | "__closure__" | "__builtins__" | "__dict__"
+                        | "__class__"
+                ))
+        {
             return None;
         }
         let n_ = stack.len();

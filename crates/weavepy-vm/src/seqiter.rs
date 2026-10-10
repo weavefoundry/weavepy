@@ -1271,6 +1271,16 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `types.MethodType(func, obj)`: `func` bound to `obj`, as the full
+    // constructor binds it.
+    if Rc::ptr_eq(cls, &bt.method_) {
+        return match args {
+            [func, obj] => Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::py_method(obj.clone(), func.clone()),
+            ))),
+            _ => None,
+        };
+    }
     // `set()`, `dict()`, `list()`, `tuple()`: an empty one (a container
     // tracked like the builtins' own, unless that would start a collection).
     if args.is_empty() {
