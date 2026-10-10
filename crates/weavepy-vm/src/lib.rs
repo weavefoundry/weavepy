@@ -15319,6 +15319,11 @@ impl Interpreter {
         if len < 5 {
             return false;
         }
+        if self.core_with_exit_inline(sw, pc) {
+            return true;
+        }
+        // SAFETY: as above (nothing was touched).
+        let frame = unsafe { &mut *sw.cur };
         // [exit_func, exit_self, lasti, prev, exc], as the full handler.
         let exc = frame.stack[len - 1].clone();
         let exit_self = frame.stack[len - 4].clone();
@@ -15352,6 +15357,83 @@ impl Interpreter {
         if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
+        true
+    }
+
+    /// [`Self::core_with_exit_lane`] for an exit method that is a plain
+    /// Python function of the manager (`LOAD_SPECIAL` left the function
+    /// under its instance): the call `exit(self, type, exc, tb)` runs as an
+    /// inline activation switched to here, as a `CALL 3` of the same
+    /// operands would, instead of nested through [`Self::call`]. Its
+    /// return lands on the stack past the `WITH_EXCEPT_START`; a raise
+    /// propagates from it as from a call there. `false` touches nothing.
+    #[inline(never)]
+    fn core_with_exit_inline(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let code = {
+            // SAFETY: see `CoreSwitch`: the running activation is synced
+            // and unborrowed here.
+            let frame = unsafe { &*sw.cur };
+            let len = frame.stack.len();
+            // [exit_func, exit_self, lasti, prev, exc], as the full handler.
+            let (Object::Function(f), exit_self, Object::Instance(_)) = (
+                &frame.stack[len - 5],
+                &frame.stack[len - 4],
+                &frame.stack[len - 1],
+            ) else {
+                return false;
+            };
+            // A pure leaf is evaluated in place through `call` (see
+            // `call_pure_leaf`), cheaper than any activation.
+            if matches!(exit_self, Object::Unbound) || fn_is_pure_leaf(f) {
+                return false;
+            }
+            match Self::lean_call_shape_cells(f, 4, true) {
+                Some(shape) => shape,
+                None => return false,
+            }
+        };
+        let (code, missing) = code;
+        // Past the recursion limit the nested call raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return false;
+        };
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`): the running
+        // activation is the innermost; its handles are live and unborrowed.
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let (frame, shell) = (&mut *frame, &mut *shell.cast::<QuietShell<'_>>());
+            let len = frame.stack.len();
+            let Object::Instance(inst) = &frame.stack[len - 1] else {
+                unreachable!("checked above")
+            };
+            let ty = Object::Type(inst.cls());
+            let tb = inst.slot_get("__traceback__").unwrap_or(Object::None);
+            let exc = frame.stack[len - 1].clone();
+            let exit_self = frame.stack[len - 4].clone();
+            let exit_func = frame.stack[len - 5].clone();
+            // Committed: the call's operands, as a `CALL 3` sees them.
+            frame.stack.extend([exit_func, exit_self, ty, exc, tb]);
+            let n = frame.stack.len();
+            let act = self.inline_slot();
+            // SAFETY: a parked slot's locals storage is its own, and empty.
+            let locals = &mut *act.frame.locals.as_ptr();
+            let callable =
+                Self::lean_call_fill(frame, &code, true, n - 4, n - 5, missing, locals);
+            frame.pc = pc as u32 + 1;
+            self.inline_bind(frame, shell, pc, act, code, callable, guard)
+        };
+        let mut act = act;
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
     }
 
