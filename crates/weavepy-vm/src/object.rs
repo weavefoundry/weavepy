@@ -5033,6 +5033,11 @@ pub struct PyFunction {
     /// slot-store probe for the overwhelmingly common function that never
     /// had them overridden.
     pub defaults_override: OverrideFlag,
+    /// The [`Self::slots`] state (its mutation stamp, `0` for none) in
+    /// which `__name__` and `__qualname__` were last found to be the
+    /// current code's own interned names (see [`Self::code_names_kept`]).
+    /// Cleared when `__code__` is rebound.
+    pub names_kept: crate::sync::Cell<u64>,
     /// The function's slot in the cycle collector's registry (see
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,
@@ -5242,6 +5247,35 @@ impl PyFunction {
             attr_str("__name__", name_hash),
             attr_str("__qualname__", qualname_hash),
         )
+    }
+
+    /// Whether `__name__` and `__qualname__` are the very objects `names`
+    /// gives (the current code's interned names, which a generator made
+    /// by this function then reports by default): the slots' seed, or
+    /// slots in a state already found to hold them, answer without a
+    /// probe.
+    pub fn code_names_kept(&self, names: impl FnOnce() -> (Object, Object)) -> bool {
+        if self.names_seeded() {
+            return true;
+        }
+        let Some(slots) = self.slots_raw.get() else {
+            return false;
+        };
+        let stamp = match slots.try_borrow() {
+            Ok(s) => s.mutation_stamp(),
+            Err(_) => return false,
+        };
+        if stamp == self.names_kept.get() {
+            return true;
+        }
+        let (name, qualname) = self.name_objects();
+        let (code_name, code_qualname) = names();
+        let kept = name.is_some_and(|n| n.is_same(&code_name))
+            && qualname.is_some_and(|q| q.is_same(&code_qualname));
+        if kept {
+            self.names_kept.set(stamp);
+        }
+        kept
     }
 
     /// Whether the function's slots are still its definition-time seed

@@ -930,6 +930,11 @@ pub struct Interpreter {
     /// invalidate on every growth.
     #[allow(clippy::vec_box)]
     inline_pool: Vec<Box<InlineAct>>,
+    /// Emptied activation stacks of finished quiet runs (see
+    /// [`Self::quiet_run`]), for the next run: a generator its native
+    /// consumer resumes item by item starts a quiet run per item.
+    #[allow(clippy::vec_box)]
+    inl_spares: Vec<Vec<Box<InlineAct>>>,
     /// Finished generators' frame boxes, their frames dropped, for the
     /// next generators' frames (see [`Self::box_gen_frame`]).
     #[allow(clippy::vec_box)]
@@ -1240,6 +1245,7 @@ impl Default for Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            inl_spares: Vec::new(),
             gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
@@ -1370,6 +1376,7 @@ impl Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            inl_spares: Vec::new(),
             gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
@@ -7462,8 +7469,9 @@ impl Interpreter {
         let maybe_dead = gc_trace::maybe_dead_flag();
         // The root activation's last executed pc (its `prev_pc` feed).
         let mut last = usize::MAX;
-        // The inline activations, innermost last.
-        let mut inl: Vec<Box<InlineAct>> = Vec::new();
+        // The inline activations, innermost last (in a finished run's
+        // emptied vector, when one is spare).
+        let mut inl: Vec<Box<InlineAct>> = self.inl_spares.pop().unwrap_or_default();
         // Every access below goes through these handles (see
         // `CoreSwitch`): the core loop's in-loop calls and returns move
         // the running activation through the same ones.
@@ -7535,6 +7543,11 @@ impl Interpreter {
                 FrameEv::Switched(stop) => QuietEntry::Stop(stop),
                 FrameEv::Exit(exit) => {
                     let Some(mut done) = inl.pop() else {
+                        // (Empty: the vector goes back for the next run.)
+                        const SPARES_CAP: usize = 16;
+                        if inl.capacity() != 0 && self.inl_spares.len() < SPARES_CAP {
+                            self.inl_spares.push(std::mem::take(inl));
+                        }
                         return exit;
                     };
                     if done.gen.is_some() {
@@ -27046,7 +27059,8 @@ impl Interpreter {
                 .is_some_and(|n| n == "__doc__")
         {
             let plain = |v: Option<&Object>| matches!(v, Some(Object::Str(_) | Object::None));
-            let key = crate::object::StrKey("__doc__");
+            // (The site's name, hashed once.)
+            let key = code_name_key(code, name_idx)?;
             if !Self::plain_metaclass(cls) {
                 // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
                 let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
@@ -48011,6 +48025,7 @@ impl Interpreter {
                         // was made from.
                         f.slots();
                         *f.code.borrow_mut() = c;
+                        f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {
                             crate::capi_watchers::func_event("MODIFY_CODE", obj, &new_code);
@@ -52265,6 +52280,7 @@ impl Interpreter {
             slot_seed: RefCell::new(None),
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
+            names_kept: crate::sync::Cell::new(0),
             gc_slot: crate::gc_trace::GcSlot::new(),
         })))
     }
@@ -56468,7 +56484,7 @@ impl Interpreter {
         // the generator is made.
         let gen = Rc::new_cyclic(|owner| {
             frame.gen_owner = Some(owner.clone());
-            if f.names_seeded() {
+            if f.code_names_kept(|| code_gen_names(code)) {
                 // The code's names, which the generator reads by default.
                 PyGenerator::new(kind, gen_code, frame)
             } else {
@@ -74140,6 +74156,7 @@ fn new_function(
         gc_slot: crate::gc_trace::GcSlot::new(),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
+        names_kept: crate::sync::Cell::new(0),
     };
     if let Some(ann) = annotations {
         f.slots()

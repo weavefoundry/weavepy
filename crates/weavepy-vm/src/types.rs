@@ -2527,6 +2527,16 @@ impl SlotStorage {
         }
     }
 
+    /// [`Self::get_index`] with the common layout of a few `__slots__`
+    /// members read in line (a cached member load's hot path).
+    #[inline(always)]
+    pub fn get_index_hot(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        if let SlotData::Small(entries) = &self.data {
+            return entries.get(index).map(|(key, value)| (key, value));
+        }
+        self.get_index(index)
+    }
+
     /// Read an ordered entry. Callers caching an index must also validate
     /// its key; the class identity alone does not determine slot order.
     #[inline]
@@ -3020,6 +3030,11 @@ impl SlotStorage {
 
     #[inline]
     pub fn get_index(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        self.0.get_index(index)
+    }
+
+    #[inline]
+    pub fn get_index_hot(&self, index: usize) -> Option<(&DictKey, &Object)> {
         self.0.get_index(index)
     }
 

@@ -3469,8 +3469,10 @@ unsafe fn slot_hit(
     if ver == 0 || inst.cls_raw().attr_version.get() != ver {
         return None;
     }
-    let slots = inst.slots.try_borrow().ok()?;
-    let (k, v) = slots.get_index(cache.idx.get() as usize)?;
+    // SAFETY: a read between two instructions, running no code (see
+    // `GilCell::peek`); the view ends with the value's clone.
+    let slots = unsafe { inst.slots.peek() }?;
+    let (k, v) = slots.get_index_hot(cache.idx.get() as usize)?;
     crate::slot_name_matches(code, code.instructions[pc].arg, k)
         .then(|| Interpreter::clone_operand(v))
 }

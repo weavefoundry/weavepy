@@ -5339,6 +5339,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                     )));
                 }
                 *f.code.borrow_mut() = c;
+                f.names_kept.set(0);
             } else if crate::object::is_function_slot(name) {
                 f.set_slot(name, value);
             } else {
@@ -10640,6 +10641,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
+        names_kept: crate::sync::Cell::new(0),
         gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Ok(Object::Function(Rc::new(marked)))
