@@ -10547,6 +10547,46 @@ impl Interpreter {
         self.run_frame(frame)
     }
 
+    /// Make the activation `depth` levels up the whole stack (the spine,
+    /// then the pending lean activations, which are always newer than
+    /// every shell on it) the spine's, pushing the shells of the pending
+    /// ones up to it and leaving the newer ones pending. Returns its depth
+    /// from the spine's top.
+    pub(crate) fn flush_pending_through(&mut self, depth: usize) -> usize {
+        let n = self.lean_pending.len();
+        if depth >= n {
+            return depth - n;
+        }
+        let mut pending = std::mem::take(&mut self.lean_pending);
+        for addr in &pending[..n - depth] {
+            // SAFETY: see `flush_lean_cold`.
+            let caller = unsafe { &mut *(*addr as *mut LeanAct) };
+            if caller.shell.is_none() {
+                caller.shell = Some(self.push_pending_caller_shell(caller));
+            }
+        }
+        pending.drain(..n - depth);
+        self.lean_pending = pending;
+        0
+    }
+
+    /// The globals of the activation `depth` levels up the whole stack
+    /// (see [`Self::flush_pending_through`]), without pushing any shell.
+    pub(crate) fn frame_globals_at(&self, depth: usize) -> Option<Rc<RefCell<DictData>>> {
+        let n = self.lean_pending.len();
+        if depth < n {
+            // SAFETY: a pending address names a live `LeanAct` whose
+            // frame pointer its `lean_pending_enter` re-derived (see
+            // `flush_lean_cold`).
+            let act = unsafe { &*(self.lean_pending[n - 1 - depth] as *const LeanAct) };
+            // SAFETY: as above.
+            return Some(unsafe { (*act.frame).globals.clone() });
+        }
+        let stack = self.frame_stack.borrow();
+        let idx = stack.len().checked_sub(1 + depth - n)?;
+        Some((*stack[idx].globals).clone())
+    }
+
     /// Push the shells of every pending lean *caller* (see
     /// [`Self::flush_lean_cold`], which also pushes the running one's).
     pub(crate) fn flush_pending_callers(&mut self) {
@@ -14330,7 +14370,8 @@ impl Interpreter {
                             // object's field (the helper's plain values).
                             _ => {
                                 // SAFETY: `top` is the receiver's slot.
-                                if unsafe { self.core_plain_attr(code, ins.arg, top) } {
+                                let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+                                if unsafe { self.core_plain_attr(code, ins.arg, top, running) } {
                                     last = pc;
                                     pc += 1;
                                     after_release!();
@@ -18284,13 +18325,19 @@ impl Interpreter {
     ///
     /// `top` is the core loop's top stack slot.
     #[inline(never)]
-    unsafe fn core_plain_attr(&self, code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+    unsafe fn core_plain_attr(
+        &self,
+        code: &CodeObject,
+        name_idx: u32,
+        top: *mut Object,
+        running: (*const (), u32),
+    ) -> bool {
         // SAFETY: the caller's contract.
         let recv = unsafe { &*top };
         if !Self::core_droppable(recv) {
             return false;
         }
-        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx) else {
+        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx, Some(running)) else {
             return false;
         };
         // SAFETY: the receiver (droppable) is replaced in place.
@@ -21009,7 +21056,9 @@ impl Interpreter {
         // `y.append` (a builtin container's method read as a value) and
         // `obj.__dict__`: sites the full handler never specializes.
         if ins.op == OpCode::LoadAttr {
-            if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg) {
+            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+            if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg, Some(running))
+            {
                 if let Some(top) = stack.last_mut() {
                     drop(std::mem::replace(top, v));
                 }
@@ -21243,11 +21292,12 @@ impl Interpreter {
         code: &CodeObject,
         recv: Option<&Object>,
         name_idx: u32,
+        running: Option<(*const (), u32)>,
     ) -> Option<Object> {
         let recv = recv?;
         let name = code.names.get(name_idx as usize)?.as_str();
         match recv {
-            Object::Code(_) | Object::Frame(_) => Self::frame_plain_attr(recv, name, false),
+            Object::Code(_) | Object::Frame(_) => Self::frame_plain_attr(recv, name, running),
             // `x.__class__` of a builtin value: its exact type (no instance
             // or class can override it there).
             Object::Generator(_)
@@ -21275,21 +21325,36 @@ impl Interpreter {
     /// A code object's fields and a frame's plain ones (neither type can
     /// be subclassed, and no getter here runs Python); the full path keeps
     /// the deprecated `co_lnotab`, a generator frame's re-derived
-    /// `f_back`, and a line-0 `f_lineno`. A live frame's line needs its
-    /// activation's `lasti` current (see `PyFrame::live`), which the
-    /// running one's is only once it waits on the pending list: `synced`
-    /// says it does.
+    /// `f_back`, and a line-0 `f_lineno`. A live frame's line is its
+    /// shell's `lasti` (see `PyFrame::live`), which is current unless its
+    /// activation is the one running: `running` names the running
+    /// activation (its locals' storage, which its frame object's mirror
+    /// shares) and the instruction it is at, if the caller knows them.
     #[inline]
-    fn frame_plain_attr(recv: &Object, name: &str, synced: bool) -> Option<Object> {
+    fn frame_plain_attr(
+        recv: &Object,
+        name: &str,
+        running: Option<(*const (), u32)>,
+    ) -> Option<Object> {
         match recv {
             Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
             Object::Frame(fr) => match name {
                 "f_code" => Some(Object::Code(fr.code.clone())),
                 "f_globals" => Some(Object::Dict(fr.globals.clone())),
                 "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
-                "f_lineno"
-                    if synced || fr.live.load(std::sync::atomic::Ordering::Relaxed).is_null() =>
-                {
+                "f_lineno" => {
+                    if !fr.live.load(std::sync::atomic::Ordering::Relaxed).is_null() {
+                        let (locals, pc) = running?;
+                        let own = fr
+                            .locals_mirror
+                            .try_borrow()
+                            .ok()?
+                            .as_ref()
+                            .is_some_and(|m| std::ptr::eq(Rc::as_ptr(m).cast::<()>(), locals));
+                        if own {
+                            fr.set_lasti(pc);
+                        }
+                    }
                     match fr.current_lineno() {
                         0 => None,
                         line => Some(Object::Int(i64::from(line))),
@@ -46096,9 +46161,12 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
         // A property's or a Python data descriptor's getter runs as an
         // inline activation, as the core loop's own arm runs it.
         if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && !frame_field
             && (self.core_property(sw) || self.core_getitem(sw, true))
         {
             return Ok(());
@@ -46106,26 +46174,24 @@ impl Interpreter {
         // SAFETY: as above (both declined untouched).
         let frame = unsafe { &mut *sw.cur };
         let ins = frame.code.instructions[pc];
-        frame.pc = pc as u32 + 1;
-        let pending = self.core_pending_enter(sw, frame, pc);
-        // A frame's or code object's plain field, now that this
-        // activation's `lasti` is current for its own frame's line.
-        if ins.op == OpCode::LoadAttr
-            && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)))
-        {
+        // A frame's or code object's plain field.
+        if frame_field {
+            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
             let v = match (frame.stack.last(), frame.code.names.get(ins.arg as usize)) {
-                (Some(recv), Some(name)) => Self::frame_plain_attr(recv, name, true),
+                (Some(recv), Some(name)) => Self::frame_plain_attr(recv, name, Some(running)),
                 _ => None,
             };
             if let Some(v) = v {
+                frame.pc = pc as u32 + 1;
                 if let Some(top) = frame.stack.last_mut() {
                     let recv = std::mem::replace(top, v);
                     self.release(recv);
                 }
-                self.core_pending_exit(sw, pending);
                 return Ok(());
             }
         }
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
         let r = match ins.op {
             OpCode::LoadAttr => match self.load_attr_certain_miss(frame, ins.arg) {
                 Some(err) => Err(err),

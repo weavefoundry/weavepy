@@ -142,7 +142,45 @@ def gen_lines(n):
     return sorted(seen)
 
 
+import types
+
+M = types.ModuleType("modx")
+exec(
+    "import sys\n"
+    "def who(d):\n"
+    "    return sys._getframemodulename(d)\n"
+    "def via(d):\n"
+    "    return who(d)\n"
+    "def frame_at(d):\n"
+    "    return sys._getframe(d)\n"
+    "def chain(d):\n"
+    "    return frame_at(d)\n",
+    M.__dict__,
+)
+HERE = __name__
+
+
+def stack_names(n):
+    seen = set()
+    for i in range(n):
+        seen.add((M.who(0), M.who(1), M.via(1), M.via(2), M.via(10**6)))
+        f = M.chain(1)
+        names = []
+        while f is not None and f.f_code.co_name != "<module>":
+            names.append(f.f_code.co_name)
+            f = f.f_back
+        seen.add(tuple(names))
+        try:
+            M.chain(10**6)
+        except ValueError:
+            seen.add("deep")
+    return seen
+
+
 def run(n):
+    want = {("modx", HERE, "modx", HERE, None), ("chain", "stack_names", "run"), "deep"}
+    got = stack_names(n)
+    assert got == want, got
     assert self_reads(n) == 0
     got = self_getattr(n)
     assert got == [L("sg-a"), L("sg-b")], got

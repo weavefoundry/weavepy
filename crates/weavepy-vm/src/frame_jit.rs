@@ -3555,6 +3555,10 @@ unsafe extern "C" fn h_stack_attr(
             Object::Type(cls) if Rc::strong_count(cls) > 1 => type_attr(code, ext, cls, pc, arg),
             Object::Module(m) => Interpreter::core_module_attr(code, m, pc, arg)
                 .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg)),
+            Object::Code(_) | Object::Frame(_) => code
+                .names
+                .get(arg as usize)
+                .and_then(|name| Interpreter::frame_plain_attr(recv, name, None)),
             _ => None,
         };
         let Some(v) = v else {
@@ -3625,6 +3629,12 @@ unsafe extern "C" fn h_local_attr(
                 Interpreter::core_local_attr(Some(ext), code, recv, pc, arg)
             }
             Object::Type(cls) => type_attr(code, ext, cls, pc, arg),
+            // A frame's or code object's plain field (a live frame's line
+            // needs the full lane, which makes its `lasti` current).
+            Object::Code(_) | Object::Frame(_) => code
+                .names
+                .get(arg as usize)
+                .and_then(|name| Interpreter::frame_plain_attr(recv, name, None)),
             _ => None,
         };
         match v {
@@ -4068,6 +4078,25 @@ unsafe extern "C" fn h_property(
             return CALL_DECLINED;
         }
         let (pc, slot) = (pc as usize, slot as usize);
+        // A frame's or code object's plain field, a live frame's line with
+        // the running activation's own instruction.
+        if matches!(&*recv, Object::Frame(_) | Object::Code(_)) && (local != 0 || droppable(&*recv))
+        {
+            let code = &*code;
+            let running = (Rc::as_ptr(&(*st.frame).locals).cast::<()>(), pc as u32);
+            let v = code
+                .names
+                .get(code.instructions[pc].arg as usize)
+                .and_then(|name| Interpreter::frame_plain_attr(&*recv, name, Some(running)));
+            if let Some(v) = v {
+                let at = st.stack.add(slot);
+                if local == 0 {
+                    crate::drop_hot(at.read());
+                }
+                at.write(v);
+                return 0;
+            }
+        }
         let Object::Instance(inst) = &*recv else {
             return attr_lane(st, pc, slot, recv, local);
         };

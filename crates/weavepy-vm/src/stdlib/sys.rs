@@ -1564,18 +1564,25 @@ fn sys_getframe(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
-    crate::builtins::sync_frame_spine();
     if args.len() > 1 {
         return Err(type_error(format!(
             "_getframe expected at most 1 argument, got {}",
             args.len()
         )));
     }
-    let depth = match args.first() {
+    let mut depth = match args.first() {
         Some(Object::Int(d)) => *d as usize,
         None => 0,
         _ => return Err(type_error("depth must be an int")),
     };
+    // Only the activations up to the one asked for need their shells: the
+    // newer ones stay lean.
+    match crate::builtins::reentrant_interp() {
+        Ok(interp) if Rc::ptr_eq(&interp.frame_stack, frame_stack) => {
+            depth = interp.flush_pending_through(depth);
+        }
+        _ => crate::builtins::sync_frame_spine(),
+    }
     // The topmost frame is the currently-executing one, which is
     // the *callee* of `sys._getframe`. CPython considers the
     // calling frame as depth 0; we mirror by indexing from the back.
@@ -1606,7 +1613,6 @@ fn sys_getframemodulename(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
-    crate::builtins::sync_frame_spine();
     let depth = match args.first() {
         Some(o) => match o {
             Object::Int(d) => *d,
@@ -1618,6 +1624,20 @@ fn sys_getframemodulename(
     if depth < 0 {
         return Ok(Object::None);
     }
+    // The globals are read where the activation is, lean or not.
+    if let Ok(interp) = crate::builtins::reentrant_interp() {
+        if Rc::ptr_eq(&interp.frame_stack, frame_stack) {
+            let Some(globals) = interp.frame_globals_at(depth as usize) else {
+                return Ok(Object::None);
+            };
+            let name = globals
+                .borrow()
+                .get(&crate::object::StrKey("__name__"))
+                .cloned();
+            return Ok(name.unwrap_or(Object::None));
+        }
+    }
+    crate::builtins::sync_frame_spine();
     let len = frame_stack.borrow().len();
     let depth = depth as usize;
     if depth >= len {
