@@ -1381,19 +1381,20 @@ unsafe extern "C" fn h_for_iter_rest(
                 None => 3,
             };
         }
-        // A native adapter whose step runs no code (`zip` of native
-        // iterators, `itertools.repeat`, ...); its exhaustion is the
-        // interpreter's.
+        // A native adapter: a step that runs no code (`zip` of native
+        // iterators, `map` with a pure callback, ...) in place; any other
+        // (a Python callback, exhaustion) through the core loop's lane.
         Object::LazyIter(l) => {
             // SAFETY: the code passes its live state, whose interpreter
             // is dormant while the helper runs.
             let interp = unsafe { &*st.interp };
-            let Some(Some(v)) = interp.lazy_core_next(l) else {
-                return 3;
-            };
-            // SAFETY: the slot above the iterator is free.
-            unsafe { out.write(v) };
-            return 1;
+            if let Some(Some(v)) = interp.lazy_core_next(l) {
+                // SAFETY: the slot above the iterator is free.
+                unsafe { out.write(v) };
+                return 1;
+            }
+            // SAFETY: as above.
+            return unsafe { for_iter_lane(st, it, pc) };
         }
         _ => return 3,
     };
@@ -1567,6 +1568,53 @@ unsafe extern "C" fn h_for_iter_rest(
     // SAFETY: the slot above the iterator is free.
     unsafe { out.write(v) };
     1
+}
+
+/// The `FOR_ITER` at `pc` over the native adapter at `it` (the stack's top)
+/// whose step may run Python code (a `map` over a Python function), as the
+/// core loop's lane runs it (`Interpreter::core_for_iter_lane`): the frame
+/// synced and waiting on the pending list meanwhile. [`h_for_iter`]'s
+/// results: `1` the item above the iterator, `2` the exhausted iterator
+/// retired, `FOR_SWITCHED` anything else for the core loop (a raise, a
+/// pending stop; the frame synced past the instruction), `3` nothing done.
+///
+/// # Safety
+///
+/// As [`h_for_iter_rest`]'s.
+#[inline(never)]
+unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+            return 3;
+        }
+        let pc = pc as usize;
+        let slot = it.offset_from(st.stack) as usize;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot + 1);
+        frame.pc = pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_for_iter_lane(sw) {
+            return 3;
+        }
+        let frame = &*st.frame;
+        if sw.pending.is_none()
+            && std::ptr::eq(sw.cur, st.frame)
+            && crate::hot_gates::loop_gen() == st.snap_gen
+        {
+            let at = frame.pc as usize;
+            let depth = frame.stack.len();
+            if at == pc + 1 && depth == slot + 2 {
+                return 1;
+            }
+            if depth == slot && at == for_iter_exit(&frame.code, pc) {
+                return 2;
+            }
+        }
+        FOR_SWITCHED
+    }
 }
 
 /// [`h_for_iter`] switched to a generator's activation (`RELOAD`).

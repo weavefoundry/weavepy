@@ -96,6 +96,12 @@ fn pure_iter(obj: &Object) -> Option<Object> {
     }
 }
 
+/// Whether `e` is a `StopIteration` (or a subclass's) being raised.
+pub(crate) fn is_stop_iteration(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::PyException(exc) if matches!(&exc.instance,
+        Object::Instance(i) if i.cls_raw().is_subclass_of(&builtin_types().stop_iteration)))
+}
+
 /// `"argument 1"` / `"arguments 1-N"`: the strict-mode mismatch wording.
 fn arg_range(count: usize) -> String {
     if count == 1 {
@@ -120,8 +126,9 @@ impl Interpreter {
         self.iter_next(it, globals)
     }
 
-    /// `func(v)` for an adapter's callback: a plain function through
-    /// the pure-leaf evaluator when it qualifies, else a full call.
+    /// `func(v)` for an adapter's callback: a pure callback in place (see
+    /// [`Self::pure_callback`]), a plain function or a method over one
+    /// bound directly, else a full call.
     #[inline]
     pub(crate) fn seq_call1(
         &mut self,
@@ -129,12 +136,18 @@ impl Interpreter {
         v: Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        if let Object::Function(f) = func {
-            if let Some(r) = self.call_pure_leaf(f, std::slice::from_ref(&v)) {
-                self.release(v);
-                return Ok(r);
+        if let Some(r) = self.pure_callback(func, std::slice::from_ref(&v)) {
+            self.release(v);
+            return Ok(r);
+        }
+        match func {
+            Object::Function(f) => return self.call_python_owned(f, vec![v], Vec::new()),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => {
+                if let Object::Function(f) = &bm.function {
+                    return self.call_python_owned(f, vec![bm.receiver.clone(), v], Vec::new());
+                }
             }
-            return self.call_python_owned(f, vec![v], Vec::new());
+            _ => {}
         }
         let r = self.call(func, std::slice::from_ref(&v), &[], globals);
         // A dead item's allocation is recycled (a tuple's, as CPython's
@@ -169,15 +182,23 @@ impl Interpreter {
                 out.reserve(if filter { n.min(64) } else { n });
             }
         }
+        // (A callback's `StopIteration` ends the drain, as it ends a step:
+        // see `Interpreter::lazy_iter_next`.)
+        let stop = |e: RuntimeError| if is_stop_iteration(&e) { Ok(true) } else { Err(e) };
         if filter {
-            while let Some(v) = self.filter_next(&func, &source, globals)? {
-                out.push(v);
+            loop {
+                match self.filter_next(&func, &source, globals) {
+                    Ok(Some(v)) => out.push(v),
+                    Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                }
             }
-            return Ok(true);
         }
         while let Some(v) = self.seq_step_source(&source, globals)? {
-            let r = self.seq_call1(&func, v, globals)?;
-            out.push(r);
+            match self.seq_call1(&func, v, globals) {
+                Ok(r) => out.push(r),
+                Err(e) => return stop(e),
+            }
         }
         Ok(true)
     }
@@ -1765,60 +1786,231 @@ fn scalar_truth(v: &Object) -> Option<bool> {
     })
 }
 
-impl Interpreter {
-    /// [`lazy_pure_next`], and also a `map` or `filter` over a plain
-    /// sequence cursor whose callback is a warm pure-leaf function
-    /// (evaluated in place, as the core loop calls one): the item is
-    /// taken only once the callback has succeeded. `None` (nothing
-    /// consumed) for every other step.
-    pub(crate) fn lazy_core_next(&self, l: &PyLazyIter) -> Option<Option<Object>> {
-        if let Some(r) = lazy_pure_next(l) {
-            return Some(r);
+/// `a == b` for two `groupby` keys when it is settled natively (identity,
+/// two machine ints, strings or floats, two classes that compare by
+/// identity): `None` when it could need Python's `__eq__`.
+fn native_key_eq(a: &Object, b: &Object) -> Option<bool> {
+    if a.is_same(b) {
+        return Some(true);
+    }
+    Some(match (a, b) {
+        (Object::Int(x), Object::Int(y)) => x == y,
+        (Object::Str(x), Object::Str(y)) => crate::dictmap::key_bytes_eq(x.as_bytes(), y.as_bytes()),
+        (Object::Float(x), Object::Float(y)) => x == y,
+        (Object::Bool(x), Object::Bool(y)) => x == y,
+        (Object::Type(x), Object::Type(y))
+            if crate::object::type_hash_is_identity(x) && crate::object::type_hash_is_identity(y) =>
+        {
+            Rc::ptr_eq(x, y)
         }
-        // SAFETY: nothing below runs code that could reach the adapter
-        // (pure leaves call nothing); the view ends with this call.
-        let st = unsafe { l.state.peek() }?;
-        let peek = |c: &Rc<RefCell<PyIterator>>| -> Option<Object> {
-            // SAFETY: as above (a distinct cell).
-            unsafe { c.peek() }?.pure_peek()
-        };
-        let advance = |c: &Rc<RefCell<PyIterator>>| -> Option<()> {
-            // SAFETY: as above; the item was found ready.
-            unsafe { c.peek_mut() }?.next_value().map(drop)
-        };
-        match st {
-            LazyIterKind::Map {
-                func: Object::Function(f),
-                iters,
-                ..
-            } => {
-                let [Object::Iter(c)] = iters.as_slice() else {
-                    return None;
-                };
-                let v = peek(c)?;
-                let r = self.call_pure_leaf(f, std::slice::from_ref(&v))?;
-                advance(c)?;
-                Some(Some(r))
+        _ => return None,
+    })
+}
+
+/// The next item of a plain sequence cursor, without taking it (see
+/// [`PyIterator::pure_peek`]).
+#[inline]
+fn cursor_peek(c: &Rc<RefCell<PyIterator>>) -> Option<Object> {
+    // SAFETY: a read that runs no code; the view ends with this call.
+    unsafe { c.peek() }?.pure_peek()
+}
+
+/// Take the item [`cursor_peek`] found.
+#[inline]
+fn cursor_advance(c: &Rc<RefCell<PyIterator>>) -> Option<()> {
+    // SAFETY: as above; the item was found ready.
+    unsafe { c.peek_mut() }?.next_value().map(drop)
+}
+
+impl Interpreter {
+    /// `func(*args)` for an adapter's callback when the call runs no Python
+    /// code: a warm pure-leaf function or a bound method over one (evaluated
+    /// in place, as the core loop calls one), a registered leaf builtin or a
+    /// leaf builtin method bound to its receiver, or a builtin type whose
+    /// native constructor builds the value (`int`, `str`, `type`, ...).
+    /// `None` leaves the call to the full machinery, nothing having
+    /// happened (a pure call that would raise declines too, so the full
+    /// call raises it).
+    pub(crate) fn pure_callback(&self, func: &Object, args: &[Object]) -> Option<Object> {
+        match func {
+            Object::Function(f) => self.call_pure_leaf(f, args),
+            // (As the core loop's leaf builtin lane admits them: a function,
+            // or a method bound to its exact builtin receiver.)
+            Object::Builtin(b) if !b.binds_instance => {
+                let kind = self.leaf_call_kind(b)?;
+                self.leaf_builtin_call(kind, b, args)?.ok()
             }
+            Object::Type(t) => self.leaf_type_call(t, args),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(f) => self.call_pure_leaf_with(f, Some(&bm.receiver), args),
+                Object::Builtin(b)
+                    if b.binds_instance
+                        && crate::builtins::method_memo_tag(&bm.receiver).is_some() =>
+                {
+                    let kind = self.leaf_call_kind(b)?;
+                    let call = match args {
+                        [a] => [bm.receiver.clone(), a.clone()],
+                        _ => return None,
+                    };
+                    self.leaf_builtin_call(kind, b, &call)?.ok()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `groupby_step` when taking the next value and computing its key
+    /// run no code: the value and its key, the value taken. `None` (nothing
+    /// consumed) otherwise.
+    fn groupby_step_pure(&self, source: &Object, keyfunc: &Object) -> Option<(Object, Object)> {
+        let Object::Iter(c) = source else {
+            return None;
+        };
+        let value = cursor_peek(c)?;
+        let key = match keyfunc {
+            Object::None => value.clone(),
+            f => self.pure_callback(f, std::slice::from_ref(&value))?,
+        };
+        cursor_advance(c)?;
+        Some((value, key))
+    }
+
+    /// One step of a native adapter that runs no Python code, for every
+    /// `FOR_ITER` (the core loop's, the frame JIT's, tier 2's) and ahead of
+    /// the interpreter's general step: [`lazy_pure_next`]'s state machines,
+    /// and a `map` or `filter` over plain sequence cursors whose callback
+    /// is pure (see [`Self::pure_callback`]; the item is taken only once
+    /// the callback has succeeded), an `enumerate` over such an adapter,
+    /// and a `groupby` or grouper whose key function and key comparisons
+    /// are native. `None` (nothing consumed, or only whole steps the
+    /// general path would have taken the same way) for every other step.
+    pub(crate) fn lazy_core_next(&self, l: &Rc<PyLazyIter>) -> Option<Option<Object>> {
+        // SAFETY: nothing below runs code that could reach the adapter
+        // (pure callbacks call nothing); the view ends with this call.
+        let st = unsafe { l.state.peek_mut() }?;
+        match st {
+            LazyIterKind::Map { func, iters, .. } => match iters.as_slice() {
+                [Object::Iter(c)] => {
+                    let v = cursor_peek(c)?;
+                    let r = self.pure_callback(func, std::slice::from_ref(&v))?;
+                    cursor_advance(c)?;
+                    Some(Some(r))
+                }
+                [Object::Iter(a), Object::Iter(b)] if !Rc::ptr_eq(a, b) => {
+                    let args = [cursor_peek(a)?, cursor_peek(b)?];
+                    let r = self.pure_callback(func, &args)?;
+                    cursor_advance(a)?;
+                    cursor_advance(b)?;
+                    Some(Some(r))
+                }
+                _ => None,
+            },
             LazyIterKind::Filter {
                 func,
                 source: Object::Iter(c),
             } => loop {
-                let v = peek(c)?;
-                let keep = match func {
+                let v = cursor_peek(c)?;
+                let keep = match &*func {
                     Object::None => scalar_truth(&v)?,
                     Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => scalar_truth(&v)?,
-                    Object::Function(f) => {
-                        scalar_truth(&self.call_pure_leaf(f, std::slice::from_ref(&v))?)?
-                    }
-                    _ => return None,
+                    f => scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v))?)?,
                 };
-                advance(c)?;
+                cursor_advance(c)?;
                 if keep {
                     return Some(Some(v));
                 }
             },
-            _ => None,
+            // `enumerate(map(...))` and the like: the source's own pure step.
+            LazyIterKind::Enumerate {
+                source: Object::LazyIter(src),
+                count,
+                count_big: None,
+            } if *count < i64::MAX => {
+                let Some(v) = self.lazy_core_next(src)? else {
+                    return Some(None);
+                };
+                let i = *count;
+                *count += 1;
+                Some(Some(Object::new_tuple_array([Object::Int(i), v])))
+            }
+            LazyIterKind::GroupBy {
+                source,
+                keyfunc,
+                tgtkey,
+                currkey,
+                currvalue,
+                currgrouper,
+                grouper_cls,
+            } => {
+                // `groupby_next`: skip to the next group, a whole step at a
+                // time (a decline midway leaves the state a general step
+                // would have left).
+                *currgrouper = None;
+                loop {
+                    match (&*currkey, &*tgtkey) {
+                        (None, _) => {}
+                        (Some(_), None) => break,
+                        (Some(curr), Some(tgt)) => {
+                            if !native_key_eq(tgt, curr)? {
+                                break;
+                            }
+                        }
+                    }
+                    let (value, key) = self.groupby_step_pure(source, keyfunc)?;
+                    let old = (currkey.replace(key), currvalue.replace(value));
+                    drop(old);
+                }
+                let key = currkey.clone()?;
+                let old = tgtkey.replace(key.clone());
+                let grouper = Rc::new(PyLazyIter {
+                    state: RefCell::new(LazyIterKind::Grouper {
+                        parent: l.clone(),
+                        tgtkey: key.clone(),
+                    }),
+                    cls: grouper_cls.clone(),
+                });
+                *currgrouper = Some(Rc::downgrade(&grouper));
+                drop(old);
+                Some(Some(Object::new_tuple_array([key, Object::LazyIter(grouper)])))
+            }
+            LazyIterKind::Grouper { parent, tgtkey } => {
+                // `_grouper_next`.
+                // SAFETY: as above (the parent's distinct cell).
+                let LazyIterKind::GroupBy {
+                    source,
+                    keyfunc,
+                    currkey,
+                    currvalue,
+                    currgrouper,
+                    ..
+                } = (unsafe { parent.state.peek_mut() })?
+                else {
+                    return Some(None);
+                };
+                if !currgrouper
+                    .as_ref()
+                    .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(l)))
+                {
+                    return Some(None);
+                }
+                if currvalue.is_none() {
+                    let (value, key) = self.groupby_step_pure(source, keyfunc)?;
+                    let old = (currkey.replace(key), currvalue.replace(value));
+                    drop(old);
+                }
+                let Some(curr) = currkey.as_ref() else {
+                    return Some(None);
+                };
+                if !native_key_eq(tgtkey, curr)? {
+                    return Some(None);
+                }
+                let value = currvalue.take()?;
+                let old = currkey.take();
+                drop(old);
+                Some(Some(value))
+            }
+            _ => lazy_pure_next(l),
         }
     }
 }

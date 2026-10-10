@@ -38931,7 +38931,7 @@ impl Interpreter {
                 let mut out = Vec::new();
                 if !self.seq_drain(l, &mut out, globals)? {
                     loop {
-                        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+                        if let Some(r) = self.lazy_core_next(l) {
                             match r {
                                 Some(x) => out.push(x),
                                 None => break,
@@ -42013,15 +42013,30 @@ impl Interpreter {
     /// Runs at the interpreter level because the wrapped source can be
     /// any VM iterable (generator, user `__next__`, native iterator) —
     /// and, like CPython's C itertools, stepping adds no Python frame.
+    /// A `StopIteration` that a callback raises ends the iteration, as a C
+    /// iterator's `tp_iternext` leaving it set does for its consumer
+    /// (`for x in map(f, xs)` stops where `f` raises it).
     fn lazy_iter_next(
         &mut self,
         l: &Rc<crate::object::PyLazyIter>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        match self.lazy_iter_step(l, globals) {
+            Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+            r => r,
+        }
+    }
+
+    /// [`Self::lazy_iter_next`]'s step.
+    fn lazy_iter_step(
+        &mut self,
+        l: &Rc<crate::object::PyLazyIter>,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
         use crate::object::LazyIterKind;
-        // Steps that run no code first (pure state machines, and native
-        // sources with an item ready), under one borrow.
-        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+        // Steps that run no code first (pure state machines, native
+        // sources with an item ready, pure callbacks), under one borrow.
+        if let Some(r) = self.lazy_core_next(l) {
             return Ok(r);
         }
         // The builtin `map`/`filter`/`zip`/`enumerate` adapters.
@@ -56486,11 +56501,24 @@ impl Interpreter {
     /// call to the full machinery, nothing having happened.
     #[inline]
     fn call_pure_leaf(&self, f: &PyFunction, args: &[Object]) -> Option<Object> {
+        self.call_pure_leaf_with(f, None, args)
+    }
+
+    /// [`Self::call_pure_leaf`] with `recv`, when given, as the first
+    /// argument (a bound method's receiver).
+    #[inline]
+    pub(crate) fn call_pure_leaf_with(
+        &self,
+        f: &PyFunction,
+        recv: Option<&Object>,
+        args: &[Object],
+    ) -> Option<Object> {
         const MAX_ARGS: usize = 6;
         // SAFETY: a function's code is only replaced under the GIL, and
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
-        if args.len() > MAX_ARGS
+        let n = args.len() + usize::from(recv.is_some());
+        if n > MAX_ARGS
             || !code_is_pure_leaf(code)
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
@@ -56500,10 +56528,10 @@ impl Interpreter {
             return None;
         }
         let mut ptrs = [std::ptr::null::<Object>(); MAX_ARGS];
-        for (p, a) in ptrs.iter_mut().zip(args) {
+        for (p, a) in ptrs.iter_mut().zip(recv.into_iter().chain(args)) {
             *p = a;
         }
-        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..args.len()])
+        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..n])
     }
 
     /// The full argument binder for [`Self::call_python_owned`]: CPython's
