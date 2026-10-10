@@ -1542,6 +1542,21 @@ unsafe extern "C" fn h_for_iter_rest(
             *index += 1;
             v
         }
+        // A dict or dict view's next key, value or `(key, value)` item, as
+        // the core loop's arm steps it (a change of size, a reverse view, an
+        // exhaustion that could release anything are its own).
+        view @ PyIterator::DictKeys { .. } => {
+            match Interpreter::core_dict_next(view, false, unique) {
+                crate::DictStep::Item(v, _) => v,
+                crate::DictStep::Exhausted => {
+                    // SAFETY: the iterator, held by the stack alone, leaves
+                    // it (its dict lives on).
+                    drop(unsafe { it.read() });
+                    return 2;
+                }
+                crate::DictStep::Decline => return 3,
+            }
+        }
         // Any other cursor whose step runs no code (a string's, bytes');
         // its exhaustion is the core loop's.
         other if other.pure_ready() => match other.next_value() {
@@ -1569,6 +1584,78 @@ unsafe extern "C" fn h_for_iter_rest(
     // SAFETY: the slot above the iterator is free.
     unsafe { out.write(v) };
     1
+}
+
+/// `FOR_ITER` fused with the `UNPACK_SEQUENCE 2` after it, for an iterator
+/// at `it` whose next step is a pair and runs no code: `enumerate` over a
+/// cursor, a dict's items, a two-source `zip`, or a list's or tuple's next
+/// item when it is an exact pair. `0` the pair's second item written to
+/// `out` and its first above it (as the unpacking leaves them, no tuple
+/// built), anything else declined untouched (the unfused helpers take it,
+/// exhaustion included).
+unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
+    // SAFETY: the code passes an initialized slot with two free ones above
+    // it; nothing below runs code while the iterator is borrowed.
+    unsafe {
+        let pair = match &*it {
+            Object::Iter(rc) => {
+                let Some(iter) = rc.peek_mut() else {
+                    return 3;
+                };
+                match iter {
+                    PyIterator::List {
+                        items,
+                        index,
+                        owner: None,
+                    } => {
+                        let Some(Object::Tuple(t)) = items.peek().and_then(|xs| xs.get(*index))
+                        else {
+                            return 3;
+                        };
+                        let [a, b] = &t[..] else {
+                            return 3;
+                        };
+                        let pair = (crate::clone_hot(a), crate::clone_hot(b));
+                        *index += 1;
+                        pair
+                    }
+                    PyIterator::Tuple { items, index } => {
+                        let Some(Object::Tuple(t)) = items.get(*index) else {
+                            return 3;
+                        };
+                        let [a, b] = &t[..] else {
+                            return 3;
+                        };
+                        let pair = (crate::clone_hot(a), crate::clone_hot(b));
+                        *index += 1;
+                        pair
+                    }
+                    // (An items view's fused step gives the key apart; its
+                    // exhaustion, declined here, is the unfused helper's.)
+                    view @ PyIterator::DictKeys {
+                        kind: crate::object::DictViewKind::Items,
+                        ..
+                    } => match Interpreter::core_dict_next(view, true, false) {
+                        crate::DictStep::Item(v, Some(k)) => (k, v),
+                        crate::DictStep::Item(..) => unreachable!("an items view's fused step"),
+                        _ => return 3,
+                    },
+                    _ => match crate::seqiter::enumerate_pure_pair(&*it) {
+                        Some(pair) => pair,
+                        None => return 3,
+                    },
+                }
+            }
+            Object::LazyIter(l) => match crate::seqiter::lazy_pure_pair(l) {
+                Some(pair) => pair,
+                None => return 3,
+            },
+            _ => return 3,
+        };
+        out.write(pair.1);
+        out.add(1).write(pair.0);
+        0
+    }
 }
 
 /// The `FOR_ITER` at `pc` over the native adapter at `it` (the stack's top)
@@ -1616,6 +1703,15 @@ unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
         }
         FOR_SWITCHED
     }
+}
+
+/// Whether the `FOR_ITER` at `pc` of `code` unpacks a pair (the
+/// `UNPACK_SEQUENCE 2` after it), which [`h_for_iter_pair`] fuses.
+fn fused_pair_at(code: &CodeObject, pc: usize) -> bool {
+    let op = |pc: usize| code.instructions.get(pc).map(|i| (i.op, i.arg));
+    matches!(op(pc), Some((OpCode::ForIter, _)))
+        && matches!(op(pc + 1), Some((OpCode::UnpackSequence, 2)))
+        && pc + 2 < code.instructions.len()
 }
 
 /// [`h_for_iter`] switched to a generator's activation (`RELOAD`).
@@ -7304,6 +7400,10 @@ impl<'a> Lower<'a> {
                 if t < n {
                     starts[t] = true;
                 }
+                if fused_pair_at(code, pc) {
+                    // Past the `UNPACK_SEQUENCE` a fused step skips.
+                    starts[pc + 2] = true;
+                }
                 if ins.op == OpCode::ForIter {
                     // The loop exit past `END_FOR` / `POP_ITER`.
                     let mut to = t;
@@ -9581,6 +9681,24 @@ impl<'a> Lower<'a> {
         let it_slot = self.depth - 1;
         let it = self.slot_addr(it_slot);
         let out_slot = self.slot_addr(self.depth);
+        // A loop that unpacks a pair (`for k, v in d.items()`): the pair
+        // straight onto the stack, past the `UNPACK_SEQUENCE`, when the
+        // step allows; any other step below.
+        if fused_pair_at(self.code, pc) {
+            let r = self
+                .call(h_for_iter_pair as *const () as usize, &[it, out_slot], true)
+                .expect("returns");
+            let pair_b = self.b.create_block();
+            let single = self.b.create_block();
+            self.b.ins().brif(r, single, &[], pair_b, &[]);
+            self.b.switch_to_block(pair_b);
+            let depth = self.depth;
+            self.depth += 2;
+            self.set_last(pc + 1);
+            self.goto(pc + 2);
+            self.depth = depth;
+            self.b.switch_to_block(single);
+        }
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let r = self
             .call(
