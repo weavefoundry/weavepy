@@ -4289,11 +4289,12 @@ unsafe fn direct_call(
         let interp = &mut *st.interp.cast_mut();
         let nested = interp.direct_calls.get();
         let code: &CodeObject = code_rc;
+        // (Native code runs only in a burst, which free-threaded mode
+        // never starts.)
         if nested >= DIRECT_CALL_DEPTH
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
             || !interp.inline_calls_ok()
-            || crate::gil::free_threading_enabled()
             || !(crate::tier2::jit_off_for_process()
                 || code.jit_hint.is_not_jitable()
                 || !code.jit_hint.is_compiled())

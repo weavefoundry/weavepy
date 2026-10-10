@@ -280,12 +280,16 @@ fn chain_contains(id: u64) -> bool {
 /// bounds, which are meaningless while running on a greenlet's own
 /// mmap'd stack, so those probes must fall back to their counted
 /// budgets here.
+#[inline]
 pub fn on_greenlet_stack() -> bool {
     // Nothing has ever created a greenlet: skip the thread-local reads
     // (this is polled on every lean Python call).
-    if !GREENLETS_EVER.load(Ordering::Relaxed) {
-        return false;
-    }
+    GREENLETS_EVER.load(Ordering::Relaxed) && on_greenlet_stack_slow()
+}
+
+#[cold]
+#[inline(never)]
+fn on_greenlet_stack_slow() -> bool {
     let main = MAIN_ID.with(|m| m.get());
     main != 0 && CURRENT.with(|c| c.get()) != main
 }

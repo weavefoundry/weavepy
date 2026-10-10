@@ -65992,8 +65992,17 @@ mod burst_stats {
     static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
-    #[inline]
+    /// (Every call path counts: off, it's one load in line.)
+    #[inline(always)]
     pub(crate) fn note_call(i: usize) {
+        if ENABLED.load(Ordering::Relaxed) != 0 {
+            note_call_slow(i);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_call_slow(i: usize) {
         if enabled() {
             CALLS[i].fetch_add(1, Ordering::Relaxed);
         }
@@ -71912,13 +71921,19 @@ pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 /// without an activation of its own.
 #[cfg(feature = "jit")]
 pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
-    // SAFETY: GIL-serialized; the borrows end before any refill.
+    // (An effect leaf that calls runs as an ordinary call, not in place:
+    // `core_local_method` declines it, so a native method-call helper
+    // there would only cost every call its probes.)
+    // SAFETY: GIL-serialized; the borrows end before any refill; a live
+    // site's code is its live function's.
     let leaf = ext
         .leaf_sites
         .get()
         .and_then(|s| s.get(pc))
         .and_then(|s| unsafe { &*s.0.get() }.as_ref())
-        .is_some_and(|site| site.func.strong_count() > 0);
+        .is_some_and(|site| {
+            site.func.strong_count() > 0 && !(site.effect && code_calls(unsafe { &*site.code }))
+        });
     leaf || ext
         .method_slots
         .get()
@@ -71927,7 +71942,10 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
             MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
             MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
                 // SAFETY: the function is alive while the upgrade holds it.
-                w.upgrade().is_some_and(|f| fn_is_leaf(&f))
+                w.upgrade().is_some_and(|f| {
+                    fn_is_pure_leaf(&f)
+                        || (fn_is_leaf(&f) && !code_calls(unsafe { &*f.code.as_ptr() }))
+                })
             }
             _ => false,
         })
