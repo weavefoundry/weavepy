@@ -863,14 +863,32 @@ fn scalar_lru_operation(
             note_scalar_lru_event(2);
             return Ok(ScalarLru::Slow);
         }
-        // Deferral also protects against private-cache tampering: a foreign
-        // key must not invoke Python inside the paired borrow.
-        let (found, deferred) =
-            crate::object::key_cmp_deferred(|| data.get_index_of(&DictKey(key.clone())));
-        let found = found?;
-        if deferred {
-            return Err(invalid_lru_order());
-        }
+        // A `str` or `int` key settles by native equality in one probe;
+        // its hash is kept for the insert below.
+        let probe = crate::object::LeafProbe::new(key);
+        let exact = match &probe {
+            Some(p) => match data.get_index_of(p) {
+                Some(i) => Some(Some(i)),
+                None if p.miss_is_exact() => Some(None),
+                None => None,
+            },
+            None => None,
+        };
+        let (found, exact_miss) = match exact {
+            Some(found) => (found, found.is_none()),
+            None => {
+                // Deferral also protects against private-cache tampering: a
+                // foreign key must not invoke Python inside the paired borrow.
+                let (found, deferred) = crate::object::key_cmp_deferred(|| {
+                    data.get_index_of(&DictKey(key.clone()))
+                });
+                let found = found?;
+                if deferred {
+                    return Err(invalid_lru_order());
+                }
+                (found, false)
+            }
+        };
         if let Some(index) = found {
             let (stored, value) = data.get_index(index).ok_or_else(invalid_lru_order)?;
             if !native_lru_key(&stored.0) {
@@ -903,7 +921,15 @@ fn scalar_lru_operation(
         } else {
             None
         };
-        data.insert(DictKey(key.clone()), value.clone());
+        match &probe {
+            // Proven absent above (an eviction keeps it so): no second probe.
+            Some(p) if exact_miss => {
+                data.insert_unique_hashed(p.hash, DictKey(key.clone()), value.clone());
+            }
+            _ => {
+                data.insert(DictKey(key.clone()), value.clone());
+            }
+        }
         order.push(limit).ok_or_else(invalid_lru_order)?;
     }
     // Publish a consistent cache before releasing an evicted result.

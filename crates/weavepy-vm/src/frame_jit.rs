@@ -1681,7 +1681,7 @@ unsafe extern "C" fn k_dict_get(
         let Some(m) = d.peek() else {
             return 1;
         };
-        let v = match m.get(&probe) {
+        let v = match m.get_hot(&probe) {
             Some(v) => crate::clone_hot(v),
             None if probe.miss_is_exact() => {
                 if b.is_null() {
@@ -2227,7 +2227,7 @@ unsafe fn subscr_fast(
                 let Some(probe) = crate::object::LeafProbe::new(k) else {
                     return 1;
                 };
-                let Some(v) = d.peek().and_then(|m| m.get(&probe)) else {
+                let Some(v) = d.peek().and_then(|m| m.get_hot(&probe)) else {
                     return 1;
                 };
                 crate::clone_hot(v)

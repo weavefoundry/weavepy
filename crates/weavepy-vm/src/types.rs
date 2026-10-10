@@ -1927,7 +1927,8 @@ impl TypeObject {
             }
             None => {}
         }
-        let key = crate::object::StrKey(name);
+        // (Hashed at most once for the whole walk.)
+        let key = crate::object::StrKeyLazy::new(name);
         let mro = self.mro.borrow();
         for (i, owner) in mro.iter().enumerate() {
             let d = owner.dict.borrow();

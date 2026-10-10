@@ -3348,6 +3348,48 @@ impl crate::dictmap::Probe for StrKey<'_> {
     }
 }
 
+/// [`StrKey`] for a probe of several tables (an MRO walk): the name's hash
+/// is computed on first need and kept, so the walk hashes it at most once,
+/// and not at all while it meets only small tables (which compare names
+/// directly; see [`crate::dictmap::Probe::probe_eq_unhashed`]).
+#[derive(Debug)]
+pub struct StrKeyLazy<'a> {
+    pub s: &'a str,
+    hash: std::cell::Cell<Option<i64>>,
+}
+
+impl<'a> StrKeyLazy<'a> {
+    #[inline]
+    pub fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            hash: std::cell::Cell::new(None),
+        }
+    }
+}
+
+impl crate::dictmap::Probe for StrKeyLazy<'_> {
+    #[inline]
+    fn probe_hash(&self) -> i64 {
+        if let Some(h) = self.hash.get() {
+            return h;
+        }
+        let h = py_str_hash(self.s);
+        self.hash.set(Some(h));
+        h
+    }
+
+    #[inline]
+    fn probe_eq(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(&StrKey(self.s), key)
+    }
+
+    #[inline]
+    fn probe_eq_unhashed(&self, key: &DictKey) -> Option<bool> {
+        crate::dictmap::Probe::probe_eq_unhashed(&StrKey(self.s), key)
+    }
+}
+
 /// [`StrKey`] with its Python hash precomputed (RFC 0077 WS4). The
 /// interpreter's attribute-name probes hash the same `co_names` entry on
 /// every execution of a site — a siphash per probe — so the VM memoises
@@ -12817,11 +12859,79 @@ fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
     (v0 ^ v1) ^ (v2 ^ v3)
 }
 
+/// The longest byte string [`sip_memo`] remembers.
+const SIP_MEMO_MAX: usize = 32;
+
+/// One remembered SipHash result: the bytes (`len` of them; `0` marks an
+/// empty slot) and their hash.
+#[derive(Clone, Copy)]
+struct SipMemoEntry {
+    len: u8,
+    hash: i64,
+    bytes: [u8; SIP_MEMO_MAX],
+}
+
+const SIP_MEMO_SLOTS: usize = 512;
+
+thread_local! {
+    /// A direct-mapped memo of the SipHash of short byte strings, by
+    /// content. With the seed pinned, a name hashed from a `&str` (a
+    /// probe of a large dict by `StrKey`, a fresh string's first hash)
+    /// costs a short compare instead of a SipHash run on a repeat; CPython
+    /// gets the same effect from the hash cached in each interned name.
+    static SIP_MEMO: std::cell::UnsafeCell<[SipMemoEntry; SIP_MEMO_SLOTS]> = const {
+        std::cell::UnsafeCell::new([SipMemoEntry { len: 0, hash: 0, bytes: [0; SIP_MEMO_MAX] }; SIP_MEMO_SLOTS])
+    };
+}
+
+/// `compute(bytes)`, remembered per thread for `bytes` of 1 to
+/// [`SIP_MEMO_MAX`] bytes.
+#[inline]
+fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
+    let n = bytes.len();
+    debug_assert!((1..=SIP_MEMO_MAX).contains(&n));
+    // SAFETY: the loads stay inside `bytes` (overlapping for short ones).
+    let fold = unsafe {
+        let p = bytes.as_ptr();
+        if n >= 8 {
+            p.cast::<u64>().read_unaligned()
+                ^ p.add(n - 8).cast::<u64>().read_unaligned().rotate_left(29)
+        } else if n >= 4 {
+            u64::from(p.cast::<u32>().read_unaligned())
+                | u64::from(p.add(n - 4).cast::<u32>().read_unaligned()) << 32
+        } else {
+            u64::from(*p) | u64::from(*p.add(n / 2)) << 8 | u64::from(*p.add(n - 1)) << 16
+        }
+    };
+    let slot = ((fold ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize;
+    // SAFETY (both accesses): this thread's memo, borrowed only for the
+    // statement (nothing inside runs code that could reach it).
+    let hit = SIP_MEMO.try_with(|memo| {
+        let e = unsafe { &(*memo.get())[slot] };
+        (usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]))
+            .then_some(e.hash)
+    });
+    if let Ok(Some(h)) = hit {
+        return h;
+    }
+    let h = compute(bytes);
+    let _ = SIP_MEMO.try_with(|memo| {
+        let e = unsafe { &mut (*memo.get())[slot] };
+        e.len = n as u8;
+        e.hash = h;
+        e.bytes[..n].copy_from_slice(bytes);
+    });
+    h
+}
+
 fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
     let v = match hash_algo() {
+        HashAlgo::Sip { k0, k1 } if bytes.len() <= SIP_MEMO_MAX => {
+            sip_memo(bytes, |b| siphash13(*k0, *k1, b) as i64)
+        }
         HashAlgo::Sip { k0, k1 } => siphash13(*k0, *k1, bytes) as i64,
         HashAlgo::Fx { salt } => {
             use std::hash::Hasher;

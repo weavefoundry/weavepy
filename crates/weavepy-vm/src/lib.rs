@@ -17498,7 +17498,7 @@ impl Interpreter {
                         // SAFETY: a read between two instructions (the
                         // probe runs no code).
                         let d = unsafe { d.peek() }?;
-                        clone_hot(d.get(&probe)?)
+                        clone_hot(d.get_hot(&probe)?)
                     }
                     // A string's code point (`str_char_at` byte-indexes an
                     // ASCII string and walks any other from its cursor).

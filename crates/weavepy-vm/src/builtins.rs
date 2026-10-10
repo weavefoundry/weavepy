@@ -13611,6 +13611,26 @@ pub(crate) fn dict_remove(
     d: &Rc<RefCell<DictData>>,
     key: &Object,
 ) -> Result<Option<(Object, Object)>, RuntimeError> {
+    // A `str` or `int` key settles by native equality: one probe, with no
+    // comparison scope (see `dict_lookup`).
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if let Ok(mut m) = d.try_borrow_mut() {
+            match m.get_index_of(&probe) {
+                Some(i) => {
+                    let (k, v) = m.shift_remove_index(i).expect("found above");
+                    drop(m);
+                    crate::object::dict_watch_bump(d);
+                    crate::object::dict_mutation_event(d);
+                    if crate::capi_watchers::dicts_active() {
+                        crate::capi_watchers::dict_event("DELETED", d, Some(key), None);
+                    }
+                    return Ok(Some((k.0, v)));
+                }
+                None if probe.miss_is_exact() => return Ok(None),
+                None => {}
+            }
+        }
+    }
     if crate::object::dict_key_is_reentrant(key) {
         return crate::object::dict_reentrant_remove(d, key);
     }

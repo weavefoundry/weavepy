@@ -434,6 +434,24 @@ impl DictMap {
         Some(found)
     }
 
+    /// [`Self::get`], always in line: for the interpreter's subscript
+    /// fast paths, where the call would cost a fair share of the probe.
+    #[inline(always)]
+    pub fn get_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&Object> {
+        if self.slots.is_empty() {
+            if self.entries.is_empty() {
+                return None;
+            }
+            if let Some(found) = self.scan_unhashed(key) {
+                // SAFETY: a found position is in bounds.
+                return found.map(|i| unsafe { &self.entries.get_unchecked(i).value });
+            }
+        }
+        let i = self.find_hashed(key.probe_hash(), key).ok()?;
+        // SAFETY: a found position is in bounds.
+        Some(unsafe { &self.entries.get_unchecked(i).value })
+    }
+
     #[inline]
     pub fn get<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&Object> {
         let i = self.get_index_of(key)?;
@@ -628,6 +646,7 @@ impl DictMap {
 
     /// The entry for a probe: its position if present, else a vacancy
     /// that inserts the key the caller builds.
+    #[inline(always)]
     pub fn probe_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> ProbeEntry<'_> {
         let hash = key.probe_hash();
         match self.find_hashed(hash, key) {
