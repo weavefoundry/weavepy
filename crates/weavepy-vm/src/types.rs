@@ -941,6 +941,10 @@ pub struct TypeObject {
     /// slots out over (see [`TypeObject::fresh_slots`]), decided at the
     /// first instance: `None` for a class that doesn't qualify.
     pub slot_layout: std::sync::OnceLock<Option<SharedSlice<DictKey>>>,
+    /// [`Self::slot_layout`]'s word (see [`SharedSlice::word`]) once it is
+    /// decided and present, `0` otherwise: compiled code compares an
+    /// instance's laid-out slots' names against it in line.
+    pub slot_layout_word: std::sync::atomic::AtomicUsize,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -1375,6 +1379,7 @@ impl TypeObject {
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
             slot_layout: std::sync::OnceLock::new(),
+            slot_layout_word: std::sync::atomic::AtomicUsize::new(0),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -1464,21 +1469,41 @@ impl TypeObject {
     /// in place, with no per-instance names and no growth.
     #[inline]
     pub fn fresh_slots(&self) -> SlotStorage {
-        match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
+        match self.slot_layout_init() {
             Some(layout) => SlotStorage::unset_over(layout.clone()),
             None => SlotStorage::default(),
         }
     }
 
     /// Make `slots` this class's [`Self::fresh_slots`], leaving storage
-    /// that is already the empty default alone.
+    /// that is already the empty default alone, and reusing a retired
+    /// instance's unset laid-out values (see [`SlotStorage::retire`]).
     #[inline]
     pub(crate) fn reset_slots(&self, slots: &mut SlotStorage) {
-        match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
-            Some(layout) => *slots = SlotStorage::unset_over(layout.clone()),
+        match self.slot_layout_init() {
+            Some(layout) => {
+                if !slots.reuse_unset_over(layout) {
+                    *slots = SlotStorage::unset_over(layout.clone());
+                }
+            }
             None if slots.is_empty_default() => {}
             None => *slots = SlotStorage::default(),
         }
+    }
+
+    /// [`Self::slot_layout`], decided now if it isn't yet.
+    #[inline]
+    fn slot_layout_init(&self) -> &Option<SharedSlice<DictKey>> {
+        self.slot_layout.get_or_init(|| {
+            let layout = self.member_slot_layout();
+            if let Some(layout) = &layout {
+                self.slot_layout_word.store(
+                    SharedSlice::word(layout),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            layout
+        })
     }
 
     /// Whether the class is one whose native method bodies read its slots
@@ -2573,7 +2598,7 @@ impl SlotStorage {
 
     /// Access native fields only when the shared layout is the same
     /// allocation. Equal user-defined slot names aren't sufficient.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn values_for_layout(&self, expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
         match &self.data {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
@@ -2618,6 +2643,38 @@ impl SlotStorage {
                 value: Object::None
             }
         )
+    }
+
+    /// Empty the storage of a retiring instance whose values are all
+    /// atomic (releasing them runs no code): laid-out values are unset in
+    /// place, keeping their allocation for the next tenant (see
+    /// [`Self::reuse_unset_over`]); any other form becomes the default.
+    pub(crate) fn retire(&mut self) {
+        if let SlotData::Fixed { values, .. } = &mut self.data {
+            for v in values.iter_mut() {
+                *v = Object::Unbound;
+            }
+        } else if !self.is_empty_default() {
+            *self = Self::default();
+        }
+    }
+
+    /// Lay a retired storage (see [`Self::retire`]) out over `layout`, all
+    /// unset, reusing its values' allocation: `false` when it has none of
+    /// that size (the caller builds fresh storage).
+    #[inline]
+    pub(crate) fn reuse_unset_over(&mut self, layout: &SharedSlice<DictKey>) -> bool {
+        let SlotData::Fixed { layout: own, values } = &mut self.data else {
+            return false;
+        };
+        if values.len() != layout.len() {
+            return false;
+        }
+        if !SharedSlice::ptr_eq(own, layout) {
+            *own = layout.clone();
+        }
+        debug_assert!(values.iter().all(|v| matches!(v, Object::Unbound)));
+        true
     }
 
     /// Storage holding a natively packed value (see [`SlotData::Packed`]).
@@ -2711,6 +2768,17 @@ impl SlotStorage {
     /// Never skipped here (see the 64-bit variant).
     #[inline(always)]
     pub(crate) fn is_empty_default(&self) -> bool {
+        false
+    }
+
+    /// Empty a retiring instance's storage (see the 64-bit variant).
+    pub(crate) fn retire(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn reuse_unset_over(&mut self, _layout: &SharedSlice<DictKey>) -> bool {
         false
     }
 
@@ -3616,9 +3684,7 @@ impl PyInstance {
             d.map_mut_atomic_store().clear();
             d.reset_deferred_owner(owner);
         }
-        if !m.slots.get_mut().is_empty_default() {
-            *m.slots.get_mut() = SlotStorage::default();
-        }
+        m.slots.get_mut().retire();
         m.inline_values.set(true);
         m.deferred.set(true);
         m.hash_cache = crate::sync::CachedHash::new(None);
@@ -3750,6 +3816,42 @@ impl PyInstance {
             .values_for_layout(layout)?
             .get(i)?;
         (!matches!(v, Object::Unbound)).then_some(v)
+    }
+
+    /// [`Self::laid_out_slot`], set or not: what a store to the member
+    /// would replace.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline(always)]
+    pub(crate) unsafe fn laid_out_slot_any(&self, i: usize) -> Option<&Object> {
+        let layout = self.cls_raw().slot_layout.get()?.as_ref()?;
+        // SAFETY: forwarded contract.
+        unsafe { self.slots.peek() }?
+            .values_for_layout(layout)?
+            .get(i)
+    }
+
+    /// [`Self::laid_out_slot`] for a store of a value of atomicity
+    /// `atomic`, set or not (a store fills an unset member): the write
+    /// barrier runs first (a non-atomic value starts tracking a deferred
+    /// instance), then the member's place.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek_mut`].
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn laid_out_slot_mut(&self, i: usize, atomic: bool) -> Option<&mut Object> {
+        let layout = self.cls_raw().slot_layout.get()?.as_ref()?;
+        if !atomic && self.deferred.get() {
+            self.ensure_gc_tracked();
+        }
+        // SAFETY: forwarded contract.
+        unsafe { self.slots.peek_mut() }?
+            .values_for_layout_mut(layout)?
+            .get_mut(i)
     }
 
     /// Where [`Self::laid_out_slot`] finds member slot `name` on this

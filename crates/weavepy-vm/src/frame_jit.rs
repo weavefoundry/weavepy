@@ -3504,6 +3504,11 @@ fn slot_note(code: &CodeObject, recv: &Object, pc: usize, cache: *const SlotCach
             let cache = unsafe { &*cache };
             cache.ver.set(ver);
             cache.idx.set(key_idx);
+            // (The compiled read takes a laid-out member in line.)
+            if let Some(ext) = crate::code_vm_ext_existing(code) {
+                let name = code.instructions[pc].arg;
+                crate::slot_field_note(code, ext, pc, inst, key_idx, name);
+            }
         }
     }
 }
@@ -9250,35 +9255,72 @@ impl<'a> Lower<'a> {
                     .iconst(ptr, std::ptr::from_ref(cache_slot).cast::<u8>() as i64);
                 let want = self.b.ins().load(types::I64, FLAGS, cache, FIELD_VER);
                 let idx = self.b.ins().uload32(FLAGS, cache, FIELD_IDX);
-                let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
                 let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
                 let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
-                let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
-                let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
                 let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
                 let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
-                let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-                let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-                let other = self.b.ins().bor(lazy, shared);
-                let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
-                let bad = self.b.ins().bor(unset, stale);
-                let bad = self.b.ins().bor(bad, busy);
-                let bad = self.b.ins().bor(bad, empty);
-                let bad = self.b.ins().bor(bad, other);
-                self.branch_out(bad, miss);
-                let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
-                let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
-                let len = self.b.ins().uload32(FLAGS, block, l.split_len);
-                let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-                let absent = self
-                    .b
-                    .ins()
-                    .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
-                let bad = self.b.ins().bor(foreign, absent);
-                self.branch_out(bad, miss);
-                let off = self.b.ins().ishl_imm(idx, 4);
-                let v = self.b.ins().iadd(block, off);
-                let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
+                let v = if cache_slot.get().1 & crate::SLOT_FIELD != 0 && l.slots_ok {
+                    // A `__slots__` member laid out over the class's own
+                    // layout, at the site's position, and set (see
+                    // `PyInstance::laid_out_slot`).
+                    let split = self.b.ins().band_imm(idx, i64::from(crate::SLOT_FIELD));
+                    let split = self.b.ins().icmp_imm(IntCC::Equal, split, 0);
+                    let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+                    let bad = self.b.ins().bor(unset, stale);
+                    let bad = self.b.ins().bor(bad, split);
+                    let bad = self.b.ins().bor(bad, shared);
+                    self.branch_out(bad, miss);
+                    let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(&l));
+                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
+                    let form = self.b.ins().uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
+                    let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
+                    let vals = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
+                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    let other =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+                    let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
+                    let bad = self.b.ins().bor(busy, other);
+                    let bad = self.b.ins().bor(bad, foreign);
+                    self.branch_out(bad, miss);
+                    let i = self.b.ins().band_imm(idx, i64::from(!crate::SLOT_FIELD));
+                    let off = self.b.ins().ishl_imm(i, 4);
+                    let v = self.b.ins().iadd(vals, off);
+                    let vt = self.b.ins().uload8(types::I32, FLAGS, v, 0);
+                    let none = self
+                        .b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, vt, i64::from(l.tag_unbound));
+                    self.branch_out(none, miss);
+                    v
+                } else {
+                    let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+                    let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+                    let other = self.b.ins().bor(lazy, shared);
+                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+                    let bad = self.b.ins().bor(unset, stale);
+                    let bad = self.b.ins().bor(bad, busy);
+                    let bad = self.b.ins().bor(bad, empty);
+                    let bad = self.b.ins().bor(bad, other);
+                    self.branch_out(bad, miss);
+                    let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
+                    let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
+                    let len = self.b.ins().uload32(FLAGS, block, l.split_len);
+                    let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+                    let absent = self
+                        .b
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+                    let bad = self.b.ins().bor(foreign, absent);
+                    self.branch_out(bad, miss);
+                    let off = self.b.ins().ishl_imm(idx, 4);
+                    let v = self.b.ins().iadd(block, off);
+                    self.b.ins().iadd_imm(v, i64::from(l.split_values))
+                };
                 match item {
                     // The receiver is the local's: the value just takes a
                     // copy.
@@ -9997,5 +10039,13 @@ impl<'a> Lower<'a> {
 }
 
 /// Where a field cache's version and position sit.
+/// Where a class keeps [`crate::types::TypeObject::slot_layout_word`],
+/// from its pointer (measured as `layout`'s `type_attr_version` is).
+fn type_slot_layout(l: &weavepy_jit::ObjLayout) -> i32 {
+    use crate::types::TypeObject;
+    let base = l.type_attr_version as isize - std::mem::offset_of!(TypeObject, attr_version) as isize;
+    (base + std::mem::offset_of!(TypeObject, slot_layout_word) as isize) as i32
+}
+
 const FIELD_VER: i32 = std::mem::offset_of!((u64, u32), 0) as i32;
 const FIELD_IDX: i32 = std::mem::offset_of!((u64, u32), 1) as i32;

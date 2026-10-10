@@ -17295,7 +17295,37 @@ impl Interpreter {
         {
             return false;
         }
-        if let Some(proving) = proving {
+        // A class that lays its `__slots__` members out: each store's site
+        // must have last stored a distinct member of this class version's
+        // instances (sites another version recorded say nothing), whose
+        // layout positions the stores then fill. A site that recorded
+        // anything else for this version never will.
+        let laid_out = ty.slot_layout.get().and_then(Option::as_ref);
+        let mut members = [0u8; 16];
+        if laid_out.is_some() {
+            let mut seen = 0u64;
+            for (k, &(pc, _)) in shape.stores.iter().enumerate() {
+                match slots.get(pc as usize).map(FieldSlot::get) {
+                    Some((v, idx))
+                        if v == ver
+                            && idx & SLOT_FIELD != 0
+                            && (idx & !SLOT_FIELD) < 64
+                            && seen & (1 << (idx & !SLOT_FIELD)) == 0 =>
+                    {
+                        let i = idx & !SLOT_FIELD;
+                        seen |= 1 << i;
+                        members[k] = i as u8;
+                    }
+                    Some((v, _)) if v == ver => {
+                        if let Some(proving) = proving {
+                            proving.store(2, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+        } else if let Some(proving) = proving {
             // Every store's site must have last stored the next position
             // of this class version's instances. A site proven for another
             // position never will be; one that hasn't stored for this
@@ -17311,26 +17341,31 @@ impl Interpreter {
                 }
             }
         }
-        let Some(keys) = ty.shared_keys.get() else {
-            return false;
-        };
         let consts = code_vm_ext(code).map_or(&[][..], |e| &e.objects[..]);
-        if keys.len() < shape.stores.len()
-            || shape
-                .stores
-                .iter()
-                .any(|&(_, src)| matches!(src, StoreSrc::Const(c) if c as usize >= consts.len()))
+        if shape
+            .stores
+            .iter()
+            .any(|&(_, src)| matches!(src, StoreSrc::Const(c) if c as usize >= consts.len()))
         {
             return false;
         }
+        let keys = match laid_out {
+            Some(_) => None,
+            None => match ty.shared_keys.get() {
+                Some(keys) if keys.len() >= shape.stores.len() => Some(keys),
+                _ => return false,
+            },
+        };
         // Committed.
         let (inst, _) = self.alloc_plain_instance_obj(ty);
         let Object::Instance(i) = &inst else {
             unreachable!("a plain class's instance")
         };
-        // SAFETY: the instance is fresh and unshared.
-        if let Some(split) = unsafe { i.dict.split_cell().peek_mut() } {
-            split.reserve_for(|| ty.shared_keys.share(), keys.len());
+        if let Some(keys) = keys {
+            // SAFETY: the instance is fresh and unshared.
+            if let Some(split) = unsafe { i.dict.split_cell().peek_mut() } {
+                split.reserve_for(|| ty.shared_keys.share(), keys.len());
+            }
         }
         // The parameters: the instance, the arguments (moved out of the
         // stack on their last use), then the defaults.
@@ -17358,6 +17393,27 @@ impl Interpreter {
                 StoreSrc::Const(c) => consts[c as usize].clone(),
                 StoreSrc::Int(n) => Object::Int(n),
             };
+            if let Some(layout) = laid_out {
+                // The member's place (the write barrier first).
+                i.note_slot_store(&value);
+                // SAFETY: the instance is fresh and unshared; its slots
+                // were laid out over its class's layout at allocation.
+                let place = unsafe { i.slots.peek_mut() }
+                    .and_then(|s| s.values_for_layout_mut(layout))
+                    .and_then(|v| v.get_mut(usize::from(members[k])));
+                match place {
+                    Some(place) => drop(std::mem::replace(place, value)),
+                    None => {
+                        // (Unreachable for a fresh instance; the plain
+                        // store keeps it correct regardless.)
+                        let at = code.instructions[shape.stores[k].0 as usize].arg;
+                        if let Some(name) = code.names.get(at as usize) {
+                            i.slot_set(name, value);
+                        }
+                    }
+                }
+                continue;
+            }
             // SAFETY: a store with nothing else running; the positions are
             // the instance's next ones (proved above).
             if let Err(value) = unsafe { i.split_append(k, value) } {
@@ -19994,6 +20050,9 @@ impl Interpreter {
                 .get_index(key_idx as usize)
                 .filter(|(key, _)| slot_name_matches_in(names, code, name_idx, key))
                 .map(|(_, value)| value);
+            if indexed.is_some() {
+                slot_field_note(code, ext, cache_pc as usize, inst, key_idx, name_idx);
+            }
             // Slot order can vary by instance or after deletion.
             let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
             #[cfg(test)]
@@ -22216,6 +22275,9 @@ impl Interpreter {
                         .get_index(key_idx as usize)
                         .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
                         .map(|(_, value)| value);
+                    if let (Some(_), Some(ext)) = (indexed, ext) {
+                        slot_field_note(code, ext, pc, inst, key_idx, ins.arg);
+                    }
                     indexed.or_else(|| slots.get(name))
                 }
                 _ => {
@@ -22297,7 +22359,21 @@ impl Interpreter {
         let cls = inst.cls_raw();
         let ext = code_vm_ext(code);
         if let Some((ver, idx)) = ext.and_then(|e| e.field_slot(attr_pc)).map(FieldSlot::get) {
-            if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
+            if idx & SLOT_FIELD != 0 && cls.attr_version.get() == ver {
+                // A laid-out `__slots__` member, set or not: the member
+                // descriptor's store, in place.
+                // SAFETY: a store between two instructions (see `peek_mut`).
+                if let Some(slot) = unsafe {
+                    inst.laid_out_slot_mut((idx & !SLOT_FIELD) as usize, value.is_gc_atomic())
+                } {
+                    if !Self::core_droppable(slot) {
+                        return false;
+                    }
+                    // SAFETY: as the indexed store below.
+                    drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
+                    return true;
+                }
+            } else if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
                 // SAFETY: a store between two instructions (see `peek_mut`).
                 if let Some(slot) =
                     unsafe { inst.split_field_mut(idx as usize, value.is_gc_atomic()) }
@@ -22351,7 +22427,7 @@ impl Interpreter {
                 Self::core_store_new_attr(code, inst, cls, attr_pc, name_idx, ver, value)
             }
             IC::StoreAttrSlot { key_idx, ver } if cls.attr_version.get() == ver => {
-                Self::core_store_slot(code, inst, key_idx, name_idx, value)
+                Self::core_store_slot(code, inst, attr_pc, key_idx, name_idx, value)
             }
             _ => false,
         }
@@ -22366,6 +22442,7 @@ impl Interpreter {
     fn core_store_slot(
         code: &CodeObject,
         inst: &PyInstance,
+        attr_pc: usize,
         key_idx: u32,
         name_idx: u32,
         value: &Object,
@@ -22385,6 +22462,10 @@ impl Interpreter {
             let v = unsafe { std::ptr::read(value) };
             inst.note_slot_store(&v);
             drop(std::mem::replace(slot, v));
+            drop(slots);
+            if let Some(ext) = code_vm_ext_existing(code) {
+                slot_field_note(code, ext, attr_pc, inst, key_idx, name_idx);
+            }
             return true;
         }
         match slots.get_index_mut(key_idx as usize) {
@@ -22453,7 +22534,16 @@ impl Interpreter {
         cursor: &mut Option<usize>,
     ) -> Option<bool> {
         let (ver, idx) = ext.field_slot(attr_pc)?.get();
-        if inst.cls_raw().attr_version.get() != ver || crate::capi_watchers::dicts_active() {
+        if inst.cls_raw().attr_version.get() != ver {
+            return None;
+        }
+        if idx & SLOT_FIELD != 0 {
+            // A laid-out member's store, set or not (see `core_store_attr`).
+            // SAFETY: a read with nothing running (the commit's check pass).
+            let slot = unsafe { inst.laid_out_slot_any((idx & !SLOT_FIELD) as usize) }?;
+            return Some(Self::core_droppable(slot));
+        }
+        if crate::capi_watchers::dicts_active() {
             return None;
         }
         // SAFETY: a read with nothing running (the commit's check pass).
@@ -26661,7 +26751,21 @@ impl Interpreter {
                     .filter(|(key, _)| slot_name_matches(code, name_idx, key))
                     .map(|(_, value)| value);
                 match indexed {
-                    Some(v) => Some(Self::clone_operand(v)),
+                    Some(v) => {
+                        let v = Self::clone_operand(v);
+                        drop(slots);
+                        if let Some(ext) = code_vm_ext_existing(code) {
+                            slot_field_note(
+                                code,
+                                ext,
+                                cache_pc as usize,
+                                inst,
+                                key_idx,
+                                name_idx,
+                            );
+                        }
+                        Some(v)
+                    }
                     None => slots
                         .get(code.names.get(name_idx as usize)?.as_str())
                         .map(Self::clone_operand),
@@ -72420,7 +72524,10 @@ impl StampSlot {
 /// (see [`field_slot_note`]). The names are append-only and the version
 /// is process-unique, so while both match, the value at that position of
 /// a split instance *is* the attribute: no inline-cache decode and no
-/// name comparison.
+/// name comparison. A position marked [`SLOT_FIELD`] is instead a
+/// `__slots__` member's in its class's slot layout (see
+/// [`slot_field_note`]), which an instance laid out over that layout
+/// keeps there.
 #[repr(transparent)]
 struct FieldSlot(std::cell::UnsafeCell<(u64, u32)>);
 
@@ -72678,7 +72785,8 @@ enum SiteCall {
 }
 
 /// The attribute `inst` holds for the `LOAD_ATTR` at `pc`, through the
-/// site's [`FieldSlot`] (never recorded for a slot or native class).
+/// site's [`FieldSlot`]: a split field, or a laid-out `__slots__` member
+/// (never recorded for a native class).
 ///
 /// # Safety
 ///
@@ -72694,8 +72802,61 @@ unsafe fn field_slot_hit<'a>(
     if inst.cls_raw().attr_version.get() != ver {
         return None;
     }
+    if idx & SLOT_FIELD != 0 {
+        // SAFETY: forwarded contract.
+        return unsafe { inst.laid_out_slot((idx & !SLOT_FIELD) as usize) };
+    }
     // SAFETY: forwarded contract.
     unsafe { inst.split_field(idx as usize) }
+}
+
+/// A [`FieldSlot`] position naming a `__slots__` member's place in its
+/// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
+/// rather than a split field's: CPython's member descriptor offset. No
+/// split position reaches it (a class shares at most
+/// [`crate::inst_dict::SHARED_KEYS_CAP`] names).
+pub(crate) const SLOT_FIELD: u32 = 1 << 31;
+
+/// Record the [`FieldSlot`] shortcut for the attribute site at `pc` of
+/// `code` (name `co_names[name_idx]`) to the `__slots__` member at
+/// position `idx` of `inst`'s slots, after the site's guarded read or
+/// store of a member (the class passed the site's version check): kept
+/// only when the instance's slots are laid out over its class's own
+/// layout with the name there, where the position names the member for
+/// as long as the class lives.
+#[inline(never)]
+fn slot_field_note(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    pc: usize,
+    inst: &PyInstance,
+    idx: u32,
+    name_idx: u32,
+) {
+    let ninstrs = code.instructions.len();
+    let cls = inst.cls_raw();
+    let Some(layout) = cls.slot_layout.get().and_then(Option::as_ref) else {
+        return;
+    };
+    match layout.get(idx as usize) {
+        Some(key) if slot_name_matches_in(&ext.name_objs, code, name_idx, key) => {}
+        _ => return,
+    }
+    // SAFETY: a read with nothing running (the caller's own guarded
+    // access, whose borrow has ended).
+    if unsafe { inst.slots.peek() }
+        .and_then(|s| s.values_for_layout(layout))
+        .is_none()
+    {
+        return;
+    }
+    if !ext.field_slots.is_allocated() && !site_tables_warm(ext, ninstrs) {
+        return;
+    }
+    let slots = ext.alloc_sites(code, &ext.field_slots, FieldSlot::empty);
+    if let Some(slot) = slots.get(pc) {
+        slot.set((cls.attr_version.get(), idx | SLOT_FIELD));
+    }
 }
 
 /// Record the [`FieldSlot`] shortcut for the `LOAD_ATTR` at `pc`, after
