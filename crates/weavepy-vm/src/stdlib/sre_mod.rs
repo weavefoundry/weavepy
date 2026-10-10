@@ -146,6 +146,14 @@ pub(crate) struct CompiledCode {
     /// table of the character set starting there ([`NO_TABLE`] for none).
     table_of: Vec<u32>,
     tables: Vec<[u64; 4]>,
+    /// Per code position, the index in `quick_ranges` of the tests of the
+    /// assertion body starting there when it is one character test or an
+    /// alternation of such tests ([`NO_TABLE`] for none; see
+    /// [`quick_asserts`]).
+    quick_of: Vec<u32>,
+    /// Each quick assertion body's slice of `quick_tests`.
+    quick_ranges: Vec<(u32, u32)>,
+    quick_tests: Vec<QuickTest>,
     /// Whether the pattern was a `str` (`Some(true)`) or a bytes-like
     /// object (`Some(false)`); `None` for a pattern compiled from a parsed
     /// tree (`re.Scanner`), which, like CPython's, accepts either subject.
@@ -200,11 +208,15 @@ fn publish(idx: usize, cc: &'static CompiledCode) {
 /// Register compiled code; the handle indexes the registry.
 pub(crate) fn register_code(code: Vec<u32>, groups: usize, is_str: Option<bool>) -> i64 {
     let (table_of, tables) = set_tables(&code);
+    let (quick_of, quick_ranges, quick_tests) = quick_asserts(&code);
     let cc: &'static CompiledCode = Box::leak(Box::new(CompiledCode {
         code,
         groups,
         table_of,
         tables,
+        quick_of,
+        quick_ranges,
+        quick_tests,
         is_str,
     }));
     let mut reg = registry().lock();
@@ -212,6 +224,90 @@ pub(crate) fn register_code(code: Vec<u32>, groups: usize, is_str: Option<bool>)
     let idx = reg.len() - 1;
     publish(idx, cc);
     idx as i64
+}
+
+/// One test of a quick assertion body (see [`quick_asserts`]).
+#[derive(Clone, Copy)]
+enum QuickTest {
+    /// The character at the position meets this requirement.
+    Char(TailFirst),
+    /// The position is this `AT` position.
+    At(u32),
+}
+
+/// The assertion bodies in `code` that test one character (a literal or
+/// a set, possibly case-folded) or a position (`AT`), or an alternation
+/// of such tests, as lists the matcher evaluates in place instead of
+/// entering itself (such a body sets no marks): textwrap's word splitter
+/// asserts this way at every character (`(?=\s|\Z)`,
+/// `(?<=[\w!"'&.,?])`). As for [`set_tables`], every word equal to an
+/// assertion opcode is tried; the matcher only consults real bodies.
+fn quick_asserts(code: &[u32]) -> (Vec<u32>, Vec<(u32, u32)>, Vec<QuickTest>) {
+    // One test at `op`, and the op after it.
+    let one = |op: usize| -> Option<(QuickTest, usize)> {
+        match *code.get(op)? {
+            OP_AT => Some((QuickTest::At(*code.get(op + 1)?), op + 2)),
+            OP_LITERAL | OP_LITERAL_IGNORE | OP_LITERAL_UNI_IGNORE => {
+                code.get(op + 1)?;
+                Some((QuickTest::Char(Matcher::<u8>::item_first(code, op)), op + 2))
+            }
+            OP_IN | OP_IN_IGNORE | OP_IN_UNI_IGNORE => {
+                let skip = *code.get(op + 1)? as usize;
+                if skip < 2 || code.get(op + 1 + skip - 1) != Some(&OP_FAILURE) {
+                    return None;
+                }
+                Some((
+                    QuickTest::Char(Matcher::<u8>::item_first(code, op)),
+                    op + 1 + skip,
+                ))
+            }
+            _ => None,
+        }
+    };
+    let body_tests = |body: usize| -> Option<Vec<QuickTest>> {
+        if *code.get(body)? != OP_BRANCH {
+            let (t, next) = one(body)?;
+            return (*code.get(next)? == OP_SUCCESS).then(|| vec![t]);
+        }
+        // `<BRANCH> (<skip> <test> <JUMP> <to tail>)* <0>`, the tail the
+        // body's end.
+        let mut tests = Vec::new();
+        let mut alt = body + 1;
+        let mut tail = None;
+        while *code.get(alt)? != 0 {
+            let (t, next) = one(alt + 1)?;
+            if *code.get(next)? != OP_JUMP {
+                return None;
+            }
+            let to = next + 1 + *code.get(next + 1)? as usize;
+            if tail.is_some_and(|t| t != to) {
+                return None;
+            }
+            tail = Some(to);
+            tests.push(t);
+            alt += *code.get(alt)? as usize;
+        }
+        (*code.get(tail?)? == OP_SUCCESS).then_some(tests)
+    };
+    let mut quick_of = vec![NO_TABLE; code.len()];
+    let mut ranges = Vec::new();
+    let mut tests = Vec::new();
+    for (i, &op) in code.iter().enumerate() {
+        // <ASSERT|ASSERT_NOT> <skip> <back> <body...>
+        if !matches!(op, OP_ASSERT | OP_ASSERT_NOT) {
+            continue;
+        }
+        let body = i + 3;
+        if body >= code.len() || quick_of[body] != NO_TABLE {
+            continue;
+        }
+        if let Some(list) = body_tests(body) {
+            quick_of[body] = ranges.len() as u32;
+            ranges.push((tests.len() as u32, (tests.len() + list.len()) as u32));
+            tests.extend(list);
+        }
+    }
+    (quick_of, ranges, tests)
 }
 
 const NO_TABLE: u32 = u32::MAX;
@@ -659,6 +755,7 @@ struct Matcher<'a, C: SreChar> {
     /// The compiled code's set tables (see [`set_tables`]).
     table_of: &'a [u32],
     tables: &'a [[u64; 4]],
+    cc: &'a CompiledCode,
     beginning: usize,
     start: usize,
     end: usize,
@@ -786,6 +883,7 @@ impl<'a, C: SreChar> Matcher<'a, C> {
             code: &cc.code,
             table_of: &cc.table_of,
             tables: &cc.tables,
+            cc,
             beginning: 0,
             start: 0,
             end: s.len(),
@@ -1230,6 +1328,26 @@ impl<'a, C: SreChar> Matcher<'a, C> {
     #[inline(never)]
     fn alternative_can_start(&self, body: usize, pos: usize) -> bool {
         self.can_start(self.tail_first(body), pos)
+    }
+
+    /// The verdict at `pos` of the assertion body at `body` when it is a
+    /// quick one (see [`quick_asserts`]); `None` for any other body.
+    #[inline]
+    fn quick_assert(&self, body: usize, pos: usize) -> Option<bool> {
+        let cc = self.cc;
+        let at = *cc.quick_of.get(body)?;
+        if at == NO_TABLE {
+            return None;
+        }
+        let (from, to) = cc.quick_ranges[at as usize];
+        Some(
+            cc.quick_tests[from as usize..to as usize]
+                .iter()
+                .any(|t| match *t {
+                    QuickTest::Char(first) => self.simple_can_start(first, pos),
+                    QuickTest::At(code) => self.at(pos, code),
+                }),
+        )
     }
 
     /// The requirement of the single-character op at `op`.
@@ -1966,8 +2084,14 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                     if ptr - self.beginning < back {
                         return Ok(false);
                     }
-                    self.ptr = ptr - back;
-                    if !self.do_match(pat + 2, false)? {
+                    let matched = match self.quick_assert(pat + 2, ptr - back) {
+                        Some(matched) => matched,
+                        None => {
+                            self.ptr = ptr - back;
+                            self.do_match(pat + 2, false)?
+                        }
+                    };
+                    if !matched {
                         return Ok(false);
                     }
                     pat += skip;
@@ -1976,10 +2100,16 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                     let skip = code[pat] as usize;
                     let back = code[pat + 1] as usize;
                     if ptr - self.beginning >= back {
-                        self.ptr = ptr - back;
-                        let save = self.snapshot();
-                        let matched = self.do_match(pat + 2, false)?;
-                        self.restore(&save);
+                        let matched = match self.quick_assert(pat + 2, ptr - back) {
+                            Some(matched) => matched,
+                            None => {
+                                self.ptr = ptr - back;
+                                let save = self.snapshot();
+                                let matched = self.do_match(pat + 2, false)?;
+                                self.restore(&save);
+                                matched
+                            }
+                        };
                         if matched {
                             return Ok(false);
                         }

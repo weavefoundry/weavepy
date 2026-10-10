@@ -27276,8 +27276,16 @@ impl Interpreter {
         }
         // A builtin class's native class method (`int.from_bytes`), bound
         // to the class as `classmethod.__get__` binds it.
-        if cls.flags.is_builtin {
-            let name = code.names.get(name_idx as usize)?;
+        // (Most names are none: the class remembers which, sparing the
+        // probe's hashing.)
+        let name = code.names.get(name_idx as usize)?;
+        if cls.flags.is_builtin
+            && !cls.memo_verdict(crate::types::Verdict::NoNativeClassMethod, name, || {
+                cls.dict.try_borrow().is_ok_and(|d| {
+                    !matches!(d.get(&crate::object::StrKey(name)), Some(Object::ClassMethod(_)))
+                })
+            })
+        {
             let d = cls.dict.try_borrow().ok()?;
             if let Some(Object::ClassMethod(cm)) = d.get(&crate::object::StrKey(name)) {
                 let f = cm.func();

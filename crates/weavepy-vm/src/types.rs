@@ -156,6 +156,9 @@ pub(crate) enum Verdict {
     /// The class reduces as `copyreg._reduce_newobj` would for a plain
     /// instance (see `Interpreter::reduce_newobj_plain`); `name` unused.
     PlainNewobj = 2,
+    /// A builtin class's own dict has no class method `name` (see
+    /// `Interpreter::leaf_load_type_attr`).
+    NoNativeClassMethod = 3,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

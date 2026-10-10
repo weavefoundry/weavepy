@@ -12778,9 +12778,12 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let mut out = String::new();
+    let mut out = String::with_capacity(s.len());
     let receiver_bridged = matches!(args.first(), Some(Object::WStr(_)));
     let mut saw_surrogate = receiver_bridged;
+    // Each ASCII character's entry, looked up once per call (CPython's
+    // `unicode_fast_translate` caches its ASCII table the same way).
+    let mut ascii_memo: [Option<Option<Object>>; 128] = std::array::from_fn(|_| None);
     // Push a translation target code point, bridging a surrogate so it
     // round-trips through `str_result`.
     let push_cp = |out: &mut String, cp: u32, saw: &mut bool| {
@@ -12805,13 +12808,17 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         } else {
             cp
         };
-        let entry = match &table {
+        let lookup = |cp: u32| match &table {
             Table::Dict(Object::Dict(d)) => d
                 .borrow()
-                .get(&DictKey(Object::Int(i64::from(real_cp))))
+                .get(&DictKey(Object::Int(i64::from(cp))))
                 .cloned(),
             Table::Dict(_) => None,
-            Table::Seq(v) => v.get(real_cp as usize).cloned(),
+            Table::Seq(v) => v.get(cp as usize).cloned(),
+        };
+        let entry = match ascii_memo.get_mut(real_cp as usize) {
+            Some(slot) => slot.get_or_insert_with(|| lookup(real_cp)).clone(),
+            None => lookup(real_cp),
         };
         match entry {
             Some(Object::None) => {}
