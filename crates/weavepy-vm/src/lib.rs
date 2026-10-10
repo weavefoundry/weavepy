@@ -8308,6 +8308,7 @@ impl Interpreter {
     ) -> Option<Box<InlineAct>> {
         let arg = match mode {
             InlineResume::NextCall | InlineResume::SendCall => GEN_NEXT_CALL,
+            InlineResume::NextDefault => GEN_NEXT_DEFAULT,
             InlineResume::ForIter => frame.code.instructions.get(pc)?.arg,
             InlineResume::Send => {
                 let jump = frame.code.instructions.get(pc)?.arg;
@@ -8352,6 +8353,12 @@ impl Interpreter {
                 }
                 _ => return None,
             }
+        } else if mode == InlineResume::NextDefault {
+            // `[next, NULL, gen, default]`.
+            let Some(Object::Generator(g)) = frame.stack.get(n.checked_sub(2)?) else {
+                return None;
+            };
+            (g, true)
         } else {
             let Some(Object::Generator(g)) = frame.stack.last() else {
                 return None;
@@ -8426,6 +8433,14 @@ impl Interpreter {
             // `next`, its empty self slot and the generator (held above).
             InlineResume::NextCall => {
                 let (a, b, c) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                drop((a, b, c));
+            }
+            // Likewise, the default staying on top (see
+            // [`GEN_NEXT_DEFAULT`]).
+            InlineResume::NextDefault => {
+                let default = frame.stack.pop().expect("checked above");
+                let (a, b, c) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                frame.stack.push(default);
                 drop((a, b, c));
             }
             // The bound `send` and its empty self slot, or the method and
@@ -8567,6 +8582,10 @@ impl Interpreter {
         }
         match result {
             Ok(GenStep::Yielded(v)) => {
+                // `next(gen, default)`: the value takes the default's place.
+                if arg == GEN_NEXT_DEFAULT {
+                    drop(frame.stack.pop());
+                }
                 frame.stack.push(v);
                 QuietEntry::Returned { cur_pc: call_pc }
             }
@@ -8575,6 +8594,11 @@ impl Interpreter {
                 err: crate::error::stop_iteration_with(v),
                 cur_pc: call_pc,
             },
+            // `next(gen, default)`: the default is the result.
+            Ok(GenStep::Exhausted(v)) if arg == GEN_NEXT_DEFAULT => {
+                drop(v);
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
             // `SEND`: the return value is the `yield from`/`await` result;
             // the sub-generator stays for `END_SEND`.
             Ok(GenStep::Exhausted(v)) if arg & GEN_SEND != 0 => {
@@ -13557,6 +13581,26 @@ impl Interpreter {
                             frame.pc = pc as u32;
                             *last_pc = last;
                             if !self.core_gen_resume(sw, pc, InlineResume::SendCall) {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
+                        }
+                        // `next(gen, default)`: as `next(gen)`, with the
+                        // default the result of an exhausted generator.
+                        // SAFETY: `len >= argc + 2 == 4`.
+                        if argc == 2
+                            && !plain_fn
+                            && matches!(
+                                unsafe { (&*base.add(len - 4), &*base.add(len - 3), &*base.add(len - 2)) },
+                                (Object::Builtin(b), Object::Unbound, Object::Generator(_))
+                                    if Rc::as_ptr(b) as usize == self.leaf_fns().next_ptr
+                            )
+                        {
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_gen_resume(sw, pc, InlineResume::NextDefault) {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
@@ -20812,6 +20856,7 @@ impl Interpreter {
                 self.core_uncollapse(&mut done);
             }
             let call_pc = done.call_pc;
+            let next_default = done.exhaust_arg == GEN_NEXT_DEFAULT;
             self.lean_pending_exit(done.caller_pending);
             // SAFETY: the shell was taken above: no drop glue owed.
             unsafe { std::ptr::write(&raw mut done.act.shell, None) };
@@ -20823,6 +20868,11 @@ impl Interpreter {
             let mut tmp = None;
             // SAFETY: the consumer is the innermost remaining activation.
             let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+            // `next(gen, default)`: the value takes the default's place.
+            if next_default {
+                // SAFETY: as above.
+                drop(unsafe { (*cframe).stack.pop() });
+            }
             sw.cur = cframe;
             sw.last = if clast == &raw mut sw.scratch {
                 sw.scratch = usize::MAX;
@@ -20942,7 +20992,11 @@ impl Interpreter {
         let (cframe, clast, cshell) = unsafe { sw.activation(inl.len(), &mut tmp) };
         // SAFETY: as above.
         let consumer = unsafe { &mut *cframe };
-        if arg & GEN_SEND != 0 {
+        if arg == GEN_NEXT_DEFAULT {
+            // `next(gen, default)`: the default (atop the consumer's stack)
+            // is the result.
+            drop(v);
+        } else if arg & GEN_SEND != 0 {
             // `SEND`: the return value is the `yield from`/`await` result;
             // the sub-generator stays for `END_SEND`.
             consumer.stack.push(v);
@@ -38566,7 +38620,13 @@ impl Interpreter {
         // instead of materializing the whole sequence first; CPython's
         // `builtin_sum_impl` is exactly this drive loop.
         let mut total = SumState::new(acc);
-        if let Object::Generator(g) = &args[0] {
+        // (An iterable whose `__iter__` is a generator function, as a tree
+        // walked by `yield from`, drains the same way.)
+        let iter = match &args[0] {
+            Object::Generator(_) => args[0].clone(),
+            other => self.make_iter(other, globals)?,
+        };
+        if let Object::Generator(g) = &iter {
             loop {
                 // A lean resume folds scalar yields straight into `total`
                 // (see `Interpreter::sum_fold`); it returns at the first
@@ -38581,7 +38641,6 @@ impl Interpreter {
         }
         // Stream the live iterator. Addition can mutate the source or
         // raise, so don't consume later elements or request a length hint.
-        let iter = self.make_iter(&args[0], globals)?;
         while let Some(x) = self.iter_next(&iter, globals)? {
             total.add(self, x)?;
         }
@@ -65268,6 +65327,12 @@ const GEN_NEXT_CALL: u32 = u32::MAX;
 /// its return value on the delegator's stack and takes the jump.
 const GEN_SEND: u32 = 1 << 31;
 
+/// [`InlineAct::exhaust_arg`] of a generator resumed by `next(gen,
+/// default)`: the default waits atop the caller's stack, replaced by a
+/// yielded value, or left as the call's result when the generator
+/// finishes. (Checked before [`GEN_SEND`], whose bit it has.)
+const GEN_NEXT_DEFAULT: u32 = u32::MAX - 1;
+
 /// How [`Interpreter::core_send_hop`] went.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SendHop {
@@ -65288,6 +65353,10 @@ enum InlineResume {
     ForIter,
     /// A `CALL` of builtin `next` on the generator at the top of the stack.
     NextCall,
+    /// A `CALL` of builtin `next` on a generator with a default (the top
+    /// of the stack): as [`Self::NextCall`], but exhaustion gives the
+    /// default.
+    NextDefault,
     /// `SEND` of the value at the top of the stack to the generator or
     /// coroutine below it (`yield from`, `await`).
     Send,

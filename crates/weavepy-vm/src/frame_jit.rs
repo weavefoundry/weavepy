@@ -4673,6 +4673,26 @@ unsafe extern "C" fn h_call(
             }
             return RELOAD;
         }
+        // `next(gen, default)`: likewise, the default the result of an
+        // exhausted generator.
+        if argc == 2
+            && matches!(
+                (&*base.add(start), &*base.add(start + 1), &*base.add(start + 2)),
+                (Object::Builtin(b), Object::Unbound, Object::Generator(_))
+                    if Rc::as_ptr(b) as usize == interp.leaf_fns().next_ptr
+            )
+        {
+            if st.sw.is_null() {
+                return CALL_DECLINED;
+            }
+            sync(st);
+            let sw = &mut *st.sw;
+            let interp = &mut *st.interp.cast_mut();
+            if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextDefault) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
+        }
         Interpreter::core_instance_callee(base.add(start));
         let done = |st: &mut State, r: Object| {
             for k in start..len {
