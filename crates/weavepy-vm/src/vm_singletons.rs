@@ -150,14 +150,20 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
     } else if t == TypeId::of::<PyGenerator>() {
         // SAFETY: as above, for `PyGenerator`.
         let g = unsafe { Arc::from_raw(Arc::into_raw(arc).cast::<PyGenerator>()) };
+        let owes_for = |state: &GeneratorState| match state {
+            GeneratorState::Suspended(_) => true,
+            GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
+            GeneratorState::Finished | GeneratorState::Running | GeneratorState::Delegating(_) => {
+                false
+            }
+        };
+        // SAFETY: a read that runs no code (`peek_mut` rejects a live
+        // borrow or shared cells, which take the borrow).
         let owes = !g.finalize_ran.get()
-            && g.state.try_borrow().is_ok_and(|state| match &*state {
-                GeneratorState::Suspended(_) => true,
-                GeneratorState::Created(_) => g.kind == CoroutineKind::Coroutine,
-                GeneratorState::Finished
-                | GeneratorState::Running
-                | GeneratorState::Delegating(_) => false,
-            });
+            && match unsafe { g.state.peek_mut() } {
+                Some(state) => owes_for(state),
+                None => g.state.try_borrow().is_ok_and(|state| owes_for(&state)),
+            };
         // A plain generator suspended outside any handler of its own
         // (CPython's `gen_close` shortcut) just finishes, here: nothing
         // could observe the `GeneratorExit` its finalizer would throw.

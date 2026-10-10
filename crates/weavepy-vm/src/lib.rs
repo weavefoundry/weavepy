@@ -13713,8 +13713,11 @@ impl Interpreter {
                                 } else if self.core_gen_call(sw, pc) {
                                     // The generator, made in place: no switch,
                                     // so the loop goes on (unless a release
-                                    // queued a finalizer).
-                                    if sw.pending.is_none() {
+                                    // queued a finalizer, or an `await`
+                                    // started the coroutine).
+                                    if sw.pending.is_none()
+                                        && std::ptr::eq(sw.cur.cast_const(), &raw const *frame)
+                                    {
                                         // SAFETY: the running activation (its
                                         // stack only shrank: no reallocation).
                                         len = unsafe { (*sw.cur).stack.len() };
@@ -44012,7 +44015,20 @@ impl Interpreter {
         }
     }
 
+    /// Hand a coroutine whose tracking was deferred (see
+    /// [`PyGenerator::track_deferred`]) to the collector.
+    #[cold]
+    #[inline(never)]
+    fn track_deferred_gen(gen: &Rc<PyGenerator>) {
+        gen.track_deferred.set(false);
+        gc_trace::track_generator(&Object::Coroutine(gen.clone()));
+    }
+
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
+        // Suspended, it can close a cycle the collector must see.
+        if gen.track_deferred.get() {
+            Self::track_deferred_gen(gen);
+        }
         if let Some(py) = &boxed.py_frame {
             if py.gen_owner.borrow().is_none() {
                 *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
@@ -56864,6 +56880,16 @@ impl Interpreter {
     /// Wrap `frame`, `f`'s generator-family body just past
     /// `RETURN_GENERATOR`, in its generator object (tracked).
     fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Box<Frame>) -> Object {
+        let obj = Self::make_started_generator(f, code, frame);
+        // RFC 0024: generator frames can participate in reference cycles
+        // (a local that holds the generator itself), so track them like
+        // instances.
+        gc_trace::track_generator(&obj);
+        obj
+    }
+
+    /// [`Self::wrap_started_generator`] without tracking the generator.
+    fn make_started_generator(f: &PyFunction, code: &CodeObject, frame: Box<Frame>) -> Object {
         let kind = if code.is_coroutine {
             crate::object::CoroutineKind::Coroutine
         } else if code.is_async_generator {
@@ -56907,18 +56933,13 @@ impl Interpreter {
                 )
             }
         });
-        let obj = if code.is_coroutine {
+        if code.is_coroutine {
             Object::Coroutine(gen)
         } else if code.is_async_generator {
             Object::AsyncGenerator(gen)
         } else {
             Object::Generator(gen)
-        };
-        // RFC 0024: generator frames can participate in reference cycles
-        // (a local that holds the generator itself), so track them like
-        // instances.
-        gc_trace::track_generator(&obj);
-        obj
+        }
     }
 
     /// `iter(obj)` (`name` `__iter__`) or `obj.__await__()` for an
@@ -57196,6 +57217,12 @@ impl Interpreter {
             std::ptr::copy_nonoverlapping(args, v.as_mut_ptr().add(v.len()), nargs);
             v.set_len(v.len() + nargs);
         };
+        // `await f(...)`: the coroutine starts as it is made (see below).
+        let await_send = if code.is_coroutine && self.inline_calls_ok() {
+            await_send_after(&frame.code, pc)
+        } else {
+            None
+        };
         let gen = if let Some(cells) = cells {
             // The arguments move straight into the locals (no staging).
             let nlocals = code.varnames.len();
@@ -57217,7 +57244,18 @@ impl Interpreter {
             let mut gen_frame = Self::gen_frame_lean(f, code, locals, cells, start);
             gen_frame.stack = self.pooled_stack();
             let code = Rc::clone(&gen_frame.code);
-            Self::wrap_started_generator(f, &code, self.box_gen_frame(gen_frame))
+            let boxed = self.box_gen_frame(gen_frame);
+            if await_send.is_some() {
+                // Tracked if it suspends (see `PyGenerator::track_deferred`),
+                // or below if it doesn't start.
+                let obj = Self::make_started_generator(f, &code, boxed);
+                if let Object::Coroutine(g) = &obj {
+                    g.track_deferred.set(true);
+                }
+                obj
+            } else {
+                Self::wrap_started_generator(f, &code, boxed)
+            }
         } else {
             let mut positional = self.pooled_scratch();
             positional.extend(callee_receiver);
@@ -57233,13 +57271,45 @@ impl Interpreter {
             Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
             callee => self.release(callee),
         }
+        let deferred = matches!(&gen, Object::Coroutine(g) if g.track_deferred.get());
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
         // SAFETY: the running activation's last-pc slot.
         unsafe { *sw.last = pc };
+        // `await f(...)`: the coroutine starts at once, as the `SEND` after
+        // its `GET_AWAITABLE` (which passes a fresh coroutine through) would
+        // start it with the `None` sent. The caller rests at the `SEND`,
+        // where the coroutine's return lands; the caller of this function
+        // finds the switch in `sw`.
+        let caller: *mut Frame = frame;
         // SAFETY: the running thread's own flag (see `quiet_run`).
-        if unsafe { (*sw.maybe_dead).get() } {
+        let started = if unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            false
+        } else if let Some(send_pc) = await_send {
+            frame.stack.push(Object::None);
+            frame.pc = send_pc as u32;
+            // SAFETY: as above (the `LOAD_CONST` before the `SEND`).
+            unsafe { *sw.last = send_pc - 1 };
+            let started = self.core_gen_resume_one(sw, send_pc, InlineResume::Send);
+            if !started {
+                // SAFETY: still the running activation (nothing switched).
+                let frame = unsafe { &mut *caller };
+                frame.stack.pop();
+                frame.pc = pc as u32 + 1;
+                // SAFETY: as above.
+                unsafe { *sw.last = pc };
+            }
+            started
+        } else {
+            false
+        };
+        if deferred && !started {
+            // SAFETY: as above.
+            if let Some(obj @ Object::Coroutine(g)) = unsafe { (*caller).stack.last() } {
+                g.track_deferred.set(false);
+                gc_trace::track_generator(obj);
+            }
         }
         true
     }
@@ -66241,6 +66311,22 @@ fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Opt
     }
     let target = (pc + 2).checked_sub(jump.arg as usize)?;
     (instrs.get(target)?.op == OpCode::Send).then_some(target)
+}
+
+/// The `SEND` of an `await` of the `CALL` at `pc`'s result: the call is
+/// followed by `GET_AWAITABLE 0; LOAD_CONST None; SEND`.
+#[inline]
+pub(crate) fn await_send_after(code: &CodeObject, pc: usize) -> Option<usize> {
+    let [get, none, send] = code.instructions.get(pc + 1..pc + 4)? else {
+        return None;
+    };
+    (get.op == OpCode::GetAwaitable
+        && get.arg == 0
+        && none.op == OpCode::LoadConst
+        && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
+        && send.op == OpCode::Send
+        && send.arg & GEN_SEND == 0)
+        .then_some(pc + 3)
 }
 
 /// Move the object at `src` to `dst` as one 16-byte copy: a move through

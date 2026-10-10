@@ -506,8 +506,16 @@ fn object_is_tracked(target: &Object) -> bool {
             inst.ensure_gc_tracked();
             gc_trace::with_state(|s| s.is_tracked_instance(target))
         }
-        // A function, generator or coroutine may still be young.
+        // A function, generator or coroutine may still be young. A
+        // coroutine whose tracking is deferred (see
+        // `PyGenerator::track_deferred`) answers as CPython's and is
+        // tracked from here on.
         Object::Function(_) | Object::Generator(_) | Object::Coroutine(_) => {
+            if let Object::Generator(g) | Object::Coroutine(g) = target {
+                if g.track_deferred.replace(false) {
+                    gc_trace::track_generator(target);
+                }
+            }
             gc_trace::with_state(|s| s.is_tracked_instance(target))
         }
         // A list/dict/set born holding only scalars has its tracking

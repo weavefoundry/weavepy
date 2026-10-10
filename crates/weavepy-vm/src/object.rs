@@ -5534,6 +5534,12 @@ pub struct PyGenerator {
     /// [`crate::gc_trace::GcSlot`]); unregistered while it is still in a
     /// young set.
     pub gc_slot: crate::gc_trace::GcSlot,
+    /// Not yet handed to the collector: a coroutine an `await` started
+    /// as it was made runs on the spine (its frame's referents are
+    /// roots), so it can close no unreachable cycle until it first
+    /// suspends, which tracks it (see `Interpreter::park_suspended_boxed`).
+    /// One that finishes first is never tracked.
+    pub track_deferred: crate::sync::Cell<bool>,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5675,6 +5681,7 @@ impl PyGenerator {
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
             gc_slot: crate::gc_trace::GcSlot::new(),
+            track_deferred: crate::sync::Cell::new(false),
         }
     }
 

@@ -76,6 +76,10 @@ pub(crate) const RELOAD: u32 = 4;
 /// synced to the return with the value atop its stack: the caller
 /// finishes the return.
 const DIRECT_RET: u32 = 5;
+/// A `CALL` of a coroutine function followed by an `await` of its result
+/// started the coroutine, which returned (see [`gen_call_done`]): the
+/// await's `END_SEND` goes on, `[coroutine, result]` atop the stack.
+const AWAITED: u32 = 6;
 
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
@@ -3880,6 +3884,40 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
     }
 }
 
+/// The end of `h_call`'s generator-function call at `pc` (its operands
+/// from `start`), made by `Interpreter::core_gen_call`: the generator in
+/// place (`0`), or an `await` whose coroutine that call started (the
+/// switch in the state), run from here as [`h_send`] runs a resumed
+/// delegate: `AWAITED` when it returned into the await's `END_SEND`
+/// (`[coroutine, result]` from `start`), else `RELOAD`.
+///
+/// # Safety
+///
+/// `st` is a live state whose switch is non-null.
+unsafe fn gen_call_done(st: &mut State, pc: usize, start: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let sw = &*st.sw;
+        if !std::ptr::eq(sw.cur, st.frame) {
+            if sw.pending.is_none() && run_switched_directly(st) {
+                let frame = &*st.frame;
+                let send_pc = pc + 3;
+                let exit = send_pc + 1 + frame.code.instructions[send_pc].arg as usize;
+                if frame.pc as usize == exit && frame.stack.len() == start + 2 {
+                    st.len = start + 2;
+                    return AWAITED;
+                }
+            }
+            return RELOAD;
+        }
+        if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
+        }
+    }
+}
+
 /// Whether the call whose operands started at `start` finished in place
 /// (a frameless `__init__`, a builtin's lane): nothing pending, the same
 /// activation running, its result alone in their place. Then the native
@@ -4674,11 +4712,7 @@ unsafe extern "C" fn h_call(
                     }
                     return RELOAD;
                 }
-                return if finished_in_place(st, start) {
-                    0
-                } else {
-                    RELOAD
-                };
+                return gen_call_done(st, pc, start);
             }
         }
         // `gen.send(v)`: likewise, with the value sent in.
@@ -4818,7 +4852,13 @@ unsafe extern "C" fn h_call(
             let saved_last = sw.last;
             let interp = &mut *st.interp.cast_mut();
             let switched = if python == 1 {
-                interp.core_call(sw, pc) || interp.core_gen_call(sw, pc)
+                if interp.core_call(sw, pc) {
+                    true
+                } else if interp.core_gen_call(sw, pc) {
+                    return gen_call_done(st, pc, start);
+                } else {
+                    false
+                }
             } else {
                 interp.core_new(sw, pc, st.snap_gen)
             };
@@ -9860,6 +9900,25 @@ impl<'a> Lower<'a> {
         self.b.ins().brif(r, other, &[], ran, &[]);
         // Raised or switched: the core loop takes it from the state.
         self.b.switch_to_block(other);
+        // `await f(...)` of a coroutine function: a coroutine the call
+        // started and that returned goes on at the await's `END_SEND`
+        // (see `gen_call_done`).
+        if let Some(send_pc) = crate::await_send_after(self.code, pc) {
+            let exit = send_pc + 1 + self.code.instructions[send_pc].arg as usize;
+            let start = self.depth - argc - 2;
+            if self.depths.get(exit).copied() == Some(start as i64 + 2) {
+                let awaited = self.b.create_block();
+                let rest = self.b.create_block();
+                let is = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(AWAITED));
+                self.b.ins().brif(is, awaited, &[], rest, &[]);
+                self.b.switch_to_block(awaited);
+                let depth = std::mem::replace(&mut self.depth, start + 2);
+                self.set_last(send_pc);
+                self.goto(exit);
+                self.depth = depth;
+                self.b.switch_to_block(rest);
+            }
+        }
         let declined = self
             .b
             .ins()
