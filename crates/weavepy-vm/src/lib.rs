@@ -18826,8 +18826,10 @@ impl Interpreter {
             if ic.is_subclass_of(cls) {
                 return Some(Ok(Object::Bool(true)));
             }
-            // A miss is final when `__class__` can't answer otherwise.
-            return ic.class_attr_is_plain().then_some(Ok(Object::Bool(false)));
+            // A miss is final when `__class__` can't answer otherwise (and
+            // the class isn't `os.PathLike`, whose check is structural).
+            return (ic.class_attr_is_plain() && !crate::stdlib::os::is_path_like(cls))
+                .then_some(Ok(Object::Bool(false)));
         }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).

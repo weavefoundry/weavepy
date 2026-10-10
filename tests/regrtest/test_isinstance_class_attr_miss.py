@@ -64,6 +64,18 @@ class IsinstanceClassAttrTest(unittest.TestCase):
         for _ in range(2000):
             self.assertFalse(isinstance(c, float))
 
+    def test_structural_pathlike(self):
+        import os
+
+        class Fake:
+            def __fspath__(self):
+                return b"/"
+
+        f = Fake()
+        for _ in range(2000):
+            self.assertTrue(isinstance(f, os.PathLike))
+            self.assertFalse(isinstance(Plain(), os.PathLike))
+
     def test_class_assignment(self):
         class A:
             pass
