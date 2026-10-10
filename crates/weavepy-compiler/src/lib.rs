@@ -7572,7 +7572,7 @@ impl Compiler {
             if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
                 self.bindings.insert(free.to_string(), Binding::Cell);
                 if !has_name(&self.co.cellvars, free) {
-                    self.co.cellvars.push(Name::from(free.clone()));
+                    self.co.cellvars.push(free.clone());
                 }
             }
         }
@@ -12089,7 +12089,7 @@ impl Compiler {
             if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
                 self.bindings.insert(free.to_string(), Binding::Cell);
                 if !has_name(&self.co.cellvars, free) {
-                    self.co.cellvars.push(Name::from(free.clone()));
+                    self.co.cellvars.push(free.clone());
                 }
             }
         }

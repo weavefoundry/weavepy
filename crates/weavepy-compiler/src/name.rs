@@ -42,6 +42,15 @@ impl Name {
         &self.0
     }
 
+    /// The text as a `String`: a copy, without the formatting machinery
+    /// `ToString` goes through for a type that isn't `str` (a function
+    /// made per call takes its name this way).
+    #[allow(clippy::inherent_to_string_shadow_display)]
+    #[inline]
+    pub fn to_string(&self) -> String {
+        String::from(&*self.0)
+    }
+
     /// Whether `a` and `b` share one allocation (equal pooled names always
     /// do).
     #[inline]
@@ -68,11 +77,10 @@ impl Hasher for Fx {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.add(u64::from_le_bytes(c.try_into().expect("eight bytes")));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for &c in chunks {
+            self.add(u64::from_le_bytes(c));
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut last = [0u8; 8];
             last[..rest.len()].copy_from_slice(rest);
