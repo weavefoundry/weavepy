@@ -1129,6 +1129,9 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         r
     }
 
+    // (In line in the matcher's `AT` arm, which a second caller, the
+    // quick assertions, would otherwise talk the compiler out of.)
+    #[inline(always)]
     fn at(&self, ptr: usize, atcode: u32) -> bool {
         let s = self.s;
         match atcode {
