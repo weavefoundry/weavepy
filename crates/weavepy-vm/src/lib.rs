@@ -71454,6 +71454,9 @@ struct CodeConstObjects {
     /// `co_name`, `co_qualname` and `co_filename` as the str objects every
     /// read returns (CPython stores them; logging reads two per record).
     ident_strs: std::sync::OnceLock<[Object; 3]>,
+    /// `co_positions()` entries, as a tuple of 4-tuples, and the
+    /// debug-ranges setting they were built under.
+    positions: std::sync::OnceLock<(bool, Object)>,
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
@@ -73621,6 +73624,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
             ident_strs: std::sync::OnceLock::new(),
+            positions: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
             cold_sites: std::sync::atomic::AtomicU32::new(0),

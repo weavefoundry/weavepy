@@ -658,10 +658,8 @@ impl PyFrame {
     /// line jump or `f_lineno` override owns the value.
     pub fn lasti_now(&self) -> u32 {
         let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
-        if !live.is_null()
-            && self.override_lineno.get().is_none()
-            && self.pending_jump.try_borrow().is_ok_and(|j| j.is_none())
-        {
+        // (A pending jump always comes with its line override.)
+        if !live.is_null() && self.override_lineno.get().is_none() {
             // SAFETY: a linked shell is alive: the link is cleared when the
             // shell leaves its spine and again when it is dropped.
             let at = unsafe { (*live).lasti.load(std::sync::atomic::Ordering::Relaxed) };
@@ -1265,7 +1263,8 @@ impl FrameShell {
     /// dispatch loops sync only the shell (see [`PyFrame::live`]). A trace
     /// function's pending line jump owns the value and is left alone.
     pub fn refresh_materialized(&self, py: &PyFrame) {
-        if py.pending_jump.borrow().is_none() && py.override_lineno.get().is_none() {
+        // (A pending jump always comes with its line override.)
+        if py.override_lineno.get().is_none() {
             py.lasti
                 .set(self.lasti.load(std::sync::atomic::Ordering::Relaxed));
         }
@@ -1596,14 +1595,13 @@ impl PyTraceback {
 /// the one it already has, else materialized where it sits on this
 /// thread's spine (linking `f_back` like any other materialization).
 pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
-    if let Some(handles) = crate::vm_singletons::current_thread_handles() {
-        let idx = handles
-            .frame_stack
+    if let Some(frame_stack) = crate::vm_singletons::current_frame_stack() {
+        let idx = frame_stack
             .borrow()
             .iter()
             .rposition(|s| Rc::ptr_eq(s, shell));
         if let Some(idx) = idx {
-            if let Some(py) = materialize_stack_at_lazy(&handles.frame_stack, idx) {
+            if let Some(py) = materialize_stack_at_lazy(&frame_stack, idx) {
                 return py;
             }
         }

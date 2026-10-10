@@ -5020,33 +5020,51 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
             .collect();
         return list_iter(items);
     }
-    let cp = c.to_cpython();
     let debug_ranges = crate::vm_singletons::debug_ranges();
-    let col = |v: Option<u32>| {
-        v.filter(|_| debug_ranges)
-            .map_or(Object::None, |x| Object::Int(i64::from(x)))
+    let build = || -> Vec<Object> {
+        let cp = c.to_cpython();
+        let col = |v: Option<u32>| {
+            v.filter(|_| debug_ranges)
+                .map_or(Object::None, |x| Object::Int(i64::from(x)))
+        };
+        let line = |v: i32| {
+            // -1 marks NO_LOCATION; 0 is a real line (module RESUME).
+            if v < 0 {
+                Object::None
+            } else {
+                Object::Int(i64::from(v))
+            }
+        };
+        cp.positions
+            .iter()
+            .map(|p| {
+                // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
+                // With debug ranges disabled only start lines survive, so
+                // end_line collapses onto line (CPython stores no
+                // end-position table; test_endline_and_columntable_none_…).
+                let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
+                Object::new_tuple_array([
+                    line(p.lineno),
+                    line(end_lineno),
+                    col(p.col),
+                    col(p.end_col),
+                ])
+            })
+            .collect()
     };
-    let line = |v: i32| {
-        // -1 marks NO_LOCATION; 0 is a real line (module RESUME).
-        if v < 0 {
-            Object::None
-        } else {
-            Object::Int(i64::from(v))
+    // The tuples are built once per code object (`traceback` asks for
+    // every frame's, then reads one entry): an iterator over one shared
+    // immutable tuple of them.
+    if let Some(ext) = crate::code_vm_ext(&c) {
+        let (ranges, all) = ext
+            .positions
+            .get_or_init(|| (debug_ranges, Object::new_tuple(build())));
+        if *ranges == debug_ranges {
+            let it = all.make_iter()?;
+            return Ok(Object::Iter(Rc::new(RefCell::new(it))));
         }
-    };
-    let items = cp
-        .positions
-        .iter()
-        .map(|p| {
-            // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
-            // With debug ranges disabled only start lines survive, so
-            // end_line collapses onto line (CPython stores no
-            // end-position table; test_endline_and_columntable_none_…).
-            let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
-            Object::new_tuple_array([line(p.lineno), line(end_lineno), col(p.col), col(p.end_col)])
-        })
-        .collect();
-    list_iter(items)
+    }
+    list_iter(build())
 }
 
 /// Wrap a vector of objects as a single-use iterator, mirroring the
