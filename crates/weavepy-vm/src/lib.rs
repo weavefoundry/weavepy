@@ -22387,24 +22387,21 @@ impl Interpreter {
                     return true;
                 }
             } else if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
-                // SAFETY: a store between two instructions (see `peek_mut`).
-                if let Some(slot) =
-                    unsafe { inst.split_field_mut(idx as usize, value.is_gc_atomic()) }
-                {
-                    if Self::core_droppable(slot) {
-                        // SAFETY: as the indexed store below.
-                        drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
-                        return true;
-                    }
-                    return false;
-                }
-                // The constructor shape: the attribute is the instance's
-                // next one.
-                // SAFETY: as above; the value moves out of the caller's
-                // stack slot, and a declined append hands the bits back.
-                match unsafe { inst.split_append(idx as usize, std::ptr::read(value)) } {
+                // Over the attribute's value, or (the constructor shape) as
+                // the instance's next one.
+                // SAFETY: a store between two instructions (see `peek_mut`);
+                // the value moves out of the caller's stack slot, and a
+                // declined store hands the bits back.
+                match unsafe {
+                    inst.split_store_at(idx as usize, std::ptr::read(value), Self::core_droppable)
+                } {
                     Ok(()) => return true,
-                    Err(v) => std::mem::forget(v),
+                    Err((v, refused)) => {
+                        std::mem::forget(v);
+                        if refused {
+                            return false;
+                        }
+                    }
                 }
             }
         }

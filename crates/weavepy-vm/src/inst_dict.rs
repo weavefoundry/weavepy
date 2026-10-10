@@ -1274,6 +1274,50 @@ impl crate::types::PyInstance {
         split.append_over(keys, || cls.shared_keys.share(), i, value)
     }
 
+    /// Store `value` at position `i` of the class's shared names from one
+    /// view of the split values: over the value set there, when
+    /// `droppable` accepts it (as [`Self::split_field_mut`]), else as the
+    /// next value (as [`Self::split_append`]). The write barrier for the
+    /// value runs first. `Err` hands the value back, touching nothing,
+    /// with `true` when the old value was refused (the caller declines
+    /// the whole store) and `false` when the split layout can't take it.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek_mut`].
+    #[inline(always)]
+    pub unsafe fn split_store_at(
+        &self,
+        i: usize,
+        value: Object,
+        droppable: impl FnOnce(&Object) -> bool,
+    ) -> Result<(), (Object, bool)> {
+        let cls = self.cls_raw();
+        let Some(keys) = cls.shared_keys.get() else {
+            return Err((value, false));
+        };
+        if !value.is_gc_atomic() && self.deferred.get() {
+            self.ensure_gc_tracked();
+        }
+        // SAFETY: forwarded contract.
+        let Some(split) = (unsafe { self.dict.split_peek_mut() }) else {
+            return Err((value, false));
+        };
+        if let Some(slot) = split.get_over_mut(keys, i) {
+            if !droppable(slot) {
+                return Err((value, true));
+            }
+            drop(std::mem::replace(slot, value));
+            return Ok(());
+        }
+        if self.c_body.get() != 0 || crate::gil::free_threading_enabled() {
+            return Err((value, false));
+        }
+        split
+            .append_over(keys, || cls.shared_keys.share(), i, value)
+            .map_err(|v| (v, false))
+    }
+
     /// The split length and whether position `i` of the class's shared
     /// names is ready for a store: an overwrite of a set value (which
     /// `droppable` must accept), or the next of a run of in-order appends
