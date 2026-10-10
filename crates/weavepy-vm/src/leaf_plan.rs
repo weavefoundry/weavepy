@@ -994,21 +994,20 @@ impl Interpreter {
     /// code, at recursion depth `depth`, once the callee's warm-up is past
     /// (the frameless call bookkeeping is then only the hit count):
     /// `None` when the plan has no native code, or the callee one of the
-    /// tiny shapes `leaf_eval` answers itself; otherwise the result, or
-    /// `None` inside having done nothing observable.
+    /// tiny shapes `leaf_eval` answers itself (the caller checked `ext`,
+    /// `code`'s extension, for those); otherwise the result, or `None`
+    /// inside having done nothing observable.
     #[cfg(feature = "jit")]
-    #[inline]
+    #[inline(always)]
     pub(crate) fn leaf_site_native<const EFFECT: bool>(
         &self,
         code: &CodeObject,
+        ext: &CodeConstObjects,
         f: &crate::object::PyFunction,
         args: &[*const Object],
         depth: usize,
     ) -> Option<Option<Object>> {
-        let ext = crate::code_vm_ext(code)?;
-        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3
-            || code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
-        {
+        if code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP {
             return None;
         }
         let plan = ext.leaf_plan.get()?.as_deref()?;

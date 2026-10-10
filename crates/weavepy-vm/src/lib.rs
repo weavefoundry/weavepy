@@ -20295,8 +20295,9 @@ impl Interpreter {
 
     /// [`Self::pure_leaf_eval`] (with `effect`, of an effect leaf) at
     /// recursion depth `depth`: a warm callee's compiled plan is entered
-    /// directly (see [`Self::leaf_site_native`]).
-    #[inline(always)]
+    /// directly (see [`Self::leaf_site_native`]). The one copy every
+    /// frameless call path shares: its extension is looked up once.
+    #[inline(never)]
     fn pure_leaf_call(
         &self,
         code: &CodeObject,
@@ -20311,7 +20312,26 @@ impl Interpreter {
         if bails >= LEAF_BAIL_LIMIT && bails > done {
             return None;
         }
-        let r = self.pure_leaf_call_inner(code, f, args, effect, depth);
+        let r = 'eval: {
+            // (The tiny shapes `leaf_eval` answers itself skip the probe.)
+            #[cfg(feature = "jit")]
+            if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                let fast = if effect {
+                    self.leaf_site_native::<true>(code, ext, f, args, depth)
+                } else {
+                    self.leaf_site_native::<false>(code, ext, f, args, depth)
+                };
+                if let Some(r) = fast {
+                    break 'eval r;
+                }
+            }
+            let _ = depth;
+            if effect {
+                self.pure_leaf_eval::<false, true>(code, f, args)
+            } else {
+                self.pure_leaf_eval::<false, false>(code, f, args)
+            }
+        };
         // (Each half stops counting when full: the counts only steer the
         // decision above.)
         let bump = if r.is_some() { 1 } else { 1 << 32 };
@@ -20320,36 +20340,6 @@ impl Interpreter {
                 .store(tries + bump, std::sync::atomic::Ordering::Relaxed);
         }
         r
-    }
-
-    fn pure_leaf_call_inner(
-        &self,
-        code: &CodeObject,
-        f: &crate::object::PyFunction,
-        args: &[*const Object],
-        effect: bool,
-        depth: usize,
-    ) -> Option<Object> {
-        // (The tiny shapes `leaf_eval` answers itself skip the probe.)
-        #[cfg(feature = "jit")]
-        if code_vm_ext(code)
-            .is_some_and(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3)
-        {
-            let fast = if effect {
-                self.leaf_site_native::<true>(code, f, args, depth)
-            } else {
-                self.leaf_site_native::<false>(code, f, args, depth)
-            };
-            if let Some(r) = fast {
-                return r;
-            }
-        }
-        let _ = depth;
-        if effect {
-            self.pure_leaf_eval::<false, true>(code, f, args)
-        } else {
-            self.pure_leaf_eval::<false, false>(code, f, args)
-        }
     }
 
     /// [`Self::pure_leaf_eval`] for a constructor's leaf `__init__` on the

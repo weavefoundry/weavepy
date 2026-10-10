@@ -322,7 +322,7 @@ pub(super) fn run<const EFFECT: bool>(
 /// [`run`] for a plan whose native code is already compiled, with the
 /// caller's recursion `depth` in hand: `None` when there is no native
 /// code (yet), otherwise the evaluation's outcome.
-#[inline]
+#[inline(always)]
 pub(super) fn run_compiled<const EFFECT: bool>(
     interp: &Interpreter,
     code: &CodeObject,
