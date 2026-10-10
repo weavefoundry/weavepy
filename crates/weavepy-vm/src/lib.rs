@@ -16242,7 +16242,10 @@ impl Interpreter {
         }
         let ops = &frame.stack[callee_at..];
         let mut args: Vec<Object> = Vec::new();
-        let mut kwargs: Vec<(String, Object)> = Vec::new();
+        // The keywords' names are the call's own `str` objects (the site's
+        // names tuple, the `**` mapping's keys).
+        let mut kwnames: Vec<Object> = Vec::new();
+        let mut kwvals: Vec<Object> = Vec::new();
         if !matches!(ops[1], Object::Unbound) {
             args.push(ops[1].clone());
         }
@@ -16254,10 +16257,11 @@ impl Interpreter {
             let npos = values.len() - names.len();
             args.extend(values[..npos].iter().cloned());
             for (name, v) in names.iter().zip(&values[npos..]) {
-                let Object::Str(name) = name else {
+                if !matches!(name, Object::Str(_)) {
                     return false;
-                };
-                kwargs.push((name.to_string(), v.clone()));
+                }
+                kwnames.push(name.clone());
+                kwvals.push(v.clone());
             }
         } else {
             let Object::Tuple(items) = &ops[2] else {
@@ -16271,16 +16275,17 @@ impl Interpreter {
                         return false;
                     };
                     for (k, v) in d.iter() {
-                        let Object::Str(name) = &k.0 else {
+                        if !matches!(k.0, Object::Str(_)) {
                             return false;
-                        };
-                        kwargs.push((name.to_string(), v.clone()));
+                        }
+                        kwnames.push(k.0.clone());
+                        kwvals.push(v.clone());
                     }
                 }
                 _ => return false,
             }
         }
-        if builtin && !kwargs.is_empty() {
+        if builtin && !kwnames.is_empty() {
             return false;
         }
         // Committed: the operands leave the stack.
@@ -16289,10 +16294,34 @@ impl Interpreter {
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        let result = self.call(&callee, &args, &kwargs, &globals);
+        // A Python function binds its keywords by name objects; anything
+        // else takes them as strings.
+        let target = match &callee {
+            Object::Function(f) if !kwnames.is_empty() => Some((f.clone(), None)),
+            Object::BoundMethod(bm) if !kwnames.is_empty() => match &bm.function {
+                Object::Function(f) => Some((f.clone(), Some(bm.receiver.clone()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        let result = match target {
+            Some((f, receiver)) => {
+                if let Some(r) = receiver {
+                    args.insert(0, r);
+                }
+                self.call_python_kw_names(&f, args, &kwnames, kwvals)
+            }
+            None => {
+                let kwargs: Vec<(String, Object)> =
+                    kwnames.iter().map(Object::to_str).zip(kwvals).collect();
+                let r = self.call(&callee, &args, &kwargs, &globals);
+                drop(args);
+                drop(kwargs);
+                r
+            }
+        };
         self.core_pending_exit(sw, pending);
-        drop(args);
-        drop(kwargs);
+        drop(kwnames);
         drop(callee);
         for o in operands {
             self.release(o);
@@ -57007,6 +57036,72 @@ impl Interpreter {
                 },
             )?
         };
+        self.call_python_bound(f, code, positional)
+    }
+
+    /// A keyword call of `f`: the positional `args`, then `kwvals` named by
+    /// `names` (the call site's `str` objects, one per value). Bound by the
+    /// `CALL_KW` specialization's permutation ([`specialize::kw_perm`],
+    /// computed for this call: no `String` per keyword) through
+    /// [`Self::kw_names_fill_locals`] when the shape has one; anything else,
+    /// its errors included, through the full binder.
+    fn call_python_kw_names(
+        &mut self,
+        f: &Rc<PyFunction>,
+        args: Vec<Object>,
+        names: &[Object],
+        kwvals: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        let code = f.code();
+        let strs = || {
+            names.iter().map(|n| match n {
+                Object::Str(s) => &**s,
+                _ => "",
+            })
+        };
+        let plan = if self.pending_raw_kwargs.borrow().is_none()
+            && names.iter().all(|n| matches!(n, Object::Str(_)))
+        {
+            specialize::kw_perm(f, &code, args.len(), strs())
+        } else {
+            None
+        };
+        if let Some((perm, covered)) = plan {
+            let (eff_argc, kwc) = (args.len(), kwvals.len());
+            let mut stack: Vec<Object> = self.pooled_scratch();
+            stack.extend(args);
+            stack.extend(kwvals);
+            let mut positional: Vec<Object> = self.pooled_scratch();
+            Self::kw_names_fill_locals(
+                &mut positional,
+                &mut stack,
+                names,
+                f,
+                &code,
+                perm,
+                covered,
+                kwc,
+                eff_argc,
+            );
+            self.recycle_scratch(stack);
+            return self.call_python_bound(f, code, positional);
+        }
+        let kwargs = names
+            .iter()
+            .zip(kwvals)
+            .map(|(n, v)| (n.to_str(), v))
+            .collect();
+        self.call_python_owned(f, args, kwargs)
+    }
+
+    /// Run `f` (whose code is `code`) on its bound fast locals
+    /// `positional` (see [`Self::call_python_owned`]).
+    fn call_python_bound(
+        &mut self,
+        f: &Rc<PyFunction>,
+        code: Rc<CodeObject>,
+        positional: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
         // Keep native eligibility outside the argument binder so its layout
         // values need not stay live across keyword and default processing.
         #[cfg(feature = "jit")]
