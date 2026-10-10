@@ -11080,11 +11080,16 @@ impl Interpreter {
             .map_or(&[][..], |s| &s[..]);
         match other {
             Object::Instance(_) | Object::Module(_) => {
-                // A site that verified its callee for this class version
-                // (its call checks the argument shape itself).
+                // A site that verified its pure callee for this class version
+                // (its call checks the argument shape itself). An effect
+                // leaf (one that stores) costs more evaluated frameless than
+                // called: the method loads and its call runs directly.
                 let mut missed = false;
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
-                    if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get()) {
+                    if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
+                        // SAFETY: the site's code is its live function's.
+                        .filter(|&(_, c, effect)| !effect || !code_calls(unsafe { &*c }))
+                    {
                         match self.core_leaf_site_call(
                             code,
                             i,
@@ -11136,7 +11141,11 @@ impl Interpreter {
                             .peek_fn(i.cls_raw().attr_version.get())
                             // SAFETY: the slot's function is alive (its class
                             // version matched).
-                            .is_some_and(|fp| fn_is_leaf(unsafe { &*fp })),
+                            .is_some_and(|fp| {
+                                let f = unsafe { &*fp };
+                                fn_is_pure_leaf(f)
+                                    || (fn_is_leaf(f) && !code_calls(unsafe { &*f.code.as_ptr() }))
+                            }),
                         _ => false,
                     };
                 if pure_site {
@@ -56330,8 +56339,7 @@ impl Interpreter {
         // SAFETY: GIL-serialized raw read of the function's code cell (the
         // callee on the stack holds the function).
         let code_ref: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        let Some(start) =
-            self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))
+        let Some(start) = self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))
         else {
             return false;
         };
@@ -70938,6 +70946,9 @@ struct CodeConstObjects {
     /// The body's store-only `__init__` shape (see [`code_store_init`]),
     /// or `None` when it isn't one.
     store_init: std::sync::OnceLock<Option<Box<StoreInit>>>,
+    /// Whether the body makes a call (see [`code_calls`]): `0` not yet
+    /// decided, `1` no, `2` yes.
+    calls: std::sync::atomic::AtomicU8,
     /// Per `co_names` entry, its position among the shared names of the
     /// instances last checked for shadowing it (see [`inst_may_shadow`]).
     name_memos: std::sync::OnceLock<Box<[crate::inst_dict::NameMemo]>>,
@@ -72786,6 +72797,27 @@ fn code_returns_only_none(code: &CodeObject) -> bool {
     yes
 }
 
+/// Whether `code`'s body makes a call of any kind (cached in its
+/// extension). An effect leaf that calls costs more evaluated frameless,
+/// its callee's evaluation nested in it, than called directly.
+fn code_calls(code: &CodeObject) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(ext) = code_vm_ext(code) else {
+        return true;
+    };
+    match ext.calls.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let yes = code
+        .instructions
+        .iter()
+        .any(|i| matches!(i.op, OpCode::Call | OpCode::CallKw | OpCode::CallEx));
+    ext.calls.store(if yes { 2 } else { 1 }, Relaxed);
+    yes
+}
+
 /// Where a store-only `__init__`'s stored value comes from.
 #[derive(Clone, Copy)]
 enum StoreSrc {
@@ -73084,6 +73116,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
             store_init: std::sync::OnceLock::new(),
+            calls: std::sync::atomic::AtomicU8::new(0),
             name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
