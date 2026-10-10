@@ -623,7 +623,7 @@ const CACHE_SWEEP_MIN: usize = 1024;
 /// cache that has grown to `sweep_at` entries first drops those of code
 /// objects that have died (see [`JitState::sweep_at`]).
 fn cache_entry<'a>(
-    cache: &'a mut CodeMap<CacheEntry>,
+    cache: &'a mut CodeMap<Box<CacheEntry>>,
     sweep_at: &mut usize,
     code: &Rc<CodeObject>,
 ) -> &'a mut CacheEntry {
@@ -633,7 +633,7 @@ fn cache_entry<'a>(
     }
     cache
         .entry(Rc::as_ptr(code).cast::<CodeObject>())
-        .or_insert_with(|| CacheEntry::new(code))
+        .or_insert_with(|| Box::new(CacheEntry::new(code)))
 }
 
 /// Give up on OSR for a code object after this many failed validations.
@@ -800,7 +800,10 @@ struct JitState {
     threshold: u32,
     range_budget: bool,
     engine: Option<JitEngine>,
-    cache: CodeMap<CacheEntry>,
+    /// Each code object's entry, boxed: every code object that runs gets
+    /// one, and an entry in line made each of the table's buckets (spare
+    /// ones included) as large as an entry.
+    cache: CodeMap<Box<CacheEntry>>,
     /// The cache size at which [`cache_entry`] next sweeps out the
     /// entries of dead code objects (twice the live count the last sweep
     /// left, so sweeping stays amortized constant time per entry).
