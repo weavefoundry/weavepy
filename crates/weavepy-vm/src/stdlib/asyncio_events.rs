@@ -251,23 +251,43 @@ fn names() -> &'static Names {
     })
 }
 
-/// Instance attribute `n`, read without running code (a split layout
-/// answers a never-set name from its filter, and a set one from the
-/// position it last had).
-fn inst_attr(inst: &PyInstance, n: &AttrName) -> Option<Object> {
+/// `f` of instance attribute `n`, read without running code (a split
+/// layout answers a never-set name from its filter, and a set one from
+/// the position it last had).
+#[inline]
+fn inst_attr_with<R>(inst: &PyInstance, n: &AttrName, f: impl FnOnce(Option<&Object>) -> R) -> R {
     match inst.dict.published() {
-        Some(d) => d
+        Some(d) => f(d
             .borrow()
             .get(&crate::object::StrKeyHashed {
                 s: n.name,
                 hash: n.hash,
-            })
-            .cloned(),
+            })),
         None => {
+            // SAFETY: a read that runs no code; the view ends with `f`,
+            // which only inspects or clones the value.
+            if let Some(split) = unsafe { inst.dict.split_peek() } {
+                return f(split.get_memo(n.name, n.hash, &n.memo));
+            }
             let split = inst.dict.split_cell().borrow();
-            split.get_memo(n.name, n.hash, &n.memo).cloned()
+            f(split.get_memo(n.name, n.hash, &n.memo))
         }
     }
+}
+
+/// Instance attribute `n` (see [`inst_attr_with`]).
+fn inst_attr(inst: &PyInstance, n: &AttrName) -> Option<Object> {
+    inst_attr_with(inst, n, |v| v.cloned())
+}
+
+/// Whether instance attribute `n` is unset.
+fn inst_attr_unset(inst: &PyInstance, n: &AttrName) -> bool {
+    inst_attr_with(inst, n, |v| v.is_none())
+}
+
+/// Whether instance attribute `n` is `False`.
+fn inst_attr_false(inst: &PyInstance, n: &AttrName) -> bool {
+    inst_attr_with(inst, n, |v| matches!(v, Some(Object::Bool(false))))
 }
 
 /// A class (by address and attribute version, which no other class
@@ -398,7 +418,7 @@ pub(crate) fn call_soon(
             ls.call_soon_native
                 .get()
                 .is_some_and(|n| resolves_to(&li.cls(), "call_soon", n))
-        }) && inst_attr(li, &names().call_soon).is_none();
+        }) && inst_attr_unset(li, &names().call_soon);
         if native {
             if let Some(h) = fast_call_soon(ls, loop_, &cb, cb_args, &ctx)? {
                 return Ok(h);
@@ -425,7 +445,7 @@ pub(crate) fn get_debug(loop_: &Object) -> Result<bool, RuntimeError> {
     if let (Some(ls), Object::Instance(li)) = (&ls, loop_) {
         let native = verified(&NATIVE_GET_DEBUG, &li.class.borrow(), || {
             resolves_to(&li.cls(), "get_debug", &ls.get_debug)
-        }) && inst_attr(li, &names().get_debug).is_none();
+        }) && inst_attr_unset(li, &names().get_debug);
         if native {
             if let Some(Object::Bool(b)) = inst_attr(li, &names().debug) {
                 return Ok(b);
@@ -452,12 +472,9 @@ fn plain_loop(ls: &LoopState, loop_: &Object) -> bool {
     });
     let n = names();
     stock
-        && matches!(inst_attr(li, &n.debug), Some(Object::Bool(false)))
-        && matches!(
-            inst_attr(li, &n.closed),
-            Some(Object::Bool(false))
-        )
-        && inst_attr(li, &n.get_debug).is_none()
+        && inst_attr_false(li, &n.debug)
+        && inst_attr_false(li, &n.closed)
+        && inst_attr_unset(li, &n.get_debug)
 }
 
 /// `module.attr`, for the module bound to global `module` in `globals`.

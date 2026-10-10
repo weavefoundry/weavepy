@@ -233,6 +233,9 @@ unsafe impl Send for NameMemo {}
 pub struct PosMemo {
     keys: AtomicUsize,
     pos: AtomicUsize,
+    /// The address of the name's text in the table (a hit whose name
+    /// sits at the same address, with the same hash, needs no compare).
+    text: AtomicUsize,
 }
 
 impl PosMemo {
@@ -240,7 +243,17 @@ impl PosMemo {
         Self {
             keys: AtomicUsize::new(0),
             pos: AtomicUsize::new(0),
+            text: AtomicUsize::new(0),
         }
+    }
+}
+
+/// The address of a `str` key's text (0 for any other key).
+#[inline(always)]
+fn key_text(key: &DictKey) -> usize {
+    match &key.0 {
+        Object::Str(s) => s.as_ptr() as usize,
+        _ => 0,
     }
 }
 
@@ -666,13 +679,20 @@ impl SplitValues {
             // SAFETY: slot `i` is published (below the values' length,
             // which never exceeds the table's).
             let h = unsafe { *keys.hashes[i].get() };
-            if h == hash && keys.get(i).is_some_and(|key| key_names_str(key, name)) {
+            if h == hash
+                && keys.get(i).is_some_and(|key| {
+                    key_text(key) == memo.text.load(Ordering::Relaxed)
+                        || key_names_str(key, name)
+                })
+            {
                 return self.values().get(i);
             }
         }
         let i = keys.position_hashed(n, name, hash)?;
         memo.keys.store(at, Ordering::Relaxed);
         memo.pos.store(i, Ordering::Relaxed);
+        memo.text
+            .store(keys.get(i).map_or(0, key_text), Ordering::Relaxed);
         self.values().get(i)
     }
 

@@ -462,10 +462,16 @@ fn handle_key() -> &'static str {
 /// The registry handle stored on `inst`, if a state is attached.
 #[inline]
 fn handle_of(inst: &PyInstance) -> Option<i64> {
-    match inst.slots.try_borrow().ok()?.get_hinted(0, handle_key()) {
+    let read = |slots: &crate::types::SlotStorage| match slots.get_hinted(0, handle_key()) {
         Some(Object::Int(h)) => Some(*h),
         _ => None,
+    };
+    // SAFETY: a read of one slot that runs no code.
+    if let Some(slots) = unsafe { inst.slots.peek() } {
+        return read(slots);
     }
+    let slots = inst.slots.try_borrow().ok()?;
+    read(&slots)
 }
 
 /// The already-attached state cell of a Future/Task instance, without
