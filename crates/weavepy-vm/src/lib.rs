@@ -922,6 +922,10 @@ pub struct Interpreter {
     /// invalidate on every growth.
     #[allow(clippy::vec_box)]
     inline_pool: Vec<Box<InlineAct>>,
+    /// Finished generators' frame boxes, their frames dropped, for the
+    /// next generators' frames (see [`Self::box_gen_frame`]).
+    #[allow(clippy::vec_box)]
+    gen_box_pool: ThreadCell<Vec<Box<std::mem::MaybeUninit<Frame>>>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1224,6 +1228,7 @@ impl Default for Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1352,6 +1357,7 @@ impl Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -3974,6 +3980,36 @@ impl Interpreter {
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.clone());
             }
+        }
+    }
+
+    /// `frame` boxed for a new generator: in a finished generator's box
+    /// (see [`Self::recycle_gen_box`]) when the pool has one.
+    #[inline]
+    fn box_gen_frame(&self, frame: Frame) -> Box<Frame> {
+        let spare = self.gen_box_pool.borrow_mut().pop();
+        match spare {
+            Some(b) => Box::write(b, frame),
+            None => Box::new(frame),
+        }
+    }
+
+    /// A finished generator's frame box: the frame is dropped here (what
+    /// dropping the box would do) and the allocation kept for the next
+    /// generator's (see [`Self::box_gen_frame`]).
+    fn recycle_gen_box(&self, boxed: Box<Frame>) {
+        const POOL_CAP: usize = 32;
+        let raw = Box::into_raw(boxed);
+        // SAFETY: the frame is dropped in place once, and its allocation
+        // goes on as uninitialized storage (freed as such past the cap).
+        // The frame's drop glue runs before the pool's borrow.
+        let spare = unsafe {
+            std::ptr::drop_in_place(raw);
+            Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>())
+        };
+        let mut pool = self.gen_box_pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(spare);
         }
     }
 
@@ -20625,7 +20661,7 @@ impl Interpreter {
         *gen.state.borrow_mut() = GeneratorState::Finished;
         self.recycle_frame_allocs(&mut boxed);
         Self::release_finished_gen(&gen);
-        drop(boxed);
+        self.recycle_gen_box(boxed);
         drop(gen);
         // A collapsed chain's innermost level takes the return value: it
         // resumes in its `SEND`, the rest of the chain still collapsed.
@@ -43166,6 +43202,7 @@ impl Interpreter {
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
+                self.recycle_gen_box(boxed);
                 Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -55980,7 +56017,7 @@ impl Interpreter {
             };
             match bootstrap {
                 FrameOutcome::StartGenerator => {
-                    let obj = Self::wrap_started_generator(f, &code, frame);
+                    let obj = Self::wrap_started_generator(f, &code, self.box_gen_frame(frame));
                     if let Some(origin) = cr_origin {
                         if let Object::Coroutine(gen) = &obj {
                             gen.set_origin(origin);
@@ -56016,7 +56053,7 @@ impl Interpreter {
 
     /// Wrap `frame`, `f`'s generator-family body just past
     /// `RETURN_GENERATOR`, in its generator object (tracked).
-    fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Frame) -> Object {
+    fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Box<Frame>) -> Object {
         let kind = if code.is_coroutine {
             crate::object::CoroutineKind::Coroutine
         } else if code.is_async_generator {
@@ -56029,11 +56066,16 @@ impl Interpreter {
         // `gi_name`/`gi_qualname` at call time, sharing the objects.
         // A generator-family body's activations never start at pc 0, where
         // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
-        // its creation counts instead.
+        // the creation of one that awaits or delegates counts instead (its
+        // `SEND`s run natively; a plain generator's body still warms by
+        // its loops and fast steps, which pays off more reliably).
         #[cfg(feature = "jit")]
         if let Some(ext) = code_vm_ext(code) {
-            ext.frame_jit
-                .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
+            let start = ext.gen_start.load(std::sync::atomic::Ordering::Relaxed);
+            if code.is_coroutine || (start != u32::MAX && start & GEN_DELEGATES != 0) {
+                ext.frame_jit
+                    .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
+            }
         }
         let gen_code = Object::Code(frame.code.clone());
         let mut frame = frame;
@@ -56043,7 +56085,7 @@ impl Interpreter {
             frame.gen_owner = Some(owner.clone());
             if f.names_seeded() {
                 // The code's names, which the generator reads by default.
-                PyGenerator::new(kind, gen_code, Box::new(frame))
+                PyGenerator::new(kind, gen_code, frame)
             } else {
                 let (name, qualname) = f.name_objects();
                 PyGenerator::with_names(
@@ -56051,7 +56093,7 @@ impl Interpreter {
                     qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
                     kind,
                     gen_code,
-                    Box::new(frame),
+                    frame,
                 )
             }
         });
@@ -56118,7 +56160,7 @@ impl Interpreter {
         let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
             0 => Self::generator_start_scan(code, ext)?,
             u32::MAX => return None,
-            at => at as usize - 1,
+            at => (at & !GEN_DELEGATES) as usize - 1,
         };
         let nargs = code.arg_count as usize;
         if given > nargs
@@ -56152,8 +56194,11 @@ impl Interpreter {
             .iter()
             .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
             .filter(|&start| shaped && code.instructions[start].op == OpCode::ReturnGenerator);
+        let delegates = code.instructions.iter().any(|i| i.op == OpCode::Send);
         ext.gen_start.store(
-            start.map_or(u32::MAX, |at| at as u32 + 1),
+            start.map_or(u32::MAX, |at| {
+                (at as u32 + 1) | if delegates { GEN_DELEGATES } else { 0 }
+            }),
             std::sync::atomic::Ordering::Relaxed,
         );
         start
@@ -56193,7 +56238,7 @@ impl Interpreter {
                 frame
             }
         };
-        Self::wrap_started_generator(f, code, frame)
+        Self::wrap_started_generator(f, code, self.box_gen_frame(frame))
     }
 
     /// The frame of a generator-family call of `f` (its code `code`, which
@@ -56337,7 +56382,7 @@ impl Interpreter {
             let mut gen_frame = Self::gen_frame_lean(f, code, locals, cells, start);
             gen_frame.stack = self.pooled_stack();
             let code = Rc::clone(&gen_frame.code);
-            Self::wrap_started_generator(f, &code, gen_frame)
+            Self::wrap_started_generator(f, &code, self.box_gen_frame(gen_frame))
         } else {
             let mut positional = self.pooled_scratch();
             positional.extend(callee_receiver);
@@ -70853,7 +70898,8 @@ struct CodeConstObjects {
     /// The `RETURN_GENERATOR` a generator-family call of the code starts
     /// past (see `Interpreter::generator_start`): `0` not yet scanned,
     /// `u32::MAX` none (the prologue holds something else), else its pc
-    /// plus one.
+    /// plus one, with [`GEN_DELEGATES`] set for a body that awaits or
+    /// delegates (a `SEND`).
     gen_start: std::sync::atomic::AtomicU32,
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
@@ -70899,6 +70945,9 @@ struct CodeConstObjects {
     /// path could run off the end.
     dispatch_len: usize,
 }
+
+/// [`CodeConstObjects::gen_start`]'s mark of a body with a `SEND`.
+const GEN_DELEGATES: u32 = 1 << 31;
 
 /// The bound the core loop checks a code object's entry pc against, so it
 /// dispatches each instruction without a bounds check: the instruction

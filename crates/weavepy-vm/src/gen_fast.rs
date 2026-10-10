@@ -1079,7 +1079,7 @@ impl Interpreter {
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(g);
-                drop(boxed);
+                self.recycle_gen_box(boxed);
                 return GenNext::Exhausted(v);
             }
             GenStep::Bail if frame.pc == start => {
