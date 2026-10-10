@@ -381,14 +381,17 @@ fn instance_closure(
     site: &ClosureSite,
 ) -> Option<Object> {
     use std::sync::atomic::Ordering::Relaxed;
-    let d = inst.dict_cell().borrow();
-    if let Some((DictKey(Object::Str(k)), v)) = d.get_index(site.at.load(Relaxed)) {
-        let k: &str = k;
-        // (The dict's keys are the same static names.)
-        if std::ptr::eq(k.as_ptr(), name.as_ptr()) && k.len() == name.len() || k == name {
-            return Some(v.clone());
+    let at = site.at.load(Relaxed);
+    // SAFETY: a read under the GIL that ends before anything else runs.
+    if let Some(d) = inst.dict.published().and_then(|d| unsafe { d.peek() }) {
+        if let Some((DictKey(Object::Str(k)), v)) = d.get_index(at) {
+            let k: &str = k;
+            if k == name {
+                return Some(v.clone());
+            }
         }
     }
+    let d = inst.dict_cell().borrow();
     let mut h = site.hash.load(Relaxed);
     if h == 0 {
         h = crate::object::py_str_hash(name);
