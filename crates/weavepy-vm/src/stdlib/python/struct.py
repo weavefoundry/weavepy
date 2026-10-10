@@ -339,6 +339,13 @@ class Struct:
         return object.__sizeof__(self)
 
 
+# CPython's `Struct` is a C type: serve the exact class's `pack` and
+# `unpack` natively (the methods above stay the fallback for every other
+# shape, errors included).
+if hasattr(_impl, "_install_struct"):
+    _impl._install_struct(Struct)
+
+
 def _new_struct(fmt):
     return Struct(fmt)
 
