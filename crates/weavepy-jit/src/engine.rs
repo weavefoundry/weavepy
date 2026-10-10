@@ -583,58 +583,6 @@ impl JitEngine {
         })
     }
 
-    /// Compile and discard a small counted loop, through the whole
-    /// pipeline a real compile takes (mid-end, register allocation,
-    /// emission, finalizing executable memory). A process's first compile
-    /// otherwise pays the code generator's cold start (its code paged in,
-    /// its tables built, the module's first memory mapped), about a
-    /// millisecond, on whatever hot loop first gets compiled.
-    pub fn warm_up(&mut self) {
-        use cranelift_codegen::ir::condcodes::IntCC;
-        use cranelift_codegen::ir::InstBuilder;
-        let int = types::I64;
-        self.ctx.func.signature.params.push(AbiParam::new(int));
-        self.ctx.func.signature.returns.push(AbiParam::new(int));
-        {
-            let mut b =
-                cranelift_frontend::FunctionBuilder::new(&mut self.ctx.func, &mut self.fbctx);
-            let entry = b.create_block();
-            let head = b.create_block();
-            let body = b.create_block();
-            let exit = b.create_block();
-            b.append_block_params_for_function_params(entry);
-            b.append_block_param(head, int);
-            b.append_block_param(head, int);
-            b.switch_to_block(entry);
-            let n = b.block_params(entry)[0];
-            let zero = b.ins().iconst(int, 0);
-            b.ins().jump(head, &[zero.into(), zero.into()]);
-            b.switch_to_block(head);
-            let (i, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
-            let more = b.ins().icmp(IntCC::SignedLessThan, i, n);
-            b.ins().brif(more, body, &[], exit, &[]);
-            b.switch_to_block(body);
-            let acc2 = b.ins().iadd(acc, i);
-            let i2 = b.ins().iadd_imm(i, 1);
-            b.ins().jump(head, &[i2.into(), acc2.into()]);
-            b.switch_to_block(exit);
-            b.ins().return_(&[acc]);
-            b.seal_all_blocks();
-            b.finalize();
-        }
-        let name = format!("wpjit_warm_{}", self.next_id);
-        self.next_id += 1;
-        let defined = self
-            .module
-            .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
-            .ok()
-            .and_then(|id| self.module.define_function(id, &mut self.ctx).ok());
-        self.module.clear_context(&mut self.ctx);
-        if defined.is_some() {
-            let _ = self.module.finalize_definitions();
-        }
-    }
-
     /// Analyze and compile a code object. `resolve` reports what each
     /// `LOAD_GLOBAL` name currently resolves to (see
     /// [`ResolvedGlobal`]); the caller must re-validate every resolution
