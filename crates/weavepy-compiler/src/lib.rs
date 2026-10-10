@@ -40,6 +40,7 @@ pub mod cpython_code;
 mod flowgraph;
 mod intern;
 mod mangle;
+mod name;
 pub mod native_code;
 mod validate;
 
@@ -50,6 +51,7 @@ pub use bytecode::{
     COMPARE_OP_TO_BOOL_FLAG, COOLDOWN, SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
 };
 pub use cpython_code::{CpythonCode, Position};
+pub use name::Name;
 
 /// CPython compile.c `STACK_USE_GUIDELINE`: literal displays and call
 /// sites with more operands than this compile through accumulator
@@ -144,6 +146,11 @@ impl CompileError {
 pub use weavepy_parser::ast::expr_name;
 
 // ---------- code object ----------
+
+/// Whether `names` holds `name`.
+fn has_name(names: &[Name], name: &str) -> bool {
+    names.iter().any(|n| n.as_str() == name)
+}
 
 /// RFC 0061 (WS2a): an opaque, VM-owned per-code-object extension slot.
 ///
@@ -597,13 +604,14 @@ pub struct CodeObject {
     pub jit_hint: JitHint,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
-    pub names: Vec<String>,
+    /// These and the other name tables hold pooled [`Name`]s.
+    pub names: Vec<Name>,
     /// Local variable names (positional + keyword + `*args`/`**kwargs` + locals).
-    pub varnames: Vec<String>,
+    pub varnames: Vec<Name>,
     /// Free variables — read from an enclosing scope.
-    pub freevars: Vec<String>,
+    pub freevars: Vec<Name>,
     /// Cell variables — locally defined but referenced by an inner scope.
-    pub cellvars: Vec<String>,
+    pub cellvars: Vec<Name>,
     /// Out-of-line exception handlers. Looked up by current PC when a
     /// `RuntimeError::PyException` propagates through this code object.
     pub exception_table: Vec<ExcHandler>,
@@ -1226,7 +1234,7 @@ impl CodeObject {
                     }
                 }
                 OpCode::LoadDeref | OpCode::StoreDeref | OpCode::LoadClosure => {
-                    let combined: Vec<&String> =
+                    let combined: Vec<&Name> =
                         self.cellvars.iter().chain(self.freevars.iter()).collect();
                     if let Some(n) = combined.get(ins.arg as usize) {
                         out.push('(');
@@ -2865,10 +2873,10 @@ impl Compiler {
         // cell index. Keeping the internal order equal to slot order
         // makes the RFC 0068 wire codec's deref mapping invertible.
         if self.co.cellvars.len() > 1 {
-            let mut sorted: Vec<String> = self.co.cellvars.clone();
+            let mut sorted: Vec<Name> = self.co.cellvars.clone();
             sorted.sort_unstable_by_key(|c| match self.co.varnames.iter().position(|v| v == c) {
                 Some(p) => (0usize, p, String::new()),
-                None => (1usize, 0, c.clone()),
+                None => (1usize, 0, c.to_string()),
             });
             if sorted != self.co.cellvars {
                 let remap: Vec<u32> = self
@@ -2928,7 +2936,7 @@ impl Compiler {
                 self.free_order = sorted;
             }
         }
-        self.co.freevars = self.free_order.clone();
+        self.co.freevars = self.free_order.iter().map(Name::from).collect();
 
         // `codegen_wrap_in_stopiteration_handler` (PEP 479): the
         // generator-family body ends in an explicit `return None`, and
@@ -3559,7 +3567,7 @@ impl Compiler {
         if has_annotations {
             self.co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             if let Some(loc) = module_loc {
                 self.apply_annotate_loc(loc);
             }
@@ -3731,10 +3739,10 @@ impl Compiler {
                 _ => {}
             }
         }
-        let mut all: Vec<String> = self.co.cellvars.clone();
+        let mut all: Vec<Name> = self.co.cellvars.clone();
         for name in comp_cells {
-            if !all.contains(&name) {
-                all.push(name);
+            if !all.iter().any(|c| *c == name) {
+                all.push(Name::from(name));
             }
         }
         all.sort_unstable();
@@ -3846,8 +3854,8 @@ impl Compiler {
         for name in needed_in_inner {
             if matches!(self.bindings.get(&name), Some(Binding::Local)) {
                 self.bindings.insert(name.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(&name) {
-                    self.co.cellvars.push(name);
+                if !has_name(&self.co.cellvars, &name) {
+                    self.co.cellvars.push(Name::from(name));
                 }
             }
         }
@@ -5769,7 +5777,7 @@ impl Compiler {
         }
         inner.co.qualname = self.compute_child_qualname(hidden_name);
         inner.co.arg_count = arg_count;
-        inner.co.varnames = hidden_params.to_vec();
+        inner.co.varnames = hidden_params.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         if class_scope {
             // `.type_params` is read by the class body (always a cell,
@@ -5778,7 +5786,10 @@ impl Compiler {
             inner
                 .bindings
                 .insert(".type_params".to_owned(), Binding::Cell);
-            inner.co.cellvars.push(".type_params".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from(".type_params".to_owned()));
             inner
                 .bindings
                 .insert(".generic_base".to_owned(), Binding::Local);
@@ -5787,8 +5798,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6254,7 +6265,7 @@ impl Compiler {
         inner.co.kwonly_count = kwonly_count;
         inner.co.has_varargs = args.vararg.is_some();
         inner.co.has_varkeywords = args.kwarg.is_some();
-        inner.co.varnames = param_names.clone();
+        inner.co.varnames = param_names.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // Methods compiled inside a class body get an implicit
         // `__class__` free variable so `super()` (and explicit
@@ -6347,8 +6358,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6512,14 +6523,14 @@ impl Compiler {
             Some((String::new(), String::new(), self.annotation_child_prefix()));
         inner.co.arg_count = 1;
         inner.co.posonly_count = 1;
-        inner.co.varnames = vec![FORMAT_PARAM.to_owned()];
+        inner.co.varnames = vec![Name::from(FORMAT_PARAM)];
         inner.current_line = loc.line;
         inner.analyze_scope_function(&[FORMAT_PARAM.to_owned()], analysis_body, &[&self.bindings]);
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6551,7 +6562,7 @@ impl Compiler {
         let mut code = inner.finish();
         // `co->co_localsplusnames = ("format", *co->co_localsplusnames[1:])`
         if is_annotate {
-            code.varnames[0] = "format".to_owned();
+            code.varnames[0] = Name::from("format");
             code.annotate_scope = true;
         }
         Ok(code)
@@ -7037,7 +7048,7 @@ impl Compiler {
                 || class_body_defs_claim_class_cell(body)
         };
         if needs_class_closure {
-            inner.co.cellvars.push("__class__".to_owned());
+            inner.co.cellvars.push(Name::from("__class__".to_owned()));
             inner.bindings.insert("__class__".to_owned(), Binding::Cell);
         }
         // PEP 695 (RFC 0051): annotation scopes created in this class
@@ -7053,7 +7064,10 @@ impl Compiler {
             .any(|s| stmt_needs_classdict(s, future_annotations))
             || needed.contains("__classdict__");
         if needs_classdict {
-            inner.co.cellvars.push("__classdict__".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from("__classdict__".to_owned()));
             inner
                 .bindings
                 .insert("__classdict__".to_owned(), Binding::Cell);
@@ -7069,7 +7083,7 @@ impl Compiler {
             inner
                 .co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             inner
                 .bindings
                 .insert("__conditional_annotations__".to_owned(), Binding::Cell);
@@ -7218,7 +7232,7 @@ impl Compiler {
                 inner.collect_comp_cells_stmt(s, &mut comp_cells);
             }
             if !comp_cells.is_empty() {
-                let implicit: Vec<String> = inner
+                let implicit: Vec<Name> = inner
                     .co
                     .cellvars
                     .iter()
@@ -7432,10 +7446,10 @@ impl Compiler {
         let inner_freevars = inner_code.freevars.clone();
 
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -9554,7 +9568,7 @@ impl Compiler {
         if let Some(i) = self.co.varnames.iter().position(|n| n == name) {
             return i as u32;
         }
-        self.co.varnames.push(name.to_owned());
+        self.co.varnames.push(Name::from(name.to_owned()));
         (self.co.varnames.len() - 1) as u32
     }
 
@@ -11507,11 +11521,11 @@ impl Compiler {
                     let pos = self.free_order.iter().position(|n| n == name).unwrap_or(0);
                     (self.co.cellvars.len() + pos) as u32
                 } else {
-                    if !self.co.cellvars.contains(name) {
+                    if !has_name(&self.co.cellvars, name) {
                         // Normally pre-registered by the scope's
                         // analysis (`register_comp_cells`); a late
                         // arrival still gets its slot.
-                        self.co.cellvars.push(name.clone());
+                        self.co.cellvars.push(Name::from(name.clone()));
                     }
                     self.co.cellvars.iter().position(|n| n == name).unwrap_or(0) as u32
                 };
@@ -11686,7 +11700,7 @@ impl Compiler {
         // `compiler_set_qualname` doesn't special-case comprehensions.
         inner.co.qualname = self.compute_child_qualname(name);
         inner.co.arg_count = 1;
-        inner.co.varnames.push(".0".to_owned());
+        inner.co.varnames.push(Name::from(".0".to_owned()));
         inner.bindings.insert(".0".to_owned(), Binding::Local);
         if is_async_comp && !matches!(kind, CompKind::Generator) {
             inner.co.is_coroutine = true;
@@ -11786,8 +11800,8 @@ impl Compiler {
                     _ => {
                         if matches!(enclosing, None | Some(Binding::Local)) {
                             self.bindings.insert(name.clone(), Binding::Cell);
-                            if !self.co.cellvars.contains(&name) {
-                                self.co.cellvars.push(name.clone());
+                            if !has_name(&self.co.cellvars, &name) {
+                                self.co.cellvars.push(Name::from(name.clone()));
                             }
                         }
                         Binding::Free
@@ -11871,8 +11885,8 @@ impl Compiler {
             for name in needed_in_inner {
                 if matches!(inner.bindings.get(&name), Some(Binding::Local)) {
                     inner.bindings.insert(name.clone(), Binding::Cell);
-                    if !inner.co.cellvars.contains(&name) {
-                        inner.co.cellvars.push(name);
+                    if !has_name(&inner.co.cellvars, &name) {
+                        inner.co.cellvars.push(Name::from(name));
                     }
                 }
             }
@@ -11949,10 +11963,10 @@ impl Compiler {
 
         // Promote our locals to cells where needed.
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }

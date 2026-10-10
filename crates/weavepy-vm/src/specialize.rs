@@ -599,7 +599,7 @@ pub fn kw_uncovered_have_defaults(
         covered & (1 << slot) != 0
             || f.kw_defaults
                 .iter()
-                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(String::as_str))
+                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(|n| n.as_str()))
     })
 }
 

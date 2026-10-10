@@ -731,7 +731,7 @@ pub const CO_FAST_FREE: u8 = 0x80;
 /// `CO_FAST_LOCAL|CO_FAST_CELL` rather than getting its own entry;
 /// the argument slots carry their `CO_FAST_ARG_*` kind and hidden
 /// comprehension locals `CO_FAST_HIDDEN`.
-fn build_localsplus(code: &CodeObject) -> (Vec<String>, Vec<u8>) {
+fn build_localsplus(code: &CodeObject) -> (Vec<crate::Name>, Vec<u8>) {
     let mut names = Vec::with_capacity(code.varnames.len() + code.cellvars.len());
     let mut kinds = Vec::with_capacity(names.capacity());
     // `argvarkinds`: pos-only, pos-or-kw, kw-only, *args, **kwargs.
@@ -1053,7 +1053,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         co_linetable: encode_linetable(code, &ext, &mapped, &zero_width, firstlineno),
         co_exceptiontable: encode_exception_table(code, &starts),
         co_code,
-        localsplusnames,
+        localsplusnames: localsplusnames.into_iter().map(String::from).collect(),
         localspluskinds,
         stacksize: code.stacksize.unwrap_or_else(|| compute_stacksize(code)),
         firstlineno,
@@ -2061,7 +2061,7 @@ impl SlotMap {
     /// Build from a code object's variable lists (mirrors
     /// [`DerefSlots::from_code`], inverted).
     #[must_use]
-    pub fn from_code_vars(varnames: &[String], cellvars: &[String], freevars: &[String]) -> Self {
+    pub fn from_code_vars<S: PartialEq>(varnames: &[S], cellvars: &[S], freevars: &[S]) -> Self {
         let nlocals = varnames.len() as u32;
         let mut nslots = varnames.len() + freevars.len();
         for c in cellvars {
@@ -2813,7 +2813,7 @@ mod tests {
             ..CodeObject::default()
         };
         // Give a couple of locals so LOAD_FAST vs LOAD_CLOSURE disambiguates.
-        c.varnames = vec!["a".to_owned(), "b".to_owned()];
+        c.varnames = vec!["a".into(), "b".into()];
         c
     }
 
@@ -3110,9 +3110,9 @@ mod tests {
             linetable: vec![1, 2, 2, 3, 3, 4, 4].into(),
             ..CodeObject::default()
         };
-        code.varnames = vec!["a".to_owned(), "b".to_owned()];
-        code.cellvars = vec!["c".to_owned()];
-        code.freevars = vec!["f".to_owned()];
+        code.varnames = vec!["a".into(), "b".into()];
+        code.cellvars = vec!["c".into()];
+        code.freevars = vec!["f".into()];
         code.exception_table.push(ExcHandler {
             start: 1,
             end: 4,
@@ -3147,9 +3147,9 @@ mod tests {
             linetable: dc.linetable.into(),
             ..CodeObject::default()
         };
-        code2.varnames = dc.varnames;
-        code2.cellvars = dc.cellvars;
-        code2.freevars = dc.freevars;
+        code2.varnames = dc.varnames.iter().map(crate::Name::from).collect();
+        code2.cellvars = dc.cellvars.iter().map(crate::Name::from).collect();
+        code2.freevars = dc.freevars.iter().map(crate::Name::from).collect();
         code2.exception_table = dc.exception_table;
         let cp2 = encode(&code2);
         assert_eq!(cp2.co_code, cp.co_code);
@@ -3315,7 +3315,7 @@ def f():
 /// mapping pattern under-reported by one).
 #[test]
 fn stack_effects_agree_with_wire_shape() {
-    let slots = SlotMap::from_code_vars(&[], &[], &[]);
+    let slots = SlotMap::from_code_vars::<crate::Name>(&[], &[], &[]);
     // Opcodes whose WeavePy arg is not the wire arg, or whose
     // fallthrough effect legitimately differs from the wire shape
     // (jumps take their real effect on the edge; FOR_ITER/END_FOR

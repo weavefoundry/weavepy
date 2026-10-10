@@ -722,7 +722,7 @@ impl PyFrame {
         let mirror = self.locals_mirror.borrow().clone()?;
         let snapshot = mirror.borrow();
         let varnames = &self.code.varnames;
-        let cell_names: Vec<&String> = self
+        let cell_names: Vec<&weavepy_compiler::Name> = self
             .code
             .cellvars
             .iter()
@@ -798,7 +798,7 @@ impl PyFrame {
             if name.starts_with('.') || out.iter().any(|n| n == name) {
                 continue;
             }
-            out.push(name.clone());
+            out.push(name.to_string());
         }
         out
     }

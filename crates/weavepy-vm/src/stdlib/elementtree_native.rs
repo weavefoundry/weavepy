@@ -1630,7 +1630,7 @@ const EP_ITERFIND: usize = 3;
 /// The closure `f` holds for free variable `name`, when it is a `str`.
 fn closure_str(
     f: &crate::object::PyFunction,
-    freevars: &[String],
+    freevars: &[weavepy_compiler::Name],
     name: &str,
 ) -> Option<SharedStr> {
     let i = freevars.iter().position(|v| v == name)?;

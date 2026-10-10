@@ -4573,10 +4573,10 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
             "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
             "co_nlocals" => requested_nlocals = Some(want_u32(v, "co_nlocals")?),
-            "co_varnames" => nc.varnames = want_str_seq(v, "co_varnames")?,
-            "co_names" => nc.names = want_str_seq(v, "co_names")?,
-            "co_freevars" => nc.freevars = want_str_seq(v, "co_freevars")?,
-            "co_cellvars" => nc.cellvars = want_str_seq(v, "co_cellvars")?,
+            "co_varnames" => nc.varnames = names_of(want_str_seq(v, "co_varnames")?),
+            "co_names" => nc.names = names_of(want_str_seq(v, "co_names")?),
+            "co_freevars" => nc.freevars = names_of(want_str_seq(v, "co_freevars")?),
+            "co_cellvars" => nc.cellvars = names_of(want_str_seq(v, "co_cellvars")?),
             "co_stacksize" => {
                 nc.wire.get_or_insert_with(Default::default).stacksize =
                     Some(want_u32(v, "co_stacksize")?);
@@ -4727,7 +4727,7 @@ pub fn foreign_code_object(
         name,
         qualname,
         filename: filename.into(),
-        varnames,
+        varnames: names_of(varnames),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -4747,6 +4747,11 @@ pub fn foreign_code_object(
     w.co_code = Some(Vec::new());
     w.exec_error = Some("cannot execute foreign bytecode".to_owned());
     Object::Code(Rc::new(nc))
+}
+
+/// A code object's name table from a constructor or `replace()` argument.
+fn names_of(names: Vec<String>) -> Vec<weavepy_compiler::Name> {
+    names.iter().map(weavepy_compiler::Name::from).collect()
 }
 
 /// Pin raw CPython `co_code` bytes on `nc` (RFC 0060 — `CodeType(...)` /
@@ -4922,10 +4927,10 @@ pub(crate) fn code_type_call(
         qualname,
         filename: filename.into(),
         constants,
-        names,
-        varnames,
-        freevars,
-        cellvars,
+        names: names_of(names),
+        varnames: names_of(varnames),
+        freevars: names_of(freevars),
+        cellvars: names_of(cellvars),
         arg_count,
         posonly_count,
         kwonly_count,

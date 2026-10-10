@@ -8,21 +8,23 @@
 //! mismatch or malformed input as a cache miss.
 //!
 //! Filenames aren't stored: every code object in a cached module shares
-//! the module's filename, which the reader supplies.
+//! the module's filename, which the reader supplies. A module's name
+//! tables refer to its distinct identifiers by number after their first
+//! appearance, so the reader decodes and pools each identifier once.
 
 use std::sync::Arc;
 
 use crate::bytecode::{CacheTable, Instruction, OpCode};
-use crate::{CodeObject, ColSpan, Constant, ExcHandler};
+use crate::{CodeObject, ColSpan, Constant, ExcHandler, Name};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
 /// a constant that has no fixed value.
 pub fn encode(code: &CodeObject) -> Option<Vec<u8>> {
-    let mut w = Writer(Vec::with_capacity(4096));
+    let mut w = Writer(Vec::with_capacity(4096), std::collections::HashMap::new());
     w.byte(VERSION);
     w.code(code)?;
     Some(w.0)
@@ -103,6 +105,7 @@ pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
         filename: Arc::from(filename),
         tables: Vec::new(),
         buffer: Arc::new(std::sync::OnceLock::new()),
+        names: Vec::new(),
     };
     let code = r.code(&mut module, 0)?;
     if r.pos != bytes.len() {
@@ -122,6 +125,9 @@ struct Module {
     tables: Vec<u8>,
     /// Where `tables` goes once the decoding is done.
     buffer: Arc<std::sync::OnceLock<Box<[u8]>>>,
+    /// The module's identifiers so far, in order of first appearance
+    /// (see [`Writer::names`]).
+    names: Vec<Name>,
 }
 
 impl Module {
@@ -134,7 +140,9 @@ impl Module {
     }
 }
 
-struct Writer(Vec<u8>);
+/// The output, and the number of each identifier written so far (see
+/// [`Writer::names`]).
+struct Writer(Vec<u8>, std::collections::HashMap<String, u32>);
 
 impl Writer {
     fn byte(&mut self, b: u8) {
@@ -162,6 +170,23 @@ impl Writer {
         self.uint(v.len() as u64);
         for s in v {
             self.bytes(s.as_bytes());
+        }
+    }
+
+    /// A name table: its length, then per name its number plus one when
+    /// the module wrote it before, else a zero and its text (which gives
+    /// it the next number).
+    fn names(&mut self, v: &[Name]) {
+        self.uint(v.len() as u64);
+        for s in v {
+            if let Some(&i) = self.1.get(s.as_str()) {
+                self.uint(u64::from(i) + 1);
+            } else {
+                let i = self.1.len() as u32;
+                self.1.insert(s.as_str().to_owned(), i);
+                self.uint(0);
+                self.bytes(s.as_bytes());
+            }
         }
     }
 
@@ -234,10 +259,10 @@ impl Writer {
         for k in &c.constants {
             self.constant(k)?;
         }
-        self.strs(&c.names);
-        self.strs(&c.varnames);
-        self.strs(&c.freevars);
-        self.strs(&c.cellvars);
+        self.names(&c.names);
+        self.names(&c.varnames);
+        self.names(&c.freevars);
+        self.names(&c.cellvars);
         self.uint(c.exception_table.len() as u64);
         for h in &c.exception_table {
             self.uint(u64::from(h.start));
@@ -250,7 +275,7 @@ impl Writer {
         self.line_runs(&c.linetable);
         // The column spans as one length-prefixed block, which a reader
         // keeps encoded until something reads a column (see `ColTable`).
-        let mut cols = Writer(Vec::new());
+        let mut cols = Writer(Vec::new(), std::collections::HashMap::new());
         cols.col_runs(&c.coltable)?;
         self.bytes(&cols.0);
         self.uint(u64::from(c.arg_count));
@@ -428,6 +453,24 @@ impl Reader<'_> {
         Some(v)
     }
 
+    /// A name table [`Writer::names`] wrote.
+    fn names(&mut self, module: &mut Module) -> Option<Vec<Name>> {
+        let n = self.len()?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = match self.uint()? {
+                0 => {
+                    let name = Name::new(std::str::from_utf8(self.raw()?).ok()?);
+                    module.names.push(name.clone());
+                    name
+                }
+                i => module.names.get(usize::try_from(i - 1).ok()?)?.clone(),
+            };
+            v.push(name);
+        }
+        Some(v)
+    }
+
     fn u32s(&mut self) -> Option<Vec<u32>> {
         let n = self.len()?;
         let mut v = Vec::with_capacity(n);
@@ -504,10 +547,10 @@ impl Reader<'_> {
         for _ in 0..n {
             constants.push(self.constant(module, depth)?);
         }
-        let names = self.strs()?;
-        let varnames = self.strs()?;
-        let freevars = self.strs()?;
-        let cellvars = self.strs()?;
+        let names = self.names(module)?;
+        let varnames = self.names(module)?;
+        let freevars = self.names(module)?;
+        let cellvars = self.names(module)?;
         let n = self.len()?;
         let mut exception_table = Vec::with_capacity(n);
         for _ in 0..n {
@@ -627,7 +670,7 @@ mod tests {
                 Instruction::new(OpCode::ReturnValue, 0),
             ],
             constants: vec![Constant::Int(-5)],
-            varnames: vec!["x".to_owned()],
+            varnames: vec!["x".into()],
             linetable: vec![1, 2, 2].into(),
             coltable: vec![ColSpan::default(); 3].into(),
             arg_count: 1,
@@ -660,7 +703,7 @@ mod tests {
                 ))),
                 Constant::Code(Arc::new(inner)),
             ],
-            names: vec!["print".to_owned()],
+            names: vec!["print".into()],
             exception_table: vec![ExcHandler {
                 start: 0,
                 end: 1,

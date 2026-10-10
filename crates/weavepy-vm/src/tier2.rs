@@ -2288,7 +2288,7 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
                 if recv.op != OpCode::LoadFast || recv.arg != 0 || store.op != OpCode::StoreAttr {
                     return None;
                 }
-                let name = icode.names.get(store.arg as usize)?.clone();
+                let name = icode.names.get(store.arg as usize)?.to_string();
                 match fields.iter_mut().find(|(n, _)| *n == name) {
                     Some(slot) => slot.1 = src,
                     None => fields.push((name, src)),
@@ -3150,12 +3150,13 @@ fn attr_chain_step(obj: &Object, name: &str) -> Option<Object> {
 /// residue for locals bound from a live list's elements: the probe
 /// predicts from a representative, and the burned fingerprints
 /// re-validate per access).
-fn walk_attr_path(frame: &super::Frame, slot: u32, path: &[String]) -> Option<Object> {
+fn walk_attr_path<S: AsRef<str>>(frame: &super::Frame, slot: u32, path: &[S]) -> Option<Object> {
     let mut cur = {
         let locals = frame.locals.borrow();
         locals.get(slot as usize)?.clone()
     };
     for name in path {
+        let name = name.as_ref();
         if name == weavepy_jit::ELEM_SENTINEL {
             cur = exemplar_element(&cur)?;
             continue;
@@ -4014,7 +4015,7 @@ fn inline_fields_of(recv: &Object, code: &CodeObject, ver: u64) -> Vec<InlineFie
             _ => continue,
         };
         out.push(InlineField {
-            name: name.clone(),
+            name: name.to_string(),
             lane,
             at,
         });
@@ -5851,7 +5852,7 @@ unsafe fn call_py_with_gaps(
         if kwargs.is_empty() && args.len() == j {
             args.push(v);
         } else if let Some(name) = code.varnames.get(j) {
-            kwargs.push((name.clone(), v));
+            kwargs.push((name.to_string(), v));
         }
     }
     let res = call_with_activation_shell(interp, ctx, jf, |i| {

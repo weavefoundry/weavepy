@@ -7976,7 +7976,7 @@ impl Interpreter {
                                 .code
                                 .names
                                 .get(arg as usize)
-                                .map_or("?", String::as_str),
+                                .map_or("?", |n| n.as_str()),
                             recv,
                         );
                     }
@@ -11292,7 +11292,7 @@ impl Interpreter {
             || call.op != OpCode::Call
             || call.arg != 1
             || frame.builtins_obj().is_some()
-            || frame.code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+            || frame.code.names.get(name_idx as usize).map(|n| n.as_str()) != Some("len")
         {
             return None;
         }
@@ -22715,7 +22715,7 @@ impl Interpreter {
             return None;
         };
         if Rc::as_ptr(f) as usize != self.leaf_fns().len_ptr
-            || code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+            || code.names.get(name_idx as usize).map(|n| n.as_str()) != Some("len")
         {
             return None;
         }
@@ -32434,7 +32434,7 @@ impl Interpreter {
     fn name_at(&self, code: &CodeObject, arg: u32) -> Result<String, RuntimeError> {
         code.names
             .get(arg as usize)
-            .cloned()
+            .map(|n| n.to_string())
             .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))
     }
 
@@ -43559,7 +43559,7 @@ impl Interpreter {
         };
         {
             let dict = d.borrow();
-            let cell_names: Vec<&String> = frame
+            let cell_names: Vec<&weavepy_compiler::Name> = frame
                 .code
                 .cellvars
                 .iter()
@@ -46275,7 +46275,7 @@ impl Interpreter {
                     .code
                     .names
                     .get(name_idx as usize)
-                    .map(String::as_str)
+                    .map(|n| n.as_str())
                     .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))?;
                 if frame
                     .globals
@@ -46624,7 +46624,7 @@ impl Interpreter {
                         // genuine `__slots__` member descriptor for this
                         // name) and the version guard covers class-dict /
                         // MRO changes since.
-                        let name = frame.code.names.get(name_idx as usize).map(String::as_str);
+                        let name = frame.code.names.get(name_idx as usize).map(|n| n.as_str());
                         if let Some(name) = name {
                             let hit = {
                                 let slots = inst.slots.borrow();
