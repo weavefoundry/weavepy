@@ -3991,6 +3991,11 @@ pub(crate) struct DirectSite {
     /// Nonzero while the site has a body or a leaf to take: the native
     /// code tries the direct helper first then.
     hot: usize,
+    /// The activation slot the site's last clean direct return parked
+    /// here (see `Interpreter::inline_park_warm`), still holding its
+    /// callee's code: the next call of that code binds it without taking
+    /// a slot from the pool or a reference to the code.
+    act: Option<Box<crate::InlineAct>>,
 }
 
 /// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
@@ -4010,6 +4015,13 @@ impl Drop for DirectSite {
                 // SAFETY: each holds the count a fill took.
                 unsafe { drop(Rc::from_raw(code as *const CodeObject)) };
             }
+        }
+        if let Some(act) = self.act.take() {
+            // SAFETY: a warm slot holds its code's count (see
+            // `Interpreter::inline_park_warm`); parked, its own drop then
+            // treats the field as stale.
+            unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
+            drop(act);
         }
     }
 }
@@ -4523,10 +4535,24 @@ unsafe fn direct_call<const CALL: bool>(
         {
             return None;
         }
-        let act = interp.inline_pool.pop()?;
+        // The site's warm slot, still holding this code (another code's
+        // goes back to being a plain parked slot), or one from the pool.
+        let (act, held) = match site.act.take() {
+            Some(act) if std::ptr::eq(Rc::as_ptr(&act.frame.code), code) => (act, true),
+            Some(act) => {
+                // SAFETY: a warm slot holds its code's count.
+                drop(std::ptr::read(&raw const act.frame.code));
+                (act, false)
+            }
+            None => (interp.inline_pool.pop()?, false),
+        };
         let sw = &mut *st.sw;
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            interp.inline_pool.push(act);
+            if held {
+                site.act = Some(act);
+            } else {
+                interp.inline_pool.push(act);
+            }
             return None;
         };
         // Committed: the caller synced as the core loop's arm syncs it, and
@@ -4536,12 +4562,13 @@ unsafe fn direct_call<const CALL: bool>(
         caller.pc = pc as u32;
         *sw.last = st.last;
         let saved_last = sw.last;
-        let callee = interp
-            .core_bind_plain::<true>(sw, pc, start, has_self, missing, cells, fp, act, guard);
+        let callee = interp.core_bind_plain::<true>(
+            sw, pc, start, has_self, missing, cells, fp, act, guard, held,
+        );
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
         Some(direct_run::<false>(
-            st, pc, start, callee, depth, native, saved_last, nested, binop, 0,
+            st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
         ))
     }
 }
@@ -4600,7 +4627,17 @@ unsafe fn run_pushed_directly(
         }
         top.direct = true;
         Some(direct_run::<true>(
-            st, pc, start, callee, depth, native, saved_last, nested, None, from,
+            st,
+            pc,
+            start,
+            callee,
+            depth,
+            native,
+            saved_last,
+            nested,
+            None,
+            from,
+            std::ptr::null_mut(),
         ))
     }
 }
@@ -4609,7 +4646,9 @@ unsafe fn run_pushed_directly(
 /// `depth`, marked `direct`) through its native code from `from`, and
 /// finish its return here: [`direct_call`]'s `Some` results. `PUSHED`
 /// for an activation the core loop's call paths bound (see
-/// [`run_pushed_directly`]), whose cells its clean return checks.
+/// [`run_pushed_directly`]), whose cells its clean return checks; `site`
+/// the direct call's cache otherwise, where its clean return parks the
+/// slot.
 ///
 /// # Safety
 ///
@@ -4627,6 +4666,7 @@ unsafe fn direct_run<const PUSHED: bool>(
     nested: u32,
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
     from: usize,
+    site: *mut DirectSite,
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
@@ -4718,6 +4758,10 @@ unsafe fn direct_run<const PUSHED: bool>(
                 if done.owns_cells {
                     done.clean = true;
                     interp.inline_park_clean(done);
+                } else if !PUSHED && (*site).act.is_none() {
+                    // The slot stays with its call site, still bound to
+                    // the callee's code, for its next call.
+                    (*site).act = Some(interp.inline_park_warm(done));
                 } else {
                     interp.inline_park_direct(done);
                 }

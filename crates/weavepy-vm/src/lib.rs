@@ -8289,6 +8289,27 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::inline_park_direct`] for a slot that stays with its direct
+    /// call's site (`frame_jit::DirectSite`) instead of the pool: parked,
+    /// but still holding its code's count, so the site's next call of the
+    /// same code binds it without one.
+    #[inline(always)]
+    pub(crate) fn inline_park_warm(&mut self, mut act: Box<InlineAct>) -> Box<InlineAct> {
+        debug_assert!(
+            act.frame.stack.is_empty()
+                && !act.owns_cells
+                && act.binop.is_none()
+                && !act.discard
+                && act.guard.is_none()
+                && act.init_inst.is_none()
+                && act.act.shell.is_none()
+        );
+        act.parked = true;
+        act.direct = false;
+        act.caller_pending = None;
+        act
+    }
+
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
     /// inline activation: the generator's boxed frame runs in place (the
     /// `generator_send_lean` shape, without a nested native activation).
@@ -15674,7 +15695,7 @@ impl Interpreter {
         // SAFETY: as above; the checks above hold.
         unsafe {
             self.core_bind_plain::<false>(
-                sw, pc, callee_slot, has_self, missing, false, fp, act, guard,
+                sw, pc, callee_slot, has_self, missing, false, fp, act, guard, false,
             )
         };
         true
@@ -15687,7 +15708,9 @@ impl Interpreter {
         f.defaults.len() >= missing && !f.defaults_maybe_overridden()
     }
 
-    /// The committed half of [`Self::core_call_plain`]: the arguments of
+    /// The committed half of [`Self::core_call_plain`] (`held`: the slot
+    /// is a direct call site's warm one, holding the callee's code): the
+    /// arguments of
     /// the `CALL` at `pc` of `sw`'s running activation (the callable at
     /// `callee_slot`, its self slot filled when `has_self`) move into the
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
@@ -15714,6 +15737,7 @@ impl Interpreter {
         fp: *const crate::object::PyFunction,
         mut act: Box<InlineAct>,
         guard: crate::recursion::Guard,
+        held: bool,
     ) -> *mut Frame {
         // SAFETY: the caller's contract.
         let frame = unsafe { &mut *sw.cur };
@@ -15723,8 +15747,7 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*(*fp).code.as_ptr() };
         // Committed. The arguments move into the slot's (empty, sole-owned)
         // locals; the callable and the empty self slot leave the stack.
-        let code = code_rc.clone();
-        let nlocals = code.varnames.len();
+        let nlocals = code_rc.varnames.len();
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
         let first = if has_self {
@@ -15765,7 +15788,10 @@ impl Interpreter {
         // while the slot holds `callable`.
         unsafe {
             let fr: &mut Frame = &mut act.frame;
-            std::ptr::write(&raw mut fr.code, code);
+            // (A warm slot, `held`, holds this code already.)
+            if !held {
+                std::ptr::write(&raw mut fr.code, code_rc.clone());
+            }
             std::ptr::write(
                 &raw mut fr.cells,
                 borrowed_rc(crate::object::empty_cells_ref()),
