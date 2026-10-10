@@ -14859,6 +14859,33 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::core_pending_enter`] with its commonest case in line: the
+    /// caller an inline activation other than the burst's entry, with no
+    /// shell yet (the call paths' callers).
+    #[inline(always)]
+    fn core_pending_enter_fast(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<usize> {
+        // SAFETY: as `core_pending_enter`.
+        unsafe {
+            let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
+            let depth = inl.len();
+            if depth != 0 && (depth != sw.entry_depth || sw.entry_dead) {
+                let caller: &mut InlineAct = &mut inl[depth - 1];
+                if caller.act.shell.is_none() {
+                    caller.act.frame = std::ptr::from_mut(frame);
+                    let addr = std::ptr::from_mut::<LeanAct>(&mut caller.act) as usize;
+                    push_fast(&mut self.lean_pending, addr);
+                    return Some(addr);
+                }
+            }
+        }
+        self.core_pending_enter(sw, frame, pc)
+    }
+
     /// Put `sw`'s running activation, `frame` (synced, suspended at the
     /// call at `pc`), on the pending list (see [`Self::lean_pending_enter`])
     /// while code it calls runs: anything that needs the whole spine then
@@ -15562,7 +15589,7 @@ impl Interpreter {
         act.direct = DIRECT;
         act.call_pc = pc;
         // The caller waits on the pending list (see `lean_pending_enter`).
-        act.caller_pending = self.core_pending_enter(sw, frame, pc);
+        act.caller_pending = self.core_pending_enter_fast(sw, frame, pc);
         act.exc_depth = self.exc_info_len();
         act.guard = Some(guard);
         // As `inline_bind_cells`: a hot body is compiled once, so native
@@ -20914,7 +20941,14 @@ impl Interpreter {
             && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
-        if clean && done.init_inst.is_none() && done.binop.is_none() && !done.discard {
+        if clean
+            && (done.init_inst.is_none() || matches!(v, Object::None))
+            && done.binop.is_none()
+            && !done.discard
+        {
+            // A constructor's `__init__` returned `None`: the caller takes
+            // the instance (`inline_deliver`'s epilogue).
+            let v = done.init_inst.take().unwrap_or(v);
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.

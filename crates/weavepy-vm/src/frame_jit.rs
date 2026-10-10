@@ -276,7 +276,7 @@ impl Native {
             } else {
                 ""
             };
-            stats::note(&self.name, &self.ops, from, st.pc, st.last, status, bail);
+            stats::note(&self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail);
         }
     }
 
@@ -306,7 +306,7 @@ impl Native {
             } else {
                 ""
             };
-            stats::note(&self.name, &self.ops, from, st.pc, st.last, status, bail);
+            stats::note(&self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail);
         }
         status
     }
@@ -368,6 +368,25 @@ impl Slot {
         if h >= hot().saturating_mul(n) {
             self.heat.store(0, Ordering::Relaxed);
             self.try_compile(code, ext, nlocals, at);
+        }
+    }
+
+    /// Count a compiled caller's call into an activation of this code that
+    /// had to switch to the core loop for want of a native body: the round
+    /// trip costs about what interpreting the whole body does, so it
+    /// counts the code's length (a call the core loop makes counts a
+    /// tenth of it), and a callee of compiled code compiles sooner.
+    #[inline]
+    pub(crate) fn warm_switched(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
+        if self.native.get().is_some() {
+            return;
+        }
+        let n = code.instructions.len() as u32;
+        let h = self.heat.load(Ordering::Relaxed).saturating_add(n);
+        self.heat.store(h, Ordering::Relaxed);
+        if h >= hot().saturating_mul(n) {
+            self.heat.store(0, Ordering::Relaxed);
+            self.try_compile(code, ext, nlocals, Heat::Call);
         }
     }
 
@@ -802,17 +821,28 @@ mod stats {
         from: usize,
         at: usize,
         last: usize,
+        sw: *mut crate::CoreSwitch,
         status: u32,
         bail: &str,
     ) {
         let op = match (status, ops.get(at)) {
             (0, Some(op)) => format!("{op:?}{bail}"),
             (0, None) => "<end>".to_owned(),
-            // (Where it switched: the last instruction it ran.)
-            (super::RELOAD, _) => match ops.get(last) {
-                Some(op) => format!("<switched> at {op:?}@{last}, {:?}", ops.get(last + 1)),
-                None => "<switched>".to_owned(),
-            },
+            // (Where it switched: the last instruction it ran, and the
+            // activation it switched to.)
+            (super::RELOAD, _) => {
+                // SAFETY: a live switch's running activation.
+                let to = (!sw.is_null())
+                    .then(|| unsafe {
+                        let cur: &crate::Frame = &*(*sw).cur;
+                        cur.code.qualname.clone()
+                    })
+                    .unwrap_or_default();
+                match ops.get(last) {
+                    Some(op) => format!("<switched> at {op:?}@{last}, {:?} to {to}", ops.get(last + 1)),
+                    None => "<switched>".to_owned(),
+                }
+            }
             (super::RAISED, _) => "<raised>".to_owned(),
             (super::DIRECT_RET, _) => "<direct return>".to_owned(),
             _ => "<marked>".to_owned(),
@@ -4302,7 +4332,6 @@ unsafe fn run_pushed_directly(
         let callee = sw.cur;
         let top = inl.last_mut()?;
         if top.gen.is_some()
-            || top.init_inst.is_some()
             || top.binop.is_some()
             || top.discard
             || top.direct
@@ -4317,7 +4346,11 @@ unsafe fn run_pushed_directly(
         }
         let cframe = &*callee;
         let ext = crate::code_vm_ext(&cframe.code)?;
-        let native = ext.frame_jit.get((*cframe.locals.as_ptr()).len())?;
+        let nlocals = (*cframe.locals.as_ptr()).len();
+        let Some(native) = ext.frame_jit.get(nlocals) else {
+            ext.frame_jit.warm_switched(&cframe.code, ext, nlocals);
+            return None;
+        };
         let from = cframe.pc as usize;
         if from >= ext.dispatch_len || !native.enters_at(from) {
             return None;
@@ -4410,19 +4443,29 @@ unsafe fn direct_run<const PUSHED: bool>(
             let clean = cst.len == 1
                 && inl.last().is_some_and(|a| {
                     a.act.shell.is_none()
-                        && (!PUSHED || cframe.code.cellvars.is_empty() || a.owns_cells)
+                        && (!PUSHED
+                            || ((cframe.code.cellvars.is_empty() || a.owns_cells)
+                                && (a.init_inst.is_none()
+                                    || matches!(&*cst.stack, Object::None))))
                 })
                 && Rc::strong_count(&cframe.locals) == 1
                 && !interp.countdown_out(2)
                 && crate::hot_gates::loop_gen() == st.snap_gen;
             if clean {
-                // `core_return`'s clean return, with the caller known.
+                // `core_return`'s clean return, with the caller known (a
+                // constructor's `__init__` returned `None`: the caller takes
+                // the instance).
                 let v = cst.stack.read();
                 cframe.stack.set_len(0);
                 let mut done = inl.pop().unwrap_unchecked();
                 if depth == sw.entry_depth {
                     sw.entry_dead = true;
                 }
+                let v = if PUSHED {
+                    done.init_inst.take().unwrap_or(v)
+                } else {
+                    v
+                };
                 crate::release_locals(&mut *cframe.locals.as_ptr());
                 drop(done.guard.take());
                 interp.lean_pending_exit(done.caller_pending);
@@ -4672,10 +4715,8 @@ unsafe extern "C" fn h_call(
             // A compiled callee runs from here, and its return continues
             // this code natively (anything else leaves for the core loop).
             if switched && sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
-                if python == 1 {
-                    if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
-                        return r;
-                    }
+                if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                    return r;
                 }
                 if run_callee_directly(st, start) {
                     st.len = start + 1;
