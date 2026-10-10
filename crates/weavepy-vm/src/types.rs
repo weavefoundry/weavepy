@@ -3645,20 +3645,27 @@ impl PyInstance {
     /// pool for `new_deferred` (CPython's per-type freelist), or drop it.
     /// The caller established that `obj` is its only reference, the
     /// instance is still deferred and owns no C body.
-    pub fn try_recycle(mut inst: Rc<Self>) {
+    pub fn try_recycle(inst: Rc<Self>) {
+        if let Err(inst) = Self::recycle(inst) {
+            // (A plain drop: the caller found no finalizer owed.)
+            crate::rc::drop_arc(Rc::into_arc(inst));
+        }
+    }
+
+    /// [`Self::try_recycle`], handing back an instance it doesn't pool
+    /// (whose state may be partly reset: it is dying) for the caller to
+    /// free without its last-release hook, which may be what called this.
+    pub(crate) fn recycle(mut inst: Rc<Self>) -> Result<(), Rc<Self>> {
         // SAFETY: the caller holds the only reference.
         if unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0 {
-            if let Err(inst) = crate::stdlib::datetime_native::recycle(inst) {
-                drop(Rc::into_arc(inst));
-            }
-            return;
+            return crate::stdlib::datetime_native::recycle(inst);
         }
         let Some(m) = Rc::get_mut(&mut inst) else {
-            return;
+            return Err(inst);
         };
         let owner = std::ptr::from_ref(&*m) as usize;
         if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
-            return;
+            return Err(inst);
         }
         // Split values are atomic (the instance is deferred): clearing
         // them runs no code. The allocation stays for the next tenant.
@@ -3671,15 +3678,16 @@ impl PyInstance {
             // hand out the same `Arc`, and a holder must keep seeing the
             // dead instance's attributes, not the next tenant's.
             if m.dict.strong_count() != 1 {
-                return;
+                return Err(inst);
             }
             // Reset in place: values are atomic, so clearing runs no code
             // that could observe the instance.
             let Ok(mut d) = dict.try_borrow_mut() else {
-                return;
+                return Err(inst);
             };
             if d.capacity() > 32 {
-                return;
+                drop(d);
+                return Err(inst);
             }
             d.map_mut_atomic_store().clear();
             d.reset_deferred_owner(owner);
@@ -3691,12 +3699,19 @@ impl PyInstance {
         // A pooled instance must not keep its class alive (a transient
         // class is collected as soon as its last instance dies).
         *m.class.get_mut() = crate::builtin_types::builtin_types().object_.clone();
-        INSTANCE_POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.len() < INSTANCE_POOL_CAP {
-                p.push(inst);
+        let mut inst = Some(inst);
+        // (A thread whose locals are being torn down pools nothing.)
+        let _ = INSTANCE_POOL.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut() {
+                if p.len() < INSTANCE_POOL_CAP {
+                    p.extend(inst.take());
+                }
             }
         });
+        match inst {
+            None => Ok(()),
+            Some(inst) => Err(inst),
+        }
     }
 
     /// Whether tracking is still deferred (the `__dict__` carries the
