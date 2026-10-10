@@ -3732,6 +3732,13 @@ pub(crate) struct DirectSite {
     /// How many trailing parameters take the function's defaults.
     missing: u32,
     has_self: bool,
+    /// A second callee the site calls directly (a polymorphic method
+    /// call's other receiver class): its code (a counted reference, `0`
+    /// none), body, defaults taken and self slot.
+    alt_code: usize,
+    alt_native: usize,
+    alt_missing: u32,
+    alt_has_self: bool,
 }
 
 const DS_NATIVE: i32 = std::mem::offset_of!(DirectSite, native) as i32;
@@ -3739,9 +3746,11 @@ const DS_RETRY: i32 = std::mem::offset_of!(DirectSite, retry) as i32;
 
 impl Drop for DirectSite {
     fn drop(&mut self) {
-        if self.code != 0 {
-            // SAFETY: `code` holds the count `fill` took.
-            unsafe { drop(Rc::from_raw(self.code as *const CodeObject)) };
+        for code in [self.code, self.alt_code] {
+            if code != 0 {
+                // SAFETY: each holds the count a fill took.
+                unsafe { drop(Rc::from_raw(code as *const CodeObject)) };
+            }
         }
     }
 }
@@ -3761,6 +3770,24 @@ impl DirectSite {
         self.missing = missing as u32;
         self.native = native;
         self.retry = if native == 0 { 64 } else { 0 };
+    }
+
+    /// Record a call of `code` with a native body as the site's first
+    /// callee, the one it held before (if it had a body) becoming its
+    /// second.
+    fn promote(&mut self, code: &Rc<CodeObject>, has_self: bool, native: usize, missing: usize) {
+        if self.native != 0 && self.code != 0 && self.code != Rc::as_ptr(code) as usize {
+            let old = std::mem::replace(&mut self.alt_code, self.code);
+            self.code = 0;
+            if old != 0 {
+                // SAFETY: `old` held the count an earlier fill took.
+                unsafe { drop(Rc::from_raw(old as *const CodeObject)) };
+            }
+            self.alt_native = self.native;
+            self.alt_missing = self.missing;
+            self.alt_has_self = self.has_self;
+        }
+        self.fill(code, has_self, native, missing);
     }
 }
 
@@ -4039,26 +4066,34 @@ unsafe fn direct_call(
         // (The site keys on the code: a fresh function made from the same
         // `def` binds the same way, and code without free variables takes
         // no closure.)
-        if site.code != Rc::as_ptr(code_rc) as usize
-            || site.has_self != has_self
-            || site.native == 0
+        let at = Rc::as_ptr(code_rc) as usize;
+        let (native, missing) = if site.code == at && site.has_self == has_self && site.native != 0
         {
+            (site.native, site.missing as usize)
+        } else if site.alt_code == at && site.alt_has_self == has_self && site.alt_native != 0 {
+            (site.alt_native, site.alt_missing as usize)
+        } else {
             let nargs = len - start - 2 + usize::from(has_self);
             let (native, missing) = direct_body(f, code_rc, nargs).map_or((0, 0), |(n, m)| {
                 (std::ptr::from_ref::<Native>(n) as usize, m)
             });
-            site.fill(code_rc, has_self, native, missing);
             if native == 0 {
+                // A callee with no body (a frameless leaf) leaves the site's
+                // compiled callees alone.
+                if site.native == 0 {
+                    site.fill(code_rc, has_self, 0, 0);
+                }
                 return None;
             }
-        }
+            site.promote(code_rc, has_self, native, missing);
+            (native, missing)
+        };
         // (Another function running the same code may have rebound its
         // defaults.)
-        let missing = site.missing as usize;
         if missing > 0 && !Interpreter::defaults_cover(f, missing) {
             return None;
         }
-        let native = &*(site.native as *const Native);
+        let native = &*(native as *const Native);
         let interp = &mut *st.interp.cast_mut();
         let nested = interp.direct_calls.get();
         let code: &CodeObject = code_rc;
