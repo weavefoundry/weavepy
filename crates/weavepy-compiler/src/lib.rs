@@ -5878,7 +5878,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(hidden_name).into();
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(hidden_name));
         inner.co.arg_count = arg_count;
         inner.co.varnames = hidden_params.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
@@ -6362,7 +6362,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(display).into();
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(display));
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
         inner.co.kwonly_count = kwonly_count;
@@ -6618,7 +6618,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_annotation_child_qualname(name).into();
+        inner.co.qualname = Name::unpooled(&self.compute_annotation_child_qualname(name));
         // A lambda or comprehension inside the annotation scope is
         // named from *this* scope (`compiler_set_qualname` looks
         // through the annotation parent).
@@ -7102,7 +7102,7 @@ impl Compiler {
         // A class body never reports `CO_NESTED` itself (no
         // `CO_OPTIMIZED`), but its methods inherit the nesting.
         inner.co.is_nested = self.child_is_nested();
-        inner.co.qualname = self.compute_child_qualname(name).into();
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // CPython only gives a class body the `__class__` closure cell —
         // and the trailing `__classcell__` store — when a method actually
@@ -11801,7 +11801,7 @@ impl Compiler {
         // PEP 3155: a comprehension scope gets a dotted qualname like any
         // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
         // `compiler_set_qualname` doesn't special-case comprehensions.
-        inner.co.qualname = self.compute_child_qualname(name).into();
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.co.arg_count = 1;
         inner.co.varnames.push(Name::from(".0".to_owned()));
         inner.bindings.insert(".0".to_owned(), Binding::Local);

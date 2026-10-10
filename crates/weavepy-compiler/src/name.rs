@@ -30,44 +30,63 @@ impl Name {
             .intern(s)
     }
 
+    /// A name equal to `s` outside the pool, for text few code objects
+    /// share (a qualified name): it costs no pool lookup, and equality
+    /// still compares the text.
+    pub fn unpooled(s: &str) -> Name {
+        Name(Arc::from(s))
+    }
+
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Whether `a` and `b` share one allocation (pooled names always do
-    /// when equal).
+    /// Whether `a` and `b` share one allocation (equal pooled names always
+    /// do).
     #[inline]
     pub fn ptr_eq(a: &Name, b: &Name) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
 }
 
-/// The pool's hasher: FNV-1a, which is quick over short identifiers.
-struct Fnv(u64);
+/// The pool's hasher (FxHash's): a rotate, an exclusive-or and a
+/// multiply per eight bytes, which is quick over short identifiers.
+#[derive(Default)]
+struct Fx(u64);
 
-impl Default for Fnv {
-    fn default() -> Self {
-        Fnv(0xcbf2_9ce4_8422_2325)
+impl Fx {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 }
 
-impl Hasher for Fnv {
+impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let mut h = self.0;
-        for &b in bytes {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().expect("eight bytes")));
         }
-        self.0 = h;
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(last));
+        }
+    }
+
+    fn write_u8(&mut self, b: u8) {
+        self.add(u64::from(b));
     }
 }
 
 struct Pool {
-    names: Option<HashSet<Arc<str>, BuildHasherDefault<Fnv>>>,
+    names: Option<HashSet<Arc<str>, BuildHasherDefault<Fx>>>,
     /// The size past which the next insertion sweeps unused names.
     sweep_at: usize,
 }

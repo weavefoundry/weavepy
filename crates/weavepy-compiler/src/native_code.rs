@@ -459,9 +459,15 @@ impl Reader<'_> {
 
     /// An identifier [`Writer::name`] wrote.
     fn name(&mut self, module: &mut Module) -> Option<Name> {
+        self.name_as(module, Name::new)
+    }
+
+    /// An identifier [`Writer::name`] wrote, made with `make` (pooled or
+    /// not) if this is its first appearance.
+    fn name_as(&mut self, module: &mut Module, make: fn(&str) -> Name) -> Option<Name> {
         Some(match self.uint()? {
             0 => {
-                let name = Name::new(std::str::from_utf8(self.raw()?).ok()?);
+                let name = make(std::str::from_utf8(self.raw()?).ok()?);
                 module.names.push(name.clone());
                 name
             }
@@ -543,7 +549,8 @@ impl Reader<'_> {
             return None;
         }
         let name = self.name(module)?;
-        let qualname = self.name(module)?;
+        // (A qualified name other than a plain name is seldom shared.)
+        let qualname = self.name_as(module, Name::unpooled)?;
         let n = self.len()?;
         let mut instructions = Vec::with_capacity(n);
         for _ in 0..n {
