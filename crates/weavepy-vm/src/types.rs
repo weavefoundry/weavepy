@@ -597,8 +597,7 @@ impl LeafAttrCache {
         if self.0.get() == 0 {
             let t: Box<[LeafAttrEntry; LEAF_ATTRS_SMALL]> =
                 Box::new(std::array::from_fn(|_| LeafAttrEntry::EMPTY));
-            self.0
-                .set(Box::into_raw(t) as usize | LEAF_ATTRS_SMALL_TAG);
+            self.0.set(Box::into_raw(t) as usize | LEAF_ATTRS_SMALL_TAG);
         }
         let t = self.0.get();
         let len = if t & LEAF_ATTRS_SMALL_TAG != 0 {
@@ -768,7 +767,10 @@ mod leaf_attr_cache_tests {
             cache.get(first, 1),
             Some(LeafAttrKind::Value(Object::Str(value))) if SharedStr::ptr_eq(value, &text)
         ));
-        assert!(matches!(cache.get(rivals[1], 1), Some(LeafAttrKind::InstanceOnly)));
+        assert!(matches!(
+            cache.get(rivals[1], 1),
+            Some(LeafAttrKind::InstanceOnly)
+        ));
         assert_eq!(SharedStr::strong_count(&text), 2);
         drop(cache);
         assert_eq!(SharedStr::strong_count(&text), 1);

@@ -666,17 +666,34 @@ impl JitEngine {
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
         slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
     ) -> Result<CompiledFrame, JitVerdict> {
-        let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
-        if calls_dynamically(&tfunc) {
-            return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
-        }
-        if mostly_generic(&tfunc) {
-            return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
-        }
-        for site in &mut tfunc.attr_sites {
-            site.slot_member = slot_member(site);
-        }
+        let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
+    }
+
+    /// [`Self::compile_frame_direct`] on the engine in `engine`, built
+    /// (see [`Self::new`]) only once the analysis admits the code: code
+    /// the analysis rejects never pays for building one. When the host
+    /// can't have one, `engine` stays empty and the verdict is
+    /// [`NO_HOST_ENGINE`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_frame_lazily(
+        engine: &mut Option<JitEngine>,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probes: &mut Probes<'_>,
+        direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
+        if engine.is_none() {
+            *engine = JitEngine::new();
+        }
+        let Some(engine) = engine.as_mut() else {
+            return Err(JitVerdict::UnsupportedOpcode(NO_HOST_ENGINE));
+        };
+        engine.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
     }
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
@@ -1146,6 +1163,31 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// through a helper that redoes the lookups the interpreter's caches
 /// remember, while each typed one saves only a dispatch. A loop-free
 /// body is left alone: other compiled code calls it directly.
+/// The [`JitEngine::compile_frame_lazily`] verdict for a host the code
+/// generator can't target.
+pub const NO_HOST_ENGINE: &str = "no code generator for the host";
+
+/// Analyze `code` for [`JitEngine::compile_frame_direct`] and apply the
+/// admission rules that need no code generator.
+fn analyze_admitted(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probes: &mut Probes<'_>,
+    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+) -> Result<TFunc, JitVerdict> {
+    let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+    if calls_dynamically(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
+    }
+    if mostly_generic(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
+    }
+    for site in &mut tfunc.attr_sites {
+        site.slot_member = slot_member(site);
+    }
+    Ok(tfunc)
+}
+
 fn mostly_generic(tfunc: &TFunc) -> bool {
     let Some((percent, loops_only)) = generic_share_limit() else {
         return false;

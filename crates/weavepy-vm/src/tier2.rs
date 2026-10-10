@@ -1098,6 +1098,29 @@ fn compile_allowed(counter: u32, threshold: u32) -> bool {
 /// attempt costs milliseconds.
 const IMPORT_THRESHOLD_FACTOR: u32 = 64;
 
+/// Bodies longer than this many instructions need proportionally more
+/// work before start-up or an import analyzes them (see
+/// [`import_size_budget`]).
+const IMPORT_LARGE_BODY: usize = 512;
+
+/// The counter a code object needs before tier 2 analyzes it, beyond
+/// [`compile_allowed`]'s, when this phase admits compiles only at
+/// `admit_at` (more than the threshold: start-up or an import). The
+/// analysis of a body costs about its length (`import statistics`, whose
+/// imports compile regular expressions, spent 12 ms and a sixth of its
+/// instructions analyzing `re._parser._parse`'s 1,700 to reject them),
+/// and import-time code mostly runs once per process, so a large body
+/// needs work in proportion to its length; it can still compile at the
+/// ordinary threshold once the imports are done.
+fn import_size_budget(code: &CodeObject, admit_at: u32) -> u32 {
+    let len = code.instructions.len();
+    if compile_allowed(0, 1) || len <= IMPORT_LARGE_BODY {
+        return 0;
+    }
+    let scale = u32::try_from(len / IMPORT_LARGE_BODY + 1).unwrap_or(u32::MAX);
+    admit_at.saturating_mul(scale)
+}
+
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
 /// keeps tier 2's start-up and import budgets.
 pub(crate) fn frame_compile_allowed(counter: u32, threshold: u32) -> bool {
@@ -1311,11 +1334,19 @@ impl JitState {
                     if entry_pc == 0 {
                         entry.calls = entry.calls.wrapping_add(1);
                     }
-                    if entry.counter == self.threshold / 2 && self.engine.is_none() {
+                    // Halfway to the work this phase admits a compile at
+                    // (start-up and imports need far more first).
+                    let admit_at = if compile_allowed(0, self.threshold) {
+                        self.threshold
+                    } else {
+                        self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
+                    };
+                    if entry.counter == admit_at / 2 && self.engine.is_none() {
                         spawn_codegen_prewarm();
                     }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
+                        || entry.counter < import_size_budget(code, admit_at)
                     {
                         return None;
                     }
@@ -1344,15 +1375,9 @@ impl JitState {
             long_calls = entry.backedges / calls >= LOOP_CALL_ITERATIONS;
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
-        if self.engine.is_none() {
-            self.engine = JitEngine::new();
-            if self.engine.is_none() {
-                // Host ISA unavailable — disable so we stop retrying.
-                self.enabled = false;
-                return None;
-            }
-        }
-        let engine = self.engine.as_mut()?;
+        // The engine is built once an analysis admits some code (see
+        // `JitEngine::compile_frame_lazily`).
+        let engine = &mut self.engine;
         let VmProbes {
             resolve_obj,
             ret_lane_of,
@@ -1675,7 +1700,8 @@ impl JitState {
             let mut slot_member =
                 |site: &AttrSiteMeta| attr_guard_of(site).is_some_and(|g| g.slot_layout != 0);
             ensure_obj_layout();
-            let r = engine.compile_frame_direct(
+            let r = JitEngine::compile_frame_lazily(
+                engine,
                 code,
                 &mut classify,
                 &mut jit_probes,
@@ -1701,6 +1727,14 @@ impl JitState {
                 first
             }
         };
+        if matches!(
+            res,
+            Err(weavepy_jit::JitVerdict::UnsupportedOpcode(why)) if why == weavepy_jit::NO_HOST_ENGINE
+        ) {
+            // Host ISA unavailable — disable so we stop retrying.
+            self.enabled = false;
+            return None;
+        }
         let (tier, out) = match res {
             Ok(cf) => {
                 self.stats.frames_compiled += 1;
