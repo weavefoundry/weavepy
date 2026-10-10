@@ -4483,7 +4483,16 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             if is_subclass_by_name(&inst_rc.cls(), "StopIteration") {
                 inst_rc.slot_set("value", rest.first().cloned().unwrap_or(Object::None));
             }
-            inst_rc.slot_set("args", Object::new_tuple(rest));
+            // Only a non-atomic argument can close a cycle through the
+            // instance (as at construction, see `build_exception_instance`).
+            if rest.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
+                inst_rc.ensure_gc_tracked();
+            }
+            let old = inst_rc
+                .slots
+                .borrow_mut()
+                .insert("args", Object::new_tuple(rest));
+            drop(old);
         }
         Ok(Object::None)
     }
@@ -4869,9 +4878,10 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
 /// A built-in exception of `class` whose `args` is `(arg,)`, or `()`
 /// for `None`: the shared tail of the Rust-side constructors.
 ///
-/// The pseudo-slots land in one vector sized for the traceback and
-/// chaining links a raise adds next, and the class's families come
-/// from its memoised flags rather than an MRO walk. CPython keeps no
+/// The pseudo-slots are laid out with room for the traceback and
+/// chaining links a raise adds next (see `SlotStorage::exception`), and
+/// the class's families come from its memoised flags rather than an MRO
+/// walk. CPython keeps no
 /// `message` attribute: `str()` and [`exception_message`] derive the
 /// text from `args` on demand, so nothing is formatted here.
 pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -> Object {

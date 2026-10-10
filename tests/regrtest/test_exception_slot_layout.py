@@ -163,6 +163,46 @@ class SlotLayoutTest(unittest.TestCase):
         e = ImportError("no module", name="m", path="/p")
         self.assertEqual((e.msg, e.name, e.path), ("no module", "m", "/p"))
 
+    def test_python_init(self):
+        class NoSuper(Exception):
+            def __init__(self, a, b):
+                self.total = a + b
+
+        e = NoSuper(1, 2)
+        self.assertEqual(e.args, (1, 2))
+        self.assertEqual(e.total, 3)
+        e = AppError(404, "missing")
+        self.assertEqual(e.args, ("missing",))
+        try:
+            try:
+                {}["k"]
+            except KeyError:
+                raise AppError(5, "five") from None
+        except AppError as err:
+            self.assertEqual((err.code, err.args), (5, ("five",)))
+            self.assertTrue(err.__suppress_context__)
+            self.assertIsInstance(err.__context__, KeyError)
+            self.assertIsNotNone(err.__traceback__)
+
+    def test_cycle_through_args(self):
+        import gc
+        import weakref
+
+        class Holder:
+            pass
+
+        class Err(Exception):
+            def __init__(self, holder):
+                super().__init__(holder)
+
+        h = Holder()
+        h.err = Err(h)
+        ref = weakref.ref(h)
+        del h
+        gc.collect()
+        self.assertIsNone(ref())
+        self.assertTrue(gc.is_tracked(Err(Holder())))
+
     def test_slotted_subclass(self):
         try:
             e = SlottedError("x")

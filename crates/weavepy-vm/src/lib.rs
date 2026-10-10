@@ -54895,7 +54895,20 @@ impl Interpreter {
     /// class's `__init__` never calls `super().__init__`.
     fn seed_exception_args(inst: &Object, args: impl Iterator<Item = Object>) {
         if let Object::Instance(i) = inst {
-            i.slot_set("args", Object::new_tuple(args.collect()));
+            let args = Object::new_tuple(args.collect());
+            if i.slots.borrow().is_empty_default() {
+                // Laid out as a built-in construction's (see
+                // `SlotStorage::exception`), so a raise fills its slots in
+                // place. As there, only a non-atomic argument can close a
+                // cycle through the instance.
+                if matches!(&args, Object::Tuple(t) if t.iter().any(|x| !gc_trace::is_atomic(x)))
+                {
+                    i.ensure_gc_tracked();
+                }
+                *i.slots.borrow_mut() = crate::types::SlotStorage::exception(args, []);
+            } else {
+                i.slot_set("args", args);
+            }
         }
     }
 
