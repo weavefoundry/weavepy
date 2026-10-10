@@ -7842,8 +7842,8 @@ impl<'a> Lower<'a> {
     /// `local[i]` of a list or tuple local and an `int` index, in line:
     /// the item is read in place (the local gives no reference to take or
     /// release) and copied to the stack. Any other operands (a `str` or a
-    /// dict, a borrowed list, an index out of range) take the container
-    /// helper, as [`Self::container`] would. `false`, emitting nothing, for
+    /// dict, a borrowed list, an index out of range) take the in-place
+    /// helper, as [`Self::subscr_ref`] does. `false`, emitting nothing, for
     /// other operand shapes.
     fn seq_index(&mut self, pc: usize) -> bool {
         let (Some(list), Some((tlen, titems))) = (self.tags.list_layout, self.tags.tuple_layout)
@@ -7933,44 +7933,21 @@ impl<'a> Lower<'a> {
         let dst = self.slot_addr(slot);
         self.copy_value(dst, item);
         self.b.ins().jump(join, &[]);
-        // Anything else: both operands to the stack, and the helper.
+        // Anything else (a dict, a string, a borrowed list, an index out of
+        // range) through the in-place helper, which reads the local
+        // container where it lies (see `Self::subscr_ref`).
         self.b.switch_to_block(slow);
-        self.materialize(cont, slot);
-        self.materialize(key, slot + 1);
-        let ins = self.b.ins().iconst(
-            self.ptr,
-            std::ptr::from_ref(&self.code.instructions[pc]) as i64,
+        let (pcont, own_c) = self.ref_or_own(cont, slot);
+        let (pkey, own_k) = self.ref_or_own(key, slot + 1);
+        let owned = u8::from(own_c) | (u8::from(own_k) << 1);
+        self.ref_call(
+            pc,
+            h_subscr_ref as *const () as usize,
+            slot,
+            2,
+            &[pcont, pkey],
+            owned,
         );
-        let code = self
-            .b
-            .ins()
-            .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
-        let pcv = self.b.ins().iconst(types::I64, pc as i64);
-        let lenv = self.b.ins().iconst(types::I64, slot as i64 + 2);
-        // (A raise needs the whole stack on the frame's: nothing virtual
-        // below the operands.)
-        let raisable = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
-        let can_raise = self.b.ins().iconst(types::I64, i64::from(raisable));
-        let r = self
-            .call_typed(
-                h_container as *const () as usize,
-                &[self.st, ins, code, pcv, lenv, can_raise],
-                Some(types::I64),
-            )
-            .expect("returns");
-        let declined = self.b.ins().icmp_imm(IntCC::Equal, r, -1);
-        let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.branch_out(declined, out);
-        if raisable {
-            let raised = self.b.ins().icmp_imm(IntCC::Equal, r, -2);
-            let raise_b = self.b.create_block();
-            let ok = self.b.create_block();
-            self.b.ins().brif(raised, raise_b, &[], ok, &[]);
-            self.b.switch_to_block(raise_b);
-            let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
-            self.leave(s);
-            self.b.switch_to_block(ok);
-        }
         // (The helper released the operands; a finalizer it queued runs
         // before the next instruction, as after `Self::container`.)
         self.depth = slot + 1;
