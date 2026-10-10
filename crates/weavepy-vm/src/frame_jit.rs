@@ -4556,10 +4556,11 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 }
 
 /// [`h_call`] at a site settled on a leaf builtin: a container's or
-/// string's method through its [`Kernel`], or `isinstance`, `len` or a
-/// registered fast half in place as `h_call` runs them first, from a
-/// small function (the general helper stays as it is); anything else
-/// (another callee, a declined shape) through `h_call`.
+/// string's method through its [`Kernel`], or `isinstance`, `len`, a
+/// registered fast half or a registered leaf body in place as `h_call`
+/// runs them, from a small function (the general helper stays as it
+/// is); anything else (another callee, a declined shape) through
+/// `h_call`.
 unsafe extern "C" fn h_call_leaf(
     st: *mut State,
     code: *const CodeObject,
@@ -4599,7 +4600,13 @@ unsafe extern "C" fn h_call_leaf(
                 }
                 if matches!(
                     kind,
-                    Some(LeafKind::Isinstance | LeafKind::Len | LeafKind::Fast(_))
+                    Some(
+                        LeafKind::Isinstance
+                            | LeafKind::Len
+                            | LeafKind::Fast(_)
+                            | LeafKind::Opaque
+                            | LeafKind::Scalar
+                    )
                 ) && Rc::strong_count(b) > 1
                 {
                     let first = if matches!(&*base.add(start + 1), Object::Unbound) {
@@ -4609,9 +4616,28 @@ unsafe extern "C" fn h_call_leaf(
                     };
                     let args = std::slice::from_raw_parts(base.add(first), lenu - first);
                     let r = if Interpreter::core_all_droppable(args) {
+                        // (A body that runs no Python code for any
+                        // arguments, or for scalar ones: as `h_call` and
+                        // `leaf_builtin_call` run them.)
+                        let body = || {
+                            Some(match b.call_kw.as_ref() {
+                                Some(ckw) => ckw(args, &[]),
+                                None => (b.call)(args),
+                            })
+                        };
                         match kind {
                             Some(LeafKind::Fast(f)) => f(args),
                             Some(LeafKind::Len) => len_fast(args),
+                            Some(LeafKind::Opaque) => body(),
+                            Some(LeafKind::Scalar) => {
+                                if args.iter().all(|a| {
+                                    matches!(a, Object::Int(_) | Object::Float(_) | Object::Bool(_))
+                                }) {
+                                    body()
+                                } else {
+                                    None
+                                }
+                            }
                             _ => Interpreter::core_isinstance(args),
                         }
                     } else {
