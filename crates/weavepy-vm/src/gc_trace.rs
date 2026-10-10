@@ -887,11 +887,18 @@ impl GcState {
             return false;
         };
         let over = {
-            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
-                // A sweep is already walking the list (it upgrades and can
-                // re-enter through a promotion). Track eagerly rather than
-                // queue onto a list we cannot touch.
-                return false;
+            // SAFETY: nothing below runs code while the list is borrowed
+            // (a dead predecessor's release only frees memory).
+            let mut guard = None;
+            let deferred = match unsafe { self.deferred.peek_mut() } {
+                Some(d) => d,
+                None => match self.deferred.try_borrow_mut() {
+                    Ok(g) => &mut **guard.insert(g),
+                    // A sweep is already walking the list (it upgrades and
+                    // can re-enter through a promotion). Track eagerly
+                    // rather than queue onto a list we cannot touch.
+                    Err(_) => return false,
+                },
             };
             // The churn shape — a loop that builds a container and drops
             // the previous one — leaves its dead predecessors just below
@@ -930,9 +937,12 @@ impl GcState {
     /// [`Self::sweep_deferred`] of the young deferrals, and of the old ones
     /// too when `old` (see [`Self::deferred_old`]); the young survivors
     /// join the old.
+    ///
+    /// The young sets are left alone: a sweep that compacts the deferrals
+    /// as they accumulate must not register every young object with them
+    /// (a collection, or a reflective API, flushes them itself).
     fn sweep_deferred_from(&self, promote_all: bool, old: bool) {
-        self.flush_young();
-        let mut promote: Vec<Object> = Vec::new();
+        let mut promote: Vec<WeakObject> = Vec::new();
         {
             let (Ok(mut deferred), Ok(mut aged)) = (
                 self.deferred.try_borrow_mut(),
@@ -940,21 +950,28 @@ impl GcState {
             ) else {
                 return;
             };
-            let mut keep = |entry: &DeferredContainer| {
-                let Some(obj) = entry.upgrade() else {
-                    return false;
-                };
-                if promote_all || container_can_cycle(&obj) {
-                    promote.push(obj);
-                    return false;
+            // Keep the live entries of `from` that still hold only atomic
+            // values (appending them to `keep`); promote the rest.
+            let mut sift = |from: Vec<DeferredContainer>, keep: &mut Vec<DeferredContainer>| {
+                for entry in from {
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    // SAFETY: alive (checked above), and the scan runs no
+                    // code.
+                    if promote_all || unsafe { entry.with_borrowed(container_can_cycle) } {
+                        promote.push(entry.into_weak());
+                    } else {
+                        keep.push(entry);
+                    }
                 }
-                true
             };
-            deferred.retain(&mut keep);
             if old {
-                aged.retain(&mut keep);
+                let from = std::mem::take(&mut *aged);
+                sift(from, &mut aged);
             }
-            aged.append(&mut deferred);
+            let from = std::mem::take(&mut *deferred);
+            sift(from, &mut aged);
             if aged.len() >= DEFERRED_CAP && !old {
                 // (Dead entries first: the old ones were left unswept.)
                 aged.retain(|e| !e.is_dead());
@@ -962,18 +979,50 @@ impl GcState {
             if aged.len() >= DEFERRED_CAP {
                 // The set has stopped being a churn buffer: hand it all
                 // over, so these allocations resume pacing collections.
-                promote.extend(aged.drain(..).filter_map(|e| e.upgrade()));
+                promote.extend(
+                    aged.drain(..)
+                        .filter(|e| !e.is_dead())
+                        .map(DeferredContainer::into_weak),
+                );
             }
             self.deferred_limit.store(DEFERRED_FLOOR, Ordering::Relaxed);
         }
-        for obj in promote {
-            self.track_now(&obj);
+        if !promote.is_empty() {
+            self.register_weaks(promote);
+        }
+    }
+
+    /// [`Self::track_now`] for the live objects `weaks` names (promoted
+    /// deferrals), under one registry borrow.
+    fn register_weaks(&self, weaks: Vec<WeakObject>) {
+        let mut added = 0;
+        {
+            let mut reg = self.reg.borrow_mut();
+            for weak in weaks {
+                if weak.is_dead() {
+                    continue;
+                }
+                // (None of these kinds records its own slot.)
+                let key = weak.addr() as ObjectId;
+                if self.tracked_filter.may_contain(key) && reg.index.contains_key(&key) {
+                    continue;
+                }
+                // SAFETY: alive (checked above, and nothing has run since).
+                unsafe { self.enter(&mut reg, weak, true) };
+                added += 1;
+            }
+        }
+        if added > 0 {
+            serial_add(&self.tracked_count, added);
+            serial_add(&self.tracked_version, 1);
+            self.note_gen0_allocs(added);
         }
     }
 
     /// Hand every deferred container to the collector. For the reflective
     /// APIs, which must enumerate the same population CPython does.
     pub fn promote_all_deferred(&self) {
+        self.flush_young();
         self.sweep_deferred(true);
     }
 
@@ -1414,6 +1463,23 @@ impl GcState {
         }
     }
 
+    /// [`Self::note_gen0_alloc`] of `n` allocations at once.
+    fn note_gen0_allocs(&self, n: usize) {
+        let before = {
+            let mut counts = self.counts.borrow_mut();
+            let before = counts[0];
+            counts[0] = counts[0].saturating_add(n);
+            self.sync_gen0_gauge(counts[0], None);
+            before
+        };
+        let gauge = self.gen0_gauge.load(Ordering::Relaxed);
+        let threshold = (gauge & 0xffff_ffff) as usize;
+        let now = (gauge >> 32) as usize;
+        if threshold != 0 && before < threshold && now >= threshold && self.is_enabled() {
+            crate::hot_gates::set(crate::hot_gates::GC_DUE);
+        }
+    }
+
     /// Republish the gen-0 gauge after a write to `counts[0]` or
     /// `thresholds[0]` (see the field docs).
     #[inline]
@@ -1600,6 +1666,7 @@ impl GcState {
     /// *without* the destructive teardown of a real collection. See
     /// [`Self::collect_generation`]'s `weakref_only` discussion.
     pub fn fire_dead_weakrefs(&self) {
+        self.flush_young();
         self.sweep_deferred_from(false, true);
         if self
             .collecting
@@ -1628,6 +1695,7 @@ impl GcState {
         // the mark phase sees the whole candidate population (the old
         // deferrals only for the older generations). Before the
         // re-entrancy claim: promotion calls `track_now`.
+        self.flush_young();
         self.sweep_deferred_from(false, upto >= 1);
         // Atomic claim: overlapping collections over the shared heap would
         // subtract the same internal edges twice.
@@ -3475,13 +3543,31 @@ impl DeferredContainer {
         }
     }
 
-    /// The container, if it is still alive.
-    fn upgrade(&self) -> Option<Object> {
+    /// The handle as the registry holds it.
+    fn into_weak(self) -> WeakObject {
         match self {
-            Self::List(w) => w.upgrade().map(Object::List),
-            Self::Dict(w) => w.upgrade().map(Object::Dict),
-            Self::Set(w) => w.upgrade().map(Object::Set),
+            Self::List(w) => WeakObject::List(w),
+            Self::Dict(w) => WeakObject::Dict(w),
+            Self::Set(w) => WeakObject::Set(w),
         }
+    }
+
+    /// Run `f` on the container through a handle that takes no reference.
+    ///
+    /// # Safety
+    ///
+    /// The container must be alive, and nothing `f` does may release it.
+    unsafe fn with_borrowed<R>(&self, f: impl FnOnce(&Object) -> R) -> R {
+        // SAFETY: alive, per the caller; the view owns no reference and is
+        // never dropped.
+        let obj = std::mem::ManuallyDrop::new(unsafe {
+            match self {
+                Self::List(w) => Object::List(crate::Rc::from_raw(w.as_ptr())),
+                Self::Dict(w) => Object::Dict(crate::Rc::from_raw(w.as_ptr())),
+                Self::Set(w) => Object::Set(crate::Rc::from_raw(w.as_ptr())),
+            }
+        });
+        f(&obj)
     }
 }
 
@@ -3505,23 +3591,22 @@ fn container_can_cycle(obj: &Object) -> bool {
     // *container*, so beyond a point it stops paying for itself — and an
     // unbounded scan would make `track` O(len) for `list(range(1e6))`.
     const SCAN_CAP: usize = 32;
+    // (The scans run no code: a guard-free read is enough.)
     match obj {
-        Object::List(l) => l
-            .try_borrow()
-            .map(|v| v.len() > SCAN_CAP || v.iter().any(|x| !element_is_inert(x)))
-            .unwrap_or(true),
-        Object::Set(s) => s
-            .try_borrow()
-            .map(|m| m.len() > SCAN_CAP || m.iter().any(|k| !element_is_inert(&k.0)))
-            .unwrap_or(true),
-        Object::Dict(d) => d
-            .try_borrow()
-            .map(|m| {
-                m.len() > SCAN_CAP
-                    || m.iter()
-                        .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
-            })
-            .unwrap_or(true),
+        Object::List(l) => with_read::<true, _, _>(l, |v| {
+            v.len() > SCAN_CAP || v.iter().any(|x| !element_is_inert(x))
+        })
+        .unwrap_or(true),
+        Object::Set(s) => with_read::<true, _, _>(s, |m| {
+            m.len() > SCAN_CAP || m.iter().any(|k| !element_is_inert(&k.0))
+        })
+        .unwrap_or(true),
+        Object::Dict(d) => with_read::<true, _, _>(d, |m| {
+            m.len() > SCAN_CAP
+                || m.iter()
+                    .any(|(k, v)| !element_is_inert(&k.0) || !element_is_inert(v))
+        })
+        .unwrap_or(true),
         // A tuple can only anchor a cycle through a non-atomic element. An
         // empty or all-scalar tuple (the interned `()`, `(1, 2)`, …) can never
         // close one, so it stays off the GC's books.
