@@ -225,9 +225,8 @@ pub enum Object {
     Bytes(SharedSlice<u8>),
     /// Mutable byte string `bytearray(...)`.
     ByteArray(Rc<RefCell<Vec<u8>>>),
-    /// Mutable set `{1, 2, 3}` / `set(...)`. Backed by an
-    /// `IndexSet<DictKey>` so iteration order is insertion order
-    /// (CPython 3.7+ semantics).
+    /// Mutable set `{1, 2, 3}` / `set(...)`. Backed by a
+    /// [`crate::dictmap::SetMap`], a compact hash table of its keys.
     Set(Rc<RefCell<SetData>>),
     /// Immutable set `frozenset(...)`. Wrapped in [`FrozenSetObj`] so the
     /// CPython `so_hash` cache (frozensets are immutable, so their hash is
@@ -2713,9 +2712,9 @@ pub struct SlotDescriptor {
     pub objclass: RefCell<Option<crate::sync::Weak<crate::types::TypeObject>>>,
 }
 
-/// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
-/// Fast-hashed for the same reason as [`DictData`].
-pub type SetData = indexmap::IndexSet<DictKey, crate::fasthash::FxBuildHasher>;
+/// Set backing for [`Object::Set`] and [`Object::FrozenSet`]: the dict
+/// table's layout without values (see [`crate::dictmap::SetMap`]).
+pub type SetData = crate::dictmap::SetMap;
 
 /// Backing object for [`Object::FrozenSet`]: the element storage plus a
 /// lazily-computed hash cache.
@@ -3329,8 +3328,9 @@ pub fn module_class(m: &Rc<PyModule>) -> Option<Rc<crate::types::TypeObject>> {
 }
 
 /// Dictionary key: a hashable [`Object`] wrapped to satisfy the
-/// `Hash + Eq` requirements of `HashMap` / `IndexSet`, and the stored key
-/// type of a dict's [`crate::dictmap::DictMap`].
+/// `Hash + Eq` requirements of `HashMap`, and the stored key type of a
+/// dict's [`crate::dictmap::DictMap`] and a set's
+/// [`crate::dictmap::SetMap`].
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
@@ -3616,20 +3616,6 @@ fn meta_hash_is_identity(m: &crate::Rc<crate::types::TypeObject>) -> bool {
     crate::Rc::ptr_eq(m, &crate::builtin_types::builtin_types().type_)
         || (!m.dunder(crate::types::Dunder::Hash).user_defined()
             && !m.dunder(crate::types::Dunder::Eq).user_defined())
-}
-
-impl Hash for LeafProbe<'_> {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
-    }
-}
-
-impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
-    #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
-        crate::dictmap::Probe::probe_eq(self, key)
-    }
 }
 
 impl crate::dictmap::Probe for LeafProbe<'_> {
@@ -4059,9 +4045,8 @@ impl PartialEq for DictKey {
             }
             // CPython dispatches `__eq__` only between keys in the *same
             // hash bucket*; unequal hashes mean "not equal" without any
-            // user code. A dict's table compares stored hashes first, but
-            // a set's (`indexmap`'s) small-table linear scan compares every
-            // entry through this `eq` with no hash check at all, so enforce
+            // user code. The tables compare stored hashes first, but a
+            // caller comparing two keys directly does not, so enforce
             // the bucket precondition here — sqlalchemy's
             // `constraints.discard(ColumnSet())` probes a 1-element set
             // with a key whose `__eq__` returns a SQL clause that *raises*
@@ -4119,19 +4104,6 @@ thread_local! {
 /// Park `err` as the pending key-comparison error (first one wins, matching
 /// CPython aborting on the first failed compare). Called from the reentrant
 /// `__hash__`/`__eq__` bridges when the callback raises.
-/// `indexmap` skips hashing when probing a table of 0 or 1 entries (it
-/// compares the lone entry directly). CPython always calls `__hash__`
-/// first, so a raising `__hash__` must still surface for `x in {'a'}`
-/// (test_set.test_unhashable_element's `HashError`). Only a user
-/// instance with a Python `__hash__` is affected; the call runs inside a
-/// `key_cmp_scope`, so a raised exception is stashed and re-raised there.
-#[inline]
-pub(crate) fn force_hash_for_tiny_table(len: usize, key: &Object) {
-    if len <= 1 && dict_key_is_reentrant(key) {
-        let _ = py_hash_value(key);
-    }
-}
-
 pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
     KEY_COMPARISON.with(|state| {
         let mut slot = state.error.borrow_mut();
@@ -4146,7 +4118,7 @@ fn key_cmp_error_pending() -> bool {
     KEY_COMPARISON.with(|state| state.error.borrow().is_some())
 }
 
-/// Run `f` — a closure that performs `IndexSet`/`IndexMap` probes which may
+/// Run `f` — a closure that performs set or dict probes which may
 /// re-enter a Python `__hash__`/`__eq__` — and surface any exception those
 /// callbacks raised. The pending error of an *outer* scope is saved across
 /// the call and restored afterwards, so a re-entrant set/dict mutation from
@@ -11026,17 +10998,11 @@ impl Object {
                 let key = crate::builtins::set_membership_key(item)?;
                 // A custom `__eq__` raising during a hash collision aborts the
                 // lookup in CPython (test_badcmp `s.__contains__(BadCmp())`).
-                key_cmp_scope(|| {
-                    force_hash_for_tiny_table(s.borrow().len(), &key.0);
-                    s.borrow().contains(&key)
-                })
+                key_cmp_scope(|| s.borrow().contains(&key))
             }
             Object::FrozenSet(s) => {
                 let key = crate::builtins::set_membership_key(item)?;
-                key_cmp_scope(|| {
-                    force_hash_for_tiny_table(s.len(), &key.0);
-                    s.contains(&key)
-                })
+                key_cmp_scope(|| s.contains(&key))
             }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {

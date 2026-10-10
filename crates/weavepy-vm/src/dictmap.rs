@@ -38,10 +38,10 @@ const IX_MASK: u64 = 0xFFFF_FFFF;
 
 /// A stored entry: the key's Python hash, the key, and its value.
 #[derive(Clone, Debug)]
-pub struct Bucket {
+pub struct Bucket<V = Object> {
     pub(crate) hash: i64,
     pub key: DictKey,
-    pub value: Object,
+    pub value: V,
 }
 
 /// A key a table can be probed with: its Python hash and its equality with
@@ -145,10 +145,10 @@ pub fn key_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
-/// An ordered hash table from [`DictKey`] to [`Object`] (see the module
-/// docs).
-pub struct DictMap {
-    entries: Vec<Bucket>,
+/// An ordered hash table from [`DictKey`] to `V` (see the module docs):
+/// [`DictMap`] for a dict, [`SetMap`] for a set.
+pub struct Table<V> {
+    entries: Vec<Bucket<V>>,
     /// The slot table: empty for a small table, else a power of two long.
     slots: Box<[u64]>,
     /// `64 - log2(slots.len())`: the shift that takes a mixed hash to its
@@ -166,14 +166,14 @@ fn slots_for(n: usize) -> usize {
     (n.max(SMALL + 1) * 3 / 2 + 1).next_power_of_two()
 }
 
-impl Default for DictMap {
+impl<V> Default for Table<V> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Clone for DictMap {
+impl<V: Clone> Clone for Table<V> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
@@ -183,7 +183,7 @@ impl Clone for DictMap {
     }
 }
 
-impl fmt::Debug for DictMap {
+impl<V: fmt::Debug> fmt::Debug for Table<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
             .entries(self.entries.iter().map(|b| (&b.key, &b.value)))
@@ -191,7 +191,7 @@ impl fmt::Debug for DictMap {
     }
 }
 
-impl DictMap {
+impl<V> Table<V> {
     /// An empty table.
     #[inline]
     pub fn new() -> Self {
@@ -222,9 +222,9 @@ impl DictMap {
     #[inline]
     pub fn from_unique_hashed(
         n: usize,
-        mut entry: impl FnMut(usize) -> (i64, DictKey, Object),
+        mut entry: impl FnMut(usize) -> (i64, DictKey, V),
     ) -> Self {
-        let mut entries: Vec<Bucket> = Vec::with_capacity(n);
+        let mut entries: Vec<Bucket<V>> = Vec::with_capacity(n);
         let dst = entries.as_mut_ptr();
         for i in 0..n {
             let (hash, key, value) = entry(i);
@@ -270,7 +270,7 @@ impl DictMap {
 
     /// The entries in order.
     #[inline]
-    pub fn as_entries(&self) -> &[Bucket] {
+    pub fn as_entries(&self) -> &[Bucket<V>] {
         &self.entries
     }
 
@@ -467,7 +467,7 @@ impl DictMap {
     /// [`Self::get`], always in line: for the interpreter's subscript
     /// fast paths, where the call would cost a fair share of the probe.
     #[inline(always)]
-    pub fn get_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&Object> {
+    pub fn get_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&V> {
         if self.slots.is_empty() {
             if self.entries.is_empty() {
                 return None;
@@ -483,21 +483,21 @@ impl DictMap {
     }
 
     #[inline]
-    pub fn get<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&Object> {
+    pub fn get<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&V> {
         let i = self.get_index_of(key)?;
         // SAFETY: a found position is in bounds.
         Some(unsafe { &self.entries.get_unchecked(i).value })
     }
 
     #[inline]
-    pub fn get_mut<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<&mut Object> {
+    pub fn get_mut<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<&mut V> {
         let i = self.get_index_of(key)?;
         // SAFETY: a found position is in bounds.
         Some(unsafe { &mut self.entries.get_unchecked_mut(i).value })
     }
 
     #[inline]
-    pub fn get_full<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(usize, &DictKey, &Object)> {
+    pub fn get_full<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(usize, &DictKey, &V)> {
         let i = self.get_index_of(key)?;
         let b = &self.entries[i];
         Some((i, &b.key, &b.value))
@@ -507,14 +507,14 @@ impl DictMap {
     pub fn get_full_mut<Q: Probe + ?Sized>(
         &mut self,
         key: &Q,
-    ) -> Option<(usize, &DictKey, &mut Object)> {
+    ) -> Option<(usize, &DictKey, &mut V)> {
         let i = self.get_index_of(key)?;
         let b = &mut self.entries[i];
         Some((i, &b.key, &mut b.value))
     }
 
     #[inline]
-    pub fn get_key_value<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(&DictKey, &Object)> {
+    pub fn get_key_value<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(&DictKey, &V)> {
         let i = self.get_index_of(key)?;
         let b = &self.entries[i];
         Some((&b.key, &b.value))
@@ -563,29 +563,29 @@ impl DictMap {
     // Positional access.
 
     #[inline]
-    pub fn get_index(&self, i: usize) -> Option<(&DictKey, &Object)> {
+    pub fn get_index(&self, i: usize) -> Option<(&DictKey, &V)> {
         self.entries.get(i).map(|b| (&b.key, &b.value))
     }
 
     #[inline]
-    pub fn get_index_mut(&mut self, i: usize) -> Option<(&DictKey, &mut Object)> {
+    pub fn get_index_mut(&mut self, i: usize) -> Option<(&DictKey, &mut V)> {
         self.entries.get_mut(i).map(|b| (&b.key, &mut b.value))
     }
 
     /// Mutable access to a key in place. The caller must keep its hash
     /// and equality unchanged.
     #[inline]
-    pub fn get_index_mut2(&mut self, i: usize) -> Option<(&mut DictKey, &mut Object)> {
+    pub fn get_index_mut2(&mut self, i: usize) -> Option<(&mut DictKey, &mut V)> {
         self.entries.get_mut(i).map(|b| (&mut b.key, &mut b.value))
     }
 
     #[inline]
-    pub fn first(&self) -> Option<(&DictKey, &Object)> {
+    pub fn first(&self) -> Option<(&DictKey, &V)> {
         self.get_index(0)
     }
 
     #[inline]
-    pub fn last(&self) -> Option<(&DictKey, &Object)> {
+    pub fn last(&self) -> Option<(&DictKey, &V)> {
         self.entries.last().map(|b| (&b.key, &b.value))
     }
 
@@ -595,7 +595,7 @@ impl DictMap {
     /// Append `key` (hash `hash`), known to be absent, at slot `pos` (from
     /// a missed [`Self::find_hashed`]): its position.
     #[inline]
-    fn push_at(&mut self, pos: usize, hash: i64, key: DictKey, value: Object) -> usize {
+    fn push_at(&mut self, pos: usize, hash: i64, key: DictKey, value: V) -> usize {
         let i = self.entries.len();
         if self.slots.is_empty() {
             if i < SMALL {
@@ -622,14 +622,14 @@ impl DictMap {
 
     /// Insert or replace: the entry's position and the replaced value.
     #[inline]
-    pub fn insert_full(&mut self, key: DictKey, value: Object) -> (usize, Option<Object>) {
+    pub fn insert_full(&mut self, key: DictKey, value: V) -> (usize, Option<V>) {
         let hash = key.probe_hash();
         self.insert_hashed(hash, key, value)
     }
 
     /// [`Self::insert_full`] with the key's Python hash precomputed.
     #[inline]
-    pub fn insert_hashed(&mut self, hash: i64, key: DictKey, value: Object) -> (usize, Option<Object>) {
+    pub fn insert_hashed(&mut self, hash: i64, key: DictKey, value: V) -> (usize, Option<V>) {
         match self.find_hashed(hash, &key) {
             Ok(i) => {
                 // SAFETY: a found position is in bounds.
@@ -641,13 +641,13 @@ impl DictMap {
     }
 
     #[inline]
-    pub fn insert(&mut self, key: DictKey, value: Object) -> Option<Object> {
+    pub fn insert(&mut self, key: DictKey, value: V) -> Option<V> {
         self.insert_full(key, value).1
     }
 
     /// Append `key` with Python hash `hash` without looking for an equal
     /// key: the caller knows there is none. Its position.
-    pub fn insert_unique_hashed(&mut self, hash: i64, key: DictKey, value: Object) -> usize {
+    pub fn insert_unique_hashed(&mut self, hash: i64, key: DictKey, value: V) -> usize {
         if self.slots.is_empty() {
             return self.push_at(0, hash, key, value);
         }
@@ -661,7 +661,7 @@ impl DictMap {
     }
 
     /// The entry for `key`, to read, change, or fill.
-    pub fn entry(&mut self, key: DictKey) -> Entry<'_> {
+    pub fn entry(&mut self, key: DictKey) -> Entry<'_, V> {
         let hash = key.probe_hash();
         match self.find_hashed(hash, &key) {
             Ok(index) => Entry::Occupied(OccupiedEntry { map: self, index }),
@@ -677,7 +677,7 @@ impl DictMap {
     /// The entry for a probe: its position if present, else a vacancy
     /// that inserts the key the caller builds.
     #[inline(always)]
-    pub fn probe_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> ProbeEntry<'_> {
+    pub fn probe_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> ProbeEntry<'_, V> {
         let hash = key.probe_hash();
         match self.find_hashed(hash, key) {
             Ok(index) => ProbeEntry::Occupied(OccupiedEntry { map: self, index }),
@@ -693,7 +693,7 @@ impl DictMap {
     // Removal.
 
     /// Remove entry `i`, shifting the later entries down.
-    pub fn shift_remove_index(&mut self, i: usize) -> Option<(DictKey, Object)> {
+    pub fn shift_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
         let n = self.entries.len();
         if i >= n {
             return None;
@@ -725,7 +725,7 @@ impl DictMap {
     }
 
     /// Remove entry `i`, moving the last entry into its place.
-    pub fn swap_remove_index(&mut self, i: usize) -> Option<(DictKey, Object)> {
+    pub fn swap_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
         let n = self.entries.len();
         if i >= n {
             return None;
@@ -743,7 +743,7 @@ impl DictMap {
     }
 
     /// Remove the last entry.
-    pub fn pop(&mut self) -> Option<(DictKey, Object)> {
+    pub fn pop(&mut self) -> Option<(DictKey, V)> {
         let n = self.entries.len();
         if n == 0 {
             return None;
@@ -756,34 +756,34 @@ impl DictMap {
         Some((b.key, b.value))
     }
 
-    pub fn shift_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, Object)> {
+    pub fn shift_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, V)> {
         let i = self.get_index_of(key)?;
         let (k, v) = self.shift_remove_index(i)?;
         Some((i, k, v))
     }
 
-    pub fn shift_remove_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(DictKey, Object)> {
+    pub fn shift_remove_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(DictKey, V)> {
         let i = self.get_index_of(key)?;
         self.shift_remove_index(i)
     }
 
-    pub fn shift_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<Object> {
+    pub fn shift_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
         self.shift_remove_entry(key).map(|(_, v)| v)
     }
 
-    pub fn swap_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<Object> {
+    pub fn swap_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
         let i = self.get_index_of(key)?;
         self.swap_remove_index(i).map(|(_, v)| v)
     }
 
-    pub fn swap_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, Object)> {
+    pub fn swap_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, V)> {
         let i = self.get_index_of(key)?;
         let (k, v) = self.swap_remove_index(i)?;
         Some((i, k, v))
     }
 
     /// Keep the entries `keep` accepts, in order.
-    pub fn retain(&mut self, mut keep: impl FnMut(&DictKey, &mut Object) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&DictKey, &mut V) -> bool) {
         let n = self.entries.len();
         self.entries.retain_mut(|b| keep(&b.key, &mut b.value));
         if self.entries.len() != n {
@@ -815,8 +815,8 @@ impl DictMap {
     }
 
     /// Remove the entries in `range`, yielding them.
-    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> std::vec::IntoIter<(DictKey, Object)> {
-        let out: Vec<(DictKey, Object)> = self.entries.drain(range).map(|b| (b.key, b.value)).collect();
+    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> std::vec::IntoIter<(DictKey, V)> {
+        let out: Vec<(DictKey, V)> = self.entries.drain(range).map(|b| (b.key, b.value)).collect();
         self.reindex();
         out.into_iter()
     }
@@ -879,7 +879,7 @@ impl DictMap {
     }
 
     /// Sort the entries with `cmp` (stable).
-    pub fn sort_by(&mut self, mut cmp: impl FnMut(&DictKey, &Object, &DictKey, &Object) -> std::cmp::Ordering) {
+    pub fn sort_by(&mut self, mut cmp: impl FnMut(&DictKey, &V, &DictKey, &V) -> std::cmp::Ordering) {
         self.entries
             .sort_by(|a, b| cmp(&a.key, &a.value, &b.key, &b.value));
         self.reindex();
@@ -895,34 +895,34 @@ impl DictMap {
     // Iteration.
 
     #[inline]
-    pub fn iter(&self) -> Iter<'_> {
+    pub fn iter(&self) -> Iter<'_, V> {
         Iter(self.entries.iter())
     }
 
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<'_> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, V> {
         IterMut(self.entries.iter_mut())
     }
 
     /// Mutable keys and values. The caller must keep every key's hash and
     /// equality unchanged.
     #[inline]
-    pub fn iter_mut2(&mut self) -> IterMut2<'_> {
+    pub fn iter_mut2(&mut self) -> IterMut2<'_, V> {
         IterMut2(self.entries.iter_mut())
     }
 
     #[inline]
-    pub fn keys(&self) -> Keys<'_> {
+    pub fn keys(&self) -> Keys<'_, V> {
         Keys(self.entries.iter())
     }
 
     #[inline]
-    pub fn values(&self) -> Values<'_> {
+    pub fn values(&self) -> Values<'_, V> {
         Values(self.entries.iter())
     }
 
     #[inline]
-    pub fn values_mut(&mut self) -> ValuesMut<'_> {
+    pub fn values_mut(&mut self) -> ValuesMut<'_, V> {
         ValuesMut(self.entries.iter_mut())
     }
 
@@ -930,29 +930,29 @@ impl DictMap {
         self.entries.into_iter().map(|b| b.key)
     }
 
-    pub fn into_values(self) -> impl DoubleEndedIterator<Item = Object> + ExactSizeIterator {
+    pub fn into_values(self) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator {
         self.entries.into_iter().map(|b| b.value)
     }
 }
 
 /// An entry of [`DictMap::entry`].
 #[derive(Debug)]
-pub enum Entry<'a> {
-    Occupied(OccupiedEntry<'a>),
-    Vacant(VacantEntry<'a>),
+pub enum Entry<'a, V = Object> {
+    Occupied(OccupiedEntry<'a, V>),
+    Vacant(VacantEntry<'a, V>),
 }
 
 /// A present entry.
 #[derive(Debug)]
-pub struct OccupiedEntry<'a> {
-    map: &'a mut DictMap,
+pub struct OccupiedEntry<'a, V = Object> {
+    map: &'a mut Table<V>,
     index: usize,
 }
 
 /// An absent key, with the slot it would take.
 #[derive(Debug)]
-pub struct VacantEntry<'a> {
-    map: &'a mut DictMap,
+pub struct VacantEntry<'a, V = Object> {
+    map: &'a mut Table<V>,
     key: DictKey,
     hash: i64,
     pos: usize,
@@ -960,28 +960,28 @@ pub struct VacantEntry<'a> {
 
 /// An entry of [`DictMap::probe_entry`].
 #[derive(Debug)]
-pub enum ProbeEntry<'a> {
-    Occupied(OccupiedEntry<'a>),
-    Vacant(ProbeVacancy<'a>),
+pub enum ProbeEntry<'a, V = Object> {
+    Occupied(OccupiedEntry<'a, V>),
+    Vacant(ProbeVacancy<'a, V>),
 }
 
 /// An absent probe key, with its hash and the slot it would take.
 #[derive(Debug)]
-pub struct ProbeVacancy<'a> {
-    map: &'a mut DictMap,
+pub struct ProbeVacancy<'a, V = Object> {
+    map: &'a mut Table<V>,
     hash: i64,
     pos: usize,
 }
 
-impl<'a> Entry<'a> {
-    pub fn or_insert(self, default: Object) -> &'a mut Object {
+impl<'a, V> Entry<'a, V> {
+    pub fn or_insert(self, default: V) -> &'a mut V {
         match self {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(default),
         }
     }
 
-    pub fn or_insert_with(self, f: impl FnOnce() -> Object) -> &'a mut Object {
+    pub fn or_insert_with(self, f: impl FnOnce() -> V) -> &'a mut V {
         match self {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(f()),
@@ -996,7 +996,7 @@ impl<'a> Entry<'a> {
     }
 }
 
-impl<'a> OccupiedEntry<'a> {
+impl<'a, V> OccupiedEntry<'a, V> {
     #[inline]
     pub fn index(&self) -> usize {
         self.index
@@ -1008,49 +1008,49 @@ impl<'a> OccupiedEntry<'a> {
     }
 
     #[inline]
-    pub fn get(&self) -> &Object {
+    pub fn get(&self) -> &V {
         &self.map.entries[self.index].value
     }
 
     #[inline]
-    pub fn get_mut(&mut self) -> &mut Object {
+    pub fn get_mut(&mut self) -> &mut V {
         &mut self.map.entries[self.index].value
     }
 
     #[inline]
-    pub fn into_mut(self) -> &'a mut Object {
+    pub fn into_mut(self) -> &'a mut V {
         &mut self.map.entries[self.index].value
     }
 
     #[inline]
-    pub fn insert(&mut self, value: Object) -> Object {
+    pub fn insert(&mut self, value: V) -> V {
         std::mem::replace(self.get_mut(), value)
     }
 
-    pub fn shift_remove_entry(self) -> (DictKey, Object) {
+    pub fn shift_remove_entry(self) -> (DictKey, V) {
         self.map
             .shift_remove_index(self.index)
             .expect("occupied entry is present")
     }
 
-    pub fn shift_remove(self) -> Object {
+    pub fn shift_remove(self) -> V {
         self.shift_remove_entry().1
     }
 }
 
-impl<'a> VacantEntry<'a> {
+impl<'a, V> VacantEntry<'a, V> {
     #[inline]
     pub fn key(&self) -> &DictKey {
         &self.key
     }
 
-    pub fn insert(self, value: Object) -> &'a mut Object {
+    pub fn insert(self, value: V) -> &'a mut V {
         let i = self.map.push_at(self.pos, self.hash, self.key, value);
         &mut self.map.entries[i].value
     }
 }
 
-impl<'a> ProbeVacancy<'a> {
+impl<'a, V> ProbeVacancy<'a, V> {
     /// The probe's Python hash.
     #[inline]
     pub fn hash(&self) -> i64 {
@@ -1060,16 +1060,16 @@ impl<'a> ProbeVacancy<'a> {
     /// Insert `key`, which must equal the probe (same hash, same key):
     /// its position.
     #[inline]
-    pub fn insert(self, key: DictKey, value: Object) -> usize {
+    pub fn insert(self, key: DictKey, value: V) -> usize {
         self.map.push_at(self.pos, self.hash, key, value)
     }
 }
 
 macro_rules! entry_iter {
     ($name:ident, $inner:ty, $item:ty, |$b:ident| $map:expr) => {
-        pub struct $name<'a>($inner);
+        pub struct $name<'a, V = Object>($inner);
 
-        impl<'a> Iterator for $name<'a> {
+        impl<'a, V> Iterator for $name<'a, V> {
             type Item = $item;
 
             #[inline]
@@ -1098,7 +1098,7 @@ macro_rules! entry_iter {
             }
         }
 
-        impl DoubleEndedIterator for $name<'_> {
+        impl<V> DoubleEndedIterator for $name<'_, V> {
             #[inline]
             fn next_back(&mut self) -> Option<Self::Item> {
                 self.0.next_back().map(|$b| $map)
@@ -1110,16 +1110,16 @@ macro_rules! entry_iter {
             }
         }
 
-        impl ExactSizeIterator for $name<'_> {
+        impl<V> ExactSizeIterator for $name<'_, V> {
             #[inline]
             fn len(&self) -> usize {
                 self.0.len()
             }
         }
 
-        impl std::iter::FusedIterator for $name<'_> {}
+        impl<V> std::iter::FusedIterator for $name<'_, V> {}
 
-        impl fmt::Debug for $name<'_> {
+        impl<V> fmt::Debug for $name<'_, V> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name)).finish_non_exhaustive()
             }
@@ -1127,36 +1127,36 @@ macro_rules! entry_iter {
     };
 }
 
-entry_iter!(Iter, std::slice::Iter<'a, Bucket>, (&'a DictKey, &'a Object), |b| (&b.key, &b.value));
-entry_iter!(IterMut, std::slice::IterMut<'a, Bucket>, (&'a DictKey, &'a mut Object), |b| (&b.key, &mut b.value));
-entry_iter!(IterMut2, std::slice::IterMut<'a, Bucket>, (&'a mut DictKey, &'a mut Object), |b| (&mut b.key, &mut b.value));
-entry_iter!(Keys, std::slice::Iter<'a, Bucket>, &'a DictKey, |b| &b.key);
-entry_iter!(Values, std::slice::Iter<'a, Bucket>, &'a Object, |b| &b.value);
-entry_iter!(ValuesMut, std::slice::IterMut<'a, Bucket>, &'a mut Object, |b| &mut b.value);
+entry_iter!(Iter, std::slice::Iter<'a, Bucket<V>>, (&'a DictKey, &'a V), |b| (&b.key, &b.value));
+entry_iter!(IterMut, std::slice::IterMut<'a, Bucket<V>>, (&'a DictKey, &'a mut V), |b| (&b.key, &mut b.value));
+entry_iter!(IterMut2, std::slice::IterMut<'a, Bucket<V>>, (&'a mut DictKey, &'a mut V), |b| (&mut b.key, &mut b.value));
+entry_iter!(Keys, std::slice::Iter<'a, Bucket<V>>, &'a DictKey, |b| &b.key);
+entry_iter!(Values, std::slice::Iter<'a, Bucket<V>>, &'a V, |b| &b.value);
+entry_iter!(ValuesMut, std::slice::IterMut<'a, Bucket<V>>, &'a mut V, |b| &mut b.value);
 
-impl Clone for Iter<'_> {
+impl<V> Clone for Iter<'_, V> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl Clone for Keys<'_> {
+impl<V> Clone for Keys<'_, V> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl Clone for Values<'_> {
+impl<V> Clone for Values<'_, V> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 /// The owning iterator of a [`DictMap`].
-pub struct IntoIter(std::vec::IntoIter<Bucket>);
+pub struct IntoIter<V = Object>(std::vec::IntoIter<Bucket<V>>);
 
-impl Iterator for IntoIter {
-    type Item = (DictKey, Object);
+impl<V> Iterator for IntoIter<V> {
+    type Item = (DictKey, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -1169,50 +1169,50 @@ impl Iterator for IntoIter {
     }
 }
 
-impl DoubleEndedIterator for IntoIter {
+impl<V> DoubleEndedIterator for IntoIter<V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.0.next_back().map(|b| (b.key, b.value))
     }
 }
 
-impl ExactSizeIterator for IntoIter {}
+impl<V> ExactSizeIterator for IntoIter<V> {}
 
-impl fmt::Debug for IntoIter {
+impl<V> fmt::Debug for IntoIter<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntoIter").finish_non_exhaustive()
     }
 }
 
-impl IntoIterator for DictMap {
-    type Item = (DictKey, Object);
-    type IntoIter = IntoIter;
+impl<V> IntoIterator for Table<V> {
+    type Item = (DictKey, V);
+    type IntoIter = IntoIter<V>;
 
-    fn into_iter(self) -> IntoIter {
+    fn into_iter(self) -> IntoIter<V> {
         IntoIter(self.entries.into_iter())
     }
 }
 
-impl<'a> IntoIterator for &'a DictMap {
-    type Item = (&'a DictKey, &'a Object);
-    type IntoIter = Iter<'a>;
+impl<'a, V> IntoIterator for &'a Table<V> {
+    type Item = (&'a DictKey, &'a V);
+    type IntoIter = Iter<'a, V>;
 
-    fn into_iter(self) -> Iter<'a> {
+    fn into_iter(self) -> Iter<'a, V> {
         self.iter()
     }
 }
 
-impl<'a> IntoIterator for &'a mut DictMap {
-    type Item = (&'a DictKey, &'a mut Object);
-    type IntoIter = IterMut<'a>;
+impl<'a, V> IntoIterator for &'a mut Table<V> {
+    type Item = (&'a DictKey, &'a mut V);
+    type IntoIter = IterMut<'a, V>;
 
-    fn into_iter(self) -> IterMut<'a> {
+    fn into_iter(self) -> IterMut<'a, V> {
         self.iter_mut()
     }
 }
 
-impl Extend<(DictKey, Object)> for DictMap {
-    fn extend<I: IntoIterator<Item = (DictKey, Object)>>(&mut self, iter: I) {
+impl<V> Extend<(DictKey, V)> for Table<V> {
+    fn extend<I: IntoIterator<Item = (DictKey, V)>>(&mut self, iter: I) {
         let iter = iter.into_iter();
         let (lo, _) = iter.size_hint();
         // (As IndexMap: reserve for all when empty, else half, since some
@@ -1224,39 +1224,401 @@ impl Extend<(DictKey, Object)> for DictMap {
     }
 }
 
-impl<'a> Extend<(&'a DictKey, &'a Object)> for DictMap {
-    fn extend<I: IntoIterator<Item = (&'a DictKey, &'a Object)>>(&mut self, iter: I) {
+impl<'a, V: Clone + 'a> Extend<(&'a DictKey, &'a V)> for Table<V> {
+    fn extend<I: IntoIterator<Item = (&'a DictKey, &'a V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 }
 
-impl FromIterator<(DictKey, Object)> for DictMap {
-    fn from_iter<I: IntoIterator<Item = (DictKey, Object)>>(iter: I) -> Self {
+impl<V> FromIterator<(DictKey, V)> for Table<V> {
+    fn from_iter<I: IntoIterator<Item = (DictKey, V)>>(iter: I) -> Self {
         let mut m = Self::new();
         m.extend(iter);
         m
     }
 }
 
-impl<const N: usize> From<[(DictKey, Object); N]> for DictMap {
-    fn from(arr: [(DictKey, Object); N]) -> Self {
+impl<V, const N: usize> From<[(DictKey, V); N]> for Table<V> {
+    fn from(arr: [(DictKey, V); N]) -> Self {
         Self::from_iter(arr)
     }
 }
 
-impl<Q: Probe + ?Sized> std::ops::Index<&Q> for DictMap {
-    type Output = Object;
+impl<V, Q: Probe + ?Sized> std::ops::Index<&Q> for Table<V> {
+    type Output = V;
 
-    fn index(&self, key: &Q) -> &Object {
+    fn index(&self, key: &Q) -> &V {
         self.get(key).expect("key not found")
     }
 }
 
-impl std::ops::Index<usize> for DictMap {
-    type Output = Object;
+impl<V> std::ops::Index<usize> for Table<V> {
+    type Output = V;
 
-    fn index(&self, i: usize) -> &Object {
+    fn index(&self, i: usize) -> &V {
         &self.entries[i].value
+    }
+}
+
+/// The table behind a `dict`.
+pub type DictMap = Table<Object>;
+
+/// The table behind a `set` or `frozenset`: [`Table`]'s entries without
+/// values (a key and its hash), with the set operations' names. Iteration
+/// is in insertion order; a removal moves the last entry into the freed
+/// position (`set` order is arbitrary, and a set's iterator reports any
+/// change of size).
+#[derive(Clone, Default)]
+pub struct SetMap(Table<()>);
+
+impl fmt::Debug for SetMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+/// The keys of a [`SetMap`], in order.
+pub type SetIter<'a> = Keys<'a, ()>;
+
+impl SetMap {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Table::new())
+    }
+
+    #[inline]
+    pub fn with_capacity(n: usize) -> Self {
+        Self(Table::with_capacity(n))
+    }
+
+    /// [`Self::with_capacity`]; the hasher is implied (see [`Table`]).
+    #[inline]
+    pub fn with_capacity_and_hasher(n: usize, _: crate::fasthash::FxBuildHasher) -> Self {
+        Self::with_capacity(n)
+    }
+
+    /// [`Self::new`]; the hasher is implied.
+    #[inline]
+    pub fn with_hasher(_: crate::fasthash::FxBuildHasher) -> Self {
+        Self::new()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.0.shrink_to_fit();
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The entries in order (each key with its stored hash).
+    #[inline]
+    pub fn as_entries(&self) -> &[Bucket<()>] {
+        self.0.as_entries()
+    }
+
+    /// Add `key`: `false` when an equal key was already present (which
+    /// stays).
+    #[inline]
+    pub fn insert(&mut self, key: DictKey) -> bool {
+        self.insert_full(key).1
+    }
+
+    /// [`Self::insert`], with the key's position.
+    #[inline]
+    pub fn insert_full(&mut self, key: DictKey) -> (usize, bool) {
+        let hash = key.probe_hash();
+        self.insert_hashed(hash, key)
+    }
+
+    /// [`Self::insert_full`] with the key's Python hash precomputed.
+    #[inline]
+    pub fn insert_hashed(&mut self, hash: i64, key: DictKey) -> (usize, bool) {
+        match self.0.find_hashed(hash, &key) {
+            Ok(i) => (i, false),
+            Err(pos) => (self.0.push_at(pos, hash, key, ()), true),
+        }
+    }
+
+    /// Append `key` with Python hash `hash`, known to be absent: its
+    /// position.
+    #[inline]
+    pub fn insert_unique_hashed(&mut self, hash: i64, key: DictKey) -> usize {
+        self.0.insert_unique_hashed(hash, key, ())
+    }
+
+    /// Add a probe's key if absent: the key is built (by `make`) only
+    /// then. `true` when it was added.
+    #[inline]
+    pub fn insert_probe<Q: Probe + ?Sized>(&mut self, key: &Q, make: impl FnOnce() -> DictKey) -> bool {
+        match self.0.probe_entry(key) {
+            ProbeEntry::Occupied(_) => false,
+            ProbeEntry::Vacant(v) => {
+                v.insert(make(), ());
+                true
+            }
+        }
+    }
+
+    /// The position of the key equal to `key`. The probe is hashed even
+    /// when the table is empty (CPython hashes first, so a raising
+    /// `__hash__` surfaces from `x in set()`).
+    #[inline]
+    fn find<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
+        if self.0.is_empty() {
+            let _ = key.probe_hash();
+            return None;
+        }
+        self.0.get_index_of(key)
+    }
+
+    #[inline]
+    pub fn contains<Q: Probe + ?Sized>(&self, key: &Q) -> bool {
+        self.find(key).is_some()
+    }
+
+    #[inline]
+    pub fn get_index_of<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
+        self.find(key)
+    }
+
+    /// The stored key equal to `key`.
+    #[inline]
+    pub fn get<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&DictKey> {
+        let i = self.find(key)?;
+        Some(&self.0.as_entries()[i].key)
+    }
+
+    #[inline]
+    pub fn get_full<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(usize, &DictKey)> {
+        let i = self.find(key)?;
+        Some((i, &self.0.as_entries()[i].key))
+    }
+
+    /// The position of the first key with Python hash `hash` that `eq`
+    /// accepts (see [`Table::find_by_hash`]).
+    #[inline]
+    pub fn find_by_hash(&self, hash: i64, eq: impl FnMut(&DictKey) -> bool) -> Option<usize> {
+        self.0.find_by_hash(hash, eq)
+    }
+
+    /// The stored Python hash of the key at `i`.
+    #[inline]
+    pub fn hash_at(&self, i: usize) -> Option<i64> {
+        self.0.hash_at(i)
+    }
+
+    #[inline]
+    pub fn get_index(&self, i: usize) -> Option<&DictKey> {
+        self.0.as_entries().get(i).map(|b| &b.key)
+    }
+
+    #[inline]
+    pub fn first(&self) -> Option<&DictKey> {
+        self.get_index(0)
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<&DictKey> {
+        self.0.as_entries().last().map(|b| &b.key)
+    }
+
+    /// Remove the key equal to `key` (the last key takes its place):
+    /// whether it was present.
+    #[inline]
+    pub fn swap_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> bool {
+        self.swap_take(key).is_some()
+    }
+
+    /// [`Self::swap_remove`], returning the removed key.
+    #[inline]
+    pub fn swap_take<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<DictKey> {
+        let i = self.find(key)?;
+        self.0.swap_remove_index(i).map(|(k, ())| k)
+    }
+
+    /// [`Self::swap_take`], with the key's former position.
+    #[inline]
+    pub fn swap_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey)> {
+        let i = self.find(key)?;
+        self.0.swap_remove_index(i).map(|(k, ())| (i, k))
+    }
+
+    /// Remove the key equal to `key`, shifting the later keys down.
+    #[inline]
+    pub fn shift_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> bool {
+        self.shift_take(key).is_some()
+    }
+
+    /// [`Self::shift_remove`], returning the removed key.
+    #[inline]
+    pub fn shift_take<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<DictKey> {
+        let i = self.find(key)?;
+        self.0.shift_remove_index(i).map(|(k, ())| k)
+    }
+
+    #[inline]
+    pub fn swap_remove_index(&mut self, i: usize) -> Option<DictKey> {
+        self.0.swap_remove_index(i).map(|(k, ())| k)
+    }
+
+    #[inline]
+    pub fn shift_remove_index(&mut self, i: usize) -> Option<DictKey> {
+        self.0.shift_remove_index(i).map(|(k, ())| k)
+    }
+
+    /// Remove the last key.
+    #[inline]
+    pub fn pop(&mut self) -> Option<DictKey> {
+        self.0.pop().map(|(k, ())| k)
+    }
+
+    /// Keep the keys `keep` accepts, in order.
+    pub fn retain(&mut self, mut keep: impl FnMut(&DictKey) -> bool) {
+        self.0.retain(|k, ()| keep(k));
+    }
+
+    /// Remove the keys in `range`, yielding them.
+    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> impl Iterator<Item = DictKey> {
+        self.0.drain(range).map(|(k, ())| k)
+    }
+
+    /// Sort the keys with `cmp` (stable).
+    pub fn sort_by(&mut self, mut cmp: impl FnMut(&DictKey, &DictKey) -> std::cmp::Ordering) {
+        self.0.sort_by_key_with(|a, b| cmp(a, b));
+    }
+
+    #[inline]
+    pub fn iter(&self) -> SetIter<'_> {
+        self.0.keys()
+    }
+
+    /// The keys in `self` that `other` lacks, in order.
+    pub fn difference<'a>(&'a self, other: &'a SetMap) -> impl Iterator<Item = &'a DictKey> + 'a {
+        self.iter().filter(move |k| !other.contains(*k))
+    }
+
+    /// The keys in both, in `self`'s order.
+    pub fn intersection<'a>(&'a self, other: &'a SetMap) -> impl Iterator<Item = &'a DictKey> + 'a {
+        self.iter().filter(move |k| other.contains(*k))
+    }
+
+    /// `self`'s keys, then `other`'s that `self` lacks.
+    pub fn union<'a>(&'a self, other: &'a SetMap) -> impl Iterator<Item = &'a DictKey> + 'a {
+        self.iter().chain(other.difference(self))
+    }
+
+    /// The keys in exactly one, `self`'s first.
+    pub fn symmetric_difference<'a>(
+        &'a self,
+        other: &'a SetMap,
+    ) -> impl Iterator<Item = &'a DictKey> + 'a {
+        self.difference(other).chain(other.difference(self))
+    }
+
+    pub fn is_subset(&self, other: &SetMap) -> bool {
+        self.len() <= other.len() && self.iter().all(|k| other.contains(k))
+    }
+
+    pub fn is_superset(&self, other: &SetMap) -> bool {
+        other.is_subset(self)
+    }
+
+    pub fn is_disjoint(&self, other: &SetMap) -> bool {
+        let (small, big) = if self.len() <= other.len() {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        small.iter().all(|k| !big.contains(k))
+    }
+}
+
+impl IntoIterator for SetMap {
+    type Item = DictKey;
+    type IntoIter = std::iter::Map<IntoIter<()>, fn((DictKey, ())) -> DictKey>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        fn key((k, ()): (DictKey, ())) -> DictKey {
+            k
+        }
+        self.0.into_iter().map(key as fn((DictKey, ())) -> DictKey)
+    }
+}
+
+impl<'a> IntoIterator for &'a SetMap {
+    type Item = &'a DictKey;
+    type IntoIter = SetIter<'a>;
+
+    fn into_iter(self) -> SetIter<'a> {
+        self.iter()
+    }
+}
+
+impl Extend<DictKey> for SetMap {
+    fn extend<I: IntoIterator<Item = DictKey>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lo, _) = iter.size_hint();
+        self.reserve(if self.is_empty() { lo } else { lo.div_ceil(2) });
+        for k in iter {
+            self.insert(k);
+        }
+    }
+}
+
+impl<'a> Extend<&'a DictKey> for SetMap {
+    fn extend<I: IntoIterator<Item = &'a DictKey>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().cloned());
+    }
+}
+
+impl FromIterator<DictKey> for SetMap {
+    fn from_iter<I: IntoIterator<Item = DictKey>>(iter: I) -> Self {
+        let mut s = Self::new();
+        s.extend(iter);
+        s
+    }
+}
+
+impl<const N: usize> From<[DictKey; N]> for SetMap {
+    fn from(arr: [DictKey; N]) -> Self {
+        Self::from_iter(arr)
+    }
+}
+
+/// Equal sizes, and every key of one in the other (order aside).
+impl PartialEq for SetMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|k| other.contains(k))
+    }
+}
+
+impl std::ops::Index<usize> for SetMap {
+    type Output = DictKey;
+
+    fn index(&self, i: usize) -> &DictKey {
+        &self.0.as_entries()[i].key
     }
 }
 

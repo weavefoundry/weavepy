@@ -1608,7 +1608,7 @@ fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
 /// bpo-46615 regression tests, can re-enter and `clear()` the operands)
 /// *without* holding a borrow on any live `Object::Set` cell. We snapshot
 /// the elements out under a short-lived borrow (`set_items`) and rebuild a
-/// detached `IndexSet`, so a re-entrant mutation touches a cell we are no
+/// detached set table, so a re-entrant mutation touches a cell we are no
 /// longer borrowing instead of panicking with `BorrowMutError`.
 fn snapshot_set(o: &Object) -> crate::object::SetData {
     let mut out = crate::object::SetData::default();
