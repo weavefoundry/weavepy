@@ -1528,7 +1528,8 @@ unsafe extern "C" fn h_for_iter_rest(
         // A set's next element while the set keeps its size (a change,
         // and exhaustion, are the core loop's to report).
         PyIterator::Set { set, len, index } => {
-            let Ok(items) = set.try_borrow() else {
+            // SAFETY: as above (a distinct cell; the read runs no code).
+            let Some(items) = (unsafe { set.peek() }) else {
                 return 3;
             };
             if items.len() != *len {

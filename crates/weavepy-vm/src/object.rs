@@ -9636,6 +9636,29 @@ impl PyIterator {
         }
     }
 
+    /// Step past the item [`Self::pure_peek`] returned (as `next` steps a
+    /// sequence iterator, whatever the sequence holds now): `false` for
+    /// any other iterator, untouched.
+    #[inline]
+    pub fn pure_skip(&mut self) -> bool {
+        match self {
+            PyIterator::List {
+                index, owner: None, ..
+            }
+            | PyIterator::Tuple { index, .. } => *index += 1,
+            PyIterator::Range { current, step, .. } => *current = current.wrapping_add(*step),
+            PyIterator::Str { s, index } => match s.get(*index..).and_then(|r| r.chars().next()) {
+                Some(ch) => *index += ch.len_utf8(),
+                None => return false,
+            },
+            PyIterator::Reversed {
+                index, owner: None, ..
+            } if *index >= 0 => *index -= 1,
+            _ => return false,
+        }
+        true
+    }
+
     /// Whether this iterator can participate in a reference cycle and so
     /// should be enrolled with the cycle GC when created (CPython tracks
     /// these `*_iterator` objects). Scalar iterators (`range`, `str`,

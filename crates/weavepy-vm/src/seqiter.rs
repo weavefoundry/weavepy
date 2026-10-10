@@ -17,7 +17,7 @@ use crate::builtin_types::{builtin_types, BuiltinTypes};
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::object::{BuiltinFn, DictData, DictKey, LazyIterKind, Object, PyIterator, PyLazyIter};
 use crate::types::{PyInstance, TypeObject};
-use crate::Interpreter;
+use crate::{Interpreter, LeafKind};
 
 /// Which builtin adapter type a class is (or derives from).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,7 +136,7 @@ impl Interpreter {
         v: Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        if let Some(r) = self.pure_callback(func, std::slice::from_ref(&v)) {
+        if let Some(r) = self.pure_callback(func, std::slice::from_ref(&v), true) {
             self.release(v);
             return Ok(r);
         }
@@ -914,6 +914,26 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     else {
         return itertools_pure_next(l);
     };
+    // Two plain sequence cursors (`zip(xs, ys)`), the commonest shape.
+    if let [a, b] = iters.as_slice() {
+        if let Some((x, y)) = cursor_pair(a, b) {
+            if let Some(slots) = result
+                .as_mut()
+                .and_then(crate::shared_value::ThinArc::get_mut)
+                .filter(|slots| slots.len() == 2)
+            {
+                let old = (
+                    std::mem::replace(&mut slots[0], x),
+                    std::mem::replace(&mut slots[1], y),
+                );
+                drop(old);
+                return Some(Some(Object::Tuple(result.clone()?)));
+            }
+            let t = crate::object::TupleStorage::from_array([x, y]);
+            *result = Some(t.clone());
+            return Some(Some(Object::Tuple(t)));
+        }
+    }
     if !srcs_ready(iters) {
         return None;
     }
@@ -958,10 +978,34 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     let [a, b] = iters.as_slice() else {
         return None;
     };
+    if let Some(pair) = cursor_pair(a, b) {
+        return Some(pair);
+    }
     if !srcs_ready(iters) {
         return None;
     }
     Some((src_step(a)?, src_step(b)?))
+}
+
+/// The next items of two distinct plain sequence cursors, both taken; `None`
+/// (neither taken) unless both have one.
+#[inline]
+fn cursor_pair(a: &Object, b: &Object) -> Option<(Object, Object)> {
+    let (Object::Iter(ca), Object::Iter(cb)) = (a, b) else {
+        return None;
+    };
+    if Rc::ptr_eq(ca, cb) {
+        return None;
+    }
+    // SAFETY: two distinct cells; nothing below runs code, and the views
+    // end with this call.
+    let (ia, ib) = unsafe { (ca.peek_mut()?, cb.peek_mut()?) };
+    let x = ia.pure_peek()?;
+    let y = ib.pure_peek()?;
+    // (`pure_skip` steps past exactly what `pure_peek` found.)
+    ia.pure_skip();
+    ib.pure_skip();
+    Some((x, y))
 }
 
 /// The `itertools` state machines that touch no other object (`repeat`,
@@ -1815,11 +1859,11 @@ fn cursor_peek(c: &Rc<RefCell<PyIterator>>) -> Option<Object> {
     unsafe { c.peek() }?.pure_peek()
 }
 
-/// Take the item [`cursor_peek`] found.
+/// Step past the item [`cursor_peek`] found.
 #[inline]
 fn cursor_advance(c: &Rc<RefCell<PyIterator>>) -> Option<()> {
     // SAFETY: as above; the item was found ready.
-    unsafe { c.peek_mut() }?.next_value().map(drop)
+    unsafe { c.peek_mut() }?.pure_skip().then_some(())
 }
 
 impl Interpreter {
@@ -1830,14 +1874,40 @@ impl Interpreter {
     /// native constructor builds the value (`int`, `str`, `type`, ...).
     /// `None` leaves the call to the full machinery, nothing having
     /// happened (a pure call that would raise declines too, so the full
-    /// call raises it).
-    pub(crate) fn pure_callback(&self, func: &Object, args: &[Object]) -> Option<Object> {
+    /// call raises it). Without `effects`, only callbacks with no effect
+    /// beyond their result qualify (a caller that may yet decline after
+    /// the call: no `list.append`, `set.pop`, or opaque registered leaf).
+    pub(crate) fn pure_callback(
+        &self,
+        func: &Object,
+        args: &[Object],
+        effects: bool,
+    ) -> Option<Object> {
+        let admit = |kind: LeafKind| -> Option<LeafKind> {
+            let effect = matches!(
+                kind,
+                LeafKind::ListAppend
+                    | LeafKind::ListPop
+                    | LeafKind::ListExtend
+                    | LeafKind::ListInsert
+                    | LeafKind::ListReverse
+                    | LeafKind::ListRemove
+                    | LeafKind::SetAdd
+                    | LeafKind::SetDiscard
+                    | LeafKind::SetRemove
+                    | LeafKind::SetPop
+                    | LeafKind::Opaque
+                    | LeafKind::Scalar
+                    | LeafKind::Fast(_)
+            );
+            (effects || !effect).then_some(kind)
+        };
         match func {
             Object::Function(f) => self.call_pure_leaf(f, args),
             // (As the core loop's leaf builtin lane admits them: a function,
             // or a method bound to its exact builtin receiver.)
             Object::Builtin(b) if !b.binds_instance => {
-                let kind = self.leaf_call_kind(b)?;
+                let kind = admit(self.leaf_call_kind(b)?)?;
                 self.leaf_builtin_call(kind, b, args)?.ok()
             }
             Object::Type(t) => self.leaf_type_call(t, args),
@@ -1847,7 +1917,7 @@ impl Interpreter {
                     if b.binds_instance
                         && crate::builtins::method_memo_tag(&bm.receiver).is_some() =>
                 {
-                    let kind = self.leaf_call_kind(b)?;
+                    let kind = admit(self.leaf_call_kind(b)?)?;
                     let call = match args {
                         [a] => [bm.receiver.clone(), a.clone()],
                         _ => return None,
@@ -1870,7 +1940,7 @@ impl Interpreter {
         let value = cursor_peek(c)?;
         let key = match keyfunc {
             Object::None => value.clone(),
-            f => self.pure_callback(f, std::slice::from_ref(&value))?,
+            f => self.pure_callback(f, std::slice::from_ref(&value), true)?,
         };
         cursor_advance(c)?;
         Some((value, key))
@@ -1893,13 +1963,13 @@ impl Interpreter {
             LazyIterKind::Map { func, iters, .. } => match iters.as_slice() {
                 [Object::Iter(c)] => {
                     let v = cursor_peek(c)?;
-                    let r = self.pure_callback(func, std::slice::from_ref(&v))?;
+                    let r = self.pure_callback(func, std::slice::from_ref(&v), true)?;
                     cursor_advance(c)?;
                     Some(Some(r))
                 }
                 [Object::Iter(a), Object::Iter(b)] if !Rc::ptr_eq(a, b) => {
                     let args = [cursor_peek(a)?, cursor_peek(b)?];
-                    let r = self.pure_callback(func, &args)?;
+                    let r = self.pure_callback(func, &args, true)?;
                     cursor_advance(a)?;
                     cursor_advance(b)?;
                     Some(Some(r))
@@ -1914,7 +1984,10 @@ impl Interpreter {
                 let keep = match &*func {
                     Object::None => scalar_truth(&v)?,
                     Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => scalar_truth(&v)?,
-                    f => scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v))?)?,
+                    // (The truth test may yet decline: no effects.)
+                    f => {
+                        scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v), false)?)?
+                    }
                 };
                 cursor_advance(c)?;
                 if keep {
@@ -2010,6 +2083,9 @@ impl Interpreter {
                 drop(old);
                 Some(Some(value))
             }
+            // A `filter` or `enumerate` over a source only the
+            // interpreter can step.
+            LazyIterKind::Filter { .. } | LazyIterKind::Enumerate { .. } => None,
             _ => lazy_pure_next(l),
         }
     }
