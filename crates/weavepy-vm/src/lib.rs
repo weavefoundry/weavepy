@@ -8407,11 +8407,41 @@ impl Interpreter {
         // Committed.
         let prev_state = std::mem::replace(state, GeneratorState::Running);
         let g = g.clone();
-        let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
-            prev_state
-        else {
+        let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) = prev_state else {
             unreachable!("checked above");
         };
+        let sent = if send {
+            frame.stack.pop().unwrap_or(Object::None)
+        } else {
+            Object::None
+        };
+        Some(self.inline_gen_commit(
+            frame,
+            shell,
+            pc,
+            mode,
+            arg,
+            (g, boxed, first_resume, sent),
+            guard,
+        ))
+    }
+
+    /// [`Self::try_inline_gen`]'s commit, once the generator `g` (its
+    /// frame `boxed`, running from here) passed its checks: the sent value
+    /// goes in (unless a fast step already consumed one), the consumer's
+    /// operands leave by `mode`, and the activation is built.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn inline_gen_commit(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        mode: InlineResume,
+        arg: u32,
+        (g, mut boxed, first_resume, sent): (Rc<PyGenerator>, Box<Frame>, bool, Object),
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
         let gf: &mut Frame = &mut boxed;
         // A native activation parked at the yield is rebuilt into the
         // interpreted suspension resumed here.
@@ -8419,11 +8449,6 @@ impl Interpreter {
         crate::tier2::materialize_parked(gf);
         gf.gen_first_resume = first_resume;
         // (A fast step that stopped partway already consumed it.)
-        let sent = if send {
-            frame.stack.pop().unwrap_or(Object::None)
-        } else {
-            Object::None
-        };
         if !std::mem::take(&mut gf.sent_consumed) {
             gf.push(sent);
         }
@@ -8472,7 +8497,7 @@ impl Interpreter {
         act.call_pc = pc;
         act.caller_pending = self.lean_pending_enter(frame, shell, pc);
         act.exc_depth = self.exc_info_len();
-        Some(act)
+        act
     }
 
     /// Finish an inline generator resume that left the quiet loop with
@@ -57318,16 +57343,10 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
             false
         } else if let Some(send_pc) = await_send {
-            frame.stack.push(Object::None);
-            frame.pc = send_pc as u32;
             // SAFETY: as above (the `LOAD_CONST` before the `SEND`).
             unsafe { *sw.last = send_pc - 1 };
-            let started = self.core_gen_resume_one(sw, send_pc, InlineResume::Send);
+            let started = self.core_await_enter(sw, send_pc);
             if !started {
-                // SAFETY: still the running activation (nothing switched).
-                let frame = unsafe { &mut *caller };
-                frame.stack.pop();
-                frame.pc = pc as u32 + 1;
                 // SAFETY: as above.
                 unsafe { *sw.last = pc };
             }
@@ -57342,6 +57361,55 @@ impl Interpreter {
                 gc_trace::track_generator(obj);
             }
         }
+        true
+    }
+
+    /// The `await` (its `SEND` at `send_pc`) of the coroutine atop `sw`'s
+    /// running activation, which the activation's call just made: started
+    /// at once as the `SEND` would start it (`try_inline_gen`'s `Send`
+    /// resume, whose checks a fresh coroutine passes but for its code's),
+    /// the caller resting past the `SEND`. `false` touches nothing.
+    fn core_await_enter(&mut self, sw: &mut CoreSwitch, send_pc: usize) -> bool {
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_gen_resume_one`).
+        let (frame, shell) = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            (&mut *frame, &mut *shell.cast::<QuietShell<'_>>())
+        };
+        let Some(Object::Coroutine(g)) = frame.stack.last() else {
+            return false;
+        };
+        let g = g.clone();
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *g.state.as_ptr() };
+        if !matches!(state, GeneratorState::Created(boxed) if Self::lean_gen_code_ok(&boxed.code)) {
+            return false;
+        }
+        // Past the recursion limit the `SEND` raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            return false;
+        };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("checked above");
+        };
+        let jump = frame.code.instructions[send_pc].arg;
+        let act = self.inline_gen_commit(
+            frame,
+            shell,
+            send_pc,
+            InlineResume::Send,
+            jump | GEN_SEND,
+            (g, boxed, true, Object::None),
+            guard,
+        );
+        let gen_frame = act.gen_frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = gen_frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
     }
 
