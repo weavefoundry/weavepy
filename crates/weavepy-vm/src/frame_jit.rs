@@ -3135,6 +3135,34 @@ unsafe extern "C" fn h_load_method(
             st.stack.add(len).write(Object::Unbound);
             return 0;
         }
+        // A receiver class the site saw before: its cached function, while
+        // the instance holds no dictionary and no value at or past the
+        // name's position (see `Lower::load_method`).
+        if let (Object::Instance(inst), false) = (&*top, cache.is_null()) {
+            let ver = inst.cls_raw().attr_version.get();
+            if let Some(e) = (*cache).poly.iter().find(|e| e.ver == ver) {
+                let shadow_free = inst.dict.published().is_none()
+                    && match inst.dict.split_peek() {
+                        Some(split) => {
+                            let (keys, n) = split.keys_and_len();
+                            n == 0 || (keys as u64 == e.keys && n <= e.before as usize)
+                        }
+                        None => false,
+                    };
+                if shadow_free {
+                    // The function's own bits: its class holds it while the
+                    // version stands, so a clone takes a count of it.
+                    let f = std::mem::ManuallyDrop::new(
+                        std::ptr::from_ref(&e.obj).cast::<Object>().read(),
+                    );
+                    let f = crate::clone_hot(&f);
+                    let recv = top.read();
+                    top.write(f);
+                    st.stack.add(len).write(recv);
+                    return 0;
+                }
+            }
+        }
         let Some(ms) = ext.method_slots.get().and_then(|s| s.get(pc)) else {
             return 1;
         };
@@ -3219,6 +3247,21 @@ pub(crate) struct MethodCache {
     func: u64,
     keys: u64,
     before: u32,
+    /// The function `Object`'s first word (its tag), `func` its second.
+    head: u64,
+    /// The site's other receiver classes (a polymorphic call), checked by
+    /// the helper before its general path, most recent first.
+    poly: [MethodEntry; 3],
+}
+
+/// One of a [`MethodCache`]'s polymorphic entries.
+#[derive(Default, Clone, Copy)]
+struct MethodEntry {
+    ver: u64,
+    /// The function `Object`'s two words.
+    obj: [u64; 2],
+    keys: u64,
+    before: u32,
 }
 
 const MC_VER: i32 = std::mem::offset_of!(MethodCache, ver) as i32;
@@ -3255,14 +3298,23 @@ fn fill_method_cache(
     };
     let obj = Object::Function(f.clone());
     // SAFETY: an `Object` is 16 bytes; its second word is the payload.
-    let word = unsafe { std::ptr::from_ref(&obj).cast::<u64>().add(1).read() };
+    let [head, word] = unsafe { std::ptr::from_ref(&obj).cast::<[u64; 2]>().read() };
     drop(obj);
-    *cache = MethodCache {
-        ver,
-        func: word,
-        keys,
-        before,
-    };
+    // The entry it replaces moves down the polymorphic list.
+    if cache.ver != 0 && cache.ver != ver {
+        cache.poly.copy_within(0..2, 1);
+        cache.poly[0] = MethodEntry {
+            ver: cache.ver,
+            obj: [cache.head, cache.func],
+            keys: cache.keys,
+            before: cache.before,
+        };
+    }
+    cache.ver = ver;
+    cache.head = head;
+    cache.func = word;
+    cache.keys = keys;
+    cache.before = before;
 }
 
 /// A method load's module-attribute shortcut: the module dict's address

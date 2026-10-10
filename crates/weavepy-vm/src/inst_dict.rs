@@ -314,6 +314,19 @@ impl SplitValues {
         unsafe { (*h).keys.as_ref() }
     }
 
+    /// The shared names' address (`0` none) and how many values are set.
+    #[inline(always)]
+    pub fn keys_and_len(&self) -> (usize, usize) {
+        match self.block {
+            // SAFETY: the block is live while owned.
+            Some(b) => unsafe {
+                let h = b.as_ptr();
+                ((*h).keys as usize, (*h).len as usize)
+            },
+            None => (0, 0),
+        }
+    }
+
     /// How many attributes are set.
     #[inline(always)]
     pub fn len(&self) -> usize {
