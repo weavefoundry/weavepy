@@ -56288,9 +56288,19 @@ impl Interpreter {
         // Committed: the arguments move into the generator's frame, and
         // the callee and its self slot leave the stack (one that dies
         // queues its finalizer, which runs before the next instruction).
-        let mut ops = frame.stack.drain(callee_at..);
-        let callee = ops.next().expect("checked above");
-        let slot = ops.next().expect("checked above");
+        // The operands are moved out whole: the stack forgets them first
+        // (nothing touches it until they're all moved).
+        let nargs = argc;
+        let base = frame.stack.as_mut_ptr();
+        // SAFETY: `callee_at + 2 + nargs` is the stack's length.
+        let (callee, slot, args) = unsafe {
+            frame.stack.set_len(callee_at);
+            (
+                base.add(callee_at).read(),
+                base.add(callee_at + 1).read(),
+                base.add(callee_at + 2),
+            )
+        };
         let (f, callee_receiver) = match &callee {
             Object::Function(f) => (f, None),
             Object::BoundMethod(bm) => match &bm.function {
@@ -56298,6 +56308,13 @@ impl Interpreter {
                 _ => unreachable!("checked above"),
             },
             _ => unreachable!("checked above"),
+        };
+        // Move the arguments onto the end of `v`.
+        // SAFETY: `args` holds `nargs` initialized values the stack forgot.
+        let take_args = |v: &mut Vec<Object>| unsafe {
+            v.reserve(nargs);
+            std::ptr::copy_nonoverlapping(args, v.as_mut_ptr().add(v.len()), nargs);
+            v.set_len(v.len() + nargs);
         };
         let gen = if let Some(cells) = cells {
             // The arguments move straight into the locals (no staging).
@@ -56307,8 +56324,10 @@ impl Interpreter {
                 // SAFETY: sole owner (see `pooled_locals_empty`).
                 let v = unsafe { &mut *locals.as_ptr() };
                 v.extend(callee_receiver);
-                v.extend((!matches!(slot, Object::Unbound)).then_some(slot));
-                v.extend(ops);
+                if !matches!(slot, Object::Unbound) {
+                    v.push(slot);
+                }
+                take_args(v);
                 let missing = (code.arg_count as usize).saturating_sub(v.len());
                 if missing > 0 {
                     v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
@@ -56322,8 +56341,10 @@ impl Interpreter {
         } else {
             let mut positional = self.pooled_scratch();
             positional.extend(callee_receiver);
-            positional.extend((!matches!(slot, Object::Unbound)).then_some(slot));
-            positional.extend(ops);
+            if !matches!(slot, Object::Unbound) {
+                positional.push(slot);
+            }
+            take_args(&mut positional);
             self.start_generator_at(f, &code, positional, start)
         };
         self.release(callee);

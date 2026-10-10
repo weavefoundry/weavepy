@@ -153,6 +153,7 @@ const S_SNAP: i32 = 56;
 const S_DEAD: i32 = 64;
 const S_OUT: i32 = 80;
 const S_INTERP: i32 = std::mem::offset_of!(State, interp) as i32;
+const S_SW: i32 = std::mem::offset_of!(State, sw) as i32;
 const S_FRAME: i32 = std::mem::offset_of!(State, frame) as i32;
 const _: () = {
     assert!(std::mem::offset_of!(State, locals) == S_LOCALS as usize);
@@ -1099,6 +1100,21 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 *sw.last = st.last;
                 if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
                     sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+                    return FOR_SWITCHED;
+                }
+                // A compiled body runs from here; its yield (the value on
+                // top, past the instruction) or its return (the iterator
+                // gone, past the loop) continues this code natively.
+                if run_switched_directly(st) {
+                    let frame = &*st.frame;
+                    let at = frame.pc as usize;
+                    let depth = frame.stack.len();
+                    if at == pc as usize + 1 && depth == len + 1 {
+                        return 1;
+                    }
+                    if depth == len - 1 && at == for_iter_exit(&frame.code, pc as usize) {
+                        return 2;
+                    }
                 }
             }
             return FOR_SWITCHED;
@@ -2478,6 +2494,34 @@ const DIRECT_CALL_DEPTH: u32 = 48;
 /// activation the callee its `CALL` just pushed.
 unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
     // SAFETY: the caller's contract.
+    unsafe { run_switched_directly(st) && (*st.frame).stack.len() == start + 1 }
+}
+
+/// The pc a `FOR_ITER` at `pc` of `code` goes on at once its iterator is
+/// exhausted and gone: past the loop's `END_FOR` / `POP_ITER` pair.
+fn for_iter_exit(code: &CodeObject, pc: usize) -> usize {
+    let mut to = pc + 1 + code.instructions[pc].arg as usize;
+    let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+    if op(to) == Some(OpCode::EndFor) {
+        to += 1;
+        if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
+            to += 1;
+        }
+    }
+    to
+}
+
+/// [`run_callee_directly`] for any activation just switched to (a call's
+/// callee, a resumed generator): `true` when its native code ran it until
+/// it switched back to this code's activation with nothing pending (the
+/// frame synced: the caller checks where it was left), `false` when the
+/// core loop goes on (with whatever the run left synced).
+///
+/// # Safety
+///
+/// As [`run_callee_directly`]'s.
+unsafe fn run_switched_directly(st: &mut State) -> bool {
+    // SAFETY: the caller's contract.
     unsafe {
         let sw = &mut *st.sw;
         let interp = &*st.interp;
@@ -2525,11 +2569,9 @@ unsafe fn run_callee_directly(st: &mut State, start: usize) -> bool {
         interp.direct_calls.set(nested);
         let sw = &mut *st.sw;
         if status == RELOAD {
-            // Returned into the caller, nothing pending: done. Otherwise
-            // whoever switched last synced what runs next.
-            return sw.pending.is_none()
-                && std::ptr::eq(sw.cur, st.frame)
-                && (*st.frame).stack.len() == start + 1;
+            // Back in the caller, nothing pending: done. Otherwise whoever
+            // switched last synced what runs next.
+            return sw.pending.is_none() && std::ptr::eq(sw.cur, st.frame);
         }
         // The callee stopped partway: its state, synced as the core loop
         // syncs it after a native run, for the core loop to go on with.
@@ -3572,8 +3614,11 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
 
 /// `SEND` at `pc` of the running activation, its stack `len` deep: the
 /// generator or coroutine below the top resumed and switched to as the
-/// core loop's arm does (`RELOAD`); anything else (another delegate, or
-/// a generator's fast step, which never switches) declined untouched.
+/// core loop's arm does (`RELOAD`), or, a compiled delegate run from here
+/// that returned into this `SEND`, its result in the sent value's place
+/// for the code to go on at the `END_SEND` (`0`); anything else (another
+/// delegate, or a generator's fast step, which never switches) declined
+/// untouched.
 unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
     // SAFETY: the code passes its live state and its stack depth (the
     // delegate and the sent value on top).
@@ -3596,6 +3641,70 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
         *sw.last = st.last;
         let interp = &mut *st.interp.cast_mut();
         if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::Send) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            return RELOAD;
+        }
+        if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) && run_switched_directly(st) {
+            let frame = &*st.frame;
+            let exit = pc as usize + 1 + frame.code.instructions[pc as usize].arg as usize;
+            if frame.pc as usize == exit && frame.stack.len() == len {
+                st.len = len;
+                return 0;
+            }
+        }
+        RELOAD
+    }
+}
+
+/// `YIELD_VALUE` at `pc` of the running activation, an inline generator
+/// resume (its stack `len` deep, the value on top), as the core loop's arm
+/// runs it: the generator parks and its consumer, the value delivered, is
+/// switched to (`RELOAD`); declined untouched for a generator's fast step,
+/// a root activation (a draining consumer's fold is the arm's), or a yield
+/// the switch doesn't take.
+unsafe extern "C" fn h_gen_yield(st: *mut State, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state and its stack depth.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() || (*(*st.sw).inl).is_empty() {
+            return 1;
+        }
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len as usize);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_gen_yield(sw, st.snap_gen) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+        } else {
+            // A `yield from` chain passes the value straight up.
+            while sw.pending.is_none()
+                && interp.core_yield_chains(sw)
+                && interp.core_gen_yield(sw, st.snap_gen)
+            {}
+        }
+        RELOAD
+    }
+}
+
+/// `RETURN_VALUE` at `pc` of the running activation, an inline generator
+/// resume, as the core loop's arm runs it (see [`h_return`]); declined
+/// untouched for a generator's fast step or a root activation.
+unsafe extern "C" fn h_gen_return(st: *mut State, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state and its stack depth.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() || (*(*st.sw).inl).is_empty() {
+            return 1;
+        }
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len as usize);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_return(sw, st.snap_gen) {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
         }
         RELOAD
@@ -5521,6 +5630,42 @@ impl<'a> Lower<'a> {
                     .call(h_send as *const () as usize, &[self.st, pcv, len], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
+                let switched = self.b.create_block();
+                let other = self.b.create_block();
+                let returned = self.b.create_block();
+                let reload = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RELOAD));
+                self.b.ins().brif(reload, switched, &[], other, &[]);
+                self.b.switch_to_block(switched);
+                self.b.ins().return_(&[r]);
+                self.b.switch_to_block(other);
+                self.b.ins().brif(r, out, &[], returned, &[]);
+                // The delegate returned into this `SEND`: its result took the
+                // sent value's place.
+                self.b.switch_to_block(returned);
+                self.set_last(pc);
+                self.goto(next + ins.arg as usize);
+                return false;
+            }
+            // A generator body's yield and return switch to its consumer
+            // (`h_gen_yield`, `h_gen_return`); in a fast step (no switch)
+            // they're the step's own.
+            OpCode::YieldValue | OpCode::ReturnValue if self.is_gen() && self.depth > 0 => {
+                self.flush();
+                let sw = self.b.ins().load(self.ptr, FLAGS, self.st, S_SW);
+                let out = self.exit_with(pc, &[], INTERP);
+                let none = self.b.ins().icmp_imm(IntCC::Equal, sw, 0);
+                self.branch_out(none, out);
+                self.store_last();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let helper = if ins.op == OpCode::YieldValue {
+                    h_gen_yield as *const () as usize
+                } else {
+                    h_gen_return as *const () as usize
+                };
+                let r = self
+                    .call(helper, &[self.st, pcv, len], true)
+                    .expect("returns");
                 let switched = self.b.create_block();
                 let reload = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RELOAD));
                 self.b.ins().brif(reload, switched, &[], out, &[]);
