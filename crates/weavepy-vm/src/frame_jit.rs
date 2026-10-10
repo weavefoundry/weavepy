@@ -4393,9 +4393,7 @@ unsafe fn leaf_site_call(st: &mut State, start: usize, len: usize, missing: usiz
         let Some(r) = (*st.interp).site_leaf_eval(ops, missing, st.depth_cell) else {
             return false;
         };
-        for k in start..len {
-            crate::drop_hot(base.add(k).read());
-        }
+        crate::release_run(base.add(start), len - start);
         base.add(start).write(r);
         st.len = start + 1;
         true
@@ -4911,9 +4909,7 @@ unsafe extern "C" fn h_call(
         }
         Interpreter::core_instance_callee(base.add(start));
         let done = |st: &mut State, r: Object| {
-            for k in start..len {
-                crate::drop_hot(base.add(k).read());
-            }
+            crate::release_run(base.add(start), len - start);
             base.add(start).write(r);
             st.len = start + 1;
             0
@@ -4942,9 +4938,7 @@ unsafe extern "C" fn h_call(
                         None => {}
                         Some(Ok(v)) => return done(st, v),
                         Some(Err(e)) => {
-                            for k in start..len {
-                                crate::drop_hot(base.add(k).read());
-                            }
+                            crate::release_run(base.add(start), len - start);
                             st.len = start;
                             st.pc = pc + 1;
                             st.err = Some(e);
@@ -5110,9 +5104,7 @@ unsafe extern "C" fn h_call(
             None => leaf_call_lane(st, pc, start, len),
             Some(Ok(v)) => done(st, v),
             Some(Err(e)) => {
-                for k in start..len {
-                    crate::drop_hot(base.add(k).read());
-                }
+                crate::release_run(base.add(start), len - start);
                 st.len = start;
                 st.pc = pc + 1;
                 st.err = Some(e);
@@ -5238,9 +5230,7 @@ unsafe extern "C" fn h_call_leaf(
                     let args = std::slice::from_raw_parts(base.add(start + 1), argc + 1);
                     if Rc::strong_count(b) > 1 && Interpreter::core_all_droppable(args) {
                         if let Some(v) = kernel_call(k, args, b) {
-                            for j in start..lenu {
-                                crate::drop_hot(base.add(j).read());
-                            }
+                            crate::release_run(base.add(start), lenu - start);
                             base.add(start).write(v);
                             s.len = start + 1;
                             return 0;
@@ -5293,9 +5283,7 @@ unsafe extern "C" fn h_call_leaf(
                         None
                     };
                     if let Some(r) = r {
-                        for k in start..lenu {
-                            crate::drop_hot(base.add(k).read());
-                        }
+                        crate::release_run(base.add(start), lenu - start);
                         return match r {
                             Ok(v) => {
                                 base.add(start).write(v);
@@ -5417,9 +5405,7 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             }
             return RELOAD;
         };
-        for k in start..len {
-            crate::drop_hot(base.add(k).read());
-        }
+        crate::release_run(base.add(start), len - start);
         base.add(start).write(r);
         0
     }

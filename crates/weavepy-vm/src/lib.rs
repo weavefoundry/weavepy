@@ -13442,9 +13442,7 @@ impl Interpreter {
                         // SAFETY: every operand was checked to leave by a plain
                         // decrement; the result takes the callee's slot.
                         unsafe {
-                            for k in start..len {
-                                drop_hot(base.add(k).read());
-                            }
+                            release_run(base.add(start), len - start);
                             base.add(start).write(r);
                         }
                         len = start + 1;
@@ -13510,9 +13508,7 @@ impl Interpreter {
                                             // by plain decrements; the result
                                             // takes the callee's slot.
                                             unsafe {
-                                                for k in callee_at..len {
-                                                    drop_hot(base.add(k).read());
-                                                }
+                                                release_run(base.add(callee_at), len - callee_at);
                                                 base.add(callee_at).write(v);
                                             }
                                             len = callee_at + 1;
@@ -13523,9 +13519,7 @@ impl Interpreter {
                                         Some(Err(e)) => {
                                             // SAFETY: as above.
                                             unsafe {
-                                                for k in callee_at..len {
-                                                    drop_hot(base.add(k).read());
-                                                }
+                                                release_run(base.add(callee_at), len - callee_at);
                                             }
                                             len = callee_at;
                                             pc += 1;
@@ -13552,9 +13546,7 @@ impl Interpreter {
                             // SAFETY: every operand was checked droppable;
                             // the result takes the callee's slot.
                             unsafe {
-                                for k in callee_at..len {
-                                    drop_hot(base.add(k).read());
-                                }
+                                release_run(base.add(callee_at), len - callee_at);
                                 base.add(callee_at).write(v);
                             }
                             len = callee_at + 1;
@@ -13586,9 +13578,7 @@ impl Interpreter {
                                         // the step) leave by plain decrements;
                                         // the value takes the callee's slot.
                                         unsafe {
-                                            for k in len - 3..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(len - 3), 3);
                                             base.add(len - 3).write(v);
                                         }
                                         len -= 2;
@@ -13601,9 +13591,7 @@ impl Interpreter {
                                     gen_fast::GenNext::Exhausted(v) => {
                                         // SAFETY: as above.
                                         unsafe {
-                                            for k in len - 3..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(len - 3), 3);
                                         }
                                         len -= 3;
                                         pc += 1;
@@ -13687,9 +13675,7 @@ impl Interpreter {
                                     // by a plain decrement; the result takes the
                                     // callee's slot.
                                     unsafe {
-                                        for k in start..len {
-                                            drop_hot(base.add(k).read());
-                                        }
+                                        release_run(base.add(start), len - start);
                                         base.add(start).write(r);
                                     }
                                     len = start + 1;
@@ -13719,9 +13705,7 @@ impl Interpreter {
                                 // plain decrement; the result takes the callee's
                                 // slot.
                                 unsafe {
-                                    for k in start..len {
-                                        drop_hot(base.add(k).read());
-                                    }
+                                    release_run(base.add(start), len - start);
                                     base.add(start).write(r);
                                 }
                                 len = start + 1;
@@ -13932,7 +13916,7 @@ impl Interpreter {
                                 let ops = unsafe {
                                     std::slice::from_raw_parts(base.add(first), len - first)
                                 };
-                                if !ops.iter().all(Self::core_droppable) {
+                                if !Self::core_all_droppable(ops) {
                                     break Some(CoreExit::Helper);
                                 }
                                 let r = match kind {
@@ -13955,9 +13939,7 @@ impl Interpreter {
                                         // by plain decrements; the result takes
                                         // the callee's slot.
                                         unsafe {
-                                            for k in callee_at..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(callee_at), len - callee_at);
                                             base.add(callee_at).write(v);
                                         }
                                         len = callee_at + 1;
@@ -13970,9 +13952,7 @@ impl Interpreter {
                                     Some(Err(e)) => {
                                         // SAFETY: as above.
                                         unsafe {
-                                            for k in callee_at..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(callee_at), len - callee_at);
                                         }
                                         len = callee_at;
                                         pc += 1;
@@ -14815,9 +14795,7 @@ impl Interpreter {
                         // SAFETY: the parts leave the stack (a string's release
                         // runs nothing); the join takes the first slot.
                         unsafe {
-                            for k in len - n..len {
-                                drop_hot(base.add(k).read());
-                            }
+                            release_run(base.add(len - n), n);
                             base.add(len - n).write(joined);
                         }
                         len = len - n + 1;
@@ -17556,9 +17534,7 @@ impl Interpreter {
         }
         // The arguments leave by plain decrements (whatever `__init__`
         // stored holds its own reference).
-        if !frame.stack[self_slot + 1..]
-            .iter()
-            .all(Self::core_droppable)
+        if !Self::core_all_droppable(&frame.stack[self_slot + 1..])
         {
             return false;
         }
@@ -19826,9 +19802,7 @@ impl Interpreter {
                 }
             }
         }
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -19890,9 +19864,7 @@ impl Interpreter {
         if depth >= crate::recursion::recursion_limit() {
             return None;
         }
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -19953,9 +19925,7 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -20041,7 +20011,7 @@ impl Interpreter {
             || ck as usize != kwc
             || vals.len() != eff_argc + kwc
             || !fn_is_pure_leaf(f)
-            || !vals.iter().all(Self::core_droppable)
+            || !Self::core_all_droppable(vals)
         {
             return None;
         }
@@ -22084,9 +22054,7 @@ impl Interpreter {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
-            if !ops
-                .iter()
-                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+            if !Self::core_all_droppable(ops)
             {
                 return None;
             }
@@ -22105,9 +22073,7 @@ impl Interpreter {
         } else {
             (&[], &[])
         };
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -22120,9 +22086,7 @@ impl Interpreter {
     /// for the full handler, which also raises every error.
     #[inline(never)]
     fn core_native_method_kw(ops: &[Object], argc: usize) -> Option<Object> {
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -22174,9 +22138,7 @@ impl Interpreter {
         }
         let n = bound.iter().take_while(|a| a.is_some()).count();
         if bound[n..].iter().any(Option::is_some)
-            || !ops
-                .iter()
-                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+            || !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -22202,9 +22164,7 @@ impl Interpreter {
             return None;
         }
         let fast = crate::stdlib::datetime_native::bound_fast(&bm.function, &bm.receiver)?;
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        if !Self::core_all_droppable(ops)
         {
             return None;
         }
@@ -66565,7 +66525,7 @@ unsafe fn release_locals(locals: &mut Vec<Object>) {
 /// The `n` values are initialized, owned by the caller, and never read
 /// again.
 #[inline(always)]
-unsafe fn release_run(base: *const Object, n: usize) {
+pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
     // SAFETY: the caller's contract.
     unsafe {
         if !crate::rc::refcounts_biased() {
