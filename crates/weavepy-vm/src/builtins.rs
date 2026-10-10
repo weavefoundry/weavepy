@@ -11008,7 +11008,59 @@ fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(str_result(args, out))
 }
 
+/// `strip`/`lstrip`/`rstrip` of an exact `str` by whitespace or by a set
+/// of ASCII characters, scanning bytes: the receiver itself when nothing
+/// goes, else one allocation. `None` for the general path (a non-ASCII
+/// set, or a non-ASCII character at an edge whitespace stripping reaches).
+fn strip_fast(args: &[Object], left: bool, right: bool) -> Option<Object> {
+    let (Some(Object::Str(s)), true) = (args.first(), args.len() <= 2) else {
+        return None;
+    };
+    let spaces = matches!(args.get(1), None | Some(Object::None));
+    let mut set = [false; 128];
+    match args.get(1) {
+        None | Some(Object::None) => set = *ascii_space_table(),
+        Some(Object::Str(chars)) if chars.is_ascii() => {
+            for &c in chars.as_bytes() {
+                set[usize::from(c)] = true;
+            }
+        }
+        _ => return None,
+    }
+    let b = s.as_bytes();
+    let strips = |c: u8| c < 0x80 && set[usize::from(c)];
+    let (mut lo, mut hi) = (0, b.len());
+    if left {
+        while lo < hi && strips(b[lo]) {
+            lo += 1;
+        }
+    }
+    if right {
+        while hi > lo && strips(b[hi - 1]) {
+            hi -= 1;
+        }
+    }
+    // (A non-ASCII character may be Unicode whitespace.)
+    if spaces && ((left && lo < hi && b[lo] >= 0x80) || (right && hi > lo && b[hi - 1] >= 0x80)) {
+        return None;
+    }
+    if lo == 0 && hi == b.len() {
+        return Some(args[0].clone());
+    }
+    // (The shortest results are the shared ones `SharedStr::from` hands
+    // out, as `str_result` would.)
+    let ascii = hi - lo > 2 && SharedStr::char_count(s) == b.len();
+    Some(Object::Str(if ascii {
+        SharedStr::from_ascii(&s[lo..hi])
+    } else {
+        SharedStr::from(&s[lo..hi])
+    }))
+}
+
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, true, true) {
+        return Ok(out);
+    }
     str_arity("strip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
@@ -11676,6 +11728,11 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
     if n.is_empty() {
         return Some(0);
     }
+    // One ASCII byte in a short string (`d in "123456789"`): a plain scan
+    // costs less than `memchr`'s set-up.
+    if let ([byte], true) = (n, h.len() <= 16) {
+        return h.iter().position(|c| c == byte);
+    }
     if n.len() > 16 || h.len() < n.len() {
         return hay.find(needle);
     }
@@ -11929,6 +11986,9 @@ fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, true, false) {
+        return Ok(out);
+    }
     str_arity("lstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
@@ -11949,6 +12009,9 @@ fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, false, true) {
+        return Ok(out);
+    }
     str_arity("rstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {

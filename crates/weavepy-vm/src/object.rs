@@ -3357,7 +3357,7 @@ impl<'a> LeafProbe<'a> {
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
             Object::Str(s) => SharedStr::hash_cached(s),
-            Object::Int(_) => py_hash_value(key)?,
+            Object::Int(i) => py_hash_long_i64(*i),
             Object::Instance(i)
                 if i.native.get().is_none()
                     && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
@@ -4459,7 +4459,12 @@ impl Hash for DictKey {
         // (functions, types, plain instances, …) fold in their allocation
         // identity; truly unhashable keys share a constant bucket and the
         // runtime raises lazily when used.
-        let h = py_hash_value(&self.0).unwrap_or_else(|| identity_hash(&self.0));
+        let h = match &self.0 {
+            // (The commonest keys, without the general dispatch.)
+            Object::Str(s) => SharedStr::hash_cached(s),
+            Object::Int(i) => py_hash_long_i64(*i),
+            other => py_hash_value(other).unwrap_or_else(|| identity_hash(other)),
+        };
         h.hash(state);
     }
 }
@@ -12497,6 +12502,7 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
 
 /// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
 /// with the reserved `-1` remapped to `-2`.
+#[inline]
 pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
     // The modulus is the Mersenne prime `2**61 - 1`, so `|n| mod P` folds
     // the high bits onto the low ones instead of dividing: `|n| < 2**64`
@@ -13041,6 +13047,12 @@ fn frozenset_style_hash<I: Iterator<Item = i64>>(lanes: I) -> i64 {
 }
 
 pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
+    // The commonest keys first, in line.
+    match obj {
+        Object::Int(i) => return Some(py_hash_long_i64(*i)),
+        Object::Str(s) => return Some(SharedStr::hash_cached(s)),
+        _ => {}
+    }
     if let Some(h) = numeric_hash(obj) {
         return Some(h);
     }
@@ -13079,6 +13091,24 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         }
         Object::Tuple(items) => {
             if let Some(hash) = items.cached_hash() {
+                return Some(hash);
+            }
+            // Ints and strings (the usual composite key): their hashes can
+            // neither fail nor run code, so no error scope is needed.
+            if items
+                .iter()
+                .all(|x| matches!(x, Object::Int(_) | Object::Str(_)))
+            {
+                let mut hash = TupleHasher::new();
+                for item in items.iter() {
+                    hash.push(match item {
+                        Object::Int(i) => py_hash_long_i64(*i),
+                        Object::Str(s) => SharedStr::hash_cached(s),
+                        _ => unreachable!("matched above"),
+                    });
+                }
+                let hash = hash.finish(items.len());
+                items.store_hash(hash);
                 return Some(hash);
             }
             // Hash table callbacks communicate errors through the ambient

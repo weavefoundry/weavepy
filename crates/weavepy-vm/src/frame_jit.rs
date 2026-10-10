@@ -200,6 +200,10 @@ pub(crate) struct Native {
     /// The `CALL` sites' direct-call caches.
     #[allow(clippy::vec_box)]
     _direct: Vec<Box<DirectSite>>,
+    /// The builtins the method kernels' calls address.
+    _held: Vec<Rc<crate::object::BuiltinFn>>,
+    #[allow(clippy::vec_box)]
+    _mods: Vec<Box<ModCache>>,
 }
 
 // SAFETY: the code only touches the state it is handed; it is only
@@ -408,6 +412,13 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
     // A method call on a local runs through a helper without leaving, when
     // its callee runs in place.
     let mut helped = vec![false; ins.len()];
+    // So does a call of a leaf builtin (`isinstance(x, C)`, `len(xs)`,
+    // `math.floor(x)`) the site has settled.
+    for (pc, h) in helped.iter_mut().enumerate() {
+        if ins[pc].op == OpCode::Call && crate::call_site_in_place(ext, pc) {
+            *h = true;
+        }
+    }
     for pc in 0..ins.len().saturating_sub(1) {
         if ins[pc].op == OpCode::LoadFast
             && ins[pc + 1].op == OpCode::LoadMethodAttr
@@ -791,10 +802,18 @@ struct Tags {
     /// payload word: `(length, first item)` byte offsets.
     tuple: u8,
     tuple_layout: Option<(i32, i32)>,
+    /// The `dict`, `set` and `str` tags (the method kernels' receivers).
+    dict: u8,
+    set: u8,
+    str: u8,
     /// The heap variants whose payload word is an `Rc`'s allocation, its
     /// strong count the allocation's first word (a clone is an increment
     /// there): instances, lists, dicts and classes, as far as measured.
     rc_counted: i64,
+    /// The heap variants whose payload word addresses a shared payload
+    /// with its strong count two words before it (see `rc::strong_word`):
+    /// strings and tuples, as far as measured.
+    rc_counted_hdr: i64,
     /// The heap variants whose identity is their payload pointer (and so
     /// `is` compares payload words): instances, strings, lists, dicts,
     /// tuples, classes.
@@ -874,9 +893,28 @@ fn tags() -> Option<Tags> {
                 &Object::new_dict(),
                 &Object::Type(crate::builtin_types::builtin_types().object_.clone()),
                 &func,
+                &Object::new_set(),
+                &Object::Builtin(Rc::new(crate::object::BuiltinFn::new("sample", |_| {
+                    Ok(Object::None)
+                }))),
             ]
             .into_iter()
             .filter(|o| tag(o) < 64 && counted_at_payload(o, word(o)))
+            .fold(0, |m, o| m | (1i64 << tag(o)))
+        },
+        dict: tag(&Object::new_dict()),
+        set: tag(&Object::new_set()),
+        str: tag(&Object::from_str("")),
+        rc_counted_hdr: if cfg!(debug_assertions) {
+            0
+        } else {
+            // (A fresh string: the small ones are shared statics.)
+            [
+                &Object::from_str("not a small string"),
+                &Object::new_tuple_array([Object::None, Object::None]),
+            ]
+            .into_iter()
+            .filter(|o| tag(o) < 64 && word(o) >= 16 && counted_at_payload(o, word(o) - 16))
             .fold(0, |m, o| m | (1i64 << tag(o)))
         },
         by_pointer: samples
@@ -1037,8 +1075,72 @@ unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, i: u64) -> u32 {
 /// `FOR_ITER` over a range, list or tuple iterator at `it` (the next value
 /// goes to `out`, the slot above): `0` an `int` in `st.out`, `1` another
 /// value written to `out`, `2` the exhausted iterator retired (it left the
-/// stack), anything else declined.
+/// stack), anything else declined. The commonest steps (a live range, a
+/// list's or tuple's next item) run here; everything else (exhaustion, a
+/// generator, the other iterators) in [`h_for_iter_rest`].
 unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Object, pc: u64) -> u32 {
+    // SAFETY: as `h_for_iter_rest`'s; nothing here runs code while the
+    // iterator is borrowed.
+    unsafe {
+        if let Object::Iter(rc) = &*it {
+            if let Some(iter) = rc.peek_mut() {
+                let v = match iter {
+                    PyIterator::Range {
+                        current,
+                        stop,
+                        step,
+                    } if *step > 0 && *current < *stop => {
+                        (*st).out = *current as u64;
+                        *current = current.wrapping_add(*step);
+                        return 0;
+                    }
+                    PyIterator::List { items, index, .. } => {
+                        match items.peek().and_then(|xs| xs.get(*index)) {
+                            Some(v) => {
+                                *index += 1;
+                                v
+                            }
+                            None => return h_for_iter_rest(st, it, out, pc),
+                        }
+                    }
+                    PyIterator::Tuple { items, index } => match items.get(*index) {
+                        Some(v) => {
+                            *index += 1;
+                            v
+                        }
+                        None => return h_for_iter_rest(st, it, out, pc),
+                    },
+                    // A string's next ASCII character (a shared one).
+                    PyIterator::Str { s, index } => match s.as_bytes().get(*index) {
+                        Some(&c) if c < 0x80 => {
+                            *index += 1;
+                            out.write(Object::Str(crate::shared_value::SharedStr::ascii_char(c)));
+                            return 1;
+                        }
+                        _ => return h_for_iter_rest(st, it, out, pc),
+                    },
+                    _ => return h_for_iter_rest(st, it, out, pc),
+                };
+                if let Object::Int(i) = *v {
+                    (*st).out = i as u64;
+                    return 0;
+                }
+                out.write(crate::clone_hot(v));
+                return 1;
+            }
+        }
+        h_for_iter_rest(st, it, out, pc)
+    }
+}
+
+/// [`h_for_iter`]'s other shapes.
+#[inline(never)]
+unsafe extern "C" fn h_for_iter_rest(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
     // SAFETY: the code passes its live state, an initialized slot with a
     // free one above it, and its `FOR_ITER`'s pc.
     let (st, top) = unsafe { (&mut *st, &*it) };
@@ -1288,7 +1390,10 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
             };
             let i = *count;
             *count += 1;
-            Object::new_tuple_array([Object::Int(i), x])
+            // (From the tuple free list.)
+            // SAFETY: the running thread's interpreter, dormant while the
+            // helper runs.
+            unsafe { (*st.interp).alloc_tuple_array([Object::Int(i), x]) }
         }
         // A set's next element while the set keeps its size (a change,
         // and exhaustion, are the core loop's to report).
@@ -1354,6 +1459,588 @@ unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) ->
         };
         crate::push_fast(items, value.read());
         0
+    }
+}
+
+/// A method kernel: `recv.m(a, b)` for an exact `list`, `dict`, `set` or
+/// `str` receiver (its tag checked by the caller), with the arguments the
+/// site passes (null past them) read in place, and the method's builtin
+/// `f` (for the kernels that run its body): `0` the result written to the
+/// free slot `out`, anything else declined untouched (the call then runs
+/// as before). A kernel runs no Python code, raises nothing, and releases
+/// nothing that could run a finalizer.
+type Kernel = unsafe extern "C" fn(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32;
+
+/// The kernel for the `tag` receiver's method of leaf kind `kind` called
+/// with `nargs` arguments (see [`Lower::method_kernel`]).
+fn kernel_for(tag: u64, kind: crate::LeafKind, nargs: usize) -> Option<Kernel> {
+    use crate::LeafKind as K;
+    Some(match (tag, kind, nargs) {
+        (1, K::ListAppend, 1) => k_list_append,
+        (1, K::ListPop, 0) => k_list_pop,
+        (1, K::ListExtend, 1) => k_list_extend,
+        (2, K::DictGet, 1 | 2) => k_dict_get,
+        (3, K::SetAdd, 1) => k_set_add,
+        (3, K::SetDiscard, 1) => k_set_discard,
+        (3, K::SetRemove, 1) => k_set_remove,
+        (4, K::StrStartswith, 1 | 2) => k_str_startswith,
+        (4, K::StrEndswith, 1 | 2) => k_str_endswith,
+        (4, K::StrIsdigit, 0) => k_str_isdigit,
+        (4, K::StrIsalpha, 0) => k_str_isalpha,
+        (4, K::StrIsspace, 0) => k_str_isspace,
+        (4, K::StrFind, 1 | 2) => k_str_find,
+        (4, K::StrLower | K::StrUpper, 0) => k_str_body,
+        (4, K::StrStrip | K::StrLstrip | K::StrRstrip, 0 | 1) => k_str_strip,
+        (4, K::StrSplit, 0 | 1) => k_str_split,
+        (4, K::StrJoin, 1) => k_str_join,
+        (4, K::StrReplace, 2) => k_str_replace,
+        (4, K::Opaque, _) => k_str_body,
+        _ => return None,
+    })
+}
+
+/// The call of method body `b` of leaf kind `kind` on `args` (the
+/// receiver first) through its [`Kernel`], for a `list`, `dict`, `set` or
+/// `str` receiver that has one: its result, or `None` (nothing done).
+/// (Out of line: the general call helper stays as it was.)
+#[inline(never)]
+fn kernel_call(
+    kind: crate::LeafKind,
+    args: &[Object],
+    b: &Rc<crate::object::BuiltinFn>,
+) -> Option<Object> {
+    let tag = match args.first()? {
+        Object::List(_) => 1,
+        Object::Dict(_) => 2,
+        Object::Set(_) => 3,
+        Object::Str(_) => 4,
+        _ => return None,
+    };
+    if args.len() > 3 {
+        return None;
+    }
+    let kernel = kernel_for(tag, kind, args.len() - 1)?;
+    let arg = |k: usize| args.get(k).map_or(std::ptr::null(), std::ptr::from_ref);
+    let mut out = std::mem::MaybeUninit::<Object>::uninit();
+    // SAFETY: the operands are initialized values; `out` is free.
+    unsafe {
+        (kernel(out.as_mut_ptr(), &args[0], arg(1), arg(2), Rc::as_ptr(b)) == 0)
+            .then(|| out.assume_init())
+    }
+}
+
+/// The method's own body on bitwise views of the operands (as the core
+/// loop's leaf call runs it): `0` its result written to `out`, anything
+/// else (an error, which the full call raises) declined.
+///
+/// # Safety
+///
+/// As [`Kernel`]'s, for a builtin whose body runs no Python code on
+/// these operands.
+unsafe fn run_body(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: the caller's contract; the views are never dropped.
+    unsafe {
+        let views = std::mem::ManuallyDrop::new([
+            recv.read(),
+            if a.is_null() {
+                Object::Unbound
+            } else {
+                a.read()
+            },
+            if b.is_null() {
+                Object::Unbound
+            } else {
+                b.read()
+            },
+        ]);
+        let n = 1 + usize::from(!a.is_null()) + usize::from(!b.is_null());
+        let f = &*f;
+        let r = match f.call_kw.as_ref() {
+            Some(ckw) => ckw(&views[..n], &[]),
+            None => (f.call)(&views[..n]),
+        };
+        match r {
+            Ok(v) => {
+                out.write(v);
+                0
+            }
+            Err(_) => 1,
+        }
+    }
+}
+
+unsafe extern "C" fn k_list_append(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; growing the list runs no code.
+    unsafe {
+        let Object::List(l) = &*recv else {
+            return 1;
+        };
+        let Some(items) = l.peek_mut() else {
+            return 1;
+        };
+        crate::push_fast(items, crate::clone_hot(&*a));
+        out.write(Object::None);
+        0
+    }
+}
+
+unsafe extern "C" fn k_list_extend(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; copying an exact list's or tuple's items runs
+    // no code.
+    unsafe {
+        let Object::List(l) = &*recv else {
+            return 1;
+        };
+        match &*a {
+            // (`xs.extend(xs)` reads the length once: it doubles.)
+            Object::List(src) if Rc::ptr_eq(l, src) => {
+                let Some(xs) = l.peek_mut() else {
+                    return 1;
+                };
+                let copy: Vec<Object> = xs.iter().map(crate::clone_hot).collect();
+                xs.extend(copy);
+            }
+            Object::List(src) => {
+                let (Some(s), Some(xs)) = (src.peek(), l.peek_mut()) else {
+                    return 1;
+                };
+                xs.extend(s.iter().map(crate::clone_hot));
+            }
+            Object::Tuple(t) => {
+                let Some(xs) = l.peek_mut() else {
+                    return 1;
+                };
+                xs.extend(t.iter().map(crate::clone_hot));
+            }
+            _ => return 1,
+        }
+        out.write(Object::None);
+        0
+    }
+}
+
+unsafe extern "C" fn k_list_pop(
+    out: *mut Object,
+    recv: *const Object,
+    _: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; the item moves out.
+    unsafe {
+        let Object::List(l) = &*recv else {
+            return 1;
+        };
+        let Some(v) = l.peek_mut().and_then(Vec::pop) else {
+            return 1;
+        };
+        out.write(v);
+        0
+    }
+}
+
+unsafe extern "C" fn k_dict_get(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; the probe runs no code.
+    unsafe {
+        let (Object::Dict(d), k) = (&*recv, &*a) else {
+            return 1;
+        };
+        let Some(probe) = crate::object::LeafProbe::new(k) else {
+            return 1;
+        };
+        let Some(m) = d.peek() else {
+            return 1;
+        };
+        let v = match m.get(&probe) {
+            Some(v) => crate::clone_hot(v),
+            None if probe.miss_is_exact() => {
+                if b.is_null() {
+                    Object::None
+                } else {
+                    crate::clone_hot(&*b)
+                }
+            }
+            None => return 1,
+        };
+        out.write(v);
+        0
+    }
+}
+
+unsafe extern "C" fn k_set_add(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; hashing and comparing a `str`, an `int` or a
+    // tuple of them runs no code.
+    unsafe {
+        let (Object::Set(s), k) = (&*recv, &*a) else {
+            return 1;
+        };
+        if !matches!(k, Object::Str(_) | Object::Int(_) | Object::Tuple(_)) {
+            return 1;
+        }
+        let Some(probe) = crate::object::LeafProbe::new(k) else {
+            return 1;
+        };
+        let Some(m) = s.peek_mut() else {
+            return 1;
+        };
+        if m.get_index_of(&probe).is_none() {
+            // (A key of another kind that may equal it: the full call's.)
+            if !probe.miss_is_exact() {
+                return 1;
+            }
+            m.insert(crate::object::DictKey(crate::clone_hot(k)));
+        }
+        out.write(Object::None);
+        0
+    }
+}
+
+/// `set.discard` (`remove`: a miss declines, for the full call's
+/// `KeyError`) of a key that compares natively (see `LeafProbe`): the
+/// removed key is the same object, or an equal `str`, `int` or tuple of
+/// them, so its release frees nothing that runs code.
+unsafe fn set_take(out: *mut Object, recv: *const Object, a: *const Object, remove: bool) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        let (Object::Set(s), k) = (&*recv, &*a) else {
+            return 1;
+        };
+        let Some(probe) = crate::object::LeafProbe::new(k) else {
+            return 1;
+        };
+        let Some(m) = s.peek_mut() else {
+            return 1;
+        };
+        match m.swap_take(&probe) {
+            Some(key) => crate::drop_hot(key.0),
+            None if !remove && probe.miss_is_exact() => {}
+            None => return 1,
+        }
+        out.write(Object::None);
+        0
+    }
+}
+
+unsafe extern "C" fn k_set_discard(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { set_take(out, recv, a, false) }
+}
+
+unsafe extern "C" fn k_set_remove(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { set_take(out, recv, a, true) }
+}
+
+/// The receiver's and the first argument's text, both exact `str`s.
+///
+/// # Safety
+///
+/// As [`Kernel`]'s.
+unsafe fn two_strs<'s>(
+    recv: *const Object,
+    a: *const Object,
+) -> Option<(
+    &'s crate::shared_value::SharedStr,
+    &'s crate::shared_value::SharedStr,
+)> {
+    // SAFETY: the caller's contract.
+    match unsafe { (&*recv, &*a) } {
+        (Object::Str(s), Object::Str(p)) => Some((s, p)),
+        _ => None,
+    }
+}
+
+/// The text from character `start` (a `str` method's optional start
+/// position, null for none) of the receiver `s`, when `s` is ASCII (its
+/// byte offsets are its indices): `Some(None)` for a start past the end
+/// (the methods' "not found"), `None` to decline.
+///
+/// # Safety
+///
+/// As [`Kernel`]'s.
+unsafe fn ascii_from<'s>(
+    s: &'s crate::shared_value::SharedStr,
+    start: *const Object,
+) -> Option<Option<(&'s [u8], usize)>> {
+    let bytes = s.as_bytes();
+    if start.is_null() {
+        return Some(Some((bytes, 0)));
+    }
+    // SAFETY: the caller's contract.
+    let Object::Int(i) = (unsafe { &*start }) else {
+        return None;
+    };
+    if crate::shared_value::SharedStr::char_count(s) != bytes.len() {
+        return None;
+    }
+    let n = bytes.len() as i64;
+    let i = if *i < 0 { (*i + n).max(0) } else { *i };
+    if i > n {
+        return Some(None);
+    }
+    Some(Some((&bytes[i as usize..], i as usize)))
+}
+
+unsafe extern "C" fn k_str_startswith(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        let Some((s, p)) = two_strs(recv, a) else {
+            return 1;
+        };
+        let Some(from) = ascii_from(s, b) else {
+            return 1;
+        };
+        let hit = from.is_some_and(|(t, _)| t.starts_with(p.as_bytes()));
+        out.write(Object::Bool(hit));
+        0
+    }
+}
+
+unsafe extern "C" fn k_str_endswith(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        let Some((s, p)) = two_strs(recv, a) else {
+            return 1;
+        };
+        let Some(from) = ascii_from(s, b) else {
+            return 1;
+        };
+        let hit = from.is_some_and(|(t, _)| t.ends_with(p.as_bytes()));
+        out.write(Object::Bool(hit));
+        0
+    }
+}
+
+/// An `isdigit`-style predicate of an ASCII string: true when non-empty
+/// and every byte passes `test`. A non-ASCII string declines (unless an
+/// earlier ASCII byte already failed).
+///
+/// # Safety
+///
+/// As [`Kernel`]'s.
+unsafe fn ascii_all(out: *mut Object, recv: *const Object, test: fn(u8) -> bool) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Str(s) = &*recv else {
+            return 1;
+        };
+        let bytes = s.as_bytes();
+        let mut all = !bytes.is_empty();
+        for &c in bytes {
+            if c >= 0x80 {
+                return 1;
+            }
+            if !test(c) {
+                all = false;
+                break;
+            }
+        }
+        out.write(Object::Bool(all));
+        0
+    }
+}
+
+unsafe extern "C" fn k_str_isdigit(
+    out: *mut Object,
+    recv: *const Object,
+    _: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { ascii_all(out, recv, |c| c.is_ascii_digit()) }
+}
+
+unsafe extern "C" fn k_str_isalpha(
+    out: *mut Object,
+    recv: *const Object,
+    _: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { ascii_all(out, recv, |c| c.is_ascii_alphabetic()) }
+}
+
+unsafe extern "C" fn k_str_isspace(
+    out: *mut Object,
+    recv: *const Object,
+    _: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { ascii_all(out, recv, |c| crate::unicode_case::is_space(char::from(c))) }
+}
+
+unsafe extern "C" fn k_str_find(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        let Some((s, p)) = two_strs(recv, a) else {
+            return 1;
+        };
+        // (An ASCII receiver's byte offsets are its indices.)
+        if crate::shared_value::SharedStr::char_count(s) != s.len() {
+            return 1;
+        }
+        let Some(from) = ascii_from(s, b) else {
+            return 1;
+        };
+        let at = from
+            .and_then(|(_, i)| crate::builtins::substr_find(&s[i..], p).map(|k| (k + i) as i64));
+        out.write(Object::Int(at.unwrap_or(-1)));
+        0
+    }
+}
+
+/// A `str` method whose body runs no Python code for any arguments
+/// (`lower`, `upper`, the registered pure bodies).
+unsafe extern "C" fn k_str_body(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe { run_body(out, recv, a, b, f) }
+}
+
+unsafe extern "C" fn k_str_strip(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        if !a.is_null() && !matches!(&*a, Object::Str(_) | Object::None) {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
+    }
+}
+
+unsafe extern "C" fn k_str_split(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        if !a.is_null() && !matches!(&*a, Object::Str(_) | Object::None) {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
+    }
+}
+
+unsafe extern "C" fn k_str_join(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; an exact list's or tuple's exact strings
+    // join with no iteration hook.
+    unsafe {
+        let strs = match &*a {
+            Object::List(l) => l
+                .peek()
+                .is_some_and(|xs| xs.iter().all(|x| matches!(x, Object::Str(_)))),
+            Object::Tuple(t) => t.iter().all(|x| matches!(x, Object::Str(_))),
+            _ => false,
+        };
+        if !strs {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
+    }
+}
+
+unsafe extern "C" fn k_str_replace(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        if !matches!((&*a, &*b), (Object::Str(_), Object::Str(_))) {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
     }
 }
 
@@ -1480,6 +2167,381 @@ unsafe extern "C" fn h_contains(at: *mut Object) -> u32 {
         crate::drop_hot(at.add(1).read());
         crate::drop_hot(at.read());
         u32::from(found)
+    }
+}
+
+/// `CONTAINS_OP` of the item at `item` in the container at `cont`, each
+/// read in place: a local's or constant's (borrowed), or a stack slot's
+/// (owned there, its bit in `owned`: `1` the item, `2` the container),
+/// which leaves the stack. `0` or `1` (found), anything else declined
+/// untouched.
+unsafe fn contains_fast(item: *const Object, cont: *const Object, owned: u32) -> u32 {
+    // SAFETY: the code passes two initialized values, the owned ones in
+    // stack slots.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        if owned != 0 && !(droppable(i) && droppable(c)) {
+            return 2;
+        }
+        let Some(found) = Interpreter::leaf_contains(c, i) else {
+            return 2;
+        };
+        if owned & 2 != 0 {
+            crate::drop_hot(cont.read());
+        }
+        if owned & 1 != 0 {
+            crate::drop_hot(item.read());
+        }
+        u32::from(found)
+    }
+}
+
+/// `BINARY_SUBSCR` of the container at `cont` by the key at `key`, each
+/// read in place as [`contains_fast`] reads its operands (`owned`: `1`
+/// the container, `2` the key): an exact `dict` by a key that compares
+/// natively, a `list` or `tuple` by an in-range `int`, or a `str` by an
+/// in-range `int` (an ASCII one's). `0` the item written to `out` (the
+/// owned operands released first), anything else declined untouched.
+unsafe fn subscr_fast(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: the code passes two initialized values, the owned ones in
+    // stack slots, and a free slot (or the container's own) for the item.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        if owned != 0 && !(droppable(c) && droppable(k)) {
+            return 1;
+        }
+        let index = |n: usize| -> Option<usize> {
+            let Object::Int(i) = *k else {
+                return None;
+            };
+            let i = if i < 0 { i.checked_add(n as i64)? } else { i };
+            usize::try_from(i).ok().filter(|&i| i < n)
+        };
+        let r = match c {
+            Object::Dict(d) => {
+                let Some(probe) = crate::object::LeafProbe::new(k) else {
+                    return 1;
+                };
+                let Some(v) = d.peek().and_then(|m| m.get(&probe)) else {
+                    return 1;
+                };
+                crate::clone_hot(v)
+            }
+            Object::List(xs) => {
+                let Some(xs) = xs.peek() else {
+                    return 1;
+                };
+                let Some(i) = index(xs.len()) else {
+                    return 1;
+                };
+                crate::clone_hot(&xs[i])
+            }
+            Object::Tuple(t) => {
+                let Some(i) = index(t.len()) else {
+                    return 1;
+                };
+                crate::clone_hot(&t[i])
+            }
+            Object::Str(s) => {
+                let bytes = s.as_bytes();
+                if crate::shared_value::SharedStr::char_count(s) != bytes.len() {
+                    return 1;
+                }
+                let Some(i) = index(bytes.len()) else {
+                    return 1;
+                };
+                Object::from_char(char::from(bytes[i]))
+            }
+            _ => return 1,
+        };
+        if owned & 2 != 0 {
+            crate::drop_hot(key.read());
+        }
+        if owned & 1 != 0 {
+            crate::drop_hot(cont.read());
+        }
+        out.write(r);
+        0
+    }
+}
+
+/// `UNPACK_SEQUENCE n` of the exact `n`-item tuple or list at `src`, read
+/// in place (a local's or constant's), or owned in the stack slot `dst`
+/// itself (`owned`), which leaves the stack: its items to `dst` and up,
+/// the last item first, as the core loop's arm pushes them. `0` unpacked,
+/// anything else declined untouched.
+unsafe fn unpack_fast(
+    dst: *mut Object,
+    src: *const Object,
+    n: u64,
+    owned: u32,
+    interp: &Interpreter,
+) -> u32 {
+    // SAFETY: the code passes an initialized value (in `dst` itself when
+    // owned) and `n` free slots from `dst` up (the first the owned
+    // value's).
+    unsafe {
+        let n = n as usize;
+        let s = &*src;
+        let fits = match s {
+            Object::Tuple(t) => t.len() == n,
+            Object::List(l) => l.peek().is_some_and(|xs| xs.len() == n),
+            _ => false,
+        };
+        // An owned sequence's release frees nothing that could finalize
+        // when this is its only reference (its items outlive it on the
+        // stack); a shared one's is a plain decrement.
+        let unique = match s {
+            Object::Tuple(t) => crate::shared_value::ThinArc::strong_count(t) == 1,
+            Object::List(l) => Rc::strong_count(l) == 1,
+            _ => false,
+        };
+        if !fits || (owned != 0 && !unique && !droppable(s)) {
+            return 1;
+        }
+        let seq = if owned != 0 { Some(src.read()) } else { None };
+        let s = seq.as_ref().unwrap_or(s);
+        match s {
+            Object::Tuple(t) => {
+                for (k, item) in t.iter().rev().enumerate() {
+                    dst.add(k).write(crate::clone_hot(item));
+                }
+            }
+            Object::List(l) => {
+                let xs = l.peek().expect("checked above");
+                for (k, item) in xs.iter().rev().enumerate() {
+                    dst.add(k).write(crate::clone_hot(item));
+                }
+            }
+            _ => unreachable!("checked above"),
+        }
+        // (A dead tuple's allocation is recycled, as `release` does it.)
+        match seq {
+            Some(seq @ Object::Tuple(_)) => interp.maybe_donate_tuple(seq),
+            Some(seq) => crate::drop_hot(seq),
+            None => {}
+        }
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the container at `cont` by
+/// the key at `key`, each read in place as [`contains_fast`] reads its
+/// operands (`owned`: `1` the value, `2` the container, `4` the key): an
+/// exact `list` by an in-range `int`, or an exact `dict` by a key that
+/// compares natively, as the core loop's arm stores. `0` stored (an owned
+/// value moved in, a borrowed one copied; the other owned operands and
+/// the displaced value released), anything else declined untouched.
+unsafe fn store_subscr_fast(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: the code passes three initialized values, the owned ones in
+    // stack slots. The store runs no code; a displaced value is released
+    // after it (a finalizer it queues runs before the next instruction).
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        if !Interpreter::core_droppable(c) || (owned & 4 != 0 && !droppable(k)) {
+            return 1;
+        }
+        let displaced_ok = |old: &Object| {
+            matches!(
+                old,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            ) || Interpreter::core_droppable(old)
+        };
+        let value = || {
+            if owned & 1 != 0 {
+                val.read()
+            } else {
+                crate::clone_hot(&*val)
+            }
+        };
+        let old = match (c, k) {
+            (Object::List(xs), Object::Int(i)) => {
+                let Some(xs) = xs.peek_mut() else {
+                    return 1;
+                };
+                let n = xs.len() as i64;
+                let i = if *i < 0 { *i + n } else { *i };
+                if i < 0 || i >= n || !displaced_ok(&xs[i as usize]) {
+                    return 1;
+                }
+                std::mem::replace(&mut xs[i as usize], value())
+            }
+            (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+                if crate::capi_watchers::dicts_active() {
+                    return 1;
+                }
+                let Some(probe) = crate::object::LeafProbe::new(k) else {
+                    return 1;
+                };
+                let Some(d) = cell.peek_mut() else {
+                    return 1;
+                };
+                let (old, changed) = match d.get_mut(&probe) {
+                    Some(slot) => {
+                        if !displaced_ok(slot) {
+                            return 1;
+                        }
+                        let old = std::mem::replace(slot, value());
+                        let changed = !old.is_same(slot);
+                        (old, changed)
+                    }
+                    None => {
+                        if !probe.miss_is_exact() {
+                            return 1;
+                        }
+                        d.insert(crate::object::DictKey(crate::clone_hot(k)), value());
+                        (Object::None, true)
+                    }
+                };
+                if changed {
+                    crate::object::dict_mutation_event(cell);
+                }
+                old
+            }
+            _ => return 1,
+        };
+        if owned & 4 != 0 {
+            crate::drop_hot(key.read());
+        }
+        if owned & 2 != 0 {
+            crate::drop_hot(cont.read());
+        }
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// Copy the borrowed operands among `ops` (bit `k` of `owned` clear) to
+/// the free stack slots `at.add(k)`, so that all of them are on the
+/// stack, as the container helpers take them.
+///
+/// # Safety
+///
+/// Each pointer addresses an initialized value; the slots of the
+/// borrowed ones are free.
+unsafe fn own_operands(at: *mut Object, ops: &[*const Object], owned: u32) {
+    for (k, &p) in ops.iter().enumerate() {
+        if owned & (1 << k) == 0 {
+            // SAFETY: the caller's contract.
+            unsafe { at.add(k).write(crate::clone_hot(&*p)) };
+        }
+    }
+}
+
+/// `CONTAINS_OP` of a local's, constant's or stack slot's item and
+/// container (bit `k` of `owned`: the one owned in the slot `at.add(k)`),
+/// read in place where they lie (see [`contains_fast`]); any other shape
+/// with both operands copied to the stack and through [`h_contains`],
+/// whose result it is.
+unsafe extern "C" fn h_contains_ref(
+    item: *const Object,
+    cont: *const Object,
+    owned: u32,
+    at: *mut Object,
+) -> u32 {
+    // SAFETY: the code passes the operands, and the two slots from `at`
+    // (the owned operands' own).
+    unsafe {
+        let r = contains_fast(item, cont, owned);
+        if r <= 1 {
+            return r;
+        }
+        own_operands(at, &[item, cont], owned);
+        h_contains(at)
+    }
+}
+
+/// `BINARY_SUBSCR` (the `pc`th instruction `ins` of `code`) on a stack
+/// `len` deep whose top two slots are the container's and key's (each
+/// owned there, by the bits of `flags`, or a local's or constant's at
+/// `cont` / `key`): through [`subscr_fast`], else with both operands on
+/// the stack through [`h_container`] (`flags` bit 8: it may raise), whose
+/// result it is.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_subscr_ref(
+    st: *mut State,
+    ins: *const weavepy_compiler::Instruction,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    cont: *const Object,
+    key: *const Object,
+    flags: u64,
+) -> u64 {
+    // SAFETY: the code passes its live state, one of its own instructions
+    // and its code, its depth, and the operands.
+    unsafe {
+        let at = (*st).stack.add(len as usize - 2);
+        let owned = (flags & 0xff) as u32;
+        if subscr_fast(at, cont, key, owned) == 0 {
+            return len - 1;
+        }
+        own_operands(at, &[cont, key], owned);
+        h_container(st, ins, code, pc, len, flags >> 8)
+    }
+}
+
+/// `UNPACK_SEQUENCE n` as [`h_subscr_ref`] runs a subscript: through
+/// [`unpack_fast`] on the sequence in the top slot or at `src`, else on
+/// the stack through [`h_container`].
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_unpack_ref(
+    st: *mut State,
+    ins: *const weavepy_compiler::Instruction,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    src: *const Object,
+    n: u64,
+    flags: u64,
+) -> u64 {
+    // SAFETY: as `h_subscr_ref`'s.
+    unsafe {
+        let at = (*st).stack.add(len as usize - 1);
+        let owned = (flags & 0xff) as u32;
+        if unpack_fast(at, src, n, owned, &*(*st).interp) == 0 {
+            return len - 1 + n;
+        }
+        own_operands(at, &[src], owned);
+        h_container(st, ins, code, pc, len, flags >> 8)
+    }
+}
+
+/// `STORE_SUBSCR` as [`h_subscr_ref`] runs a subscript: through
+/// [`store_subscr_fast`] on the value, container and key in the top
+/// three slots or at `val`, `cont`, `key`, else on the stack through
+/// [`h_container`].
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_store_subscr_ref(
+    st: *mut State,
+    ins: *const weavepy_compiler::Instruction,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+    flags: u64,
+) -> u64 {
+    // SAFETY: as `h_subscr_ref`'s.
+    unsafe {
+        let at = (*st).stack.add(len as usize - 3);
+        let owned = (flags & 0xff) as u32;
+        if store_subscr_fast(val, cont, key, owned) == 0 {
+            return len - 3;
+        }
+        own_operands(at, &[val, cont, key], owned);
+        h_container(st, ins, code, pc, len, flags >> 8)
     }
 }
 
@@ -2028,6 +3090,7 @@ unsafe extern "C" fn h_load_method(
     pc: u64,
     len: u64,
     cache: *mut MethodCache,
+    mcache: *const ModCache,
 ) -> u32 {
     // SAFETY: the code passes its live state, its own code and extension,
     // one of its method loads, and its stack depth (at least one, with
@@ -2049,8 +3112,24 @@ unsafe extern "C" fn h_load_method(
         // `module.func(...)`: the attribute with an empty self slot, as the
         // core loop's arm loads it.
         if let Object::Module(m) = &*top {
-            let Some(v) = Interpreter::core_module_attr(code, m, pc, name) else {
-                return 1;
+            // The entry the site last read, while the module's dict is
+            // exactly as it was then (its stamp moves with every change).
+            let mc = &*mcache;
+            let hit = m.dict.peek().and_then(|d| {
+                (std::ptr::eq(Rc::as_ptr(&m.dict).cast::<u8>(), mc.dict.get() as *const u8)
+                    && d.mutation_stamp() == mc.stamp.get())
+                .then(|| d.get_index(mc.idx.get()).map(|(_, v)| crate::clone_hot(v)))
+                .flatten()
+            });
+            let v = match hit {
+                Some(v) => v,
+                None => {
+                    let Some(v) = Interpreter::core_module_attr(code, m, pc, name) else {
+                        return 1;
+                    };
+                    mc.note(code, m, pc);
+                    v
+                }
             };
             crate::drop_hot(std::mem::replace(&mut *top, v));
             st.stack.add(len).write(Object::Unbound);
@@ -2184,6 +3263,33 @@ fn fill_method_cache(
         keys,
         before,
     };
+}
+
+/// A method load's module-attribute shortcut: the module dict's address
+/// and stamp when the site last read it, and the entry's position (`0`
+/// address: empty).
+#[derive(Default)]
+pub(crate) struct ModCache {
+    dict: std::cell::Cell<usize>,
+    stamp: std::cell::Cell<u64>,
+    idx: std::cell::Cell<usize>,
+}
+
+impl ModCache {
+    /// Remember the entry the site's inline cache just read from `m`.
+    #[cold]
+    fn note(&self, code: &CodeObject, m: &crate::object::PyModule, pc: usize) {
+        use weavepy_compiler::InlineCache as IC;
+        let IC::LoadAttrModule { key_idx, .. } = code.caches.get(pc as u32) else {
+            return;
+        };
+        // SAFETY: a read between two instructions.
+        if let Some(d) = unsafe { m.dict.peek() } {
+            self.dict.set(Rc::as_ptr(&m.dict) as *const u8 as usize);
+            self.stamp.set(d.mutation_stamp());
+            self.idx.set(key_idx as usize);
+        }
+    }
 }
 
 /// A `LOAD_ATTR` site's `__slots__` member shortcut: the class version and
@@ -3432,6 +4538,110 @@ unsafe extern "C" fn h_call(
     }
 }
 
+/// `len(x)` of an exact container or string.
+fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // SAFETY: reads between two instructions (the lengths run no code).
+    let n = unsafe {
+        match args {
+            [Object::List(l)] => l.peek()?.len(),
+            [Object::Tuple(t)] => t.len(),
+            [Object::Str(s)] => crate::shared_value::SharedStr::char_count(s),
+            [Object::Dict(d)] => d.peek()?.len(),
+            [Object::Set(s)] => s.peek()?.len(),
+            [Object::Bytes(b)] => b.len(),
+            _ => return None,
+        }
+    };
+    Some(Ok(Object::Int(n as i64)))
+}
+
+/// [`h_call`] at a site settled on a leaf builtin: a container's or
+/// string's method through its [`Kernel`], or `isinstance`, `len` or a
+/// registered fast half in place as `h_call` runs them first, from a
+/// small function (the general helper stays as it is); anything else
+/// (another callee, a declined shape) through `h_call`.
+unsafe extern "C" fn h_call_leaf(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u64,
+    len: u64,
+) -> u32 {
+    use crate::LeafKind;
+    // SAFETY: as `h_call`'s.
+    unsafe {
+        let s = &mut *st;
+        let (c, x, pcu, lenu) = (&*code, &*ext, pc as usize, len as usize);
+        let argc = c.instructions[pcu].arg as usize;
+        if lenu >= argc + 2 && !s.sw.is_null() {
+            let base = s.stack;
+            let start = lenu - argc - 2;
+            if let Object::Builtin(b) = &*base.add(start) {
+                let kind = x
+                    .method_slots
+                    .get()
+                    .and_then(|m| m.get(pcu))
+                    .and_then(|m| m.get_leaf(b));
+                // A container's or string's method with a kernel, on the
+                // receiver in the self slot.
+                if let (Some(k), false) = (kind, matches!(&*base.add(start + 1), Object::Unbound)) {
+                    let args = std::slice::from_raw_parts(base.add(start + 1), argc + 1);
+                    if Rc::strong_count(b) > 1 && Interpreter::core_all_droppable(args) {
+                        if let Some(v) = kernel_call(k, args, b) {
+                            for j in start..lenu {
+                                crate::drop_hot(base.add(j).read());
+                            }
+                            base.add(start).write(v);
+                            s.len = start + 1;
+                            return 0;
+                        }
+                    }
+                }
+                if matches!(
+                    kind,
+                    Some(LeafKind::Isinstance | LeafKind::Len | LeafKind::Fast(_))
+                ) && Rc::strong_count(b) > 1
+                {
+                    let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                        start + 2
+                    } else {
+                        start + 1
+                    };
+                    let args = std::slice::from_raw_parts(base.add(first), lenu - first);
+                    let r = if Interpreter::core_all_droppable(args) {
+                        match kind {
+                            Some(LeafKind::Fast(f)) => f(args),
+                            Some(LeafKind::Len) => len_fast(args),
+                            _ => Interpreter::core_isinstance(args),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(r) = r {
+                        for k in start..lenu {
+                            crate::drop_hot(base.add(k).read());
+                        }
+                        return match r {
+                            Ok(v) => {
+                                base.add(start).write(v);
+                                s.len = start + 1;
+                                0
+                            }
+                            Err(e) => {
+                                s.len = start;
+                                s.pc = pcu + 1;
+                                s.err = Some(e);
+                                RAISED
+                            }
+                        };
+                    }
+                }
+            }
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of a
 /// leaf builtin whose leaf half declined, or of an instance's
 /// `__reduce_ex__`, through the core loop's lane for them
@@ -4161,6 +5371,8 @@ fn compile_with(
     let mut slots: Vec<Box<SlotCache>>;
     let mut methods: Vec<Box<MethodCache>>;
     let mut direct: Vec<Box<DirectSite>>;
+    let mut held: Vec<Rc<crate::object::BuiltinFn>>;
+    let mut mods: Vec<Box<ModCache>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
@@ -4176,6 +5388,8 @@ fn compile_with(
         slots = std::mem::take(&mut lower.slot_caches);
         methods = std::mem::take(&mut lower.method_caches);
         direct = std::mem::take(&mut lower.direct_sites);
+        held = std::mem::take(&mut lower.held);
+        mods = std::mem::take(&mut lower.mod_caches);
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
@@ -4237,6 +5451,8 @@ fn compile_with(
         _slots: slots,
         _methods: methods,
         _direct: direct,
+        _held: held,
+        _mods: mods,
     })
 }
 
@@ -4340,6 +5556,11 @@ struct Lower<'a> {
     method_caches: Vec<Box<MethodCache>>,
     #[allow(clippy::vec_box)]
     direct_sites: Vec<Box<DirectSite>>,
+    /// The builtins the method kernels' calls address.
+    held: Vec<Rc<crate::object::BuiltinFn>>,
+    /// The method loads' module-attribute caches.
+    #[allow(clippy::vec_box)]
+    mod_caches: Vec<Box<ModCache>>,
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
     /// first use.
     catch: Option<Block>,
@@ -4504,6 +5725,8 @@ impl<'a> Lower<'a> {
             slot_caches: Vec::new(),
             method_caches: Vec::new(),
             direct_sites: Vec::new(),
+            held: Vec::new(),
+            mod_caches: Vec::new(),
             catch: None,
         }
     }
@@ -4692,19 +5915,22 @@ impl<'a> Lower<'a> {
         let by_value = self.b.create_block();
         let by_clone = self.b.create_block();
         let done = self.b.create_block();
-        if self.tags.rc_counted == 0 {
+        if self.tags.rc_counted == 0 && self.tags.rc_counted_hdr == 0 {
             self.b.ins().brif(scalar, by_value, &[], by_clone, &[]);
         } else {
-            // An instance, list, dict or class while one thread owns every
-            // count: a plain increment of its count.
+            // An instance, list, dict, class, string or tuple while one
+            // thread owns every count: a plain increment of its count.
             let counted = self.b.create_block();
             let heap = self.b.create_block();
             self.b.ins().brif(scalar, by_value, &[], heap, &[]);
             self.b.switch_to_block(heap);
             let one = self.b.ins().iconst(types::I64, 1);
             let bit = self.b.ins().ishl(one, tag);
-            let rc = self.b.ins().band_imm(bit, self.tags.rc_counted);
-            let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+            let any = self
+                .b
+                .ins()
+                .band_imm(bit, self.tags.rc_counted | self.tags.rc_counted_hdr);
+            let rc = self.b.ins().icmp_imm(IntCC::NotEqual, any, 0);
             let flag = self.b.ins().iconst(
                 self.ptr,
                 std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
@@ -4714,10 +5940,10 @@ impl<'a> Lower<'a> {
             let ok = self.b.ins().band(rc, solo);
             self.b.ins().brif(ok, counted, &[], by_clone, &[]);
             self.b.switch_to_block(counted);
-            let w = self.b.ins().load(self.ptr, FLAGS, src, 8);
-            let c = self.b.ins().load(types::I64, FLAGS, w, 0);
+            let at = self.count_addr(src, bit);
+            let c = self.b.ins().load(types::I64, FLAGS, at, 0);
             let c1 = self.b.ins().iadd_imm(c, 1);
-            self.b.ins().store(FLAGS, c1, w, 0);
+            self.b.ins().store(FLAGS, c1, at, 0);
             self.b.ins().jump(by_value, &[]);
         }
         self.b.switch_to_block(by_value);
@@ -4727,6 +5953,20 @@ impl<'a> Lower<'a> {
         self.call(h_clone as *const () as usize, &[dst, src], false);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
+    }
+
+    /// The strong count's address of the counted heap value at `src`
+    /// whose tag bit is `bit`: its payload word, or two words before it
+    /// for a [`Tags::rc_counted_hdr`] variant.
+    fn count_addr(&mut self, src: Value, bit: Value) -> Value {
+        let w = self.b.ins().load(self.ptr, FLAGS, src, 8);
+        if self.tags.rc_counted_hdr == 0 {
+            return w;
+        }
+        let hdr = self.b.ins().band_imm(bit, self.tags.rc_counted_hdr);
+        let hdr = self.b.ins().icmp_imm(IntCC::NotEqual, hdr, 0);
+        let before = self.b.ins().iadd_imm(w, -16);
+        self.b.ins().select(hdr, before, w)
     }
 
     /// Write the whole virtual stack to the frame's.
@@ -5217,7 +6457,8 @@ impl<'a> Lower<'a> {
                         let scalar = self.is_scalar(tag);
                         let heap = self.b.create_block();
                         let done = self.b.create_block();
-                        self.b.ins().brif(scalar, done, &[], heap, &[]);
+                        // (A shared counted value by a plain decrement.)
+                        self.release_or(scalar, at, tag, done, heap);
                         self.b.switch_to_block(heap);
                         let r = self
                             .call(h_pop as *const () as usize, &[at], true)
@@ -5385,6 +6626,9 @@ impl<'a> Lower<'a> {
             }
             OpCode::ForIter => return self.for_iter(pc, ins.arg),
             OpCode::BinarySubscr if self.seq_index(pc) => true,
+            OpCode::BinarySubscr if self.subscr_ref(pc) => true,
+            OpCode::UnpackSequence if self.unpack_ref(pc, ins.arg as usize) => true,
+            OpCode::StoreSubscr if self.store_subscr_ref(pc) => true,
             OpCode::BinarySubscr
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
@@ -5741,6 +6985,7 @@ impl<'a> Lower<'a> {
             Some(OpCode::LoadMethodAttr)
                 if !self.is_gen() && crate::method_site_in_place(self.ext, pc + 1) =>
             {
+                self.method_kernel(pc);
                 self.method_call(pc)
             }
             Some(OpCode::StoreAttr) => return self.store_attr(pc),
@@ -5769,6 +7014,118 @@ impl<'a> Lower<'a> {
     /// loop's).
     fn is_gen(&self) -> bool {
         self.code.is_generator || self.code.is_coroutine || self.code.is_async_generator
+    }
+
+    /// `LOAD_FAST x; x.m(<up to two local, constant or small-int
+    /// arguments>); CALL` on an exact `list`, `dict`, `set` or `str` whose
+    /// method the site settled as a leaf with a [`Kernel`]: the receiver's
+    /// tag checked in line and the kernel called on the operands in place
+    /// (no method object, receiver copy or argument copies), continuing
+    /// after the `CALL`. Lowering continues (at the general fused call)
+    /// where the receiver is something else or the kernel declines;
+    /// nothing is emitted for a site without a kernel.
+    fn method_kernel(&mut self, pc: usize) {
+        #[derive(Clone, Copy)]
+        enum Arg {
+            Local(u32),
+            Const(u32),
+            Small(u32),
+        }
+        let code = self.code;
+        let ins = &code.instructions;
+        let n = ins.len();
+        let mut args: Vec<Arg> = Vec::new();
+        let mut k = pc + 2;
+        let call_pc = loop {
+            let Some(i) = ins.get(k) else {
+                return;
+            };
+            match i.op {
+                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {
+                    args.push(Arg::Local(i.arg));
+                }
+                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {
+                    args.push(Arg::Const(i.arg));
+                }
+                OpCode::LoadSmallInt => args.push(Arg::Small(i.arg)),
+                OpCode::Call if i.arg as usize == args.len() => break k,
+                _ => return,
+            }
+            if args.len() > 2 {
+                return;
+            }
+            k += 1;
+        };
+        if call_pc + 1 >= n || self.blocks.get(call_pc + 1).copied().flatten().is_none() {
+            return;
+        }
+        let Some((tag, kind, f)) = crate::builtin_method_site(self.ext, pc + 1, call_pc) else {
+            return;
+        };
+        let Some(kernel) = kernel_for(tag, kind, args.len()) else {
+            return;
+        };
+        let want = match tag {
+            1 => self.tags.list,
+            2 => self.tags.dict,
+            3 => self.tags.set,
+            _ => self.tags.str,
+        };
+        self.flush();
+        let slot = self.depth;
+        let declined = self.b.create_block();
+        let recv = self.local_addr(self.code.instructions[pc].arg);
+        let t = self.tag_at(recv);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, t, i64::from(want));
+        self.branch_out(other, declined);
+        let mut addrs = Vec::with_capacity(2);
+        for (j, arg) in args.iter().enumerate() {
+            let at = match *arg {
+                Arg::Local(i) => {
+                    let at = self.local_addr(i);
+                    if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
+                        let t = self.tag_at(at);
+                        let unbound =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
+                        self.branch_out(unbound, declined);
+                    }
+                    at
+                }
+                Arg::Const(c) => self.const_addr(c),
+                // A scalar in the slot the argument would take.
+                Arg::Small(v) => {
+                    let at = self.slot_addr(slot + 2 + j);
+                    self.write_tag(at, self.tags.int);
+                    let v = self.b.ins().iconst(types::I64, i64::from(v));
+                    self.b.ins().store(FLAGS, v, at, 8);
+                    at
+                }
+            };
+            addrs.push(at);
+        }
+        let null = self.b.ins().iconst(self.ptr, 0);
+        let a = addrs.first().copied().unwrap_or(null);
+        let b = addrs.get(1).copied().unwrap_or(null);
+        let fp = self.b.ins().iconst(self.ptr, Rc::as_ptr(&f) as i64);
+        self.held.push(f);
+        let out = self.slot_addr(slot);
+        let r = self
+            .call(kernel as *const () as usize, &[out, recv, a, b, fp], true)
+            .expect("returns");
+        let ran = self.b.create_block();
+        self.b.ins().brif(r, declined, &[], ran, &[]);
+        // Ran: the result in the receiver's slot, as after the `CALL`.
+        self.b.switch_to_block(ran);
+        let (depth, last) = (self.depth, self.last_pc);
+        self.push(Item::Mem(slot));
+        self.set_last(call_pc);
+        self.goto(call_pc + 1);
+        self.depth = depth;
+        self.last_pc = last;
+        self.vs.clear();
+        self.b.switch_to_block(declined);
     }
 
     /// `LOAD_FAST x; x.m(<simple arguments>)` through [`h_local_method`],
@@ -5978,7 +7335,7 @@ impl<'a> Lower<'a> {
     /// a plain decrement (one thread owns every count, and no watcher or
     /// tracer wants the release). Anything else goes to `slow`.
     fn release_or(&mut self, plain: Value, local: Value, old: Value, fast: Block, slow: Block) {
-        if self.cold || self.tags.rc_counted == 0 {
+        if self.cold || (self.tags.rc_counted == 0 && self.tags.rc_counted_hdr == 0) {
             self.b.ins().brif(plain, fast, &[], slow, &[]);
             return;
         }
@@ -5989,7 +7346,10 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(heap);
         let one = self.b.ins().iconst(types::I64, 1);
         let bit = self.b.ins().ishl(one, old);
-        let rc = self.b.ins().band_imm(bit, self.tags.rc_counted);
+        let rc = self
+            .b
+            .ins()
+            .band_imm(bit, self.tags.rc_counted | self.tags.rc_counted_hdr);
         let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
         // The single-thread bias, and the release observers, all off.
         let mut quiet = rc;
@@ -6001,7 +7361,7 @@ impl<'a> Lower<'a> {
         }
         self.b.ins().brif(quiet, counted, &[], slow, &[]);
         self.b.switch_to_block(counted);
-        let w = self.b.ins().load(self.ptr, FLAGS, local, 8);
+        let w = self.count_addr(local, bit);
         let c = self.b.ins().load(types::I64, FLAGS, w, 0);
         let shared = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, c, 1);
         self.b.ins().brif(shared, dec, &[], slow, &[]);
@@ -6624,6 +7984,141 @@ impl<'a> Lower<'a> {
         true
     }
 
+    /// A container instruction through one of the in-place helpers
+    /// ([`h_subscr_ref`], [`h_unpack_ref`], [`h_store_subscr_ref`]), its
+    /// `n` operands from `slot` up (the owned ones there, by the bits of
+    /// `owned`; `ops` their addresses and any further arguments): the
+    /// helper's new depth, a decline leaving for the core loop with the
+    /// operands on the stack, a raise (only with nothing virtual below
+    /// the operands) taking the handlers.
+    fn ref_call(
+        &mut self,
+        pc: usize,
+        helper: usize,
+        slot: usize,
+        n: usize,
+        ops: &[Value],
+        owned: u8,
+    ) {
+        let ins = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref(&self.code.instructions[pc]) as i64,
+        );
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let lenv = self.b.ins().iconst(types::I64, (slot + n) as i64);
+        let raisable = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+        let flags = self
+            .b
+            .ins()
+            .iconst(types::I64, i64::from(owned) | (i64::from(raisable) << 8));
+        let mut args = vec![self.st, ins, code, pcv, lenv];
+        args.extend_from_slice(ops);
+        args.push(flags);
+        let r = self
+            .call_typed(helper, &args, Some(types::I64))
+            .expect("returns");
+        let declined = self.b.ins().icmp_imm(IntCC::Equal, r, -1);
+        let restore: Vec<Item> = (slot..slot + n).map(Item::Mem).collect();
+        let out = self.exit_with(pc, &restore, INTERP);
+        self.branch_out(declined, out);
+        if raisable {
+            let raised = self.b.ins().icmp_imm(IntCC::Equal, r, -2);
+            let raise_b = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(raised, raise_b, &[], ok, &[]);
+            self.b.switch_to_block(raise_b);
+            let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
+            self.leave(s);
+            self.b.switch_to_block(ok);
+        }
+    }
+
+    /// `BINARY_SUBSCR` through [`h_subscr_ref`], which reads a local's or
+    /// constant's operand in place (no reference taken or released): the
+    /// item in the container's slot. `false`, emitting nothing, where the
+    /// depth after isn't known.
+    fn subscr_ref(&mut self, pc: usize) -> bool {
+        if self.depth < 2 || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0 {
+            return false;
+        }
+        let key = self.pop();
+        let cont = self.pop();
+        let slot = self.depth;
+        let (pcont, own_c) = self.ref_or_own(cont, slot);
+        let (pkey, own_k) = self.ref_or_own(key, slot + 1);
+        let owned = u8::from(own_c) | (u8::from(own_k) << 1);
+        self.ref_call(
+            pc,
+            h_subscr_ref as *const () as usize,
+            slot,
+            2,
+            &[pcont, pkey],
+            owned,
+        );
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
+        // (The helper released the owned operands; a finalizer that queued
+        // runs before the next instruction.)
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// `UNPACK_SEQUENCE n` through [`h_unpack_ref`], which reads a local's
+    /// or constant's sequence in place. `false`, emitting nothing, where
+    /// the depth after isn't known.
+    fn unpack_ref(&mut self, pc: usize, n: usize) -> bool {
+        if n == 0 || self.depth == 0 || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0 {
+            return false;
+        }
+        let item = self.pop();
+        let slot = self.depth;
+        let (src, owned) = self.ref_or_own(item, slot);
+        let nv = self.b.ins().iconst(types::I64, n as i64);
+        self.ref_call(
+            pc,
+            h_unpack_ref as *const () as usize,
+            slot,
+            1,
+            &[src, nv],
+            u8::from(owned),
+        );
+        for k in 0..n {
+            self.push(Item::Mem(slot + k));
+        }
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// `STORE_SUBSCR` through [`h_store_subscr_ref`], which reads a local's
+    /// or constant's operand in place. `false`, emitting nothing, where
+    /// the depth after isn't known.
+    fn store_subscr_ref(&mut self, pc: usize) -> bool {
+        if self.depth < 3 || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0 {
+            return false;
+        }
+        let key = self.pop();
+        let cont = self.pop();
+        let val = self.pop();
+        let slot = self.depth;
+        let (pv, own_v) = self.ref_or_own(val, slot);
+        let (pcont, own_c) = self.ref_or_own(cont, slot + 1);
+        let (pkey, own_k) = self.ref_or_own(key, slot + 2);
+        let owned = u8::from(own_v) | (u8::from(own_c) << 1) | (u8::from(own_k) << 2);
+        self.ref_call(
+            pc,
+            h_store_subscr_ref as *const () as usize,
+            slot,
+            3,
+            &[pv, pcont, pkey],
+            owned,
+        );
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        true
+    }
+
     /// `LIST_APPEND` through [`h_list_append`] (the value leaves the stack
     /// into the list `arg` below it).
     fn list_append(&mut self, pc: usize, arg: usize) -> bool {
@@ -6640,16 +8135,40 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// `CONTAINS_OP` through [`h_contains`]: an unboxed `bool`.
+    /// An operand for a helper that reads it in place: a local's or a
+    /// constant's own value (borrowed, `false`), or anything else on the
+    /// stack at `slot` (owned there, `true`).
+    fn ref_or_own(&mut self, item: Item, slot: usize) -> (Value, bool) {
+        match item {
+            Item::Local(i) => (self.local_addr(i), false),
+            Item::Const(k) => (self.const_addr(k), false),
+            other => {
+                self.materialize(other, slot);
+                (self.slot_addr(slot), true)
+            }
+        }
+    }
+
+    /// `CONTAINS_OP` through [`h_contains_ref`], which reads a local or
+    /// constant operand in place (any other through [`h_contains`]): an
+    /// unboxed `bool`.
     fn contains(&mut self, pc: usize, arg: u32) -> bool {
         let bi = self.pop();
         let ai = self.pop();
         let slot = self.depth;
-        self.materialize(ai, slot);
-        self.materialize(bi, slot + 1);
+        let (pa, own_a) = self.ref_or_own(ai, slot);
+        let (pb, own_b) = self.ref_or_own(bi, slot + 1);
+        let owned = self.b.ins().iconst(
+            types::I32,
+            i64::from(u8::from(own_a) | (u8::from(own_b) << 1)),
+        );
         let at = self.slot_addr(slot);
         let r = self
-            .call(h_contains as *const () as usize, &[at], true)
+            .call(
+                h_contains_ref as *const () as usize,
+                &[pa, pb, owned, at],
+                true,
+            )
             .expect("returns");
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
@@ -7527,10 +9046,16 @@ impl<'a> Lower<'a> {
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
         let c = self.b.ins().iconst(self.ptr, cache_at);
+        let mcache: Box<ModCache> = Box::default();
+        let mc = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<ModCache>(&mcache) as i64);
+        self.mod_caches.push(mcache);
         let r = self
             .call(
                 h_load_method as *const () as usize,
-                &[self.st, code, ext, pcv, len, c],
+                &[self.st, code, ext, pcv, len, c, mc],
                 true,
             )
             .expect("returns");
@@ -7687,12 +9212,16 @@ impl<'a> Lower<'a> {
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(general);
+        // (A site settled on a leaf builtin tries it first, in a smaller
+        // helper.)
+        let leaf = crate::call_site_leaf(self.ext, pc).is_some();
+        let helper = if leaf {
+            h_call_leaf as *const () as usize
+        } else {
+            h_call as *const () as usize
+        };
         let r = self
-            .call(
-                h_call as *const () as usize,
-                &[self.st, code, ext, pcv, len],
-                true,
-            )
+            .call(helper, &[self.st, code, ext, pcv, len], true)
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(called);

@@ -25165,6 +25165,7 @@ impl Interpreter {
                     ("any", LeafKind::Fast(crate::seqiter::any_fast)),
                     ("all", LeafKind::Fast(crate::seqiter::all_fast)),
                     ("abs", LeafKind::Fast(crate::seqiter::abs_fast)),
+                    ("hash", LeafKind::Fast(crate::seqiter::hash_fast)),
                     ("ord", LeafKind::Fast(crate::seqiter::ord_fast)),
                     ("chr", LeafKind::Fast(crate::seqiter::chr_fast)),
                     ("divmod", LeafKind::Fast(crate::seqiter::divmod_fast)),
@@ -25189,6 +25190,7 @@ impl Interpreter {
                         ("__len__", LeafKind::Len),
                         ("append", LeafKind::ListAppend),
                         ("pop", LeafKind::ListPop),
+                        ("extend", LeafKind::ListExtend),
                         ("insert", LeafKind::ListInsert),
                         ("reverse", LeafKind::ListReverse),
                         ("copy", LeafKind::ListCopy),
@@ -25882,6 +25884,13 @@ impl Interpreter {
                 });
             }
             K::ListInsert => args.len() == 3 && matches!(args[0], O::List(_)) && leaf_int(&args[1]),
+            // An exact list's or tuple's items, snapshotted: no iteration
+            // hook runs.
+            K::ListExtend => {
+                args.len() == 2
+                    && matches!(args[0], O::List(_))
+                    && matches!(args[1], O::List(_) | O::Tuple(_))
+            }
             K::ListReverse | K::ListCopy => args.len() == 1 && matches!(args[0], O::List(_)),
             // Admitted when every comparison `list.remove` makes up to its
             // match (or to the end: the ValueError) runs no Python code.
@@ -64337,6 +64346,8 @@ enum LeafKind {
     GetAttr,
     ListAppend,
     ListPop,
+    /// `list.extend` of an exact list or tuple.
+    ListExtend,
     ListInsert,
     ListReverse,
     ListCopy,
@@ -64389,6 +64400,7 @@ impl LeafKind {
                 | Self::SetAdd
                 | Self::ListAppend
                 | Self::ListPop
+                | Self::ListExtend
                 | Self::ListInsert
                 | Self::ListReverse
                 | Self::ListCopy
@@ -71435,6 +71447,51 @@ fn leaf_site_hit(
         Some(_) => site.poly_hit(ver),
         None => None,
     }
+}
+
+/// The builtin method a `LOAD_ATTR` (method) site at `attr_pc` cached for
+/// a `list`, `dict`, `set` or `str` receiver, with the receiver's tag (see
+/// [`builtin_recv_tag`]) and the leaf kind its `CALL` at `call_pc`
+/// settled on, for the frame JIT's method kernels.
+#[cfg(feature = "jit")]
+pub(crate) fn builtin_method_site(
+    ext: &CodeConstObjects,
+    attr_pc: usize,
+    call_pc: usize,
+) -> Option<(u64, LeafKind, Rc<crate::object::BuiltinFn>)> {
+    let slots = ext.method_slots.get()?;
+    // SAFETY: GIL-serialized; the borrow ends before any refill.
+    let (ver, f) = unsafe { &*slots.get(attr_pc)?.0.get() };
+    let MethodSlotFn::Builtin(b) = f else {
+        return None;
+    };
+    if ver & MethodSlot::BUILTIN_TAG == 0 {
+        return None;
+    }
+    let tag = ver & !MethodSlot::BUILTIN_TAG;
+    if !(1..=4).contains(&tag) {
+        return None;
+    }
+    let kind = slots.get(call_pc)?.get_leaf_ptr(Rc::as_ptr(b))?;
+    Some((tag, kind, b.clone()))
+}
+
+/// The leaf builtin's kind the `CALL` at `pc` last settled on.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKind> {
+    let slot = ext.method_slots.get()?.get(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::Leaf(_, kind) => Some(*kind),
+        _ => None,
+    }
+}
+
+/// Whether the `CALL` at `pc` last settled on a leaf builtin the core
+/// loop's arm (and the frame JIT's helper) runs in place.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
+    call_site_leaf(ext, pc).is_some_and(LeafKind::runs_in_core)
 }
 
 /// Whether the method call whose `LOAD_ATTR` is at `pc` last resolved to

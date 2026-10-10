@@ -831,6 +831,15 @@ impl SharedStr {
     }
 }
 
+impl SharedStr {
+    /// The shared one-character string of ASCII byte `c` (below `0x80`).
+    #[inline]
+    pub fn ascii_char(c: u8) -> Self {
+        debug_assert!(c.is_ascii());
+        small_table()[usize::from(c & 0x7f)].clone()
+    }
+}
+
 /// [`SharedStr::small`]'s strings: the 256 Latin-1 characters by code
 /// point, then the empty string.
 fn small_table() -> &'static [SharedStr; 257] {

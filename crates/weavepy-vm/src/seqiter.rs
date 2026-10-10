@@ -1591,6 +1591,27 @@ pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     }))
 }
 
+/// `hash(x)` of a value whose hash runs no Python code and can't fail: a
+/// native scalar, a `str`, or a tuple of `int`s and `str`s.
+pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [x] = args else {
+        return None;
+    };
+    let native = match x {
+        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
+        // (A NaN hashes by identity.)
+        Object::Float(f) => !f.is_nan(),
+        Object::Tuple(t) => t
+            .iter()
+            .all(|e| matches!(e, Object::Int(_) | Object::Str(_))),
+        _ => false,
+    };
+    if !native {
+        return None;
+    }
+    Some(Ok(Object::Int(crate::object::py_hash_value(x)?)))
+}
+
 /// `ord(c)` of a one-character `str`.
 pub(crate) fn ord_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Str(s)] = args else {
