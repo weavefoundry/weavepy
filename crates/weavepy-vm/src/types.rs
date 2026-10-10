@@ -146,6 +146,18 @@ impl DunderInfo {
     }
 }
 
+/// The questions [`TypeObject::memo_verdict`] memoizes per class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Verdict {
+    /// An instance attribute `name` that no class-level source supplies
+    /// (see `attr_certainly_missing`).
+    AttrMissing = 1,
+    /// The class reduces as `copyreg._reduce_newobj` would for a plain
+    /// instance (see `Interpreter::reduce_newobj_plain`); `name` unused.
+    PlainNewobj = 2,
+}
+
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
 
 impl AttrVersion {
@@ -268,7 +280,6 @@ mod attr_version_tests {
 /// whose hash and length happen to collide.
 pub(crate) mod type_cache {
     use std::cell::RefCell;
-    use std::hash::Hasher;
     use std::rc::Rc;
 
     /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). The
@@ -307,11 +318,50 @@ pub(crate) mod type_cache {
         Absent,
     }
 
+    /// A slot hash for `name` from its length and at most its first and
+    /// last eight bytes: constant time for any name (entries still
+    /// compare the whole name), and attribute names differ there.
     #[inline]
     pub(crate) fn name_hash(name: &str) -> u64 {
-        let mut h = crate::fasthash::FxHasher::default();
-        h.write(name.as_bytes());
-        h.finish()
+        let b = name.as_bytes();
+        let n = b.len();
+        let (head, tail) = if n >= 8 {
+            (
+                u64::from_le_bytes(b[..8].try_into().expect("8 bytes")),
+                u64::from_le_bytes(b[n - 8..].try_into().expect("8 bytes")),
+            )
+        } else {
+            let mut w = [0u8; 8];
+            w[..n].copy_from_slice(b);
+            (u64::from_le_bytes(w), 0)
+        };
+        let x = (head ^ tail.rotate_left(29) ^ (n as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^ (x >> 29)
+    }
+
+    /// `a == b` for attribute names, in line for the short ones (most
+    /// dunders and identifiers fit in sixteen bytes).
+    #[inline]
+    pub(crate) fn name_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let n = a.len();
+        if n != b.len() {
+            return false;
+        }
+        if n > 16 {
+            return a == b;
+        }
+        let w = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().expect("8"));
+        if n >= 8 {
+            return w(a, 0) == w(b, 0) && w(a, n - 8) == w(b, n - 8);
+        }
+        let mut x = 0u64;
+        let mut y = 0u64;
+        for i in 0..n {
+            x |= u64::from(a[i]) << (8 * i);
+            y |= u64::from(b[i]) << (8 * i);
+        }
+        x == y
     }
 
     #[inline]
@@ -329,7 +379,7 @@ pub(crate) mod type_cache {
             let c = c.try_borrow().ok()?;
             let table = c.as_ref()?;
             let e = &table[slot(ty, ver, name_hash)];
-            if e.ver == ver && e.name.as_deref() == Some(name) {
+            if e.ver == ver && e.name.as_deref().is_some_and(|n| name_eq(n, name)) {
                 Some(if e.mro_idx == ABSENT {
                     Hit::Absent
                 } else {
@@ -1914,6 +1964,43 @@ impl TypeObject {
         None
     }
 
+    /// A per-class yes/no verdict about `name`, memoized in the type
+    /// cache until the class or a base changes: `compute` runs only on
+    /// a miss, and must be a pure function of the class's attributes
+    /// (it runs no Python code). Each [`Verdict`] family's entries live
+    /// under the class's version with the family in its top byte, which
+    /// no real version has (the dunder memo already keeps versions below
+    /// 2**56), so they never answer an attribute lookup or another
+    /// family's question.
+    #[inline]
+    pub(crate) fn memo_verdict(
+        &self,
+        family: Verdict,
+        name: &str,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        let h = type_cache::name_hash(name);
+        match type_cache::probe(ty, ver, name, h) {
+            Some(type_cache::Hit::Absent) => true,
+            Some(type_cache::Hit::At { .. }) => false,
+            None => {
+                let verdict = compute();
+                let hit = if verdict {
+                    type_cache::Hit::Absent
+                } else {
+                    type_cache::Hit::At {
+                        mro_idx: 0,
+                        dict_idx: 0,
+                    }
+                };
+                type_cache::fill(ty, ver, name, h, hit);
+                verdict
+            }
+        }
+    }
+
     /// The plain-`str`-keys MRO walk behind [`Self::lookup`] and
     /// [`Self::lookup_with_owner`], fronted by the per-thread
     /// [`type_cache`]. Returns the value and the MRO index of its owner.
@@ -1925,6 +2012,19 @@ impl TypeObject {
         match type_cache::probe(ty, ver, name, h) {
             Some(type_cache::Hit::Absent) => return None,
             Some(type_cache::Hit::At { mro_idx, dict_idx }) => {
+                // (Guard-free views when they are free: nothing below runs
+                // code before the value is cloned.)
+                // SAFETY: both views end before anything else runs.
+                if let Some(owner) = unsafe { self.mro.peek() }.and_then(|m| m.get(mro_idx as usize))
+                {
+                    if let Some(d) = unsafe { owner.dict.peek() } {
+                        if let Some((k, v)) = d.get_index(dict_idx as usize) {
+                            if matches!(&k.0, Object::Str(s) if type_cache::name_eq(s, name)) {
+                                return Some((v.clone(), mro_idx as usize));
+                            }
+                        }
+                    }
+                }
                 let mro = self.mro.borrow();
                 if let Some(owner) = mro.get(mro_idx as usize) {
                     let d = owner.dict.borrow();

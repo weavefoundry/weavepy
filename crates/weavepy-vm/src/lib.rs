@@ -58716,6 +58716,10 @@ impl Interpreter {
         &mut self,
         recv: &Object,
     ) -> Result<Option<Object>, RuntimeError> {
+        // (No class of these is subclassable: an instance is none of them.)
+        if matches!(recv, Object::Instance(_)) {
+            return Ok(None);
+        }
         let ty_name = crate::builtins::class_of(recv).name.clone();
         if !matches!(
             ty_name.as_str(),
@@ -58854,30 +58858,40 @@ impl Interpreter {
             return None;
         }
         let cls = inst.cls();
-        let slots_key = crate::object::StrKey("__slots__");
-        if cls
-            .mro
-            .borrow()
-            .iter()
-            .any(|c| c.dict.borrow().get(&slots_key).is_some())
-        {
+        // (A pure function of the class's attributes: memoized.)
+        let plain = cls.memo_verdict(crate::types::Verdict::PlainNewobj, "", || {
+            let slots_key = crate::object::StrKey("__slots__");
+            if cls
+                .mro
+                .borrow()
+                .iter()
+                .any(|c| c.dict.borrow().get(&slots_key).is_some())
+            {
+                return false;
+            }
+            if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some()
+            {
+                return false;
+            }
+            let Some(default_getstate) = builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("__getstate__"))
+                .cloned()
+            else {
+                return false;
+            };
+            // (The class lookup skips `object`'s own entry: none found is
+            // the default too.)
+            match (cls.lookup("__getstate__"), &default_getstate) {
+                (None, _) => true,
+                (Some(Object::Builtin(a)), Object::Builtin(b)) => Rc::ptr_eq(&a, b),
+                _ => false,
+            }
+        });
+        if !plain {
             return None;
-        }
-        if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some() {
-            return None;
-        }
-        let default_getstate = builtin_types()
-            .object_
-            .dict
-            .borrow()
-            .get(&crate::object::StrKey("__getstate__"))
-            .cloned()?;
-        // (The class lookup skips `object`'s own entry: none found is the
-        // default too.)
-        match (cls.lookup("__getstate__"), &default_getstate) {
-            (None, _) => {}
-            (Some(Object::Builtin(a)), Object::Builtin(b)) if Rc::ptr_eq(&a, b) => {}
-            _ => return None,
         }
         let newobj = self.module_attr("copyreg", "__newobj__")?;
         let dict = inst.dict_shared();
@@ -67114,29 +67128,39 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
         return false;
     }
     let cls = inst.cls();
-    if cls.native_kind.get() != 0
-        || !cls.dunder(Dunder::GetAttribute).object_owner()
-        || cls.dunder(Dunder::GetAttr).present()
-        || cls.lookup(name).is_some()
-    {
+    if cls.native_kind.get() != 0 {
         return false;
     }
-    // A dunder may also come from a builtin base's slot (`__repr__`,
-    // `__reduce_ex__`), or be an instance-level special; one that none
-    // supplies (`__deepcopy__`, which `copy` probes) is missing.
-    if dunder {
-        let special = matches!(
-            name,
-            "__class__" | "__dict__" | "__weakref__" | "__doc__" | "__module__"
-        );
-        let builtin_base = cls
-            .mro
-            .borrow()
-            .iter()
-            .any(|t| t.flags.is_builtin && t.name != "object");
-        if special || builtin_base || builtin_slot_wrapper(&cls, name).is_some() {
+    // The class's part of the verdict depends only on its attributes
+    // (memoized until it or a base changes).
+    let class_missing = cls.memo_verdict(crate::types::Verdict::AttrMissing, name, || {
+        if !cls.dunder(Dunder::GetAttribute).object_owner()
+            || cls.dunder(Dunder::GetAttr).present()
+            || cls.lookup(name).is_some()
+        {
             return false;
         }
+        // A dunder may also come from a builtin base's slot (`__repr__`,
+        // `__reduce_ex__`), or be an instance-level special; one that none
+        // supplies (`__deepcopy__`, which `copy` probes) is missing.
+        if dunder {
+            let special = matches!(
+                name,
+                "__class__" | "__dict__" | "__weakref__" | "__doc__" | "__module__"
+            );
+            let builtin_base = cls
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| t.flags.is_builtin && t.name != "object");
+            if special || builtin_base || builtin_slot_wrapper(&cls, name).is_some() {
+                return false;
+            }
+        }
+        true
+    });
+    if !class_missing {
+        return false;
     }
     match inst.dict.published() {
         Some(d) => d
