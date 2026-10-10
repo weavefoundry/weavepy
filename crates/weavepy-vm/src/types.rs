@@ -3660,6 +3660,14 @@ impl PyInstance {
         if unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0 {
             return crate::stdlib::datetime_native::recycle(inst);
         }
+        // A full pool (the program discards more instances than it makes
+        // through the pool) takes nothing: skip the reset.
+        let room = INSTANCE_POOL
+            .try_with(|p| p.try_borrow().is_ok_and(|p| p.len() < INSTANCE_POOL_CAP))
+            .unwrap_or(false);
+        if !room {
+            return Err(inst);
+        }
         let Some(m) = Rc::get_mut(&mut inst) else {
             return Err(inst);
         };

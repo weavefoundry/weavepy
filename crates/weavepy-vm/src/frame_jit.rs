@@ -1146,17 +1146,6 @@ unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
         if !droppable(&*slot) {
             return 1;
         }
-        // A plain instance dying here goes to the instance pool, as the
-        // core loop's release sends it (`C(...)` as a statement).
-        if let Object::Instance(i) = &*slot {
-            if Rc::strong_count(i) == 1 && i.dies_by_plain_drop() {
-                let Object::Instance(i) = slot.read() else {
-                    unreachable!("matched above")
-                };
-                crate::types::PyInstance::try_recycle(i);
-                return 0;
-            }
-        }
         crate::drop_hot(slot.read());
     }
     0

@@ -22402,7 +22402,10 @@ impl Interpreter {
         let cls = inst.cls_raw();
         let ext = code_vm_ext(code);
         if let Some((ver, idx)) = ext.and_then(|e| e.field_slot(attr_pc)).map(FieldSlot::get) {
-            if idx & SLOT_FIELD != 0 && cls.attr_version.get() == ver {
+            if cls.attr_version.get() != ver {
+                // Another class's (or version's) shortcut: the site's
+                // cache below decides.
+            } else if idx & SLOT_FIELD != 0 {
                 // A laid-out `__slots__` member, set or not: the member
                 // descriptor's store, in place.
                 // SAFETY: a store between two instructions (see `peek_mut`).
@@ -22416,7 +22419,7 @@ impl Interpreter {
                     drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
                     return true;
                 }
-            } else if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
+            } else if !crate::capi_watchers::dicts_active() {
                 // Over the attribute's value, or (the constructor shape) as
                 // the instance's next one.
                 // SAFETY: a store between two instructions (see `peek_mut`);
