@@ -5885,11 +5885,14 @@ fn compile_with(
         direct = std::mem::take(&mut lower.direct_sites);
         held = std::mem::take(&mut lower.held);
         mods = std::mem::take(&mut lower.mod_caches);
+        // (Measured as if every exit's tail were in line, the size the
+        // threshold was tuned with.)
+        let size_in_line = lower.tail_savings;
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
         }
-        if done && !lean && engine.ctx.func.dfg.num_insts() > lean_above() {
+        if done && !lean && engine.ctx.func.dfg.num_insts() + size_in_line > lean_above() {
             lean = true;
             engine.fbctx = FunctionBuilderContext::new();
             engine.module.clear_context(&mut engine.ctx);
@@ -6046,6 +6049,13 @@ struct Lower<'a> {
     /// Side exits waiting for their blocks to be filled (after the body:
     /// the builder fills one block at a time).
     side_exits: Vec<SideExit>,
+    /// The blocks that end the exits returning a status (see
+    /// [`Self::exit`]), by status and whether they store the last
+    /// instruction; filled after the side exits.
+    exit_tails: Vec<(u32, bool, Block)>,
+    /// The IR instructions the shared tails saved over writing each
+    /// exit's state and return in line.
+    tail_savings: usize,
     /// The `LOAD_GLOBAL` and `LOAD_ATTR` sites' caches, which the code
     /// addresses.
     #[allow(clippy::vec_box)]
@@ -6231,6 +6241,8 @@ impl<'a> Lower<'a> {
             depth: 0,
             sigs: Vec::new(),
             side_exits: Vec::new(),
+            exit_tails: Vec::new(),
+            tail_savings: 0,
             global_caches: Vec::new(),
             slot_caches: Vec::new(),
             method_caches: Vec::new(),
@@ -6503,17 +6515,60 @@ impl<'a> Lower<'a> {
     }
 
     /// Return `status` with the virtual stack written out and `pc` next.
+    /// The state's stores and the return are a tail block every exit with
+    /// the same status shares, which takes the depth, `pc` and the last
+    /// instruction as arguments: a body has hundreds of exits, and their
+    /// tails would otherwise be most of its IR.
     fn exit(&mut self, status: u32, pc: usize) {
         let cold = std::mem::replace(&mut self.cold, true);
         self.flush();
         self.cold = cold;
+        let last = self.last_pc;
+        let tail = match self
+            .exit_tails
+            .iter()
+            .find(|&&(s, l, _)| s == status && l == last.is_some())
+        {
+            Some(&(_, _, tail)) => tail,
+            None => {
+                let tail = self.b.create_block();
+                let params = if last.is_some() { 3 } else { 2 };
+                for _ in 0..params {
+                    self.b.append_block_param(tail, types::I64);
+                }
+                self.exit_tails.push((status, last.is_some(), tail));
+                tail
+            }
+        };
+        // In line, the status constant, the stores and the return less
+        // the jump.
+        self.tail_savings += if last.is_some() { 4 } else { 3 };
         let l = self.b.ins().iconst(types::I64, self.depth as i64);
-        self.b.ins().store(FLAGS, l, self.st, S_LEN);
-        self.store_last();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
-        self.b.ins().store(FLAGS, pcv, self.st, S_PC);
-        let s = self.b.ins().iconst(types::I32, i64::from(status));
-        self.b.ins().return_(&[s]);
+        match last {
+            Some(last) => {
+                let lv = self.b.ins().iconst(types::I64, last as i64);
+                self.b.ins().jump(tail, &[l.into(), pcv.into(), lv.into()]);
+            }
+            None => {
+                self.b.ins().jump(tail, &[l.into(), pcv.into()]);
+            }
+        }
+    }
+
+    /// Fill the exit tails (see [`Self::exit`]).
+    fn exit_tails(&mut self) {
+        for (status, _, tail) in std::mem::take(&mut self.exit_tails) {
+            self.b.switch_to_block(tail);
+            let params = self.b.block_params(tail).to_vec();
+            self.b.ins().store(FLAGS, params[0], self.st, S_LEN);
+            self.b.ins().store(FLAGS, params[1], self.st, S_PC);
+            if let Some(&last) = params.get(2) {
+                self.b.ins().store(FLAGS, last, self.st, S_LAST);
+            }
+            let s = self.b.ins().iconst(types::I32, i64::from(status));
+            self.b.ins().return_(&[s]);
+        }
     }
 
     /// Leave for the core loop at `pc` (the instruction about to run),
@@ -6567,6 +6622,7 @@ impl<'a> Lower<'a> {
             }
             self.exit(x.status, x.pc);
         }
+        self.exit_tails();
     }
 
     /// Stop for a queued finalizer (with `pc` next), from the current
