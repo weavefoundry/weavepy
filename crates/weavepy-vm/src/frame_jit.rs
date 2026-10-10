@@ -4659,6 +4659,28 @@ unsafe extern "C" fn h_call(
             frame.pc = pc as u32;
             *(*st.sw).last = st.last;
         };
+        // A generator function's call makes its generator in place
+        // (`core_call` admits none), ahead of the shapes below, none of
+        // which a plain function matches.
+        if let Object::Function(f) = &*base.add(start) {
+            let c = &*f.code.as_ptr();
+            if (c.is_generator || c.is_coroutine || c.is_async_generator) && !st.sw.is_null() {
+                sync(st);
+                let sw = &mut *st.sw;
+                let interp = &mut *st.interp.cast_mut();
+                if !interp.core_gen_call(sw, pc) {
+                    if sw.pending.is_none() {
+                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+                    }
+                    return RELOAD;
+                }
+                return if finished_in_place(st, start) {
+                    0
+                } else {
+                    RELOAD
+                };
+            }
+        }
         // `gen.send(v)`: likewise, with the value sent in.
         if argc == 1
             && !st.sw.is_null()
@@ -4790,19 +4812,12 @@ unsafe extern "C" fn h_call(
             if st.sw.is_null() {
                 return CALL_DECLINED;
             }
-            // A generator function's call makes its generator in place
-            // (`core_call` admits none).
-            let gen_fn = matches!(&ops[0], Object::Function(f) if {
-                let c = &*f.code.as_ptr();
-                c.is_generator || c.is_coroutine || c.is_async_generator
-            });
+            // (A generator function's call was made above.)
             sync(st);
             let sw = &mut *st.sw;
             let saved_last = sw.last;
             let interp = &mut *st.interp.cast_mut();
-            let switched = if gen_fn {
-                interp.core_gen_call(sw, pc)
-            } else if python == 1 {
+            let switched = if python == 1 {
                 interp.core_call(sw, pc) || interp.core_gen_call(sw, pc)
             } else {
                 interp.core_new(sw, pc, st.snap_gen)
@@ -5502,9 +5517,10 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
         let cause = (n == 2).then(|| st.stack.add(len - 1).read());
         let arg = st.stack.add(len - n).read();
         let interp = &mut *st.interp.cast_mut();
-        let globals = (*st.frame).globals.clone();
+        // (The frame holds its globals for the raise.)
+        let globals = &(*st.frame).globals;
         let raised = interp
-            .instantiate_raised_class(arg, &globals)
+            .instantiate_raised_class(arg, globals)
             .and_then(|arg| Interpreter::normalize_exception(arg, cause))
             .map(|mut exc| {
                 interp.attach_implicit_context(&mut exc);

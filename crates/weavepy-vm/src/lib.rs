@@ -8536,7 +8536,7 @@ impl Interpreter {
                 Ok(GenStep::Yielded(v))
             }
             Ok(FrameOutcome::Returned(v)) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Self::finish_running_gen(&gen);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
@@ -21121,7 +21121,7 @@ impl Interpreter {
         let gen = done.gen.take().expect("a generator activation");
         let mut boxed = done.gen_box.take().expect("a generator activation");
         done.gen_frame = std::ptr::null_mut();
-        *gen.state.borrow_mut() = GeneratorState::Finished;
+        Self::finish_running_gen(&gen);
         self.recycle_frame_allocs(&mut boxed);
         Self::release_finished_gen(&gen);
         self.recycle_gen_box(boxed);
@@ -32228,7 +32228,7 @@ impl Interpreter {
             let new_tb = Object::Traceback(new_tb);
             inst.note_slot_store(&new_tb);
             let mut slots = inst.slots.borrow_mut();
-            match slots.place_mut("__traceback__") {
+            match slots.exc_tail_place(crate::types::ExcTail::Traceback) {
                 Some(slot) => {
                     let prev = std::mem::replace(slot, new_tb);
                     // The chain so far moves under the new head.
@@ -32400,14 +32400,15 @@ impl Interpreter {
     /// `False`), so only real values need storing.
     fn sync_exc_attrs(exc: &PyException) {
         if let Object::Instance(inst) = &exc.instance {
+            use crate::types::ExcTail;
             if let Some(cause) = exc.cause.as_ref() {
-                inst.slot_set("__cause__", cause.instance.clone());
+                drop(inst.exc_tail_set(ExcTail::Cause, cause.instance.clone()));
                 // Explicit cause suppresses __context__ rendering by
                 // default; user code can still set __suppress_context__.
-                inst.slot_set("__suppress_context__", Object::Bool(true));
+                drop(inst.exc_tail_set(ExcTail::SuppressContext, Object::Bool(true)));
             }
             if let Some(context) = exc.context.as_ref() {
-                inst.slot_set("__context__", context.instance.clone());
+                drop(inst.exc_tail_set(ExcTail::Context, context.instance.clone()));
             }
         }
     }
@@ -32497,12 +32498,17 @@ impl Interpreter {
             if matches!(c, Object::None) {
                 pe.cause = None;
                 if let Object::Instance(ref inst_rc) = pe.instance {
+                    use crate::types::ExcTail;
                     // An unset `__cause__` already reads None (a re-raised
                     // instance's earlier cause is cleared).
-                    if inst_rc.slots.borrow().get("__cause__").is_some() {
-                        inst_rc.slot_set("__cause__", Object::None);
-                    }
-                    inst_rc.slot_set("__suppress_context__", Object::Bool(true));
+                    let earlier = inst_rc
+                        .slots
+                        .borrow_mut()
+                        .exc_tail_place(ExcTail::Cause)
+                        .filter(|cause| !matches!(cause, Object::Unbound))
+                        .map(|cause| std::mem::replace(cause, Object::None));
+                    drop(earlier);
+                    drop(inst_rc.exc_tail_set(ExcTail::SuppressContext, Object::Bool(true)));
                 }
             } else {
                 let cpe = Self::normalize_exception(c, None)?;
@@ -43944,7 +43950,7 @@ impl Interpreter {
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Self::finish_running_gen(&gen);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
@@ -43989,6 +43995,21 @@ impl Interpreter {
             return;
         }
         gc_trace::untrack_generator(gen);
+    }
+
+    /// Mark `gen`, running (its frame out of its state), finished.
+    #[inline]
+    fn finish_running_gen(gen: &Rc<PyGenerator>) {
+        // SAFETY: the store runs no code (the displaced state is `Running`,
+        // which owns nothing) and no guard is live on the cell (`peek_mut`
+        // checks).
+        match unsafe { gen.state.peek_mut() } {
+            Some(state) if matches!(state, GeneratorState::Running) => unsafe {
+                std::ptr::write(state, GeneratorState::Finished);
+            },
+            Some(state) => *state = GeneratorState::Finished,
+            None => *gen.state.borrow_mut() = GeneratorState::Finished,
+        }
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
@@ -57206,7 +57227,12 @@ impl Interpreter {
             take_args(&mut positional);
             self.start_generator_at(f, &code, positional, start)
         };
-        self.release(callee);
+        match callee {
+            // A function something else still holds (its module, its
+            // class) can't die here: a plain decrement.
+            Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
+            callee => self.release(callee),
+        }
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
         // SAFETY: the running activation's last-pc slot.

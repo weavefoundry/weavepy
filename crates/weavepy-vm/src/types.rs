@@ -2525,23 +2525,49 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
     }
 }
 
+/// The slot names every raise populates (`args`, `__traceback__`, the
+/// chaining links) and the commonest family fields, in [`common_slot_keys`]
+/// order. `__traceback__` through `__suppress_context__` are [`ExcTail`]'s.
+const COMMON_SLOT_NAMES: [&str; 10] = [
+    "args",
+    "__traceback__",
+    "__context__",
+    "__cause__",
+    "__suppress_context__",
+    "message",
+    "value",
+    "msg",
+    "name",
+    "obj",
+];
+
+/// [`COMMON_SLOT_NAMES`], interned once.
+fn common_slot_keys() -> &'static [Object; 10] {
+    static KEYS: std::sync::OnceLock<[Object; 10]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| COMMON_SLOT_NAMES.map(crate::stdlib::sys::intern_name))
+}
+
+/// A `BaseException` pseudo-slot, laid out at the end of every exception
+/// instance's slots (see [`SlotStorage::exception`]).
+#[derive(Clone, Copy)]
+pub(crate) enum ExcTail {
+    Traceback = 0,
+    Context = 1,
+    Cause = 2,
+    SuppressContext = 3,
+}
+
+impl ExcTail {
+    /// The slot's name.
+    pub(crate) fn name(self) -> &'static str {
+        COMMON_SLOT_NAMES[1 + self as usize]
+    }
+}
+
 /// The key for a newly populated slot `name`. The slots every raise
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
 pub(crate) fn slot_key(name: &str) -> DictKey {
-    const COMMON: [&str; 10] = [
-        "args",
-        "__traceback__",
-        "__context__",
-        "__cause__",
-        "__suppress_context__",
-        "message",
-        "value",
-        "msg",
-        "name",
-        "obj",
-    ];
-    static KEYS: std::sync::OnceLock<[Object; 10]> = std::sync::OnceLock::new();
     // (By length first: one comparison settles each common name.)
     let common = match name.len() {
         3 if name == "msg" => Some(7),
@@ -2557,9 +2583,8 @@ pub(crate) fn slot_key(name: &str) -> DictKey {
         _ => None,
     };
     if let Some(i) = common {
-        debug_assert_eq!(COMMON[i], name);
-        let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
-        return DictKey(keys[i].clone());
+        debug_assert_eq!(COMMON_SLOT_NAMES[i], name);
+        return DictKey(common_slot_keys()[i].clone());
     }
     // Interned, as instance-dict keys are: a guard holding the interned
     // name settles a slot's key by identity, and no instance allocates
@@ -2567,20 +2592,14 @@ pub(crate) fn slot_key(name: &str) -> DictKey {
     DictKey(crate::stdlib::sys::intern_name(name))
 }
 
-/// The `BaseException` pseudo-slots after `args`, which raising and
-/// chaining populate: an exception instance's slots are laid out over them
-/// from its birth (see [`SlotStorage::exception`]).
+/// How many [`ExcTail`] pseudo-slots end an exception layout.
 #[cfg(target_pointer_width = "64")]
-const EXC_TAIL: [&str; 4] = [
-    "__traceback__",
-    "__context__",
-    "__cause__",
-    "__suppress_context__",
-];
+const EXC_TAIL_LEN: usize = 4;
 
 /// The shared slot layout of an exception instance whose families' own
-/// fields are `extra`: `args`, `extra`, then [`EXC_TAIL`]. `None` for a
-/// shape without one (its slots are stored per key).
+/// fields are `extra`: `args`, `extra`, then the [`ExcTail`] pseudo-slots,
+/// which raising and chaining populate. `None` for a shape without one
+/// (its slots are stored per key).
 #[cfg(target_pointer_width = "64")]
 fn exception_layout(extra: &[&'static str]) -> Option<SharedSlice<DictKey>> {
     type Layout = std::sync::OnceLock<SharedSlice<DictKey>>;
@@ -2601,7 +2620,7 @@ fn exception_layout(extra: &[&'static str]) -> Option<SharedSlice<DictKey>> {
         cell.get_or_init(|| {
             std::iter::once("args")
                 .chain(extra.iter().copied())
-                .chain(EXC_TAIL)
+                .chain(COMMON_SLOT_NAMES[1..=EXC_TAIL_LEN].iter().copied())
                 .map(slot_key)
                 .collect::<Vec<_>>()
                 .into()
@@ -2623,16 +2642,20 @@ impl SlotStorage {
         let names: [&'static str; N] = std::array::from_fn(|i| extra[i].0);
         #[cfg(target_pointer_width = "64")]
         if let Some(layout) = exception_layout(&names) {
-            let mut values = Vec::with_capacity(layout.len());
-            values.push(args);
-            values.extend(extra.into_iter().map(|(_, v)| v));
-            let unset = layout.len() - values.len();
-            values.extend((0..unset).map(|_| Object::Unbound));
+            // Written in place: `args`, the fields, then the unset tail.
+            let mut values = Box::<[Object]>::new_uninit_slice(layout.len());
+            values[0].write(args);
+            for (slot, (_, v)) in values[1..].iter_mut().zip(extra) {
+                slot.write(v);
+            }
+            for slot in &mut values[1 + N..] {
+                slot.write(Object::Unbound);
+            }
+            // SAFETY: every element was written above (the layout holds
+            // `args`, the `N` fields and the tail).
+            let values = unsafe { values.assume_init() };
             return Self {
-                data: SlotData::Fixed {
-                    layout,
-                    values: values.into_boxed_slice(),
-                },
+                data: SlotData::Fixed { layout, values },
             };
         }
         let _ = names;
@@ -3261,6 +3284,36 @@ impl SlotStorage {
         }
     }
 
+    /// The place of the exception pseudo-slot `which` (holding `Unbound`
+    /// while unset) in storage laid out over an exception layout (see
+    /// [`Self::exception`]): one identity compare of the laid-out key.
+    /// `None` for any other storage.
+    #[inline]
+    pub(crate) fn exc_tail_mut(&mut self, which: ExcTail) -> Option<&mut Object> {
+        let SlotData::Fixed { layout, values } = &mut self.data else {
+            return None;
+        };
+        let i = layout.len().checked_sub(EXC_TAIL_LEN)? + which as usize;
+        match (&layout[i].0, &common_slot_keys()[1 + which as usize]) {
+            (Object::Str(laid), Object::Str(key))
+                if crate::shared_value::SharedStr::ptr_eq(laid, key) =>
+            {
+                values.get_mut(i)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
+    /// [`Self::exc_tail_mut`] when the storage has an exception layout.
+    #[inline]
+    pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
+        if self.exc_tail_mut(which).is_some() {
+            return self.exc_tail_mut(which);
+        }
+        self.place_mut(which.name())
+    }
+
     /// Where slot `name` lives: its laid-out place (holding `Unbound`
     /// while unset), else its populated slot. `None` when a store must
     /// add the slot.
@@ -3498,6 +3551,18 @@ impl SlotStorage {
     /// 64-bit variant).
     pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
         self.get_mut(name)
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_mut(&mut self, _which: ExcTail) -> Option<&mut Object> {
+        None
+    }
+
+    /// The populated pseudo-slot `which` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
+        self.get_mut(which.name())
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
@@ -4017,6 +4082,21 @@ impl PyInstance {
     pub fn slot_set(&self, name: &str, value: Object) {
         self.note_slot_store(&value);
         self.slots.borrow_mut().insert(name, value);
+    }
+
+    /// [`Self::slot_set`] of an exception pseudo-slot: in its laid-out
+    /// place when the instance has one (see `SlotStorage::exc_tail_mut`).
+    /// Returns the displaced value (`Unbound` if unset), dropped by the
+    /// caller once the slots are released.
+    pub(crate) fn exc_tail_set(&self, which: ExcTail, value: Object) -> Object {
+        self.note_slot_store(&value);
+        let mut slots = self.slots.borrow_mut();
+        if let Some(place) = slots.exc_tail_mut(which) {
+            return std::mem::replace(place, value);
+        }
+        slots
+            .insert(which.name(), value)
+            .unwrap_or(Object::Unbound)
     }
 
     /// Delete slot `name` from the side table; `false` when unset.

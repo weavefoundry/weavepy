@@ -5729,17 +5729,13 @@ impl Drop for PyGenerator {
         // pipeline (`chain(chain(chain(…)))`); dropping it inline recurses
         // one native stack frame per link and overflows on long chains, so
         // route it through the iterative trampoline below.
-        if let Ok(mut state) = self.state.try_borrow_mut() {
-            let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
-            drop(state);
-            if matches!(
-                prev,
-                GeneratorState::Suspended(_)
-                    | GeneratorState::Created(_)
-                    | GeneratorState::Delegating(_)
-            ) {
-                defer_generator_state_drop(prev);
-            }
+        // (Exclusive: no borrow of the state can be live.)
+        let state = self.state.get_mut();
+        if matches!(
+            state,
+            GeneratorState::Suspended(_) | GeneratorState::Created(_) | GeneratorState::Delegating(_)
+        ) {
+            defer_generator_state_drop(std::mem::replace(state, GeneratorState::Finished));
         }
         crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }

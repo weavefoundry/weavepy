@@ -1077,7 +1077,7 @@ impl Interpreter {
             // generator finishes and its frame is released (anything that
             // dies with it queues its finalizer).
             GenStep::Returned(v) => {
-                *g.state.borrow_mut() = GeneratorState::Finished;
+                Self::finish_running_gen(g);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(g);
