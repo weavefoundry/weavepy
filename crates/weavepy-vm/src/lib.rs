@@ -262,12 +262,6 @@ struct FrameRare {
 /// handled an exception carries.
 #[derive(Default)]
 struct FrameExc {
-    /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
-    /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
-    /// Each entry is tagged with the pc just past its handler body
-    /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
-    /// exception propagates *out of* (see `handle_exception`).
-    handlers: Vec<(u32, PyException)>,
     /// A *generator/coroutine* frame's own handled-exception entries,
     /// detached from the interpreter-wide `exc_info_stack` while it is
     /// suspended at a `yield`. CPython stores this as the generator's
@@ -323,12 +317,6 @@ impl Frame {
     #[inline]
     fn exc_mut(&mut self) -> &mut FrameExc {
         self.exc.get_or_insert_with(Box::default)
-    }
-
-    /// Pop the innermost [`FrameExc::handlers`] entry.
-    #[inline]
-    fn exc_handlers_pop(&mut self) -> Option<(u32, PyException)> {
-        self.exc.as_mut()?.handlers.pop()
     }
 
     /// Whether the frame holds detached [`FrameExc::saved`] entries.
@@ -5712,7 +5700,6 @@ impl Interpreter {
             frame.stack.pop();
         }
         for _ in 0..jump.exc_pops {
-            frame.exc_handlers_pop();
             self.exc_info_stack.borrow_mut().pop();
         }
         frame.pc = jump.target_pc;
@@ -8164,7 +8151,6 @@ impl Interpreter {
         // activation never left the quiet loop's leaf paths).
         if !act.clean {
             if let Some(exc) = fr.exc.as_mut() {
-                exc.handlers.clear();
                 exc.saved.clear();
                 exc.cleanup_lasti = None;
                 exc.pending_lasti = None;
@@ -10919,6 +10905,75 @@ impl Interpreter {
         frame.stack.push(method);
         frame.stack.push(owner);
         CoreAttr::Done
+    }
+
+    /// [`Self::leaf_load_special`] over the `len` stack slots at `base`
+    /// (room to `cap`), for compiled code: `LOAD_SPECIAL` (`ins`, at `pc`
+    /// of `code`) of an instance whose class resolves the method to a
+    /// plain function or a native class's method, from the site's slot or
+    /// filling it. Returns the new stack length, or `None`, having touched
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    pub(crate) unsafe fn core_load_special(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<usize> {
+        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        if len == 0 || len >= cap {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        let top = unsafe { base.add(len - 1) };
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let ms = code_method_slot(code, pc as u32);
+        let held = ms.and_then(|ms| {
+            ms.get_held(ver)
+                .map(Object::Function)
+                .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
+        });
+        let method = match held {
+            Some(m) => m,
+            None => {
+                let name = match ins.arg {
+                    SPECIAL_ENTER => "__enter__",
+                    SPECIAL_EXIT => "__exit__",
+                    _ => return None,
+                };
+                match cls.lookup(name) {
+                    Some(Object::Function(f)) => {
+                        if let Some(ms) = ms {
+                            ms.set(ver, &f);
+                        }
+                        Object::Function(f)
+                    }
+                    Some(Object::Builtin(b)) if b.binds_instance && native_call_ic_safe(b.name) => {
+                        if let Some(ms) = ms {
+                            ms.set_inst_builtin(ver, &b);
+                        }
+                        Object::Builtin(b)
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        // SAFETY: `len < cap`; the instance moves up into the self slot.
+        unsafe {
+            let recv = top.read();
+            top.write(method);
+            base.add(len).write(recv);
+        }
+        Some(len + 1)
     }
 
     /// The core loop's `LOAD_FAST x` (at `pc`, of the heap local `other`)
@@ -14517,7 +14572,7 @@ impl Interpreter {
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
-                        match unsafe { self.core_exc_op(&mut frame.exc, ins, base, len, cap) } {
+                        match unsafe { self.core_exc_op(ins, base, len, cap) } {
                             Some(n) => len = n,
                             None => break None,
                         }
@@ -17044,9 +17099,8 @@ impl Interpreter {
     }
 
     /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
-    /// `POP_EXCEPT` (`ins`) of a frame (its handler state `exc`) over the
-    /// `len` stack slots at `base`
-    /// (room to `cap`), as the full handlers run their common shapes: an
+    /// `POP_EXCEPT` (`ins`) over the `len` stack slots at `base` (room to
+    /// `cap`), as the full handlers run their common shapes: an
     /// exception instance on entry, class operands that are
     /// `BaseException` subclasses. Returns the new stack length, or
     /// `None`, having touched nothing. A `POP_EXCEPT`'s releases may queue
@@ -17059,7 +17113,6 @@ impl Interpreter {
     #[inline(never)]
     unsafe fn core_exc_op(
         &mut self,
-        exc: &mut Option<Box<FrameExc>>,
         ins: weavepy_compiler::Instruction,
         base: *mut Object,
         len: usize,
@@ -17088,11 +17141,9 @@ impl Interpreter {
                     base.add(len - 1).write(prev);
                     base.add(len).write(top);
                 }
-                let pe = PyException::new(instance);
-                exc.get_or_insert_with(Box::default)
-                    .handlers
-                    .push((ins.arg, pe.clone()));
-                self.exc_info_stack.borrow_mut().push(pe);
+                self.exc_info_stack
+                    .borrow_mut()
+                    .push(PyException::new(instance));
                 Some(len + 1)
             }
             OpCode::CheckExcMatch => {
@@ -17116,13 +17167,11 @@ impl Interpreter {
                 }
                 // SAFETY: the slot at `len - 1` is initialized.
                 let prev = unsafe { base.add(len - 1).read() };
-                let popped = exc.as_mut().and_then(|e| e.handlers.pop());
                 let top = self.exc_info_stack.borrow_mut().pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
                 self.recheck_frame_observed = true;
-                drop(top);
-                if let Some((_, pe)) = popped {
+                if let Some(pe) = top {
                     self.release(pe.instance);
                 }
                 self.release(prev);
@@ -22152,7 +22201,6 @@ impl Interpreter {
             globals,
             builtins,
             rare,
-            exc: frame_exc,
             ..
         } = frame;
         let code: &CodeObject = code_rc;
@@ -22933,10 +22981,15 @@ impl Interpreter {
                     let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
                         break;
                     };
-                    let removed = inst
-                        .dict_cell()
-                        .borrow_mut()
-                        .shift_remove(&DictKey(Object::Str(key.clone())));
+                    // (The split layout deletes in place; see
+                    // `PyInstance::split_remove`.)
+                    let removed = match inst.split_remove(key) {
+                        Some(removed) => removed,
+                        None => inst
+                            .dict_cell()
+                            .borrow_mut()
+                            .shift_remove(&DictKey(Object::Str(key.clone()))),
+                    };
                     // A missing attribute raises through the full path.
                     let Some(removed) = removed else {
                         break;
@@ -23955,12 +24008,7 @@ impl Interpreter {
                         .map_or(Object::None, |pe| pe.instance.clone());
                     stack.push(prev);
                     stack.push(exc.clone());
-                    let pe = PyException::new(exc);
-                    frame_exc
-                        .get_or_insert_with(Box::default)
-                        .handlers
-                        .push((ins.arg, pe.clone()));
-                    self.exc_info_stack.borrow_mut().push(pe);
+                    self.exc_info_stack.borrow_mut().push(PyException::new(exc));
                     last = pc;
                     pc += 1;
                 }
@@ -23979,15 +24027,13 @@ impl Interpreter {
                 }
                 OpCode::PopExcept => {
                     let Some(prev) = stack.pop() else { break };
-                    let popped = frame_exc.as_mut().and_then(|e| e.handlers.pop());
                     let top = self.exc_info_stack.borrow_mut().pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
                     self.recheck_frame_observed = true;
                     last = pc;
                     pc += 1;
-                    drop(top);
-                    if let Some((_, pe)) = popped {
+                    if let Some(pe) = top {
                         self.release(pe.instance);
                     }
                     self.release(prev);
@@ -30089,10 +30135,7 @@ impl Interpreter {
                 if !matches!(matched, Object::None) {
                     let pe = PyException::new(matched.clone());
                     if let Some(top) = self.exc_info_stack.borrow_mut().last_mut() {
-                        *top = pe.clone();
-                    }
-                    if let Some(top) = frame.exc.as_mut().and_then(|e| e.handlers.last_mut()) {
-                        top.1 = pe;
+                        *top = pe;
                     }
                 }
                 frame.push(rest);
@@ -30115,17 +30158,7 @@ impl Interpreter {
                 frame.push(prev);
                 frame.push(exc.clone());
                 if let Object::Instance(_) = &exc {
-                    let pe = PyException::new(exc);
-                    // `ins.arg` is the pc just past this handler body
-                    // (back-patched by the compiler). Tag the entry so
-                    // the unwinder can drop it when an exception escapes
-                    // the handler to an enclosing `try`. A 0 arg means
-                    // the code carries no tag (e.g. older marshalled
-                    // bytecode); leave it untagged and let frame-exit
-                    // reconciliation handle any residue.
-                    let body_end = ins.arg;
-                    frame.exc_mut().handlers.push((body_end, pe.clone()));
-                    self.exc_info_stack.borrow_mut().push(pe);
+                    self.exc_info_stack.borrow_mut().push(PyException::new(exc));
                 }
             }
             OpCode::PopExcept => {
@@ -30135,14 +30168,13 @@ impl Interpreter {
                 // `sys.exc_info()` restore, so the value itself is
                 // discarded).
                 let _prev = frame.pop()?;
-                let popped = frame.exc_handlers_pop();
-                drop(self.exc_info_stack.borrow_mut().pop());
+                let popped = self.exc_info_stack.borrow_mut().pop();
                 // CPython clears the just-handled exception at the end of an
                 // `except` block (the implicit `del` of the bound name plus
                 // the per-frame exc-state pop): it dies here unless something
                 // else holds it.
                 self.recheck_frame_observed = true;
-                if let Some((_, pe)) = popped {
+                if let Some(pe) = popped {
                     self.release(pe.instance);
                 }
             }
@@ -45689,12 +45721,39 @@ impl Interpreter {
         }
         // SAFETY: as above (both declined untouched).
         let frame = unsafe { &mut *sw.cur };
-        let arg = frame.code.instructions[pc].arg;
+        let ins = frame.code.instructions[pc];
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        let r = self.load_attr_step(frame, pc as u32, arg);
+        let r = match ins.op {
+            OpCode::LoadAttr => match self.load_attr_certain_miss(frame, ins.arg) {
+                Some(err) => Err(err),
+                None => self.load_attr_step(frame, pc as u32, ins.arg),
+            },
+            _ => self.load_attr_step(frame, pc as u32, ins.arg),
+        };
         self.core_pending_exit(sw, pending);
         r
+    }
+
+    /// A `LOAD_ATTR` (name `name_idx`) of a plain instance that has no
+    /// such attribute anywhere ([`attr_certainly_missing`]): the receiver
+    /// leaves the stack, released as the full load releases it, and the
+    /// `AttributeError` the default lookup ends with comes back without
+    /// its resolution passes. `None` touches nothing.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn load_attr_certain_miss(&mut self, frame: &mut Frame, name_idx: u32) -> Option<RuntimeError> {
+        let recv @ Object::Instance(_) = frame.stack.last()? else {
+            return None;
+        };
+        let name = frame.code.names.get(name_idx as usize)?;
+        if !attr_certainly_missing(recv, name) {
+            return None;
+        }
+        let recv = frame.stack.pop()?;
+        let err = crate::error::attribute_error_named(&recv, name);
+        self.release(recv);
+        Some(err)
     }
 
     fn specialized_load_attr(
@@ -48547,10 +48606,15 @@ impl Interpreter {
                 _ => {}
             }
         }
-        let removed = inst
-            .dict_cell()
-            .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(name)));
+        // The split layout deletes in place (see `PyInstance::split_remove`);
+        // a real dictionary is watchable.
+        let removed = match inst.split_remove(name) {
+            Some(removed) => removed,
+            None => inst
+                .dict_cell()
+                .borrow_mut()
+                .shift_remove(&DictKey(Object::from_str(name))),
+        };
         // Watched instance `__dict__` observes attribute deletion as
         // PyDict_EVENT_DELETED (test_watchers test_object_dict).
         if removed.is_some() && crate::capi_watchers::dicts_active() {

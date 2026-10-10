@@ -2216,7 +2216,7 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
 pub(crate) fn slot_key(name: &str) -> DictKey {
-    const COMMON: [&str; 8] = [
+    const COMMON: [&str; 10] = [
         "args",
         "__traceback__",
         "__context__",
@@ -2225,9 +2225,26 @@ pub(crate) fn slot_key(name: &str) -> DictKey {
         "message",
         "value",
         "msg",
+        "name",
+        "obj",
     ];
-    static KEYS: std::sync::OnceLock<[Object; 8]> = std::sync::OnceLock::new();
-    if let Some(i) = COMMON.iter().position(|c| *c == name) {
+    static KEYS: std::sync::OnceLock<[Object; 10]> = std::sync::OnceLock::new();
+    // (By length first: one comparison settles each common name.)
+    let common = match name.len() {
+        3 if name == "msg" => Some(7),
+        3 if name == "obj" => Some(9),
+        4 if name == "args" => Some(0),
+        4 if name == "name" => Some(8),
+        5 if name == "value" => Some(6),
+        7 if name == "message" => Some(5),
+        9 if name == "__cause__" => Some(3),
+        11 if name == "__context__" => Some(2),
+        13 if name == "__traceback__" => Some(1),
+        20 if name == "__suppress_context__" => Some(4),
+        _ => None,
+    };
+    if let Some(i) = common {
+        debug_assert_eq!(COMMON[i], name);
         let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
         return DictKey(keys[i].clone());
     }

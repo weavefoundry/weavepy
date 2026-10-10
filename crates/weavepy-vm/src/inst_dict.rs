@@ -118,15 +118,49 @@ impl SharedKeys {
     /// Publish the `str` name `name` as the next name; `None` when the
     /// table is full. The caller holds the GIL outside free-threaded mode.
     fn push(&self, name: &SharedStr) -> Option<usize> {
+        self.push_key(
+            DictKey(Object::Str(name.clone())),
+            crate::object::py_str_hash(name),
+        )
+    }
+
+    /// Remove the `i`th name, closing up the rest: only for a table no
+    /// one else holds (an instance's private names, see
+    /// [`SplitValues::remove_str`]).
+    fn remove_at(&mut self, i: usize) {
+        let n = *self.len.get_mut();
+        if i >= n {
+            return;
+        }
+        // SAFETY: `&mut self` is exclusive; the first `n` names are
+        // initialized, the `i`th drops once, and the later ones move down
+        // one slot each.
+        unsafe {
+            self.keys[i].get_mut().assume_init_drop();
+            for k in i + 1..n {
+                let key = self.keys[k].get_mut().assume_init_read();
+                self.keys[k - 1].get_mut().write(key);
+                *self.hashes[k - 1].get_mut() = *self.hashes[k].get_mut();
+            }
+        }
+        *self.len.get_mut() = n - 1;
+        let mut filter = 0u64;
+        for h in &mut self.hashes[..n - 1] {
+            filter |= 1 << (*h.get_mut() & 63);
+        }
+        *self.filter.get_mut() = filter;
+    }
+
+    /// [`Self::push`] of a name key whose Python hash is `hash`.
+    fn push_key(&self, key: DictKey, hash: i64) -> Option<usize> {
         let n = self.len.load(Ordering::Relaxed);
         if n >= SHARED_KEYS_CAP {
             return None;
         }
-        let hash = crate::object::py_str_hash(name);
         // SAFETY: slot `n` is unpublished, so no reader can see it, and
         // the GIL serializes writers.
         unsafe {
-            (*self.keys[n].get()).write(DictKey(Object::Str(name.clone())));
+            (*self.keys[n].get()).write(key);
             *self.hashes[n].get() = hash;
         }
         self.filter.fetch_or(1 << (hash & 63), Ordering::Relaxed);
@@ -637,6 +671,47 @@ impl SplitValues {
             value,
         );
         Ok(None)
+    }
+
+    /// Remove attribute `name`, returning its value (`None` when it is not
+    /// set). The last value simply leaves (the instance then holds one
+    /// name fewer of the same table); removing any other lays the rest out
+    /// over a private copy of their names, in order. Compiled code checks
+    /// an instance's names against its class's before using a position, so
+    /// such an instance takes the general paths from then on, as one with
+    /// a real dictionary does, without materializing one (CPython's split
+    /// dictionaries also keep their layout across a deletion).
+    pub fn remove_str(&mut self, name: &str) -> Option<Object> {
+        let i = self.position_str(name)?;
+        let h = self.block?.as_ptr();
+        // SAFETY: the block is live while owned, `i` is below its length,
+        // and every value from `i` on moves down one slot exactly once
+        // (the removed one moves out first).
+        unsafe {
+            let n = (*h).len as usize;
+            let values = Self::values_ptr(h);
+            let removed = values.add(i).read();
+            if i + 1 < n {
+                let mut keys = Rc::from_raw((*h).keys);
+                match Rc::get_mut(&mut keys) {
+                    // Names already private to this instance (an earlier
+                    // deletion's) close up in place.
+                    Some(own) => own.remove_at(i),
+                    None => {
+                        let fresh = SharedKeys::default();
+                        for k in (0..n).filter(|&k| k != i) {
+                            let key = keys.get(k).expect("a set value's name").clone();
+                            fresh.push_key(key, *keys.hashes[k].get());
+                        }
+                        keys = Rc::new(fresh);
+                    }
+                }
+                (*h).keys = Rc::into_raw(keys);
+                std::ptr::copy(values.add(i + 1), values.add(i), n - i - 1);
+            }
+            (*h).len = n as u32 - 1;
+            Some(removed)
+        }
     }
 
     /// Move every value out (the caller drops them after releasing the
@@ -1256,6 +1331,24 @@ impl crate::types::PyInstance {
                 }
             }
         }
+    }
+
+    /// Delete attribute `name` through the split layout (see
+    /// [`SplitValues::remove_str`]): `Some` with the removed value, or with
+    /// `None` when the instance has no such attribute; `None` when the
+    /// instance has (or needs) a real dictionary. Runs no code: the caller
+    /// releases the value. The caller has established that a plain
+    /// `__dict__` deletion is what this `del` means.
+    pub fn split_remove(&self, name: &str) -> Option<Option<Object>> {
+        if self.dict.published().is_some()
+            || self.c_body.get() != 0
+            || crate::gil::free_threading_enabled()
+            || self.cls_raw().native_kind.get() != 0
+        {
+            return None;
+        }
+        let mut split = self.dict.split_cell().try_borrow_mut().ok()?;
+        Some(split.remove_str(name))
     }
 
     /// Store `value` under the interned name `name` through the split

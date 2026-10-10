@@ -417,6 +417,49 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             }
         }
     }
+    // So do a `with` statement's `__enter__` and `__exit__` calls when
+    // its special-method sites found methods that run in place: the
+    // enter call follows its `LOAD_SPECIAL`, and a normal exit's
+    // `CALL 3` (over three `None`s) pairs with the innermost open exit
+    // site.
+    {
+        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        let mut open = Vec::new();
+        for pc in 0..ins.len() {
+            let i = ins[pc];
+            match i.op {
+                OpCode::LoadSpecial if i.arg == SPECIAL_EXIT => open.push(pc),
+                OpCode::LoadSpecial if i.arg == SPECIAL_ENTER => {
+                    if ins
+                        .get(pc + 1)
+                        .is_some_and(|c| c.op == OpCode::Call && c.arg == 0)
+                        && crate::method_site_in_place(ext, pc)
+                    {
+                        helped[pc + 1] = true;
+                    }
+                }
+                OpCode::Call
+                    if i.arg == 3
+                        && pc >= 3
+                        && ins[pc - 3..pc].iter().all(|c| {
+                            c.op == OpCode::LoadConst
+                                && matches!(
+                                    code.constants.get(c.arg as usize),
+                                    Some(weavepy_compiler::Constant::None)
+                                )
+                        }) =>
+                {
+                    if open
+                        .pop()
+                        .is_some_and(|x| crate::method_site_in_place(ext, x))
+                    {
+                        helped[pc] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let t = tuning();
     // What running an instruction natively saves, in halves of an
     // in-line instruction's: one run in line saves its whole dispatch and
@@ -461,6 +504,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::ListToTuple
             | OpCode::UnpackEx
             | OpCode::LoadSuperAttr
+            | OpCode::LoadSpecial
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept
@@ -1270,13 +1314,17 @@ unsafe extern "C" fn h_container(
             return Interpreter::core_super_attr(&*code, ins, pc as usize, st.stack, len)
                 .map_or(u64::MAX, |n| n as u64);
         }
+        if ins.op == OpCode::LoadSpecial {
+            return Interpreter::core_load_special(&*code, ins, pc as usize, st.stack, len, st.cap)
+                .map_or(u64::MAX, |n| n as u64);
+        }
         if matches!(
             ins.op,
             OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept
         ) {
             let interp = &mut *st.interp.cast_mut();
             return interp
-                .core_exc_op(&mut (*st.frame).exc, ins, st.stack, len, st.cap)
+                .core_exc_op(ins, st.stack, len, st.cap)
                 .map_or(u64::MAX, |n| n as u64);
         }
         if let Some(n) = Interpreter::core_container_op(ins, st.stack, len, st.cap) {
@@ -4028,6 +4076,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::ListToTuple
             | OpCode::UnpackEx
             | OpCode::LoadSuperAttr
+            | OpCode::LoadSpecial
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept
@@ -4995,6 +5044,7 @@ impl<'a> Lower<'a> {
             | OpCode::UnpackSequence
             | OpCode::UnpackEx
             | OpCode::LoadSuperAttr
+            | OpCode::LoadSpecial
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept

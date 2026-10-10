@@ -4875,6 +4875,17 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
 /// `message` attribute: `str()` and [`exception_message`] derive the
 /// text from `args` on demand, so nothing is formatted here.
 pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -> Object {
+    exception_from_parts_with(class, arg, [])
+}
+
+/// [`exception_from_parts`] with the further pseudo-slots `extra`, in
+/// order, after the families' own (`AttributeError`'s `name` and `obj`):
+/// the instance's slots are built once, with no per-slot probe.
+pub(crate) fn exception_from_parts_with<const N: usize>(
+    class: Rc<TypeObject>,
+    arg: Option<Object>,
+    extra: [(&'static str, Object); N],
+) -> Object {
     use crate::types::{slot_key, PyInstance, SlotStorage};
     let families = crate::exc_family_flags(&class);
     let inst = PyInstance::new(class);
@@ -4916,6 +4927,10 @@ pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -
         let msg = arg.unwrap_or_else(|| Object::from_static(""));
         inst.note_slot_store(&msg);
         entries.push((slot_key("msg"), msg));
+    }
+    for (name, value) in extra {
+        inst.note_slot_store(&value);
+        entries.push((slot_key(name), value));
     }
     *inst.slots.borrow_mut() = SlotStorage::from_entries(entries);
     Object::Instance(Rc::new(inst))

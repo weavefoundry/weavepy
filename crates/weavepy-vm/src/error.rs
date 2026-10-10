@@ -293,18 +293,24 @@ pub fn attribute_error(message: impl Into<String>) -> RuntimeError {
 /// CPython's C raise sites populate (PEP 3134-adjacent; used by
 /// suggestion machinery and asserted on by `test_exceptions`).
 pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
-    let err = attribute_error(format!(
-        "'{}' object has no attribute '{}'",
-        obj.type_name_owned(),
-        name
-    ));
-    if let RuntimeError::PyException(pe) = &err {
-        if let Object::Instance(inst) = &pe.instance {
-            inst.slot_set("name", Object::from_str(name));
-            inst.slot_set("obj", obj.clone());
-        }
-    }
-    err
+    // Built in one step (message, `args` and both fields): a failing
+    // lookup under `getattr(o, n, default)` or `except AttributeError`
+    // is a hot path.
+    let type_name = obj.type_name_owned();
+    let mut message = String::with_capacity(type_name.len() + name.len() + 30);
+    message.push('\'');
+    message.push_str(&type_name);
+    message.push_str("' object has no attribute '");
+    message.push_str(name);
+    message.push('\'');
+    let instance = crate::builtin_types::exception_from_parts_with(
+        crate::builtin_types::builtin_types()
+            .attribute_error
+            .clone(),
+        Some(Object::from_str(message)),
+        [("name", Object::from_str(name)), ("obj", obj.clone())],
+    );
+    RuntimeError::PyException(PyException::new(instance))
 }
 
 pub fn key_error(message: impl Into<String>) -> RuntimeError {
@@ -420,23 +426,18 @@ pub fn stop_async_iteration() -> RuntimeError {
 /// of a `return` statement. The wrapped value is exposed as `.value`
 /// on the exception instance.
 pub fn stop_iteration_with(value: Object) -> RuntimeError {
-    let pe = PyException::new(crate::builtin_types::make_exception_with_class(
-        crate::builtin_types::builtin_types().stop_iteration.clone(),
-        "",
-    ));
-    if let Object::Instance(ref inst) = pe.instance {
-        inst.slot_set("value", value.clone());
-        // A bare `return` (value None) raises `StopIteration()` with
-        // *empty* args, so `str(e)` renders bare and `e.args` is `()` —
-        // CPython's `gen_return` only packs non-None return values.
-        let args = if matches!(value, Object::None) {
-            Object::new_tuple(Vec::new())
-        } else {
-            Object::new_tuple_array([value])
-        };
-        inst.slot_set("args", args);
-    }
-    RuntimeError::PyException(pe)
+    // `value` is the return value; a bare `return` (value None) raises
+    // `StopIteration()` with *empty* args, so `str(e)` renders bare and
+    // `e.args` is `()` — CPython's `gen_return` only packs non-None
+    // return values. (The family's construction sets `.value` from the
+    // argument, `None` without one.)
+    let arg = (!matches!(value, Object::None)).then_some(value);
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::exception_from_parts(
+            crate::builtin_types::builtin_types().stop_iteration.clone(),
+            arg,
+        ),
+    ))
 }
 
 pub fn not_implemented_error(message: impl Into<String>) -> RuntimeError {
