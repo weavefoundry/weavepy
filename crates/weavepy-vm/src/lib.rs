@@ -15455,28 +15455,38 @@ impl Interpreter {
             callee_slot + 2
         };
         let nargs = n - first;
-        locals.reserve(nlocals.max(nargs + missing));
+        let total = nlocals.max(nargs + missing);
+        if locals.capacity() < total {
+            locals.reserve(total);
+        }
         // SAFETY: the `nargs` operands above `first` move into the locals
-        // (reserved above) and the stack forgets them; the callable moves
-        // out of its slot, and an empty self slot owns nothing.
+        // (reserved above) and the stack forgets them, the defaults follow
+        // as copies, and the other locals start unbound, in one pass; the
+        // callable moves out of its slot, and an empty self slot owns
+        // nothing.
         let callable = unsafe {
             let (src, dst) = (frame.stack.as_ptr().add(first), locals.as_mut_ptr());
-            for k in 0..nargs {
+            let mut k = 0;
+            while k < nargs {
                 dst.add(k).write(src.add(k).read());
+                k += 1;
             }
-            locals.set_len(nargs);
+            if missing > 0 {
+                let defaults = &(*fp).defaults;
+                for d in &defaults[defaults.len() - missing..] {
+                    dst.add(k).write(clone_hot(d));
+                    k += 1;
+                }
+            }
+            while k < total {
+                dst.add(k).write(Object::Unbound);
+                k += 1;
+            }
+            locals.set_len(total);
             let callable = frame.stack.as_ptr().add(callee_slot).read();
             frame.stack.set_len(callee_slot);
             callable
         };
-        if missing > 0 {
-            // SAFETY: as above.
-            let defaults = unsafe { &(*fp).defaults };
-            for d in &defaults[defaults.len() - missing..] {
-                push_fast(locals, clone_hot(d));
-            }
-        }
-        fill_unbound(locals, nlocals);
         frame.pc = pc as u32 + 1;
         // SAFETY: the slot is parked (see `inline_bind_cells`): its handles
         // are stale copies, overwritten without a drop. `fp` stays alive
