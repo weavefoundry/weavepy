@@ -143,7 +143,7 @@ struct GreenletBody {
     /// whenever the greenlet is delivered to.
     frames: crate::object::FrameStack,
     /// This greenlet's own handled-exception stack.
-    exc_info: Rc<RefCell<Vec<PyException>>>,
+    exc_info: Rc<RefCell<Vec<Object>>>,
     /// `recursion::DEPTH` snapshot while parked.
     saved_depth: Cell<usize>,
     /// `gr_context` while not running (`None` = fresh implicit context;

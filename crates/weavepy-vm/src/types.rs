@@ -2503,18 +2503,26 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    if a.len() > 16 {
+    let n = a.len();
+    // (Two overlapping words cover every length from one word to two.)
+    let word = |s: &[u8], at: usize| u64::from_ne_bytes(s[at..at + 8].try_into().unwrap());
+    let half = |s: &[u8], at: usize| u32::from_ne_bytes(s[at..at + 4].try_into().unwrap());
+    match n {
         // Past a couple of words the library routine's vector loop wins.
-        return a == b;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
+        17.. => a == b,
+        8..=16 => word(a, 0) == word(b, 0) && word(a, n - 8) == word(b, n - 8),
+        4..=7 => half(a, 0) == half(b, 0) && half(a, n - 4) == half(b, n - 4),
+        _ => {
+            let mut i = 0;
+            while i < n {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
         }
-        i += 1;
     }
-    true
 }
 
 /// The key for a newly populated slot `name`. The slots every raise
@@ -2559,7 +2567,81 @@ pub(crate) fn slot_key(name: &str) -> DictKey {
     DictKey(crate::stdlib::sys::intern_name(name))
 }
 
+/// The `BaseException` pseudo-slots after `args`, which raising and
+/// chaining populate: an exception instance's slots are laid out over them
+/// from its birth (see [`SlotStorage::exception`]).
+#[cfg(target_pointer_width = "64")]
+const EXC_TAIL: [&str; 4] = [
+    "__traceback__",
+    "__context__",
+    "__cause__",
+    "__suppress_context__",
+];
+
+/// The shared slot layout of an exception instance whose families' own
+/// fields are `extra`: `args`, `extra`, then [`EXC_TAIL`]. `None` for a
+/// shape without one (its slots are stored per key).
+#[cfg(target_pointer_width = "64")]
+fn exception_layout(extra: &[&'static str]) -> Option<SharedSlice<DictKey>> {
+    type Layout = std::sync::OnceLock<SharedSlice<DictKey>>;
+    static PLAIN: Layout = Layout::new();
+    static VALUE: Layout = Layout::new();
+    static MSG: Layout = Layout::new();
+    static NAME_OBJ: Layout = Layout::new();
+    static NAME: Layout = Layout::new();
+    let cell = match extra {
+        [] => &PLAIN,
+        ["value"] => &VALUE,
+        ["msg"] => &MSG,
+        ["name", "obj"] => &NAME_OBJ,
+        ["name"] => &NAME,
+        _ => return None,
+    };
+    Some(
+        cell.get_or_init(|| {
+            std::iter::once("args")
+                .chain(extra.iter().copied())
+                .chain(EXC_TAIL)
+                .map(slot_key)
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .clone(),
+    )
+}
+
 impl SlotStorage {
+    /// The slots of a new exception instance: `args`, then its families'
+    /// own fields `extra` (`StopIteration.value`, `AttributeError`'s
+    /// `name` and `obj`), with the `BaseException` pseudo-slots laid out
+    /// unset after them, so a raise stores its traceback and chaining
+    /// links in place.
+    pub(crate) fn exception<const N: usize>(
+        args: Object,
+        extra: [(&'static str, Object); N],
+    ) -> Self {
+        let names: [&'static str; N] = std::array::from_fn(|i| extra[i].0);
+        #[cfg(target_pointer_width = "64")]
+        if let Some(layout) = exception_layout(&names) {
+            let mut values = Vec::with_capacity(layout.len());
+            values.push(args);
+            values.extend(extra.into_iter().map(|(_, v)| v));
+            let unset = layout.len() - values.len();
+            values.extend((0..unset).map(|_| Object::Unbound));
+            return Self {
+                data: SlotData::Fixed {
+                    layout,
+                    values: values.into_boxed_slice(),
+                },
+            };
+        }
+        let _ = names;
+        let mut entries = Vec::with_capacity(N + 2);
+        entries.push((slot_key("args"), args));
+        entries.extend(extra.into_iter().map(|(k, v)| (slot_key(k), v)));
+        Self::from_entries(entries)
+    }
+
     /// Storage holding exactly `entries` (distinct `str` keys, in slot
     /// order), built in one step.
     pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
@@ -3179,6 +3261,26 @@ impl SlotStorage {
         }
     }
 
+    /// Where slot `name` lives: its laid-out place (holding `Unbound`
+    /// while unset), else its populated slot. `None` when a store must
+    /// add the slot.
+    pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.unpack();
+        let laid_out = match &self.data {
+            SlotData::Fixed { layout, .. } => Some(layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            )?),
+            _ => None,
+        };
+        match laid_out {
+            Some(i) => match &mut self.data {
+                SlotData::Fixed { values, .. } => values.get_mut(i),
+                _ => None,
+            },
+            None => self.get_mut(name),
+        }
+    }
+
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
         self.insert_with_key(name, value, || slot_key(name))
     }
@@ -3390,6 +3492,12 @@ impl SlotStorage {
 
     pub fn get(&self, name: &str) -> Option<&Object> {
         self.0.get(&crate::object::StrKey(name))
+    }
+
+    /// The populated slot `name` (nothing is laid out here; see the
+    /// 64-bit variant).
+    pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.get_mut(name)
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {

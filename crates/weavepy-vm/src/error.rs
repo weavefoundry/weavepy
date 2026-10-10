@@ -37,44 +37,16 @@ impl PartialEq for TracebackEntry {
     }
 }
 
-/// An exception's [`TracebackEntry`] list, innermost first, with the
-/// first entry held inline: most exceptions are caught in the frame that
-/// raised them or the next one, and a raise then allocates nothing here.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TracebackEntries {
-    first: Option<TracebackEntry>,
-    rest: Vec<TracebackEntry>,
-}
-
-impl TracebackEntries {
-    pub fn push(&mut self, entry: TracebackEntry) {
-        if self.first.is_none() {
-            self.first = Some(entry);
-        } else {
-            self.rest.push(entry);
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.first.is_none()
-    }
-
-    pub fn len(&self) -> usize {
-        usize::from(self.first.is_some()) + self.rest.len()
-    }
-
-    /// The entries in push order (innermost frame first).
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &TracebackEntry> {
-        self.first.iter().chain(self.rest.iter())
-    }
-}
-
 /// A Python-visible exception. The wrapped [`Object`] is always an
 /// `Object::Instance` whose class's MRO contains `BaseException`.
 #[derive(Debug, Clone)]
 pub struct PyException {
     pub instance: Object,
-    pub traceback: TracebackEntries,
+    /// Whether the exception has unwound through a frame (which added
+    /// that frame's entry to the instance's `__traceback__` chain): a
+    /// fresh Rust-raised error has not. The entries themselves live only
+    /// in the chain (see [`Self::traceback_entries`]).
+    pub traced: bool,
     /// Implicit chaining context (`raise X` inside `except Y:` records
     /// `Y` as `__context__`). Stored separately from `instance.__dict__`
     /// so re-raises through pure Rust paths keep the link intact.
@@ -97,7 +69,7 @@ impl PyException {
     pub fn new(instance: Object) -> Self {
         Self {
             instance,
-            traceback: TracebackEntries::default(),
+            traced: false,
             context: None,
             cause: None,
             suppress_tb_once: false,
@@ -127,8 +99,25 @@ impl PyException {
         crate::builtin_types::exception_message(&self.instance).unwrap_or_default()
     }
 
-    pub fn push_traceback(&mut self, entry: TracebackEntry) {
-        self.traceback.push(entry);
+    /// The instance's `__traceback__` chain as entries, outermost frame
+    /// first ("most recent call last").
+    pub fn traceback_entries(&self) -> Vec<TracebackEntry> {
+        let mut entries = Vec::new();
+        let Object::Instance(inst) = &self.instance else {
+            return entries;
+        };
+        let mut cur = match inst.slot_get("__traceback__") {
+            Some(Object::Traceback(tb)) => Some(tb),
+            _ => None,
+        };
+        while let Some(node) = cur {
+            entries.push(TracebackEntry {
+                code: node.code(),
+                lineno: node.lineno,
+            });
+            cur = node.next.borrow().clone();
+        }
+        entries
     }
 
     /// PEP 678: append a string note to the wrapped instance's

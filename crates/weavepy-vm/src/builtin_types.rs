@@ -4894,45 +4894,50 @@ pub(crate) fn exception_from_parts_with<const N: usize>(
         Some(a) => Object::new_tuple_array([a.clone()]),
     };
     inst.note_slot_store(&args);
-    let mut entries: Vec<(crate::object::DictKey, Object)> = Vec::with_capacity(4);
     // PEP 380: `StopIteration.value` is always present (CPython sets it
     // in `StopIteration.__init__`, defaulting to None). A Rust-raised
     // bare `StopIteration` must answer `.value` too: asyncio's
     // `Task.__step` reads `exc.value` on every coroutine return, and a
     // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
-    if families & crate::EXC_FAM_STOP_ITERATION != 0 {
-        let value = arg.clone().unwrap_or(Object::None);
-        inst.note_slot_store(&value);
-        entries.push((slot_key("value"), value));
-    }
-    entries.push((slot_key("args"), args));
+    let value = (families & crate::EXC_FAM_STOP_ITERATION != 0)
+        .then(|| arg.clone().unwrap_or(Object::None));
     // The BaseException pseudo-slots (`__context__`/`__cause__`/
     // `__suppress_context__`/`__traceback__`) and OSError's named fields
     // (`errno`/`strerror`/…) are *not* seeded per-instance: their class
     // slot descriptors answer the CPython getset defaults while unset,
     // and a subclass's own class attribute (`class Err(OSError): errno =
     // EINVAL`, raised bare via `raise Err`) stays visible.
-    if families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0 {
-        // ImportError/ModuleNotFoundError expose `msg` (the message
-        // string). CPython always defines the slot; a Rust-raised
-        // ImportError must answer `.msg` so consumers (e.g. numpy's
-        // `_core/__init__` error handling, which reads `exc.msg`) don't
-        // AttributeError. `name`/`path`/`name_from` are intentionally
-        // *not* pre-set here so the import machinery's
-        // `set_exception_attr` (which skips already-present slots) can
-        // still populate the real module name. SyntaxError gets `msg`
-        // from `args[0]` too; the location payload reads `None` off the
-        // class descriptors until `error::syntax_error_located` fills
-        // real values.
-        let msg = arg.unwrap_or_else(|| Object::from_static(""));
-        inst.note_slot_store(&msg);
-        entries.push((slot_key("msg"), msg));
+    //
+    // ImportError/ModuleNotFoundError expose `msg` (the message
+    // string). CPython always defines the slot; a Rust-raised
+    // ImportError must answer `.msg` so consumers (e.g. numpy's
+    // `_core/__init__` error handling, which reads `exc.msg`) don't
+    // AttributeError. `name`/`path`/`name_from` are intentionally
+    // *not* pre-set here so the import machinery's
+    // `set_exception_attr` (which skips already-present slots) can
+    // still populate the real module name. SyntaxError gets `msg`
+    // from `args[0]` too; the location payload reads `None` off the
+    // class descriptors until `error::syntax_error_located` fills
+    // real values.
+    let msg = (families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0)
+        .then(|| arg.unwrap_or_else(|| Object::from_static("")));
+    for v in value.iter().chain(&msg).chain(extra.iter().map(|(_, v)| v)) {
+        inst.note_slot_store(v);
     }
-    for (name, value) in extra {
-        inst.note_slot_store(&value);
-        entries.push((slot_key(name), value));
-    }
-    *inst.slots.borrow_mut() = SlotStorage::from_entries(entries);
+    let slots = match (value, msg) {
+        (None, None) => SlotStorage::exception(args, extra),
+        (Some(value), None) if N == 0 => SlotStorage::exception(args, [("value", value)]),
+        (None, Some(msg)) if N == 0 => SlotStorage::exception(args, [("msg", msg)]),
+        (value, msg) => {
+            let mut entries = Vec::with_capacity(N + 3);
+            entries.push((slot_key("args"), args));
+            entries.extend(value.map(|v| (slot_key("value"), v)));
+            entries.extend(msg.map(|m| (slot_key("msg"), m)));
+            entries.extend(extra.into_iter().map(|(k, v)| (slot_key(k), v)));
+            SlotStorage::from_entries(entries)
+        }
+    };
+    *inst.slots.borrow_mut() = slots;
     Object::Instance(Rc::new(inst))
 }
 

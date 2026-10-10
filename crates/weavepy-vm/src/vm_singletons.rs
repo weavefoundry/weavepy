@@ -598,7 +598,7 @@ pub fn thread_ident_is_live(id: u64) -> bool {
 #[derive(Clone, Debug)]
 pub struct ThreadHandles {
     pub frame_stack: crate::object::FrameStack,
-    pub exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    pub exc_info_stack: Rc<RefCell<Vec<Object>>>,
     pub excepthook: Rc<RefCell<Object>>,
     pub unraisable_hook: Rc<RefCell<Object>>,
 }

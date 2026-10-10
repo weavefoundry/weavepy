@@ -34,7 +34,7 @@ pub const PY_VERSION: (i64, i64, i64) = (
 pub fn build_with_state(
     cache: &ModuleCache,
     frame_stack: crate::object::FrameStack,
-    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: Rc<RefCell<Vec<Object>>>,
     excepthook: Rc<RefCell<Object>>,
     unraisable_hook: Rc<RefCell<Object>>,
 ) -> Rc<PyModule> {
@@ -403,7 +403,7 @@ pub fn build_with_state(
                             let value = exc
                                 .borrow()
                                 .last()
-                                .map(|top| top.instance.clone())
+                                .cloned()
                                 .unwrap_or(Object::None);
                             d.insert(DictKey(Object::Int(ident as i64)), value);
                         }
@@ -1661,12 +1661,12 @@ fn sys_getframemodulename(
 /// being handled, or `None` if not in an `except`. Equivalent to
 /// `sys.exc_info()[1]`. The verbatim CPython `contextlib` relies on this.
 fn sys_exception(
-    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
 ) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     Ok(stack
         .last()
-        .map(|top| top.instance.clone())
+        .cloned()
         .or_else(capi_handled_exception_instance)
         .unwrap_or(Object::None))
 }
@@ -1682,12 +1682,12 @@ fn capi_handled_exception_instance() -> Option<Object> {
 }
 
 fn sys_exc_info(
-    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
 ) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     let inst = stack
         .last()
-        .map(|top| top.instance.clone())
+        .cloned()
         .or_else(capi_handled_exception_instance);
     if let Some(inst) = inst {
         let type_obj = match &inst {

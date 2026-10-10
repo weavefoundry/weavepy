@@ -102,7 +102,7 @@ use crate::error::{
     attribute_error, import_error, index_error, key_error, key_error_object,
     module_not_found_error, name_error, overflow_error, recursion_error, runtime_error,
     stop_async_iteration, stop_iteration, stop_iteration_with, type_error, value_error,
-    zero_division_error, TracebackEntry,
+    zero_division_error,
 };
 pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
@@ -272,7 +272,7 @@ struct FrameExc {
     /// are peeled back off so they don't leak into the *resumer's*
     /// `sys.exc_info()`. Always empty for ordinary frames (they never
     /// suspend).
-    saved: Vec<PyException>,
+    saved: Vec<Object>,
     /// pc of the instruction whose exception is being handled by a
     /// *cleanup* handler (`push_lasti` exception-table entries: `with`
     /// exits, except-variable unbind blocks). CPython pushes this on
@@ -327,12 +327,12 @@ impl Frame {
     }
 
     /// The innermost [`FrameExc::saved`] entry.
-    fn saved_exc_info_last(&self) -> Option<&PyException> {
+    fn saved_exc_info_last(&self) -> Option<&Object> {
         self.exc.as_ref()?.saved.last()
     }
 
     /// Take the [`FrameExc::saved`] entries.
-    fn take_saved_exc_info(&mut self) -> Vec<PyException> {
+    fn take_saved_exc_info(&mut self) -> Vec<Object> {
         self.exc
             .as_mut()
             .map(|e| std::mem::take(&mut e.saved))
@@ -340,7 +340,7 @@ impl Frame {
     }
 
     /// Set the [`FrameExc::saved`] entries.
-    fn set_saved_exc_info(&mut self, saved: Vec<PyException>) {
+    fn set_saved_exc_info(&mut self, saved: Vec<Object>) {
         if saved.is_empty() && self.exc.is_none() {
             return;
         }
@@ -867,7 +867,7 @@ pub struct Interpreter {
     /// Stack of currently-handled exceptions across all frames. The
     /// top is what `sys.exc_info()` returns. Pushed by
     /// `PUSH_EXC_INFO`; popped by `POP_EXCEPT`.
-    pub(crate) exc_info_stack: Rc<RefCell<Vec<PyException>>>,
+    pub(crate) exc_info_stack: Rc<RefCell<Vec<Object>>>,
     /// User-installable hook called when an exception escapes the
     /// top-level frame. Defaults to a Rust builtin that prints the
     /// canonical CPython-style traceback to `sys.stderr`.
@@ -3315,7 +3315,7 @@ impl Interpreter {
                 (
                     inst,
                     ty,
-                    pyexc.traceback.iter().cloned().collect::<Vec<_>>(),
+                    pyexc.traceback_entries(),
                 )
             }
             other => {
@@ -17684,11 +17684,12 @@ impl Interpreter {
                 }
                 // SAFETY: as above.
                 let instance = unsafe { &*base.add(len - 1) }.clone();
-                let prev = self
-                    .exc_info_stack
-                    .borrow()
-                    .last()
-                    .map_or(Object::None, |pe| pe.instance.clone());
+                let prev = {
+                    let mut handled = self.exc_info_stack.borrow_mut();
+                    let prev = handled.last().cloned().unwrap_or(Object::None);
+                    handled.push(instance);
+                    prev
+                };
                 // SAFETY: the exception moves up one slot and the previous
                 // one takes its place (`len < cap`).
                 unsafe {
@@ -17696,9 +17697,6 @@ impl Interpreter {
                     base.add(len - 1).write(prev);
                     base.add(len).write(top);
                 }
-                self.exc_info_stack
-                    .borrow_mut()
-                    .push(PyException::new(instance));
                 Some(len + 1)
             }
             OpCode::CheckExcMatch => {
@@ -17725,8 +17723,8 @@ impl Interpreter {
                 let top = self.exc_info_stack.borrow_mut().pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
-                if let Some(pe) = top {
-                    self.release(pe.instance);
+                if let Some(top) = top {
+                    self.release(top);
                 }
                 self.release(prev);
                 Some(len - 1)
@@ -24758,14 +24756,14 @@ impl Interpreter {
                         break;
                     }
                     let exc = stack.pop().expect("checked above");
-                    let prev = self
-                        .exc_info_stack
-                        .borrow()
-                        .last()
-                        .map_or(Object::None, |pe| pe.instance.clone());
+                    let prev = {
+                        let mut handled = self.exc_info_stack.borrow_mut();
+                        let prev = handled.last().cloned().unwrap_or(Object::None);
+                        handled.push(exc.clone());
+                        prev
+                    };
                     stack.push(prev);
-                    stack.push(exc.clone());
-                    self.exc_info_stack.borrow_mut().push(PyException::new(exc));
+                    stack.push(exc);
                     last = pc;
                     pc += 1;
                 }
@@ -24789,8 +24787,8 @@ impl Interpreter {
                     // here unless something else holds it.
                     last = pc;
                     pc += 1;
-                    if let Some(pe) = top {
-                        self.release(pe.instance);
+                    if let Some(top) = top {
+                        self.release(top);
                     }
                     self.release(prev);
                 }
@@ -30841,12 +30839,13 @@ impl Interpreter {
                         // (`sys.exc_info()`), not frame-local: a helper
                         // called from inside an `except:` block can
                         // re-raise the caller's exception.
-                        let mut top = self
+                        let top = self
                             .exc_info_stack
                             .borrow()
                             .last()
                             .cloned()
                             .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
+                        let mut top = PyException::new(top);
                         top.suppress_tb_once = true;
                         top.context_settled = true;
                         return Err(RuntimeError::PyException(top));
@@ -30999,9 +30998,8 @@ impl Interpreter {
                 // `raise`'s `__context__` see the match, not the whole
                 // group, with no per-clause PUSH_EXC_INFO on the wire.
                 if !matches!(matched, Object::None) {
-                    let pe = PyException::new(matched.clone());
                     if let Some(top) = self.exc_info_stack.borrow_mut().last_mut() {
-                        *top = pe;
+                        *top = matched.clone();
                     }
                 }
                 frame.push(rest);
@@ -31019,12 +31017,12 @@ impl Interpreter {
                     .exc_info_stack
                     .borrow()
                     .last()
-                    .map(|pe| pe.instance.clone())
+                    .cloned()
                     .unwrap_or(Object::None);
                 frame.push(prev);
                 frame.push(exc.clone());
                 if let Object::Instance(_) = &exc {
-                    self.exc_info_stack.borrow_mut().push(PyException::new(exc));
+                    self.exc_info_stack.borrow_mut().push(exc);
                 }
             }
             OpCode::PopExcept => {
@@ -31039,8 +31037,8 @@ impl Interpreter {
                 // `except` block (the implicit `del` of the bound name plus
                 // the per-frame exc-state pop): it dies here unless something
                 // else holds it.
-                if let Some(pe) = popped {
-                    self.release(pe.instance);
+                if let Some(popped) = popped {
+                    self.release(popped);
                 }
             }
             OpCode::PrepReraiseStar => {
@@ -31489,7 +31487,7 @@ impl Interpreter {
                         // Keep the in-flight traceback so the RuntimeError
                         // points at the offending frame; chain the original
                         // as cause + context (PEP 479 wording).
-                        new_exc.traceback = orig.traceback.clone();
+                        new_exc.traced = orig.traced;
                         new_exc.cause = Some(Box::new(orig.clone()));
                         new_exc.context = Some(Box::new(orig));
                         new_exc.context_settled = true;
@@ -31878,7 +31876,7 @@ impl Interpreter {
         let fresh = !exc.context_settled
             && exc.context.is_none()
             && exc.cause.is_none()
-            && exc.traceback.is_empty()
+            && !exc.traced
             && !exc.suppress_tb_once;
         // Nothing is being handled: there is no context to chain (the
         // decision `attach_implicit_context` would settle the same way),
@@ -31892,7 +31890,7 @@ impl Interpreter {
             if exc.context.is_some() {
                 Self::sync_exc_attrs(exc);
             }
-        } else if exc.traceback.is_empty() && (exc.cause.is_some() || exc.context.is_some()) {
+        } else if !exc.traced && (exc.cause.is_some() || exc.context.is_some()) {
             // A fresh Rust-raised error that already carries an
             // explicit `cause`/`context` (e.g. `_io` chaining a
             // misbehaving raw `readinto`'s `TypeError` into an
@@ -32145,15 +32143,10 @@ impl Interpreter {
     }
 
     /// Push one frame's worth of `tb_*` info onto the exception's
-    /// traceback chain — both the legacy `Vec<TracebackEntry>` (used
-    /// for the cheap `RuntimeError` Display impl) and the new
-    /// `PyTraceback` chain stored on the instance dict so Python code
-    /// can walk `exc.__traceback__`.
+    /// traceback: the `PyTraceback` chain stored on the instance so
+    /// Python code can walk `exc.__traceback__`.
     fn append_traceback(&self, exc: &mut PyException, frame: &mut Frame, lasti: u32, lineno: u32) {
-        exc.push_traceback(TracebackEntry {
-            code: frame.code.clone(),
-            lineno,
-        });
+        exc.traced = true;
         // The Python-visible frame for this entry must be *this* frame's
         // snapshot. Generator-family frames cache theirs (stable identity
         // across resumes) but are not necessarily on `frame_stack` when an
@@ -32235,12 +32228,17 @@ impl Interpreter {
             let new_tb = Object::Traceback(new_tb);
             inst.note_slot_store(&new_tb);
             let mut slots = inst.slots.borrow_mut();
-            match slots.get_mut("__traceback__") {
+            match slots.place_mut("__traceback__") {
                 Some(slot) => {
                     let prev = std::mem::replace(slot, new_tb);
-                    if let (Object::Traceback(prev_tb), Object::Traceback(head)) = (&prev, &*slot) {
-                        *head.next.borrow_mut() = Some(prev_tb.clone());
-                    }
+                    // The chain so far moves under the new head.
+                    let prev = match (prev, &*slot) {
+                        (Object::Traceback(prev_tb), Object::Traceback(head)) => {
+                            *head.next.borrow_mut() = Some(prev_tb);
+                            None
+                        }
+                        (prev, _) => Some(prev),
+                    };
                     drop(slots);
                     drop(prev);
                 }
@@ -32305,7 +32303,7 @@ impl Interpreter {
         let Some(ctx) = stack.last() else {
             return;
         };
-        let Object::Instance(ctx_inst) = &ctx.instance else {
+        let Object::Instance(ctx_inst) = ctx else {
             return;
         };
         let Object::Instance(exc_inst) = &exc.instance else {
@@ -32322,7 +32320,7 @@ impl Interpreter {
         // first so traceback walkers can't loop. CPython does the same
         // before assigning the new `__context__`.
         Self::break_implicit_context_cycle(ctx_inst, exc_inst);
-        exc.context = Some(Box::new(ctx.clone()));
+        exc.context = Some(Box::new(PyException::new(ctx.clone())));
     }
 
     /// Chain an exception injected by `gen.throw()` to whatever the
@@ -32336,7 +32334,7 @@ impl Interpreter {
         let Some(active) = frame.saved_exc_info_last() else {
             return;
         };
-        let Object::Instance(active_inst) = &active.instance else {
+        let Object::Instance(active_inst) = active else {
             return;
         };
         let Object::Instance(exc_inst) = &exc.instance else {
@@ -32346,7 +32344,7 @@ impl Interpreter {
             return;
         }
         Self::break_implicit_context_cycle(active_inst, exc_inst);
-        exc.context = Some(Box::new(active.clone()));
+        exc.context = Some(Box::new(PyException::new(active.clone())));
         // Mirror onto the instance dict so Python's `e.__context__` sees
         // it (the throw path doesn't go through `RAISE_VARARGS`, which is
         // where `sync_exc_attrs` normally runs).
@@ -41622,7 +41620,7 @@ impl Interpreter {
                         let RuntimeError::PyException(mut outer) = not_awaitable(&value) else {
                             unreachable!("not_awaitable builds a PyException");
                         };
-                        outer.traceback = inner.traceback.clone();
+                        outer.traced = inner.traced;
                         outer.cause = Some(Box::new(inner.clone()));
                         outer.context = Some(Box::new(inner));
                         Self::sync_exc_attrs(&outer);
@@ -43037,7 +43035,7 @@ impl Interpreter {
         let mut new_exc = PyException::new(rt_inst);
         // Keep the in-flight traceback so the RuntimeError points at the
         // offending frame; chain the original as cause + context.
-        new_exc.traceback = exc.traceback.clone();
+        new_exc.traced = exc.traced;
         new_exc.cause = Some(Box::new(exc.clone()));
         new_exc.context = Some(Box::new(exc));
         Self::sync_exc_attrs(&new_exc);
@@ -56039,9 +56037,7 @@ impl Interpreter {
             let inst = PyInstance::new(cls);
             let args_tuple = Object::new_tuple(args.to_vec());
             inst.note_slot_store(&args_tuple);
-            let mut entries = Vec::with_capacity(4);
-            entries.push((crate::types::slot_key("args"), args_tuple));
-            *inst.slots.borrow_mut() = crate::types::SlotStorage::from_entries(entries);
+            *inst.slots.borrow_mut() = crate::types::SlotStorage::exception(args_tuple, []);
             let obj = Object::Instance(Rc::new(inst));
             // See the GC note at the end.
             if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
@@ -56069,13 +56065,27 @@ impl Interpreter {
         };
         // (No `message` mirror: CPython has none, and `str()` and the Rust
         // display derive the text from `args`.)
-        inst.slot_set("args", args_tuple);
         // PEP 380: `StopIteration.value` is the first constructor arg
         // (or None). Generator `return` goes through
         // `stop_iteration_with`, but user code constructs
         // `StopIteration(x)` directly and reads `.value` too.
-        if is_stop_iteration {
-            inst.slot_set("value", args.first().cloned().unwrap_or(Object::None));
+        let value = is_stop_iteration.then(|| args.first().cloned().unwrap_or(Object::None));
+        if inst.slots.borrow().is_empty_default() {
+            // Laid out as the common case's (see `SlotStorage::exception`).
+            inst.note_slot_store(&args_tuple);
+            let slots = match value {
+                Some(value) => {
+                    inst.note_slot_store(&value);
+                    crate::types::SlotStorage::exception(args_tuple, [("value", value)])
+                }
+                None => crate::types::SlotStorage::exception(args_tuple, []),
+            };
+            *inst.slots.borrow_mut() = slots;
+        } else {
+            inst.slot_set("args", args_tuple);
+            if let Some(value) = value {
+                inst.slot_set("value", value);
+            }
         }
         // `SystemExit.code`: None for no args, the lone argument for
         // one, the whole tuple otherwise (CPython `SystemExit_init`).
