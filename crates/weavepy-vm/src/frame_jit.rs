@@ -3982,6 +3982,15 @@ pub(crate) struct DirectSite {
     /// low bit, `0` while it has no body (one compare per lookup).
     key: usize,
     alt_key: usize,
+    /// A frameless leaf callee the site evaluates in place (see
+    /// [`leaf_site_call`]): its code (a counted reference, `0` none), key,
+    /// and defaults taken.
+    leaf_code: usize,
+    leaf_key: usize,
+    leaf_missing: u32,
+    /// Nonzero while the site has a body or a leaf to take: the native
+    /// code tries the direct helper first then.
+    hot: usize,
 }
 
 /// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
@@ -3991,12 +4000,12 @@ fn site_key(code: usize, has_self: bool) -> usize {
     code | usize::from(has_self)
 }
 
-const DS_NATIVE: i32 = std::mem::offset_of!(DirectSite, native) as i32;
+const DS_HOT: i32 = std::mem::offset_of!(DirectSite, hot) as i32;
 const DS_RETRY: i32 = std::mem::offset_of!(DirectSite, retry) as i32;
 
 impl Drop for DirectSite {
     fn drop(&mut self) {
-        for code in [self.code, self.alt_code] {
+        for code in [self.code, self.alt_code, self.leaf_code] {
             if code != 0 {
                 // SAFETY: each holds the count a fill took.
                 unsafe { drop(Rc::from_raw(code as *const CodeObject)) };
@@ -4025,6 +4034,23 @@ impl DirectSite {
         } else {
             site_key(self.code, has_self)
         };
+        self.hot = self.native | self.leaf_key;
+    }
+
+    /// Record a frameless leaf callee running `code` (with or without its
+    /// self slot), whose last `missing` parameters take defaults.
+    fn fill_leaf(&mut self, code: &Rc<CodeObject>, has_self: bool, missing: usize) {
+        let at = Rc::as_ptr(code) as usize;
+        if at != self.leaf_code {
+            let old = std::mem::replace(&mut self.leaf_code, Rc::into_raw(code.clone()) as usize);
+            if old != 0 {
+                // SAFETY: `old` held the count an earlier fill took.
+                unsafe { drop(Rc::from_raw(old as *const CodeObject)) };
+            }
+        }
+        self.leaf_key = site_key(at, has_self);
+        self.leaf_missing = missing as u32;
+        self.hot = self.native | self.leaf_key;
     }
 
     /// Record a call of `code` with a native body as the site's first
@@ -4326,11 +4352,53 @@ unsafe extern "C" fn h_call_direct(
         debug_assert!(len_u >= argc + 2);
         if !s.sw.is_null() {
             let start = len_u - argc - 2;
-            if let Some(r) = direct_call(s, pc as usize, start, len_u, &mut *site, None) {
+            if let Some(r) = direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None) {
                 return r;
             }
         }
         h_call(st, code, ext, pc, len)
+    }
+}
+
+/// Whether a site may evaluate a call of `f` (running `code`) with `nargs`
+/// positional arguments as a frameless leaf ([`leaf_site_call`]): a leaf
+/// with only positional parameters, at most eight, `nargs` of them given.
+/// How many take defaults.
+fn site_leaf_fits(f: &crate::object::PyFunction, code: &CodeObject, nargs: usize) -> Option<usize> {
+    let missing = (code.arg_count as usize).checked_sub(nargs)?;
+    (crate::fn_is_leaf(f)
+        && !Interpreter::has_extended_params(code)
+        && code.arg_count <= 8
+        && Interpreter::leaf_code_ok(code))
+    .then_some(missing)
+}
+
+/// A `CALL`'s (its operands from `start` up a `len`-deep stack) callee,
+/// the frameless leaf its site cached (see [`DirectSite::fill_leaf`]),
+/// whose last `missing` parameters take defaults, evaluated in place as
+/// `h_call` evaluates a leaf callee (`Interpreter::site_leaf_eval`):
+/// `true` with the result at `start` (`st.len` past it), `false` declined
+/// untouched.
+///
+/// # Safety
+///
+/// As [`direct_call`]'s; the callee is a plain function whose code is the
+/// site's leaf's.
+#[inline(never)]
+unsafe fn leaf_site_call(st: &mut State, start: usize, len: usize, missing: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let base = st.stack;
+        let ops = std::slice::from_raw_parts(base.add(start), len - start);
+        let Some(r) = (*st.interp).site_leaf_eval(ops, missing, st.depth_cell) else {
+            return false;
+        };
+        for k in start..len {
+            crate::drop_hot(base.add(k).read());
+        }
+        base.add(start).write(r);
+        st.len = start + 1;
+        true
     }
 }
 
@@ -4346,7 +4414,7 @@ unsafe fn direct_call_out(
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
-    unsafe { direct_call(st, pc, start, len, site, binop) }
+    unsafe { direct_call::<false>(st, pc, start, len, site, binop) }
 }
 
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
@@ -4360,7 +4428,7 @@ unsafe fn direct_call_out(
 /// (`binop`) that leaves the direct return to the core loop carries the
 /// operator, whose `TypeError` its `NotImplemented` becomes there.
 #[inline(always)]
-unsafe fn direct_call(
+unsafe fn direct_call<const CALL: bool>(
     st: &mut State,
     pc: usize,
     start: usize,
@@ -4387,6 +4455,21 @@ unsafe fn direct_call(
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
+            let leaf = CALL && site.leaf_key == key;
+            if leaf {
+                // The site's frameless leaf, evaluated in place.
+                if leaf_site_call(st, start, len, site.leaf_missing as usize) {
+                    return Some(0);
+                }
+                // Declined (a leaf that keeps bailing, or one not warm
+                // yet): an ordinary call, unless a body compiled since,
+                // which every few declines check for.
+                if site.retry != 0 {
+                    site.retry -= 1;
+                    return Some(call_activation_out(st, pc, start, len));
+                }
+                site.retry = 64;
+            }
             let (native, missing) = direct_body(f, code_rc, nargs).map_or((0, 0), |(n, m)| {
                 (std::ptr::from_ref::<Native>(n) as usize, m)
             });
@@ -4395,6 +4478,18 @@ unsafe fn direct_call(
                 // compiled callees alone.
                 if site.native == 0 {
                     site.fill(code_rc, has_self, 0, 0);
+                }
+                if leaf {
+                    return Some(call_activation_out(st, pc, start, len));
+                }
+                if CALL {
+                    if let Some(missing) = site_leaf_fits(f, code_rc, nargs) {
+                        site.fill_leaf(code_rc, has_self, missing);
+                        if leaf_site_call(st, start, len, missing) {
+                            return Some(0);
+                        }
+                        return Some(call_activation_out(st, pc, start, len));
+                    }
                 }
                 return None;
             }
@@ -4886,46 +4981,7 @@ unsafe extern "C" fn h_call(
             }
         }
         if python != 0 {
-            // A Python callee's activation, switched to as the arm does
-            // (the frame synced first; a declined switch leaves the call
-            // to the quiet loop).
-            if st.sw.is_null() {
-                return CALL_DECLINED;
-            }
-            // (A generator function's call was made above.)
-            sync(st);
-            let sw = &mut *st.sw;
-            let saved_last = sw.last;
-            let interp = &mut *st.interp.cast_mut();
-            let switched = if python == 1 {
-                if interp.core_call(sw, pc) {
-                    true
-                } else if interp.core_gen_call(sw, pc) {
-                    return gen_call_done(st, pc, start);
-                } else {
-                    false
-                }
-            } else {
-                interp.core_new(sw, pc, st.snap_gen)
-            };
-            if !switched && sw.pending.is_none() {
-                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
-            }
-            // A compiled callee runs from here, and its return continues
-            // this code natively (anything else leaves for the core loop).
-            if switched && sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
-                if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
-                    return r;
-                }
-                if run_callee_directly(st, start) {
-                    st.len = start + 1;
-                    return 0;
-                }
-            }
-            if switched && finished_in_place(st, start) {
-                return 0;
-            }
-            return RELOAD;
+            return call_activation(st, pc, start, len, python);
         }
         // A builtin type's call (`range(a, b)`, `float(x)`, `list(xs)`), as
         // the core loop's arms run it: in place when nothing it does can
@@ -5063,6 +5119,75 @@ unsafe extern "C" fn h_call(
                 RAISED
             }
         }
+    }
+}
+
+/// [`call_activation`] of a plain function out of line, for a direct
+/// call's site whose frameless leaf declined (`h_call` keeps its own copy
+/// in line).
+///
+/// # Safety
+///
+/// As `h_call`'s.
+#[inline(never)]
+unsafe fn call_activation_out(st: &mut State, pc: usize, start: usize, len: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe { call_activation(st, pc, start, len, 1) }
+}
+
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
+/// a Python callee (`python` 1, a function or a bound method over one) or
+/// a Python class's constructor (`python` 2), its activation switched to
+/// as the core loop's arm switches it (the frame synced first; a declined
+/// switch leaves the call to the quiet loop): `h_call`'s results.
+///
+/// # Safety
+///
+/// As `h_call`'s.
+#[inline(always)]
+unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, python: u8) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let saved_last = sw.last;
+        let interp = &mut *st.interp.cast_mut();
+        // (A generator function's call was made by `h_call` before.)
+        let switched = if python == 1 {
+            if interp.core_call(sw, pc) {
+                true
+            } else if interp.core_gen_call(sw, pc) {
+                return gen_call_done(st, pc, start);
+            } else {
+                false
+            }
+        } else {
+            interp.core_new(sw, pc, st.snap_gen)
+        };
+        if !switched && sw.pending.is_none() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+        }
+        // A compiled callee runs from here, and its return continues
+        // this code natively (anything else leaves for the core loop).
+        if switched && sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+            if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                return r;
+            }
+            if run_callee_directly(st, start) {
+                st.len = start + 1;
+                return 0;
+            }
+        }
+        if switched && finished_in_place(st, start) {
+            return 0;
+        }
+        RELOAD
     }
 }
 
@@ -9907,8 +10032,8 @@ impl<'a> Lower<'a> {
         self.b.append_block_param(called, types::I32);
         self.b.ins().brif(is_fn, fresh, &[], general, &[]);
         self.b.switch_to_block(fresh);
-        let native = self.b.ins().load(types::I64, FLAGS, site_at, DS_NATIVE);
-        self.b.ins().brif(native, direct, &[], waiting, &[]);
+        let hot = self.b.ins().load(types::I64, FLAGS, site_at, DS_HOT);
+        self.b.ins().brif(hot, direct, &[], waiting, &[]);
         self.b.switch_to_block(waiting);
         let retry = self.b.ins().load(types::I32, FLAGS, site_at, DS_RETRY);
         self.b.ins().brif(retry, counted, &[], direct, &[]);

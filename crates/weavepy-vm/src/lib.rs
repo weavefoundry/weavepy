@@ -19850,6 +19850,59 @@ impl Interpreter {
         self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
     }
 
+    /// [`Self::core_pure_call`] for a `CALL` site of the frame JIT that
+    /// cached its leaf callee (see `frame_jit::leaf_site_call`): the site
+    /// settled the callee's shape (positional parameters only, at most
+    /// eight, the last `missing` of them from the defaults), so only the
+    /// checks that can change from call to call remain.
+    pub(crate) fn site_leaf_eval(
+        &self,
+        ops: &[Object],
+        missing: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        let Object::Function(f) = ops.first()? else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`), while the caller's stack keeps the function
+        // alive.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let pure = code_is_pure_leaf(code_rc);
+        let effect = !pure && code_is_effect_leaf(code_rc);
+        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+            return None;
+        }
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        if depth >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        if !ops
+            .iter()
+            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
+        {
+            return None;
+        }
+        let first = if matches!(ops[1], Object::Unbound) { 2 } else { 1 };
+        let nargs = ops.len() - first;
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, o) in ops[first..].iter().enumerate() {
+            args[k] = o;
+        }
+        for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
+            args[nargs + k] = o;
+        }
+        self.pure_leaf_call(code_rc, f, &args[..nargs + missing], effect, depth)
+    }
+
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
     /// callee, its self slot, `argc` positionals, the keyword values and
     /// the names tuple. The site's cached `CallPyKwNames` permutation
