@@ -27282,19 +27282,25 @@ impl Interpreter {
         if cls.flags.is_builtin
             && !cls.memo_verdict(crate::types::Verdict::NoNativeClassMethod, name, || {
                 cls.dict.try_borrow().is_ok_and(|d| {
-                    !matches!(d.get(&crate::object::StrKey(name)), Some(Object::ClassMethod(_)))
+                    !matches!(
+                        d.get(&crate::object::StrKey(name)),
+                        Some(Object::ClassMethod(_))
+                    )
                 })
             })
         {
-            let d = cls.dict.try_borrow().ok()?;
-            if let Some(Object::ClassMethod(cm)) = d.get(&crate::object::StrKey(name)) {
-                let f = cm.func();
-                return matches!(f, Object::Builtin(_)).then(|| {
-                    Object::BoundMethod(Rc::new(BoundMethod::py_method(
-                        Object::Type(cls.clone()),
-                        f,
-                    )))
-                });
+            // (Through the type cache: the class's own entry is the one
+            // its MRO walk finds first.)
+            if let Some((Object::ClassMethod(cm), owner)) = cls.lookup_with_owner(name) {
+                if Rc::ptr_eq(&owner, cls) {
+                    let f = cm.func();
+                    return matches!(f, Object::Builtin(_)).then(|| {
+                        Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                            Object::Type(cls.clone()),
+                            f,
+                        )))
+                    });
+                }
             }
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -70734,6 +70740,9 @@ fn format_bigint_hex(b: &num_bigint::BigInt, upper: bool, p: &ParsedSpec) -> Str
 /// rest (`'%.123456f'` matches CPython instead of aborting).
 fn fixed_core(mag: f64, prec: usize) -> String {
     const FIXED_PREC_CAP: usize = 1100;
+    if let Some(s) = fixed_core_word(mag, prec) {
+        return s;
+    }
     if prec <= FIXED_PREC_CAP {
         format!("{mag:.*}", prec)
     } else {
@@ -70742,6 +70751,61 @@ fn fixed_core(mag: f64, prec: usize) -> String {
         s.extend(std::iter::repeat_n('0', prec - cap));
         s
     }
+}
+
+/// [`fixed_core`] in 128-bit integer arithmetic, for the common shapes:
+/// at most 17 fractional digits of a magnitude below 2**63. The float is
+/// `m * 2**e` exactly, so `mag * 10**prec` is `m * 10**prec` shifted by
+/// `e`, rounded half to even on the exact remainder (the correctly
+/// rounded answer the general formatter gives). `None` for any other
+/// magnitude or precision.
+fn fixed_core_word(mag: f64, prec: usize) -> Option<String> {
+    if prec > 17 {
+        return None;
+    }
+    let bits = mag.to_bits();
+    let exp_field = ((bits >> 52) & 0x7ff) as i32;
+    let frac = u128::from(bits & ((1u64 << 52) - 1));
+    let (m, e) = if exp_field == 0 {
+        (frac, -1074)
+    } else {
+        (frac | 1 << 52, exp_field - 1075)
+    };
+    let p10 = 10u128.pow(prec as u32);
+    let scaled = if e >= 0 {
+        // `m << e` stays below 2**63, and times `10**17` below 2**120.
+        if e > 10 {
+            return None;
+        }
+        (m << e) * p10
+    } else if -e > 120 {
+        // Below 2**-68 the scaled value is under one half: it rounds to 0.
+        0
+    } else {
+        let sh = e.unsigned_abs();
+        let num = m * p10;
+        let q = num >> sh;
+        let r = num & ((1u128 << sh) - 1);
+        let half = 1u128 << (sh - 1);
+        q + u128::from(r > half || (r == half && q & 1 == 1))
+    };
+    let digits = scaled.to_string();
+    if prec == 0 {
+        return Some(digits);
+    }
+    let mut out = String::with_capacity(digits.len().max(prec + 1) + 1);
+    if digits.len() <= prec {
+        out.push('0');
+        out.push('.');
+        out.extend(std::iter::repeat_n('0', prec - digits.len()));
+        out.push_str(&digits);
+    } else {
+        let (int, frac) = digits.split_at(digits.len() - prec);
+        out.push_str(int);
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
 }
 
 /// `true` when every decimal digit in `core` is `'0'` (and there is at
