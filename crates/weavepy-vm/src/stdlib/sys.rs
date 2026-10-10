@@ -1586,7 +1586,7 @@ fn sys_getframe(
     let idx = len - 1 - depth;
     // RFC 0058: the spine holds cheap shells; the Python-visible
     // frame object is materialised on demand right here.
-    match crate::object::materialize_stack_at(frame_stack, idx) {
+    match crate::object::materialize_stack_at_lazy(frame_stack, idx) {
         Some(py) => {
             // PEP 578: `sys._getframe` audits with the frame object.
             audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
@@ -1622,11 +1622,9 @@ fn sys_getframemodulename(
         return Ok(Object::None);
     }
     let idx = len - 1 - depth;
-    let Some(py) = crate::object::materialize_stack_at(frame_stack, idx) else {
-        return Ok(Object::None);
-    };
-    let name = py
-        .globals
+    // The shell's globals are the frame's: no frame object needed.
+    let globals = frame_stack.borrow()[idx].globals.clone();
+    let name = globals
         .borrow()
         .get(&crate::object::StrKey("__name__"))
         .cloned();

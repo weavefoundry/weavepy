@@ -1352,6 +1352,67 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
     back
 }
 
+/// [`materialize_stack_at`] for the one frame at `idx`: its `f_back` is
+/// its caller's frame object when one exists, else a lazy link to the
+/// caller's shell (see [`PyFrame::lazy_back`]), so the frames below are
+/// built only if something walks to them (`logging`'s `findCaller` reads
+/// two or three `f_back`s of a much deeper stack). A generator-family
+/// activation or caller, whose frame objects' links its resumes manage,
+/// takes the eager walk.
+pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame>> {
+    let s = stack.borrow();
+    let shell = s.get(idx)?;
+    let caller = idx.checked_sub(1).map(|i| &s[i]);
+    if shell.is_gen || caller.is_some_and(|c| c.is_gen) {
+        drop(s);
+        return materialize_stack_at(stack, idx);
+    }
+    let existing = shell.materialized.borrow().clone();
+    let mut refreshed = existing.is_some();
+    let py = match existing {
+        Some(py) => {
+            shell.refresh_materialized(&py);
+            py
+        }
+        // Counted as live on the stack, as the eager walk counts it.
+        None => shell.materialize(None),
+    };
+    match caller {
+        None => py.set_back(None),
+        Some(c) => {
+            let caller_py = c.materialized.borrow().clone();
+            match caller_py {
+                Some(back) => {
+                    c.refresh_materialized(&back);
+                    refreshed = true;
+                    let linked = py.lazy_back.borrow().is_none()
+                        && py.back.borrow().as_ref().is_some_and(|b| Rc::ptr_eq(b, &back));
+                    if !linked {
+                        py.set_back(Some(back));
+                    }
+                }
+                None => {
+                    let linked = py.back.borrow().is_none()
+                        && py
+                            .lazy_back
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|l| Rc::ptr_eq(&l.0, c));
+                    if !linked {
+                        *py.back.borrow_mut() = None;
+                        *py.lazy_back.borrow_mut() = Some(LazyShellRef::new(c.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if refreshed {
+        // As in `materialize_stack_at`: a new holder of existing objects.
+        crate::hot_gates::bump_loop_gen();
+    }
+    Some(py)
+}
+
 /// Materialise and return the top frame of a stack, or `None` when
 /// the stack is empty.
 pub fn materialize_stack_top(stack: &FrameStack) -> Option<Rc<PyFrame>> {
@@ -1487,7 +1548,7 @@ pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
             .iter()
             .rposition(|s| Rc::ptr_eq(s, shell));
         if let Some(idx) = idx {
-            if let Some(py) = materialize_stack_at(&handles.frame_stack, idx) {
+            if let Some(py) = materialize_stack_at_lazy(&handles.frame_stack, idx) {
                 return py;
             }
         }
@@ -1505,7 +1566,7 @@ pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
             .ok()
             .and_then(|s| s.iter().rposition(|s| Rc::ptr_eq(s, shell)));
         if let Some(idx) = idx {
-            if let Some(py) = materialize_stack_at(&stack, idx) {
+            if let Some(py) = materialize_stack_at_lazy(&stack, idx) {
                 return py;
             }
         }
@@ -3189,7 +3250,20 @@ static MODULE_CLASS: std::sync::LazyLock<
 /// Record `m.__class__ = cls`. The caller validates that `cls` is a
 /// `ModuleType` subclass.
 pub fn set_module_class(m: &Rc<PyModule>, cls: Object) {
+    MODULE_CLASSES_SET.store(true, std::sync::atomic::Ordering::Release);
     MODULE_CLASS.write().insert(Rc::as_ptr(m) as usize, cls);
+}
+
+/// Whether any module ever got a class of its own (see
+/// [`set_module_class`]): until then every module's attributes are its
+/// dictionary's, `ModuleType`'s own descriptors aside.
+static MODULE_CLASSES_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`MODULE_CLASSES_SET`].
+#[inline]
+pub fn module_classes_possible() -> bool {
+    MODULE_CLASSES_SET.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The class assigned via [`set_module_class`], if any. `None` means the

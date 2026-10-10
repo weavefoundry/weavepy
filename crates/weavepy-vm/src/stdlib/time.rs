@@ -290,15 +290,27 @@ const STRUCT_TIME_FIELDS: [&str; 9] = [
 /// bare tuple (the old shape) broke them with `'tuple' object has no attribute
 /// 'tm_year'`.
 fn struct_time_type() -> Rc<crate::types::TypeObject> {
-    // Full CPython layout: 9 sequence slots plus the two hidden named
-    // members, so `n_fields` is 11 and an 10/11-element constructor sequence
-    // fills `tm_zone`/`tm_gmtoff` positionally (test_structseq).
-    let slots: Vec<Option<&'static str>> = STRUCT_TIME_FIELDS
-        .iter()
-        .map(|f| Some(*f))
-        .chain([Some("tm_zone"), Some("tm_gmtoff")])
-        .collect();
-    crate::stdlib::os::struct_seq_type_layout("struct_time", "time", slots, 9)
+    // (The registry memoises the type per thread too; this skips building
+    // the layout and the name lookup for every `localtime`.)
+    thread_local! {
+        static TYPE: std::cell::OnceCell<Rc<crate::types::TypeObject>> =
+            const { std::cell::OnceCell::new() };
+    }
+    TYPE.with(|t| {
+        t.get_or_init(|| {
+            // Full CPython layout: 9 sequence slots plus the two hidden
+            // named members, so `n_fields` is 11 and an 10/11-element
+            // constructor sequence fills `tm_zone`/`tm_gmtoff`
+            // positionally (test_structseq).
+            let slots: Vec<Option<&'static str>> = STRUCT_TIME_FIELDS
+                .iter()
+                .map(|f| Some(*f))
+                .chain([Some("tm_zone"), Some("tm_gmtoff")])
+                .collect();
+            crate::stdlib::os::struct_seq_type_layout("struct_time", "time", slots, 9)
+        })
+        .clone()
+    })
 }
 
 fn make_struct_time(values: Vec<Object>) -> Object {
@@ -691,7 +703,7 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
             let mut v = Vec::with_capacity(9);
             for f in STRUCT_TIME_FIELDS {
                 v.push(
-                    d.get(&DictKey(Object::from_static(f)))
+                    d.get(&crate::stdlib::os::static_name_key(f))
                         .cloned()
                         .ok_or_else(illegal)?,
                 );
@@ -730,11 +742,11 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
     let (zone, gmtoff) = match arg {
         Some(Object::Instance(inst)) => {
             let d = inst.dict_cell().borrow();
-            let zone = match d.get(&DictKey(Object::from_static("tm_zone"))) {
+            let zone = match d.get(&crate::stdlib::os::static_name_key("tm_zone")) {
                 Some(z @ (Object::Str(_) | Object::WStr(_))) => Some(z.to_str()),
                 _ => None,
             };
-            let gmtoff = match d.get(&DictKey(Object::from_static("tm_gmtoff"))) {
+            let gmtoff = match d.get(&crate::stdlib::os::static_name_key("tm_gmtoff")) {
                 Some(Object::Int(v)) => Some(*v),
                 _ => None,
             };
@@ -888,6 +900,10 @@ fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
     // code points into the PUA window — non-ASCII chars are copied through
     // verbatim (never handed to libc), then mapped back at the end.
     let cps = match args.first() {
+        // An ASCII format (the usual one) is its own bridge encoding.
+        Some(Object::Str(s)) if s.is_ascii() => {
+            return strftime_bridged(s.to_string(), args);
+        }
         Some(o @ (Object::Str(_) | Object::WStr(_))) => o.str_codepoints().unwrap_or_default(),
         Some(other) => {
             return Err(type_error(format!(
@@ -897,7 +913,11 @@ fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         None => return Err(type_error("strftime expects format string")),
     };
-    let fmt = crate::builtins::bridge_encode_cps(&cps);
+    strftime_bridged(crate::builtins::bridge_encode_cps(&cps), args)
+}
+
+/// `time.strftime` of the bridge-encoded format `fmt` (see `time_strftime`).
+fn strftime_bridged(fmt: String, args: &[Object]) -> Result<Object, RuntimeError> {
     let mut tm = match args.get(1) {
         None => localtime_now_tm()?,
         Some(o) => {
@@ -933,6 +953,12 @@ fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
         ctm.tm_zone = zone_c
             .as_ref()
             .map_or(std::ptr::null_mut(), |c| c.as_ptr().cast_mut());
+        if fmt.bytes().all(|b| (1..=0x7f).contains(&b)) {
+            // One ASCII run: the whole format goes through libc.
+            let out = strftime_chunk(&fmt, &ctm);
+            drop(zone_c);
+            return Ok(crate::builtins::bridge_to_object(&out));
+        }
         let chars: Vec<char> = fmt.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -1114,11 +1140,11 @@ fn with_tz_extras(obj: Object, gmtoff: i64, zone: &str) -> Object {
     if let Object::Instance(inst) = &obj {
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(
-            DictKey(Object::from_static("tm_gmtoff")),
+            crate::stdlib::os::static_name_key("tm_gmtoff"),
             Object::Int(gmtoff),
         );
         d.insert(
-            DictKey(Object::from_static("tm_zone")),
+            crate::stdlib::os::static_name_key("tm_zone"),
             Object::from_str(zone.to_owned()),
         );
     }

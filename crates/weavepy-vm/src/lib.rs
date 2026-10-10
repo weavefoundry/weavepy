@@ -8626,23 +8626,17 @@ impl Interpreter {
                 }
                 Ok(FrameOutcome::Returned(v))
             }
-            // A shell, but nothing the full epilogue would act on.
+            // A shell, and no observer for the general loop's return
+            // events: its epilogue, without entering it (see
+            // `Self::finish_quiet_return`).
             (
                 QuietExit::Outcome {
                     stepped: Ok(StepOutcome::Return(v)),
                     ..
                 },
                 Some(shell),
-            ) if !shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && self.exc_info_len() <= exc_depth =>
-            {
-                self.pop_frame_shell();
-                // A lazy traceback entry still holding the shell had its
-                // frame object built by the pop.
-                Self::settle_exited_frame_object(&shell, frame, true);
-                self.recycle_frame_shell(shell);
+            ) if self.return_settles_quietly(&shell, exc_depth) => {
+                self.finish_quiet_return(frame, shell, exc_depth);
                 Ok(FrameOutcome::Returned(v))
             }
             // An exception leaving an unobserved activation with no handler
@@ -10625,23 +10619,16 @@ impl Interpreter {
                 },
                 None,
             ) => FrameOutcome::Returned(v),
-            // A shell, but nothing the full epilogue would act on.
+            // A shell, and no observer for the general loop's return
+            // events: its epilogue, without entering it.
             (
                 QuietExit::Outcome {
                     stepped: Ok(StepOutcome::Return(v)),
                     ..
                 },
                 Some(shell),
-            ) if !shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && self.exc_info_len() <= exc_depth_on_entry =>
-            {
-                self.pop_frame_shell();
-                // A lazy traceback entry still holding the shell had its
-                // frame object built by the pop.
-                Self::settle_exited_frame_object(&shell, frame, true);
-                self.recycle_frame_shell(shell);
+            ) if self.return_settles_quietly(&shell, exc_depth_on_entry) => {
+                self.finish_quiet_return(frame, shell, exc_depth_on_entry);
                 FrameOutcome::Returned(v)
             }
             // Everything else finishes in the general loop, which takes
@@ -20760,12 +20747,12 @@ impl Interpreter {
         }
         // An activation whose shell the full epilogue would act on
         // finishes through `quiet_run`; so does a return into a caller
-        // whose protocol would yield straight away.
-        if top
-            .act
-            .shell
-            .as_deref()
-            .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
+        // whose protocol would yield straight away. (A frame object alone
+        // settles in `retire_quiet_shell` while nothing observes returns.)
+        if top.act.shell.as_deref().is_some_and(|s| {
+            !self.shell_pops_quietly(s, top.exc_depth)
+                && (self.exc_info_len() > top.exc_depth || crate::trace::any_observers_active())
+        })
             || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -25758,6 +25745,19 @@ impl Interpreter {
             // A function's stored attribute (`__doc__` once read,
             // `__wrapped__`).
             Object::Function(f) => return function_stored_attr(f, name_obj).map(Ok),
+            // A plain module's global (`hasattr(os, 'getpid')`): its
+            // dictionary's value (`ModuleType`'s descriptors are dunders;
+            // a missing name may reach a module `__getattr__`).
+            Object::Module(m)
+                if !name.starts_with("__") && !crate::object::module_classes_possible() =>
+            {
+                return m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(args[1].clone()))
+                    .cloned()
+                    .map(Ok);
+            }
             _ => return None,
         };
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
@@ -31287,6 +31287,44 @@ impl Interpreter {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether a quiet loop's return from an activation with `shell` may
+    /// skip the general loop: nothing the full epilogue acts on (no frame
+    /// object, no handled-exception entries left above `exc_depth`), or
+    /// no observer for its `'return'` events (the epilogue's object
+    /// settling and stack reconciling then run here, see
+    /// [`Self::finish_quiet_return`]). A `sys._getframe` handle, or a
+    /// frame object some traceback entry built, no longer sends the
+    /// return through the general loop.
+    #[inline]
+    fn return_settles_quietly(&self, shell: &crate::object::FrameShell, exc_depth: usize) -> bool {
+        (!shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.exc_info_len() <= exc_depth)
+            || !crate::trace::any_observers_active()
+    }
+
+    /// `run_activation`'s epilogue for a normal return of an ordinary
+    /// activation that [`Self::return_settles_quietly`] accepted: pop its
+    /// shell, settle its frame object, drop the handled-exception entries
+    /// it left, park the shell.
+    #[inline(never)]
+    fn finish_quiet_return(
+        &mut self,
+        frame: &Frame,
+        shell: Rc<crate::object::FrameShell>,
+        exc_depth: usize,
+    ) {
+        self.pop_frame_shell();
+        // A lazy traceback entry still holding the shell had its frame
+        // object built by the pop.
+        Self::settle_exited_frame_object(&shell, frame, true);
+        if self.exc_info_len() > exc_depth {
+            self.exc_info_stack.borrow_mut().truncate(exc_depth);
+        }
+        self.recycle_frame_shell(shell);
     }
 
     /// The general loop's unwind of an inline activation that `exc`
