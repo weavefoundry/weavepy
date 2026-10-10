@@ -7835,7 +7835,11 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
             Object::new_tuple_array([
                 Object::from_static(""),
                 Object::from_str(root.to_owned()),
-                if n == 0 { p.clone() } else { Object::from_str(tail.to_owned()) },
+                if n == 0 {
+                    p.clone()
+                } else {
+                    Object::from_str(tail.to_owned())
+                },
             ])
         }
         [p @ Object::Bytes(b)] => {
@@ -7844,7 +7848,11 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
             Object::new_tuple_array([
                 Object::new_bytes(Vec::new()),
                 Object::new_bytes(root.to_vec()),
-                if n == 0 { p.clone() } else { Object::new_bytes(tail.to_vec()) },
+                if n == 0 {
+                    p.clone()
+                } else {
+                    Object::new_bytes(tail.to_vec())
+                },
             ])
         }
         _ => return None,
@@ -7870,7 +7878,11 @@ fn os_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::new_tuple_array([
             Object::from_static(""),
             Object::str_from_codepoints(cps[..n].to_vec()),
-            if n == 0 { p.clone() } else { Object::str_from_codepoints(cps[n..].to_vec()) },
+            if n == 0 {
+                p.clone()
+            } else {
+                Object::str_from_codepoints(cps[n..].to_vec())
+            },
         ]));
     }
     path_splitroot_fast(std::slice::from_ref(&p))

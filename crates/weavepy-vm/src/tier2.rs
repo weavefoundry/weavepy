@@ -6930,6 +6930,17 @@ fn call_with_activation_shell<T>(
     f: impl FnOnce(&mut super::Interpreter) -> T,
 ) -> T {
     let Some(code) = &ctx.frameless_code else {
+        // A framed activation's shell is the spine's top while its native
+        // code runs: the call site becomes its `f_lineno`, as the
+        // interpreter's own call would record it.
+        if let Ok(stack) = interp.frame_stack.try_borrow() {
+            if let Some(top) = stack.last() {
+                if std::ptr::eq(Rc::as_ptr(&*top.code), ctx.code_ptr) {
+                    top.lasti
+                        .store(jf.deopt_pc, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         return f(interp);
     };
     let shell_locals = Rc::new(GilRefCell::new(Vec::new()));

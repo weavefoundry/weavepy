@@ -20752,8 +20752,7 @@ impl Interpreter {
         if top.act.shell.as_deref().is_some_and(|s| {
             !self.shell_pops_quietly(s, top.exc_depth)
                 && (self.exc_info_len() > top.exc_depth || crate::trace::any_observers_active())
-        })
-            || self.gil_countdown <= 2
+        }) || self.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;

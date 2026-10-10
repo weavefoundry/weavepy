@@ -1386,7 +1386,11 @@ pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<Py
                     c.refresh_materialized(&back);
                     refreshed = true;
                     let linked = py.lazy_back.borrow().is_none()
-                        && py.back.borrow().as_ref().is_some_and(|b| Rc::ptr_eq(b, &back));
+                        && py
+                            .back
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|b| Rc::ptr_eq(b, &back));
                     if !linked {
                         py.set_back(Some(back));
                     }
