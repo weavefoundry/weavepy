@@ -70628,6 +70628,9 @@ struct CodeConstObjects {
     /// The body's store-only `__init__` shape (see [`code_store_init`]),
     /// or `None` when it isn't one.
     store_init: std::sync::OnceLock<Option<Box<StoreInit>>>,
+    /// Per `co_names` entry, its position among the shared names of the
+    /// instances last checked for shadowing it (see [`inst_may_shadow`]).
+    name_memos: std::sync::OnceLock<Box<[crate::inst_dict::NameMemo]>>,
     /// The code's name and qualified name as interned strings: a fresh
     /// generator's `gi_name` and `gi_qualname` while its function's names
     /// are untouched.
@@ -72722,6 +72725,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
             store_init: std::sync::OnceLock::new(),
+            name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
@@ -73071,9 +73075,18 @@ fn inst_may_shadow(inst: &PyInstance, code: &CodeObject, name_idx: u32) -> bool 
                 return false;
             }
             let i = name_idx as usize;
-            match code_vm_ext(code).map(|t| (t.name_objs.get(i), t.name_hashes.get(i))) {
+            let ext = code_vm_ext(code);
+            match ext.map(|t| (t.name_objs.get(i), t.name_hashes.get(i))) {
                 Some((Some(Object::Str(n)), Some(&hash))) => {
-                    split.position_hashed(n, hash).is_some()
+                    let memos = ext.expect("matched above").name_memos.get_or_init(|| {
+                        (0..code.names.len())
+                            .map(|_| crate::inst_dict::NameMemo::default())
+                            .collect()
+                    });
+                    match memos.get(i) {
+                        Some(memo) => split.holds_memo(n, hash, memo),
+                        None => split.position_hashed(n, hash).is_some(),
+                    }
                 }
                 _ => code_name_key(code, name_idx)
                     .is_none_or(|k| split.position_hashed(k.s, k.hash).is_some()),

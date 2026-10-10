@@ -214,6 +214,18 @@ fn key_names_str(key: &DictKey, name: &str) -> bool {
     matches!(&key.0, Object::Str(s) if name_eq(s, name))
 }
 
+/// A name's last position among a class's shared names (see
+/// [`SplitValues::holds_memo`]): the names table's address and the
+/// position. Touched only under the GIL.
+#[derive(Default, Debug)]
+pub struct NameMemo(std::cell::UnsafeCell<(usize, u32)>);
+
+// SAFETY: read and written only under the GIL (never in free-threaded
+// mode, whose paths don't consult it).
+unsafe impl Sync for NameMemo {}
+// SAFETY: as above.
+unsafe impl Send for NameMemo {}
+
 /// The header of an instance's split values allocation; the values
 /// follow it.
 #[repr(C)]
@@ -571,6 +583,33 @@ impl SplitValues {
     #[inline(always)]
     pub fn position_hashed(&self, name: &str, hash: i64) -> Option<usize> {
         self.keys()?.position_hashed(self.len(), name, hash)
+    }
+
+    /// Whether these values hold `name` (Python hash `hash`), with `memo`
+    /// remembering the names table it last searched and the name's
+    /// position there (all of them when absent). The table only grows,
+    /// so values no longer than that position can't hold the name, and
+    /// only longer ones search again.
+    #[inline]
+    pub fn holds_memo(&self, name: &str, hash: i64, memo: &NameMemo) -> bool {
+        let Some(keys) = self.keys() else {
+            return false;
+        };
+        // (A clear filter bit settles it at once.)
+        if keys.filter.load(Ordering::Relaxed) & (1 << (hash & 63)) == 0 {
+            return false;
+        }
+        let n = self.len();
+        let at = std::ptr::from_ref(keys) as usize;
+        // SAFETY: GIL-serialized (see `NameMemo`).
+        let (k, before) = unsafe { *memo.0.get() };
+        if k == at && n <= before as usize {
+            return false;
+        }
+        let before = keys.names_before(name, hash);
+        // SAFETY: as above.
+        unsafe { *memo.0.get() = (at, u32::try_from(before).unwrap_or(u32::MAX)) };
+        n > before
     }
 
     /// [`Self::position`] for a borrowed name (identity of the bytes
