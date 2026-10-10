@@ -20945,10 +20945,8 @@ impl Interpreter {
         let Some(top) = inl.last_mut() else {
             return false;
         };
-        // A shell (the general epilogue's), or `next(gen)`'s exhaustion
-        // (a `StopIteration`), finishes through `quiet_run`.
+        // A shell (the general epilogue's) finishes through `quiet_run`.
         if top.act.shell.is_some()
-            || top.exhaust_arg == GEN_NEXT_CALL
             || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
@@ -20992,7 +20990,13 @@ impl Interpreter {
         let (cframe, clast, cshell) = unsafe { sw.activation(inl.len(), &mut tmp) };
         // SAFETY: as above.
         let consumer = unsafe { &mut *cframe };
-        if arg == GEN_NEXT_DEFAULT {
+        let mut raised = None;
+        if arg == GEN_NEXT_CALL {
+            // `next(gen)` or `gen.send(v)`: `StopIteration(value)`, raised
+            // at the call (the consumer's `pc` is past it), as
+            // `inline_gen_deliver` raises it.
+            raised = Some(crate::error::stop_iteration_with(v));
+        } else if arg == GEN_NEXT_DEFAULT {
             // `next(gen, default)`: the default (atop the consumer's stack)
             // is the result.
             drop(v);
@@ -21016,6 +21020,11 @@ impl Interpreter {
         } else {
             clast
         };
+        // The raise protocol of a call that raised (the leaf raise shape).
+        if let Some(e) = raised {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+            return true;
+        }
         // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
         // SAFETY: as above.
         unsafe { *sw.last = call_pc };
