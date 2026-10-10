@@ -198,40 +198,74 @@ fn install_handle(args: &[Object]) -> Result<Object, RuntimeError> {
 // ---------------------------------------------------------------------
 // BaseEventLoop.call_soon.
 
-/// The Python hashes of the instance attributes the fast paths read.
+/// A name the fast paths look up: its Python hash, and where an instance
+/// of the loop class last held it (see [`crate::inst_dict::PosMemo`]).
+struct AttrName {
+    name: &'static str,
+    hash: i64,
+    memo: crate::inst_dict::PosMemo,
+}
+
+impl AttrName {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            hash: crate::object::py_str_hash(name),
+            memo: crate::inst_dict::PosMemo::new(),
+        }
+    }
+}
+
+/// The instance attributes the fast paths read, and the module globals
+/// they check.
 struct Names {
-    debug: i64,
-    closed: i64,
-    ready: i64,
-    call_soon: i64,
-    get_debug: i64,
-    task_factory: i64,
+    debug: AttrName,
+    closed: AttrName,
+    ready: AttrName,
+    call_soon: AttrName,
+    get_debug: AttrName,
+    task_factory: AttrName,
+    events: AttrName,
+    handle: AttrName,
+    tasks: AttrName,
+    task: AttrName,
+    futures: AttrName,
+    future: AttrName,
 }
 
 fn names() -> &'static Names {
     static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| Names {
-        debug: crate::object::py_str_hash("_debug"),
-        closed: crate::object::py_str_hash("_closed"),
-        ready: crate::object::py_str_hash("_ready"),
-        call_soon: crate::object::py_str_hash("call_soon"),
-        get_debug: crate::object::py_str_hash("get_debug"),
-        task_factory: crate::object::py_str_hash("_task_factory"),
+        debug: AttrName::new("_debug"),
+        closed: AttrName::new("_closed"),
+        ready: AttrName::new("_ready"),
+        call_soon: AttrName::new("call_soon"),
+        get_debug: AttrName::new("get_debug"),
+        task_factory: AttrName::new("_task_factory"),
+        events: AttrName::new("events"),
+        handle: AttrName::new("Handle"),
+        tasks: AttrName::new("tasks"),
+        task: AttrName::new("Task"),
+        futures: AttrName::new("futures"),
+        future: AttrName::new("Future"),
     })
 }
 
-/// Instance attribute `name` (Python hash `hash`), read without running
-/// code (a split layout answers a never-set name from its filter).
-fn inst_attr(inst: &PyInstance, name: &str, hash: i64) -> Option<Object> {
+/// Instance attribute `n`, read without running code (a split layout
+/// answers a never-set name from its filter, and a set one from the
+/// position it last had).
+fn inst_attr(inst: &PyInstance, n: &AttrName) -> Option<Object> {
     match inst.dict.published() {
         Some(d) => d
             .borrow()
-            .get(&crate::object::StrKeyHashed { s: name, hash })
+            .get(&crate::object::StrKeyHashed {
+                s: n.name,
+                hash: n.hash,
+            })
             .cloned(),
         None => {
             let split = inst.dict.split_cell().borrow();
-            let i = split.position_hashed(name, hash)?;
-            split.values().get(i).cloned()
+            split.get_memo(n.name, n.hash, &n.memo).cloned()
         }
     }
 }
@@ -271,7 +305,7 @@ fn resolves_to(cls: &TypeObject, name: &str, expected: &Object) -> bool {
 
 /// The `_ready` deque of a stock loop, if its `append` is the native one.
 fn ready_deque(inst: &PyInstance) -> Option<Object> {
-    let ready = inst_attr(inst, "_ready", names().ready)?;
+    let ready = inst_attr(inst, &names().ready)?;
     let Object::Instance(r) = &ready else {
         return None;
     };
@@ -304,7 +338,7 @@ fn fast_call_soon(
     // The class the loop's module would build (`events.Handle`, looked up
     // at call time: it may have been replaced, or come from another
     // import of `asyncio.events` than the one `hs` describes).
-    let current = global_module_attr(&ls.globals, "events", "Handle")
+    let current = global_module_attr(&ls.globals, &names().events, &names().handle)
         .is_some_and(|h| matches!(h, Object::Type(t) if Rc::ptr_eq(&t, &hs.cls)));
     if !current {
         return Ok(None);
@@ -364,7 +398,7 @@ pub(crate) fn call_soon(
             ls.call_soon_native
                 .get()
                 .is_some_and(|n| resolves_to(&li.cls(), "call_soon", n))
-        }) && inst_attr(li, "call_soon", names().call_soon).is_none();
+        }) && inst_attr(li, &names().call_soon).is_none();
         if native {
             if let Some(h) = fast_call_soon(ls, loop_, &cb, cb_args, &ctx)? {
                 return Ok(h);
@@ -391,9 +425,9 @@ pub(crate) fn get_debug(loop_: &Object) -> Result<bool, RuntimeError> {
     if let (Some(ls), Object::Instance(li)) = (&ls, loop_) {
         let native = verified(&NATIVE_GET_DEBUG, &li.class.borrow(), || {
             resolves_to(&li.cls(), "get_debug", &ls.get_debug)
-        }) && inst_attr(li, "get_debug", names().get_debug).is_none();
+        }) && inst_attr(li, &names().get_debug).is_none();
         if native {
-            if let Some(Object::Bool(b)) = inst_attr(li, "_debug", names().debug) {
+            if let Some(Object::Bool(b)) = inst_attr(li, &names().debug) {
                 return Ok(b);
             }
         }
@@ -418,24 +452,38 @@ fn plain_loop(ls: &LoopState, loop_: &Object) -> bool {
     });
     let n = names();
     stock
-        && matches!(inst_attr(li, "_debug", n.debug), Some(Object::Bool(false)))
+        && matches!(inst_attr(li, &n.debug), Some(Object::Bool(false)))
         && matches!(
-            inst_attr(li, "_closed", n.closed),
+            inst_attr(li, &n.closed),
             Some(Object::Bool(false))
         )
-        && inst_attr(li, "get_debug", n.get_debug).is_none()
+        && inst_attr(li, &n.get_debug).is_none()
 }
 
 /// `module.attr`, for the module bound to global `module` in `globals`.
-fn global_module_attr(globals: &Rc<RefCell<DictData>>, module: &str, attr: &str) -> Option<Object> {
+fn global_module_attr(
+    globals: &Rc<RefCell<DictData>>,
+    module: &AttrName,
+    attr: &AttrName,
+) -> Option<Object> {
     let m = globals
         .borrow()
-        .get(&crate::object::StrKey(module))
+        .get(&crate::object::StrKeyHashed {
+            s: module.name,
+            hash: module.hash,
+        })
         .cloned()?;
     let Object::Module(m) = m else {
         return None;
     };
-    let v = m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
+    let v = m
+        .dict
+        .borrow()
+        .get(&crate::object::StrKeyHashed {
+            s: attr.name,
+            hash: attr.hash,
+        })
+        .cloned();
     v
 }
 
@@ -454,10 +502,10 @@ fn loop_create_task_method(
                 unreachable!("plain_loop checks for an instance")
             };
             let no_factory = matches!(
-                inst_attr(li, "_task_factory", names().task_factory),
+                inst_attr(li, &names().task_factory),
                 Some(Object::None)
             );
-            let native = global_module_attr(&ls.globals, "tasks", "Task")
+            let native = global_module_attr(&ls.globals, &names().tasks, &names().task)
                 .is_some_and(|t| crate::stdlib::asyncio_mod::is_task_class(&t));
             if no_factory && native {
                 return crate::stdlib::asyncio_mod::new_task(loop_, coro.clone(), kwargs);
@@ -470,7 +518,7 @@ fn loop_create_task_method(
 /// `BaseEventLoop.create_future(self)`.
 fn loop_create_future_method(ls: &LoopState, args: &[Object]) -> Result<Object, RuntimeError> {
     if let [loop_] = args {
-        let native = global_module_attr(&ls.globals, "futures", "Future")
+        let native = global_module_attr(&ls.globals, &names().futures, &names().future)
             .is_some_and(|f| crate::stdlib::asyncio_mod::is_future_class(&f));
         // (Not in debug mode: there the Python method's frame shows in
         // the future's `_source_traceback`.)

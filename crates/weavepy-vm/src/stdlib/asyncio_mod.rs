@@ -510,7 +510,12 @@ fn state_of_obj(obj: &Object) -> Result<Rc<RefCell<FutState>>, RuntimeError> {
 /// or a Python subclass of either).
 fn is_native_future(obj: &Object) -> bool {
     match obj {
-        Object::Instance(inst) => inst.cls().is_subclass_of(&future_class()),
+        Object::Instance(inst) => {
+            if is_exact_native(obj) {
+                return true;
+            }
+            inst.cls().is_subclass_of(future_class_ref())
+        }
         _ => false,
     }
 }
@@ -2193,6 +2198,19 @@ fn task_step_handle_result(
             }
             Ok(())
         }
+        // A bare `yield` (`asyncio.sleep(0)`) reschedules, as the C Task
+        // checks before looking for the future protocol (`None` has no
+        // `_asyncio_future_blocking`, so the order is unobservable, and
+        // the failed lookup built an `AttributeError` each time).
+        SendOutcome::Yield(Object::None) => {
+            call_soon(
+                loop_,
+                task_step_callable(task.clone()),
+                &[],
+                context.clone(),
+            )?;
+            Ok(())
+        }
         SendOutcome::Yield(result) => {
             // The coroutine suspended, yielding `result`.
             let blocking_attr = interp
@@ -2253,15 +2271,6 @@ fn task_step_handle_result(
                     );
                     schedule_step_with_exc(interp, task, loop_, context, new_exc)
                 }
-            } else if matches!(result, Object::None) {
-                // Bare `yield` — reschedule.
-                call_soon(
-                    loop_,
-                    task_step_callable(task.clone()),
-                    &[],
-                    context.clone(),
-                )?;
-                Ok(())
             } else if matches!(result, Object::Generator(_)) {
                 let t = py_repr(interp, task);
                 let r = py_repr(interp, &result);

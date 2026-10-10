@@ -226,6 +226,24 @@ unsafe impl Sync for NameMemo {}
 // SAFETY: as above.
 unsafe impl Send for NameMemo {}
 
+/// A name's position in the names table it was last found in (see
+/// [`SplitValues::get_memo`]). A hit is verified against the table, so a
+/// stale or torn pair only costs a search.
+#[derive(Default, Debug)]
+pub struct PosMemo {
+    keys: AtomicUsize,
+    pos: AtomicUsize,
+}
+
+impl PosMemo {
+    pub const fn new() -> Self {
+        Self {
+            keys: AtomicUsize::new(0),
+            pos: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// The header of an instance's split values allocation; the values
 /// follow it.
 #[repr(C)]
@@ -623,6 +641,39 @@ impl SplitValues {
         // SAFETY: as above.
         unsafe { *memo.0.get() = (at, u32::try_from(before).unwrap_or(u32::MAX)) };
         n > before
+    }
+
+    /// The value of attribute `name` (Python hash `hash`), with `memo`
+    /// remembering the names table it was last found in and its position
+    /// there. A name never moves within a table, so a hit checks just
+    /// that position (the name there, in case the table's address was
+    /// reused); anything else searches and remembers.
+    #[inline]
+    pub fn get_memo(
+        &self,
+        name: &str,
+        hash: i64,
+        memo: &PosMemo,
+    ) -> Option<&Object> {
+        let keys = self.keys()?;
+        let n = self.len();
+        let at = std::ptr::from_ref(keys) as usize;
+        let (k, i) = (
+            memo.keys.load(Ordering::Relaxed),
+            memo.pos.load(Ordering::Relaxed),
+        );
+        if k == at && i < n {
+            // SAFETY: slot `i` is published (below the values' length,
+            // which never exceeds the table's).
+            let h = unsafe { *keys.hashes[i].get() };
+            if h == hash && keys.get(i).is_some_and(|key| key_names_str(key, name)) {
+                return self.values().get(i);
+            }
+        }
+        let i = keys.position_hashed(n, name, hash)?;
+        memo.keys.store(at, Ordering::Relaxed);
+        memo.pos.store(i, Ordering::Relaxed);
+        self.values().get(i)
     }
 
     /// [`Self::position`] for a borrowed name (identity of the bytes
