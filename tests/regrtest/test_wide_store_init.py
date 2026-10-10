@@ -50,6 +50,41 @@ class WideInitTest(unittest.TestCase):
                 with self.subTest(n=n, slots=slots):
                     self.check(n, slots)
 
+    def test_tracked_values_and_cycles(self):
+        import gc
+        import weakref
+
+        class Node:
+            def __init__(self, other, tag, items):
+                self.other = other
+                self.tag = tag
+                self.items = items
+
+        refs = []
+        for i in range(500):
+            a = Node(None, i, [i])
+            b = Node(a, i, [a])
+            a.other = b
+            refs.append(weakref.ref(a))
+            del a, b
+        gc.collect()
+        self.assertTrue(all(r() is None for r in refs))
+        n = Node(None, 1, [])
+        m = Node(n, 2, [n])
+        self.assertIs(m.other, n)
+        self.assertIs(m.items[0], n)
+
+    def test_reused_instance_with_published_dict(self):
+        cls, nparams = make_class(5)
+        for i in range(2000):
+            a = cls(*range(nparams))
+            # A published `__dict__`, kept (emptied) by a pooled instance.
+            self.assertEqual(vars(a), expected(5))
+            del a
+            b = cls(*range(nparams))
+            self.assertEqual(vars(b), expected(5))
+            self.assertEqual(b.f0, 0)
+
     def test_class_change_between_calls(self):
         cls, nparams = make_class(20)
         for _ in range(300):

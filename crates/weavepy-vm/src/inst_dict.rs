@@ -612,6 +612,46 @@ impl SplitValues {
         self.block = Some(h);
     }
 
+    /// Lay `n` values down as the first `n` of values over `keys` (a
+    /// fresh instance's constructor stores, in its names' order), taking
+    /// value `k` from `value(k)` once each; a block without names adopts
+    /// them through `share`. `false` when the block can't take them all
+    /// at once (no block, values already set, too little room or other
+    /// names), touching nothing and calling `value` never.
+    pub(crate) fn fill_fresh(
+        &mut self,
+        keys: &SharedKeys,
+        share: impl FnOnce() -> Rc<SharedKeys>,
+        n: usize,
+        mut value: impl FnMut(usize) -> Object,
+    ) -> bool {
+        if n > keys.len() {
+            return false;
+        }
+        let Some(b) = self.block else {
+            return false;
+        };
+        let h = b.as_ptr();
+        // SAFETY: the block is live while owned; its first `n` slots are
+        // inside the capacity (checked) and unset (the length is zero).
+        unsafe {
+            if (*h).len != 0 || ((*h).cap as usize) < n {
+                return false;
+            }
+            if (*h).keys.is_null() {
+                (*h).keys = Rc::into_raw(share());
+            } else if !std::ptr::eq((*h).keys, keys) {
+                return false;
+            }
+            let values = Self::values_ptr(h);
+            for k in 0..n {
+                values.add(k).write(value(k));
+            }
+            (*h).len = n as u32;
+        }
+        true
+    }
+
     /// Whether [`Self::append_over`] of position `i` of `keys` succeeds
     /// once the positions from the current length up to `i` have been
     /// appended first (the next of a run of in-order appends).

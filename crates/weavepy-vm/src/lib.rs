@@ -17386,6 +17386,9 @@ impl Interpreter {
         let mut left = [0u8; 8];
         left[..shape.uses.len()].copy_from_slice(&shape.uses);
         let defaults = &init.defaults[init.defaults.len() - missing..];
+        // A split instance's values, all computed, go down in one pass.
+        let mut split_vals =
+            [const { std::mem::MaybeUninit::<Object>::uninit() }; crate::inst_dict::SHARED_KEYS_CAP];
         for (k, &(_, src)) in shape.stores.iter().enumerate() {
             let value = match src {
                 StoreSrc::Param(0) => inst.clone(),
@@ -17427,16 +17430,47 @@ impl Interpreter {
                 }
                 continue;
             }
-            // SAFETY: a store with nothing else running; the positions are
-            // the instance's next ones (proved above).
-            if let Err(value) = unsafe { i.split_append(k, value) } {
-                // (Unreachable for a fresh instance over its class's
-                // names; the plain store keeps it correct regardless.)
-                let at = code.instructions[shape.stores[k].0 as usize].arg;
-                if let Some(name) = code_name_obj(code, at) {
-                    i.dict_shared()
-                        .borrow_mut()
-                        .insert(DictKey(name.clone()), value);
+            split_vals[k].write(value);
+        }
+        if let Some(keys) = keys {
+            let n = shape.stores.len();
+            // SAFETY: the first `n` entries were written above; each is
+            // read exactly once, by the fill or by the stores after it.
+            let vals = unsafe {
+                std::slice::from_raw_parts_mut(split_vals.as_mut_ptr().cast::<Object>(), n)
+            };
+            // The write barrier, once, before the values are viewed.
+            if i.deferred.get() && !vals.iter().all(Object::is_gc_atomic) {
+                i.ensure_gc_tracked();
+            }
+            // (A recycled instance may carry a published, empty `__dict__`,
+            // which then holds its attributes instead.)
+            // SAFETY: the instance is fresh and unshared.
+            let filled = i.c_body.get() == 0
+                && !crate::gil::free_threading_enabled()
+                && unsafe { i.dict.split_peek_mut() }.is_some_and(|split| {
+                    let at = vals.as_ptr();
+                    // SAFETY: as above.
+                    split.fill_fresh(keys, || ty.shared_keys.share(), n, |k| unsafe {
+                        at.add(k).read()
+                    })
+                });
+            if !filled {
+                for k in 0..n {
+                    // SAFETY: as above.
+                    let value = unsafe { std::ptr::read(&vals[k]) };
+                    // SAFETY: a store with nothing else running; the
+                    // positions are the instance's next ones (proved above).
+                    if let Err(value) = unsafe { i.split_append(k, value) } {
+                        // (Unreachable for a fresh instance over its class's
+                        // names; the plain store keeps it correct regardless.)
+                        let at = code.instructions[shape.stores[k].0 as usize].arg;
+                        if let Some(name) = code_name_obj(code, at) {
+                            i.dict_shared()
+                                .borrow_mut()
+                                .insert(DictKey(name.clone()), value);
+                        }
+                    }
                 }
             }
         }
