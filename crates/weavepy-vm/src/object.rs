@@ -14003,7 +14003,11 @@ impl Object {
     /// allocates nothing for them.
     #[inline]
     pub fn from_char(ch: char) -> Self {
-        // (Latin-1 characters come out of `SharedStr::small`'s table.)
+        // (Latin-1 characters come out of `SharedStr::small`'s table; an
+        // ASCII one is its table entry by index.)
+        if ch.is_ascii() {
+            return Object::Str(SharedStr::ascii_char(ch as u8));
+        }
         Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 

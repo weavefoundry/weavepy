@@ -1981,7 +1981,9 @@ impl TypeObject {
     ) -> bool {
         let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
         let ver = self.attr_version.get() | (family as u64) << 56;
-        let h = type_cache::name_hash(name);
+        // (The slot ignores the version's top byte: a family moves its
+        // entries off the ones the attribute lookups use.)
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         match type_cache::probe(ty, ver, name, h) {
             Some(type_cache::Hit::Absent) => true,
             Some(type_cache::Hit::At { .. }) => false,
@@ -2015,7 +2017,8 @@ impl TypeObject {
                 // (Guard-free views when they are free: nothing below runs
                 // code before the value is cloned.)
                 // SAFETY: both views end before anything else runs.
-                if let Some(owner) = unsafe { self.mro.peek() }.and_then(|m| m.get(mro_idx as usize))
+                if let Some(owner) =
+                    unsafe { self.mro.peek() }.and_then(|m| m.get(mro_idx as usize))
                 {
                     if let Some(d) = unsafe { owner.dict.peek() } {
                         if let Some((k, v)) = d.get_index(dict_idx as usize) {

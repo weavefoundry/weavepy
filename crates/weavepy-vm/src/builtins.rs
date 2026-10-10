@@ -6064,7 +6064,10 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         if let Some((Some(num), Some(den))) = small {
             let num = if sign < 0 { -num } else { num };
-            return Ok(Object::new_tuple_array([Object::Int(num), Object::Int(den)]));
+            return Ok(Object::new_tuple_array([
+                Object::Int(num),
+                Object::Int(den),
+            ]));
         }
     }
     let (mantissa, exponent): (BigInt, i32) = if exp_field == 0 {
@@ -11435,7 +11438,7 @@ fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("startswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3), ascii_receiver(args))?;
     match slice {
         Some(slice) => Ok(Object::Bool(str_match_prefix_suffix(slice, target, true)?)),
         None => Ok(Object::Bool(false)),
@@ -11449,10 +11452,25 @@ fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("endswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3), ascii_receiver(args))?;
     match slice {
         Some(slice) => Ok(Object::Bool(str_match_prefix_suffix(slice, target, false)?)),
         None => Ok(Object::Bool(false)),
+    }
+}
+
+/// Whether a `str` method's receiver is known to be pure ASCII, so a
+/// character index is a byte index. A long receiver's code points are
+/// counted once (the count is memoized on the string); a scan per call
+/// would make `s.startswith(x, pos)` linear in `pos`, as tomllib's
+/// tokenizer calls it at every position.
+fn ascii_receiver(args: &[Object]) -> bool {
+    match args.first() {
+        Some(Object::Str(t)) => {
+            crate::shared_value::SharedStr::known_char_count(t) == Some(t.len())
+                || (t.len() > 64 && crate::shared_value::SharedStr::is_ascii(t))
+        }
+        _ => false,
     }
 }
 
@@ -11465,6 +11483,7 @@ fn str_apply_start_end<'a>(
     s: &'a str,
     start: Option<&Object>,
     end: Option<&Object>,
+    ascii: bool,
 ) -> Result<Option<&'a str>, RuntimeError> {
     // The common unbounded check only needs to inspect the needle. In
     // particular, json.loads checks for a BOM this way on the whole input.
@@ -11504,7 +11523,7 @@ fn str_apply_start_end<'a>(
         }
         let index = usize::try_from(index).ok()?;
         let prefix = text.as_bytes().get(..index)?;
-        if prefix.is_ascii() {
+        if ascii || prefix.is_ascii() {
             Some(index)
         } else {
             text.char_indices()

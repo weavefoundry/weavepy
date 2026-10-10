@@ -26189,8 +26189,10 @@ impl Interpreter {
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
         // default.
         if name.starts_with("__") {
-            return (args.len() == 3 && attr_certainly_missing(&args[0], name))
-                .then(|| Ok(args[2].clone()));
+            if args.len() == 3 && attr_certainly_missing(&args[0], name) {
+                return Some(Ok(args[2].clone()));
+            }
+            return Self::leaf_builtin_dunder_attr(inst, &args[0], name).map(Ok);
         }
         let cls = inst.cls_raw();
         if cls.native_kind.get() != 0
@@ -26230,6 +26232,43 @@ impl Interpreter {
             }
             None => return None,
         }))
+    }
+
+    /// A dunder a plain instance gets from a builtin method on its class
+    /// (`obj.__reduce_ex__`, which `copy` fetches): what
+    /// `load_attr_instance_default` resolves for it (an instance-dict
+    /// entry, else the method bound to `obj`), or `None` for any shape
+    /// that path treats specially.
+    fn leaf_builtin_dunder_attr(inst: &PyInstance, recv: &Object, name: &str) -> Option<Object> {
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || !Self::default_getattribute(cls)
+            || cls.dunder(crate::types::Dunder::GetAttr).present()
+            || cls.is_super_proxy_type()
+        {
+            return None;
+        }
+        let Some(Object::Builtin(b)) = cls.lookup(name) else {
+            return None;
+        };
+        // (A weak proxy forwards these names to its referent.)
+        if matches!(
+            name,
+            "__reduce_ex__" | "__reduce__" | "__copy__" | "__deepcopy__" | "__getstate__"
+        ) && crate::stdlib::weakref_real::proxy_referent(recv).is_some()
+        {
+            return None;
+        }
+        if let Some(v) = inst.attr_get_str(name) {
+            return Some(v);
+        }
+        Some(if b.binds_instance {
+            Object::BoundMethod(Rc::new(BoundMethod::new(recv.clone(), Object::Builtin(b))))
+        } else {
+            Object::Builtin(b)
+        })
     }
 
     /// `hasattr(obj, name)` decided as [`Self::leaf_getattr`] decides
@@ -58869,8 +58908,7 @@ impl Interpreter {
             {
                 return false;
             }
-            if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some()
-            {
+            if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some() {
                 return false;
             }
             let Some(default_getstate) = builtin_types()
