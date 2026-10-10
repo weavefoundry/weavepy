@@ -11,6 +11,12 @@
 //! the module's filename, which the reader supplies. A module's name
 //! tables refer to its distinct identifiers by number after their first
 //! appearance, so the reader decodes and pools each identifier once.
+//!
+//! The layout: the version byte, the offset of the table section as four
+//! little-endian bytes, the module's code object, then the table section,
+//! which holds every code object's line, column and wire-mark tables in
+//! the order the code records their lengths. A reader copies the section
+//! whole and decodes a table only when something reads it.
 
 use std::sync::Arc;
 
@@ -18,15 +24,21 @@ use crate::bytecode::{CacheTable, Instruction, OpCode};
 use crate::{CodeObject, ColSpan, Constant, ExcHandler, Name};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
 /// a constant that has no fixed value.
 pub fn encode(code: &CodeObject) -> Option<Vec<u8>> {
-    let mut w = Writer(Vec::with_capacity(4096), std::collections::HashMap::new());
+    let mut w = Writer::new(Vec::with_capacity(4096));
     w.byte(VERSION);
+    // The table section's offset, filled in below.
+    w.0.extend_from_slice(&[0; 4]);
     w.code(code)?;
+    let at = u32::try_from(w.0.len()).ok()?;
+    w.0[1..5].copy_from_slice(&at.to_le_bytes());
+    let tables = std::mem::take(&mut w.2);
+    w.0.extend_from_slice(&tables);
     Some(w.0)
 }
 
@@ -97,54 +109,71 @@ pub(crate) fn decode_wire_marks(bytes: &[u8]) -> Option<Vec<u8>> {
 /// holds all their line and column tables and wire marks (see
 /// `LineTable`).
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
-    let mut r = Reader { bytes, pos: 0 };
-    if r.byte()? != VERSION {
+    if bytes.first() != Some(&VERSION) {
         return None;
     }
+    let at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
+    let code_bytes = bytes.get(5..at)?;
+    let tables = &bytes[at..];
+    let mut r = Reader {
+        bytes: code_bytes,
+        pos: 0,
+    };
     let mut module = Module {
         filename: Arc::from(filename),
-        tables: Vec::new(),
-        buffer: Arc::new(std::sync::OnceLock::new()),
+        buffer: Arc::new(std::sync::OnceLock::from(Box::from(tables))),
+        tables_len: tables.len(),
+        next: 0,
         names: Vec::new(),
     };
     let code = r.code(&mut module, 0)?;
-    if r.pos != bytes.len() {
-        return None;
-    }
-    // (Copied rather than shrunk in place, which can keep the vector's
-    // spare capacity.)
-    let _ = module.buffer.set(Box::from(module.tables.as_slice()));
-    Some(code)
+    (r.pos == code_bytes.len() && module.next == tables.len()).then_some(code)
 }
 
 /// What the code objects of one module decoded by [`decode`] share.
 struct Module {
     filename: Arc<str>,
-    /// Every code object's encoded line and column tables and wire
-    /// marks, in order.
-    tables: Vec<u8>,
-    /// Where `tables` goes once the decoding is done.
-    buffer: Arc<std::sync::OnceLock<Box<[u8]>>>,
+    /// The table section (see the module docs).
+    buffer: Arc<crate::TableBuffer>,
+    /// The section's length, and where its next table starts.
+    tables_len: usize,
+    next: usize,
     /// The module's identifiers so far, in order of first appearance
     /// (see [`Writer::names`]).
     names: Vec<Name>,
 }
 
 impl Module {
-    /// Append an encoded table to the shared buffer.
-    fn table(&mut self, bytes: &[u8]) -> Option<crate::Encoded> {
-        let start = u32::try_from(self.tables.len()).ok()?;
-        self.tables.extend_from_slice(bytes);
-        let end = u32::try_from(self.tables.len()).ok()?;
-        Some(crate::Encoded::new(self.buffer.clone(), start, end))
+    /// The table section's next `len` bytes.
+    fn table(&mut self, len: usize) -> Option<crate::Encoded> {
+        let start = self.next;
+        let end = start
+            .checked_add(len)
+            .filter(|&end| end <= self.tables_len)?;
+        self.next = end;
+        Some(crate::Encoded::new(
+            self.buffer.clone(),
+            u32::try_from(start).ok()?,
+            u32::try_from(end).ok()?,
+        ))
     }
 }
 
-/// The output, and the number of each identifier written so far (see
-/// [`Writer::names`]).
-struct Writer(Vec<u8>, std::collections::HashMap<String, u32>);
+/// The output, the number of each identifier written so far (see
+/// [`Writer::names`]), and the table section (see the module docs).
+struct Writer(Vec<u8>, std::collections::HashMap<String, u32>, Vec<u8>);
 
 impl Writer {
+    fn new(out: Vec<u8>) -> Self {
+        Writer(out, std::collections::HashMap::new(), Vec::new())
+    }
+
+    /// Move a table into the table section, recording its length.
+    fn table(&mut self, table: Vec<u8>) {
+        self.uint(table.len() as u64);
+        self.2.extend_from_slice(&table);
+    }
+
     fn byte(&mut self, b: u8) {
         self.0.push(b);
     }
@@ -276,12 +305,12 @@ impl Writer {
             self.byte(u8::from(h.push_lasti));
         }
         // Line numbers in runs: a statement's instructions share a line.
-        self.line_runs(&c.linetable);
-        // The column spans as one length-prefixed block, which a reader
-        // keeps encoded until something reads a column (see `ColTable`).
-        let mut cols = Writer(Vec::new(), std::collections::HashMap::new());
+        let mut lines = Writer::new(Vec::new());
+        lines.line_runs(&c.linetable);
+        self.table(lines.0);
+        let mut cols = Writer::new(Vec::new());
         cols.col_runs(&c.coltable)?;
-        self.bytes(&cols.0);
+        self.table(cols.0);
         self.uint(u64::from(c.arg_count));
         self.uint(u64::from(c.posonly_count));
         self.uint(u64::from(c.kwonly_count));
@@ -306,7 +335,12 @@ impl Writer {
         self.uint(u64::from(c.future_flags));
         self.uint(c.stacksize.map_or(0, |s| u64::from(s) + 1));
         self.u32s(c.no_interrupt_jumps());
-        self.wire_marks(&c.wire_marks)?;
+        // (No table at all for code without marks.)
+        let mut marks = Writer::new(Vec::new());
+        if !c.wire_marks.is_empty() {
+            marks.wire_marks(&c.wire_marks)?;
+        }
+        self.table(marks.0);
         self.strs(c.hidden_locals());
         self.strs(c.const_identifiers());
         Some(())
@@ -517,25 +551,11 @@ impl Reader<'_> {
         Some(())
     }
 
-    /// The bytes of a line-number block, checked as decoding would but
-    /// left encoded (see `LineTable`).
-    fn line_runs_raw(&mut self) -> Option<&[u8]> {
-        let start = self.pos;
-        self.line_runs(|_, _| {})?;
-        Some(&self.bytes[start..self.pos])
-    }
-
-    /// The bytes of a wire-mark block, checked for length but left
-    /// encoded (see `WireMarks`); empty for code without marks.
-    fn wire_marks_raw(&mut self) -> Option<&[u8]> {
-        let start = self.pos;
-        let n = self.table_len()?;
-        let end = self.pos.checked_add(n.div_ceil(2))?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        self.pos = end;
-        Some(if n == 0 { &[] } else { &self.bytes[start..end] })
+    /// The next table of the module's table section (see the module
+    /// docs), left encoded.
+    fn table(&mut self, module: &mut Module) -> Option<crate::Encoded> {
+        let len = usize::try_from(self.uint()?).ok()?;
+        module.table(len)
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -577,8 +597,8 @@ impl Reader<'_> {
                 push_lasti: self.byte()? != 0,
             });
         }
-        let linetable = crate::LineTable::encoded(module.table(self.line_runs_raw()?)?);
-        let coltable = crate::ColTable::encoded(module.table(self.raw()?)?);
+        let linetable = crate::LineTable::encoded(self.table(module)?);
+        let coltable = crate::ColTable::encoded(self.table(module)?);
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;
@@ -587,9 +607,11 @@ impl Reader<'_> {
         let future_flags = self.u32()?;
         let stacksize = self.u32()?.checked_sub(1);
         let no_interrupt_jumps = self.u32s()?;
-        let wire_marks = match self.wire_marks_raw()? {
-            [] => crate::WireMarks::default(),
-            marks => crate::WireMarks::encoded(module.table(marks)?),
+        let marks = self.table(module)?;
+        let wire_marks = if marks.is_empty() {
+            crate::WireMarks::default()
+        } else {
+            crate::WireMarks::encoded(marks)
         };
         let mut rare = crate::CodeRare::default();
         rare.set(crate::RareFields {

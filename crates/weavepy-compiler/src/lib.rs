@@ -1082,6 +1082,10 @@ impl Encoded {
     pub(crate) fn new(buffer: std::sync::Arc<TableBuffer>, start: u32, end: u32) -> Self {
         Encoded { buffer, start, end }
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
 }
 
 /// A code object's wire marks (see [`CodeObject::wire_marks`]): a vector,

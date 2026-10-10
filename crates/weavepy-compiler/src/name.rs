@@ -113,8 +113,10 @@ impl Pool {
 }
 
 impl Default for Name {
+    /// The empty name, made once (every default code object has two).
     fn default() -> Self {
-        Name::new("")
+        static EMPTY: std::sync::OnceLock<Name> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| Name::new("")).clone()
     }
 }
 
