@@ -897,9 +897,13 @@ pub struct Interpreter {
     /// native dict alive (CPython's function keeps the mapping itself),
     /// so a weak owner would die with the caller's last direct reference.
     globals_missing_hooks: RefCell<Vec<(usize, Rc<PyInstance>)>>,
-    /// Whether `globals_missing_hooks` has ever been non-empty: the leaf
-    /// paths' one-load gate before the cell borrow.
+    /// Whether `globals_missing_hooks` is non-empty (as of its last
+    /// prune): the leaf paths' one-load gate before the cell borrow. While
+    /// it's set, every builtin `LOAD_GLOBAL` takes the slow path.
     globals_missing_any: Cell<bool>,
+    /// Finalizer drains left before the next prune of
+    /// `globals_missing_hooks` while `globals_missing_any` is set.
+    globals_missing_prune_in: Cell<u32>,
     /// Non-zero while the VM is lazily loading one of its own machinery
     /// modules (e.g. `importlib._bootstrap` for `module.__repr__`). In
     /// CPython those are frozen and fully initialized before user code
@@ -1225,6 +1229,7 @@ impl Default for Interpreter {
             unraisable_hook,
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
+            globals_missing_prune_in: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
@@ -1354,6 +1359,7 @@ impl Interpreter {
             unraisable_hook: self.unraisable_hook.clone(),
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
+            globals_missing_prune_in: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
@@ -2699,6 +2705,10 @@ impl Interpreter {
     /// `sys.unraisablehook` (the default hook prints `Exception ignored
     /// in: …` to stderr, exactly like CPython) so they don't propagate.
     pub fn run_pending_finalizers(&mut self) -> usize {
+        // (Before the drain: an owner the prune lets go of may queue one.)
+        if self.globals_missing_any.get() {
+            self.prune_globals_missing_hooks_sometimes();
+        }
         // RFC 0077 (WS2): the prompt reaper drains after every node it
         // tears down, and for the overwhelming majority nothing was
         // queued. Answer that without publishing the interpreter pointer
@@ -32233,6 +32243,25 @@ impl Interpreter {
             // the dict, and this table's for the instance.
             Rc::strong_count(d) > 1 || Rc::strong_count(inst) > 1
         });
+        // With no owner left, builtin lookups take their fast paths again
+        // (a `@dataclass` whose annotations needed `annotationlib`'s
+        // `_StringifierDict` set the gate for good otherwise).
+        self.globals_missing_any.set(!hooks.is_empty());
+    }
+
+    /// [`Self::prune_globals_missing_hooks`] every 64th finalizer drain
+    /// while the gate is set: owners die when the `exec`/`eval` or
+    /// function that used them is done, with nothing to notice.
+    #[cold]
+    #[inline(never)]
+    fn prune_globals_missing_hooks_sometimes(&self) {
+        let n = self.globals_missing_prune_in.get();
+        if n > 0 {
+            self.globals_missing_prune_in.set(n - 1);
+            return;
+        }
+        self.globals_missing_prune_in.set(63);
+        self.prune_globals_missing_hooks();
     }
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
