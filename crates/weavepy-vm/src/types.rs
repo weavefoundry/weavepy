@@ -798,6 +798,11 @@ pub struct TypeObject {
     /// Every exception construction asked the MRO for nine names. Last
     /// field: the hot ones above keep their offsets.
     pub exc_families: Cell<u64>,
+    /// The class's slot in the cycle collector's registry, or
+    /// [`crate::gc_trace::NO_SLOT`] while it isn't registered (as
+    /// [`PyInstance::gc_slot`]: every instance's traversal visits its
+    /// class, so finding the class's entry must not cost a hash probe).
+    pub gc_slot: crate::gc_trace::GcSlot,
 }
 
 /// A dying TypeObject clears the weak references watching it.
@@ -1144,6 +1149,7 @@ impl TypeObject {
         }
         let ty = Rc::new(TypeObject {
             name: name.to_owned(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
             qualname: RefCell::new(qualname),
             bases: RefCell::new(bases.clone()),
             mro: RefCell::new(Vec::new()),
@@ -2957,6 +2963,44 @@ impl SlotStorage {
             // (An unset laid-out slot.)
             .filter(|(_, value)| !matches!(value, Object::Unbound))
     }
+
+    /// Call `f` on each populated slot, as [`Self::iter`] yields them, by
+    /// a direct walk of the representation (the collector's traversal).
+    #[inline]
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&DictKey, &Object)) {
+        let mut each = |k: &DictKey, v: &Object| {
+            if !matches!(v, Object::Unbound) {
+                f(k, v);
+            }
+        };
+        match &self.data {
+            SlotData::Single { key, value } => {
+                if let Some(key) = key {
+                    each(key, value);
+                }
+            }
+            SlotData::Small(entries) => {
+                for (k, v) in entries {
+                    each(k, v);
+                }
+            }
+            SlotData::Many(table) => {
+                for (k, v) in table.iter() {
+                    each(k, v);
+                }
+            }
+            SlotData::Fixed { layout, values } => {
+                for (k, v) in layout.iter().zip(values.iter()) {
+                    each(k, v);
+                }
+            }
+            SlotData::Packed(p) => {
+                for (k, v) in p.layout().iter().zip(p.values().iter()) {
+                    each(k, v);
+                }
+            }
+        }
+    }
 }
 
 /// Slot storage for targets where an inline object pair would enlarge
@@ -3022,6 +3066,14 @@ impl SlotStorage {
 
     pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
         self.0.iter()
+    }
+
+    /// Call `f` on each populated slot.
+    #[inline]
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&DictKey, &Object)) {
+        for (k, v) in self.0.iter() {
+            f(k, v);
+        }
     }
 }
 
@@ -3095,6 +3147,12 @@ pub struct PyInstance {
     /// mutation reached through the dict alone (`vars(obj)['x'] = y`)
     /// still starts tracking; the two are set and cleared together.
     pub deferred: Cell<bool>,
+    /// The instance's slot in the cycle collector's registry, or
+    /// [`crate::gc_trace::NO_SLOT`] while it isn't registered. The
+    /// registry keeps no id index for instances: this field is how a
+    /// collection finds an instance's entry, and how the instance's
+    /// `Drop` removes it.
+    pub gc_slot: crate::gc_trace::GcSlot,
     /// The stable C "inline body" this instance owns once it has crossed
     /// into a C extension that reads its fields at fixed `tp_basicsize`
     /// offsets (RFC 0045, wave 3). `0` for the overwhelmingly common case
@@ -3126,6 +3184,7 @@ impl PyInstance {
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
             c_body: CBody::default(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         }
     }
 
@@ -3143,6 +3202,7 @@ impl PyInstance {
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
             c_body: CBody::default(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         }
     }
 
@@ -3495,7 +3555,10 @@ impl Drop for PyInstance {
         crate::weakref_registry::on_death(id);
         // A collector registry entry's weak handle would keep this
         // allocation until its generation is next collected.
-        crate::gc_trace::forget_dead(id);
+        let slot = self.gc_slot.get();
+        if slot != crate::gc_trace::NO_SLOT {
+            crate::gc_trace::forget_instance(slot, id as usize);
+        }
     }
 }
 

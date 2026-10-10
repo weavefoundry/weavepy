@@ -1143,7 +1143,8 @@ impl Default for Interpreter {
         // frames (their `Frame` type is private to this module).
         static GEN_TRAVERSE: std::sync::Once = std::sync::Once::new();
         GEN_TRAVERSE.call_once(|| {
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::GENERATOR,
                 |o| {
                     matches!(
                         o,
@@ -1157,17 +1158,23 @@ impl Default for Interpreter {
             // live set it walks. Teach the cycle GC to trace through it so
             // e.g. `obj.x = iter(set_containing_obj)` is collectable
             // (`test_set.test_container_iterator`).
-            crate::gc_trace::register_traverse(|o| matches!(o, Object::Iter(_)), iter_traverse);
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::ITER,
+                |o| matches!(o, Object::Iter(_)),
+                iter_traverse,
+            );
             // A dying exception's `__traceback__` is often the sole owner of
             // the unwound frames — and their locals — below it; CPython's
             // refcounting frees that whole chain the instant the exception
             // dies. Teach the prompt-reap cascade (and anything else walking
             // `traverse_object`) to follow traceback → frame → locals.
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::TRACEBACK,
                 |o| matches!(o, Object::Traceback(_)),
                 py_traceback_traverse,
             );
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::FRAME,
                 |o| matches!(o, Object::Frame(_)),
                 py_frame_traverse,
             );
@@ -2755,7 +2762,7 @@ impl Interpreter {
                 // finalized and clear its deferral flag so the next collection
                 // treats it as plain garbage (if it wasn't resurrected) and
                 // never runs `__del__` a second time.
-                crate::gc_trace::complete_finalizer(crate::weakref_registry::id_of(&obj));
+                crate::gc_trace::complete_finalizer(&obj);
             }
             // Weakref callbacks run after finalizers (CPython's order);
             // errors route through the unraisable hook. WeavePy reaps at
@@ -3066,29 +3073,22 @@ impl Interpreter {
             Some(Object::Module(m)) => m.dict.borrow().iter().map(|(_k, v)| v.clone()).collect(),
             _ => Vec::new(),
         };
-        let mut sys_deferred: Vec<(crate::sync::Rc<crate::gc_trace::TrackedHandle>, Object)> =
-            Vec::new();
+        let mut sys_deferred: Vec<Object> = Vec::new();
         for _ in 0..8 {
             let candidates = crate::gc_trace::finalization_candidates();
             if candidates.is_empty() {
                 break;
             }
-            for (handle, obj) in candidates {
+            for obj in candidates {
                 if sys_values.iter().any(|v| v.is_same(&obj)) {
-                    if !sys_deferred
-                        .iter()
-                        .any(|(h, _)| crate::sync::Rc::ptr_eq(h, &handle))
-                    {
-                        sys_deferred.push((handle, obj));
+                    if !sys_deferred.iter().any(|o| o.is_same(&obj)) {
+                        sys_deferred.push(obj);
                     }
                     continue;
                 }
-                // `swap` claims the finalizer so the cycle collector
-                // and a later shutdown pass can't double-run it.
-                if handle
-                    .finalized
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
+                // Claiming the finalizer means the cycle collector and a
+                // later shutdown pass can't double-run it.
+                if !crate::gc_trace::claim_finalizer(&obj) {
                     continue;
                 }
                 self.invoke_finalizer(&obj);
@@ -3098,11 +3098,8 @@ impl Interpreter {
         }
         if !sys_deferred.is_empty() {
             crate::vm_singletons::set_unraisable_silenced(true);
-            for (handle, obj) in sys_deferred {
-                if handle
-                    .finalized
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
+            for obj in sys_deferred {
+                if !crate::gc_trace::claim_finalizer(&obj) {
                     continue;
                 }
                 self.invoke_finalizer(&obj);
@@ -19348,7 +19345,7 @@ impl Interpreter {
                                 let id = Rc::as_ptr(instance) as usize as u64;
                                 eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}",
                                     Rc::strong_count(instance), instance.is_gc_deferred(),
-                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(id),
+                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(operand),
                                     crate::weakref_registry::may_have_weakrefs(id));
                             }
                         }
@@ -43344,17 +43341,16 @@ impl Interpreter {
         if gen.kind == crate::object::CoroutineKind::AsyncGenerator {
             return;
         }
-        // A generator still in the collector's young set has no index
+        // A generator still in the collector's young set has no registry
         // entry to remove (the set drops it once it's dead).
-        if !gen.gc_registered.get() {
+        if !gen.gc_slot.is_registered() {
             return;
         }
         let id = Rc::as_ptr(gen) as usize as u64;
         if crate::weakref_registry::count_for(id) > 0 {
             return;
         }
-        gen.gc_registered.set(false);
-        gc_trace::untrack_registered_id(id);
+        gc_trace::untrack_generator(gen);
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
@@ -51997,6 +51993,7 @@ impl Interpreter {
             slot_seed: RefCell::new(None),
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         })))
     }
 
@@ -73623,6 +73620,7 @@ fn new_function(
         attrs: RefCell::new(None),
         slots_raw: crate::sync::OnceBox::new(),
         slot_seed: RefCell::new(Some(crate::object::LazySlots(module))),
+        gc_slot: crate::gc_trace::GcSlot::new(),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
     };
@@ -77167,7 +77165,7 @@ assert loop(2000) == 1999000
                 "  function owners={}, maybe_tracked={}, tracked={}",
                 Rc::strong_count(function),
                 gc_trace::maybe_tracked(id),
-                gc_trace::is_tracked(id)
+                gc_trace::is_tracked(&Object::Function(function.clone()))
             );
             if *name == "default_predicate" {
                 if let Some(receiver @ Object::Instance(inst)) = function.defaults.first() {

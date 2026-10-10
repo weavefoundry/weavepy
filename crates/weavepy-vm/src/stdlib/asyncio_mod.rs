@@ -729,8 +729,9 @@ fn fut_gc_clear(obj: &Object) {
 fn register_gc_hooks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        crate::gc_trace::register_traverse(fut_gc_matches, fut_gc_traverse);
-        crate::gc_trace::register_clear(fut_gc_matches, fut_gc_clear);
+        let kind = crate::gc_trace::hook_kind::INSTANCE;
+        crate::gc_trace::register_traverse_for(kind, fut_gc_matches, fut_gc_traverse);
+        crate::gc_trace::register_clear_for(kind, fut_gc_matches, fut_gc_clear);
     });
 }
 

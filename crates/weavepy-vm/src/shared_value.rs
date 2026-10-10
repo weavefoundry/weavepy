@@ -245,6 +245,19 @@ impl<T: ?Sized + ThinPayload> ThinWeak<T> {
     pub fn upgrade(&self) -> Option<ThinArc<T>> {
         self.weak_view().upgrade().map(ThinArc::from_arc)
     }
+
+    /// A strong handle on the payload that owns no reference of its own.
+    ///
+    /// # Safety
+    ///
+    /// The payload must be alive, and stay so while the view is used; the
+    /// view must never be dropped (it owns no reference to release).
+    pub(crate) unsafe fn borrowed_arc(&self) -> ManuallyDrop<ThinArc<T>> {
+        ManuallyDrop::new(ThinArc {
+            data: self.data,
+            ownership: PhantomData,
+        })
+    }
     pub fn strong_count(&self) -> usize {
         self.weak_view().strong_count()
     }

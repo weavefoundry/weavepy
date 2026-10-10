@@ -1189,6 +1189,7 @@ fn make_ref_object_with_class(
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     });
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
     // this same wrapper object.

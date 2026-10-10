@@ -8720,6 +8720,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -8799,6 +8800,7 @@ pub(crate) fn build_super_proxy(
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -10608,6 +10610,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Ok(Object::Function(Rc::new(marked)))
 }

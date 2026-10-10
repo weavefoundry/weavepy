@@ -10,10 +10,7 @@
 //! so objects — and the cycles they form — routinely span OS threads.
 //! A single shared `GcState` is the only design that can break a
 //! cross-thread cycle, and it mirrors CPython's one-collector-per-
-//! interpreter model. `Arc<TrackedHandle>` gives the collector and
-//! the weakref registry shared ownership of each slot; the `Arc` is
-//! genuinely `Send + Sync` now, so no Clippy suppression is needed for
-//! it.
+//! interpreter model.
 //!
 //! The model:
 //!
@@ -73,12 +70,10 @@
 
 use crate::fasthash::ObjectIdHasher;
 use crate::shared_value::ThinArc;
-use crate::sync::Rc as HandleRc;
+
 use crate::sync::RefCell;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use crate::object::Object;
 use crate::weak_object::WeakObject;
@@ -87,34 +82,9 @@ use crate::weakref_registry::{id_of, ObjectId};
 /// A set of object ids (addresses), hashed with the address mixer.
 type IdSet = std::collections::HashSet<ObjectId, BuildHasherDefault<ObjectIdHasher>>;
 
-/// The collector's id index: each tracked object's handle, found by the
-/// id the handle carries (one word a bucket, against two for a map from
-/// the id to the handle).
-type GcIndex = std::collections::HashSet<IndexEntry, BuildHasherDefault<ObjectIdHasher>>;
-
-/// A [`GcIndex`] entry: a handle, hashed, compared and looked up by its id.
-struct IndexEntry(HandleRc<TrackedHandle>);
-
-impl std::hash::Hash for IndexEntry {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // As `ObjectId` hashes, so a lookup by id finds it.
-        self.0.id.hash(state);
-    }
-}
-
-impl PartialEq for IndexEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.id == other.0.id
-    }
-}
-
-impl Eq for IndexEntry {}
-
-impl std::borrow::Borrow<ObjectId> for IndexEntry {
-    fn borrow(&self) -> &ObjectId {
-        &self.0.id
-    }
-}
+/// The registry's id index: a tracked object's slot by its payload
+/// address, for the kinds that don't record their slot themselves.
+type GcIndex = std::collections::HashMap<ObjectId, u32, BuildHasherDefault<ObjectIdHasher>>;
 
 /// The standard CPython generation count (3) and default
 /// thresholds (CPython 3.14's): gen 0 collects when 2000 net tracked allocations
@@ -123,7 +93,6 @@ impl std::borrow::Borrow<ObjectId> for IndexEntry {
 pub const N_GENERATIONS: usize = 3;
 // Color and generation are bounded states; reference counts remain full-width.
 const _: () = assert!(N_GENERATIONS > 0 && N_GENERATIONS <= u8::MAX as usize + 1);
-const MAX_GENERATION: u8 = (N_GENERATIONS - 1) as u8;
 pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [2000, 10, 10];
 
 /// Upper bound on the number of mark-sweep passes a single
@@ -155,156 +124,297 @@ pub trait Finalize {
     fn finalize(&self);
 }
 
-/// A tracked object's entry: a non-owning handle on the object plus the
-/// bookkeeping that outlives a collection. The collector never keeps an
-/// object alive. An entry whose object died stays in its generation until
-/// the next collection or prune of that generation drops it; its weak
-/// handle keeps the allocation reserved until then, so the address the
-/// index keys it by can't be reused by another object meanwhile.
-#[allow(missing_debug_implementations)]
-pub struct TrackedHandle {
-    /// The tracked object, held weakly.
-    pub object: WeakObject,
-    /// Identity, computed from `id_of(object)` at `track` time.
-    pub id: ObjectId,
-    /// [`color::Frozen`] while `gc.freeze()` holds the entry, otherwise
-    /// [`color::White`]. Collections keep their marking state in the
-    /// candidates they build, not here.
-    pub color: AtomicU8,
-    /// Generation index (0..N_GENERATIONS). Survivors are promoted by
-    /// incrementing this.
-    pub generation: AtomicU8,
-    /// Position of this handle within its owning `Vec` —
-    /// `generations[generation].handles` normally, or the `frozen`
-    /// list when `color == Frozen`. Maintained by every site that
-    /// pushes, drains, or rebuilds those vectors so that
-    /// [`GcState::untrack_id`] can `swap_remove` in O(1).
-    pub slot: CachedSlot,
-    /// Has this object's `__del__` already *run* to completion? CPython
-    /// guarantees a finaliser runs at most once.
-    pub finalized: AtomicBool,
-    /// Has this object's `__del__` been *queued* by a collection but not yet
-    /// run? While set, the object is excluded from the `collected` count:
-    /// its finalizer (drained after `gc.collect()` returns) may resurrect
-    /// it, and CPython only counts objects that are actually reclaimed.
-    pub finalize_queued: AtomicBool,
-}
+/// No registry slot: the [`GcSlot`] of an object the collector doesn't
+/// hold, and the end of the free list.
+pub const NO_SLOT: u32 = u32::MAX;
 
-/// A compact vector-position hint, with separate absent and uncached states.
-///
-/// Positions too large to cache use the pointer-search fallback. Neither
-/// decoded sentinel can index a live `Vec<Arc<TrackedHandle>>`, whose
-/// allocation is bounded by `isize::MAX`.
+/// The registry slot an object of a kind that records its own (see
+/// [`Registry`]) carries: [`NO_SLOT`] while it isn't registered. A copy of
+/// the object is another object, so a clone starts unregistered.
 #[derive(Debug)]
-pub struct CachedSlot(AtomicU32);
+pub struct GcSlot(crate::sync::Cell<u32>);
 
-impl CachedSlot {
-    const fn encode(slot: usize) -> u32 {
-        if slot == usize::MAX {
-            u32::MAX
-        } else if slot >= (u32::MAX - 1) as usize {
-            u32::MAX - 1
-        } else {
-            slot as u32
+impl GcSlot {
+    pub fn new() -> Self {
+        Self(crate::sync::Cell::new(NO_SLOT))
+    }
+
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0.get()
+    }
+
+    #[inline]
+    fn set(&self, slot: u32) {
+        self.0.set(slot);
+    }
+
+    /// Whether the object has a registry entry.
+    #[inline]
+    pub fn is_registered(&self) -> bool {
+        self.get() != NO_SLOT
+    }
+}
+
+impl Default for GcSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for GcSlot {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+/// [`Entry::gen`] of an entry `gc.freeze()` holds (it sits in the frozen
+/// list).
+const GEN_FROZEN: u8 = 0xfe;
+/// [`Entry::gen`] of a free slot.
+const GEN_FREE: u8 = 0xff;
+
+/// [`Entry::flags`]: the object's `__del__` has run to completion
+/// (CPython guarantees a finalizer runs at most once).
+const F_FINALIZED: u8 = 1;
+/// The object's `__del__` was queued by a collection and hasn't run yet.
+/// While set, the object is excluded from the `collected` count: its
+/// finalizer (drained after `gc.collect()` returns) may resurrect it, and
+/// CPython only counts objects that are actually reclaimed.
+const F_QUEUED: u8 = 2;
+/// The object is a candidate of the collection in progress; the entry's
+/// `gc_refs` holds its marking count.
+const F_CAND: u8 = 4;
+/// The collection in progress found the candidate reachable from outside
+/// the candidates (its marking color is grey or black).
+const F_REACHED: u8 = 8;
+
+/// One registered object: a non-owning handle on it plus the bookkeeping
+/// that outlives a collection. The collector never keeps an object alive.
+/// An entry whose object died stays in its generation until its removal
+/// (an instance removes its own from its `Drop`) or the next prune or
+/// collection of that generation; its weak handle keeps the allocation
+/// reserved until then, so the address the index keys it by can't be
+/// reused by another object meanwhile.
+struct Entry {
+    /// The object, held weakly; `None` for a free slot.
+    obj: Option<WeakObject>,
+    /// Position in the owning list (`gens[gen]`, or `frozen`), or the next
+    /// free slot for a free one.
+    pos: u32,
+    /// While [`F_CAND`] is set: the object's references from outside the
+    /// candidates, as the collection counts them (CPython's `gc_refs`).
+    gc_refs: std::cell::Cell<i32>,
+    /// Generation (0..N_GENERATIONS), [`GEN_FROZEN`] or [`GEN_FREE`].
+    gen: u8,
+    /// [`F_FINALIZED`], [`F_QUEUED`] and [`F_CAND`].
+    flags: std::cell::Cell<u8>,
+}
+
+impl Entry {
+    #[inline]
+    fn has(&self, flag: u8) -> bool {
+        self.flags.get() & flag != 0
+    }
+
+    #[inline]
+    fn set(&self, flag: u8, on: bool) {
+        let f = self.flags.get();
+        self.flags.set(if on { f | flag } else { f & !flag });
+    }
+}
+
+/// Whether the registry finds `w`'s object through the object's own
+/// [`GcSlot`] (instances, classes, functions and the generator family)
+/// rather than the id index.
+#[inline]
+fn slot_is_intrusive(w: &WeakObject) -> bool {
+    matches!(
+        w,
+        WeakObject::Instance(_)
+            | WeakObject::Type(_)
+            | WeakObject::Function(_)
+            | WeakObject::Generator(_)
+            | WeakObject::Coroutine(_)
+            | WeakObject::AsyncGenerator(_)
+    )
+}
+
+/// The [`GcSlot`] of a kind that records its own registry slot.
+#[inline]
+fn intrusive_slot(obj: &Object) -> Option<&GcSlot> {
+    match obj {
+        Object::Instance(i) => Some(&i.gc_slot),
+        Object::Type(t) => Some(&t.gc_slot),
+        Object::Function(f) => Some(&f.gc_slot),
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => Some(&g.gc_slot),
+        _ => None,
+    }
+}
+
+/// Forget the registry slot a live object records (its entry is going).
+/// A dead one's field is gone with it.
+#[inline]
+fn clear_intrusive_slot(w: &WeakObject) {
+    fn clear<T: 'static>(w: &crate::sync::Weak<T>, slot: impl Fn(&T) -> &GcSlot) {
+        if w.strong_count() > 0 {
+            // SAFETY: the object is alive (the handle keeps the
+            // allocation, the count says the payload is live), and the
+            // field is an atomic cell.
+            slot(unsafe { &*w.as_ptr() }).set(NO_SLOT);
+        }
+    }
+    match w {
+        WeakObject::Instance(w) => clear(w, |i| &i.gc_slot),
+        WeakObject::Type(w) => clear(w, |t| &t.gc_slot),
+        WeakObject::Function(w) => clear(w, |f| &f.gc_slot),
+        WeakObject::Generator(w) | WeakObject::Coroutine(w) | WeakObject::AsyncGenerator(w) => {
+            clear(w, |g| &g.gc_slot);
+        }
+        _ => {}
+    }
+}
+
+/// The registry of tracked objects: a slab of entries addressed by slot,
+/// one list of slots per generation (and one for the frozen set), and an
+/// id index for the kinds that don't record their own slot.
+///
+/// Every list keeps each member's position in its entry, so a removal is
+/// a swap with the list's last member, and a collection walks a
+/// generation without hashing. An instance records its slot itself
+/// ([`crate::types::PyInstance::gc_slot`]), so registering one, finding
+/// it from an edge, and its death's removal never touch the index.
+struct Registry {
+    slab: Vec<Entry>,
+    /// Head of the free-slot list (threaded through `Entry::pos`).
+    free: u32,
+    gens: [Vec<u32>; N_GENERATIONS],
+    frozen: Vec<u32>,
+    /// Payload address -> slot, for the kinds without an intrusive slot.
+    index: GcIndex,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            slab: Vec::new(),
+            free: NO_SLOT,
+            gens: Default::default(),
+            frozen: Vec::new(),
+            index: GcIndex::default(),
         }
     }
 
-    const fn decode(slot: u32) -> usize {
-        if slot == u32::MAX {
-            usize::MAX
-        } else if slot == u32::MAX - 1 {
-            usize::MAX - 1
+    #[inline]
+    fn entry(&self, slot: u32) -> &Entry {
+        &self.slab[slot as usize]
+    }
+
+    #[inline]
+    fn list_mut(&mut self, gen: u8) -> &mut Vec<u32> {
+        if gen == GEN_FROZEN {
+            &mut self.frozen
         } else {
-            slot as usize
+            &mut self.gens[usize::from(gen)]
         }
     }
 
-    pub const fn new(slot: usize) -> Self {
-        Self(AtomicU32::new(Self::encode(slot)))
-    }
-
+    /// The slot of the registered object `obj`, if any. `filter` is the
+    /// index's miss-filter.
     #[inline]
-    pub fn load(&self, order: Ordering) -> usize {
-        Self::decode(self.0.load(order))
+    fn slot_of(&self, obj: &Object, filter: &crate::hot_filter::RebuildableBloom) -> Option<u32> {
+        if let Some(cell) = intrusive_slot(obj) {
+            let s = cell.get();
+            return (s != NO_SLOT).then_some(s);
+        }
+        let key = obj.payload_addr()? as ObjectId;
+        if !filter.may_contain(key) {
+            return None;
+        }
+        self.index.get(&key).copied()
     }
 
-    #[inline]
-    pub fn store(&self, slot: usize, order: Ordering) {
-        self.0.store(Self::encode(slot), order);
+    /// Add `obj` to list `gen` in a fresh slot.
+    fn insert(&mut self, obj: WeakObject, gen: u8, flags: u8) -> u32 {
+        let pos = self.list_mut(gen).len() as u32;
+        let entry = Entry {
+            obj: Some(obj),
+            pos,
+            gc_refs: std::cell::Cell::new(0),
+            gen,
+            flags: std::cell::Cell::new(flags),
+        };
+        let slot = if self.free != NO_SLOT {
+            let slot = self.free;
+            let e = &mut self.slab[slot as usize];
+            self.free = e.pos;
+            *e = entry;
+            slot
+        } else {
+            let slot = u32::try_from(self.slab.len()).expect("collector registry overflow");
+            // (A collection's grey stack tags temporaries with the top bit.)
+            assert!(slot < TEMP_BIT, "collector registry overflow");
+            self.slab.push(entry);
+            slot
+        };
+        self.list_mut(gen).push(slot);
+        slot
     }
 
-    #[inline]
-    pub fn swap(&self, slot: usize, order: Ordering) -> usize {
-        Self::decode(self.0.swap(Self::encode(slot), order))
+    /// Take `slot` out of its list (a swap with the list's last member).
+    fn unlink(&mut self, slot: u32) {
+        let (gen, pos) = {
+            let e = self.entry(slot);
+            (e.gen, e.pos as usize)
+        };
+        let list = self.list_mut(gen);
+        debug_assert_eq!(list.get(pos), Some(&slot));
+        list.swap_remove(pos);
+        if let Some(&moved) = list.get(pos) {
+            self.slab[moved as usize].pos = pos as u32;
+        }
     }
-}
 
-#[allow(non_upper_case_globals)]
-pub mod color {
-    pub const White: u8 = 0;
-    pub const Grey: u8 = 1;
-    pub const Black: u8 = 2;
-    pub const Frozen: u8 = 3;
-}
-
-impl TrackedHandle {
-    /// A generation-`generation` entry for `object`, or `None` for a value
-    /// with no heap allocation of its own.
-    pub fn new(object: &Object, generation: usize) -> Option<Self> {
-        assert!(generation < N_GENERATIONS, "invalid collector generation");
-        Some(Self {
-            id: id_of(object),
-            object: WeakObject::new(object)?,
-            color: AtomicU8::new(color::White),
-            generation: AtomicU8::new(generation as u8),
-            slot: CachedSlot::new(0),
-            finalized: AtomicBool::new(false),
-            finalize_queued: AtomicBool::new(false),
-        })
+    /// Return an unlinked slot to the free list, handing back its handle
+    /// (whose drop only releases memory).
+    fn release(&mut self, slot: u32) -> Option<WeakObject> {
+        let free = self.free;
+        let e = &mut self.slab[slot as usize];
+        let w = e.obj.take();
+        e.gen = GEN_FREE;
+        e.flags.set(0);
+        e.pos = free;
+        self.free = slot;
+        w
     }
-}
 
-/// Swap-remove the handle at `slot` from `vec`, fixing up the slot
-/// index of whatever handle gets moved into the vacated position.
-/// O(1): the only handle whose position changes is the one swapped
-/// in from the end, and its `slot` field is corrected here so the
-/// per-handle position invariant holds after the call.
-#[inline]
-fn swap_remove_handle(vec: &mut Vec<HandleRc<TrackedHandle>>, slot: usize) {
-    if slot >= vec.len() {
-        return;
+    /// Drop `slot`'s entry altogether: from its list, the index, and a live
+    /// instance's own record.
+    fn remove(&mut self, slot: u32) -> Option<WeakObject> {
+        self.unlink(slot);
+        self.forget_key(slot);
+        self.release(slot)
     }
-    vec.swap_remove(slot);
-    if let Some(moved) = vec.get(slot) {
-        moved.slot.store(slot, Ordering::Release);
-    }
-}
 
-/// Correctness fallback for [`GcState::untrack_id`]: when a handle's cached
-/// `slot` no longer points at it (a concurrent `swap_remove`/promotion on
-/// another OS thread moved it before this thread acquired the vector lock),
-/// locate it by pointer identity and `swap_remove` it. Returns `true` if the
-/// handle was found and removed. O(n) in the generation length, but only ever
-/// taken on the rare stale-cache path — the common case stays O(1).
-#[inline]
-fn remove_handle_by_ptr(
-    vec: &mut Vec<HandleRc<TrackedHandle>>,
-    handle: &HandleRc<TrackedHandle>,
-) -> bool {
-    if let Some(pos) = vec.iter().position(|h| HandleRc::ptr_eq(h, handle)) {
-        swap_remove_handle(vec, pos);
-        true
-    } else {
-        false
+    /// Drop the index entry (or a live instance's record) naming `slot`.
+    fn forget_key(&mut self, slot: u32) {
+        let Some(w) = self.slab[slot as usize].obj.as_ref() else {
+            return;
+        };
+        if slot_is_intrusive(w) {
+            clear_intrusive_slot(w);
+        } else {
+            let key = w.addr() as ObjectId;
+            if self.index.get(&key) == Some(&slot) {
+                self.index.remove(&key);
+            }
+        }
     }
-}
 
-#[derive(Default)]
-struct Generation {
-    /// All tracked handles in this generation. Append-only
-    /// during normal allocation; rewritten in place when
-    /// objects are promoted or moved to the unreachable list.
-    handles: Vec<HandleRc<TrackedHandle>>,
+    /// Every live member of every list, frozen ones included.
+    fn len(&self) -> usize {
+        self.gens.iter().map(Vec::len).sum::<usize>() + self.frozen.len()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -314,40 +424,26 @@ pub struct GcStats {
     pub uncollectable: u64,
 }
 
-/// One object under examination by a collection: a strong reference for
-/// the collection's duration, its entry (absent for a temporary candidate
-/// discovered through an untracked container), and the marking state.
-struct Cand {
+/// The top bit of a grey-stack item: the rest is a temporary candidate's
+/// position rather than a registry slot.
+const TEMP_BIT: u32 = 1 << 31;
+
+/// A temporary candidate: an untracked object a collection found a cycle
+/// could route through (see `collect_generation`'s phase 2), held for the
+/// collection's duration, with its marking state.
+struct Temp {
     obj: Object,
-    id: ObjectId,
-    entry: Option<HandleRc<TrackedHandle>>,
     gc_refs: std::cell::Cell<i64>,
-    color: std::cell::Cell<u8>,
+    reached: std::cell::Cell<bool>,
 }
 
-impl Cand {
-    fn new(obj: Object, id: ObjectId, entry: Option<HandleRc<TrackedHandle>>) -> Self {
-        Self {
-            obj,
-            id,
-            entry,
-            gc_refs: std::cell::Cell::new(0),
-            color: std::cell::Cell::new(color::White),
-        }
-    }
-
-    fn is_white(&self) -> bool {
-        self.color.get() == color::White
-    }
-
-    /// Whether the object still owes a `__del__` (or a generator close).
-    fn pending_finalizer(&self) -> bool {
-        has_finalizer(&self.obj)
-            && !self
-                .entry
-                .as_ref()
-                .is_some_and(|e| e.finalized.load(Ordering::Acquire))
-    }
+/// A collection's view of one candidate (see [`Finder::find`]).
+#[derive(Clone, Copy)]
+enum Hit {
+    /// A registered candidate, by slot.
+    Real(u32),
+    /// A temporary, by position.
+    Temp(u32),
 }
 
 /// How many entries of the older generations each young collection or
@@ -372,15 +468,13 @@ const OLD_PRUNE_BUDGET: usize = 512;
 /// have to find and break the cycles.
 #[allow(missing_debug_implementations)]
 pub struct GcState {
-    generations: RefCell<[Generation; N_GENERATIONS]>,
-    /// Insert-only miss-filter over `index`, maintained at
-    /// [`Self::track_now`] and consulted by the usually-miss `is_tracked`
-    /// probes. Rebuilt from `index` once most of its bits name objects
-    /// long gone.
+    /// Every tracked object, by generation (see [`Registry`]).
+    reg: RefCell<Registry>,
+    /// Insert-only miss-filter over the registry's id index, maintained at
+    /// [`Self::register`] and consulted by the usually-miss lookups.
+    /// Rebuilt from the index once most of its bits name objects long
+    /// gone.
     tracked_filter: crate::hot_filter::RebuildableBloom,
-    /// Id → handle index over every tracked object (all generations plus
-    /// the frozen set): keeps `track` dedupe and `is_tracked` O(1).
-    index: RefCell<GcIndex>,
     /// Re-entrancy guard: a nested collection would see torn generation
     /// lists. Atomic so the whole `GcState` is `Sync`.
     collecting: AtomicBool,
@@ -441,10 +535,6 @@ pub struct GcState {
     /// and most die before any collection.
     young_lists: RefCell<Vec<crate::sync::Weak<RefCell<Vec<Object>>>>>,
     young_dicts: RefCell<Vec<crate::sync::Weak<RefCell<crate::object::DictData>>>>,
-    /// Frozen handles. `gc.freeze()` moves all tracked objects
-    /// here; they are skipped by future collections until
-    /// `gc.unfreeze()` runs.
-    frozen: RefCell<Vec<HandleRc<TrackedHandle>>>,
     /// `gc.garbage` — uncollectable objects (cycles whose
     /// finalisers refused to release).
     pub garbage: RefCell<Vec<Object>>,
@@ -479,9 +569,8 @@ impl Default for GcState {
 impl GcState {
     pub fn new() -> Self {
         Self {
-            generations: RefCell::new(Default::default()),
+            reg: RefCell::new(Registry::new()),
             tracked_filter: crate::hot_filter::RebuildableBloom::new(),
-            index: RefCell::new(GcIndex::default()),
             collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
@@ -496,7 +585,6 @@ impl GcState {
             young_gens: RefCell::new(Vec::new()),
             young_lists: RefCell::new(Vec::new()),
             young_dicts: RefCell::new(Vec::new()),
-            frozen: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Vec::new()),
             stats: RefCell::new([GcStats::default(); N_GENERATIONS]),
@@ -527,8 +615,7 @@ impl GcState {
     /// holds) are consistent.
     pub unsafe fn reinit_after_fork_in_child(this: *mut Self) {
         unsafe {
-            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).generations));
-            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).index));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).reg));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).thresholds));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).deferred));
@@ -538,7 +625,6 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_gens));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_lists));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).young_dicts));
-            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
@@ -566,12 +652,25 @@ impl GcState {
     /// `__del__` returns, so the next collection treats a non-resurrected
     /// object as plain dead garbage (and a resurrected one is never
     /// re-finalized).
-    pub fn complete_finalizer(&self, id: ObjectId) {
-        self.note_finalized(id);
-        if let Some(h) = self.handle_for(id) {
-            h.finalized.store(true, Ordering::Release);
-            h.finalize_queued.store(false, Ordering::Release);
+    pub fn complete_finalizer(&self, obj: &Object) {
+        self.note_finalized(id_of(obj));
+        let reg = self.reg.borrow();
+        if let Some(slot) = reg.slot_of(obj, &self.tracked_filter) {
+            let e = reg.entry(slot);
+            e.set(F_FINALIZED, true);
+            e.set(F_QUEUED, false);
         }
+    }
+
+    /// Claim `obj`'s finalizer for the caller: mark it run, returning
+    /// whether it had been claimed before (`None`: `obj` isn't tracked).
+    pub fn claim_finalizer(&self, obj: &Object) -> Option<bool> {
+        let reg = self.reg.borrow();
+        let slot = reg.slot_of(obj, &self.tracked_filter)?;
+        let e = reg.entry(slot);
+        let was = e.has(F_FINALIZED);
+        e.set(F_FINALIZED, true);
+        Some(was)
     }
 
     /// Track `obj` for cycle detection. Idempotent — if `obj`
@@ -882,114 +981,117 @@ impl GcState {
         }
     }
 
-    /// Enter `obj` in the index and generation 0 (`false`: it was already
+    /// Enter `obj` in the registry's generation 0 (`false`: it was already
     /// there, or has no heap allocation of its own). A `fresh` object's id
     /// may be a finalized one's, recycled; a young instance's own
     /// finalizer may already have run, and its entry says so.
     fn register(&self, obj: &Object, fresh: bool) -> bool {
-        let new_id = id_of(obj);
+        let Some(key) = obj.payload_addr() else {
+            return false;
+        };
+        let key = key as ObjectId;
         {
-            let mut index = self.index.borrow_mut();
+            let mut reg = self.reg.borrow_mut();
             // An entry whose object died can't sit at this address: its
             // weak handle keeps the allocation reserved until the entry is
             // pruned.
-            if index.contains(&new_id) {
+            if reg.slot_of(obj, &self.tracked_filter).is_some() {
                 return false;
             }
-            let Some(handle) = TrackedHandle::new(obj, 0) else {
+            let Some(weak) = WeakObject::new(obj) else {
                 return false;
             };
-            let handle = HandleRc::new(handle);
-            // A generator remembers it has an index entry, which its
-            // finishing release then removes (see `release_finished_gen`).
-            if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = obj {
-                g.gc_registered.set(true);
-            }
-            // Publish to the miss-filter *before* the insert becomes
-            // observable (we hold the index borrow).
-            self.tracked_filter.insert(new_id);
-            index.insert(IndexEntry(handle.clone()));
             // `finalized_ids` is keyed by object id (a pointer), which the
             // allocator recycles. A freshly tracked object at a recycled
             // address must start *un*-finalized (`test_is_finalized`).
             // Almost always empty (only `__del__`-bearing objects ever land
             // there).
-            if !self.finalized_ids.borrow().is_empty() {
+            let mut flags = 0;
+            // SAFETY: a read that runs no code.
+            if unsafe { self.finalized_ids.peek() }.is_none_or(|f| !f.is_empty()) {
+                let id = id_of(obj);
                 if fresh {
-                    self.finalized_ids.borrow_mut().remove(&new_id);
-                } else if self.finalized_ids.borrow().contains(&new_id) {
-                    handle.finalized.store(true, Ordering::Release);
+                    self.finalized_ids.borrow_mut().remove(&id);
+                } else if self.finalized_ids.borrow().contains(&id) {
+                    flags = F_FINALIZED;
                 }
             }
-            let mut gens = self.generations.borrow_mut();
-            handle.slot.store(gens[0].handles.len(), Ordering::Release);
-            gens[0].handles.push(handle);
+            if !slot_is_intrusive(&weak) {
+                // Publish to the miss-filter *before* the insert becomes
+                // observable (we hold the registry borrow).
+                self.tracked_filter.insert(key);
+            }
+            let slot = reg.insert(weak, 0, flags);
+            match intrusive_slot(obj) {
+                Some(cell) => cell.set(slot),
+                None => {
+                    reg.index.insert(key, slot);
+                }
+            }
+            // (Registered other than through `track`, which retires the
+            // deferral itself.)
+            if let Object::Instance(i) = obj {
+                if i.is_gc_deferred() {
+                    i.clear_deferred_tracking();
+                }
+            }
         }
         serial_add(&self.tracked_count, 1);
         serial_add(&self.tracked_version, 1);
         true
     }
 
-    /// Drop the registry entry of a registered object that just died, if
-    /// the registry is free to change: its weak handle otherwise keeps the
-    /// object's allocation alive until a collection of its generation
-    /// prunes it (CPython unlinks a dying object from its GC list at
-    /// once). A busy registry (a collection is releasing garbage) is left
-    /// as it is; that collection prunes the entry.
-    fn forget_dead(&self, id: ObjectId) {
-        let (Ok(mut index), Ok(mut counts), Ok(mut gens)) = (
-            self.index.try_borrow_mut(),
-            self.counts.try_borrow_mut(),
-            self.generations.try_borrow_mut(),
-        ) else {
+    /// Drop the registry entry of an instance that is dying (from its
+    /// `Drop`, with its `gc_slot` and address), if the registry is free to
+    /// change: its weak handle otherwise keeps the object's allocation
+    /// alive until a collection of its generation prunes it (CPython
+    /// unlinks a dying object from its GC list at once). A busy registry
+    /// (a collection is releasing garbage) is left as it is; that
+    /// collection prunes the entry.
+    fn forget_instance(&self, slot: u32, addr: usize) {
+        let (Ok(mut reg), Ok(mut counts)) =
+            (self.reg.try_borrow_mut(), self.counts.try_borrow_mut())
+        else {
             return;
         };
-        let Some(IndexEntry(handle)) = index.get(&id) else {
+        let Some(e) = reg.slab.get(slot as usize) else {
             return;
         };
-        if !handle.object.is_dead() || handle.color.load(Ordering::Acquire) == color::Frozen {
+        match &e.obj {
+            Some(WeakObject::Instance(w)) if w.as_ptr() as usize == addr => {}
+            _ => return,
+        }
+        if e.gen == GEN_FROZEN {
             return;
         }
-        let IndexEntry(handle) = index.take(&id).expect("probed above");
-        let g = usize::from(
-            handle
-                .generation
-                .load(Ordering::Acquire)
-                .min(MAX_GENERATION),
-        );
-        let slot = handle.slot.load(Ordering::Acquire);
-        let removed = if gens[g]
-            .handles
-            .get(slot)
-            .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
-        {
-            swap_remove_handle(&mut gens[g].handles, slot);
-            true
-        } else {
-            remove_handle_by_ptr(&mut gens[g].handles, &handle)
-        };
-        if !removed {
-            // Somewhere unexpected: leave it to the collector.
-            index.insert(IndexEntry(handle));
-            return;
-        }
-        // (As `untrack_id_in` accounts it.)
+        let weak = reg.remove(slot);
+        // (As `untrack_slot` accounts it.)
         counts[0] = counts[0].saturating_sub(1);
         self.sync_gen0_gauge(counts[0], None);
-        drop((index, counts, gens));
+        drop((reg, counts));
         serial_add(&self.tracked_count, usize::MAX);
         serial_add(&self.tracked_version, 1);
-        drop(handle);
+        drop(weak);
     }
 
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
+    pub fn untrack(&self, obj: &Object) {
+        let slot = self.reg.borrow().slot_of(obj, &self.tracked_filter);
+        match slot {
+            Some(slot) => self.untrack_slot(slot, id_of(obj), true),
+            None => self.untrack_young(id_of(obj)),
+        }
+    }
+
+    /// [`Self::untrack`] by id, for an object that isn't an instance.
     pub fn untrack_id(&self, id: ObjectId) {
         self.untrack_id_in(id, true);
     }
 
-    /// [`Self::untrack_id`]; with `young` false, an object in a young set
-    /// is left there (see [`untrack_registered_id`]).
+    /// Stop tracking the object of id `id`, which isn't an instance;
+    /// with `young` false, an object in a young set is left there (see
+    /// [`untrack_registered_id`]).
     fn untrack_id_in(&self, id: ObjectId, young: bool) {
         // A registered object is never in a young set, so the index (a
         // hash probe) answers first; the young sets are scanned only for
@@ -998,14 +1100,28 @@ impl GcState {
         // `YOUNG_CAP` entries.) An index entry left by a dead object
         // whose address a young one now reuses is dropped, and the young
         // sets still searched.
-        let indexed = self.index.borrow_mut().take(&id);
-        let Some(IndexEntry(handle)) = indexed else {
-            if young {
-                self.untrack_young(id);
-            }
-            return;
+        let slot = if self.tracked_filter.may_contain(id) {
+            self.reg.borrow().index.get(&id).copied()
+        } else {
+            None
         };
-        if young && handle.object.is_dead() {
+        match slot {
+            Some(slot) => self.untrack_slot(slot, id, young),
+            None if young => self.untrack_young(id),
+            None => {}
+        }
+    }
+
+    /// Remove the entry at `slot` (an object of id `id`), accounting it as
+    /// a deallocation; with `young`, a dead entry's id is also searched in
+    /// the young sets.
+    fn untrack_slot(&self, slot: u32, id: ObjectId, young: bool) {
+        let (weak, dead) = {
+            let mut reg = self.reg.borrow_mut();
+            let dead = reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead);
+            (reg.remove(slot), dead)
+        };
+        if young && dead {
             self.untrack_young(id);
         }
         {
@@ -1013,43 +1129,7 @@ impl GcState {
             counts[0] = counts[0].saturating_sub(1);
             self.sync_gen0_gauge(counts[0], None);
         }
-        // O(1) removal via the handle's cached `slot`. The cached position is
-        // only valid under the owning vector's lock; fall back to a pointer
-        // search if it's stale.
-        if handle.color.load(Ordering::Acquire) == color::Frozen {
-            let mut frozen = self.frozen.borrow_mut();
-            let slot = handle.slot.load(Ordering::Acquire);
-            if frozen
-                .get(slot)
-                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
-            {
-                swap_remove_handle(&mut frozen, slot);
-            } else {
-                remove_handle_by_ptr(&mut frozen, &handle);
-            }
-        } else {
-            let mut gens = self.generations.borrow_mut();
-            let g = usize::from(
-                handle
-                    .generation
-                    .load(Ordering::Acquire)
-                    .min(MAX_GENERATION),
-            );
-            let slot = handle.slot.load(Ordering::Acquire);
-            if gens[g]
-                .handles
-                .get(slot)
-                .is_some_and(|h| HandleRc::ptr_eq(h, &handle))
-            {
-                swap_remove_handle(&mut gens[g].handles, slot);
-            } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
-                for gg in 0..N_GENERATIONS {
-                    if gg != g && remove_handle_by_ptr(&mut gens[gg].handles, &handle) {
-                        break;
-                    }
-                }
-            }
-        }
+        drop(weak);
         serial_add(&self.tracked_count, usize::MAX);
         serial_add(&self.tracked_version, 1);
     }
@@ -1084,29 +1164,29 @@ impl GcState {
         }
     }
 
-    /// Drop the entries of objects that have died from `handles`, and from
-    /// the index; `budget` caps how many entries are examined, starting at
-    /// `start` (wrapping). Returns how many were dropped and where the
+    /// Drop the entries of objects that have died from generation `gen`;
+    /// `budget` caps how many entries are examined, starting at `start`
+    /// (wrapping). Returns how many were dropped and where the
     /// examination stopped.
-    // (An `IndexEntry` hashes and compares by its handle's immutable id.)
-    #[allow(clippy::mutable_key_type)]
     fn prune_dead_in(
-        index: &mut GcIndex,
-        handles: &mut Vec<HandleRc<TrackedHandle>>,
+        reg: &mut Registry,
+        gen: usize,
         start: usize,
         budget: usize,
     ) -> (usize, usize) {
         let mut removed = 0;
-        let mut i = if start < handles.len() { start } else { 0 };
+        let mut i = if start < reg.gens[gen].len() {
+            start
+        } else {
+            0
+        };
         let mut examined = 0;
-        while examined < budget && i < handles.len() {
+        while examined < budget && i < reg.gens[gen].len() {
             examined += 1;
-            if handles[i].object.is_dead() {
-                let h = handles.swap_remove(i);
-                index.remove(&h.id);
-                if let Some(moved) = handles.get(i) {
-                    moved.slot.store(i, Ordering::Release);
-                }
+            let slot = reg.gens[gen][i];
+            if reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead) {
+                // (The swap brings the list's last member to `i`.)
+                drop(reg.remove(slot));
                 removed += 1;
             } else {
                 i += 1;
@@ -1120,36 +1200,33 @@ impl GcState {
     /// Returns the young generation's live population.
     fn prune(&self, old_budget: usize) -> usize {
         let (removed, live) = {
-            let mut index = self.index.borrow_mut();
-            let mut gens = self.generations.borrow_mut();
-            let (mut removed, _) =
-                Self::prune_dead_in(&mut index, &mut gens[0].handles, 0, usize::MAX);
+            let mut reg = self.reg.borrow_mut();
+            let (mut removed, _) = Self::prune_dead_in(&mut reg, 0, 0, usize::MAX);
             // The older generations, a slice at a time: the cursor runs
             // over gen 1 then gen 2 as one sequence.
             let cursor = self.old_prune_cursor.load(Ordering::Relaxed);
-            let n1 = gens[1].handles.len();
+            let n1 = reg.gens[1].len();
             let (g, start) = if cursor < n1 {
                 (1, cursor)
             } else {
                 (2, cursor - n1)
             };
-            let (r, stop) =
-                Self::prune_dead_in(&mut index, &mut gens[g].handles, start, old_budget);
+            let (r, stop) = Self::prune_dead_in(&mut reg, g, start, old_budget);
             removed += r;
             self.old_deaths.fetch_add(r, Ordering::Relaxed);
-            let next = if stop >= gens[g].handles.len() {
+            let next = if stop >= reg.gens[g].len() {
                 if g == 1 {
-                    gens[1].handles.len()
+                    reg.gens[1].len()
                 } else {
                     0
                 }
             } else if g == 1 {
                 stop
             } else {
-                gens[1].handles.len() + stop
+                reg.gens[1].len() + stop
             };
             self.old_prune_cursor.store(next, Ordering::Relaxed);
-            (removed, gens[0].handles.len())
+            (removed, reg.gens[0].len())
         };
         if removed > 0 {
             self.tracked_count.fetch_sub(
@@ -1161,52 +1238,54 @@ impl GcState {
         live
     }
 
+    /// Whether the object of id `id` is registered. Only for a kind the id
+    /// index holds (not an instance: see [`Self::is_tracked_obj`]).
     pub fn is_tracked(&self, id: ObjectId) -> bool {
-        // Usually-miss probe: two relaxed loads instead of the index
+        // Usually-miss probe: two relaxed loads instead of the registry
         // borrow. A stale filter bit just takes the precise path.
         if !self.tracked_filter.may_contain(id) {
             return false;
         }
-        self.index.borrow().contains(&id)
+        self.reg.borrow().index.contains_key(&id)
     }
 
-    /// [`Self::is_tracked`] for an object that may be young (an instance,
-    /// function, generator, list or dict).
-    pub fn is_tracked_instance(&self, id: ObjectId) -> bool {
-        self.is_tracked(id) || self.is_young(id)
+    /// Whether `obj` is registered.
+    pub fn is_tracked_obj(&self, obj: &Object) -> bool {
+        self.reg
+            .borrow()
+            .slot_of(obj, &self.tracked_filter)
+            .is_some()
     }
 
-    /// O(1) handle lookup by object id (any generation or frozen).
-    pub fn handle_for(&self, id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
-        if !self.tracked_filter.may_contain(id) {
-            return None;
-        }
-        self.index.borrow().get(&id).map(|e| e.0.clone())
+    /// [`Self::is_tracked_obj`] for an object that may be young (an
+    /// instance, function, generator, list or dict).
+    pub fn is_tracked_instance(&self, obj: &Object) -> bool {
+        self.is_tracked_obj(obj) || self.is_young(id_of(obj))
     }
 
     /// Snapshot every live tracked object that still carries an unrun
     /// `__del__`. The interpreter's shutdown pass walks this list to
-    /// finalize objects that are still alive at exit. The per-handle
-    /// `finalized` flag guarantees each `__del__` runs at most once.
-    pub fn finalization_candidates(&self) -> Vec<(HandleRc<TrackedHandle>, Object)> {
+    /// finalize objects that are still alive at exit; it claims each one
+    /// through [`Self::claim_finalizer`], so each `__del__` runs at most
+    /// once.
+    pub fn finalization_candidates(&self) -> Vec<Object> {
         self.flush_young();
+        let reg = self.reg.borrow();
         let mut out = Vec::new();
-        let mut consider = |h: &HandleRc<TrackedHandle>| {
+        let lists = reg.gens.iter().chain(std::iter::once(&reg.frozen));
+        for &slot in lists.flatten() {
+            let e = reg.entry(slot);
             // A finalizer already queued by a collection (but not yet
             // drained) must not be listed again.
-            if h.finalized.load(Ordering::Acquire) || h.finalize_queued.load(Ordering::Acquire) {
-                return;
+            if e.has(F_FINALIZED) || e.has(F_QUEUED) {
+                continue;
             }
-            if let Some(obj) = h.object.upgrade() {
+            if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
                 if has_finalizer(&obj) {
-                    out.push((h.clone(), obj));
+                    out.push(obj);
                 }
             }
-        };
-        for gen in self.generations.borrow().iter() {
-            gen.handles.iter().for_each(&mut consider);
         }
-        self.frozen.borrow().iter().for_each(&mut consider);
         out
     }
 
@@ -1383,12 +1462,7 @@ impl GcState {
     /// Total population (across all generations + frozen).
     pub fn population(&self) -> usize {
         self.flush_young();
-        let gens = self.generations.borrow();
-        let mut n = 0;
-        for g in gens.iter() {
-            n += g.handles.len();
-        }
-        n + self.frozen.borrow().len()
+        self.reg.borrow().len()
     }
 
     /// Snapshot all live tracked objects. Used by
@@ -1397,17 +1471,17 @@ impl GcState {
         // `gc.get_objects()` enumerates every container CPython tracks,
         // including the all-scalar ones whose tracking we defer.
         self.promote_all_deferred();
-        let gens = self.generations.borrow();
+        let reg = self.reg.borrow();
         let mut out = Vec::new();
-        let mut push = |h: &HandleRc<TrackedHandle>| out.extend(h.object.upgrade());
+        let mut push = |s: &u32| {
+            out.extend(reg.entry(*s).obj.as_ref().and_then(WeakObject::upgrade));
+        };
         match generation {
-            Some(g) if g < N_GENERATIONS => gens[g].handles.iter().for_each(&mut push),
-            _ => gens
-                .iter()
-                .for_each(|g| g.handles.iter().for_each(&mut push)),
+            Some(g) if g < N_GENERATIONS => reg.gens[g].iter().for_each(&mut push),
+            _ => reg.gens.iter().for_each(|g| g.iter().for_each(&mut push)),
         }
         if generation.is_none() {
-            self.frozen.borrow().iter().for_each(&mut push);
+            reg.frozen.iter().for_each(&mut push);
         }
         out
     }
@@ -1416,13 +1490,14 @@ impl GcState {
     /// frozen so it is ignored by future collections.
     pub fn freeze_all(&self) {
         self.flush_young();
-        let mut gens = self.generations.borrow_mut();
-        let mut frozen = self.frozen.borrow_mut();
-        for g in gens.iter_mut() {
-            for h in g.handles.drain(..) {
-                h.color.store(color::Frozen, Ordering::Release);
-                h.slot.store(frozen.len(), Ordering::Release);
-                frozen.push(h);
+        let mut reg = self.reg.borrow_mut();
+        for g in 0..N_GENERATIONS {
+            for slot in std::mem::take(&mut reg.gens[g]) {
+                let pos = reg.frozen.len() as u32;
+                let e = &mut reg.slab[slot as usize];
+                e.gen = GEN_FROZEN;
+                e.pos = pos;
+                reg.frozen.push(slot);
             }
         }
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
@@ -1431,20 +1506,19 @@ impl GcState {
     /// `gc.unfreeze()` — move every frozen object back to
     /// generation 0.
     pub fn unfreeze_all(&self) {
-        // Lock order: generations before frozen, matching `freeze_all`.
-        let mut gens = self.generations.borrow_mut();
-        let mut frozen = self.frozen.borrow_mut();
-        for h in frozen.drain(..) {
-            h.color.store(color::White, Ordering::Release);
-            h.generation.store(0, Ordering::Release);
-            h.slot.store(gens[0].handles.len(), Ordering::Release);
-            gens[0].handles.push(h);
+        let mut reg = self.reg.borrow_mut();
+        for slot in std::mem::take(&mut reg.frozen) {
+            let pos = reg.gens[0].len() as u32;
+            let e = &mut reg.slab[slot as usize];
+            e.gen = 0;
+            e.pos = pos;
+            reg.gens[0].push(slot);
         }
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn freeze_count(&self) -> usize {
-        self.frozen.borrow().len()
+        self.reg.borrow().frozen.len()
     }
 
     /// Collect generations `0..=upto`. Returns the number of
@@ -1544,10 +1618,16 @@ impl GcState {
             self.sync_gen0_gauge(counts[0], None);
         }
         // The tracked-id filter only ever gains bits; once most of them
-        // name objects long gone, rebuild it from the live index.
-        let live = self.index.borrow().len();
+        // name objects long gone, rebuild it from the live index (sooner
+        // after a full collection, which finds the most dead).
+        let live = self.reg.borrow().index.len();
         let stale = self.tracked_filter.inserts_since_rebuild();
-        if gen == N_GENERATIONS - 1 || stale > 4096.max(live.saturating_mul(4)) {
+        let bound = if gen == N_GENERATIONS - 1 {
+            live
+        } else {
+            live.saturating_mul(4)
+        };
+        if stale > 4096.max(bound) {
             self.rebuild_tracked_filter();
         }
         self.collecting.store(false, Ordering::Release);
@@ -1560,8 +1640,8 @@ impl GcState {
     /// Rebuild the tracked-id miss filter from the live index. Holding the
     /// index borrow serializes it against every `track`.
     pub fn rebuild_tracked_filter(&self) {
-        let index = self.index.borrow();
-        self.tracked_filter.rebuild(index.iter().map(|e| e.0.id));
+        let reg = self.reg.borrow();
+        self.tracked_filter.rebuild(reg.index.keys().copied());
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -1574,15 +1654,24 @@ impl GcState {
     /// `weakref_cb` without the destructive teardown of a full collection
     /// (RFC 0040: `test_shutdown`).
     fn collect_generation(&self, gen: usize, weakref_only: bool) -> usize {
-        // Phase 1: the live objects of this generation and the younger ones,
-        // each held strongly for the collection's duration. Entries whose
-        // object died are dropped on the way.
-        let mut cands = self.snapshot_for_collection(gen);
-        let n_real = cands.len();
-        if n_real == 0 {
+        let gen = gen.min(N_GENERATIONS - 1);
+        // Phase 1: mark the live entries of this generation and the
+        // younger ones as candidates. Entries whose object died are dropped
+        // on the way. The candidates are the generation lists themselves,
+        // and each one's marking state lives in its entry (as CPython's
+        // lives in the object's header): the collection takes no reference
+        // and makes no copy per candidate.
+        if self.mark_candidates(gen) == 0 {
             return 0;
         }
-        let mut by_id: GcIdMap = cands.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+        // Temporary candidates, and their positions by id.
+        let mut temps: Vec<Temp> = Vec::new();
+
+        // The registry can't change while the mark phase reads it: no code
+        // runs, and a dying object's own removal finds it busy.
+        let reg = self.reg.borrow();
+        let finder = Finder::new(&reg, &self.tracked_filter);
+        let lists = &reg.gens[..=gen];
 
         // Phase 2: one walk over the candidates promotes the untracked nodes
         // reachable from them to temporary candidates for this pass only,
@@ -1594,97 +1683,184 @@ impl GcState {
         // internal edges are accounted. A temporary is a candidate from its
         // first edge on, so each of its edges is tallied too. Temporaries
         // take part in the mark walk but are never reclaimed or tracked.
-        let mut scanned = 0usize;
         let mut found: Vec<Object> = Vec::new();
-        while scanned < cands.len() {
-            let parent_is_iter = matches!(cands[scanned].obj, Object::Iter(_));
-            let parent_is_frame = matches!(cands[scanned].obj, Object::Frame(_));
-            traverse_object(&cands[scanned].obj, &mut |child| {
+        let tally = |obj: &Object, temps: &mut Vec<Temp>, found: &mut Vec<Object>| {
+            let parent_is_iter = matches!(obj, Object::Iter(_));
+            let parent_is_frame = matches!(obj, Object::Frame(_));
+            traverse_collected(obj, &mut |child| {
                 if child.never_gc_candidate() {
                     return;
                 }
-                if let Some(&i) = by_id.get(&id_of(child)) {
-                    let t = &cands[i];
-                    t.gc_refs.set(t.gc_refs.get() - 1);
-                } else if promotes_temporarily(child, parent_is_iter, parent_is_frame) {
-                    found.push(child.clone());
+                match finder.find(child) {
+                    Some(Hit::Real(s)) => {
+                        let e = reg.entry(s);
+                        e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+                    }
+                    Some(Hit::Temp(i)) => {
+                        let t = &temps[i as usize];
+                        t.gc_refs.set(t.gc_refs.get() - 1);
+                    }
+                    None => {
+                        if promotes_temporarily(child, parent_is_iter, parent_is_frame) {
+                            found.push(child.clone());
+                        }
+                    }
                 }
             });
             // (One entry per edge: a node reached twice is promoted once and
             // tallied twice.)
             for child in found.drain(..) {
-                let cid = id_of(&child);
-                let i = match by_id.entry(cid) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(cands.len());
-                        cands.push(Cand::new(child, cid, None));
-                        cands.len() - 1
+                let i = match finder.find(&child) {
+                    Some(Hit::Temp(i)) => i as usize,
+                    Some(Hit::Real(s)) => {
+                        let e = reg.entry(s);
+                        e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+                        continue;
                     }
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    None => {
+                        finder.add_temp(&child, temps.len());
+                        temps.push(Temp {
+                            obj: child,
+                            gc_refs: std::cell::Cell::new(0),
+                            reached: std::cell::Cell::new(false),
+                        });
+                        temps.len() - 1
+                    }
                 };
-                let t = &cands[i];
+                let t = &temps[i];
                 t.gc_refs.set(t.gc_refs.get() - 1);
             }
+        };
+        for &slot in lists.iter().flatten() {
+            // SAFETY: the mark walk runs no code that could release the
+            // object (see `traverse_collected`).
+            unsafe {
+                reg.entry(slot)
+                    .obj
+                    .as_ref()
+                    .and_then(|w| w.with_borrowed(|obj| tally(obj, &mut temps, &mut found)));
+            }
+        }
+        let mut scanned = 0;
+        while scanned < temps.len() {
+            let obj = temps[scanned].obj.clone();
+            tally(&obj, &mut temps, &mut found);
             scanned += 1;
         }
+        let lookup = |child: &Object| finder.find(child);
 
         // Phase 3: add the outer refcount, read after the walk (an iterator
         // synthesises a fresh wrapper for its buffer on each traverse, alive
-        // only during the visit). Each candidate holds one reference of its
+        // only during the visit). A temporary holds one reference of its
         // own.
-        for c in &cands {
-            c.gc_refs
-                .set(strong_count_for(&c.obj) as i64 - 1 + c.gc_refs.get());
+        let mut grey: Vec<u32> = Vec::new();
+        for &slot in lists.iter().flatten() {
+            let e = reg.entry(slot);
+            let strong = e.obj.as_ref().map_or(0, WeakObject::strong_count);
+            let refs = i64::from(e.gc_refs.get()) + strong as i64;
+            e.gc_refs
+                .set(refs.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+            // Phase 4: anything referenced from outside is reachable; mark
+            // it and propagate.
+            if refs > 0 {
+                e.set(F_REACHED, true);
+                grey.push(slot);
+            }
         }
-
-        // Phase 4: anything with gc_refs > 0 is reachable from outside; mark
-        // it black and propagate.
-        let mut grey: Vec<usize> = Vec::new();
-        for (i, c) in cands.iter().enumerate() {
-            if c.gc_refs.get() > 0 {
-                c.color.set(color::Grey);
-                grey.push(i);
+        for (i, t) in temps.iter().enumerate() {
+            t.gc_refs
+                .set(strong_count_for(&t.obj) as i64 - 1 + t.gc_refs.get());
+            if t.gc_refs.get() > 0 {
+                t.reached.set(true);
+                grey.push(i as u32 | TEMP_BIT);
             }
         }
         if root_debug() {
-            for &i in &grey {
-                let c = &cands[i];
-                eprintln!(
-                    "[root] id={} gc_refs={} sc={} {}",
-                    c.id,
-                    c.gc_refs.get(),
-                    strong_count_for(&c.obj),
-                    c.obj.type_name_owned()
-                );
+            for &g in &grey {
+                if g & TEMP_BIT == 0 {
+                    let e = reg.entry(g);
+                    eprintln!(
+                        "[root] slot={} gc_refs={} sc={}",
+                        g,
+                        e.gc_refs.get(),
+                        e.obj.as_ref().map_or(0, WeakObject::strong_count)
+                    );
+                } else {
+                    let t = &temps[(g & !TEMP_BIT) as usize];
+                    eprintln!(
+                        "[root] temp gc_refs={} {}",
+                        t.gc_refs.get(),
+                        t.obj.type_name_owned()
+                    );
+                }
             }
         }
-        Self::propagate_black(&cands, &by_id, &mut grey);
+        if stats_debug() {
+            let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+            for t in &temps {
+                *kinds.entry(t.obj.type_name_owned()).or_default() += 1;
+            }
+            eprintln!(
+                "[gc] gen={} cands={} roots={} temps={} {:?}",
+                gen,
+                lists.iter().map(Vec::len).sum::<usize>(),
+                grey.len(),
+                temps.len(),
+                kinds
+            );
+        }
+        Self::propagate_reached(&reg, &temps, &lookup, &mut grey);
 
-        // Phase 5: white real candidates are unreachable cyclic garbage.
-        let unreachable: Vec<usize> = (0..n_real).filter(|&i| cands[i].is_white()).collect();
+        // Phase 5: the candidates still unreached are unreachable cyclic
+        // garbage; hold each for the rest of the collection.
+        let mut unreachable: Vec<(u32, Object)> = Vec::new();
+        for &slot in lists.iter().flatten() {
+            let e = reg.entry(slot);
+            if !e.has(F_REACHED) {
+                if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
+                    unreachable.push((slot, obj));
+                }
+            }
+        }
 
         // CPython's `handle_weakrefs`: a weakref that is *itself* part of the
         // cyclic trash has its callback cleared without invocation — only
         // weakrefs rooted outside the dying subgraph observe the deaths
         // (test_callbacks_on_callback).
-        let trash_ids: IdSet = unreachable.iter().map(|&i| cands[i].id).collect();
+        // (Built only for a collection whose garbage was weakly referenced.)
+        let trash_ids: std::cell::OnceCell<IdSet> = std::cell::OnceCell::new();
+        let is_trash = |id: ObjectId| {
+            trash_ids
+                .get_or_init(|| unreachable.iter().map(|(_, o)| id_of(o)).collect())
+                .contains(&id)
+        };
         let wrapper_is_trash = |slot: &crate::sync::Rc<crate::weakref_registry::WeakRefSlot>| {
             slot.py_ref
                 .borrow()
                 .as_ref()
                 .and_then(crate::sync::Weak::upgrade)
-                .is_none_or(|inst| {
-                    trash_ids.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
-                })
+                .is_none_or(|inst| is_trash(crate::sync::Rc::as_ptr(&inst) as usize as u64))
         };
+        // The weakrefs to `obj`, cleared (a lock-free probe answers for an
+        // object never weakly referenced).
+        let notify_clear = |obj: &Object| {
+            let id = id_of(obj);
+            if crate::weakref_registry::may_have_weakrefs(id) {
+                crate::weakref_registry::notify_clear(id)
+            } else {
+                Vec::new()
+            }
+        };
+        let pending_finalizer =
+            |slot: u32, obj: &Object| has_finalizer(obj) && !reg.entry(slot).has(F_FINALIZED);
 
         if weakref_only {
             let mut weakref_callbacks = Vec::new();
-            for &i in &unreachable {
-                if cands[i].pending_finalizer() {
+            for (slot, obj) in &unreachable {
+                if pending_finalizer(*slot, obj) {
                     continue;
                 }
-                for (slot, cb) in crate::weakref_registry::notify_clear(cands[i].id) {
+                for (slot, cb) in notify_clear(obj) {
                     if let Some(cb) = cb {
                         if !wrapper_is_trash(&slot) {
                             weakref_callbacks.push((slot, cb));
@@ -1692,7 +1868,13 @@ impl GcState {
                     }
                 }
             }
+            for &slot in lists.iter().flatten() {
+                let e = reg.entry(slot);
+                e.set(F_CAND | F_REACHED, false);
+            }
+            drop(reg);
             queue_weakref_callbacks(weakref_callbacks, |_| false);
+            drop(unreachable);
             return 0;
         }
 
@@ -1701,8 +1883,8 @@ impl GcState {
         // watching an object a finalizer later revives stays cleared
         // (`test_io.test_garbage_collection`).
         let mut weakref_callbacks = Vec::new();
-        for &i in &unreachable {
-            for (slot, cb) in crate::weakref_registry::notify_clear(cands[i].id) {
+        for (_, obj) in &unreachable {
+            for (slot, cb) in notify_clear(obj) {
                 if let Some(cb) = cb {
                     if !wrapper_is_trash(&slot) {
                         weakref_callbacks.push((slot, cb));
@@ -1716,167 +1898,320 @@ impl GcState {
         // the collection) may resurrect them, and CPython only counts
         // objects it actually reclaims. The next collection, by which point
         // the finalizer has set `finalized`, reclaims the ones it didn't.
-        let (deferred, maybe_dead): (Vec<usize>, Vec<usize>) = unreachable
-            .iter()
-            .partition(|&&i| cands[i].pending_finalizer());
-        for &i in &deferred {
-            if let Some(e) = &cands[i].entry {
-                if !e.finalize_queued.swap(true, Ordering::AcqRel) {
-                    run_finalizer(&cands[i].obj);
-                }
-            }
-        }
         // CPython runs `finalize_garbage` before `delete_garbage`, so a
         // pending finalizer always sees its own class, closure cells, and
         // referents intact: protect the deferred objects' whole subgraphs.
-        let mut protect: Vec<usize> = Vec::new();
-        for &i in &deferred {
-            cands[i].color.set(color::Grey);
-            protect.push(i);
+        let mut protect: Vec<u32> = Vec::new();
+        for (slot, obj) in &unreachable {
+            if pending_finalizer(*slot, obj) {
+                let e = reg.entry(*slot);
+                if !e.has(F_QUEUED) {
+                    e.set(F_QUEUED, true);
+                    run_finalizer(obj);
+                }
+                e.set(F_REACHED, true);
+                protect.push(*slot);
+            }
         }
-        Self::propagate_black(&cands, &by_id, &mut protect);
+        Self::propagate_reached(&reg, &temps, &lookup, &mut protect);
 
-        let dead: Vec<usize> = maybe_dead
-            .into_iter()
-            .filter(|&i| cands[i].is_white())
+        let dead: Vec<Object> = unreachable
+            .iter()
+            .filter(|(slot, _)| !reg.entry(*slot).has(F_REACHED))
+            .map(|(_, obj)| obj.clone())
             .collect();
         let collected = dead.len();
         // Temporarily promoted iterators and immutable containers that ended
-        // up white are cyclic garbage too, freed by refcount once the cycle's
-        // mutable anchor is cleared below. CPython counts each (`test_tuple`
-        // asserts the closing tuple is counted alongside its list).
+        // up unreached are cyclic garbage too, freed by refcount once the
+        // cycle's mutable anchor is cleared below. CPython counts each
+        // (`test_tuple` asserts the closing tuple is counted alongside its
+        // list).
         let reported = collected
-            + cands[n_real..]
+            + temps
                 .iter()
-                .filter(|c| {
-                    c.is_white()
+                .filter(|t| {
+                    !t.reached.get()
                         && matches!(
-                            c.obj,
+                            t.obj,
                             Object::Iter(_) | Object::Tuple(_) | Object::FrozenSet(_)
                         )
                 })
                 .count();
+        // The clears below release objects, whose removal from the registry
+        // must find it free.
+        drop(reg);
 
         // Break the cycles by clearing the reclaimed objects' fields — or,
         // under `gc.DEBUG_SAVEALL`, park them in `gc.garbage` intact.
         if self.debug.load(Ordering::Acquire) & DEBUG_SAVEALL != 0 {
             let mut garbage = self.garbage.borrow_mut();
-            for &i in &dead {
-                garbage.push(cands[i].obj.clone());
+            for obj in &dead {
+                garbage.push(obj.clone());
             }
         } else {
             // Instances whose `__dict__` is shared are deferred; once every
             // other dead object has released its references, a dict held
             // only by dead holders is down to one owner and the retry
             // clears it (a live holder keeps it intact).
-            let mut shared_dict_holders: Vec<usize> = Vec::new();
-            for &i in &dead {
-                if !clear_object_fields(&cands[i].obj) {
-                    shared_dict_holders.push(i);
+            let mut shared_dict_holders: Vec<&Object> = Vec::new();
+            for obj in &dead {
+                if !clear_object_fields(obj) {
+                    shared_dict_holders.push(obj);
                 }
             }
-            for i in shared_dict_holders {
-                clear_object_fields(&cands[i].obj);
+            for obj in shared_dict_holders {
+                clear_object_fields(obj);
             }
         }
 
         // Queue the weakref callbacks (after finalisers and cyclic clears,
         // matching CPython's order) for the interpreter's next safe point.
-        queue_weakref_callbacks(weakref_callbacks, |slot| {
-            slot.py_ref
-                .borrow()
-                .as_ref()
-                .and_then(crate::sync::Weak::upgrade)
-                .is_none_or(|inst| {
-                    trash_ids.contains(&(crate::sync::Rc::as_ptr(&inst) as usize as u64))
-                })
-        });
+        queue_weakref_callbacks(weakref_callbacks, wrapper_is_trash);
 
         // Phase 6: rebuild the generation lists. Survivors of generation
         // `g` move to generation min(g+1, N_GENERATIONS-1); the dead leave
-        // the index. Dropping `cands` then frees the dead by refcount.
-        self.rebuild_generations(gen, &cands[..n_real]);
+        // the registry. Dropping the held objects then frees the dead by
+        // refcount.
+        self.rebuild_generations(gen);
         self.tracked_count.fetch_sub(
             collected.min(self.tracked_count.load(Ordering::Acquire)),
             Ordering::AcqRel,
         );
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
-        drop(cands);
+        drop(dead);
+        drop(unreachable);
+        drop(temps);
         reported
     }
 
-    /// Blacken everything reachable from the grey candidates in `grey`.
-    fn propagate_black(cands: &[Cand], by_id: &GcIdMap, grey: &mut Vec<usize>) {
-        while let Some(i) = grey.pop() {
-            cands[i].color.set(color::Black);
-            traverse_object(&cands[i].obj, &mut |child| {
+    /// Mark everything reachable from the candidates on the `grey` stack
+    /// (registry slots, or temporaries tagged [`TEMP_BIT`]), which are
+    /// marked already; `lookup` finds a child's candidate.
+    fn propagate_reached(
+        reg: &Registry,
+        temps: &[Temp],
+        lookup: &dyn Fn(&Object) -> Option<Hit>,
+        grey: &mut Vec<u32>,
+    ) {
+        while let Some(item) = grey.pop() {
+            let mut visit = |child: &Object| {
                 if child.never_gc_candidate() {
                     return;
                 }
-                if let Some(&j) = by_id.get(&id_of(child)) {
-                    if cands[j].is_white() {
-                        cands[j].color.set(color::Grey);
-                        grey.push(j);
+                match lookup(child) {
+                    Some(Hit::Real(s)) => {
+                        let e = reg.entry(s);
+                        if !e.has(F_REACHED) {
+                            e.set(F_REACHED, true);
+                            grey.push(s);
+                        }
                     }
+                    Some(Hit::Temp(i)) => {
+                        let t = &temps[i as usize];
+                        if !t.reached.get() {
+                            t.reached.set(true);
+                            grey.push(i | TEMP_BIT);
+                        }
+                    }
+                    None => {}
                 }
-            });
+            };
+            if item & TEMP_BIT == 0 {
+                // SAFETY: as in the mark walk.
+                unsafe {
+                    reg.entry(item)
+                        .obj
+                        .as_ref()
+                        .and_then(|w| w.with_borrowed(|obj| traverse_collected(obj, &mut visit)));
+                }
+            } else {
+                traverse_collected(&temps[(item & !TEMP_BIT) as usize].obj, &mut visit);
+            }
         }
     }
 
-    /// The live objects of generations `0..=upto` as collection candidates;
-    /// entries whose object died are dropped from those generations and the
-    /// index.
-    fn snapshot_for_collection(&self, upto: usize) -> Vec<Cand> {
-        let mut index = self.index.borrow_mut();
-        let mut gens = self.generations.borrow_mut();
-        let mut out = Vec::new();
-        let mut pruned = 0usize;
-        for g in gens.iter_mut().take(upto.min(N_GENERATIONS - 1) + 1) {
-            g.handles.retain(|h| match h.object.upgrade() {
-                Some(obj) => {
-                    out.push(Cand::new(obj, h.id, Some(h.clone())));
-                    true
+    /// Mark the live entries of generations `0..=upto` as candidates of a
+    /// collection, dropping the entries whose object died. Returns how
+    /// many there are.
+    fn mark_candidates(&self, upto: usize) -> usize {
+        let mut reg = self.reg.borrow_mut();
+        let mut dead = Vec::new();
+        let mut n = 0;
+        for g in 0..=upto {
+            let mut i = 0;
+            while i < reg.gens[g].len() {
+                let slot = reg.gens[g][i];
+                let e = reg.entry(slot);
+                if e.obj.as_ref().is_none_or(WeakObject::is_dead) {
+                    // (The swap brings the list's last member to `i`.)
+                    dead.push(reg.remove(slot));
+                    continue;
                 }
-                None => {
-                    index.remove(&h.id);
-                    pruned += 1;
-                    false
-                }
-            });
-            for (i, h) in g.handles.iter().enumerate() {
-                h.slot.store(i, Ordering::Release);
+                e.gc_refs.set(0);
+                e.set(F_REACHED, false);
+                e.set(F_CAND, true);
+                i += 1;
             }
+            n += reg.gens[g].len();
         }
-        if pruned > 0 {
+        drop(reg);
+        if !dead.is_empty() {
             self.tracked_count.fetch_sub(
-                pruned.min(self.tracked_count.load(Ordering::Acquire)),
+                dead.len().min(self.tracked_count.load(Ordering::Acquire)),
                 Ordering::AcqRel,
             );
         }
-        out
+        n
     }
 
-    fn rebuild_generations(&self, upto: usize, cands: &[Cand]) {
-        // Lock order MUST match `track` (index before generations).
-        let mut index = self.index.borrow_mut();
-        let mut gens = self.generations.borrow_mut();
-        for g in 0..=upto.min(N_GENERATIONS - 1) {
-            gens[g].handles.clear();
+    /// Move the surviving candidates of generations `0..=upto` up a
+    /// generation and drop the dead (unreached) ones from the registry. A
+    /// member that joined during the collection stays where it is.
+    fn rebuild_generations(&self, upto: usize) {
+        let mut reg = self.reg.borrow_mut();
+        let mut lists: [Vec<u32>; N_GENERATIONS] = Default::default();
+        let mut dead = Vec::new();
+        for g in 0..=upto {
+            let target = (g + 1).min(N_GENERATIONS - 1);
+            for slot in std::mem::take(&mut reg.gens[g]) {
+                let e = reg.entry(slot);
+                if !e.has(F_CAND) {
+                    lists[g].push(slot);
+                    continue;
+                }
+                let reached = e.has(F_REACHED);
+                e.set(F_CAND | F_REACHED, false);
+                if reached {
+                    reg.slab[slot as usize].gen = target as u8;
+                    lists[target].push(slot);
+                } else {
+                    // (Already out of its list.)
+                    reg.forget_key(slot);
+                    dead.push(reg.release(slot));
+                }
+            }
         }
-        for c in cands {
-            let Some(h) = &c.entry else { continue };
-            if c.is_white() {
-                index.remove(&h.id);
+        for (g, list) in lists.into_iter().enumerate() {
+            if g > upto && list.is_empty() {
                 continue;
             }
-            let g = h.generation.load(Ordering::Acquire);
-            let new_g = g.saturating_add(1).min(MAX_GENERATION);
-            h.generation.store(new_g, Ordering::Release);
-            let new_g = usize::from(new_g);
-            h.slot.store(gens[new_g].handles.len(), Ordering::Release);
-            gens[new_g].handles.push(h.clone());
+            let start = reg.gens[g].len();
+            for (i, &slot) in list.iter().enumerate() {
+                reg.slab[slot as usize].pos = (start + i) as u32;
+            }
+            reg.gens[g].extend(list);
+        }
+        drop(reg);
+        drop(dead);
+    }
+}
+
+/// How a collection's mark walk finds a child's candidate: the registry
+/// (which can't change while the walk runs), a cache in front of its id
+/// index for the children seen again and again (a module's namespace, a
+/// shared function), and the temporaries.
+struct Finder<'a> {
+    reg: &'a Registry,
+    filter: &'a crate::hot_filter::RebuildableBloom,
+    /// Temporaries' positions by id.
+    temp_ids: std::cell::RefCell<GcIdMap>,
+    /// Some temporary is also a registered object (outside the
+    /// candidates): a registered child may then still be a temporary.
+    registered_temp: std::cell::Cell<bool>,
+    /// Payload address -> slot (or [`NO_SLOT`]), direct-mapped.
+    cache_keys: [std::cell::Cell<ObjectId>; FINDER_CACHE],
+    cache_slots: [std::cell::Cell<u32>; FINDER_CACHE],
+}
+
+/// [`Finder`]'s cache size.
+const FINDER_CACHE: usize = 256;
+
+impl<'a> Finder<'a> {
+    fn new(reg: &'a Registry, filter: &'a crate::hot_filter::RebuildableBloom) -> Self {
+        Self {
+            reg,
+            filter,
+            temp_ids: std::cell::RefCell::new(GcIdMap::default()),
+            registered_temp: std::cell::Cell::new(false),
+            cache_keys: std::array::from_fn(|_| std::cell::Cell::new(0)),
+            cache_slots: std::array::from_fn(|_| std::cell::Cell::new(NO_SLOT)),
         }
     }
+
+    /// `obj`'s registry slot, if it has one.
+    #[inline]
+    fn slot(&self, obj: &Object) -> Option<u32> {
+        if let Some(cell) = intrusive_slot(obj) {
+            let s = cell.get();
+            return (s != NO_SLOT).then_some(s);
+        }
+        let key = obj.payload_addr()? as ObjectId;
+        if !self.filter.may_contain(key) {
+            return None;
+        }
+        let i = ((key >> 4) ^ (key >> 12)) as usize & (FINDER_CACHE - 1);
+        let slot = if self.cache_keys[i].get() == key {
+            self.cache_slots[i].get()
+        } else {
+            let slot = self.reg.index.get(&key).copied().unwrap_or(NO_SLOT);
+            self.cache_keys[i].set(key);
+            self.cache_slots[i].set(slot);
+            slot
+        };
+        (slot != NO_SLOT).then_some(slot)
+    }
+
+    /// `child`'s candidate, if it is one.
+    #[inline]
+    fn find(&self, child: &Object) -> Option<Hit> {
+        if let Some(slot) = self.slot(child) {
+            if self.reg.entry(slot).has(F_CAND) {
+                return Some(Hit::Real(slot));
+            }
+            if !self.registered_temp.get() {
+                return None;
+            }
+        }
+        if !may_be_temporary(child) {
+            return None;
+        }
+        let ids = self.temp_ids.borrow();
+        if ids.is_empty() {
+            return None;
+        }
+        ids.get(&id_of(child)).map(|&i| Hit::Temp(i as u32))
+    }
+
+    /// Record `child` as the temporary at position `i`.
+    fn add_temp(&self, child: &Object, i: usize) {
+        if self.slot(child).is_some() {
+            self.registered_temp.set(true);
+        }
+        self.temp_ids.borrow_mut().insert(id_of(child), i);
+    }
+}
+
+/// Whether [`promotes_temporarily`] can accept `child` (from some parent).
+#[inline]
+fn may_be_temporary(child: &Object) -> bool {
+    matches!(
+        child,
+        Object::Iter(_)
+            | Object::Tuple(_)
+            | Object::FrozenSet(_)
+            | Object::DictView(_)
+            | Object::Slice(_)
+            | Object::Cell(_)
+            | Object::Traceback(_)
+            | Object::Frame(_)
+            | Object::BoundMethod(_)
+            | Object::StaticMethod(_)
+            | Object::ClassMethod(_)
+            | Object::Property(_)
+            | Object::List(_)
+            | Object::Instance(_)
+            | Object::Dict(_)
+    )
 }
 
 /// Id → candidate position, for one collection.
@@ -1893,7 +2228,6 @@ fn promotes_temporarily(child: &Object, parent_is_iter: bool, parent_is_frame: b
         // l.append(t)`, a recursive closure's `function -> cell ->
         // function`, an exception's `__traceback__ -> frame -> f_locals`).
         Object::Iter(_)
-        | Object::Tuple(_)
         | Object::FrozenSet(_)
         | Object::DictView(_)
         | Object::Slice(_)
@@ -1904,6 +2238,10 @@ fn promotes_temporarily(child: &Object, parent_is_iter: bool, parent_is_frame: b
         | Object::StaticMethod(_)
         | Object::ClassMethod(_)
         | Object::Property(_) => true,
+        // A tuple of atomic values can't take part in a cycle (CPython
+        // untracks it at creation), and a list of edges or a dict of
+        // coordinates holds thousands.
+        Object::Tuple(t) => t.iter().any(|x| !is_atomic(x)),
         // Lists are tracked at creation, so an *untracked* list is only an
         // iterator's private snapshot buffer.
         Object::List(_) => parent_is_iter,
@@ -2043,12 +2381,41 @@ pub fn strong_count_for(obj: &Object) -> usize {
 /// refcount-seeded reachability model — an unvisited child keeps its
 /// external `gc_refs` and therefore survives the pass.
 pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    traverse_impl::<false>(obj, visit);
+}
+
+/// [`traverse_object`] for a collection's mark walk, whose visitor runs no
+/// code and borrows no container: the common containers' cells are read
+/// without borrow bookkeeping while nothing holds them mutably, and an
+/// instance's class is visited through a handle that takes no reference.
+fn traverse_collected(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    traverse_impl::<true>(obj, visit);
+}
+
+/// Run `f` on `cell`'s value: a guard-free view when `PEEK` allows one,
+/// else a shared borrow (`None` while the cell is borrowed mutably).
+#[inline(always)]
+fn with_read<const PEEK: bool, T, R>(cell: &RefCell<T>, f: impl FnOnce(&T) -> R) -> Option<R> {
+    if PEEK {
+        // SAFETY: a `PEEK` traversal's visitor runs no code and borrows no
+        // container (see `traverse_collected`), so nothing can borrow the
+        // cell mutably while the view lives.
+        if let Some(v) = unsafe { cell.peek() } {
+            return Some(f(v));
+        }
+    }
+    cell.try_borrow().ok().map(|g| f(&g))
+}
+
+#[inline(always)]
+fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     match obj {
         Object::List(l) => {
-            let Ok(v) = l.try_borrow() else { return };
-            for item in v.iter() {
-                visit(item);
-            }
+            with_read::<PEEK, _, _>(l, |v| {
+                for item in v.iter() {
+                    visit(item);
+                }
+            });
         }
         Object::Tuple(t) => {
             for item in t.iter() {
@@ -2056,18 +2423,20 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::Dict(d) | Object::MappingProxy(d) | Object::SimpleNamespace(d) => {
-            let Ok(m) = d.try_borrow() else { return };
-            for (k, v) in m.iter() {
-                visit(&k.0);
-                visit(v);
-            }
+            with_read::<PEEK, _, _>(d, |m| {
+                for (k, v) in m.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            });
         }
         Object::MappingProxyObj(inner) => visit(inner),
         Object::Set(s) => {
-            let Ok(m) = s.try_borrow() else { return };
-            for k in m.iter() {
-                visit(&k.0);
-            }
+            with_read::<PEEK, _, _>(s, |m| {
+                for k in m.iter() {
+                    visit(&k.0);
+                }
+            });
         }
         Object::FrozenSet(s) => {
             for k in s.iter() {
@@ -2081,9 +2450,23 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // instances (e.g. `A.a = A(); del A`) must see that edge subtracted
             // or it never collects. Built-in types are immortal and untracked,
             // so skip them (the `by_id` lookup would miss anyway).
-            let cls = i.cls();
-            if !cls.flags.is_builtin {
-                visit(&Object::Type(cls));
+            // SAFETY: as `with_read`'s; the instance keeps its class alive,
+            // and the view, which owns no reference, is never dropped.
+            match PEEK.then(|| unsafe { i.class.peek() }).flatten() {
+                Some(cls) => {
+                    if !cls.flags.is_builtin {
+                        let view = std::mem::ManuallyDrop::new(Object::Type(unsafe {
+                            crate::sync::Rc::from_raw(crate::sync::Rc::as_ptr(cls))
+                        }));
+                        visit(&view);
+                    }
+                }
+                None => {
+                    let cls = i.cls();
+                    if !cls.flags.is_builtin {
+                        visit(&Object::Type(cls));
+                    }
+                }
             }
             // A namespace dict that is itself a GC candidate — a
             // `types.ModuleType('foo')` instance's `__dict__`, tracked in
@@ -2099,14 +2482,14 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 // Split values: the instance's own children. Their names
                 // are the class's shared strings, which hold nothing (as
                 // CPython's inline values visit only the values).
-                if let Ok(split) = i.dict.split_cell().try_borrow() {
+                with_read::<PEEK, _, _>(i.dict.split_cell(), |split| {
                     for v in split.values() {
                         visit(v);
                     }
-                }
+                });
             } else if let Some(dict) = i.dict.get_shared() {
                 let dict_obj = Object::Dict(dict);
-                if is_tracked(id_of(&dict_obj)) {
+                if is_tracked(&dict_obj) {
                     visit(&dict_obj);
                 } else if let Object::Dict(dict) = &dict_obj {
                     if let Ok(m) = dict.try_borrow() {
@@ -2117,12 +2500,12 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                     }
                 }
             }
-            if let Ok(slots) = i.slots.try_borrow() {
-                for (k, v) in slots.iter() {
+            with_read::<PEEK, _, _>(&i.slots, |slots| {
+                slots.for_each_entry(|k, v| {
                     visit(&k.0);
                     visit(v);
-                }
-            }
+                });
+            });
             // A built-in *container* subclass (`class C(list)`, `D(dict)`,
             // `S(set)`, …) keeps its payload in `native`; that container is
             // an internal, separately-untracked detail of the instance, so
@@ -2131,7 +2514,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // prompt reclamation can follow such a chain (a leaf `native`
             // like an `int`/`str` subclass simply has no children).
             if let Some(native) = i.native.get() {
-                traverse_object(native, visit);
+                traverse_impl::<PEEK>(native, visit);
             }
             // A C extension type (RFC 0044) may hold child references in
             // C-managed memory invisible to the dict walk above; give its
@@ -2356,10 +2739,37 @@ fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     // The table is append-only and read lock-free (see `HookTable`); a
     // hook may re-enter the collector, and this function, on the same
     // thread.
-    for (matches, traverse) in TRAVERSE_TABLE.iter() {
+    for (matches, traverse) in TRAVERSE_TABLE.iter(hook_kind(obj)) {
         if matches(obj) {
             traverse(obj, visit);
         }
+    }
+}
+
+/// [`HookTable`] kinds: a hook names the kinds of object its `matches` can
+/// accept, and only an object of one of them is offered to it.
+pub mod hook_kind {
+    pub const INSTANCE: u8 = 1;
+    pub const GENERATOR: u8 = 2;
+    pub const ITER: u8 = 4;
+    pub const FRAME: u8 = 8;
+    pub const TRACEBACK: u8 = 16;
+    pub const OTHER: u8 = 32;
+    pub const ANY: u8 = u8::MAX;
+}
+
+/// `obj`'s [`hook_kind`].
+#[inline]
+fn hook_kind(obj: &Object) -> u8 {
+    match obj {
+        Object::Instance(_) => hook_kind::INSTANCE,
+        Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_) => {
+            hook_kind::GENERATOR
+        }
+        Object::Iter(_) => hook_kind::ITER,
+        Object::Frame(_) => hook_kind::FRAME,
+        Object::Traceback(_) => hook_kind::TRACEBACK,
+        _ => hook_kind::OTHER,
     }
 }
 
@@ -2371,7 +2781,7 @@ const HOOK_TABLE_CAP: usize = 16;
 
 struct HookTable<H: Copy> {
     len: std::sync::atomic::AtomicUsize,
-    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H)>; HOOK_TABLE_CAP],
+    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H, u8)>; HOOK_TABLE_CAP],
 }
 
 impl<H: Copy> HookTable<H> {
@@ -2384,17 +2794,22 @@ impl<H: Copy> HookTable<H> {
         }
     }
 
-    fn push(&self, matches: fn(&Object) -> bool, hook: H) {
+    fn push(&self, kinds: u8, matches: fn(&Object) -> bool, hook: H) {
         let i = self.len.fetch_add(1, Ordering::AcqRel);
         assert!(i < Self::CAP, "too many GC hook registrations");
-        let _ = self.slots[i].set((matches, hook));
+        let _ = self.slots[i].set((matches, hook, kinds));
     }
 
+    /// The hooks offered an object of [`hook_kind`] `kind`.
     #[inline]
-    fn iter(&self) -> impl Iterator<Item = (fn(&Object) -> bool, H)> + '_ {
+    fn iter(&self, kind: u8) -> impl Iterator<Item = (fn(&Object) -> bool, H)> + '_ {
         let n = self.len.load(Ordering::Acquire).min(Self::CAP);
         // A slot past a registration in flight is still unset; skip it.
-        self.slots[..n].iter().filter_map(|s| s.get().copied())
+        self.slots[..n].iter().filter_map(move |s| {
+            s.get()
+                .filter(|(_, _, kinds)| kinds & kind != 0)
+                .map(|&(m, h, _)| (m, h))
+        })
     }
 }
 
@@ -2406,7 +2821,17 @@ pub fn register_traverse(
     matches: fn(&Object) -> bool,
     traverse: fn(&Object, &mut dyn FnMut(&Object)),
 ) {
-    TRAVERSE_TABLE.push(matches, traverse);
+    TRAVERSE_TABLE.push(hook_kind::ANY, matches, traverse);
+}
+
+/// [`register_traverse`] for a hook whose `matches` only accepts objects
+/// of the [`hook_kind`]s in `kinds`.
+pub fn register_traverse_for(
+    kinds: u8,
+    matches: fn(&Object) -> bool,
+    traverse: fn(&Object, &mut dyn FnMut(&Object)),
+) {
+    TRAVERSE_TABLE.push(kinds, matches, traverse);
 }
 
 static CLEAR_TABLE: HookTable<fn(&Object)> = HookTable::new();
@@ -2416,7 +2841,7 @@ static CLEAR_TABLE: HookTable<fn(&Object)> = HookTable::new();
 /// cycles during the collector's clear phase. The companion of
 /// [`register_traverse`] (RFC 0044, WS4).
 fn run_external_clear(obj: &Object) {
-    for (matches, clear) in CLEAR_TABLE.iter() {
+    for (matches, clear) in CLEAR_TABLE.iter(hook_kind(obj)) {
         if matches(obj) {
             clear(obj);
         }
@@ -2427,7 +2852,13 @@ fn run_external_clear(obj: &Object) {
 /// during the collector's clear phase so a matching object can drop the
 /// child references it holds outside the VM's view.
 pub fn register_clear(matches: fn(&Object) -> bool, clear: fn(&Object)) {
-    CLEAR_TABLE.push(matches, clear);
+    CLEAR_TABLE.push(hook_kind::ANY, matches, clear);
+}
+
+/// [`register_clear`] for a hook whose `matches` only accepts objects of
+/// the [`hook_kind`]s in `kinds`.
+pub fn register_clear_for(kinds: u8, matches: fn(&Object) -> bool, clear: fn(&Object)) {
+    CLEAR_TABLE.push(kinds, matches, clear);
 }
 
 /// Drain a container's child references in place. Used during
@@ -2471,7 +2902,9 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             // that dict is still intact.
             run_external_clear(obj);
             if let Ok(mut slots) = i.slots.try_borrow_mut() {
-                *slots = crate::types::SlotStorage::default();
+                if !slots.is_empty_default() {
+                    *slots = crate::types::SlotStorage::default();
+                }
             }
             if i.dict.published().is_none() {
                 let values = i
@@ -2782,30 +3215,27 @@ pub fn collection_in_progress() -> bool {
 /// process-global GC. The inverse of [`track`]; backs the C-API
 /// `PyObject_GC_UnTrack` (RFC 0044, WS4).
 pub fn untrack(obj: &Object) {
-    let id = crate::weakref_registry::id_of(obj);
-    with_state(|s| s.untrack_id(id));
+    with_state(|s| s.untrack(obj));
 }
 
-/// See [`GcState::forget_dead`]; a cheap filter probe first.
+/// Drop the registry entry of the instance at `addr`, which is dying and
+/// recorded registry slot `slot` (see [`GcState::forget_instance`]).
 #[inline]
-pub fn forget_dead(id: ObjectId) {
-    if maybe_tracked(id) {
-        with_state(|s| s.forget_dead(id));
-    }
+pub fn forget_instance(slot: u32, addr: usize) {
+    with_state(|s| s.forget_instance(slot, addr));
 }
 
-/// [`untrack`] by identity.
-pub fn untrack_id(id: ObjectId) {
-    with_state(|s| s.untrack_id(id));
-}
-
-/// [`untrack_id`] for a registered object only: one still in a young set
+/// [`untrack`] for a registered generator only: one still in a young set
 /// stays there. For a finished generator, which holds no frame (and so no
 /// references a cycle could run through): finding it among thousands of
 /// young entries would cost more than leaving it, and a dead entry is
 /// dropped at the next flush.
-pub fn untrack_registered_id(id: ObjectId) {
-    with_state(|s| s.untrack_id_in(id, false));
+pub fn untrack_generator(g: &crate::Rc<crate::object::PyGenerator>) {
+    let slot = g.gc_slot.get();
+    if slot != NO_SLOT {
+        let id = crate::Rc::as_ptr(g) as usize as ObjectId;
+        with_state(|s| s.untrack_slot(slot, id, false));
+    }
 }
 
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
@@ -2851,6 +3281,12 @@ pub fn is_atomic(obj: &Object) -> bool {
 /// this is CPython's container-untracking optimization applied at
 /// construction time, and it keeps numeric/string-heavy workloads off
 /// the GC's books entirely.
+/// `WP_GC_STATS`: print each collection's population (read once).
+fn stats_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WP_GC_STATS").is_some())
+}
+
 /// `WP_ROOT_DBG`: print each collection's roots (read once).
 fn root_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3005,26 +3441,16 @@ pub fn maybe_auto_collect() -> bool {
     with_state(GcState::maybe_auto_collect)
 }
 
-/// Convenience: find a tracked handle by object id (O(1) via the
-/// id index, which covers all generations plus the frozen set).
-pub fn find_handle(id: ObjectId) -> Option<HandleRc<TrackedHandle>> {
-    with_state(|s| s.handle_for(id))
+/// Convenience: is `obj` currently tracked by the cycle GC?
+pub fn is_tracked(obj: &Object) -> bool {
+    with_state(|s| s.is_tracked_obj(obj))
 }
 
-/// Convenience: is `id` currently tracked by the cycle GC?
-pub fn is_tracked(id: ObjectId) -> bool {
-    with_state(|s| s.is_tracked(id))
-}
-
-/// Convenience: claim `id`'s finalizer (so a later collection
+/// Convenience: claim `obj`'s finalizer (so a later collection
 /// won't double-run `__del__`). Returns false if it was already
-/// claimed or the object isn't tracked.
-pub fn mark_finalized(id: ObjectId) -> bool {
-    with_state(|s| s.note_finalized(id));
-    match find_handle(id) {
-        Some(h) => !h.finalized.swap(true, Ordering::AcqRel),
-        None => false,
-    }
+/// claimed (a tracked object that isn't claims it).
+pub fn claim_finalizer(obj: &Object) -> bool {
+    with_state(|s| s.claim_finalizer(obj)) != Some(true)
 }
 
 /// Convenience: has `id`'s finalizer already run on the current thread?
@@ -3035,13 +3461,13 @@ pub fn was_finalized(id: ObjectId) -> bool {
 
 /// Convenience: mark `id`'s finalizer as finished on the current thread's GC
 /// (see [`GcState::complete_finalizer`]).
-pub fn complete_finalizer(id: ObjectId) {
-    with_state(|s| s.complete_finalizer(id));
+pub fn complete_finalizer(obj: &Object) {
+    with_state(|s| s.complete_finalizer(obj));
 }
 
 /// Convenience: the live tracked objects with an unrun `__del__` (see
 /// [`GcState::finalization_candidates`]).
-pub fn finalization_candidates() -> Vec<(HandleRc<TrackedHandle>, Object)> {
+pub fn finalization_candidates() -> Vec<Object> {
     with_state(|s| s.finalization_candidates())
 }
 
@@ -3113,34 +3539,49 @@ mod tests {
     use crate::object::DictData;
 
     #[test]
-    fn compact_positions_keep_absent_and_uncached_states_distinct() {
-        for value in [0, 1, (u32::MAX - 2) as usize, usize::MAX] {
-            let hint = CachedSlot::new(value);
-            assert_eq!(hint.load(Ordering::Acquire), value);
-            assert_eq!(hint.swap(3, Ordering::AcqRel), value);
-            assert_eq!(hint.load(Ordering::Acquire), 3);
-            hint.store(value, Ordering::Release);
-            assert_eq!(hint.load(Ordering::Acquire), value);
-        }
-        for value in [(u32::MAX - 1) as usize, usize::MAX - 1] {
-            let hint = CachedSlot::new(value);
-            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
-            assert_eq!(hint.swap(usize::MAX, Ordering::AcqRel), usize::MAX - 1);
-            assert_eq!(hint.load(Ordering::Acquire), usize::MAX);
-        }
+    fn registry_entries_stay_compact_and_slots_are_reused() {
         #[cfg(target_pointer_width = "64")]
-        {
-            let hint = CachedSlot::new(u32::MAX as usize + 100);
-            assert_eq!(hint.load(Ordering::Acquire), usize::MAX - 1);
-            assert_eq!(std::mem::size_of::<TrackedHandle>(), 32);
+        assert_eq!(std::mem::size_of::<Entry>(), 32);
+        let state = GcState::new();
+        let roots: Vec<_> = (0..3)
+            .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
+            .collect();
+        for root in &roots {
+            state.track_now(root);
+        }
+        let slab_len = state.reg.borrow().slab.len();
+        state.untrack_id(id_of(&roots[1]));
+        assert!(!state.is_tracked(id_of(&roots[1])));
+        let extra = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+        state.track_now(&extra);
+        // The freed slot is the new entry's.
+        assert_eq!(state.reg.borrow().slab.len(), slab_len);
+        assert!(state.is_tracked(id_of(&extra)));
+        for obj in [&roots[0], &roots[2], &extra] {
+            assert_eq!(placement(&state, obj).map(|p| p.0), Some(0));
         }
     }
 
+    /// `obj`'s generation (or [`GEN_FROZEN`]) and position in its list,
+    /// checking that the list holds it there.
+    fn placement(state: &GcState, obj: &Object) -> Option<(u8, u32)> {
+        let reg = state.reg.borrow();
+        let slot = reg.slot_of(obj, &state.tracked_filter)?;
+        let e = reg.entry(slot);
+        let list = if e.gen == GEN_FROZEN {
+            &reg.frozen
+        } else {
+            &reg.gens[usize::from(e.gen)]
+        };
+        assert_eq!(list[e.pos as usize], slot);
+        Some((e.gen, e.pos))
+    }
+
     #[test]
-    fn uncacheable_generation_and_frozen_positions_use_identity_fallback() {
+    fn removals_keep_generation_and_frozen_positions() {
         for frozen in [false, true] {
             let state = GcState::new();
-            let roots: Vec<_> = (0..3)
+            let roots: Vec<_> = (0..4)
                 .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
                 .collect();
             for root in &roots {
@@ -3149,22 +3590,20 @@ mod tests {
             if frozen {
                 state.freeze_all();
             }
-            let first = state.handle_for(id_of(&roots[0])).unwrap();
-            first.slot.store((u32::MAX - 1) as usize, Ordering::Release);
-            state.untrack_id(first.id);
-            assert!(!state.is_tracked(first.id));
-            let moved = state.handle_for(id_of(&roots[2])).unwrap();
-            assert_eq!(moved.slot.load(Ordering::Acquire), 0);
-            let second = state.handle_for(id_of(&roots[1])).unwrap();
-            // A cacheable but stale position must also validate identity.
-            second.slot.store(0, Ordering::Release);
-            state.untrack_id(second.id);
-            assert!(!state.is_tracked(second.id));
-            assert!(state.is_tracked(moved.id));
-            assert_eq!(state.freeze_count(), usize::from(frozen));
-            state.untrack_id(moved.id);
-            assert!(!state.is_tracked(moved.id));
+            state.untrack_id(id_of(&roots[0]));
+            assert!(!state.is_tracked(id_of(&roots[0])));
+            // The last member moved into the vacated position.
+            assert_eq!(placement(&state, &roots[3]).unwrap().1, 0);
+            state.untrack_id(id_of(&roots[2]));
+            for root in [&roots[1], &roots[3]] {
+                let (gen, _) = placement(&state, root).unwrap();
+                assert_eq!(gen == GEN_FROZEN, frozen);
+            }
+            assert_eq!(state.freeze_count(), if frozen { 2 } else { 0 });
+            state.untrack_id(id_of(&roots[1]));
+            state.untrack_id(id_of(&roots[3]));
             assert_eq!(state.freeze_count(), 0);
+            assert_eq!(state.population(), 0);
         }
     }
 
@@ -3199,44 +3638,27 @@ mod tests {
         for (collection, expected) in [(0, 1), (1, 2), (2, 2), (2, 2)] {
             assert_eq!(state.collect(collection), 0);
             for (slot, root) in roots.iter().enumerate() {
-                let handle = state.handle_for(id_of(root)).unwrap();
-                assert_eq!(handle.generation.load(Ordering::Acquire), expected);
-                assert_eq!(handle.color.load(Ordering::Acquire), color::White);
-                assert_eq!(handle.slot.load(Ordering::Acquire), slot);
+                assert_eq!(placement(&state, root), Some((expected, slot as u32)));
             }
         }
         state.freeze_all();
         assert_eq!(state.freeze_count(), roots.len());
         assert_eq!(state.collect(2), 0);
         for root in &roots {
-            let handle = state.handle_for(id_of(root)).unwrap();
-            assert_eq!(handle.color.load(Ordering::Acquire), color::Frozen);
+            assert_eq!(placement(&state, root).unwrap().0, GEN_FROZEN);
         }
         state.untrack_id(id_of(&roots[1]));
         assert!(!state.is_tracked(id_of(&roots[1])));
         assert_eq!(state.freeze_count(), 3);
-        let moved = state.handle_for(id_of(&roots[3])).unwrap();
-        assert_eq!(moved.slot.load(Ordering::Acquire), 1);
+        assert_eq!(placement(&state, &roots[3]).unwrap().1, 1);
         state.unfreeze_all();
         assert_eq!(state.freeze_count(), 0);
         for (slot, index) in [0, 3, 2].into_iter().enumerate() {
-            let handle = state.handle_for(id_of(&roots[index])).unwrap();
-            assert_eq!(handle.generation.load(Ordering::Acquire), 0);
-            assert_eq!(handle.color.load(Ordering::Acquire), color::White);
-            assert_eq!(handle.slot.load(Ordering::Acquire), slot);
+            assert_eq!(placement(&state, &roots[index]), Some((0, slot as u32)));
         }
         state.untrack_id(id_of(&roots[3]));
         assert!(!state.is_tracked(id_of(&roots[3])));
-        let moved = state.handle_for(id_of(&roots[2])).unwrap();
-        assert_eq!(moved.slot.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn generation_constructor_rejects_out_of_range_indices() {
-        for generation in [N_GENERATIONS, u8::MAX as usize + 1, usize::MAX] {
-            let result = std::panic::catch_unwind(|| TrackedHandle::new(&Object::None, generation));
-            assert!(result.is_err());
-        }
+        assert_eq!(placement(&state, &roots[2]).unwrap().1, 1);
     }
 
     #[test]

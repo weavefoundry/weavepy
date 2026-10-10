@@ -4919,6 +4919,9 @@ pub struct PyFunction {
     /// slot-store probe for the overwhelmingly common function that never
     /// had them overridden.
     pub defaults_override: OverrideFlag,
+    /// The function's slot in the cycle collector's registry (see
+    /// [`crate::gc_trace::GcSlot`]).
+    pub gc_slot: crate::gc_trace::GcSlot,
 }
 
 /// A function's getset slots before their first read (see
@@ -5368,9 +5371,10 @@ pub struct PyGenerator {
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
-    /// Whether the cycle collector's index holds an entry for this
-    /// generator (one still in a young set has none).
-    pub gc_registered: crate::sync::Cell<bool>,
+    /// The generator's slot in the cycle collector's registry (see
+    /// [`crate::gc_trace::GcSlot`]); unregistered while it is still in a
+    /// young set.
+    pub gc_slot: crate::gc_trace::GcSlot,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5511,7 +5515,7 @@ impl PyGenerator {
             extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
-            gc_registered: crate::sync::Cell::new(false),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         }
     }
 

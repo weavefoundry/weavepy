@@ -457,7 +457,7 @@ fn find_paths_dbg(args: &[Object]) -> Result<Object, RuntimeError> {
                     out.push(Object::from_str(p.join(" -> ")));
                     continue;
                 }
-                if gc_trace::is_tracked(cid) || !seen.insert(cid) {
+                if gc_trace::is_tracked(&child) || !seen.insert(cid) {
                     continue;
                 }
                 let mut p = path.clone();
@@ -504,28 +504,22 @@ fn object_is_tracked(target: &Object) -> bool {
         // answers as CPython's (always tracked) and is tracked from here on.
         Object::Instance(inst) => {
             inst.ensure_gc_tracked();
-            gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
+            gc_trace::with_state(|s| s.is_tracked_instance(target))
         }
         // A function, generator or coroutine may still be young.
         Object::Function(_) | Object::Generator(_) | Object::Coroutine(_) => {
-            gc_trace::with_state(|s| s.is_tracked_instance(id_of(target)))
+            gc_trace::with_state(|s| s.is_tracked_instance(target))
         }
         // A list/dict/set born holding only scalars has its tracking
         // deferred; CPython tracks it from birth, so answer as CPython
         // does and hand it to the collector from here on.
-        Object::List(_) | Object::Dict(_) | Object::Set(_) => {
-            let id = id_of(target);
-            gc_trace::with_state(|s| {
-                if !s.is_tracked_instance(id) {
-                    s.track_now(target);
-                }
-                s.is_tracked_instance(id)
-            })
-        }
-        other => {
-            let id = id_of(other);
-            gc_trace::with_state(|s| s.is_tracked(id))
-        }
+        Object::List(_) | Object::Dict(_) | Object::Set(_) => gc_trace::with_state(|s| {
+            if !s.is_tracked_instance(target) {
+                s.track_now(target);
+            }
+            s.is_tracked_instance(target)
+        }),
+        other => gc_trace::with_state(|s| s.is_tracked_obj(other)),
     }
 }
 
@@ -596,8 +590,7 @@ fn track_obj(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn untrack_obj(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(o) = args.first() {
-        let id = id_of(o);
-        gc_trace::with_state(|s| s.untrack_id(id));
+        gc_trace::untrack(o);
     }
     Ok(Object::None)
 }
