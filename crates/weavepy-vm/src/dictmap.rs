@@ -1252,7 +1252,7 @@ mod tests {
     fn insert_remove_order() {
         let mut m = DictMap::new();
         for i in 0..200 {
-            assert_eq!(m.insert(k(i * 1024), Object::Int(i)), None);
+            assert!(m.insert(k(i * 1024), Object::Int(i)).is_none());
             check(&m);
         }
         for i in (0..200).step_by(3) {
@@ -1292,6 +1292,6 @@ mod tests {
         let c = m.clone();
         check(&c);
         assert_eq!(c.get(&k(5)).map(|o| matches!(o, Object::Int(5))), Some(true));
-        assert_eq!(c.get(&k(50)).is_none(), true);
+        assert!(c.get(&k(50)).is_none());
     }
 }
