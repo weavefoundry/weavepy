@@ -515,6 +515,7 @@ impl Interpreter {
                         frame: frame_ptr,
                         sw: std::ptr::null_mut(),
                         gen_depth: depth,
+                        direct: false,
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -683,7 +684,7 @@ impl Interpreter {
                 OpCode::JumpForward => pc += 1 + ins.arg as usize,
                 OpCode::JumpBackward => {
                     // The back edge is the eval-breaker (as the core loop's).
-                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                    if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
                         break None;
                     }
                     self.gil_countdown -= 1;
@@ -857,6 +858,7 @@ impl Interpreter {
             frame: frame_ptr,
             sw: std::ptr::null_mut(),
             gen_depth: depth,
+            direct: false,
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };

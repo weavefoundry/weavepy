@@ -7681,6 +7681,29 @@ impl Interpreter {
         }
     }
 
+    /// Whether the GIL countdown is down to `floor` with a hand-off to
+    /// make: the quiet paths' calls, returns and back edges then yield to
+    /// the outer loop's checkpoint. A countdown that runs out with no
+    /// thread waiting starts over in place instead (the checkpoint would
+    /// do nothing else), so a busy single thread doesn't unwind its whole
+    /// native call nest every 128 calls.
+    #[inline(always)]
+    pub(crate) fn countdown_out(&mut self, floor: u32) -> bool {
+        self.gil_countdown <= floor && !self.countdown_refill()
+    }
+
+    /// [`Self::countdown_out`]'s cold half: `true` when the countdown
+    /// started over.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn countdown_refill(&mut self) -> bool {
+        if crate::gil::handoff_idle() {
+            self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+            return true;
+        }
+        false
+    }
+
     /// After the quiet loop caught an exception: whether the activation
     /// yields as the outer loop's per-instruction prologue would (the GIL
     /// countdown, a hot gate). Code that only calls and catches, such as
@@ -7688,7 +7711,7 @@ impl Interpreter {
     /// never let another thread or a signal in.
     #[inline]
     fn quiet_caught_yields(&mut self, snap_gen: u64) -> bool {
-        if self.gil_countdown <= 2 {
+        if self.countdown_out(2) {
             return true;
         }
         self.gil_countdown -= 1;
@@ -7722,7 +7745,7 @@ impl Interpreter {
                 // lean paths below.
                 QuietEntry::Returned { cur_pc } => {
                     *last = cur_pc;
-                    if self.gil_countdown <= 2 {
+                    if self.countdown_out(2) {
                         break 'run QuietExit::Yield;
                     }
                     self.gil_countdown -= 1;
@@ -7892,7 +7915,7 @@ impl Interpreter {
                             });
                         }
                         *last = cur_pc;
-                        if self.gil_countdown <= 2 {
+                        if self.countdown_out(2) {
                             break 'run QuietExit::Yield;
                         }
                         self.gil_countdown -= 1;
@@ -7976,7 +7999,7 @@ impl Interpreter {
                             });
                         }
                         *last = cur_pc;
-                        if self.gil_countdown <= 2 {
+                        if self.countdown_out(2) {
                             break 'run QuietExit::Yield;
                         }
                         self.gil_countdown -= 1;
@@ -8031,7 +8054,7 @@ impl Interpreter {
                 }
                 *last = cur_pc;
                 // The outer loop's per-instruction prologue, in its order.
-                if self.gil_countdown <= 2 {
+                if self.countdown_out(2) {
                     break 'run QuietExit::Yield;
                 }
                 self.gil_countdown -= 1;
@@ -8283,6 +8306,39 @@ impl Interpreter {
         act.binop = None;
         act.discard = false;
         act.guard = None;
+        act.caller_pending = None;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, act);
+        }
+    }
+
+    /// [`Self::inline_park_clean`] for a direct call's activation (see
+    /// `frame_jit::direct_call`) after its clean return: it never owns
+    /// cells, and of the fields the park resets only `direct` was set
+    /// (its guard is gone already).
+    #[inline(always)]
+    pub(crate) fn inline_park_direct(&mut self, mut act: Box<InlineAct>) {
+        debug_assert!(
+            act.frame.stack.is_empty()
+                && !act.owns_cells
+                && act.binop.is_none()
+                && !act.discard
+                && act.guard.is_none()
+                && act.init_inst.is_none()
+                && act.act.shell.is_none()
+        );
+        // SAFETY: as `inline_park`: the code handle is owned while active;
+        // a function holds the code too, so this is rarely its last owner.
+        unsafe {
+            let code = std::ptr::read(&raw const act.frame.code);
+            if crate::rc::try_release_shared(Rc::as_ptr(&code)) {
+                std::mem::forget(code);
+            } else {
+                drop(code);
+            }
+        }
+        act.parked = true;
+        act.direct = false;
         act.caller_pending = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
@@ -11361,6 +11417,7 @@ impl Interpreter {
                             frame: sw.cur,
                             sw: std::ptr::from_mut(sw),
                             gen_depth: 0,
+                            direct: false,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -12495,7 +12552,7 @@ impl Interpreter {
                     OpCode::JumpBackward => {
                         // The back edge is the burst's eval-breaker (see
                         // `leaf_burst_slow`).
-                        if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                        if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
                             break Some(CoreExit::Stop(LeafStop::Breaker));
                         }
                         #[cfg(feature = "jit")]
@@ -15395,7 +15452,11 @@ impl Interpreter {
             return false;
         };
         // SAFETY: as above; the checks above hold.
-        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, missing, fp, act, guard) };
+        unsafe {
+            self.core_bind_plain::<false>(
+                sw, pc, callee_slot, has_self, missing, false, fp, act, guard,
+            )
+        };
         true
     }
 
@@ -15412,7 +15473,8 @@ impl Interpreter {
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
     /// `fp` (with exactly its arity) under the recursion `guard`, is
     /// pushed and made the running activation. The last `missing`
-    /// parameters take `fp`'s positional defaults.
+    /// parameters take `fp`'s positional defaults. `DIRECT` marks the
+    /// activation a direct call's (see `frame_jit::direct_call`).
     ///
     /// # Safety
     ///
@@ -15421,13 +15483,14 @@ impl Interpreter {
     /// `missing`, see [`Self::defaults_cover`]).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn core_bind_plain(
+    unsafe fn core_bind_plain<const DIRECT: bool>(
         &mut self,
         sw: &mut CoreSwitch,
         pc: usize,
         callee_slot: usize,
         has_self: bool,
         missing: usize,
+        cells: bool,
         fp: *const crate::object::PyFunction,
         mut act: Box<InlineAct>,
         guard: crate::recursion::Guard,
@@ -15490,9 +15553,13 @@ impl Interpreter {
             std::ptr::write(&raw mut fr.globals, borrowed_rc(&(*fp).globals));
             std::ptr::write(&raw mut fr.builtins, borrowed_rc(&(*fp).builtins));
             std::ptr::write(&raw mut act.callable, callable);
+            if cells {
+                Self::bind_call_cells(&mut act, &*fp);
+            }
         }
         act.frame.pc = 0;
         act.parked = false;
+        act.direct = DIRECT;
         act.call_pc = pc;
         // The caller waits on the pending list (see `lean_pending_enter`).
         act.caller_pending = self.core_pending_enter(sw, frame, pc);
@@ -15518,6 +15585,33 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         callee
+    }
+
+    /// [`Self::core_bind_plain`]'s cells for a callee with cell or free
+    /// variables (a direct call's, see `frame_jit::direct_body`): fresh
+    /// cells of its own (its parameters that are cells move into them, as
+    /// `inline_bind` binds them), or its closure's lean cells, which `f`
+    /// holds (see `PyFunction::lean_cells_ref`).
+    ///
+    /// # Safety
+    ///
+    /// `act` is freshly bound to `f` (its locals filled, its cells handle
+    /// a stale copy, overwritten without a drop).
+    #[cold]
+    #[inline(never)]
+    unsafe fn bind_call_cells(act: &mut InlineAct, f: &PyFunction) {
+        // SAFETY: the caller's contract; the code outlives the binding.
+        unsafe {
+            let code: &CodeObject = &*Rc::as_ptr(&act.frame.code);
+            if code.cellvars.is_empty() {
+                let cells = f.lean_cells_ref(code).expect("checked by the call");
+                std::ptr::write(&raw mut act.frame.cells, borrowed_rc(cells));
+            } else {
+                let cells = fresh_cells(f, code, &mut *act.frame.locals.as_ptr());
+                std::ptr::write(&raw mut act.frame.cells, cells);
+                act.owns_cells = true;
+            }
+        }
     }
 
     /// A bound method over a plain function with an empty self slot,
@@ -20545,7 +20639,7 @@ impl Interpreter {
                 .as_deref()
                 .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
             || Self::collapse_flushed(top)
-            || self.gil_countdown <= 2
+            || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20632,7 +20726,7 @@ impl Interpreter {
             }
             // SAFETY: as above.
             unsafe { push_fast(&mut (*cframe).stack, v) };
-            if self.gil_countdown <= 2 {
+            if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
             }
@@ -20672,7 +20766,7 @@ impl Interpreter {
         // (a `StopIteration`), finishes through `quiet_run`.
         if top.act.shell.is_some()
             || top.exhaust_arg == GEN_NEXT_CALL
-            || self.gil_countdown <= 2
+            || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20738,7 +20832,7 @@ impl Interpreter {
         // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
         // SAFETY: as above.
         unsafe { *sw.last = call_pc };
-        if self.gil_countdown <= 2 {
+        if self.countdown_out(2) {
             sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
             return true;
         }
@@ -20785,7 +20879,7 @@ impl Interpreter {
         if top.act.shell.as_deref().is_some_and(|s| {
             !self.shell_pops_quietly(s, top.exc_depth)
                 && (self.exc_info_len() > top.exc_depth || crate::trace::any_observers_active())
-        }) || self.gil_countdown <= 2
+        }) || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20860,7 +20954,7 @@ impl Interpreter {
             // below.
             // SAFETY: as above.
             unsafe { *sw.last = call_pc };
-            if self.gil_countdown <= 2 {
+            if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
             }
@@ -20914,7 +21008,7 @@ impl Interpreter {
                 // SAFETY: as above.
                 unsafe { *sw.last = cur_pc };
                 // The caller's `Returned` entry protocol (`quiet_frame`).
-                if self.gil_countdown <= 2 {
+                if self.countdown_out(2) {
                     sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                     return true;
                 }
@@ -22853,7 +22947,7 @@ impl Interpreter {
                     // hand-off cadence, every loop-generation input
                     // (signals, async exceptions, observers, pending
                     // finalizers), and tier-2 heat are all polled here.
-                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                    if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
                         stop = LeafStop::Breaker;
                         break;
                     }
