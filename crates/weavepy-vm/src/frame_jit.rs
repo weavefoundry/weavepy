@@ -3984,10 +3984,14 @@ pub(crate) struct DirectSite {
     alt_key: usize,
     /// A frameless leaf callee the site evaluates in place (see
     /// [`leaf_site_call`]): its code (a counted reference, `0` none), key,
-    /// and defaults taken.
+    /// and defaults taken; and the one before it (a polymorphic method
+    /// call's other receiver class).
     leaf_code: usize,
     leaf_key: usize,
     leaf_missing: u32,
+    alt_leaf_missing: u32,
+    alt_leaf_code: usize,
+    alt_leaf_key: usize,
     /// Nonzero while the site has a body or a leaf to take: the native
     /// code tries the direct helper first then.
     hot: usize,
@@ -4010,7 +4014,7 @@ const DS_RETRY: i32 = std::mem::offset_of!(DirectSite, retry) as i32;
 
 impl Drop for DirectSite {
     fn drop(&mut self) {
-        for code in [self.code, self.alt_code, self.leaf_code] {
+        for code in [self.code, self.alt_code, self.leaf_code, self.alt_leaf_code] {
             if code != 0 {
                 // SAFETY: each holds the count a fill took.
                 unsafe { drop(Rc::from_raw(code as *const CodeObject)) };
@@ -4050,9 +4054,20 @@ impl DirectSite {
     }
 
     /// Record a frameless leaf callee running `code` (with or without its
-    /// self slot), whose last `missing` parameters take defaults.
+    /// self slot), whose last `missing` parameters take defaults, as the
+    /// site's first leaf, the one it held before becoming its second.
     fn fill_leaf(&mut self, code: &Rc<CodeObject>, has_self: bool, missing: usize) {
         let at = Rc::as_ptr(code) as usize;
+        if self.leaf_code != 0 && at != self.leaf_code {
+            let old = std::mem::replace(&mut self.alt_leaf_code, self.leaf_code);
+            self.leaf_code = 0;
+            if old != 0 {
+                // SAFETY: `old` held the count an earlier fill took.
+                unsafe { drop(Rc::from_raw(old as *const CodeObject)) };
+            }
+            self.alt_leaf_key = self.leaf_key;
+            self.alt_leaf_missing = self.leaf_missing;
+        }
         if at != self.leaf_code {
             let old = std::mem::replace(&mut self.leaf_code, Rc::into_raw(code.clone()) as usize);
             if old != 0 {
@@ -4465,10 +4480,15 @@ unsafe fn direct_call<const CALL: bool>(
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
-            let leaf = CALL && site.leaf_key == key;
+            let leaf = CALL && (site.leaf_key == key || site.alt_leaf_key == key);
             if leaf {
                 // The site's frameless leaf, evaluated in place.
-                if leaf_site_call(st, start, len, site.leaf_missing as usize) {
+                let missing = if site.leaf_key == key {
+                    site.leaf_missing
+                } else {
+                    site.alt_leaf_missing
+                };
+                if leaf_site_call(st, start, len, missing as usize) {
                     return Some(0);
                 }
                 // Declined (a leaf that keeps bailing, or one not warm
