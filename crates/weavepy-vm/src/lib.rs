@@ -16520,6 +16520,48 @@ impl Interpreter {
             }
             return true;
         }
+        // A class whose construction its plan proved to be a store-only
+        // `__init__`'s stores (see `core_store_init`).
+        // SAFETY: as above.
+        let proven = unsafe { ty.instance_plan.peek() }
+            .and_then(Option::as_ref)
+            .filter(|(v, plan)| {
+                *v == ty.attr_version.get()
+                    && plan.store_init.load(std::sync::atomic::Ordering::Relaxed) == 1
+            })
+            .and_then(|(_, plan)| {
+                let (init, code) = plan.lean_init.as_ref()?;
+                // SAFETY: GIL-serialized raw read of the function's code
+                // cell; only the pointer is compared.
+                let same = std::ptr::eq(
+                    unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+                    Rc::as_ptr(code),
+                );
+                let missing = Self::missing_defaults(init, code, argc + 1).filter(|_| same)?;
+                Some((ty.clone(), init.clone(), code.clone(), missing))
+            });
+        if let Some((ty, init, code, missing)) = proven {
+            if self.core_store_init(
+                frame,
+                &ty,
+                &init,
+                &code,
+                None,
+                argc,
+                missing,
+                self_slot,
+                callee_slot,
+                sw.depth_cell,
+            ) {
+                frame.pc = pc as u32 + 1;
+                return true;
+            }
+        }
+        // SAFETY: as above.
+        let frame = unsafe { &mut *sw.cur };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
         let ty = ty.clone();
         let plan = self.instance_plan(&ty);
         // A named tuple: the tuple of the arguments is the whole call (see
@@ -16590,6 +16632,26 @@ impl Interpreter {
         let Some(missing) = Self::lean_init_missing(init, code, argc + 1) else {
             return false;
         };
+        // A store-only `__init__`: the stores themselves, as its sites
+        // last proved them.
+        if matches!(plan.native, crate::types::NativeKind::Plain)
+            && !plan.seeds_exception_args
+            && self.core_store_init(
+                frame,
+                &ty,
+                init,
+                code,
+                Some(&plan.store_init),
+                argc,
+                missing,
+                self_slot,
+                callee_slot,
+                sw.depth_cell,
+            )
+        {
+            frame.pc = pc as u32 + 1;
+            return true;
+        }
         // A leaf `__init__` (plain stores of its arguments into `self`)
         // runs frameless, as a leaf method call does (a plain instance
         // only).
@@ -16682,6 +16744,146 @@ impl Interpreter {
     /// unused instance was never seen).
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
+    /// [`Self::core_new`] for a store-only `__init__` (see
+    /// [`code_store_init`]): a fresh instance takes the arguments (or
+    /// constants) straight into its split values, in the order the
+    /// class's shared names hold them, when every store's site last
+    /// stored there for the class's current version (which proves the
+    /// store a plain `__dict__` one, see `core_store_new_attr`). The
+    /// arguments the stores don't take are released. `false` touches
+    /// nothing.
+    ///
+    /// `proving` is the class plan's verdict to record when the stores
+    /// prove (or disprove) the shape; `None` when the plan proved it.
+    #[allow(clippy::too_many_arguments)]
+    fn core_store_init(
+        &self,
+        frame: &mut Frame,
+        ty: &Rc<TypeObject>,
+        init: &Rc<crate::object::PyFunction>,
+        code: &Rc<CodeObject>,
+        proving: Option<&std::sync::atomic::AtomicU8>,
+        argc: usize,
+        missing: usize,
+        self_slot: usize,
+        callee_slot: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> bool {
+        let Some(shape) = code_store_init(code) else {
+            return false;
+        };
+        let Some(slots) = code_vm_ext(code).and_then(|e| e.field_slots.get()) else {
+            return false;
+        };
+        let ver = ty.attr_version.get();
+        if argc + 1 + missing != code.arg_count as usize
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || ty.instances_need_finalize()
+            || crate::capi_watchers::dicts_active()
+            || crate::gil::free_threading_enabled()
+            // The ordinary call's `RecursionError` check.
+            // SAFETY: this thread's own depth cell.
+            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        if let Some(proving) = proving {
+            // Every store's site must have last stored the next position
+            // of this class version's instances. A site proven for another
+            // position never will be; one that hasn't stored for this
+            // version yet may still.
+            for (k, &(pc, _)) in shape.stores.iter().enumerate() {
+                match slots.get(pc as usize).map(FieldSlot::get) {
+                    Some((v, idx)) if v == ver && idx == k as u32 => {}
+                    Some((v, _)) if v == ver => {
+                        proving.store(2, std::sync::atomic::Ordering::Relaxed);
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        let Some(keys) = ty.shared_keys.get() else {
+            return false;
+        };
+        let consts = code_vm_ext(code).map_or(&[][..], |e| &e.objects[..]);
+        if keys.len() < shape.stores.len()
+            || shape
+                .stores
+                .iter()
+                .any(|&(_, src)| matches!(src, StoreSrc::Const(c) if c as usize >= consts.len()))
+        {
+            return false;
+        }
+        // Committed.
+        let (inst, _) = self.alloc_plain_instance_obj(ty);
+        let Object::Instance(i) = &inst else {
+            unreachable!("a plain class's instance")
+        };
+        // SAFETY: the instance is fresh and unshared.
+        if let Some(split) = unsafe { i.dict.split_cell().peek_mut() } {
+            split.reserve_for(|| ty.shared_keys.share(), keys.len());
+        }
+        // The parameters: the instance, the arguments (moved out of the
+        // stack on their last use), then the defaults.
+        let args = self_slot + 1;
+        let mut left = [0u8; 8];
+        left[..shape.uses.len()].copy_from_slice(&shape.uses);
+        let defaults = &init.defaults[init.defaults.len() - missing..];
+        for (k, &(_, src)) in shape.stores.iter().enumerate() {
+            let value = match src {
+                StoreSrc::Param(0) => inst.clone(),
+                StoreSrc::Param(j) => {
+                    let j = j as usize;
+                    left[j] -= 1;
+                    if j <= argc {
+                        let slot = &mut frame.stack[args + j - 1];
+                        if left[j] == 0 {
+                            std::mem::replace(slot, Object::Unbound)
+                        } else {
+                            slot.clone()
+                        }
+                    } else {
+                        defaults[j - argc - 1].clone()
+                    }
+                }
+                StoreSrc::Const(c) => consts[c as usize].clone(),
+                StoreSrc::Int(n) => Object::Int(n),
+            };
+            // SAFETY: a store with nothing else running; the positions are
+            // the instance's next ones (proved above).
+            if let Err(value) = unsafe { i.split_append(k, value) } {
+                // (Unreachable for a fresh instance over its class's
+                // names; the plain store keeps it correct regardless.)
+                let at = code.instructions[shape.stores[k].0 as usize].arg;
+                if let Some(name) = code_name_obj(code, at) {
+                    i.dict_shared()
+                        .borrow_mut()
+                        .insert(DictKey(name.clone()), value);
+                }
+            }
+        }
+        // The class, the self slot and the arguments the stores left.
+        // SAFETY: the operands leave the stack, each released once.
+        unsafe {
+            let base = frame.stack.as_ptr();
+            let n = frame.stack.len();
+            frame.stack.set_len(callee_slot);
+            for k in callee_slot..n {
+                let o = base.add(k).read();
+                if !matches!(o, Object::Unbound) {
+                    self.release(o);
+                }
+            }
+        }
+        frame.stack.push(inst);
+        if let Some(proving) = proving {
+            proving.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
+
     fn core_leaf_init(
         &self,
         frame: &mut Frame,
@@ -53924,6 +54126,7 @@ impl Interpreter {
             lean_init,
             tuple_new,
             bare_alloc,
+            store_init: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -70248,6 +70451,9 @@ struct CodeConstObjects {
     /// Whether every return is `return None` (see
     /// [`code_returns_only_none`]): `0` not yet decided, `1` no, `2` yes.
     returns_none: std::sync::atomic::AtomicU8,
+    /// The body's store-only `__init__` shape (see [`code_store_init`]),
+    /// or `None` when it isn't one.
+    store_init: std::sync::OnceLock<Option<Box<StoreInit>>>,
     /// The code's name and qualified name as interned strings: a fresh
     /// generator's `gi_name` and `gi_qualname` while its function's names
     /// are untouched.
@@ -72045,6 +72251,103 @@ fn code_returns_only_none(code: &CodeObject) -> bool {
     yes
 }
 
+/// Where a store-only `__init__`'s stored value comes from.
+#[derive(Clone, Copy)]
+enum StoreSrc {
+    /// The parameter at this position (`0` is the instance itself).
+    Param(u32),
+    /// This constant (an index into the code's constant objects).
+    Const(u32),
+    /// A small int literal.
+    Int(i64),
+}
+
+/// A *store-only* `__init__` (see [`code_store_init`]): its attribute
+/// stores into `self`, in order.
+struct StoreInit {
+    /// Each store's `STORE_ATTR` pc and the value it stores.
+    stores: Box<[(u32, StoreSrc)]>,
+    /// How many stores take each parameter (a parameter's last use moves
+    /// it, any earlier one copies it).
+    uses: Box<[u8]>,
+}
+
+/// The store-only shape of `code`: a body that is nothing but
+/// `self.name = <parameter or constant>` statements followed by
+/// `return None` (`RESUME` aside), as most `__init__`s are. Cached in the
+/// code's extension.
+fn code_store_init(code: &CodeObject) -> Option<&StoreInit> {
+    let ext = code_vm_ext(code)?;
+    ext.store_init
+        .get_or_init(|| store_init_shape(code).map(Box::new))
+        .as_deref()
+}
+
+fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
+    let nparams = code.arg_count as usize;
+    if nparams == 0
+        || nparams > 8
+        || code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || !code.cellvars.is_empty()
+        || !code.freevars.is_empty()
+        || Interpreter::has_extended_params(code)
+    {
+        return None;
+    }
+    let ins = &code.instructions;
+    let mut stores = Vec::new();
+    let mut uses = vec![0u8; nparams];
+    let mut pc = 0;
+    while pc < ins.len() {
+        let i = ins[pc];
+        match i.op {
+            OpCode::Resume | OpCode::Nop | OpCode::NotTaken => pc += 1,
+            OpCode::LoadConst
+                if matches!(code.constants.get(i.arg as usize), Some(Constant::None))
+                    && ins.get(pc + 1).is_some_and(|n| n.op == OpCode::ReturnValue) =>
+            {
+                // The final `return None`: the shape holds when nothing
+                // else follows it.
+                if pc + 2 != ins.len() || stores.is_empty() || stores.len() > 16 {
+                    return None;
+                }
+                return Some(StoreInit {
+                    stores: stores.into_boxed_slice(),
+                    uses: uses.into_boxed_slice(),
+                });
+            }
+            _ => {
+                let src = match i.op {
+                    OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+                        if (i.arg as usize) < nparams =>
+                    {
+                        uses[i.arg as usize] = uses[i.arg as usize].checked_add(1)?;
+                        StoreSrc::Param(i.arg)
+                    }
+                    OpCode::LoadConst => StoreSrc::Const(i.arg),
+                    OpCode::LoadSmallInt => StoreSrc::Int(i64::from(i.arg)),
+                    _ => return None,
+                };
+                let recv = ins.get(pc + 1)?;
+                let store = ins.get(pc + 2)?;
+                if !matches!(
+                    recv.op,
+                    OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+                ) || recv.arg != 0
+                    || store.op != OpCode::StoreAttr
+                {
+                    return None;
+                }
+                stores.push((u32::try_from(pc + 2).ok()?, src));
+                pc += 3;
+            }
+        }
+    }
+    None
+}
+
 /// Whether `code` is an *effect leaf* (see `code_pure_leaf_decide`),
 /// deciding its leaf verdicts on first use.
 #[inline]
@@ -72244,6 +72547,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             leaf_sites: std::sync::OnceLock::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
+            store_init: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),

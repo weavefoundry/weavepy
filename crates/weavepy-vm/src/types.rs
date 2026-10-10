@@ -863,6 +863,10 @@ pub struct InstancePlan {
     /// and not a module or generic-alias subclass (whose allocators
     /// differ).
     pub bare_alloc: bool,
+    /// Whether construction is the stores of a store-only `__init__` (see
+    /// `Interpreter::core_store_init`): `0` not yet proven, `1` proven
+    /// for this class version, `2` never.
+    pub store_init: std::sync::atomic::AtomicU8,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
