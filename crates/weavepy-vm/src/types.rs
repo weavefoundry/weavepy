@@ -487,12 +487,24 @@ pub(crate) mod type_cache {
 /// address and the class's attribute version. A small direct-mapped
 /// cache per class: polymorphic sites (one receiver class per iteration)
 /// find every class's answer here with no site cache at all. Storage is
-/// allocated on the first fill; unused classes occupy only one pointer.
+/// allocated on the first fill, [`LEAF_ATTRS_SMALL`] entries at first and
+/// [`LEAF_ATTRS_LARGE`] once two names compete for a full slot pair (most
+/// classes answer only a few names); unused classes occupy only one
+/// pointer.
 ///
 /// Read and written only from the dispatch loop with the GIL held (the
 /// burst is off in free-threaded mode), like the dispatch loop's other
-/// side caches.
-pub struct LeafAttrCache(std::cell::UnsafeCell<Option<Box<[LeafAttrEntry; 32]>>>);
+/// side caches. A reference [`LeafAttrCache::get`] returns must not be
+/// held across a [`LeafAttrCache::set`], which may move the entries.
+pub struct LeafAttrCache(std::cell::Cell<usize>);
+
+/// The entries a class's first [`LeafAttrCache`] fill allocates.
+const LEAF_ATTRS_SMALL: usize = 8;
+/// The entries a [`LeafAttrCache`] grows to.
+const LEAF_ATTRS_LARGE: usize = 32;
+/// The tag bit of a [`LeafAttrCache`]'s table address that marks a
+/// table of [`LEAF_ATTRS_SMALL`] entries (entries are word-aligned).
+const LEAF_ATTRS_SMALL_TAG: usize = 1;
 
 // SAFETY: see the type docs — GIL-serialized access from one thread at a
 // time, never across a Python call.
@@ -557,7 +569,86 @@ pub enum LeafAttrKind {
 
 impl LeafAttrCache {
     pub fn new() -> Self {
-        Self(std::cell::UnsafeCell::new(None))
+        Self(std::cell::Cell::new(0))
+    }
+
+    /// The table, if one was allocated.
+    #[inline]
+    fn table(&self) -> Option<&[LeafAttrEntry]> {
+        let t = self.0.get();
+        if t == 0 {
+            return None;
+        }
+        let len = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL
+        } else {
+            LEAF_ATTRS_LARGE
+        };
+        // SAFETY: a nonzero address (tag removed) is a live table of `len`
+        // entries; GIL-serialized, and no `&mut` escapes `set`.
+        Some(unsafe {
+            std::slice::from_raw_parts((t & !LEAF_ATTRS_SMALL_TAG) as *const LeafAttrEntry, len)
+        })
+    }
+
+    /// The table for writing, allocated (small) on first use.
+    #[allow(clippy::mut_from_ref)]
+    fn table_mut(&self) -> &mut [LeafAttrEntry] {
+        if self.0.get() == 0 {
+            let t: Box<[LeafAttrEntry; LEAF_ATTRS_SMALL]> =
+                Box::new(std::array::from_fn(|_| LeafAttrEntry::EMPTY));
+            self.0
+                .set(Box::into_raw(t) as usize | LEAF_ATTRS_SMALL_TAG);
+        }
+        let t = self.0.get();
+        let len = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL
+        } else {
+            LEAF_ATTRS_LARGE
+        };
+        // SAFETY: as `table`; the exclusive reference lives only for the
+        // caller's update.
+        unsafe {
+            std::slice::from_raw_parts_mut((t & !LEAF_ATTRS_SMALL_TAG) as *mut LeafAttrEntry, len)
+        }
+    }
+
+    /// Release the table, leaving none.
+    fn free(&self) {
+        let t = self.0.replace(0);
+        if t == 0 {
+            return;
+        }
+        let p = t & !LEAF_ATTRS_SMALL_TAG;
+        // SAFETY: the table was allocated as this boxed array (see
+        // `table_mut` and `grow`) and is no longer reachable.
+        unsafe {
+            if t & LEAF_ATTRS_SMALL_TAG != 0 {
+                drop(Box::from_raw(p as *mut [LeafAttrEntry; LEAF_ATTRS_SMALL]));
+            } else {
+                drop(Box::from_raw(p as *mut [LeafAttrEntry; LEAF_ATTRS_LARGE]));
+            }
+        }
+    }
+
+    /// Move a small table's entries into a large one.
+    #[cold]
+    fn grow(&self) {
+        let mut large: Box<[LeafAttrEntry; LEAF_ATTRS_LARGE]> =
+            Box::new(std::array::from_fn(|_| LeafAttrEntry::EMPTY));
+        for e in self.table_mut() {
+            let e = std::mem::replace(e, LeafAttrEntry::EMPTY);
+            if e.name == 0 {
+                continue;
+            }
+            let (i, j) = (Self::index(e.name), Self::alt(e.name));
+            let k = if large[i].name == 0 { i } else { j };
+            if large[k].name == 0 {
+                large[k] = e;
+            }
+        }
+        self.free();
+        self.0.set(Box::into_raw(large) as usize);
     }
 
     #[inline]
@@ -576,34 +667,48 @@ impl LeafAttrCache {
     /// The cached kind for `name` under `ver`, if present.
     #[inline]
     pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
-        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
-        let t = unsafe { &*self.0.get() }.as_deref()?;
-        let e = &t[Self::index(name)];
+        let t = self.table()?;
+        // (Both table lengths are powers of two.)
+        let mask = t.len() - 1;
+        let e = &t[Self::index(name) & mask];
         if e.name == name && e.ver == ver {
             return Some(&e.kind);
         }
-        let e = &t[Self::alt(name)];
+        let e = &t[Self::alt(name) & mask];
         (e.name == name && e.ver == ver).then_some(&e.kind)
     }
 
     #[inline]
     pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
-        // SAFETY: GIL-serialized; the exclusive reference lives only for
-        // the assignment.
-        let t = unsafe { &mut *self.0.get() }.get_or_insert_with(|| {
-            Box::new(std::array::from_fn(|_| LeafAttrEntry {
-                name: 0,
-                ver: 0,
-                kind: LeafAttrKind::Other,
-            }))
-        });
-        let (i, j) = (Self::index(name), Self::alt(name));
         // The first slot unless it holds another name that is still
         // current; then the second, unless that one is too (evict the
-        // first).
+        // first, or grow a small table instead).
         let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != name && e.ver == ver;
+        let mut t = self.table_mut();
+        let mut mask = t.len() - 1;
+        let (i, j) = (Self::index(name), Self::alt(name));
+        if t.len() == LEAF_ATTRS_SMALL && busy(&t[i & mask]) && busy(&t[j & mask]) {
+            self.grow();
+            t = self.table_mut();
+            mask = t.len() - 1;
+        }
+        let (i, j) = (i & mask, j & mask);
         let k = if !busy(&t[i]) || busy(&t[j]) { i } else { j };
         t[k] = LeafAttrEntry { name, ver, kind };
+    }
+}
+
+impl LeafAttrEntry {
+    const EMPTY: LeafAttrEntry = LeafAttrEntry {
+        name: 0,
+        ver: 0,
+        kind: LeafAttrKind::Other,
+    };
+}
+
+impl Drop for LeafAttrCache {
+    fn drop(&mut self) {
+        self.free();
     }
 }
 
@@ -627,22 +732,58 @@ impl std::fmt::Debug for LeafAttrCache {
 
 #[cfg(test)]
 mod leaf_attr_cache_tests {
-    use super::{LeafAttrCache, LeafAttrKind};
+    use super::{LeafAttrCache, LeafAttrKind, LEAF_ATTRS_LARGE, LEAF_ATTRS_SMALL};
     use crate::object::Object;
     use crate::shared_value::SharedStr;
+
+    #[test]
+    fn small_table_grows_when_names_compete_and_keeps_values() {
+        let cache = LeafAttrCache::new();
+        let text = SharedStr::from("moved value");
+        let first = 16;
+        cache.set(first, 1, LeafAttrKind::Value(Object::Str(text.clone())));
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_SMALL));
+        // Two names sharing `first`'s slot pair in the small table, but
+        // neither of its slot in the large one.
+        let small = |n: usize| {
+            (
+                LeafAttrCache::index(n) % LEAF_ATTRS_SMALL,
+                LeafAttrCache::alt(n) % LEAF_ATTRS_SMALL,
+            )
+        };
+        let home = LeafAttrCache::index(first);
+        let rivals: Vec<usize> = (17..1_000_000)
+            .filter(|&n| {
+                small(n) == small(first)
+                    && LeafAttrCache::index(n) != home
+                    && LeafAttrCache::alt(n) != home
+            })
+            .take(2)
+            .collect();
+        cache.set(rivals[0], 1, LeafAttrKind::InstanceOnly);
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_SMALL));
+        cache.set(rivals[1], 1, LeafAttrKind::InstanceOnly);
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_LARGE));
+        assert!(matches!(
+            cache.get(first, 1),
+            Some(LeafAttrKind::Value(Object::Str(value))) if SharedStr::ptr_eq(value, &text)
+        ));
+        assert!(matches!(cache.get(rivals[1], 1), Some(LeafAttrKind::InstanceOnly)));
+        assert_eq!(SharedStr::strong_count(&text), 2);
+        drop(cache);
+        assert_eq!(SharedStr::strong_count(&text), 1);
+    }
 
     #[test]
     fn cold_cache_and_its_clone_do_not_allocate_entries() {
         let cache = LeafAttrCache::new();
         assert_eq!(std::mem::size_of_val(&cache), std::mem::size_of::<usize>());
         assert!(cache.get(16, 1).is_none());
-        // SAFETY: this test owns the cache exclusively.
-        assert!(unsafe { &*cache.0.get() }.is_none());
+        assert!(cache.table().is_none());
         cache.set(16, 1, LeafAttrKind::InstanceOnly);
         let other = cache.clone();
         assert!(other.get(16, 1).is_none());
-        // SAFETY: this test owns the clone exclusively.
-        assert!(unsafe { &*other.0.get() }.is_none());
+        assert!(other.table().is_none());
     }
 
     #[test]
