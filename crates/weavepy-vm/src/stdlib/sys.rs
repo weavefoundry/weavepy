@@ -2826,9 +2826,18 @@ thread_local! {
     static CORO_ORIGIN_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether any thread ever set a nonzero coroutine origin tracking depth:
+/// until one does, every thread's depth is `0` without a thread-local read
+/// (the coroutine constructors ask on every call).
+static CORO_ORIGIN_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Current `sys.get_coroutine_origin_tracking_depth()` value; read by
 /// the interpreter when constructing coroutine objects.
+#[inline]
 pub fn coroutine_origin_tracking_depth() -> i64 {
+    if !CORO_ORIGIN_EVER.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
     CORO_ORIGIN_DEPTH.with(std::cell::Cell::get)
 }
 
@@ -2844,6 +2853,9 @@ fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, Ru
     };
     if depth < 0 {
         return Err(crate::error::value_error("depth must be >= 0"));
+    }
+    if depth != 0 {
+        CORO_ORIGIN_EVER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     CORO_ORIGIN_DEPTH.with(|c| c.set(depth));
     Ok(Object::None)

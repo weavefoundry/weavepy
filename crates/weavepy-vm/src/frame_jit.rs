@@ -463,6 +463,37 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             }
         }
     }
+    // A generator expression's creation (`MAKE_FUNCTION`, the iterable,
+    // `GET_ITER`, `CALL 0`) runs in place through the call helper.
+    for pc in 1..ins.len() {
+        if ins[pc].op == OpCode::Call && ins[pc].arg == 0 && ins[pc - 1].op == OpCode::GetIter {
+            let made = (pc.saturating_sub(16)..pc)
+                .rev()
+                .find(|&k| ins[k].op == OpCode::MakeFunction)
+                .filter(|&k| k > 0 && ins[k - 1].op == OpCode::LoadConst)
+                .and_then(|k| code.constants.get(ins[k - 1].arg as usize));
+            if matches!(made, Some(weavepy_compiler::Constant::Code(c)) if c.is_generator) {
+                helped[pc] = true;
+            }
+        }
+    }
+    // The fallback of an inlined `tuple(...)`, `list(...)`, `all(...)` or
+    // `any(...)` of a generator expression (`LOAD_COMMON_CONSTANT; IS_OP;
+    // POP_JUMP_IF_FALSE` to the plain call, which the inlined loop jumps
+    // over) runs only when the name is rebound: its calls don't count.
+    let mut cold = vec![false; ins.len()];
+    for pc in 0..ins.len().saturating_sub(2) {
+        if ins[pc].op == OpCode::LoadCommonConstant
+            && ins[pc + 1].op == OpCode::IsOp
+            && ins[pc + 2].op == OpCode::PopJumpIfFalse
+        {
+            let from = pc + 3 + ins[pc + 2].arg as usize;
+            if from > pc + 3 && from <= ins.len() && ins[from - 1].op == OpCode::JumpForward {
+                let to = (from + ins[from - 1].arg as usize).min(ins.len());
+                cold[from..to].iter_mut().for_each(|c| *c = true);
+            }
+        }
+    }
     let t = tuning();
     // What running an instruction natively saves, in halves of an
     // in-line instruction's: one run in line saves its whole dispatch and
@@ -513,7 +544,11 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::PopExcept
             | OpCode::DeleteFast
             | OpCode::StoreSlice
-            | OpCode::DeleteSubscr => false,
+            | OpCode::DeleteSubscr
+            | OpCode::GetAwaitable
+            | OpCode::GetYieldFromIter
+            | OpCode::Send
+            | OpCode::EndSend => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -556,6 +591,9 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         let top = (pc + 1).saturating_sub(i.arg as usize);
         let (mut n, mut exits) = (0usize, 0usize);
         for (k, ins_k) in ins.iter().enumerate().take(pc + 1).skip(top) {
+            if cold[k] {
+                continue;
+            }
             match gain(k) {
                 Some(g) => n += g,
                 // (A loop's epilogue inside a region a handler's back edge
@@ -568,7 +606,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
                 // A resume ends at its yield whether or not the body runs
                 // natively: no round trip to pay for.
                 None if ins_k.op == OpCode::YieldValue
-                    && (matches!(at, Heat::Step) || code.is_generator) => {}
+                    && (matches!(at, Heat::Step)
+                        || code.is_generator
+                        || code.is_coroutine
+                        || code.is_async_generator) => {}
                 None => exits += 1,
             }
         }
@@ -1166,7 +1207,14 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                     *index += 1;
                     v
                 }
-                None if unique && owner.is_none() => {
+                // A shared iterator (a generator expression's `.0`, which
+                // its local holds too) detaches from the list, as the core
+                // loop's arm does, so a later append can't resurrect it
+                // (when the list lives on: its release frees nothing).
+                None if owner.is_none() && (unique || crate::sync::Rc::strong_count(items) > 1) => {
+                    if !unique {
+                        *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
+                    }
                     // SAFETY: as above.
                     drop(unsafe { it.read() });
                     return 2;
@@ -1174,21 +1222,22 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 None => return 3,
             }
         }
-        PyIterator::Tuple { items, index } => match items.get(*index) {
-            Some(v) => {
-                let v = v.clone();
-                *index += 1;
-                v
-            }
-            // The exhausted iterator leaves the stack, as for a list: its
-            // tuple has another owner, so nothing dies with it.
-            None if unique && crate::object::SharedTuple::strong_count(items) > 1 => {
-                // SAFETY: as above.
+        PyIterator::Tuple { items, index } => {
+            let Some(v) = items.get(*index).cloned() else {
+                // The exhausted iterator leaves the stack (as the core
+                // loop's arm retires it), when its release can't free the
+                // tuple (whose items could queue finalizers): a shared
+                // iterator stays exhausted, the tuple immutable.
+                if unique && crate::shared_value::ThinArc::strong_count(items) == 1 {
+                    return 3;
+                }
+                // SAFETY: the iterator leaves the stack.
                 drop(unsafe { it.read() });
                 return 2;
-            }
-            None => return 3,
-        },
+            };
+            *index += 1;
+            v
+        }
         // `reversed(xs)`: the item below the cursor.
         PyIterator::Reversed { items, index, .. } => {
             if *index < 0 {
@@ -3462,6 +3511,99 @@ unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
     }
 }
 
+/// `GET_AWAITABLE` (`kind` 0) or `GET_YIELD_FROM_ITER` (`kind` 1) of the
+/// value at `at` (the stack's top), as the core loop's arms run them: `0`
+/// the delegate in place (a coroutine nothing has started, a generator,
+/// or an instance's generator `__await__` / `__iter__`, made here),
+/// anything else declined untouched.
+unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) -> u32 {
+    // SAFETY: the code passes its live state and its initialized top slot.
+    unsafe {
+        let st = &*st;
+        let top = &*at;
+        let ok = if kind == 0 {
+            match top {
+                // A read between instructions.
+                Object::Coroutine(g) => g
+                    .state
+                    .peek()
+                    .is_some_and(|s| matches!(s, crate::object::GeneratorState::Created(_))),
+                // A `types.coroutine` generator is its own.
+                Object::Generator(g) => {
+                    matches!(&g.code, Object::Code(c) if c.is_iterable_coroutine)
+                }
+                _ => false,
+            }
+        } else {
+            let code = &(*st.frame).code;
+            match top {
+                Object::Generator(_) => true,
+                Object::Coroutine(_) => code.is_coroutine || code.is_iterable_coroutine,
+                _ => false,
+            }
+        };
+        if ok {
+            return 0;
+        }
+        if matches!(top, Object::Instance(_)) && Interpreter::core_droppable(top) {
+            let name = if kind == 0 { "__await__" } else { "__iter__" };
+            if let Some(gen) = (*st.interp).instance_gen_call(top, name) {
+                // The instance (droppable) is replaced in place.
+                crate::drop_hot(std::mem::replace(&mut *at, gen));
+                return 0;
+            }
+        }
+        1
+    }
+}
+
+/// `SEND` at `pc` of the running activation, its stack `len` deep: the
+/// generator or coroutine below the top resumed and switched to as the
+/// core loop's arm does (`RELOAD`); anything else (another delegate, or
+/// a generator's fast step, which never switches) declined untouched.
+unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
+    // SAFETY: the code passes its live state and its stack depth (the
+    // delegate and the sent value on top).
+    unsafe {
+        let st = &mut *st;
+        let len = len as usize;
+        if st.sw.is_null()
+            || len < 2
+            || !matches!(
+                &*st.stack.add(len - 2),
+                Object::Generator(_) | Object::Coroutine(_)
+            )
+        {
+            return 1;
+        }
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::Send) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+        }
+        RELOAD
+    }
+}
+
+/// `END_SEND` on the slots at `at` (the delegate) and above it (the
+/// result): the result moves down over the delegate, which leaves by a
+/// plain decrement (`0`); anything else declined untouched.
+unsafe extern "C" fn h_end_send(at: *mut Object) -> u32 {
+    // SAFETY: the code passes two initialized slots atop its stack.
+    unsafe {
+        if !Interpreter::core_droppable(&*at) {
+            return 1;
+        }
+        let v = at.add(1).read();
+        crate::drop_hot(std::mem::replace(&mut *at, v));
+        0
+    }
+}
+
 /// `LOAD_DEREF i` of the running frame, as the core loop's arm runs it:
 /// `0` the cell's value written to the free slot `dst`, anything else
 /// declined untouched.
@@ -4156,6 +4298,10 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::DeleteFast
             | OpCode::StoreSlice
             | OpCode::DeleteSubscr
+            | OpCode::GetAwaitable
+            | OpCode::GetYieldFromIter
+            | OpCode::Send
+            | OpCode::EndSend
     )
 }
 
@@ -4766,6 +4912,11 @@ impl<'a> Lower<'a> {
                 OpCode::JumpBackward => Some(next.saturating_sub(ins.arg as usize)),
                 _ => None,
             };
+            // A `SEND`'s exit (`END_SEND`), where a delegate's return
+            // resumes the activation.
+            if ins.op == OpCode::Send && next + (ins.arg as usize) < n {
+                starts[next + ins.arg as usize] = true;
+            }
             if let Some(t) = target {
                 if t < n {
                     starts[t] = true;
@@ -5328,6 +5479,55 @@ impl<'a> Lower<'a> {
             // helper; a generator body's return isn't a switch.)
             OpCode::Call => return self.call_op(pc, ins.arg as usize),
             OpCode::CallKw => return self.call_kw(pc),
+            // `await`'s and `yield from`'s delegate, through `h_await_iter`.
+            OpCode::GetAwaitable | OpCode::GetYieldFromIter if self.depth > 0 => {
+                let s = self.top_to_mem();
+                let at = self.slot_addr(s);
+                let k = self
+                    .b
+                    .ins()
+                    .iconst(types::I64, i64::from(ins.op == OpCode::GetYieldFromIter));
+                let r = self
+                    .call(h_await_iter as *const () as usize, &[self.st, at, k], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                // (A replaced instance's release may queue a finalizer.)
+                self.set_last(pc);
+                self.check_released(pc + 1);
+                true
+            }
+            // The delegate resumes as the running activation (`h_send`):
+            // the block ends either way.
+            OpCode::Send if self.depth >= 2 => {
+                self.flush();
+                self.store_last();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let r = self
+                    .call(h_send as *const () as usize, &[self.st, pcv, len], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let switched = self.b.create_block();
+                let reload = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RELOAD));
+                self.b.ins().brif(reload, switched, &[], out, &[]);
+                self.b.switch_to_block(switched);
+                self.b.ins().return_(&[r]);
+                return false;
+            }
+            OpCode::EndSend if self.depth >= 2 => {
+                self.flush();
+                let at = self.slot_addr(self.depth - 2);
+                let r = self
+                    .call(h_end_send as *const () as usize, &[at], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                self.depth -= 1;
+                self.set_last(pc);
+                self.check_released(pc + 1);
+                true
+            }
             OpCode::ReturnValue if !self.is_gen() && self.depth > 0 => {
                 self.flush();
                 self.store_last();

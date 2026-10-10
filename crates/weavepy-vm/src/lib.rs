@@ -3888,6 +3888,34 @@ impl Interpreter {
         Rc::new(RefCell::new(v))
     }
 
+    /// An empty locals vector with room for `n`, recycled when the pool
+    /// has one this frame can own (see [`Self::pooled_locals_from_args`]).
+    #[inline]
+    fn pooled_locals_empty(&self, n: usize) -> Rc<RefCell<Vec<Object>>> {
+        let pooled = {
+            let mut pool = self.frame_locals_pool.borrow_mut();
+            loop {
+                match pool.pop() {
+                    Some(rc) if Rc::strong_count(&rc) == 1 => break Some(rc),
+                    // Still shared: only our clone is dropped (no element
+                    // destructor runs under the borrow).
+                    Some(_) => (),
+                    None => break None,
+                }
+            }
+        };
+        match pooled {
+            Some(rc) => {
+                // SAFETY: sole owner, checked at the pop above.
+                let v = unsafe { &mut *rc.as_ptr() };
+                debug_assert!(v.is_empty());
+                v.reserve(n);
+                rc
+            }
+            None => Rc::new(RefCell::new(Vec::with_capacity(n))),
+        }
+    }
+
     /// RFC 0061 (WS3b): fetch a recycled argument-staging vector, or
     /// allocate one. Deliberately a separate pool from
     /// [`Self::pooled_stack`] — see the `scratch_pool` field docs.
@@ -13492,7 +13520,24 @@ impl Interpreter {
                             frame.pc = pc as u32;
                             *last_pc = last;
                             let switched = if python == 1 {
-                                self.core_call(sw, pc) || self.core_gen_call(sw, pc)
+                                if self.core_call(sw, pc) {
+                                    true
+                                } else if self.core_gen_call(sw, pc) {
+                                    // The generator, made in place: no switch,
+                                    // so the loop goes on (unless a release
+                                    // queued a finalizer).
+                                    if sw.pending.is_none() {
+                                        // SAFETY: the running activation (its
+                                        // stack only shrank: no reallocation).
+                                        len = unsafe { (*sw.cur).stack.len() };
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
                             } else {
                                 let new = self.core_new(sw, pc, snap_gen);
                                 if new {
@@ -55972,22 +56017,34 @@ impl Interpreter {
         // CPython snapshots the *function's* current `__name__` and
         // `__qualname__` (which user code may have reassigned) into
         // `gi_name`/`gi_qualname` at call time, sharing the objects.
+        // A generator-family body's activations never start at pc 0, where
+        // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
+        // its creation counts instead.
+        #[cfg(feature = "jit")]
+        if let Some(ext) = code_vm_ext(code) {
+            ext.frame_jit
+                .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
+        }
         let gen_code = Object::Code(frame.code.clone());
-        let gen = if f.names_seeded() {
-            // The code's names, which the generator reads by default.
-            PyGenerator::new(kind, gen_code, Box::new(frame))
-        } else {
-            let (name, qualname) = f.name_objects();
-            PyGenerator::with_names(
-                name.unwrap_or_else(|| Object::from_str(f.name.clone())),
-                qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
-                kind,
-                gen_code,
-                Box::new(frame),
-            )
-        };
-        let gen = Rc::new(gen);
-        Self::set_frame_gen_owner(&gen);
+        let mut frame = frame;
+        // The frame's weak backlink (see `set_frame_gen_owner`), stamped as
+        // the generator is made.
+        let gen = Rc::new_cyclic(|owner| {
+            frame.gen_owner = Some(owner.clone());
+            if f.names_seeded() {
+                // The code's names, which the generator reads by default.
+                PyGenerator::new(kind, gen_code, Box::new(frame))
+            } else {
+                let (name, qualname) = f.name_objects();
+                PyGenerator::with_names(
+                    name.unwrap_or_else(|| Object::from_str(f.name.clone())),
+                    qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+                    kind,
+                    gen_code,
+                    Box::new(frame),
+                )
+            }
+        });
         let obj = if code.is_coroutine {
             Object::Coroutine(gen)
         } else if code.is_async_generator {
@@ -56064,11 +56121,29 @@ impl Interpreter {
         if missing > 0 && (missing > f.defaults.len() || f.defaults_maybe_overridden()) {
             return None;
         }
+        let ext = code_vm_ext(code)?;
+        match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext),
+            u32::MAX => None,
+            at => Some(at as usize - 1),
+        }
+    }
+
+    /// [`Self::generator_start`]'s scan of `code`'s prologue, remembered
+    /// in its extension table.
+    #[cold]
+    #[inline(never)]
+    fn generator_start_scan(code: &CodeObject, ext: &CodeConstObjects) -> Option<usize> {
         let start = code
             .instructions
             .iter()
-            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))?;
-        (code.instructions[start].op == OpCode::ReturnGenerator).then_some(start)
+            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
+            .filter(|&start| code.instructions[start].op == OpCode::ReturnGenerator);
+        ext.gen_start.store(
+            start.map_or(u32::MAX, |at| at as u32 + 1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        start
     }
 
     /// [`Self::start_generator_fast`] once [`Self::generator_start`] has
@@ -56084,15 +56159,61 @@ impl Interpreter {
         if missing > 0 {
             positional.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
-        let mut frame = self.make_frame(
-            code.clone(),
-            positional,
-            f.closure.clone(),
-            f.globals.clone(),
-            Some(f.builtins.clone()),
-        );
-        frame.pc = start as u32 + 1;
+        let frame = match f.lean_cells_ref(code) {
+            // No cells of its own: the function's (see `core_gen_call`).
+            Some(cells) => {
+                let locals = self.pooled_locals_from_args(&mut positional, code.varnames.len());
+                self.recycle_scratch(positional);
+                let mut frame = Self::gen_frame_lean(f, code.clone(), locals, cells.clone(), start);
+                frame.stack = self.pooled_stack();
+                frame
+            }
+            None => {
+                let mut frame = self.make_frame(
+                    code.clone(),
+                    positional,
+                    f.closure.clone(),
+                    f.globals.clone(),
+                    Some(f.builtins.clone()),
+                );
+                frame.pc = start as u32 + 1;
+                frame
+            }
+        };
         Self::wrap_started_generator(f, code, frame)
+    }
+
+    /// The frame of a generator-family call of `f` (its code `code`, which
+    /// defines no cells of its own) with its `locals` filled and `cells`
+    /// the function's, just past the `RETURN_GENERATOR` at `start`.
+    #[inline]
+    fn gen_frame_lean(
+        f: &PyFunction,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        start: usize,
+    ) -> Frame {
+        Frame {
+            code,
+            locals,
+            cells,
+            stack: Vec::new(),
+            globals: f.globals.clone(),
+            builtins: f.builtins.clone(),
+            rare: None,
+            exc: None,
+            agen_yielded_value: true,
+            pc: start as u32 + 1,
+            py_frame: None,
+            gen_owner: None,
+            suppress_call_event: false,
+            gen_first_resume: false,
+            sent_consumed: false,
+            shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
+        }
     }
 
     /// The core loop's `CALL` at `pc` of a generator function (a plain
@@ -56122,34 +56243,58 @@ impl Interpreter {
             }
             _ => return false,
         };
-        let code = f.code();
-        let Some(start) = self.generator_start(f, &code, argc + usize::from(receiver.is_some()))
+        // SAFETY: GIL-serialized raw read of the function's code cell (the
+        // callee on the stack holds the function).
+        let code_ref: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let Some(start) =
+            self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))
         else {
             return false;
         };
+        let code = code_ref.clone();
+        // A body without cells of its own shares the function's (see
+        // `PyFunction::lean_cells`), and its frame is built right here.
+        let cells = f.lean_cells_ref(&code).cloned();
         // Committed: the arguments move into the generator's frame, and
         // the callee and its self slot leave the stack (one that dies
         // queues its finalizer, which runs before the next instruction).
-        let mut positional = self.pooled_scratch();
         let mut ops = frame.stack.drain(callee_at..);
         let callee = ops.next().expect("checked above");
         let slot = ops.next().expect("checked above");
-        let callee_receiver = match &callee {
-            Object::BoundMethod(bm) => Some(bm.receiver.clone()),
-            _ => None,
-        };
-        positional.extend(callee_receiver);
-        positional.extend((!matches!(slot, Object::Unbound)).then_some(slot));
-        positional.extend(ops);
-        let gen = match &callee {
-            Object::Function(f) => self.start_generator_at(f, &code, positional, start),
-            Object::BoundMethod(bm) => {
-                let Object::Function(f) = &bm.function else {
-                    unreachable!("checked above");
-                };
-                self.start_generator_at(f, &code, positional, start)
-            }
+        let (f, callee_receiver) = match &callee {
+            Object::Function(f) => (f, None),
+            Object::BoundMethod(bm) => match &bm.function {
+                Object::Function(f) => (f, Some(bm.receiver.clone())),
+                _ => unreachable!("checked above"),
+            },
             _ => unreachable!("checked above"),
+        };
+        let gen = if let Some(cells) = cells {
+            // The arguments move straight into the locals (no staging).
+            let nlocals = code.varnames.len();
+            let locals = self.pooled_locals_empty(nlocals);
+            {
+                // SAFETY: sole owner (see `pooled_locals_empty`).
+                let v = unsafe { &mut *locals.as_ptr() };
+                v.extend(callee_receiver);
+                v.extend((!matches!(slot, Object::Unbound)).then_some(slot));
+                v.extend(ops);
+                let missing = (code.arg_count as usize).saturating_sub(v.len());
+                if missing > 0 {
+                    v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+                }
+                v.resize(nlocals, Object::Unbound);
+            }
+            let mut gen_frame = Self::gen_frame_lean(f, code, locals, cells, start);
+            gen_frame.stack = self.pooled_stack();
+            let code = Rc::clone(&gen_frame.code);
+            Self::wrap_started_generator(f, &code, gen_frame)
+        } else {
+            let mut positional = self.pooled_scratch();
+            positional.extend(callee_receiver);
+            positional.extend((!matches!(slot, Object::Unbound)).then_some(slot));
+            positional.extend(ops);
+            self.start_generator_at(f, &code, positional, start)
         };
         self.release(callee);
         frame.stack.push(gen);
@@ -70603,6 +70748,11 @@ struct CodeConstObjects {
     /// Whether the code is a generator body fast steps run (see
     /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
     gen_fast: std::sync::atomic::AtomicU8,
+    /// The `RETURN_GENERATOR` a generator-family call of the code starts
+    /// past (see `Interpreter::generator_start`): `0` not yet scanned,
+    /// `u32::MAX` none (the prologue holds something else), else its pc
+    /// plus one.
+    gen_start: std::sync::atomic::AtomicU32,
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
     field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
@@ -72718,6 +72868,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             leaf_tries: std::sync::atomic::AtomicU64::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
+            gen_start: std::sync::atomic::AtomicU32::new(0),
             field_slots: std::sync::OnceLock::new(),
             native_sites: std::sync::OnceLock::new(),
             instance_sites: std::sync::OnceLock::new(),
