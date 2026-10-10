@@ -15160,51 +15160,63 @@ impl Interpreter {
         let Some(callee_at) = n.checked_sub(argc + 2) else {
             return false;
         };
-        let (b, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
-            (Object::Builtin(b), Object::Unbound) => (b, None),
-            (Object::Builtin(b), recv) => (b, Some(recv)),
+        if argc >= MAX_ARGS {
+            return false;
+        }
+        let recv_ok = |b: &crate::object::BuiltinFn, recv: &Object| {
+            b.binds_instance
+                && (!via_call
+                    || builtins::method_memo_tag(recv).is_some()
+                    || exception_init_call(b, recv)
+                    || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                        && matches!(recv, Object::Instance(_))))
+        };
+        let ok = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+            (Object::Builtin(b), Object::Unbound) => !b.binds_instance,
+            (Object::Builtin(b), recv) => recv_ok(b, recv),
             (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                 match &bm.function {
-                    Object::Builtin(b) => (b, Some(&bm.receiver)),
-                    _ => return false,
+                    Object::Builtin(b) => recv_ok(b, &bm.receiver),
+                    _ => false,
                 }
             }
-            _ => return false,
+            _ => false,
         };
-        let ok = argc < MAX_ARGS
-            && match receiver {
-                Some(recv) => {
-                    b.binds_instance
-                        && (!via_call
-                            || builtins::method_memo_tag(recv).is_some()
-                            || exception_init_call(b, recv)
-                            || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
-                                && matches!(recv, Object::Instance(_))))
-                }
-                None => !b.binds_instance,
-            };
         if !ok {
             return false;
         }
-        let (b, receiver) = (b.clone(), receiver.cloned());
-        // Committed. The receiver and the arguments move into `buf`; the
-        // self slot and the callable leave the stack.
+        // Committed. The callable and the self slot leave the stack, the
+        // receiver (the self slot's, moved, or a bound method's) and the
+        // arguments into `buf`.
         let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX_ARGS + 1];
-        let first = usize::from(receiver.is_some());
-        if let Some(receiver) = receiver {
-            buf[0].write(receiver);
-        }
-        // SAFETY: the `argc` operands above the self slot move into `buf`
-        // (`argc < MAX_ARGS`) and the stack forgets them.
-        unsafe {
-            let src = frame.stack.as_ptr().add(callee_at + 2);
-            for k in 0..argc {
-                buf[first + k].write(src.add(k).read());
+        // SAFETY: the callable, the self slot and the `argc` operands
+        // above it leave the stack, which forgets them (`argc < MAX_ARGS`).
+        let (callable, moved_self) = unsafe {
+            let base = frame.stack.as_ptr().add(callee_at);
+            let callable = base.read();
+            let self_slot = base.add(1).read();
+            let moved_self = !matches!(self_slot, Object::Unbound);
+            if moved_self {
+                buf[0].write(self_slot);
+            } else if let Object::BoundMethod(bm) = &callable {
+                buf[0].write(bm.receiver.clone());
             }
-            frame.stack.set_len(callee_at + 2);
-        }
-        let self_slot = frame.stack.pop();
-        let callable = frame.stack.pop();
+            let first = usize::from(moved_self || matches!(callable, Object::BoundMethod(_)));
+            for k in 0..argc {
+                buf[first + k].write(base.add(2 + k).read());
+            }
+            frame.stack.set_len(callee_at);
+            (callable, moved_self)
+        };
+        let b: &crate::object::BuiltinFn = match &callable {
+            Object::Builtin(b) => b,
+            Object::BoundMethod(bm) => match &bm.function {
+                Object::Builtin(b) => b,
+                _ => unreachable!("checked above"),
+            },
+            _ => unreachable!("checked above"),
+        };
+        let first = usize::from(moved_self || matches!(callable, Object::BoundMethod(_)));
         frame.pc = pc as u32 + 1;
         // SAFETY: the first `first + argc` entries were written above.
         let ops = unsafe {
@@ -15214,7 +15226,10 @@ impl Interpreter {
         let pending = self.core_pending_enter(sw, frame, pc);
         let result = if via_call {
             let globals = frame.globals.clone();
-            self.call(&Object::Builtin(b.clone()), ops, &[], &globals)
+            match &callable {
+                Object::Builtin(_) => self.call(&callable, ops, &[], &globals),
+                _ => self.call(&bm_builtin(&callable), ops, &[], &globals),
+            }
         } else {
             match b.call_kw.as_ref() {
                 Some(call_kw) => call_kw(ops, &[]),
@@ -15222,28 +15237,26 @@ impl Interpreter {
             }
         };
         self.core_pending_exit(sw, pending);
-        // The operands drop as the full handler's do, after the call.
+        // The operands drop as the full handler's do, after the call: the
+        // arguments plainly, the receiver the self slot held and the
+        // callable as the full handler releases them (a scalar or a shared
+        // builtin by a plain drop).
         // SAFETY: each initialized entry drops exactly once; `buf` itself
         // has no drop glue.
-        unsafe { std::ptr::drop_in_place(ops) };
-        for o in [callable, self_slot].into_iter().flatten() {
-            // A scalar or a shared builtin leaves by a plain drop; anything
-            // else as the full handler releases it.
-            if matches!(
-                o,
-                Object::Int(_)
-                    | Object::Float(_)
-                    | Object::Bool(_)
-                    | Object::None
-                    | Object::Unbound
-                    | Object::Builtin(_)
-            ) {
-                drop(o);
+        unsafe {
+            if moved_self {
+                let receiver = ops.as_ptr().read();
+                std::ptr::drop_in_place(&mut ops[1..]);
+                self.release(receiver);
             } else {
-                self.release(o);
+                std::ptr::drop_in_place(ops);
             }
         }
-        drop(b);
+        if matches!(callable, Object::Builtin(_)) {
+            drop(callable);
+        } else {
+            self.release(callable);
+        }
         match result {
             Ok(v) => {
                 // SAFETY: as above (the body ran nested activations of its
@@ -26251,18 +26264,35 @@ impl Interpreter {
     /// the default. `None` for anything else (descriptors, dunders, a
     /// missing attribute's `AttributeError`), which the full call handles.
     fn leaf_getattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-        let (recv, Object::Str(name_obj)) = (args.first()?, args.get(1)?) else {
+        if args.len() > 3 {
+            return None;
+        }
+        Self::leaf_getattr_parts(args.first()?, args.get(1)?, args.get(2), false).map(Ok)
+    }
+
+    /// [`Self::leaf_getattr`] on its parts, `default` the third argument's
+    /// value if any. With `probe` (`hasattr`), the value found matters
+    /// only as present: a method found to bind is answered with `True`
+    /// instead of a bound method, and a built-in kind's method (see
+    /// [`builtins::lookup_method`]) is found without binding it.
+    fn leaf_getattr_parts(
+        recv: &Object,
+        name_arg: &Object,
+        default: Option<&Object>,
+        probe: bool,
+    ) -> Option<Object> {
+        let Object::Str(name_obj) = name_arg else {
             return None;
         };
         let name: &str = name_obj;
-        if args.len() > 3 || crate::object::exotic_str_keys_possible() {
+        if crate::object::exotic_str_keys_possible() {
             return None;
         }
         let inst = match recv {
             Object::Instance(inst) => inst,
             // A function's stored attribute (`__doc__` once read,
             // `__wrapped__`).
-            Object::Function(f) => return function_stored_attr(f, name_obj).map(Ok),
+            Object::Function(f) => return function_stored_attr(f, name_obj),
             // A plain module's global (`hasattr(os, 'getpid')`): its
             // dictionary's value (`ModuleType`'s descriptors are dunders;
             // a missing name may reach a module `__getattr__`).
@@ -26272,19 +26302,28 @@ impl Interpreter {
                 return m
                     .dict
                     .borrow()
-                    .get(&DictKey(args[1].clone()))
-                    .cloned()
-                    .map(Ok);
+                    .get(&crate::object::StrKey(name))
+                    .cloned();
+            }
+            // A built-in kind's method (`hasattr(stream, "write")`): its
+            // lookup runs no code, and a found method means the attribute
+            // is there.
+            _ if probe
+                && !name.starts_with('_')
+                && builtins::method_memo_tag(recv).is_some()
+                && builtins::lookup_method(recv, name).is_some() =>
+            {
+                return Some(Object::Bool(true));
             }
             _ => return None,
         };
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
         // default.
         if name.starts_with("__") {
-            if args.len() == 3 && attr_certainly_missing(&args[0], name) {
-                return Some(Ok(args[2].clone()));
+            if let Some(d) = default.filter(|_| attr_certainly_missing(recv, name)) {
+                return Some(d.clone());
             }
-            return Self::leaf_builtin_dunder_attr(inst, &args[0], name).map(Ok);
+            return Self::leaf_builtin_dunder_attr(inst, recv, name);
         }
         let cls = inst.cls_raw();
         if cls.native_kind.get() != 0
@@ -26312,18 +26351,19 @@ impl Interpreter {
             return None;
         }
         if let Some(v) = inst.attr_get_str(name) {
-            return Some(Ok(v));
+            return Some(v);
         }
-        Some(Ok(match on_class {
+        Some(match on_class {
+            Some(Object::Function(_)) if probe => Object::Bool(true),
             Some(f @ Object::Function(_)) => {
-                Object::BoundMethod(Rc::new(BoundMethod::new(args[0].clone(), f)))
+                Object::BoundMethod(Rc::new(BoundMethod::new(recv.clone(), f)))
             }
             Some(v) => v,
-            None if args.len() == 3 && !cls.dunder(crate::types::Dunder::GetAttr).present() => {
-                args[2].clone()
+            None if default.is_some() && !cls.dunder(crate::types::Dunder::GetAttr).present() => {
+                default?.clone()
             }
             None => return None,
-        }))
+        })
     }
 
     /// A dunder a plain instance gets from a builtin method on its class
@@ -26371,11 +26411,9 @@ impl Interpreter {
         let [obj, name] = args else {
             return None;
         };
-        let probe = [obj.clone(), name.clone(), Object::Unbound];
-        match Self::leaf_getattr(&probe)? {
-            Ok(Object::Unbound) => Some(Ok(Object::Bool(false))),
-            Ok(_) => Some(Ok(Object::Bool(true))),
-            Err(_) => None,
+        match Self::leaf_getattr_parts(obj, name, Some(&Object::Unbound), true)? {
+            Object::Unbound => Some(Ok(Object::Bool(false))),
+            _ => Some(Ok(Object::Bool(true))),
         }
     }
 
@@ -71612,6 +71650,15 @@ pub(crate) fn native_call_ic_safe(name: &str) -> bool {
 /// exception class.
 fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
     b.name == "__init__" && matches!(recv, Object::Instance(i) if i.cls_raw().flags.is_exception)
+}
+
+/// The builtin function a bound method of one wraps, as its own callable.
+#[cold]
+fn bm_builtin(callable: &Object) -> Object {
+    match callable {
+        Object::BoundMethod(bm) => bm.function.clone(),
+        other => other.clone(),
+    }
 }
 
 /// Builtin type methods the interpreter dispatches by name (their bodies
