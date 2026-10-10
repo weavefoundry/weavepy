@@ -3551,6 +3551,22 @@ impl<'a> LeafProbe<'a> {
         })
     }
 
+    /// A probe for a class that hashes and compares by identity (see
+    /// [`type_hash_is_identity`]), checked by the caller.
+    #[inline(always)]
+    pub(crate) fn identity_type(key: &'a Object) -> Self {
+        let hash = match key {
+            // (As `identity_hash` hashes a class.)
+            Object::Type(t) => pointer_hash(Rc::as_ptr(t).cast()),
+            _ => identity_hash(key),
+        };
+        Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        }
+    }
+
     /// [`Self::new`]'s hash for a key other than a `str` or an `int`.
     #[inline(never)]
     fn other_hash(key: &Object) -> Option<i64> {
@@ -3633,6 +3649,8 @@ impl crate::dictmap::Probe for LeafProbe<'_> {
                 SharedStr::ptr_eq(a, b) || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
             }
             (Object::Int(a), Object::Int(b)) => a == b,
+            // The same class (a class probe meets its own entry).
+            (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.other_eq(key),
         }
     }
@@ -13146,20 +13164,24 @@ pub fn py_wstr_hash(cps: &[u32]) -> i64 {
     py_hash_bytes_slice(&buf)
 }
 
+/// CPython's pointer hash of the allocation at `p` (see [`identity_hash`]).
+#[inline(always)]
+pub(crate) fn pointer_hash(p: *const ()) -> i64 {
+    let u = p as usize as u64;
+    let v = u.rotate_right(4) as i64;
+    if v == -1 {
+        -2
+    } else {
+        v
+    }
+}
+
 /// Identity-based hash for objects that hash by allocation identity in
 /// CPython (functions, types, modules, plain instances without a custom
 /// `__hash__`, …). Mirrors CPython's pointer hash: rotate so the low
 /// alignment zero-bits don't waste bucket entropy, remapping `-1` to `-2`.
 pub(crate) fn identity_hash(obj: &Object) -> i64 {
-    fn rot(p: *const ()) -> i64 {
-        let u = p as usize as u64;
-        let v = u.rotate_right(4) as i64;
-        if v == -1 {
-            -2
-        } else {
-            v
-        }
-    }
+    let rot = pointer_hash;
     match obj {
         Object::Function(r) => rot(Rc::as_ptr(r).cast()),
         Object::Builtin(r) => rot(Rc::as_ptr(r).cast()),

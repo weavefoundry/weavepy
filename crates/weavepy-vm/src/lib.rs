@@ -25036,31 +25036,8 @@ impl Interpreter {
     /// hands the instruction to the full handler (which restarts the scan:
     /// nothing observable happened here).
     fn leaf_contains(container: &Object, item: &Object) -> Option<bool> {
-        // A `str` or machine `int` in a set or dict, the commonest test,
-        // probed in line.
-        if let (
-            Object::Set(_) | Object::FrozenSet(_) | Object::Dict(_),
-            Object::Str(_) | Object::Int(_),
-        ) = (container, item)
-        {
-            if let Some(probe) = crate::object::LeafProbe::new(item) {
-                let found = match container {
-                    // SAFETY: a read between two instructions (the probe
-                    // runs no code).
-                    Object::Set(st) => unsafe { st.peek() }.map(|m| m.contains_hot(&probe)),
-                    Object::FrozenSet(fs) => Some(fs.contains_hot(&probe)),
-                    // SAFETY: as above.
-                    Object::Dict(d) => {
-                        unsafe { d.peek() }.map(|m| m.get_index_hot(&probe).is_some())
-                    }
-                    _ => None,
-                };
-                if let Some(found) = found {
-                    if found || probe.miss_is_exact() {
-                        return Some(found);
-                    }
-                }
-            }
+        if let Some(found) = Self::leaf_contains_table(container, item) {
+            return Some(found);
         }
         let member = Self::leaf_member_eq;
         match container {
@@ -25124,6 +25101,46 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// [`Self::leaf_contains`]'s commonest tests, small enough to inline
+    /// into the frame JIT's helper: a `str`, machine `int` or plain class
+    /// in a set or dict (`cls in _atomic_types`), probed in line. `None`
+    /// for anything else, or a miss a key of another kind might explain.
+    #[inline(always)]
+    pub(crate) fn leaf_contains_table(container: &Object, item: &Object) -> Option<bool> {
+        // A `str`, machine `int` or plain class in a set or dict, the
+        // commonest tests (`cls in _atomic_types`), probed in line.
+        if let (
+            Object::Set(_) | Object::FrozenSet(_) | Object::Dict(_),
+            Object::Str(_) | Object::Int(_) | Object::Type(_),
+        ) = (container, item)
+        {
+            let probe = match item {
+                Object::Type(t) => crate::object::type_hash_is_identity(t)
+                    .then(|| crate::object::LeafProbe::identity_type(item)),
+                _ => crate::object::LeafProbe::new(item),
+            };
+            if let Some(probe) = probe {
+                let found = match container {
+                    // SAFETY: a read between two instructions (the probe
+                    // runs no code).
+                    Object::Set(st) => unsafe { st.peek() }.map(|m| m.contains_hot(&probe)),
+                    Object::FrozenSet(fs) => Some(fs.contains_hot(&probe)),
+                    // SAFETY: as above.
+                    Object::Dict(d) => {
+                        unsafe { d.peek() }.map(|m| m.get_index_hot(&probe).is_some())
+                    }
+                    _ => None,
+                };
+                if let Some(found) = found {
+                    if found || probe.miss_is_exact() {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Whether hashing `item` runs no Python code: a native scalar, a

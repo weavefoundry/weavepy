@@ -2361,7 +2361,9 @@ unsafe fn contains_fast(item: *const Object, cont: *const Object, owned: u32) ->
         if owned != 0 && !(droppable(i) && droppable(c)) {
             return 2;
         }
-        let Some(found) = Interpreter::leaf_contains(c, i) else {
+        let Some(found) = Interpreter::leaf_contains_table(c, i)
+            .or_else(|| Interpreter::leaf_contains(c, i))
+        else {
             return 2;
         };
         if owned & 2 != 0 {
