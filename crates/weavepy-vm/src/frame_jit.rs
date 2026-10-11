@@ -6286,6 +6286,80 @@ unsafe extern "C" fn h_make_function(st: *mut State, at: *mut Object, flags: u64
     }
 }
 
+/// How many `SET_FUNCTION_ATTRIBUTE`s right after the bare `MAKE_FUNCTION`
+/// at `pc` attach defaults (`0x01`) or a closure (`0x08`), each once:
+/// the ones [`h_make_function_attrs`] builds the function with.
+fn fused_function_attrs(code: &CodeObject, pc: usize) -> usize {
+    let ins = &code.instructions;
+    let mut seen = 0;
+    let mut k = 0;
+    while let Some(next) = ins.get(pc + 1 + k) {
+        let flag = next.arg;
+        if next.op != OpCode::SetFunctionAttribute
+            || !matches!(flag, 0x01 | 0x08)
+            || seen & flag != 0
+        {
+            break;
+        }
+        seen |= flag;
+        k += 1;
+    }
+    k
+}
+
+/// The bare `MAKE_FUNCTION` at `pc` of `code` with the `k`
+/// `SET_FUNCTION_ATTRIBUTE`s after it (see [`fused_function_attrs`]), the
+/// code object at stack slot `at + k` and the first attribute's value next
+/// below it, as the core loop's arm runs them: `0` the function at `at`
+/// with its defaults and closure (the operands consumed), anything else
+/// declined untouched.
+unsafe extern "C" fn h_make_function_attrs(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    at: *mut Object,
+    k: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code, the fused run
+    // at `pc`, and its `k + 1` initialized operand slots.
+    unsafe {
+        let (code, pc, k) = (&*code, pc as usize, k as usize);
+        if crate::capi_watchers::funcs_active() || !matches!(&*at.add(k), Object::Code(_)) {
+            return 1;
+        }
+        let mut defaults = Vec::new();
+        let mut closure = Vec::new();
+        for j in 0..k {
+            let Object::Tuple(items) = &*at.add(k - 1 - j) else {
+                return 1;
+            };
+            match code.instructions[pc + 1 + j].arg {
+                0x01 => defaults = items.iter().cloned().collect(),
+                _ => closure = items.iter().cloned().collect(),
+            }
+        }
+        let Object::Code(fn_code) = at.add(k).read() else {
+            unreachable!("checked above")
+        };
+        // (The tuples' items live on in the function.)
+        for j in 0..k {
+            drop(at.add(j).read());
+        }
+        let frame = &*(*st).frame;
+        let f = crate::new_function(
+            fn_code,
+            &frame.globals,
+            &frame.builtins,
+            defaults,
+            Vec::new(),
+            closure,
+            None,
+        );
+        at.write(f);
+        0
+    }
+}
+
 /// `SET_FUNCTION_ATTRIBUTE flag` of the value at stack slot `at` on the
 /// fresh function above it: `0` the function at `at`, `RAISED` its error
 /// (`st` synced past the instruction at `pc`), anything else declined
@@ -7507,6 +7581,14 @@ impl<'a> Lower<'a> {
             {
                 starts[pc + 2] = true;
             }
+            // A function built with its defaults or closure continues after
+            // its last `SET_FUNCTION_ATTRIBUTE`.
+            if ins.op == OpCode::MakeFunction && ins.arg == 0 {
+                let k = fused_function_attrs(code, pc);
+                if k > 0 && pc + 1 + k < n {
+                    starts[pc + 1 + k] = true;
+                }
+            }
             // A forwarding call (`f(*args, **kwargs)`) continues after its
             // `CALL_FUNCTION_EX`.
             if ins.op == OpCode::BuildMap
@@ -7976,6 +8058,41 @@ impl<'a> Lower<'a> {
                 self.set_last(pc);
                 self.check_released(pc + 1);
                 true
+            }
+            // A `def` or `lambda` with its defaults or closure: the
+            // function built with them at once.
+            OpCode::MakeFunction
+                if ins.arg == 0
+                    && fused_function_attrs(self.code, pc) > 0
+                    && self.depth > fused_function_attrs(self.code, pc) =>
+            {
+                let k = fused_function_attrs(self.code, pc);
+                if self.blocks.get(pc + 1 + k).copied().flatten().is_none() {
+                    self.exit(INTERP, pc);
+                    return false;
+                }
+                self.flush();
+                let s = self.depth - (k + 1);
+                let at = self.slot_addr(s);
+                let code = self.code_ptr();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let kv = self.b.ins().iconst(types::I64, k as i64);
+                let r = self
+                    .call(
+                        h_make_function_attrs as *const () as usize,
+                        &[self.st, code, pcv, at, kv],
+                        true,
+                    )
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                self.branch_out(r, out);
+                for _ in 0..=k {
+                    self.pop();
+                }
+                self.push(Item::Mem(s));
+                self.set_last(pc + k);
+                self.goto(pc + 1 + k);
+                false
             }
             OpCode::MakeFunction | OpCode::SetFunctionAttribute => {
                 let n = if ins.op == OpCode::MakeFunction {

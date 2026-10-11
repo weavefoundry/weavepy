@@ -52941,7 +52941,7 @@ impl Interpreter {
                 .unwrap_or_else(|| self.builtins.clone()),
         };
         Ok(Object::Function(Rc::new(crate::object::PyFunction {
-            name,
+            name: name.into(),
             code: RefCell::new(code),
             globals,
             builtins,
@@ -75270,12 +75270,16 @@ fn new_function(
     // staticmethod wrappers) return the *same* object, which
     // `assertIs(wrapper.__name__, func.__name__)` in test_decorators
     // relies on.
-    let module = globals
-        .borrow()
-        .get(&DictKey(fn_slot_keys()[1].clone()))
-        .cloned();
+    let module = {
+        let g = globals.borrow();
+        match g.get_index(0) {
+            // A module's namespace starts with its `__name__`.
+            Some((k, v)) if matches!(&k.0, Object::Str(s) if &**s == "__name__") => Some(v.clone()),
+            _ => g.get(&DictKey(fn_slot_keys()[1].clone())).cloned(),
+        }
+    };
     let f = PyFunction {
-        name: code.name.to_string(),
+        name: code.name.clone(),
         code: RefCell::new(code),
         globals: globals.clone(),
         // The defining frame's builtins, not a fresh resolution: the same

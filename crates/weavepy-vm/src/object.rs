@@ -4981,7 +4981,7 @@ impl<'a> IntoIterator for &'a mut DictData {
 
 #[derive(Clone)]
 pub struct PyFunction {
-    pub name: String,
+    pub name: weavepy_compiler::Name,
     /// The code object executed on call. Interior-mutable because
     /// `f.__code__ = other.__code__` rebinds it at runtime (CPython's
     /// `func_set_code`); every call reads the *current* value.

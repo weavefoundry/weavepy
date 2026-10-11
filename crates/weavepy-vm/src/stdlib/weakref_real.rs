@@ -382,7 +382,7 @@ fn fq_type_name(target: &Object) -> String {
 fn referent_display_name(target: &Object) -> Option<String> {
     match target {
         Object::Type(t) => Some(t.name.clone()),
-        Object::Function(f) => Some(f.name.clone()),
+        Object::Function(f) => Some(f.name.to_string()),
         Object::Module(m) => Some(m.name.clone()),
         Object::Instance(i) => match i.cls().lookup("__name__")? {
             Object::Str(s) => Some(s.to_string()),
