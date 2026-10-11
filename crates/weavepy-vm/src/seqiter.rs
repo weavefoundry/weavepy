@@ -1177,6 +1177,16 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
 /// The next item of a native iterator source when taking it runs no
 /// code and releases nothing (see [`PyIterator::pure_ready`]).
 fn ready_next(it: &Object) -> Option<Object> {
+    // A plain sequence cursor (`chain(xs, ys)`'s, `islice(xs, n)`'s), in
+    // one view.
+    if let Object::Iter(c) = it {
+        // SAFETY: a step that runs no code; the view ends with this call.
+        let cur = unsafe { c.peek_mut() }?;
+        if let Some(v) = cur.pure_peek() {
+            cur.pure_skip();
+            return Some(v);
+        }
+    }
     if !src_ready(it, false) {
         return None;
     }
