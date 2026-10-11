@@ -61996,11 +61996,15 @@ impl Interpreter {
         {
             frozen_code_cache::insert(full, &code);
             // RFC 0059 WS5a — persist for future processes as well.
-            // `-B`/`PYTHONDONTWRITEBYTECODE` suppresses the write like
-            // any other bytecode artifact (reads stay enabled).
-            if !self.bytecode_writes_disabled() {
-                frozen_code_cache::write_disk(full, source, &code);
-            }
+            // `-B`/`PYTHONDONTWRITEBYTECODE` doesn't suppress the write:
+            // it governs `.pyc` files beside source files, and CPython
+            // ships its standard library already compiled, so this cache
+            // (in the user's cache directory, keyed by the binary's
+            // format) is the counterpart of that installed bytecode.
+            // Without it, every process under `-B` compiled each stdlib
+            // module it imported (`import asyncio`: about 5x the
+            // instructions). `WEAVEPY_FROZEN_CACHE=0` turns it off.
+            frozen_code_cache::write_disk(full, source, &code);
         }
         self.run_frozen_compiled(full, code, is_package, filename)
     }
