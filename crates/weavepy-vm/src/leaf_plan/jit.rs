@@ -898,6 +898,13 @@ unsafe impl Send for Engine {}
 static ENGINE: std::sync::Mutex<Option<Option<Engine>>> = std::sync::Mutex::new(None);
 
 impl Engine {
+    /// Drop the function and builder contexts for empty ones (see the
+    /// frame compiler's `Engine::release`).
+    fn release(&mut self) {
+        self.ctx = self.module.make_context();
+        self.fbctx = FunctionBuilderContext::new();
+    }
+
     fn new() -> Option<Engine> {
         if !tags_match() {
             return None;
@@ -1029,8 +1036,7 @@ fn compile_with(
     };
     let Some((depth, frames, keep, fields, globals, methods)) = lowered else {
         // An unfinished function leaves the builder's state behind.
-        engine.fbctx = FunctionBuilderContext::new();
-        engine.module.clear_context(&mut engine.ctx);
+        engine.release();
         return None;
     };
     let defined = engine.module.define_function(id, &mut engine.ctx);
@@ -1040,7 +1046,7 @@ fn compile_with(
             code.qualname
         );
     }
-    engine.module.clear_context(&mut engine.ctx);
+    engine.release();
     defined.ok()?;
     engine.module.finalize_definitions().ok()?;
     let func = engine.module.get_finalized_function(id);

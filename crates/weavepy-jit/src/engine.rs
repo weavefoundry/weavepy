@@ -583,6 +583,14 @@ impl JitEngine {
         })
     }
 
+    /// Drop the function and builder contexts for empty ones: clearing
+    /// them keeps their buffers' capacity, the largest function's size,
+    /// for the rest of the thread (and under the next compile's peak).
+    fn release(&mut self) {
+        self.ctx = self.module.make_context();
+        self.fbctx = FunctionBuilderContext::new();
+    }
+
     /// Analyze and compile a code object. `resolve` reports what each
     /// `LOAD_GLOBAL` name currently resolves to (see
     /// [`ResolvedGlobal`]); the caller must re-validate every resolution
@@ -1007,7 +1015,7 @@ impl JitEngine {
             inline_method,
         );
         if !sound {
-            self.module.clear_context(&mut self.ctx);
+            self.release();
             return Err(JitVerdict::NotConverged);
         }
         if std::env::var_os("WEAVEPY_JIT_CLIF_DUMP").is_some() {
@@ -1032,11 +1040,10 @@ impl JitEngine {
             let _ = cranelift_codegen::timing::take_current();
         }
         let t0 = stats.then(std::time::Instant::now);
-        self.module
-            .define_function(id, &mut self.ctx)
-            .map_err(|_| JitVerdict::NotConverged)?;
+        let defined = self.module.define_function(id, &mut self.ctx);
         let t1 = stats.then(std::time::Instant::now);
-        self.module.clear_context(&mut self.ctx);
+        self.release();
+        defined.map_err(|_| JitVerdict::NotConverged)?;
         self.module
             .finalize_definitions()
             .map_err(|_| JitVerdict::NotConverged)?;

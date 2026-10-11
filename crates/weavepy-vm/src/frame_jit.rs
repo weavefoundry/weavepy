@@ -112,6 +112,12 @@ const MAX_FAILS: u8 = 32;
 /// The longest code compiled.
 const MAX_INSTRUCTIONS: usize = 4096;
 
+/// An exit's packed constant (see `Lower::exit`): the stack depth in its
+/// low bits, the pc from bit `EXIT_PC_SHIFT`, and the last instruction
+/// from bit `EXIT_LAST_SHIFT` (both below `MAX_INSTRUCTIONS`).
+const EXIT_PC_SHIFT: i64 = 20;
+const EXIT_LAST_SHIFT: i64 = 42;
+
 /// The running activation's state, as the core loop holds it: the native
 /// code reads it on entry and writes it back on exit.
 #[repr(C)]
@@ -6926,6 +6932,14 @@ unsafe impl Send for Engine {}
 static ENGINE: std::sync::Mutex<Option<Option<Engine>>> = std::sync::Mutex::new(None);
 
 impl Engine {
+    /// Drop the function and builder contexts for empty ones: clearing
+    /// them keeps their buffers' capacity, the largest body's size, for
+    /// the rest of the process (and under the next compile's peak).
+    fn release(&mut self) {
+        self.ctx = self.module.make_context();
+        self.fbctx = FunctionBuilderContext::new();
+    }
+
     fn new() -> Option<Engine> {
         let tags = tags()?;
         let mut flags = settings::builder();
@@ -7055,8 +7069,7 @@ fn compile_with(
         }
         if done && !lean && engine.ctx.func.dfg.num_insts() + size_in_line > lean_above() {
             lean = true;
-            engine.fbctx = FunctionBuilderContext::new();
-            engine.module.clear_context(&mut engine.ctx);
+            engine.release();
             engine.ctx.func.signature = signature.clone();
             continue;
         }
@@ -7064,8 +7077,7 @@ fn compile_with(
     };
     if !built {
         // An unfinished function leaves the builder's state behind.
-        engine.fbctx = FunctionBuilderContext::new();
-        engine.module.clear_context(&mut engine.ctx);
+        engine.release();
         return None;
     }
     if std::env::var("WEAVEPY_FRAME_JIT_DUMP").is_ok_and(|n| code.qualname.contains(&n)) {
@@ -7094,7 +7106,7 @@ fn compile_with(
             code.qualname
         );
     }
-    engine.module.clear_context(&mut engine.ctx);
+    engine.release();
     defined.ok()?;
     engine.module.finalize_definitions().ok()?;
     let func = engine.module.get_finalized_function(id);
@@ -7703,38 +7715,41 @@ impl<'a> Lower<'a> {
             Some(&(_, _, tail)) => tail,
             None => {
                 let tail = self.b.create_block();
-                let params = if last.is_some() { 3 } else { 2 };
-                for _ in 0..params {
-                    self.b.append_block_param(tail, types::I64);
-                }
+                self.b.append_block_param(tail, types::I64);
                 self.exit_tails.push((status, last.is_some(), tail));
                 tail
             }
         };
-        // In line, the status constant, the stores and the return less
-        // the jump.
-        self.tail_savings += if last.is_some() { 4 } else { 3 };
-        let l = self.b.ins().iconst(types::I64, self.depth as i64);
-        let pcv = self.b.ins().iconst(types::I64, pc as i64);
-        match last {
-            Some(last) => {
-                let lv = self.b.ins().iconst(types::I64, last as i64);
-                self.b.ins().jump(tail, &[l.into(), pcv.into(), lv.into()]);
-            }
-            None => {
-                self.b.ins().jump(tail, &[l.into(), pcv.into()]);
-            }
+        // In line, the depth, pc, last instruction and status constants,
+        // the stores and the return, less the packed constant and the
+        // jump.
+        self.tail_savings += if last.is_some() { 6 } else { 4 };
+        // The depth, pc and last instruction packed in one constant (see
+        // `EXIT_PC_SHIFT`): one value to the tail where three would each
+        // be an instruction and a block argument to allocate.
+        debug_assert!(self.depth < 1 << EXIT_PC_SHIFT);
+        debug_assert!(pc < 1 << (EXIT_LAST_SHIFT - EXIT_PC_SHIFT));
+        let mut packed = self.depth as i64 | (pc as i64) << EXIT_PC_SHIFT;
+        if let Some(last) = last {
+            packed |= (last as i64) << EXIT_LAST_SHIFT;
         }
+        let v = self.b.ins().iconst(types::I64, packed);
+        self.b.ins().jump(tail, &[v.into()]);
     }
 
     /// Fill the exit tails (see [`Self::exit`]).
     fn exit_tails(&mut self) {
-        for (status, _, tail) in std::mem::take(&mut self.exit_tails) {
+        for (status, last, tail) in std::mem::take(&mut self.exit_tails) {
             self.b.switch_to_block(tail);
-            let params = self.b.block_params(tail).to_vec();
-            self.b.ins().store(FLAGS, params[0], self.st, S_LEN);
-            self.b.ins().store(FLAGS, params[1], self.st, S_PC);
-            if let Some(&last) = params.get(2) {
+            let packed = self.b.block_params(tail)[0];
+            let field = (1 << (EXIT_LAST_SHIFT - EXIT_PC_SHIFT)) - 1;
+            let len = self.b.ins().band_imm(packed, (1 << EXIT_PC_SHIFT) - 1);
+            let pc = self.b.ins().ushr_imm(packed, EXIT_PC_SHIFT);
+            let pc = self.b.ins().band_imm(pc, field);
+            self.b.ins().store(FLAGS, len, self.st, S_LEN);
+            self.b.ins().store(FLAGS, pc, self.st, S_PC);
+            if last {
+                let last = self.b.ins().ushr_imm(packed, EXIT_LAST_SHIFT);
                 self.b.ins().store(FLAGS, last, self.st, S_LAST);
             }
             let s = self.b.ins().iconst(types::I32, i64::from(status));
