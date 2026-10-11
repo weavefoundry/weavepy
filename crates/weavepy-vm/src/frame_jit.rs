@@ -212,6 +212,8 @@ pub(crate) struct Native {
     /// The `CALL` sites' settled builtins.
     #[allow(clippy::vec_box)]
     _builtin_sites: Vec<Box<BuiltinSite>>,
+    #[allow(clippy::vec_box)]
+    _type_sites: Vec<Box<TypeSite>>,
     /// The builtins the method kernels' calls address.
     _held: Vec<Rc<crate::object::BuiltinFn>>,
     #[allow(clippy::vec_box)]
@@ -5228,6 +5230,7 @@ unsafe extern "C" fn h_call(
                 _ => None,
             };
             if let Some(r) = r {
+                crate::note_type_site(Some(ext), pc, &ops[0]);
                 return done(st, r);
             }
         }
@@ -5240,6 +5243,7 @@ unsafe extern "C" fn h_call(
         if let Object::Type(t) = &ops[0] {
             if t.flags.is_builtin {
                 if let Some(r) = interp.core_builtin_ctor(base, start, len) {
+                    crate::note_type_site(Some(ext), pc, &*base.add(start));
                     return done(st, r);
                 }
                 if argc == 1 && !st.sw.is_null() {
@@ -5601,6 +5605,52 @@ unsafe extern "C" fn h_call_leaf(
                     s.err = Some(e);
                     return RAISED;
                 }
+            }
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// A `CALL` site that constructed a builtin type in place when its code
+/// compiled (see `Lower::call_op`): the type and the operand count.
+pub(crate) struct TypeSite {
+    cls: Rc<crate::types::TypeObject>,
+    argc: usize,
+}
+
+/// [`h_call`] at a site settled on a builtin type `site` names: the callee
+/// checked to be that type, with an empty self slot, and its constructor
+/// run in place when nothing it does can run Python code (as
+/// `Interpreter::core_builtin_ctor` runs it), the operands released after;
+/// anything else through `h_call`.
+unsafe extern "C" fn h_call_type(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u64,
+    len: u64,
+    site: *const TypeSite,
+) -> u32 {
+    // SAFETY: as `h_call`'s; the site is this `CALL`'s.
+    unsafe {
+        let s = &mut *st;
+        let site = &*site;
+        let lenu = len as usize;
+        let start = lenu - site.argc - 2;
+        let base = s.stack;
+        let hit = matches!(&*base.add(start), Object::Type(t) if Rc::ptr_eq(t, &site.cls))
+            && matches!(&*base.add(start + 1), Object::Unbound);
+        if hit && !s.sw.is_null() {
+            let args = std::slice::from_raw_parts(base.add(start + 2), site.argc);
+            let interp = &*s.interp;
+            if let Some(v) = interp
+                .leaf_type_call(&site.cls, args)
+                .or_else(|| crate::seqiter::builtin_ctor_pure(&site.cls, args))
+            {
+                crate::release_operands(interp, base.add(start), lenu - start);
+                base.add(start).write(v);
+                s.len = start + 1;
+                return 0;
             }
         }
         h_call(st, code, ext, pc, len)
@@ -6720,6 +6770,7 @@ fn compile_with(
     let mut methods: Vec<Box<MethodCache>>;
     let mut direct: Vec<Box<DirectSite>>;
     let mut builtin_sites: Vec<Box<BuiltinSite>>;
+    let mut type_sites: Vec<Box<TypeSite>>;
     let mut held: Vec<Rc<crate::object::BuiltinFn>>;
     let mut mods: Vec<Box<ModCache>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
@@ -6738,6 +6789,7 @@ fn compile_with(
         methods = std::mem::take(&mut lower.method_caches);
         direct = std::mem::take(&mut lower.direct_sites);
         builtin_sites = std::mem::take(&mut lower.builtin_sites);
+        type_sites = std::mem::take(&mut lower.type_sites);
         held = std::mem::take(&mut lower.held);
         mods = std::mem::take(&mut lower.mod_caches);
         // (Measured as if every exit's tail were in line, the size the
@@ -6809,6 +6861,7 @@ fn compile_with(
         _methods: methods,
         _direct: direct,
         _builtin_sites: builtin_sites,
+        _type_sites: type_sites,
         _held: held,
         _mods: mods,
     })
@@ -6924,6 +6977,9 @@ struct Lower<'a> {
     /// The `CALL` sites' settled builtins (see [`BuiltinSite`]).
     #[allow(clippy::vec_box)]
     builtin_sites: Vec<Box<BuiltinSite>>,
+    /// The `CALL` sites' settled builtin types (see [`TypeSite`]).
+    #[allow(clippy::vec_box)]
+    type_sites: Vec<Box<TypeSite>>,
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     /// The method loads' module-attribute caches.
@@ -7107,6 +7163,7 @@ impl<'a> Lower<'a> {
             method_caches: Vec::new(),
             direct_sites: Vec::new(),
             builtin_sites: Vec::new(),
+            type_sites: Vec::new(),
             held: Vec::new(),
             mod_caches: Vec::new(),
             catch: None,
@@ -10878,7 +10935,16 @@ impl<'a> Lower<'a> {
     /// [`h_call_native`]; `None` for anything else (`h_call` alone).
     fn builtin_site(&mut self, pc: usize, argc: usize) -> Option<(usize, Value)> {
         use crate::LeafKind;
-        let (f, kind, via_call) = crate::call_site_builtin(self.ext, pc)?;
+        let Some((f, kind, via_call)) = crate::call_site_builtin(self.ext, pc) else {
+            let cls = crate::call_site_type(self.ext, pc)?;
+            let site = Box::new(TypeSite { cls, argc });
+            let at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<TypeSite>(&site) as i64);
+            self.type_sites.push(site);
+            return Some((h_call_type as *const () as usize, at));
+        };
         let (kernel, recv_tag) = match kind {
             // (An opaque body's kernel is the body: run in place on any
             // receiver below.)

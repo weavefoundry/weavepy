@@ -13551,6 +13551,8 @@ impl Interpreter {
                             .flatten()
                         {
                             let callee_at = len - argc - 2;
+                            // SAFETY: as above: the callee.
+                            note_type_site(ext, pc, unsafe { &*base.add(callee_at) });
                             // SAFETY: every operand was checked droppable;
                             // the result takes the callee's slot.
                             unsafe {
@@ -73426,6 +73428,28 @@ pub(crate) fn load_method_builtin(
     }
 }
 
+/// The builtin type the `CALL` at `pc` last constructed in place.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_type(ext: &CodeConstObjects, pc: usize) -> Option<Rc<crate::types::TypeObject>> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::BuiltinType(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Note at the `CALL` site at `pc` that its callee, a builtin type, was
+/// constructed in place (see [`MethodSlot::note_builtin_type`]).
+#[inline]
+fn note_type_site(ext: Option<&CodeConstObjects>, pc: usize, callee: &Object) {
+    if let (Some(slot), Object::Type(t)) = (ext.and_then(|e| e.method_slot(pc)), callee) {
+        if t.flags.is_builtin && t.native_kind.get() == 0 {
+            slot.note_builtin_type(t);
+        }
+    }
+}
+
 /// Whether the `CALL` at `pc` last settled on a leaf builtin the core
 /// loop's arm (and the frame JIT's helper) runs in place.
 #[cfg(feature = "jit")]
@@ -73960,6 +73984,10 @@ enum MethodSlotFn {
         generation: u64,
         fast: leaf_builtins::Fast,
     },
+    /// A `CALL` site's builtin type (`type(x)`, `int(s)`, `list()`), which
+    /// the site constructed in place (see `Interpreter::core_builtin_ctor`).
+    /// Builtin types live as long as the interpreter.
+    BuiltinType(Rc<crate::types::TypeObject>),
     /// A rejected native bound-call body, weakly held so a call site
     /// doesn't extend its lifetime. The key is the registry generation.
     NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
@@ -74293,6 +74321,22 @@ impl MethodSlot {
     fn set_native_body(&self, f: &Rc<crate::object::BuiltinFn>, via_call: bool) {
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (0, MethodSlotFn::NativeBody(f.clone(), via_call)) };
+    }
+
+    /// Remember that this `CALL` site constructed the builtin type `t` in
+    /// place, unless the site already settled on another callee.
+    #[inline]
+    fn note_builtin_type(&self, t: &Rc<crate::types::TypeObject>) {
+        // SAFETY: as `get`; the shared borrow ends before the write.
+        let vacant = match unsafe { &*self.0.get() } {
+            (_, MethodSlotFn::BuiltinType(c)) => !Rc::ptr_eq(c, t),
+            (0, MethodSlotFn::Py(w)) => w.strong_count() == 0,
+            _ => false,
+        };
+        if vacant {
+            // SAFETY: as `set`.
+            unsafe { *self.0.get() = (0, MethodSlotFn::BuiltinType(t.clone())) };
+        }
     }
 
     fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {

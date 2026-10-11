@@ -264,6 +264,46 @@ def bound_appends(n):
     return y
 
 
+def type_calls(xs):
+    out = []
+    for x in xs:
+        out.append((type(x).__name__, len(list()), str(1), int("5")))
+    return out
+
+
+def rebound_type(n):
+    global type
+    out = []
+    try:
+        for i in range(n):
+            if i == n // 2:
+                type = lambda x: "rebound"  # noqa: E731
+            out.append(type(i))
+    finally:
+        del type
+    return out
+
+
+def bad_ints(strs):
+    out = []
+    for s in strs:
+        try:
+            out.append(int(s))
+        except ValueError as e:
+            out.append((str(e), e.__traceback__.tb_lineno))
+    return out
+
+
+BAD_INT_LINE = bad_ints.__code__.co_firstlineno + 4
+
+
+def errors(n):
+    out = []
+    for i in range(n):
+        out.append(ValueError("v", i))
+    return out
+
+
 class BuiltinSiteTest(unittest.TestCase):
     def test_leaf_and_rebinding(self):
         self.assertEqual(lengths([1, 2], N), 2 * N)
@@ -382,6 +422,18 @@ class BuiltinSiteTest(unittest.TestCase):
 
     def test_bound_method_kernel(self):
         self.assertEqual(bound_appends(N), list(range(N)))
+
+    def test_type_sites(self):
+        out = type_calls([1, "s", 2.0] * 1000)
+        self.assertEqual(out[:3], [("int", 0, "1", 5), ("str", 0, "1", 5), ("float", 0, "1", 5)])
+        out = rebound_type(N)
+        self.assertEqual(out[: N // 2], [int] * (N // 2))
+        self.assertEqual(out[N // 2 :], ["rebound"] * (N - N // 2))
+        out = bad_ints(["1", "x", "3"] * 1000)
+        self.assertEqual(out[:3], [1, ("invalid literal for int() with base 10: 'x'", BAD_INT_LINE), 3])
+        errs = errors(N)
+        self.assertEqual([type(e) for e in errs[:2]], [ValueError, ValueError])
+        self.assertEqual(errs[5].args, ("v", 5))
 
     def test_forced_frame_jit(self):
         if FORCED in sys.argv:
