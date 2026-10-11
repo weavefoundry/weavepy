@@ -851,6 +851,18 @@ impl SharedStr {
 }
 
 impl SharedStr {
+    /// The text as an owned `String`, copied directly. The blanket
+    /// `ToString` would run it through `Display` and `Formatter::pad`,
+    /// several times the work for the same result (no width is set);
+    /// as an inherent method this one is what `s.to_string()` calls.
+    #[inline]
+    #[allow(clippy::inherent_to_string_shadow_display)]
+    pub fn to_string(&self) -> String {
+        String::from(&**self)
+    }
+}
+
+impl SharedStr {
     /// The shared one-character string of ASCII byte `c` (below `0x80`).
     #[inline]
     pub fn ascii_char(c: u8) -> Self {
