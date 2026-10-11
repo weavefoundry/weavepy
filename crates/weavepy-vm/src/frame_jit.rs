@@ -3995,6 +3995,11 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
                 let arg = code.instructions[pc].arg;
                 return u32::from(!Interpreter::core_function_store(code, arg, at.add(1)));
             }
+            // A plain class's own attribute (`Cls.count = n`).
+            Object::Type(_) => {
+                let arg = code.instructions[pc].arg;
+                return u32::from(!Interpreter::core_class_store(code, arg, at.add(1)));
+            }
             _ => return 1,
         };
         if !droppable(recv)
@@ -4500,7 +4505,8 @@ unsafe extern "C" fn h_binop_dunder(
 /// ([`attr_lane`]); the result at stack slot `slot`. The receiver is the
 /// stack's at `slot` (`local` 0) or the local at `recv`, read in place.
 /// `0` done, `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
-/// [`h_call`]'s.
+/// [`h_call`]'s. With [`PROPERTY_ONLY`] in `local`, anything but the cached
+/// getter declines instead of taking the full handler.
 unsafe extern "C" fn h_property(
     st: *mut State,
     code: *const CodeObject,
@@ -4518,7 +4524,17 @@ unsafe extern "C" fn h_property(
         if st.sw.is_null() {
             return CALL_DECLINED;
         }
+        let only = local & PROPERTY_ONLY != 0;
+        let local = local & !PROPERTY_ONLY;
         let (pc, slot) = (pc as usize, slot as usize);
+        // The full handler, unless only the cached getter was asked for.
+        let lane = |st: &mut State| {
+            if only {
+                CALL_DECLINED
+            } else {
+                attr_lane(st, pc, slot, recv, local)
+            }
+        };
         // A frame's or code object's plain field, a live frame's line with
         // the running activation's own instruction.
         if matches!(&*recv, Object::Frame(_) | Object::Code(_)) && (local != 0 || droppable(&*recv))
@@ -4539,13 +4555,13 @@ unsafe extern "C" fn h_property(
             }
         }
         let Object::Instance(inst) = &*recv else {
-            return attr_lane(st, pc, slot, recv, local);
+            return lane(st);
         };
         let Some((getter, gcode)) = crate::code_vm_ext(&*code)
             .and_then(|ext| ext.method_slot(pc))
             .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
         else {
-            return attr_lane(st, pc, slot, recv, local);
+            return lane(st);
         };
         let at = st.stack.add(slot);
         // A pure leaf getter (no native body of its own: it never runs as
@@ -4580,12 +4596,16 @@ unsafe extern "C" fn h_property(
                     at.write(at.add(1).read());
                 }
                 drop(f);
-                attr_lane(st, pc, slot, recv, local)
+                lane(st)
             }
             Some(r) => r,
         }
     }
 }
+
+/// [`h_property`]'s flag (in `local`) for a call that wants the site's
+/// cached getter only.
+const PROPERTY_ONLY: u64 = 2;
 
 /// The `LOAD_ATTR` at `pc` (its receiver the stack's at `slot`, or the
 /// local at `recv` when `local`) as the full handler runs it
@@ -10661,11 +10681,48 @@ impl<'a> Lower<'a> {
                 self.b.ins().jump(miss, &[]);
             }
         }
-        // The core loop's cached reads.
         self.b.switch_to_block(miss);
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        // A property site: the getter the site cached for the receiver's
+        // class first, ahead of the cached reads that would all decline
+        // (CPython's `LOAD_ATTR_PROPERTY`).
+        let all_mem = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+        let site_at = all_mem.then(|| {
+            let site: Box<DirectSite> = Box::default();
+            let at = std::ptr::from_ref::<DirectSite>(&site) as i64;
+            self.direct_sites.push(site);
+            at
+        });
+        if let (Some(site_at), true) = (site_at, crate::property_site(self.ext, pc)) {
+            let code = self.code_ptr();
+            let slotv = self.b.ins().iconst(types::I64, slot as i64);
+            let flags = PROPERTY_ONLY | u64::from(matches!(item, Item::Local(_)));
+            let local = self.b.ins().iconst(types::I64, flags as i64);
+            let site = self.b.ins().iconst(self.ptr, site_at);
+            let r = self
+                .call(
+                    h_property as *const () as usize,
+                    &[self.st, code, pcv, slotv, at, local, site],
+                    true,
+                )
+                .expect("returns");
+            let other = self.b.create_block();
+            let reads = self.b.create_block();
+            let leave = self.b.create_block();
+            self.b.ins().brif(r, other, &[], done, &[]);
+            self.b.switch_to_block(other);
+            let declined = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+            self.b.ins().brif(declined, reads, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.leave(r);
+            self.b.switch_to_block(reads);
+        }
+        // The core loop's cached reads.
         let code = self.code_ptr();
         let ext = self.ext_ptr();
-        let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let c = self.b.ins().iconst(self.ptr, cache_at);
         let r = match item {
             Item::Local(_) => self.call(
@@ -10682,16 +10739,11 @@ impl<'a> Lower<'a> {
         .expect("returns");
         // A property whose getter the site has cached runs directly, when
         // nothing virtual lies below (its call can raise or switch).
-        if self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+        if let Some(site_at) = site_at {
             let prop = self.b.create_block();
             self.b.ins().brif(r, prop, &[], done, &[]);
             self.b.switch_to_block(prop);
-            let site: Box<DirectSite> = Box::default();
-            let site_at = self
-                .b
-                .ins()
-                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
-            self.direct_sites.push(site);
+            let site_at = self.b.ins().iconst(self.ptr, site_at);
             let code = self.code_ptr();
             let slotv = self.b.ins().iconst(types::I64, slot as i64);
             let local = self

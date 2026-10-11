@@ -14876,6 +14876,21 @@ impl Interpreter {
                                 }
                                 offload!(OFFLOAD_HELPER);
                             }
+                            // A plain class's own attribute (`Cls.count = n`).
+                            Object::Type(_) => {
+                                // SAFETY: `len >= 2`: the receiver over the
+                                // value.
+                                if unsafe {
+                                    Self::core_class_store(code, ins.arg, base.add(len - 1))
+                                } {
+                                    len -= 2;
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                offload!(OFFLOAD_HELPER);
+                            }
                             _ => offload!(OFFLOAD_HELPER),
                         };
                         if !Self::core_droppable(recv)
@@ -19305,6 +19320,63 @@ impl Interpreter {
         // droppable); the value's slot moved out above.
         unsafe { drop_hot(recv.read()) };
         // (Released after the dictionary's borrow ends.)
+        drop(old);
+        true
+    }
+
+    /// `C.name = v` with the class at `recv` and the value below it: a
+    /// non-dunder name written to a heap class's own dict under `type`'s
+    /// default `__setattr__` (the plain end of [`Self::set_type_attr_direct`];
+    /// a custom metaclass or a type watcher keeps the full path), the
+    /// class's version advanced, both operands leaving the stack. `false`
+    /// touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `recv` is the core loop's top stack slot, the value the one below.
+    #[inline(never)]
+    unsafe fn core_class_store(code: &CodeObject, name_idx: u32, recv: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let (Object::Type(cls), value) = (unsafe { &*recv }, unsafe { &*recv.sub(1) }) else {
+            return false;
+        };
+        if crate::capi_watchers::types_active()
+            || !Self::core_drops_plain()
+            || !Self::core_droppable(unsafe { &*recv })
+            || cls.flags.is_builtin
+            || cls.immutable.get()
+            || cls.c_ext_ptr.get() != 0
+            || !Self::plain_metaclass(cls)
+        {
+            return false;
+        }
+        let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        if n.starts_with("__") {
+            return false;
+        }
+        let old = {
+            let Ok(mut d) = cls.dict.try_borrow_mut() else {
+                return false;
+            };
+            match d.get_mut(&crate::object::StrKey(n)) {
+                // (The value it replaces leaves by a plain decrement.)
+                Some(slot) if !Self::core_droppable(slot) => return false,
+                // SAFETY: the value moves into the dictionary; its slot is
+                // forgotten below.
+                Some(slot) => Some(std::mem::replace(slot, unsafe { std::ptr::read(value) })),
+                None => {
+                    // SAFETY: as above.
+                    d.insert(DictKey(name.clone()), unsafe { std::ptr::read(value) });
+                    None
+                }
+            }
+        };
+        cls.bump_attr_version();
+        // SAFETY: the class leaves by a plain decrement (checked droppable);
+        // the value's slot moved out above.
+        unsafe { drop_hot(recv.read()) };
         drop(old);
         true
     }
@@ -36070,6 +36142,10 @@ impl Interpreter {
         getattr: Object,
         name: &str,
     ) -> Result<Object, RuntimeError> {
+        // A plain function binds the instance as its first argument.
+        if let Object::Function(f) = &getattr {
+            return self.call_python(f, &[instance_obj.clone(), Object::from_str(name)], &[]);
+        }
         // `dispatch` so a descriptor `__getattr__` also honours its
         // `__get__` (test_descr test_getattr_hooks).
         let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(

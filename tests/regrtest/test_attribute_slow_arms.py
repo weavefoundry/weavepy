@@ -251,6 +251,137 @@ class SlotMissTest(unittest.TestCase):
         self.assertEqual(o._s, "hook")
 
 
+class ClassStoreTest(unittest.TestCase):
+    def test_store_is_seen(self):
+        class K:
+            n = 0
+
+        class Sub(K):
+            pass
+
+        k, s = K(), Sub()
+        for i in range(N):
+            K.n = i
+            self.assertEqual(k.n, i)
+            self.assertEqual(s.n, i)
+            self.assertEqual(Sub.n, i)
+        K.fresh = "new"
+        self.assertEqual(k.fresh, "new")
+
+    def test_metaclass_hooks_run(self):
+        seen = []
+
+        class Meta(type):
+            def __setattr__(cls, name, value):
+                seen.append(name)
+                super().__setattr__(name, value)
+
+        class M(metaclass=Meta):
+            n = 0
+
+        def store(c, v):
+            c.n = v
+
+        class P:
+            n = 0
+
+        for i in range(N):
+            store(P, i)
+        store(M, 5)
+        self.assertEqual(seen, ["n"])
+        self.assertEqual(M.n, 5)
+
+    def test_immutable_type(self):
+        def store(c):
+            c.attr = 1
+
+        class P:
+            pass
+
+        for _ in range(N):
+            store(P)
+        with self.assertRaises(TypeError):
+            store(int)
+
+    def test_replaced_value_finalized(self):
+        log = []
+
+        class Fin:
+            def __del__(self):
+                log.append("del")
+
+        class P:
+            v = None
+
+        def store(v):
+            P.v = v
+
+        for _ in range(N):
+            store(1)
+        store(Fin())
+        store(2)
+        self.assertEqual(log, ["del"])
+
+
+class PropertySiteTest(unittest.TestCase):
+    def test_polymorphic_site(self):
+        class A:
+            @property
+            def v(self):
+                return "prop"
+
+        class B:
+            def __init__(self):
+                self.v = "field"
+
+        def read(o):
+            return o.v
+
+        for _ in range(N):
+            self.assertEqual(read(A()), "prop")
+        self.assertEqual(read(B()), "field")
+        self.assertEqual(read(A()), "prop")
+
+    def test_getter_raises(self):
+        class A:
+            def __init__(self):
+                self.fail = False
+
+            @property
+            def v(self):
+                if self.fail:
+                    raise ValueError("boom")
+                return 1
+
+        a = A()
+
+        def read(o):
+            return o.v
+
+        for _ in range(N):
+            self.assertEqual(read(a), 1)
+        a.fail = True
+        with self.assertRaises(ValueError):
+            read(a)
+
+    def test_property_replaced(self):
+        class A:
+            @property
+            def v(self):
+                return 1
+
+        def read(o):
+            return o.v
+
+        a = A()
+        for _ in range(N):
+            self.assertEqual(read(a), 1)
+        A.v = property(lambda self: 2)
+        self.assertEqual(read(a), 2)
+        A.v = 3
+        self.assertEqual(read(a), 3)
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)

@@ -1860,9 +1860,17 @@ impl TypeObject {
     /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
     pub fn bump_attr_version(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         self.attr_version.bump();
         self.mro_kind.store(0, Relaxed);
+        // (A leaf class, the common case, has nothing to walk.)
+        if self
+            .subclasses
+            .try_borrow()
+            .is_ok_and(|subs| subs.iter().all(|w| w.strong_count() == 0))
+        {
+            return;
+        }
+        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
         while let Some(t) = queue.pop() {
             let ptr = Rc::as_ptr(&t);
