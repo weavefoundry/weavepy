@@ -29190,10 +29190,24 @@ impl Interpreter {
         let Object::Type(cls) = class_obj else {
             return None;
         };
-        let Object::Instance(inst) = self_obj else {
-            return None;
+        // The receiver's class, whose MRO `super()` walks. A class
+        // receiver that is an instance of `cls` (a metaclass method's
+        // `super().__setattr__(...)`) binds like any instance, through
+        // its metaclass; one that is a subclass of `cls` (a class method,
+        // `__new__`) binds unlike one and stays on the full path.
+        let meta_holder;
+        let recv_cls: &TypeObject = match self_obj {
+            Object::Instance(inst) => inst.cls_raw(),
+            Object::Type(k) => {
+                if k.is_subclass_of(cls) {
+                    return None;
+                }
+                // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+                meta_holder = unsafe { (*k.metaclass.as_ptr()).clone() }?;
+                &meta_holder
+            }
+            _ => return None,
         };
-        let recv_cls = inst.cls_raw();
         let ver = recv_cls.attr_version.get();
         let cls_id = Rc::as_ptr(cls) as usize as u64;
         let slot = code_method_slot(code, cache_pc);
@@ -29214,9 +29228,14 @@ impl Interpreter {
             _ => {}
         }
         let name = code.names.get(name_idx as usize)?;
-        if name.starts_with("__") && name != "__init__" {
+        // `super().__class__` is the proxy's own attribute.
+        if name == "__class__" {
             return None;
         }
+        // A built-in class can serve a dunder from outside its dict (a
+        // slot wrapper the full lookup synthesizes): a dunder's walk may
+        // not pass one by.
+        let dunder = name.starts_with("__") && name != "__init__";
         // (The receiver's metaclass takes no part: `super()` reads the
         // dicts along its stored MRO, which a custom `mro()` produced.)
         let mro = recv_cls.mro.try_borrow().ok()?;
@@ -29229,8 +29248,15 @@ impl Interpreter {
             }
             let d = owner.dict.try_borrow().ok()?;
             if let Some(v) = d.get(&key) {
+                // (An introspection-only entry is invisible to dispatch.)
+                if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                    return None;
+                }
                 found = Some(v.clone());
                 break;
+            }
+            if dunder && owner.flags.is_builtin {
+                return None;
             }
         }
         match found? {
