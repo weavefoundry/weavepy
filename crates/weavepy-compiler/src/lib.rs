@@ -40,6 +40,7 @@ pub mod cpython_code;
 mod flowgraph;
 mod intern;
 mod mangle;
+mod name;
 pub mod native_code;
 mod validate;
 
@@ -50,6 +51,7 @@ pub use bytecode::{
     COMPARE_OP_TO_BOOL_FLAG, COOLDOWN, SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
 };
 pub use cpython_code::{CpythonCode, Position};
+pub use name::Name;
 
 /// CPython compile.c `STACK_USE_GUIDELINE`: literal displays and call
 /// sites with more operands than this compile through accumulator
@@ -145,6 +147,11 @@ pub use weavepy_parser::ast::expr_name;
 
 // ---------- code object ----------
 
+/// Whether `names` holds `name`.
+fn has_name(names: &[Name], name: &str) -> bool {
+    names.iter().any(|n| n.as_str() == name)
+}
+
 /// RFC 0061 (WS2a): an opaque, VM-owned per-code-object extension slot.
 ///
 /// The VM stashes derived, execution-only state here (today: the
@@ -158,20 +165,27 @@ pub use weavepy_parser::ast::expr_name;
 /// cloned code object starts with an empty slot), never participates in
 /// equality, and is not serialized.
 ///
-/// The slot holds the payload's address (the VM's hot accessor reads one
-/// thin pointer) and the function that drops it, two words in all.
+/// The slot is one word: the address of the payload, which starts with
+/// the function that drops it (the VM's hot accessor reads one thin
+/// pointer).
 #[derive(Default)]
 pub struct VmExt {
-    /// The payload, a leaked `Box`, or null.
+    /// The payload, a leaked `Box<Payload<T>>`, or null.
     payload: std::sync::atomic::AtomicPtr<()>,
-    /// The payload's `drop_payload` instance, stored once `payload` is.
-    drop: std::sync::atomic::AtomicPtr<()>,
+}
+
+/// A [`VmExt`] payload: the value, after the function that drops the box.
+#[repr(C)]
+struct Payload<T> {
+    drop: fn(*mut ()),
+    value: T,
 }
 
 /// Drop a [`VmExt`] payload of type `T`.
 fn drop_payload<T>(payload: *mut ()) {
-    // SAFETY: `payload` is the `Box<T>` `VmExt::get_or_init` leaked.
-    drop(unsafe { Box::from_raw(payload.cast::<T>()) });
+    // SAFETY: `payload` is the `Box<Payload<T>>` `VmExt::get_or_init`
+    // leaked.
+    drop(unsafe { Box::from_raw(payload.cast::<Payload<T>>()) });
 }
 
 impl VmExt {
@@ -183,9 +197,9 @@ impl VmExt {
     #[inline]
     pub unsafe fn get<T>(&self) -> Option<&T> {
         let p = self.payload.load(std::sync::atomic::Ordering::Acquire);
-        // SAFETY: a non-null payload is a live `T` (the caller's contract)
-        // that lives as long as the slot.
-        (!p.is_null()).then(|| unsafe { &*p.cast::<T>() })
+        // SAFETY: a non-null payload is a live `Payload<T>` (the caller's
+        // contract) that lives as long as the slot.
+        (!p.is_null()).then(|| unsafe { &(*p.cast::<Payload<T>>()).value })
     }
 
     /// The payload, set from `init` if there is none yet. Racing
@@ -200,26 +214,23 @@ impl VmExt {
         if let Some(payload) = unsafe { self.get::<T>() } {
             return payload;
         }
-        let fresh = Box::into_raw(Box::new(init())).cast::<()>();
+        let fresh = Box::into_raw(Box::new(Payload {
+            drop: drop_payload::<T>,
+            value: init(),
+        }))
+        .cast::<()>();
         match self.payload.compare_exchange(
             std::ptr::null_mut(),
             fresh,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                // Read only by `drop`, which has the slot to itself.
-                self.drop.store(
-                    drop_payload::<T> as fn(*mut ()) as *mut (),
-                    Ordering::Release,
-                );
-                // SAFETY: just published; it lives as long as the slot.
-                unsafe { &*fresh.cast::<T>() }
-            }
+            // SAFETY: just published; it lives as long as the slot.
+            Ok(_) => unsafe { &(*fresh.cast::<Payload<T>>()).value },
             Err(won) => {
                 drop_payload::<T>(fresh);
-                // SAFETY: the winner's `T` (the caller's contract).
-                unsafe { &*won.cast::<T>() }
+                // SAFETY: the winner's `Payload<T>` (the caller's contract).
+                unsafe { &(*won.cast::<Payload<T>>()).value }
             }
         }
     }
@@ -235,11 +246,11 @@ impl VmExt {
 
 impl Drop for VmExt {
     fn drop(&mut self) {
-        let (payload, drop_fn) = (*self.payload.get_mut(), *self.drop.get_mut());
-        if !payload.is_null() && !drop_fn.is_null() {
-            // SAFETY: `drop_fn` was stored from a `fn(*mut ())` for this
-            // payload's type.
-            let drop_fn = unsafe { std::mem::transmute::<*mut (), fn(*mut ())>(drop_fn) };
+        let payload = *self.payload.get_mut();
+        if !payload.is_null() {
+            // SAFETY: every payload starts with its own drop function
+            // (`Payload` is `repr(C)`).
+            let drop_fn = unsafe { *payload.cast::<fn(*mut ())>() };
             drop_fn(payload);
         }
     }
@@ -574,13 +585,13 @@ impl std::fmt::Debug for JitHint {
 /// `PyCodeObject` we need to emulate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodeObject {
-    pub name: String,
+    pub name: Name,
     /// Dotted qualified name (PEP 3155), computed at compile time from the
     /// lexical scope nesting: `outer.<locals>.inner` for a function nested
     /// in `outer`, `C.method` for a method of class `C`. Equals `name` for
     /// module-level definitions. Drives `function.__qualname__` /
     /// `type.__qualname__` (and thus reprs, error messages, and pickling).
-    pub qualname: String,
+    pub qualname: Name,
     /// Source filename or `<string>`. Used for diagnostics only. Shared:
     /// every code object compiled or decoded from one module holds the
     /// same allocation.
@@ -597,13 +608,14 @@ pub struct CodeObject {
     pub jit_hint: JitHint,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
-    pub names: Vec<String>,
+    /// These and the other name tables hold pooled [`Name`]s.
+    pub names: Vec<Name>,
     /// Local variable names (positional + keyword + `*args`/`**kwargs` + locals).
-    pub varnames: Vec<String>,
+    pub varnames: Vec<Name>,
     /// Free variables — read from an enclosing scope.
-    pub freevars: Vec<String>,
+    pub freevars: Vec<Name>,
     /// Cell variables — locally defined but referenced by an inner scope.
-    pub cellvars: Vec<String>,
+    pub cellvars: Vec<Name>,
     /// Out-of-line exception handlers. Looked up by current PC when a
     /// `RuntimeError::PyException` propagates through this code object.
     pub exception_table: Vec<ExcHandler>,
@@ -776,10 +788,10 @@ impl PartialEq for CodeRare {
 }
 
 // A decoded module holds a code object per function, class body and
-// comprehension, each behind an `Arc`'s two counts: at 432 bytes or
-// fewer, the allocation fits mimalloc's 448-byte size class.
+// comprehension, each behind an `Arc`'s two counts: at 368 bytes or
+// fewer, the allocation fits mimalloc's 384-byte size class.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<CodeObject>() <= 432);
+const _: () = assert!(std::mem::size_of::<CodeObject>() <= 368);
 
 impl CodeObject {
     /// See [`RareFields::no_interrupt_jumps`].
@@ -814,49 +826,218 @@ pub struct WireOverrides {
     pub exec_error: Option<String>,
 }
 
-/// A per-instruction source-column span (PEP-657). `col`/`end_col` are
-/// 0-based UTF-8 byte offsets within their respective source lines, and
+/// A table decoded on first read from the code cache's encoding of it
+/// (see `native_code`), or a vector: the state behind [`LineTable`],
+/// [`ColTable`] and [`WireMarks`].
+///
+/// Two words: the encoding's range of the buffer every code object of a
+/// module shares, and one word of state. State `0` is an empty table not
+/// yet materialized; an address with [`LAZY_ENCODED`] set is the shared
+/// buffer's `Arc` (one count), still encoded; any other address is the
+/// decoded table, which takes over that count. (It keeps the buffer
+/// alive while a racing reader may still decode from it, until the table
+/// is dropped or borrowed mutably.)
+struct LazyTable<T> {
+    state: std::sync::atomic::AtomicUsize,
+    start: u32,
+    end: u32,
+    _items: std::marker::PhantomData<Vec<T>>,
+}
+
+/// The table section of a module in the code cache's native form (see
+/// `native_code`): its own bytes, or, say, a mapping of the cache file
+/// that only the tables something reads ever page in.
+pub struct TableBuffer(Box<dyn AsRef<[u8]> + Send + Sync>);
+
+impl TableBuffer {
+    pub fn new(bytes: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+        TableBuffer(Box::new(bytes))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
+impl std::fmt::Debug for TableBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TableBuffer({} bytes)", self.bytes().len())
+    }
+}
+
+/// The tag of an encoded [`LazyTable`]'s state.
+const LAZY_ENCODED: usize = 1;
+
+/// A decoded [`LazyTable`].
+struct Decoded<T> {
+    items: Vec<T>,
+    /// The buffer the table was decoded from, if any.
+    source: Option<std::sync::Arc<TableBuffer>>,
+}
+
+// SAFETY: the state is either nothing, an `Arc` of a shareable buffer, or
+// an owned `Box<Decoded<T>>` published through the atomic.
+unsafe impl<T: Send> Send for LazyTable<T> {}
+unsafe impl<T: Send + Sync> Sync for LazyTable<T> {}
+
+impl<T> LazyTable<T> {
+    fn new(state: usize, start: u32, end: u32) -> Self {
+        LazyTable {
+            state: std::sync::atomic::AtomicUsize::new(state),
+            start,
+            end,
+            _items: std::marker::PhantomData,
+        }
+    }
+
+    fn from_vec(items: Vec<T>) -> Self {
+        let decoded = Box::new(Decoded {
+            items,
+            source: None,
+        });
+        Self::new(Box::into_raw(decoded) as usize, 0, 0)
+    }
+
+    fn encoded(encoded: Encoded) -> Self {
+        let Encoded { buffer, start, end } = encoded;
+        Self::new(
+            std::sync::Arc::into_raw(buffer) as usize | LAZY_ENCODED,
+            start,
+            end,
+        )
+    }
+
+    /// The table, decoded with `decode` (or empty when that fails) if
+    /// this is its first read.
+    #[inline]
+    fn get(&self, decode: fn(&[u8]) -> Option<Vec<T>>) -> &Vec<T> {
+        use std::sync::atomic::Ordering;
+        let state = self.state.load(Ordering::Acquire);
+        if state != 0 && state & LAZY_ENCODED == 0 {
+            // SAFETY: a decoded table lives as long as `self`.
+            return unsafe { &(*(state as *const Decoded<T>)).items };
+        }
+        self.decode(state, decode)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode(&self, state: usize, decode: fn(&[u8]) -> Option<Vec<T>>) -> &Vec<T> {
+        use std::sync::atomic::Ordering;
+        let buffer = (state & !LAZY_ENCODED) as *const TableBuffer;
+        let (items, source) = if buffer.is_null() {
+            (Vec::new(), None)
+        } else {
+            // SAFETY: the state holds a count of this `Arc`, which the
+            // decoded table takes over if it is published (and which a
+            // published table keeps alive for any racing reader).
+            let source = unsafe { std::sync::Arc::from_raw(buffer) };
+            let items = source
+                .bytes()
+                .get(self.start as usize..self.end as usize)
+                .and_then(decode)
+                .unwrap_or_default();
+            (items, Some(source))
+        };
+        let fresh = Box::into_raw(Box::new(Decoded { items, source }));
+        match self.state.compare_exchange(
+            state,
+            fresh as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: just published; it lives as long as `self`.
+            Ok(_) => unsafe { &(*fresh).items },
+            Err(won) => {
+                // SAFETY: never published; the count it holds is the
+                // state's, which the winner took over.
+                let lost = unsafe { Box::from_raw(fresh) };
+                if let Some(source) = lost.source {
+                    let _ = std::sync::Arc::into_raw(source);
+                }
+                // SAFETY: the winner's decoded table lives as long as
+                // `self`.
+                unsafe { &(*(won as *const Decoded<T>)).items }
+            }
+        }
+    }
+
+    fn get_mut(&mut self, decode: fn(&[u8]) -> Option<Vec<T>>) -> &mut Vec<T> {
+        self.get(decode);
+        let state = *self.state.get_mut();
+        // SAFETY: `get` left a decoded table, and the exclusive borrow
+        // means no reader can still be decoding from its source.
+        let decoded = unsafe { &mut *(state as *mut Decoded<T>) };
+        decoded.source = None;
+        &mut decoded.items
+    }
+}
+
+impl<T> Drop for LazyTable<T> {
+    fn drop(&mut self) {
+        let state = *self.state.get_mut();
+        if state == 0 {
+            return;
+        }
+        // SAFETY: the state owns what it points at (see the type docs).
+        unsafe {
+            if state & LAZY_ENCODED != 0 {
+                drop(std::sync::Arc::from_raw(
+                    (state & !LAZY_ENCODED) as *const TableBuffer,
+                ));
+            } else {
+                drop(Box::from_raw(state as *mut Decoded<T>));
+            }
+        }
+    }
+}
+
+impl<T> Default for LazyTable<T> {
+    fn default() -> Self {
+        Self::new(0, 0, 0)
+    }
+}
+
+impl<T: Clone> Clone for LazyTable<T> {
+    fn clone(&self) -> Self {
+        let state = self.state.load(std::sync::atomic::Ordering::Acquire);
+        if state == 0 {
+            Self::default()
+        } else if state & LAZY_ENCODED != 0 {
+            // SAFETY: the state holds a count of this `Arc`; the clone
+            // takes another.
+            unsafe {
+                std::sync::Arc::increment_strong_count(
+                    (state & !LAZY_ENCODED) as *const TableBuffer,
+                );
+            }
+            Self::new(state, self.start, self.end)
+        } else {
+            // SAFETY: a decoded table lives as long as `self`.
+            Self::from_vec(unsafe { &(*(state as *const Decoded<T>)).items }.clone())
+        }
+    }
+}
+
 /// A code object's column spans (see [`CodeObject::coltable`]): a
 /// vector, or the code cache's encoding of one, decoded on first use.
 /// Most code never reports a column (only tracebacks and
 /// `co_positions()` read them), so a module loaded from the cache skips
 /// the work until something does.
 #[derive(Clone, Default)]
-pub struct ColTable {
-    // Boxed so that the (usual) undecoded table costs one word here.
-    #[allow(clippy::box_collection)]
-    spans: std::sync::OnceLock<Box<Vec<ColSpan>>>,
-    encoded: Option<Encoded>,
-}
+pub struct ColTable(LazyTable<ColSpan>);
 
 impl ColTable {
     /// The spans `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        ColTable {
-            spans: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
-    }
-
-    fn spans(&self) -> &Vec<ColSpan> {
-        self.spans.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_coltable(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        ColTable(LazyTable::encoded(encoded))
     }
 }
 
 impl From<Vec<ColSpan>> for ColTable {
     fn from(spans: Vec<ColSpan>) -> Self {
-        ColTable {
-            spans: std::sync::OnceLock::from(Box::new(spans)),
-            encoded: None,
-        }
+        ColTable(LazyTable::from_vec(spans))
     }
 }
 
@@ -864,15 +1045,13 @@ impl std::ops::Deref for ColTable {
     type Target = Vec<ColSpan>;
 
     fn deref(&self) -> &Vec<ColSpan> {
-        self.spans()
+        self.0.get(native_code::decode_coltable)
     }
 }
 
 impl std::ops::DerefMut for ColTable {
     fn deref_mut(&mut self) -> &mut Vec<ColSpan> {
-        self.spans();
-        self.encoded = None;
-        self.spans.get_mut().expect("decoded above")
+        self.0.get_mut(native_code::decode_coltable)
     }
 }
 
@@ -895,32 +1074,13 @@ impl std::fmt::Debug for ColTable {
 /// a module loaded from the cache keeps the compact form until something
 /// does, instead of four bytes per instruction.
 #[derive(Clone, Default)]
-pub struct LineTable {
-    // Boxed so that the (usual) undecoded table costs one word here.
-    #[allow(clippy::box_collection)]
-    lines: std::sync::OnceLock<Box<Vec<u32>>>,
-    encoded: Option<Encoded>,
-}
+pub struct LineTable(LazyTable<u32>);
 
 impl LineTable {
     /// The lines `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        LineTable {
-            lines: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
-    }
-
-    fn lines(&self) -> &Vec<u32> {
-        self.lines.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_linetable(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        LineTable(LazyTable::encoded(encoded))
     }
 }
 
@@ -928,28 +1088,19 @@ impl LineTable {
 /// encoding: a range of a buffer that every code object decoded from one
 /// module shares (see `native_code::decode`), so a module's tables take
 /// one allocation rather than three per code object.
-#[derive(Clone)]
 pub(crate) struct Encoded {
-    /// Set once the module's decoding finishes, before any table is read.
-    buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
+    buffer: std::sync::Arc<TableBuffer>,
     start: u32,
     end: u32,
 }
 
 impl Encoded {
-    pub(crate) fn new(
-        buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
-        start: u32,
-        end: u32,
-    ) -> Self {
+    pub(crate) fn new(buffer: std::sync::Arc<TableBuffer>, start: u32, end: u32) -> Self {
         Encoded { buffer, start, end }
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.buffer
-            .get()
-            .and_then(|b| b.get(self.start as usize..self.end as usize))
-            .unwrap_or_default()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 }
 
@@ -957,30 +1108,19 @@ impl Encoded {
 /// or the code cache's encoding of one (two marks a byte), decoded on
 /// first use. Only the CPython wire form of the code reads them.
 #[derive(Clone, Default)]
-pub struct WireMarks {
-    // Boxed so that the (usual) undecoded marks cost one word here.
-    #[allow(clippy::box_collection)]
-    marks: std::sync::OnceLock<Box<Vec<u8>>>,
-    encoded: Option<Encoded>,
-}
+pub struct WireMarks(LazyTable<u8>);
 
 impl WireMarks {
     /// The marks `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        WireMarks {
-            marks: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
+        WireMarks(LazyTable::encoded(encoded))
     }
 }
 
 impl From<Vec<u8>> for WireMarks {
     fn from(marks: Vec<u8>) -> Self {
-        WireMarks {
-            marks: std::sync::OnceLock::from(Box::new(marks)),
-            encoded: None,
-        }
+        WireMarks(LazyTable::from_vec(marks))
     }
 }
 
@@ -988,14 +1128,7 @@ impl std::ops::Deref for WireMarks {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        self.marks.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_wire_marks(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        self.0.get(native_code::decode_wire_marks)
     }
 }
 
@@ -1013,10 +1146,7 @@ impl std::fmt::Debug for WireMarks {
 
 impl From<Vec<u32>> for LineTable {
     fn from(lines: Vec<u32>) -> Self {
-        LineTable {
-            lines: std::sync::OnceLock::from(Box::new(lines)),
-            encoded: None,
-        }
+        LineTable(LazyTable::from_vec(lines))
     }
 }
 
@@ -1024,15 +1154,13 @@ impl std::ops::Deref for LineTable {
     type Target = Vec<u32>;
 
     fn deref(&self) -> &Vec<u32> {
-        self.lines()
+        self.0.get(native_code::decode_linetable)
     }
 }
 
 impl std::ops::DerefMut for LineTable {
     fn deref_mut(&mut self) -> &mut Vec<u32> {
-        self.lines();
-        self.encoded = None;
-        self.lines.get_mut().expect("decoded above")
+        self.0.get_mut(native_code::decode_linetable)
     }
 }
 
@@ -1048,6 +1176,8 @@ impl std::fmt::Debug for LineTable {
     }
 }
 
+/// A per-instruction source-column span (PEP-657). `col`/`end_col` are
+/// 0-based UTF-8 byte offsets within their respective source lines, and
 /// are `-1` when the column was not tracked. `end_lineno` is `0` when
 /// unknown (callers fall back to the instruction's start line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,7 +1356,7 @@ impl CodeObject {
                     }
                 }
                 OpCode::LoadDeref | OpCode::StoreDeref | OpCode::LoadClosure => {
-                    let combined: Vec<&String> =
+                    let combined: Vec<&Name> =
                         self.cellvars.iter().chain(self.freevars.iter()).collect();
                     if let Some(n) = combined.get(ins.arg as usize) {
                         out.push('(');
@@ -2678,6 +2808,7 @@ impl Compiler {
         let mut co = CodeObject::default();
         // Default qualname == name; nested scopes overwrite this via
         // `compute_child_qualname` once the parent context is known.
+        let name = Name::from(name);
         co.qualname = name.clone();
         co.name = name;
         co.filename = filename;
@@ -2828,7 +2959,7 @@ impl Compiler {
         if force_global && self.explicit_globals.contains(name) {
             return name.to_owned();
         }
-        let mut base = self.co.qualname.clone();
+        let mut base = self.co.qualname.to_string();
         if matches!(self.kind, CodeKind::Function) {
             base.push_str(".<locals>");
         }
@@ -2847,7 +2978,7 @@ impl Compiler {
         if matches!(self.kind, CodeKind::Module) {
             return String::new();
         }
-        let mut base = self.co.qualname.clone();
+        let mut base = self.co.qualname.to_string();
         if matches!(self.kind, CodeKind::Function) && self.annotation_qualname.is_none() {
             base.push_str(".<locals>");
         }
@@ -2865,10 +2996,10 @@ impl Compiler {
         // cell index. Keeping the internal order equal to slot order
         // makes the RFC 0068 wire codec's deref mapping invertible.
         if self.co.cellvars.len() > 1 {
-            let mut sorted: Vec<String> = self.co.cellvars.clone();
+            let mut sorted: Vec<Name> = self.co.cellvars.clone();
             sorted.sort_unstable_by_key(|c| match self.co.varnames.iter().position(|v| v == c) {
                 Some(p) => (0usize, p, String::new()),
-                None => (1usize, 0, c.clone()),
+                None => (1usize, 0, c.to_string()),
             });
             if sorted != self.co.cellvars {
                 let remap: Vec<u32> = self
@@ -2928,7 +3059,7 @@ impl Compiler {
                 self.free_order = sorted;
             }
         }
-        self.co.freevars = self.free_order.clone();
+        self.co.freevars = self.free_order.iter().map(Name::from).collect();
 
         // `codegen_wrap_in_stopiteration_handler` (PEP 479): the
         // generator-family body ends in an explicit `return None`, and
@@ -3559,7 +3690,7 @@ impl Compiler {
         if has_annotations {
             self.co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             if let Some(loc) = module_loc {
                 self.apply_annotate_loc(loc);
             }
@@ -3731,10 +3862,10 @@ impl Compiler {
                 _ => {}
             }
         }
-        let mut all: Vec<String> = self.co.cellvars.clone();
+        let mut all: Vec<Name> = self.co.cellvars.clone();
         for name in comp_cells {
-            if !all.contains(&name) {
-                all.push(name);
+            if !all.iter().any(|c| *c == name) {
+                all.push(Name::from(name));
             }
         }
         all.sort_unstable();
@@ -3846,8 +3977,8 @@ impl Compiler {
         for name in needed_in_inner {
             if matches!(self.bindings.get(&name), Some(Binding::Local)) {
                 self.bindings.insert(name.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(&name) {
-                    self.co.cellvars.push(name);
+                if !has_name(&self.co.cellvars, &name) {
+                    self.co.cellvars.push(Name::from(name));
                 }
             }
         }
@@ -5767,9 +5898,9 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(hidden_name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(hidden_name));
         inner.co.arg_count = arg_count;
-        inner.co.varnames = hidden_params.to_vec();
+        inner.co.varnames = hidden_params.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         if class_scope {
             // `.type_params` is read by the class body (always a cell,
@@ -5778,7 +5909,10 @@ impl Compiler {
             inner
                 .bindings
                 .insert(".type_params".to_owned(), Binding::Cell);
-            inner.co.cellvars.push(".type_params".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from(".type_params".to_owned()));
             inner
                 .bindings
                 .insert(".generic_base".to_owned(), Binding::Local);
@@ -5787,8 +5921,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6248,13 +6382,13 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(display);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(display));
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
         inner.co.kwonly_count = kwonly_count;
         inner.co.has_varargs = args.vararg.is_some();
         inner.co.has_varkeywords = args.kwarg.is_some();
-        inner.co.varnames = param_names.clone();
+        inner.co.varnames = param_names.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // Methods compiled inside a class body get an implicit
         // `__class__` free variable so `super()` (and explicit
@@ -6347,8 +6481,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6504,7 +6638,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_annotation_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_annotation_child_qualname(name));
         // A lambda or comprehension inside the annotation scope is
         // named from *this* scope (`compiler_set_qualname` looks
         // through the annotation parent).
@@ -6512,14 +6646,14 @@ impl Compiler {
             Some((String::new(), String::new(), self.annotation_child_prefix()));
         inner.co.arg_count = 1;
         inner.co.posonly_count = 1;
-        inner.co.varnames = vec![FORMAT_PARAM.to_owned()];
+        inner.co.varnames = vec![Name::from(FORMAT_PARAM)];
         inner.current_line = loc.line;
         inner.analyze_scope_function(&[FORMAT_PARAM.to_owned()], analysis_body, &[&self.bindings]);
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6551,7 +6685,7 @@ impl Compiler {
         let mut code = inner.finish();
         // `co->co_localsplusnames = ("format", *co->co_localsplusnames[1:])`
         if is_annotate {
-            code.varnames[0] = "format".to_owned();
+            code.varnames[0] = Name::from("format");
             code.annotate_scope = true;
         }
         Ok(code)
@@ -6988,7 +7122,7 @@ impl Compiler {
         // A class body never reports `CO_NESTED` itself (no
         // `CO_OPTIMIZED`), but its methods inherit the nesting.
         inner.co.is_nested = self.child_is_nested();
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // CPython only gives a class body the `__class__` closure cell —
         // and the trailing `__classcell__` store — when a method actually
@@ -7037,7 +7171,7 @@ impl Compiler {
                 || class_body_defs_claim_class_cell(body)
         };
         if needs_class_closure {
-            inner.co.cellvars.push("__class__".to_owned());
+            inner.co.cellvars.push(Name::from("__class__".to_owned()));
             inner.bindings.insert("__class__".to_owned(), Binding::Cell);
         }
         // PEP 695 (RFC 0051): annotation scopes created in this class
@@ -7053,7 +7187,10 @@ impl Compiler {
             .any(|s| stmt_needs_classdict(s, future_annotations))
             || needed.contains("__classdict__");
         if needs_classdict {
-            inner.co.cellvars.push("__classdict__".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from("__classdict__".to_owned()));
             inner
                 .bindings
                 .insert("__classdict__".to_owned(), Binding::Cell);
@@ -7069,7 +7206,7 @@ impl Compiler {
             inner
                 .co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             inner
                 .bindings
                 .insert("__conditional_annotations__".to_owned(), Binding::Cell);
@@ -7218,7 +7355,7 @@ impl Compiler {
                 inner.collect_comp_cells_stmt(s, &mut comp_cells);
             }
             if !comp_cells.is_empty() {
-                let implicit: Vec<String> = inner
+                let implicit: Vec<Name> = inner
                     .co
                     .cellvars
                     .iter()
@@ -7257,7 +7394,7 @@ impl Compiler {
             inner.emit_load_name("__name__");
             inner.emit_store_name("__module__");
             let qualname_str = inner.co.qualname.clone();
-            let qualname_const = inner.intern_constant(Constant::Str(qualname_str));
+            let qualname_const = inner.intern_constant(Constant::Str(qualname_str.to_string()));
             inner.emit(OpCode::LoadConst, qualname_const);
             inner.emit_store_name("__qualname__");
             // A `nonlocal __firstlineno__` declaration in the class body
@@ -7432,9 +7569,9 @@ impl Compiler {
         let inner_freevars = inner_code.freevars.clone();
 
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
                     self.co.cellvars.push(free.clone());
                 }
             }
@@ -9554,7 +9691,7 @@ impl Compiler {
         if let Some(i) = self.co.varnames.iter().position(|n| n == name) {
             return i as u32;
         }
-        self.co.varnames.push(name.to_owned());
+        self.co.varnames.push(Name::from(name.to_owned()));
         (self.co.varnames.len() - 1) as u32
     }
 
@@ -11507,11 +11644,11 @@ impl Compiler {
                     let pos = self.free_order.iter().position(|n| n == name).unwrap_or(0);
                     (self.co.cellvars.len() + pos) as u32
                 } else {
-                    if !self.co.cellvars.contains(name) {
+                    if !has_name(&self.co.cellvars, name) {
                         // Normally pre-registered by the scope's
                         // analysis (`register_comp_cells`); a late
                         // arrival still gets its slot.
-                        self.co.cellvars.push(name.clone());
+                        self.co.cellvars.push(Name::from(name.clone()));
                     }
                     self.co.cellvars.iter().position(|n| n == name).unwrap_or(0) as u32
                 };
@@ -11684,9 +11821,9 @@ impl Compiler {
         // PEP 3155: a comprehension scope gets a dotted qualname like any
         // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
         // `compiler_set_qualname` doesn't special-case comprehensions.
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.co.arg_count = 1;
-        inner.co.varnames.push(".0".to_owned());
+        inner.co.varnames.push(Name::from(".0".to_owned()));
         inner.bindings.insert(".0".to_owned(), Binding::Local);
         if is_async_comp && !matches!(kind, CompKind::Generator) {
             inner.co.is_coroutine = true;
@@ -11786,8 +11923,8 @@ impl Compiler {
                     _ => {
                         if matches!(enclosing, None | Some(Binding::Local)) {
                             self.bindings.insert(name.clone(), Binding::Cell);
-                            if !self.co.cellvars.contains(&name) {
-                                self.co.cellvars.push(name.clone());
+                            if !has_name(&self.co.cellvars, &name) {
+                                self.co.cellvars.push(Name::from(name.clone()));
                             }
                         }
                         Binding::Free
@@ -11871,8 +12008,8 @@ impl Compiler {
             for name in needed_in_inner {
                 if matches!(inner.bindings.get(&name), Some(Binding::Local)) {
                     inner.bindings.insert(name.clone(), Binding::Cell);
-                    if !inner.co.cellvars.contains(&name) {
-                        inner.co.cellvars.push(name);
+                    if !has_name(&inner.co.cellvars, &name) {
+                        inner.co.cellvars.push(Name::from(name));
                     }
                 }
             }
@@ -11949,9 +12086,9 @@ impl Compiler {
 
         // Promote our locals to cells where needed.
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
                     self.co.cellvars.push(free.clone());
                 }
             }

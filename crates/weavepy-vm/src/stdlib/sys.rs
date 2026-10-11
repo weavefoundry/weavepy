@@ -34,7 +34,7 @@ pub const PY_VERSION: (i64, i64, i64) = (
 pub fn build_with_state(
     cache: &ModuleCache,
     frame_stack: crate::object::FrameStack,
-    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: Rc<RefCell<Vec<Object>>>,
     excepthook: Rc<RefCell<Object>>,
     unraisable_hook: Rc<RefCell<Object>>,
 ) -> Rc<PyModule> {
@@ -54,8 +54,8 @@ pub fn build_with_state(
                 name: "_getframe",
                 binds_instance: false,
                 call: Box::new(move |args| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_getframe(args, &h.frame_stack)
+                    if let Some(fs) = crate::vm_singletons::current_frame_stack() {
+                        sys_getframe(args, &fs)
                     } else {
                         sys_getframe(args, &fs_fallback)
                     }
@@ -70,8 +70,8 @@ pub fn build_with_state(
                 name: "_getframemodulename",
                 binds_instance: false,
                 call: Box::new(move |args| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_getframemodulename(args, &h.frame_stack)
+                    if let Some(fs) = crate::vm_singletons::current_frame_stack() {
+                        sys_getframemodulename(args, &fs)
                     } else {
                         sys_getframemodulename(args, &fs_fallback_modname)
                     }
@@ -96,20 +96,24 @@ pub fn build_with_state(
             })),
         );
         let es_fallback_exc = exc_info_stack.clone();
+        let exception = Rc::new(BuiltinFn {
+            name: "exception",
+            binds_instance: false,
+            call: Box::new(move |_| {
+                if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                    sys_exception(&h.exc_info_stack)
+                } else {
+                    sys_exception(&es_fallback_exc)
+                }
+            }),
+            call_kw: None,
+        });
+        // Reads the handled-exception stack: no Python runs, and no frame
+        // is looked at (`ExitStack.__exit__` calls it every time).
+        crate::leaf_builtins::register(&exception);
         d.insert(
             DictKey(Object::from_static("exception")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "exception",
-                binds_instance: false,
-                call: Box::new(move |_| {
-                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
-                        sys_exception(&h.exc_info_stack)
-                    } else {
-                        sys_exception(&es_fallback_exc)
-                    }
-                }),
-                call_kw: None,
-            })),
+            Object::Builtin(exception),
         );
         d.insert(
             DictKey(Object::from_static("__excepthook__")),
@@ -399,7 +403,7 @@ pub fn build_with_state(
                             let value = exc
                                 .borrow()
                                 .last()
-                                .map(|top| top.instance.clone())
+                                .cloned()
                                 .unwrap_or(Object::None);
                             d.insert(DictKey(Object::Int(ident as i64)), value);
                         }
@@ -1564,18 +1568,25 @@ fn sys_getframe(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
-    crate::builtins::sync_frame_spine();
     if args.len() > 1 {
         return Err(type_error(format!(
             "_getframe expected at most 1 argument, got {}",
             args.len()
         )));
     }
-    let depth = match args.first() {
+    let mut depth = match args.first() {
         Some(Object::Int(d)) => *d as usize,
         None => 0,
         _ => return Err(type_error("depth must be an int")),
     };
+    // Only the activations up to the one asked for need their shells: the
+    // newer ones stay lean.
+    match crate::builtins::reentrant_interp() {
+        Ok(interp) if Rc::ptr_eq(&interp.frame_stack, frame_stack) => {
+            depth = interp.flush_pending_through(depth);
+        }
+        _ => crate::builtins::sync_frame_spine(),
+    }
     // The topmost frame is the currently-executing one, which is
     // the *callee* of `sys._getframe`. CPython considers the
     // calling frame as depth 0; we mirror by indexing from the back.
@@ -1586,10 +1597,12 @@ fn sys_getframe(
     let idx = len - 1 - depth;
     // RFC 0058: the spine holds cheap shells; the Python-visible
     // frame object is materialised on demand right here.
-    match crate::object::materialize_stack_at(frame_stack, idx) {
+    match crate::object::materialize_stack_at_lazy(frame_stack, idx) {
         Some(py) => {
             // PEP 578: `sys._getframe` audits with the frame object.
-            audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
+            if crate::trace::any_audit_active() {
+                audit_event("sys._getframe", &[Object::Frame(py.clone())])?;
+            }
             Ok(Object::Frame(py))
         }
         None => Err(value_error("call stack is not deep enough")),
@@ -1604,7 +1617,6 @@ fn sys_getframemodulename(
     args: &[Object],
     frame_stack: &crate::object::FrameStack,
 ) -> Result<Object, RuntimeError> {
-    crate::builtins::sync_frame_spine();
     let depth = match args.first() {
         Some(o) => match o {
             Object::Int(d) => *d,
@@ -1616,17 +1628,29 @@ fn sys_getframemodulename(
     if depth < 0 {
         return Ok(Object::None);
     }
+    // The globals are read where the activation is, lean or not.
+    if let Ok(interp) = crate::builtins::reentrant_interp() {
+        if Rc::ptr_eq(&interp.frame_stack, frame_stack) {
+            let Some(globals) = interp.frame_globals_at(depth as usize) else {
+                return Ok(Object::None);
+            };
+            let name = globals
+                .borrow()
+                .get(&crate::object::StrKey("__name__"))
+                .cloned();
+            return Ok(name.unwrap_or(Object::None));
+        }
+    }
+    crate::builtins::sync_frame_spine();
     let len = frame_stack.borrow().len();
     let depth = depth as usize;
     if depth >= len {
         return Ok(Object::None);
     }
     let idx = len - 1 - depth;
-    let Some(py) = crate::object::materialize_stack_at(frame_stack, idx) else {
-        return Ok(Object::None);
-    };
-    let name = py
-        .globals
+    // The shell's globals are the frame's: no frame object needed.
+    let globals = frame_stack.borrow()[idx].globals.clone();
+    let name = globals
         .borrow()
         .get(&crate::object::StrKey("__name__"))
         .cloned();
@@ -1637,12 +1661,12 @@ fn sys_getframemodulename(
 /// being handled, or `None` if not in an `except`. Equivalent to
 /// `sys.exc_info()[1]`. The verbatim CPython `contextlib` relies on this.
 fn sys_exception(
-    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
 ) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     Ok(stack
         .last()
-        .map(|top| top.instance.clone())
+        .cloned()
         .or_else(capi_handled_exception_instance)
         .unwrap_or(Object::None))
 }
@@ -1658,12 +1682,12 @@ fn capi_handled_exception_instance() -> Option<Object> {
 }
 
 fn sys_exc_info(
-    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
 ) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     let inst = stack
         .last()
-        .map(|top| top.instance.clone())
+        .cloned()
         .or_else(capi_handled_exception_instance);
     if let Some(inst) = inst {
         let type_obj = match &inst {
@@ -2826,9 +2850,18 @@ thread_local! {
     static CORO_ORIGIN_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether any thread ever set a nonzero coroutine origin tracking depth:
+/// until one does, every thread's depth is `0` without a thread-local read
+/// (the coroutine constructors ask on every call).
+static CORO_ORIGIN_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Current `sys.get_coroutine_origin_tracking_depth()` value; read by
 /// the interpreter when constructing coroutine objects.
+#[inline]
 pub fn coroutine_origin_tracking_depth() -> i64 {
+    if !CORO_ORIGIN_EVER.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
     CORO_ORIGIN_DEPTH.with(std::cell::Cell::get)
 }
 
@@ -2844,6 +2877,9 @@ fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, Ru
     };
     if depth < 0 {
         return Err(crate::error::value_error("depth must be >= 0"));
+    }
+    if depth != 0 {
+        CORO_ORIGIN_EVER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     CORO_ORIGIN_DEPTH.with(|c| c.set(depth));
     Ok(Object::None)

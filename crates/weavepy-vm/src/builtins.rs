@@ -4306,14 +4306,26 @@ pub(crate) fn code_synthetic_attr(
     c: &Rc<weavepy_compiler::CodeObject>,
     name: &str,
 ) -> Option<Object> {
+    let ident = |k: usize| {
+        crate::code_vm_ext(c).map(|ext| {
+            ext.ident_strs.get_or_init(|| {
+                [
+                    Object::from_str(&c.name),
+                    Object::from_str(if c.qualname.is_empty() {
+                        &c.name
+                    } else {
+                        &c.qualname
+                    }),
+                    Object::from_str(&*c.filename),
+                ]
+            })[k]
+                .clone()
+        })
+    };
     match name {
-        "co_name" | "__name__" => Some(Object::from_str(&c.name)),
-        "co_qualname" | "__qualname__" => Some(Object::from_str(if c.qualname.is_empty() {
-            &c.name
-        } else {
-            &c.qualname
-        })),
-        "co_filename" => Some(Object::from_str(&*c.filename)),
+        "co_name" | "__name__" => ident(0),
+        "co_qualname" | "__qualname__" => ident(1),
+        "co_filename" => ident(2),
         "co_argcount" => Some(Object::Int(i64::from(c.arg_count))),
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
@@ -4554,17 +4566,17 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let mut requested_nlocals: Option<u32> = None;
     for (k, v) in kwargs {
         match k.as_str() {
-            "co_name" => nc.name = want_str(v, "co_name")?,
-            "co_qualname" => nc.qualname = want_str(v, "co_qualname")?,
+            "co_name" => nc.name = want_str(v, "co_name")?.into(),
+            "co_qualname" => nc.qualname = want_str(v, "co_qualname")?.into(),
             "co_filename" => nc.filename = want_str(v, "co_filename")?.into(),
             "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
             "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
             "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
             "co_nlocals" => requested_nlocals = Some(want_u32(v, "co_nlocals")?),
-            "co_varnames" => nc.varnames = want_str_seq(v, "co_varnames")?,
-            "co_names" => nc.names = want_str_seq(v, "co_names")?,
-            "co_freevars" => nc.freevars = want_str_seq(v, "co_freevars")?,
-            "co_cellvars" => nc.cellvars = want_str_seq(v, "co_cellvars")?,
+            "co_varnames" => nc.varnames = names_of(want_str_seq(v, "co_varnames")?),
+            "co_names" => nc.names = names_of(want_str_seq(v, "co_names")?),
+            "co_freevars" => nc.freevars = names_of(want_str_seq(v, "co_freevars")?),
+            "co_cellvars" => nc.cellvars = names_of(want_str_seq(v, "co_cellvars")?),
             "co_stacksize" => {
                 nc.wire.get_or_insert_with(Default::default).stacksize =
                     Some(want_u32(v, "co_stacksize")?);
@@ -4712,10 +4724,10 @@ pub fn foreign_code_object(
     const CO_ITERABLE_COROUTINE: u32 = 0x0100;
     const CO_ASYNC_GENERATOR: u32 = 0x0200;
     let mut nc = weavepy_compiler::CodeObject {
-        name,
-        qualname,
+        name: name.into(),
+        qualname: qualname.into(),
         filename: filename.into(),
-        varnames,
+        varnames: names_of(varnames),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -4735,6 +4747,11 @@ pub fn foreign_code_object(
     w.co_code = Some(Vec::new());
     w.exec_error = Some("cannot execute foreign bytecode".to_owned());
     Object::Code(Rc::new(nc))
+}
+
+/// A code object's name table from a constructor or `replace()` argument.
+fn names_of(names: Vec<String>) -> Vec<weavepy_compiler::Name> {
+    names.iter().map(weavepy_compiler::Name::from).collect()
 }
 
 /// Pin raw CPython `co_code` bytes on `nc` (RFC 0060 — `CodeType(...)` /
@@ -4906,14 +4923,14 @@ pub(crate) fn code_type_call(
     const CO_ITERABLE_COROUTINE: u32 = 0x0100;
     const CO_ASYNC_GENERATOR: u32 = 0x0200;
     let mut nc = weavepy_compiler::CodeObject {
-        name,
-        qualname,
+        name: name.into(),
+        qualname: qualname.into(),
         filename: filename.into(),
         constants,
-        names,
-        varnames,
-        freevars,
-        cellvars,
+        names: names_of(names),
+        varnames: names_of(varnames),
+        freevars: names_of(freevars),
+        cellvars: names_of(cellvars),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -5008,33 +5025,51 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
             .collect();
         return list_iter(items);
     }
-    let cp = c.to_cpython();
     let debug_ranges = crate::vm_singletons::debug_ranges();
-    let col = |v: Option<u32>| {
-        v.filter(|_| debug_ranges)
-            .map_or(Object::None, |x| Object::Int(i64::from(x)))
+    let build = || -> Vec<Object> {
+        let cp = c.to_cpython();
+        let col = |v: Option<u32>| {
+            v.filter(|_| debug_ranges)
+                .map_or(Object::None, |x| Object::Int(i64::from(x)))
+        };
+        let line = |v: i32| {
+            // -1 marks NO_LOCATION; 0 is a real line (module RESUME).
+            if v < 0 {
+                Object::None
+            } else {
+                Object::Int(i64::from(v))
+            }
+        };
+        cp.positions
+            .iter()
+            .map(|p| {
+                // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
+                // With debug ranges disabled only start lines survive, so
+                // end_line collapses onto line (CPython stores no
+                // end-position table; test_endline_and_columntable_none_…).
+                let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
+                Object::new_tuple_array([
+                    line(p.lineno),
+                    line(end_lineno),
+                    col(p.col),
+                    col(p.end_col),
+                ])
+            })
+            .collect()
     };
-    let line = |v: i32| {
-        // -1 marks NO_LOCATION; 0 is a real line (module RESUME).
-        if v < 0 {
-            Object::None
-        } else {
-            Object::Int(i64::from(v))
+    // The tuples are built once per code object (`traceback` asks for
+    // every frame's, then reads one entry): an iterator over one shared
+    // immutable tuple of them.
+    if let Some(ext) = crate::code_vm_ext(&c) {
+        let (ranges, all) = ext
+            .positions
+            .get_or_init(|| (debug_ranges, Object::new_tuple(build())));
+        if *ranges == debug_ranges {
+            let it = all.make_iter()?;
+            return Ok(Object::Iter(Rc::new(RefCell::new(it))));
         }
-    };
-    let items = cp
-        .positions
-        .iter()
-        .map(|p| {
-            // A NO_LOCATION unit (lineno 0) reports all-None (PEP 657).
-            // With debug ranges disabled only start lines survive, so
-            // end_line collapses onto line (CPython stores no
-            // end-position table; test_endline_and_columntable_none_…).
-            let end_lineno = if debug_ranges { p.end_lineno } else { p.lineno };
-            Object::new_tuple_array([line(p.lineno), line(end_lineno), col(p.col), col(p.end_col)])
-        })
-        .collect();
-    list_iter(items)
+    }
+    list_iter(build())
 }
 
 /// Wrap a vector of objects as a single-use iterator, mirroring the
@@ -5309,6 +5344,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                     )));
                 }
                 *f.code.borrow_mut() = c;
+                f.names_kept.set(0);
             } else if crate::object::is_function_slot(name) {
                 f.set_slot(name, value);
             } else {
@@ -6009,6 +6045,36 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
     let sign = if (bits >> 63) & 1 == 1 { -1i32 } else { 1 };
     let exp_field = ((bits >> 52) & 0x7FF) as i32;
     let mantissa_field = bits & ((1u64 << 52) - 1);
+    // Machine-word answer when both terms fit an `i64` (every float of
+    // magnitude below 2**10 with few fraction bits, the statistics
+    // module's common case): the denominator is a power of two, so
+    // lowest terms only strip the mantissa's trailing zeros.
+    {
+        let (m, e) = if exp_field == 0 {
+            (mantissa_field, -1074)
+        } else {
+            ((1u64 << 52) | mantissa_field, exp_field - 1075)
+        };
+        if m == 0 {
+            return Ok(Object::new_tuple_array([Object::Int(0), Object::Int(1)]));
+        }
+        let small = if e >= 0 {
+            // `m < 2**53`, so the shift stays below 2**63 while `e <= 9`.
+            (e <= 9).then(|| (i64::try_from(m << e).ok(), Some(1i64)))
+        } else {
+            let shift = m.trailing_zeros().min(e.unsigned_abs());
+            let m = m >> shift;
+            let e = e + shift as i32;
+            (e > -63).then(|| (i64::try_from(m).ok(), Some(1i64 << -e)))
+        };
+        if let Some((Some(num), Some(den))) = small {
+            let num = if sign < 0 { -num } else { num };
+            return Ok(Object::new_tuple_array([
+                Object::Int(num),
+                Object::Int(den),
+            ]));
+        }
+    }
     let (mantissa, exponent): (BigInt, i32) = if exp_field == 0 {
         // Subnormal.
         (BigInt::from(mantissa_field), -1074)
@@ -8720,6 +8786,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -8799,6 +8866,7 @@ pub(crate) fn build_super_proxy(
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -10608,6 +10676,8 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         closure_cells: std::sync::OnceLock::new(),
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
+        names_kept: crate::sync::Cell::new(0),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Ok(Object::Function(Rc::new(marked)))
 }
@@ -11008,7 +11078,59 @@ fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(str_result(args, out))
 }
 
+/// `strip`/`lstrip`/`rstrip` of an exact `str` by whitespace or by a set
+/// of ASCII characters, scanning bytes: the receiver itself when nothing
+/// goes, else one allocation. `None` for the general path (a non-ASCII
+/// set, or a non-ASCII character at an edge whitespace stripping reaches).
+fn strip_fast(args: &[Object], left: bool, right: bool) -> Option<Object> {
+    let (Some(Object::Str(s)), true) = (args.first(), args.len() <= 2) else {
+        return None;
+    };
+    let spaces = matches!(args.get(1), None | Some(Object::None));
+    let mut set = [false; 128];
+    match args.get(1) {
+        None | Some(Object::None) => set = *ascii_space_table(),
+        Some(Object::Str(chars)) if chars.is_ascii() => {
+            for &c in chars.as_bytes() {
+                set[usize::from(c)] = true;
+            }
+        }
+        _ => return None,
+    }
+    let b = s.as_bytes();
+    let strips = |c: u8| c < 0x80 && set[usize::from(c)];
+    let (mut lo, mut hi) = (0, b.len());
+    if left {
+        while lo < hi && strips(b[lo]) {
+            lo += 1;
+        }
+    }
+    if right {
+        while hi > lo && strips(b[hi - 1]) {
+            hi -= 1;
+        }
+    }
+    // (A non-ASCII character may be Unicode whitespace.)
+    if spaces && ((left && lo < hi && b[lo] >= 0x80) || (right && hi > lo && b[hi - 1] >= 0x80)) {
+        return None;
+    }
+    if lo == 0 && hi == b.len() {
+        return Some(args[0].clone());
+    }
+    // (The shortest results are the shared ones `SharedStr::from` hands
+    // out, as `str_result` would.)
+    let ascii = hi - lo > 2 && SharedStr::char_count(s) == b.len();
+    Some(Object::Str(if ascii {
+        SharedStr::from_ascii(&s[lo..hi])
+    } else {
+        SharedStr::from(&s[lo..hi])
+    }))
+}
+
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, true, true) {
+        return Ok(out);
+    }
     str_arity("strip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
@@ -11321,7 +11443,7 @@ fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("startswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3), ascii_receiver(args))?;
     match slice {
         Some(slice) => Ok(Object::Bool(str_match_prefix_suffix(slice, target, true)?)),
         None => Ok(Object::Bool(false)),
@@ -11335,10 +11457,25 @@ fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("endswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3), ascii_receiver(args))?;
     match slice {
         Some(slice) => Ok(Object::Bool(str_match_prefix_suffix(slice, target, false)?)),
         None => Ok(Object::Bool(false)),
+    }
+}
+
+/// Whether a `str` method's receiver is known to be pure ASCII, so a
+/// character index is a byte index. A long receiver's code points are
+/// counted once (the count is memoized on the string); a scan per call
+/// would make `s.startswith(x, pos)` linear in `pos`, as tomllib's
+/// tokenizer calls it at every position.
+fn ascii_receiver(args: &[Object]) -> bool {
+    match args.first() {
+        Some(Object::Str(t)) => {
+            crate::shared_value::SharedStr::known_char_count(t) == Some(t.len())
+                || (t.len() > 64 && crate::shared_value::SharedStr::is_ascii(t))
+        }
+        _ => false,
     }
 }
 
@@ -11351,6 +11488,7 @@ fn str_apply_start_end<'a>(
     s: &'a str,
     start: Option<&Object>,
     end: Option<&Object>,
+    ascii: bool,
 ) -> Result<Option<&'a str>, RuntimeError> {
     // The common unbounded check only needs to inspect the needle. In
     // particular, json.loads checks for a BOM this way on the whole input.
@@ -11390,7 +11528,7 @@ fn str_apply_start_end<'a>(
         }
         let index = usize::try_from(index).ok()?;
         let prefix = text.as_bytes().get(..index)?;
-        if prefix.is_ascii() {
+        if ascii || prefix.is_ascii() {
             Some(index)
         } else {
             text.char_indices()
@@ -11676,6 +11814,11 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
     if n.is_empty() {
         return Some(0);
     }
+    // One ASCII byte in a short string (`d in "123456789"`): a plain scan
+    // costs less than `memchr`'s set-up.
+    if let ([byte], true) = (n, h.len() <= 16) {
+        return h.iter().position(|c| c == byte);
+    }
     if n.len() > 16 || h.len() < n.len() {
         return hay.find(needle);
     }
@@ -11929,6 +12072,9 @@ fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, true, false) {
+        return Ok(out);
+    }
     str_arity("lstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
@@ -11949,6 +12095,9 @@ fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = strip_fast(args, false, true) {
+        return Ok(out);
+    }
     str_arity("rstrip", args, 0, 1)?;
     let s = str_self(args)?;
     let out = match args.get(1) {
@@ -12526,6 +12675,9 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
                 [_, Object::Str(enc)] => {
                     matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
                 }
+                [_, Object::Str(enc), errors] if is_builtin_error_handler(errors) => {
+                    matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
+                }
                 _ => false,
             };
         if utf8 {
@@ -12631,9 +12783,12 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let mut out = String::new();
+    let mut out = String::with_capacity(s.len());
     let receiver_bridged = matches!(args.first(), Some(Object::WStr(_)));
     let mut saw_surrogate = receiver_bridged;
+    // Each ASCII character's entry, looked up once per call (CPython's
+    // `unicode_fast_translate` caches its ASCII table the same way).
+    let mut ascii_memo: [Option<Option<Object>>; 128] = std::array::from_fn(|_| None);
     // Push a translation target code point, bridging a surrogate so it
     // round-trips through `str_result`.
     let push_cp = |out: &mut String, cp: u32, saw: &mut bool| {
@@ -12658,13 +12813,17 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         } else {
             cp
         };
-        let entry = match &table {
+        let lookup = |cp: u32| match &table {
             Table::Dict(Object::Dict(d)) => d
                 .borrow()
-                .get(&DictKey(Object::Int(i64::from(real_cp))))
+                .get(&DictKey(Object::Int(i64::from(cp))))
                 .cloned(),
             Table::Dict(_) => None,
-            Table::Seq(v) => v.get(real_cp as usize).cloned(),
+            Table::Seq(v) => v.get(cp as usize).cloned(),
+        };
+        let entry = match ascii_memo.get_mut(real_cp as usize) {
+            Some(slot) => slot.get_or_insert_with(|| lookup(real_cp)).clone(),
+            None => lookup(real_cp),
         };
         match entry {
             Some(Object::None) => {}
@@ -13440,21 +13599,25 @@ pub(crate) fn dict_insert_exact(
     let Ok(mut m) = d.try_borrow_mut() else {
         return Err((key, value));
     };
-    if let Some(slot) = m.get_mut(&probe) {
-        let replaced = !slot.is_same(&value);
-        let old = std::mem::replace(slot, value);
-        drop(m);
-        // (Re-storing the identical object is no change; PEP 509.)
-        if replaced {
-            crate::object::dict_mutation_event(d);
+    let vacancy = match m.probe_entry(&probe) {
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            let slot = e.into_mut();
+            let replaced = !slot.is_same(&value);
+            let old = std::mem::replace(slot, value);
+            drop(m);
+            // (Re-storing the identical object is no change; PEP 509.)
+            if replaced {
+                crate::object::dict_mutation_event(d);
+            }
+            return Ok(Some(old));
         }
-        return Ok(Some(old));
-    }
+        crate::dictmap::ProbeEntry::Vacant(e) => e,
+    };
     if !probe.miss_is_exact() {
         drop(m);
         return Err((key, value));
     }
-    m.insert(DictKey(key), value);
+    vacancy.insert(DictKey(key), value);
     drop(m);
     crate::object::dict_watch_bump(d);
     crate::object::dict_mutation_event(d);
@@ -13541,6 +13704,26 @@ pub(crate) fn dict_remove(
     d: &Rc<RefCell<DictData>>,
     key: &Object,
 ) -> Result<Option<(Object, Object)>, RuntimeError> {
+    // A `str` or `int` key settles by native equality: one probe, with no
+    // comparison scope (see `dict_lookup`).
+    if let Some(probe) = crate::object::LeafProbe::new(key) {
+        if let Ok(mut m) = d.try_borrow_mut() {
+            match m.get_index_of(&probe) {
+                Some(i) => {
+                    let (k, v) = m.shift_remove_index(i).expect("found above");
+                    drop(m);
+                    crate::object::dict_watch_bump(d);
+                    crate::object::dict_mutation_event(d);
+                    if crate::capi_watchers::dicts_active() {
+                        crate::capi_watchers::dict_event("DELETED", d, Some(key), None);
+                    }
+                    return Ok(Some((k.0, v)));
+                }
+                None if probe.miss_is_exact() => return Ok(None),
+                None => {}
+            }
+        }
+    }
     if crate::object::dict_key_is_reentrant(key) {
         return crate::object::dict_reentrant_remove(d, key);
     }
@@ -13638,6 +13821,13 @@ fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
     if n.len() > 10 {
         return None;
     }
+    // The spellings code writes, without the normalizing copy.
+    match n {
+        "utf-8" | "utf8" => return Some(PlainCodec::Utf8),
+        "ascii" => return Some(PlainCodec::Ascii),
+        "latin-1" | "latin1" => return Some(PlainCodec::Latin1),
+        _ => {}
+    }
     let n = n.to_ascii_lowercase().replace('_', "-");
     Some(match n.as_str() {
         "utf-8" | "utf8" => PlainCodec::Utf8,
@@ -13647,13 +13837,31 @@ fn plain_codec(name: Option<&Object>) -> Option<PlainCodec> {
     })
 }
 
+/// One of the codec error handlers every interpreter registers. A
+/// conversion that meets no error never consults its handler, so a leaf
+/// half that only serves error-free conversions may accept any of these
+/// (an unknown name is left to the full path, which owns its checks).
+fn is_builtin_error_handler(o: &Object) -> bool {
+    matches!(o, Object::Str(e) if matches!(
+        &**e,
+        "strict"
+            | "ignore"
+            | "replace"
+            | "surrogateescape"
+            | "surrogatepass"
+            | "backslashreplace"
+            | "xmlcharrefreplace"
+            | "namereplace"
+    ))
+}
+
 /// `s.encode([encoding])` with a plain codec, when every character
 /// encodes (an unencodable one raises on the full path).
 pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (Object::Str(s), rest) = args.split_first()? else {
         return None;
     };
-    if rest.len() > 1 {
+    if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
     let s: &str = s;
@@ -13675,7 +13883,7 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     let (Object::Bytes(b), rest) = args.split_first()? else {
         return None;
     };
-    if rest.len() > 1 {
+    if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
     let text = match plain_codec(rest.first())? {
@@ -13744,17 +13952,17 @@ pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     let probe = crate::object::LeafProbe::new(key)?;
     let cell = leaf_dict_of(recv)?;
     let mut d = cell.try_borrow_mut().ok()?;
-    let (old, changed, added) = match d.get_mut(&probe) {
-        Some(slot) => {
-            let old = std::mem::replace(slot, value.clone());
+    let (old, changed, added) = match d.probe_entry(&probe) {
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            let old = std::mem::replace(e.into_mut(), value.clone());
             let changed = !old.is_same(value);
             (Some(old), changed, false)
         }
-        None => {
+        crate::dictmap::ProbeEntry::Vacant(e) => {
             if !probe.miss_is_exact() {
                 return None;
             }
-            d.insert(DictKey(key.clone()), value.clone());
+            e.insert(DictKey(key.clone()), value.clone());
             (None, true, true)
         }
     };
@@ -16940,8 +17148,10 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             // Text writes commit fully and report the *character* count
             // (CPython `TextIOWrapper.write`), never a partial byte tally.
-            f.write_text_all(&f.encode_text(s)?)?;
-            s.chars().count()
+            if !f.mem_text_append(s) {
+                f.write_text_all(&f.encode_text(s)?)?;
+            }
+            crate::object::str_char_len(s)
         }
         // A surrogate-bearing `str`. For an in-memory `StringIO` the lone
         // surrogates ride through the PUA bridge so they round-trip; a real

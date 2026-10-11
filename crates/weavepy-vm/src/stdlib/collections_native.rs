@@ -1420,22 +1420,25 @@ fn tally_one(
     if let Some(probe) = crate::object::LeafProbe::new(key) {
         if !crate::capi_watchers::dicts_active() {
             if let Ok(mut m) = d.try_borrow_mut() {
-                match m.get_mut(&probe) {
-                    Some(Object::Int(n)) if *n < i64::MAX => {
-                        *n += 1;
-                        drop(m);
-                        crate::object::dict_mutation_event(d);
-                        return Ok(());
+                match m.probe_entry(&probe) {
+                    crate::dictmap::ProbeEntry::Occupied(e) => {
+                        if let Object::Int(n) = e.into_mut() {
+                            if *n < i64::MAX {
+                                *n += 1;
+                                drop(m);
+                                crate::object::dict_mutation_event(d);
+                                return Ok(());
+                            }
+                        }
                     }
-                    Some(_) => {}
-                    None if probe.miss_is_exact() => {
-                        m.insert(DictKey(key.clone()), Object::Int(1));
+                    crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                        e.insert(DictKey(key.clone()), Object::Int(1));
                         drop(m);
                         crate::object::dict_watch_bump(d);
                         crate::object::dict_mutation_event(d);
                         return Ok(());
                     }
-                    None => {}
+                    crate::dictmap::ProbeEntry::Vacant(_) => {}
                 }
             }
         }

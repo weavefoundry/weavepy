@@ -701,7 +701,7 @@ fn type_name(o: &Object) -> &'static str {
 fn callable_label(o: &Object) -> String {
     use Object as O;
     match o {
-        O::Function(f) => f.code().qualname.clone(),
+        O::Function(f) => f.code().qualname.to_string(),
         O::Builtin(b) => b.name.to_string(),
         O::Type(t) => format!("type:{}", t.name),
         O::BoundMethod(bm) => format!("bound:{}", callable_label(&bm.function)),

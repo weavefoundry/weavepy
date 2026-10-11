@@ -36,6 +36,7 @@ pub use analyze::{
 };
 pub use engine::{
     admit_generic_loops, CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix,
+    NO_HOST_ENGINE,
 };
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,

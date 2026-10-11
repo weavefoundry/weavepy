@@ -6,7 +6,7 @@
 //! CPython's C `odict` keeps a linked list of nodes next to its dict: a
 //! second, keys-only dict in a hidden slot (see [`order_of`]). The order
 //! dict is insertion-ordered like every WeavePy dict, so appending a key,
-//! moving one (`IndexMap::move_index`), and removing one are its own
+//! moving one (`DictMap::move_index`), and removing one are its own
 //! operations. Values are always read from the payload by key, so a
 //! payload changed behind the order's back (`dict.__delitem__(od, k)`)
 //! surfaces as a `KeyError` on the next ordered read, as it does in
@@ -249,33 +249,36 @@ fn od_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let probe = crate::object::LeafProbe::new(key)?;
     let mut m = main.try_borrow_mut().ok()?;
     let mut o = order.try_borrow_mut().ok()?;
-    let in_main = m.get_index_of(&probe);
-    let in_order = o.get_index_of(&probe).is_some();
-    if (in_main.is_none() || !in_order) && !probe.miss_is_exact() {
+    // One probe of each finds the entry or the slot a new key takes.
+    use crate::dictmap::ProbeEntry;
+    let in_main = m.probe_entry(&probe);
+    let in_order = o.probe_entry(&probe);
+    let (main_new, order_new) = (
+        matches!(in_main, ProbeEntry::Vacant(_)),
+        matches!(in_order, ProbeEntry::Vacant(_)),
+    );
+    if (main_new || order_new) && !probe.miss_is_exact() {
         return None;
     }
     let old = match in_main {
-        Some(i) => {
-            let (_, slot) = m.get_index_mut(i)?;
-            Some(std::mem::replace(slot, value.clone()))
-        }
-        None => {
-            m.insert(DictKey(key.clone()), value.clone());
+        ProbeEntry::Occupied(e) => Some(std::mem::replace(e.into_mut(), value.clone())),
+        ProbeEntry::Vacant(e) => {
+            e.insert(DictKey(key.clone()), value.clone());
             None
         }
     };
-    if !in_order {
-        o.insert(DictKey(key.clone()), Object::None);
+    if let ProbeEntry::Vacant(e) = in_order {
+        e.insert(DictKey(key.clone()), Object::None);
     }
     drop((m, o));
     let changed = old.as_ref().is_none_or(|o| !o.is_same(value));
-    if in_main.is_none() {
+    if main_new {
         crate::object::dict_watch_bump(main);
     }
     if changed {
         crate::object::dict_mutation_event(main);
     }
-    if !in_order {
+    if order_new {
         crate::object::dict_watch_bump(&order);
     }
     drop(old);

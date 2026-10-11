@@ -1271,6 +1271,16 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `types.MethodType(func, obj)`: `func` bound to `obj`, as the full
+    // constructor binds it.
+    if Rc::ptr_eq(cls, &bt.method_) {
+        return match args {
+            [func, obj] => Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::py_method(obj.clone(), func.clone()),
+            ))),
+            _ => None,
+        };
+    }
     // `set()`, `dict()`, `list()`, `tuple()`: an empty one (a container
     // tracked like the builtins' own, unless that would start a collection).
     if args.is_empty() {
@@ -1589,6 +1599,27 @@ pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
         [Object::Bool(b)] => Object::Int(i64::from(*b)),
         _ => return None,
     }))
+}
+
+/// `hash(x)` of a value whose hash runs no Python code and can't fail: a
+/// native scalar, a `str`, or a tuple of `int`s and `str`s.
+pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [x] = args else {
+        return None;
+    };
+    let native = match x {
+        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
+        // (A NaN hashes by identity.)
+        Object::Float(f) => !f.is_nan(),
+        Object::Tuple(t) => t
+            .iter()
+            .all(|e| matches!(e, Object::Int(_) | Object::Str(_))),
+        _ => false,
+    };
+    if !native {
+        return None;
+    }
+    Some(Ok(Object::Int(crate::object::py_hash_value(x)?)))
 }
 
 /// `ord(c)` of a one-character `str`.

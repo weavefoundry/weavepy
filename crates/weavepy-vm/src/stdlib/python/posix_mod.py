@@ -34,6 +34,11 @@ _exit = _os._exit
 # 3.14: `_pyrepl`'s console polls `posix._is_inputhook_installed()` /
 # `nt._is_inputhook_installed()` for `PyOS_InputHook`.
 _is_inputhook_installed = _os._is_inputhook_installed
+# CPython's C accelerators for `posixpath.splitroot` and `posixpath.normpath`
+# (`posixpath` imports them from here when present).
+if hasattr(_os, "_path_normpath"):
+    _path_normpath = _os._path_normpath
+    _path_splitroot_ex = _os._path_splitroot_ex
 
 if hasattr(_os, "_fcopyfile"):
     _fcopyfile = _os._fcopyfile

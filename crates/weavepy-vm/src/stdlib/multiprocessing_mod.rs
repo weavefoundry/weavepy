@@ -599,6 +599,7 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     });
     Object::Instance(inst)
 }
@@ -1232,6 +1233,7 @@ fn nt_make_semlock_instance(inner: &Arc<NtSemInner>) -> Object {
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     });
     Object::Instance(inst)
 }

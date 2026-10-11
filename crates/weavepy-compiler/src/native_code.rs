@@ -8,23 +8,37 @@
 //! mismatch or malformed input as a cache miss.
 //!
 //! Filenames aren't stored: every code object in a cached module shares
-//! the module's filename, which the reader supplies.
+//! the module's filename, which the reader supplies. A module's name
+//! tables refer to its distinct identifiers by number after their first
+//! appearance, so the reader decodes and pools each identifier once.
+//!
+//! The layout: the version byte, the offset of the table section as four
+//! little-endian bytes, the module's code object, then the table section,
+//! which holds every code object's line, column and wire-mark tables in
+//! the order the code records their lengths. A reader copies the section
+//! whole and decodes a table only when something reads it.
 
 use std::sync::Arc;
 
 use crate::bytecode::{CacheTable, Instruction, OpCode};
-use crate::{CodeObject, ColSpan, Constant, ExcHandler};
+use crate::{CodeObject, ColSpan, Constant, ExcHandler, Name};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 7;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
 /// a constant that has no fixed value.
 pub fn encode(code: &CodeObject) -> Option<Vec<u8>> {
-    let mut w = Writer(Vec::with_capacity(4096));
+    let mut w = Writer::new(Vec::with_capacity(4096));
     w.byte(VERSION);
+    // The table section's offset, filled in below.
+    w.0.extend_from_slice(&[0; 4]);
     w.code(code)?;
+    let at = u32::try_from(w.0.len()).ok()?;
+    w.0[1..5].copy_from_slice(&at.to_le_bytes());
+    let tables = std::mem::take(&mut w.2);
+    w.0.extend_from_slice(&tables);
     Some(w.0)
 }
 
@@ -95,48 +109,89 @@ pub(crate) fn decode_wire_marks(bytes: &[u8]) -> Option<Vec<u8>> {
 /// holds all their line and column tables and wire marks (see
 /// `LineTable`).
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
-    let mut r = Reader { bytes, pos: 0 };
-    if r.byte()? != VERSION {
+    let at = tables_at(bytes)?;
+    let tables = crate::TableBuffer::new(Box::<[u8]>::from(bytes.get(at..)?));
+    decode_split(&bytes[..at], tables, filename)
+}
+
+/// Where the table section of what [`encode`] wrote starts, from its
+/// first five bytes (or more); `None` for input it didn't write.
+pub fn tables_at(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&VERSION) {
         return None;
     }
+    let at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
+    (at >= 5).then_some(at)
+}
+
+/// [`decode`] for input split at [`tables_at`]: `code` is what comes
+/// before the table section and `tables` holds the section, which the
+/// decoded code objects keep, reading a table from it only when
+/// something asks for that table.
+pub fn decode_split(code: &[u8], tables: crate::TableBuffer, filename: &str) -> Option<CodeObject> {
+    if tables_at(code)? != code.len() {
+        return None;
+    }
+    let tables_len = tables.bytes().len();
+    let mut r = Reader {
+        bytes: &code[5..],
+        pos: 0,
+    };
     let mut module = Module {
         filename: Arc::from(filename),
-        tables: Vec::new(),
-        buffer: Arc::new(std::sync::OnceLock::new()),
+        buffer: Arc::new(tables),
+        tables_len,
+        next: 0,
+        names: Vec::new(),
     };
-    let code = r.code(&mut module, 0)?;
-    if r.pos != bytes.len() {
-        return None;
-    }
-    // (Copied rather than shrunk in place, which can keep the vector's
-    // spare capacity.)
-    let _ = module.buffer.set(Box::from(module.tables.as_slice()));
-    Some(code)
+    let decoded = r.code(&mut module, 0)?;
+    (r.pos == r.bytes.len() && module.next == tables_len).then_some(decoded)
 }
 
 /// What the code objects of one module decoded by [`decode`] share.
 struct Module {
     filename: Arc<str>,
-    /// Every code object's encoded line and column tables and wire
-    /// marks, in order.
-    tables: Vec<u8>,
-    /// Where `tables` goes once the decoding is done.
-    buffer: Arc<std::sync::OnceLock<Box<[u8]>>>,
+    /// The table section (see the module docs).
+    buffer: Arc<crate::TableBuffer>,
+    /// The section's length, and where its next table starts.
+    tables_len: usize,
+    next: usize,
+    /// The module's identifiers so far, in order of first appearance
+    /// (see [`Writer::names`]).
+    names: Vec<Name>,
 }
 
 impl Module {
-    /// Append an encoded table to the shared buffer.
-    fn table(&mut self, bytes: &[u8]) -> Option<crate::Encoded> {
-        let start = u32::try_from(self.tables.len()).ok()?;
-        self.tables.extend_from_slice(bytes);
-        let end = u32::try_from(self.tables.len()).ok()?;
-        Some(crate::Encoded::new(self.buffer.clone(), start, end))
+    /// The table section's next `len` bytes.
+    fn table(&mut self, len: usize) -> Option<crate::Encoded> {
+        let start = self.next;
+        let end = start
+            .checked_add(len)
+            .filter(|&end| end <= self.tables_len)?;
+        self.next = end;
+        Some(crate::Encoded::new(
+            self.buffer.clone(),
+            u32::try_from(start).ok()?,
+            u32::try_from(end).ok()?,
+        ))
     }
 }
 
-struct Writer(Vec<u8>);
+/// The output, the number of each identifier written so far (see
+/// [`Writer::names`]), and the table section (see the module docs).
+struct Writer(Vec<u8>, std::collections::HashMap<String, u32>, Vec<u8>);
 
 impl Writer {
+    fn new(out: Vec<u8>) -> Self {
+        Writer(out, std::collections::HashMap::new(), Vec::new())
+    }
+
+    /// Move a table into the table section, recording its length.
+    fn table(&mut self, table: Vec<u8>) {
+        self.uint(table.len() as u64);
+        self.2.extend_from_slice(&table);
+    }
+
     fn byte(&mut self, b: u8) {
         self.0.push(b);
     }
@@ -162,6 +217,27 @@ impl Writer {
         self.uint(v.len() as u64);
         for s in v {
             self.bytes(s.as_bytes());
+        }
+    }
+
+    /// An identifier: its number plus one when the module wrote it
+    /// before, else a zero and its text (which gives it the next number).
+    fn name(&mut self, s: &Name) {
+        if let Some(&i) = self.1.get(s.as_str()) {
+            self.uint(u64::from(i) + 1);
+        } else {
+            let i = self.1.len() as u32;
+            self.1.insert(s.as_str().to_owned(), i);
+            self.uint(0);
+            self.bytes(s.as_bytes());
+        }
+    }
+
+    /// A name table: its length, then its identifiers (see [`Self::name`]).
+    fn names(&mut self, v: &[Name]) {
+        self.uint(v.len() as u64);
+        for s in v {
+            self.name(s);
         }
     }
 
@@ -223,8 +299,8 @@ impl Writer {
         if c.wire.is_some() {
             return None;
         }
-        self.bytes(c.name.as_bytes());
-        self.bytes(c.qualname.as_bytes());
+        self.name(&c.name);
+        self.name(&c.qualname);
         self.uint(c.instructions.len() as u64);
         for ins in &c.instructions {
             self.byte(ins.op as u8);
@@ -234,10 +310,10 @@ impl Writer {
         for k in &c.constants {
             self.constant(k)?;
         }
-        self.strs(&c.names);
-        self.strs(&c.varnames);
-        self.strs(&c.freevars);
-        self.strs(&c.cellvars);
+        self.names(&c.names);
+        self.names(&c.varnames);
+        self.names(&c.freevars);
+        self.names(&c.cellvars);
         self.uint(c.exception_table.len() as u64);
         for h in &c.exception_table {
             self.uint(u64::from(h.start));
@@ -247,12 +323,12 @@ impl Writer {
             self.byte(u8::from(h.push_lasti));
         }
         // Line numbers in runs: a statement's instructions share a line.
-        self.line_runs(&c.linetable);
-        // The column spans as one length-prefixed block, which a reader
-        // keeps encoded until something reads a column (see `ColTable`).
-        let mut cols = Writer(Vec::new());
+        let mut lines = Writer::new(Vec::new());
+        lines.line_runs(&c.linetable);
+        self.table(lines.0);
+        let mut cols = Writer::new(Vec::new());
         cols.col_runs(&c.coltable)?;
-        self.bytes(&cols.0);
+        self.table(cols.0);
         self.uint(u64::from(c.arg_count));
         self.uint(u64::from(c.posonly_count));
         self.uint(u64::from(c.kwonly_count));
@@ -277,7 +353,12 @@ impl Writer {
         self.uint(u64::from(c.future_flags));
         self.uint(c.stacksize.map_or(0, |s| u64::from(s) + 1));
         self.u32s(c.no_interrupt_jumps());
-        self.wire_marks(&c.wire_marks)?;
+        // (No table at all for code without marks.)
+        let mut marks = Writer::new(Vec::new());
+        if !c.wire_marks.is_empty() {
+            marks.wire_marks(&c.wire_marks)?;
+        }
+        self.table(marks.0);
         self.strs(c.hidden_locals());
         self.strs(c.const_identifiers());
         Some(())
@@ -428,6 +509,34 @@ impl Reader<'_> {
         Some(v)
     }
 
+    /// An identifier [`Writer::name`] wrote.
+    fn name(&mut self, module: &mut Module) -> Option<Name> {
+        self.name_as(module, Name::new)
+    }
+
+    /// An identifier [`Writer::name`] wrote, made with `make` (pooled or
+    /// not) if this is its first appearance.
+    fn name_as(&mut self, module: &mut Module, make: fn(&str) -> Name) -> Option<Name> {
+        Some(match self.uint()? {
+            0 => {
+                let name = make(std::str::from_utf8(self.raw()?).ok()?);
+                module.names.push(name.clone());
+                name
+            }
+            i => module.names.get(usize::try_from(i - 1).ok()?)?.clone(),
+        })
+    }
+
+    /// A name table [`Writer::names`] wrote.
+    fn names(&mut self, module: &mut Module) -> Option<Vec<Name>> {
+        let n = self.len()?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(self.name(module)?);
+        }
+        Some(v)
+    }
+
     fn u32s(&mut self) -> Option<Vec<u32>> {
         let n = self.len()?;
         let mut v = Vec::with_capacity(n);
@@ -460,25 +569,11 @@ impl Reader<'_> {
         Some(())
     }
 
-    /// The bytes of a line-number block, checked as decoding would but
-    /// left encoded (see `LineTable`).
-    fn line_runs_raw(&mut self) -> Option<&[u8]> {
-        let start = self.pos;
-        self.line_runs(|_, _| {})?;
-        Some(&self.bytes[start..self.pos])
-    }
-
-    /// The bytes of a wire-mark block, checked for length but left
-    /// encoded (see `WireMarks`); empty for code without marks.
-    fn wire_marks_raw(&mut self) -> Option<&[u8]> {
-        let start = self.pos;
-        let n = self.table_len()?;
-        let end = self.pos.checked_add(n.div_ceil(2))?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        self.pos = end;
-        Some(if n == 0 { &[] } else { &self.bytes[start..end] })
+    /// The next table of the module's table section (see the module
+    /// docs), left encoded.
+    fn table(&mut self, module: &mut Module) -> Option<crate::Encoded> {
+        let len = usize::try_from(self.uint()?).ok()?;
+        module.table(len)
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -491,8 +586,9 @@ impl Reader<'_> {
         if depth > MAX_NESTING {
             return None;
         }
-        let name = self.string()?;
-        let qualname = self.string()?;
+        let name = self.name(module)?;
+        // (A qualified name other than a plain name is seldom shared.)
+        let qualname = self.name_as(module, Name::unpooled)?;
         let n = self.len()?;
         let mut instructions = Vec::with_capacity(n);
         for _ in 0..n {
@@ -504,10 +600,10 @@ impl Reader<'_> {
         for _ in 0..n {
             constants.push(self.constant(module, depth)?);
         }
-        let names = self.strs()?;
-        let varnames = self.strs()?;
-        let freevars = self.strs()?;
-        let cellvars = self.strs()?;
+        let names = self.names(module)?;
+        let varnames = self.names(module)?;
+        let freevars = self.names(module)?;
+        let cellvars = self.names(module)?;
         let n = self.len()?;
         let mut exception_table = Vec::with_capacity(n);
         for _ in 0..n {
@@ -519,8 +615,8 @@ impl Reader<'_> {
                 push_lasti: self.byte()? != 0,
             });
         }
-        let linetable = crate::LineTable::encoded(module.table(self.line_runs_raw()?)?);
-        let coltable = crate::ColTable::encoded(module.table(self.raw()?)?);
+        let linetable = crate::LineTable::encoded(self.table(module)?);
+        let coltable = crate::ColTable::encoded(self.table(module)?);
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;
@@ -529,9 +625,11 @@ impl Reader<'_> {
         let future_flags = self.u32()?;
         let stacksize = self.u32()?.checked_sub(1);
         let no_interrupt_jumps = self.u32s()?;
-        let wire_marks = match self.wire_marks_raw()? {
-            [] => crate::WireMarks::default(),
-            marks => crate::WireMarks::encoded(module.table(marks)?),
+        let marks = self.table(module)?;
+        let wire_marks = if marks.is_empty() {
+            crate::WireMarks::default()
+        } else {
+            crate::WireMarks::encoded(marks)
         };
         let mut rare = crate::CodeRare::default();
         rare.set(crate::RareFields {
@@ -618,8 +716,8 @@ mod tests {
     #[test]
     fn round_trips_constants_and_metadata() {
         let inner = CodeObject {
-            name: "f".to_owned(),
-            qualname: "C.f".to_owned(),
+            name: "f".into(),
+            qualname: "C.f".into(),
             filename: "m.py".into(),
             instructions: vec![
                 Instruction::new(OpCode::Resume, 0),
@@ -627,7 +725,7 @@ mod tests {
                 Instruction::new(OpCode::ReturnValue, 0),
             ],
             constants: vec![Constant::Int(-5)],
-            varnames: vec!["x".to_owned()],
+            varnames: vec!["x".into()],
             linetable: vec![1, 2, 2].into(),
             coltable: vec![ColSpan::default(); 3].into(),
             arg_count: 1,
@@ -637,8 +735,8 @@ mod tests {
             ..CodeObject::default()
         };
         let mut code = CodeObject {
-            name: "<module>".to_owned(),
-            qualname: "<module>".to_owned(),
+            name: "<module>".into(),
+            qualname: "<module>".into(),
             filename: "m.py".into(),
             instructions: vec![Instruction::new(OpCode::Nop, 0)],
             constants: vec![
@@ -660,7 +758,7 @@ mod tests {
                 ))),
                 Constant::Code(Arc::new(inner)),
             ],
-            names: vec!["print".to_owned()],
+            names: vec!["print".into()],
             exception_table: vec![ExcHandler {
                 start: 0,
                 end: 1,
@@ -686,6 +784,37 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&back.filename, &inner.filename));
         assert_eq!(*inner.linetable, [1, 2, 2]);
+    }
+
+    #[test]
+    fn encoded_tables_clone_and_mutate_independently() {
+        let code = CodeObject {
+            instructions: vec![Instruction::new(OpCode::Nop, 0); 3],
+            linetable: vec![1, 2, 2].into(),
+            coltable: vec![ColSpan::default(); 3].into(),
+            wire_marks: vec![0, 3, 0].into(),
+            ..CodeObject::default()
+        };
+        let back = decode(&encode(&code).expect("encodable"), "m.py").expect("decodable");
+        // A clone of a table still encoded shares the encoding.
+        let copy = back.clone();
+        assert_eq!(*copy.linetable, [1, 2, 2]);
+        assert_eq!(*back.linetable, [1, 2, 2]);
+        // Mutating a table decodes it first, and leaves the others alone.
+        let mut owned = back.clone();
+        owned.linetable.push(3);
+        owned.coltable.pop();
+        assert_eq!(*owned.linetable, [1, 2, 2, 3]);
+        assert_eq!(owned.coltable.len(), 2);
+        assert_eq!(*back.linetable, [1, 2, 2]);
+        assert_eq!(back.coltable.len(), 3);
+        assert_eq!(&*copy.wire_marks, &[0, 3, 0]);
+        // A clone of a decoded table copies it.
+        let again = owned.clone();
+        drop(owned);
+        assert_eq!(*again.linetable, [1, 2, 2, 3]);
+        // A default table reads as empty.
+        assert!(CodeObject::default().linetable.is_empty());
     }
 
     #[test]
@@ -730,7 +859,7 @@ mod tests {
     #[test]
     fn rejects_truncated_or_foreign_input() {
         let code = CodeObject {
-            name: "<module>".to_owned(),
+            name: "<module>".into(),
             instructions: vec![Instruction::new(OpCode::Nop, 0)],
             constants: vec![Constant::Str("x".repeat(40))],
             ..CodeObject::default()

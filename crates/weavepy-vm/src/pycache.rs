@@ -469,7 +469,7 @@ mod ownership_tests {
     #[test]
     fn relocation_preserves_shared_code_and_nested_tuple_constants() {
         let child = Arc::new(CodeObject {
-            name: "child".to_owned(),
+            name: "child".into(),
             filename: "original.py".into(),
             ..CodeObject::default()
         });

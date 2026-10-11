@@ -78,12 +78,13 @@ impl Error {
             Error::Runtime(vm::RuntimeError::PyException(exc)) => {
                 let mut s = String::new();
                 let _ = writeln!(s, "Traceback (most recent call last):");
-                // Tracebacks are accumulated from inner-most frame
-                // outward; print outer-most first to match CPython.
-                if exc.traceback.is_empty() {
+                // The `__traceback__` chain, outermost frame first, as
+                // CPython prints it.
+                let entries = exc.traceback_entries();
+                if entries.is_empty() {
                     let _ = writeln!(s, "  File \"{filename}\", line ?, in <module>");
                 } else {
-                    for entry in exc.traceback.iter().rev() {
+                    for entry in &entries {
                         let _ = writeln!(
                             s,
                             "  File \"{}\", line {}, in {}",

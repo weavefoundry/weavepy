@@ -4483,7 +4483,16 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             if is_subclass_by_name(&inst_rc.cls(), "StopIteration") {
                 inst_rc.slot_set("value", rest.first().cloned().unwrap_or(Object::None));
             }
-            inst_rc.slot_set("args", Object::new_tuple(rest));
+            // Only a non-atomic argument can close a cycle through the
+            // instance (as at construction, see `build_exception_instance`).
+            if rest.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
+                inst_rc.ensure_gc_tracked();
+            }
+            let old = inst_rc
+                .slots
+                .borrow_mut()
+                .insert("args", Object::new_tuple(rest));
+            drop(old);
         }
         Ok(Object::None)
     }
@@ -4869,12 +4878,24 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
 /// A built-in exception of `class` whose `args` is `(arg,)`, or `()`
 /// for `None`: the shared tail of the Rust-side constructors.
 ///
-/// The pseudo-slots land in one vector sized for the traceback and
-/// chaining links a raise adds next, and the class's families come
-/// from its memoised flags rather than an MRO walk. CPython keeps no
+/// The pseudo-slots are laid out with room for the traceback and
+/// chaining links a raise adds next (see `SlotStorage::exception`), and
+/// the class's families come from its memoised flags rather than an MRO
+/// walk. CPython keeps no
 /// `message` attribute: `str()` and [`exception_message`] derive the
 /// text from `args` on demand, so nothing is formatted here.
 pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -> Object {
+    exception_from_parts_with(class, arg, [])
+}
+
+/// [`exception_from_parts`] with the further pseudo-slots `extra`, in
+/// order, after the families' own (`AttributeError`'s `name` and `obj`):
+/// the instance's slots are built once, with no per-slot probe.
+pub(crate) fn exception_from_parts_with<const N: usize>(
+    class: Rc<TypeObject>,
+    arg: Option<Object>,
+    extra: [(&'static str, Object); N],
+) -> Object {
     use crate::types::{slot_key, PyInstance, SlotStorage};
     let families = crate::exc_family_flags(&class);
     let inst = PyInstance::new(class);
@@ -4883,41 +4904,50 @@ pub(crate) fn exception_from_parts(class: Rc<TypeObject>, arg: Option<Object>) -
         Some(a) => Object::new_tuple_array([a.clone()]),
     };
     inst.note_slot_store(&args);
-    let mut entries: Vec<(crate::object::DictKey, Object)> = Vec::with_capacity(4);
     // PEP 380: `StopIteration.value` is always present (CPython sets it
     // in `StopIteration.__init__`, defaulting to None). A Rust-raised
     // bare `StopIteration` must answer `.value` too: asyncio's
     // `Task.__step` reads `exc.value` on every coroutine return, and a
     // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
-    if families & crate::EXC_FAM_STOP_ITERATION != 0 {
-        let value = arg.clone().unwrap_or(Object::None);
-        inst.note_slot_store(&value);
-        entries.push((slot_key("value"), value));
-    }
-    entries.push((slot_key("args"), args));
+    let value = (families & crate::EXC_FAM_STOP_ITERATION != 0)
+        .then(|| arg.clone().unwrap_or(Object::None));
     // The BaseException pseudo-slots (`__context__`/`__cause__`/
     // `__suppress_context__`/`__traceback__`) and OSError's named fields
     // (`errno`/`strerror`/…) are *not* seeded per-instance: their class
     // slot descriptors answer the CPython getset defaults while unset,
     // and a subclass's own class attribute (`class Err(OSError): errno =
     // EINVAL`, raised bare via `raise Err`) stays visible.
-    if families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0 {
-        // ImportError/ModuleNotFoundError expose `msg` (the message
-        // string). CPython always defines the slot; a Rust-raised
-        // ImportError must answer `.msg` so consumers (e.g. numpy's
-        // `_core/__init__` error handling, which reads `exc.msg`) don't
-        // AttributeError. `name`/`path`/`name_from` are intentionally
-        // *not* pre-set here so the import machinery's
-        // `set_exception_attr` (which skips already-present slots) can
-        // still populate the real module name. SyntaxError gets `msg`
-        // from `args[0]` too; the location payload reads `None` off the
-        // class descriptors until `error::syntax_error_located` fills
-        // real values.
-        let msg = arg.unwrap_or_else(|| Object::from_static(""));
-        inst.note_slot_store(&msg);
-        entries.push((slot_key("msg"), msg));
+    //
+    // ImportError/ModuleNotFoundError expose `msg` (the message
+    // string). CPython always defines the slot; a Rust-raised
+    // ImportError must answer `.msg` so consumers (e.g. numpy's
+    // `_core/__init__` error handling, which reads `exc.msg`) don't
+    // AttributeError. `name`/`path`/`name_from` are intentionally
+    // *not* pre-set here so the import machinery's
+    // `set_exception_attr` (which skips already-present slots) can
+    // still populate the real module name. SyntaxError gets `msg`
+    // from `args[0]` too; the location payload reads `None` off the
+    // class descriptors until `error::syntax_error_located` fills
+    // real values.
+    let msg = (families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0)
+        .then(|| arg.unwrap_or_else(|| Object::from_static("")));
+    for v in value.iter().chain(&msg).chain(extra.iter().map(|(_, v)| v)) {
+        inst.note_slot_store(v);
     }
-    *inst.slots.borrow_mut() = SlotStorage::from_entries(entries);
+    let slots = match (value, msg) {
+        (None, None) => SlotStorage::exception(args, extra),
+        (Some(value), None) if N == 0 => SlotStorage::exception(args, [("value", value)]),
+        (None, Some(msg)) if N == 0 => SlotStorage::exception(args, [("msg", msg)]),
+        (value, msg) => {
+            let mut entries = Vec::with_capacity(N + 3);
+            entries.push((slot_key("args"), args));
+            entries.extend(value.map(|v| (slot_key("value"), v)));
+            entries.extend(msg.map(|m| (slot_key("msg"), m)));
+            entries.extend(extra.into_iter().map(|(k, v)| (slot_key(k), v)));
+            SlotStorage::from_entries(entries)
+        }
+    };
+    *inst.slots.borrow_mut() = slots;
     Object::Instance(Rc::new(inst))
 }
 

@@ -458,10 +458,20 @@ pub struct PyFrame {
     pub code: Rc<CodeObject>,
     pub globals: Rc<RefCell<DictData>>,
     pub builtins: Rc<RefCell<DictData>>,
-    /// Index of the current instruction inside [`Self::code`]. Updated
-    /// per-instruction by the dispatch loop while this frame is the
-    /// active one.
+    /// Index of the current instruction inside [`Self::code`]. While the
+    /// activation is live its shell's mirror is the current one (see
+    /// [`Self::live`]): read through [`Self::lasti_now`] and write through
+    /// [`Self::set_lasti`].
     pub lasti: Cell<u32>,
+    /// The spine shell of this frame's activation while it is live, null
+    /// otherwise. The dispatch loops keep the shell's `lasti` current at
+    /// every point where code may look at the frame (each call, each
+    /// out-of-line attribute load, each hand-back to the general loop),
+    /// so a frame object reads it from there instead of making its
+    /// activation sync the object instruction by instruction. Set when
+    /// the shell takes the object, cleared when the shell leaves the
+    /// spine or dies.
+    pub(crate) live: std::sync::atomic::AtomicPtr<FrameShell>,
     /// The enclosing frame (the next-outer in the call stack), `None`
     /// for the module frame.
     pub back: RefCell<Option<Rc<PyFrame>>>,
@@ -639,8 +649,48 @@ impl PyFrame {
         if let Some(v) = self.override_lineno.get() {
             return v;
         }
-        let pc = self.lasti.get() as usize;
+        let pc = self.lasti_now() as usize;
         self.code.linetable.get(pc).copied().unwrap_or(0)
+    }
+
+    /// The current instruction index: the live shell's mirror while the
+    /// activation runs (see [`Self::live`]), unless a trace function's
+    /// line jump or `f_lineno` override owns the value.
+    pub fn lasti_now(&self) -> u32 {
+        let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        // (A pending jump always comes with its line override.)
+        if !live.is_null() && self.override_lineno.get().is_none() {
+            // SAFETY: a linked shell is alive: the link is cleared when the
+            // shell leaves its spine and again when it is dropped.
+            let at = unsafe { (*live).lasti.load(std::sync::atomic::Ordering::Relaxed) };
+            self.lasti.set(at);
+            return at;
+        }
+        self.lasti.get()
+    }
+
+    /// Set the current instruction index, in the live shell's mirror too.
+    pub fn set_lasti(&self, at: u32) {
+        self.lasti.set(at);
+        let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        if !live.is_null() {
+            // SAFETY: as in `lasti_now`.
+            unsafe {
+                (*live)
+                    .lasti
+                    .store(at, std::sync::atomic::Ordering::Relaxed)
+            };
+        }
+    }
+
+    /// Settle the frame as its activation leaves the spine on `shell`:
+    /// the shell's last instruction becomes the object's own.
+    pub(crate) fn unlink_live(&self, shell: &FrameShell) {
+        if std::ptr::eq(self.live.load(std::sync::atomic::Ordering::Relaxed), shell) {
+            shell.refresh_materialized(self);
+            self.live
+                .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Compute a fresh locals mapping from the live frame state —
@@ -672,7 +722,7 @@ impl PyFrame {
         let mirror = self.locals_mirror.borrow().clone()?;
         let snapshot = mirror.borrow();
         let varnames = &self.code.varnames;
-        let cell_names: Vec<&String> = self
+        let cell_names: Vec<&weavepy_compiler::Name> = self
             .code
             .cellvars
             .iter()
@@ -748,7 +798,7 @@ impl PyFrame {
             if name.starts_with('.') || out.iter().any(|n| n == name) {
                 continue;
             }
-            out.push(name.clone());
+            out.push(name.to_string());
         }
         out
     }
@@ -1163,6 +1213,16 @@ impl<T> std::ops::Deref for FrameSlot<T> {
     }
 }
 
+impl Drop for FrameShell {
+    fn drop(&mut self) {
+        // A frame object outliving its shell (a spine dropped whole) must
+        // not read through a dead link.
+        if let Some(py) = self.materialized.get_mut().take() {
+            py.unlink_live(self);
+        }
+    }
+}
+
 impl FrameShell {
     /// Make every borrowed slot own its value (see [`FrameSlot`]).
     pub(crate) fn upgrade_slots(&self) {
@@ -1199,39 +1259,37 @@ impl FrameShell {
         }
     }
 
-    /// Build the real [`PyFrame`] for this shell with the given
-    /// `back` pointer, caching it. Bumps `on_stack` exactly once per
-    /// materialisation — the pop path decrements it for shells whose
-    /// `materialized` is set.
-    /// Bring an existing frame object's `lasti` up to this live shell's.
-    /// The executing frame's quiet loops sync only the shell while nothing
-    /// else holds the object (see `Interpreter::frame_object_observed`);
-    /// every path that hands the object out calls this first. A trace
+    /// Bring an existing frame object's `lasti` up to this shell's: the
+    /// dispatch loops sync only the shell (see [`PyFrame::live`]). A trace
     /// function's pending line jump owns the value and is left alone.
     pub fn refresh_materialized(&self, py: &PyFrame) {
-        if py.pending_jump.borrow().is_none() && py.override_lineno.get().is_none() {
+        // (A pending jump always comes with its line override.)
+        if py.override_lineno.get().is_none() {
             py.lasti
                 .set(self.lasti.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 
-    pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
-        let py = self.materialize_departing(back);
-        // RFC 0065 (WS1): a freshly materialized frame must kick its
-        // dispatch loop off the quiet path so the per-instruction
-        // `lasti`-cell sync resumes.
-        crate::hot_gates::bump_loop_gen();
-        py
+    /// Make `py` read its `lasti` from this shell, which is on its spine
+    /// and keeps `py` as its frame object (see [`PyFrame::live`]).
+    pub(crate) fn link(&self, py: &PyFrame) {
+        py.live.store(
+            std::ptr::from_ref(self).cast_mut(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
-    /// [`Self::materialize`] for an activation that is leaving the spine:
-    /// no dispatch loop will run it again, so none needs kicking off its
-    /// quiet path.
+    /// Build the real [`PyFrame`] for this shell, which is on its spine,
+    /// with the given `back` pointer, caching it. Bumps `on_stack` exactly
+    /// once per materialisation — the pop path decrements it for shells
+    /// whose `materialized` is set.
+    pub fn materialize(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
+        self.materialize_departing(back)
+    }
+
+    /// [`Self::materialize`] for an activation that is leaving the spine.
     pub fn materialize_departing(&self, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(existing) = self.materialized.borrow().as_ref() {
-            // (`materialize` still bumps: the new holder may keep it, and
-            // a quiet loop running this activation re-derives, finding it
-            // observed if so.)
             self.refresh_materialized(existing);
             return existing.clone();
         }
@@ -1259,7 +1317,9 @@ impl FrameShell {
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
             lazy_back: RefCell::new(None),
+            live: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         });
+        self.link(&py);
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1326,13 +1386,12 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
         return None;
     }
     let mut back: Option<Rc<PyFrame>> = None;
-    let mut refreshed = false;
     for shell in &s[..=idx] {
         let existing = shell.materialized.borrow().clone();
         let py = match existing {
             Some(py) => {
                 shell.refresh_materialized(&py);
-                refreshed = true;
+                shell.link(&py);
                 py.set_back(back);
                 py
             }
@@ -1344,12 +1403,68 @@ pub fn materialize_stack_at(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame
         };
         back = Some(py);
     }
-    if refreshed {
-        // See `FrameShell::materialize`: the objects handed out (the
-        // frame and its `f_back` chain) may be kept.
-        crate::hot_gates::bump_loop_gen();
-    }
     back
+}
+
+/// [`materialize_stack_at`] for the one frame at `idx`: its `f_back` is
+/// its caller's frame object when one exists, else a lazy link to the
+/// caller's shell (see [`PyFrame::lazy_back`]), so the frames below are
+/// built only if something walks to them (`logging`'s `findCaller` reads
+/// two or three `f_back`s of a much deeper stack). A generator-family
+/// activation or caller, whose frame objects' links its resumes manage,
+/// takes the eager walk.
+pub fn materialize_stack_at_lazy(stack: &FrameStack, idx: usize) -> Option<Rc<PyFrame>> {
+    let s = stack.borrow();
+    let shell = s.get(idx)?;
+    let caller = idx.checked_sub(1).map(|i| &s[i]);
+    if shell.is_gen || caller.is_some_and(|c| c.is_gen) {
+        drop(s);
+        return materialize_stack_at(stack, idx);
+    }
+    let existing = shell.materialized.borrow().clone();
+    let py = match existing {
+        Some(py) => {
+            shell.refresh_materialized(&py);
+            shell.link(&py);
+            py
+        }
+        // Counted as live on the stack, as the eager walk counts it.
+        None => shell.materialize(None),
+    };
+    match caller {
+        None => py.set_back(None),
+        Some(c) => {
+            let caller_py = c.materialized.borrow().clone();
+            match caller_py {
+                Some(back) => {
+                    c.refresh_materialized(&back);
+                    c.link(&back);
+                    let linked = py.lazy_back.borrow().is_none()
+                        && py
+                            .back
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|b| Rc::ptr_eq(b, &back));
+                    if !linked {
+                        py.set_back(Some(back));
+                    }
+                }
+                None => {
+                    let linked = py.back.borrow().is_none()
+                        && py
+                            .lazy_back
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|l| Rc::ptr_eq(&l.0, c));
+                    if !linked {
+                        *py.back.borrow_mut() = None;
+                        *py.lazy_back.borrow_mut() = Some(LazyShellRef::new(c.clone()));
+                    }
+                }
+            }
+        }
+    }
+    Some(py)
 }
 
 /// Materialise and return the top frame of a stack, or `None` when
@@ -1480,14 +1595,13 @@ impl PyTraceback {
 /// the one it already has, else materialized where it sits on this
 /// thread's spine (linking `f_back` like any other materialization).
 pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
-    if let Some(handles) = crate::vm_singletons::current_thread_handles() {
-        let idx = handles
-            .frame_stack
+    if let Some(frame_stack) = crate::vm_singletons::current_frame_stack() {
+        let idx = frame_stack
             .borrow()
             .iter()
             .rposition(|s| Rc::ptr_eq(s, shell));
         if let Some(idx) = idx {
-            if let Some(py) = materialize_stack_at(&handles.frame_stack, idx) {
+            if let Some(py) = materialize_stack_at_lazy(&frame_stack, idx) {
                 return py;
             }
         }
@@ -1505,7 +1619,7 @@ pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
             .ok()
             .and_then(|s| s.iter().rposition(|s| Rc::ptr_eq(s, shell)));
         if let Some(idx) = idx {
-            if let Some(py) = materialize_stack_at(&stack, idx) {
+            if let Some(py) = materialize_stack_at_lazy(&stack, idx) {
                 return py;
             }
         }
@@ -1522,12 +1636,15 @@ impl Drop for PyTraceback {
         // is a `tb_next` linked list one node per stack level, so a
         // ~1000-deep traceback (a `RecursionError`) would drop recursively
         // and overflow the native stack. Tear the chain down iteratively.
+        // (The last owner of each link detaches its successor in place,
+        // then frees a node with nothing left to chain to.)
         let mut link = self.next.borrow_mut().take();
         while let Some(tb) = link {
-            match Rc::try_unwrap(tb) {
-                Ok(inner) => link = inner.next.borrow_mut().take(),
-                Err(_) => break,
+            if Rc::strong_count(&tb) != 1 {
+                break;
             }
+            link = tb.next.borrow_mut().take();
+            drop(tb);
         }
     }
 }
@@ -2322,7 +2439,7 @@ impl DictViewKind {
 }
 
 /// Live view over a backing `dict`. Iteration order mirrors the
-/// underlying `IndexMap`. Mutations to the dict propagate through
+/// underlying table. Mutations to the dict propagate through
 /// the view (CPython invariant).
 #[derive(Debug)]
 pub struct PyDictView {
@@ -3186,7 +3303,20 @@ static MODULE_CLASS: std::sync::LazyLock<
 /// Record `m.__class__ = cls`. The caller validates that `cls` is a
 /// `ModuleType` subclass.
 pub fn set_module_class(m: &Rc<PyModule>, cls: Object) {
+    MODULE_CLASSES_SET.store(true, std::sync::atomic::Ordering::Release);
     MODULE_CLASS.write().insert(Rc::as_ptr(m) as usize, cls);
+}
+
+/// Whether any module ever got a class of its own (see
+/// [`set_module_class`]): until then every module's attributes are its
+/// dictionary's, `ModuleType`'s own descriptors aside.
+static MODULE_CLASSES_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`MODULE_CLASSES_SET`].
+#[inline]
+pub fn module_classes_possible() -> bool {
+    MODULE_CLASSES_SET.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The class assigned via [`set_module_class`], if any. `None` means the
@@ -3199,7 +3329,8 @@ pub fn module_class(m: &Rc<PyModule>) -> Option<Rc<crate::types::TypeObject>> {
 }
 
 /// Dictionary key: a hashable [`Object`] wrapped to satisfy the
-/// `Hash + Eq` requirements imposed by `HashMap` / `IndexMap`.
+/// `Hash + Eq` requirements of `HashMap` / `IndexSet`, and the stored key
+/// type of a dict's [`crate::dictmap::DictMap`].
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
@@ -3224,21 +3355,36 @@ pub struct DictKey(pub Object);
 #[derive(Debug, Clone, Copy)]
 pub struct StrKey<'a>(pub &'a str);
 
-impl Hash for StrKey<'_> {
+impl crate::dictmap::Probe for StrKey<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
+    fn probe_hash(&self) -> i64 {
         // Bit-for-bit the `DictKey` hash of `Object::Str(self.0)`.
-        py_str_hash(self.0).hash(state);
+        py_str_hash(self.0)
     }
-}
 
-impl indexmap::Equivalent<DictKey> for StrKey<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
+    fn probe_eq_unhashed(&self, key: &DictKey) -> Option<bool> {
+        // Comparing a name with a small table's stored strings costs less
+        // than hashing it.
+        match &key.0 {
+            Object::Str(s) => Some(
+                std::ptr::eq(s.as_ptr(), self.0.as_ptr())
+                    || crate::dictmap::key_bytes_eq(s.as_bytes(), self.0.as_bytes()),
+            ),
+            Object::WStr(_) => Some(false),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match &key.0 {
             // Interned names probe with the stored key's own bytes: the
             // pointer settles it before any byte compare.
-            Object::Str(s) => std::ptr::eq(s.as_ptr(), self.0.as_ptr()) || &**s == self.0,
+            Object::Str(s) => {
+                std::ptr::eq(s.as_ptr(), self.0.as_ptr())
+                    || crate::dictmap::key_bytes_eq(s.as_bytes(), self.0.as_bytes())
+            }
             // A `WStr` always carries a lone surrogate (module invariant),
             // so it can never equal a valid `&str`.
             Object::WStr(_) => false,
@@ -3248,6 +3394,48 @@ impl indexmap::Equivalent<DictKey> for StrKey<'_> {
             // irrelevant.
             _ => DictKey(Object::from_str(self.0)) == *key,
         }
+    }
+}
+
+/// [`StrKey`] for a probe of several tables (an MRO walk): the name's hash
+/// is computed on first need and kept, so the walk hashes it at most once,
+/// and not at all while it meets only small tables (which compare names
+/// directly; see [`crate::dictmap::Probe::probe_eq_unhashed`]).
+#[derive(Debug)]
+pub struct StrKeyLazy<'a> {
+    pub s: &'a str,
+    hash: std::cell::Cell<Option<i64>>,
+}
+
+impl<'a> StrKeyLazy<'a> {
+    #[inline]
+    pub fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            hash: std::cell::Cell::new(None),
+        }
+    }
+}
+
+impl crate::dictmap::Probe for StrKeyLazy<'_> {
+    #[inline]
+    fn probe_hash(&self) -> i64 {
+        if let Some(h) = self.hash.get() {
+            return h;
+        }
+        let h = py_str_hash(self.s);
+        self.hash.set(Some(h));
+        h
+    }
+
+    #[inline]
+    fn probe_eq(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(&StrKey(self.s), key)
+    }
+
+    #[inline]
+    fn probe_eq_unhashed(&self, key: &DictKey) -> Option<bool> {
+        crate::dictmap::Probe::probe_eq_unhashed(&StrKey(self.s), key)
     }
 }
 
@@ -3264,17 +3452,15 @@ pub struct StrKeyHashed<'a> {
     pub hash: i64,
 }
 
-impl Hash for StrKeyHashed<'_> {
+impl crate::dictmap::Probe for StrKeyHashed<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+    fn probe_hash(&self) -> i64 {
+        self.hash
     }
-}
 
-impl indexmap::Equivalent<DictKey> for StrKeyHashed<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
-        indexmap::Equivalent::equivalent(&StrKey(self.s), key)
+    fn probe_eq(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(&StrKey(self.s), key)
     }
 }
 
@@ -3307,18 +3493,19 @@ impl<'a> LeafNameProbe<'a> {
     }
 }
 
-impl Hash for LeafNameProbe<'_> {
+impl crate::dictmap::Probe for LeafNameProbe<'_> {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+    fn probe_hash(&self) -> i64 {
+        self.hash
     }
-}
 
-impl indexmap::Equivalent<DictKey> for LeafNameProbe<'_> {
     #[inline]
-    fn equivalent(&self, key: &DictKey) -> bool {
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match &key.0 {
-            Object::Str(k) => std::ptr::eq(k.as_ptr(), self.s.as_ptr()) || &**k == self.s,
+            Object::Str(k) => {
+                std::ptr::eq(k.as_ptr(), self.s.as_ptr())
+                    || crate::dictmap::key_bytes_eq(k.as_bytes(), self.s.as_bytes())
+            }
             // A lone surrogate never equals a valid `&str`.
             Object::WStr(_) => false,
             _ => {
@@ -3350,11 +3537,24 @@ impl<'a> LeafProbe<'a> {
     /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
     /// generator-family object or module, or a tuple of machine ints and
     /// strings.
-    #[inline]
+    #[inline(always)]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
             Object::Str(s) => SharedStr::hash_cached(s),
-            Object::Int(_) => py_hash_value(key)?,
+            Object::Int(i) => py_hash_long_i64(*i),
+            _ => Self::other_hash(key)?,
+        };
+        Some(Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        })
+    }
+
+    /// [`Self::new`]'s hash for a key other than a `str` or an `int`.
+    #[inline(never)]
+    fn other_hash(key: &Object) -> Option<i64> {
+        Some(match key {
             Object::Instance(i)
                 if i.native.get().is_none()
                     && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
@@ -3377,11 +3577,6 @@ impl<'a> LeafProbe<'a> {
             | Object::AsyncGenerator(_)
             | Object::Module(_) => identity_hash(key),
             _ => return None,
-        };
-        Some(Self {
-            key,
-            hash,
-            foreign: std::cell::Cell::new(false),
         })
     }
 
@@ -3433,13 +3628,36 @@ impl Hash for LeafProbe<'_> {
 impl indexmap::Equivalent<DictKey> for LeafProbe<'_> {
     #[inline]
     fn equivalent(&self, key: &DictKey) -> bool {
+        crate::dictmap::Probe::probe_eq(self, key)
+    }
+}
+
+impl crate::dictmap::Probe for LeafProbe<'_> {
+    #[inline(always)]
+    fn probe_hash(&self) -> i64 {
+        self.hash
+    }
+
+    #[inline(always)]
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match (self.key, &key.0) {
             // (The same string object, an interned name's usual case,
             // settles before any byte compare.)
             (Object::Str(a), Object::Str(b)) => {
-                std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.as_bytes() == b.as_bytes()
+                SharedStr::ptr_eq(a, b) || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
             }
             (Object::Int(a), Object::Int(b)) => a == b,
+            _ => self.other_eq(key),
+        }
+    }
+}
+
+impl LeafProbe<'_> {
+    /// [`crate::dictmap::Probe::probe_eq`] for any pairing but two `str`s
+    /// or two `int`s.
+    #[inline(never)]
+    fn other_eq(&self, key: &DictKey) -> bool {
+        match (self.key, &key.0) {
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
@@ -3804,7 +4022,9 @@ impl PartialEq for DictKey {
         // Two plain strings or machine ints, the common keys, are equal by
         // value alone.
         match (&self.0, &other.0) {
-            (Object::Str(a), Object::Str(b)) => return a.as_bytes() == b.as_bytes(),
+            (Object::Str(a), Object::Str(b)) => {
+                return crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
+            }
             (Object::Int(a), Object::Int(b)) => return a == b,
             _ => {}
         }
@@ -3839,7 +4059,8 @@ impl PartialEq for DictKey {
             }
             // CPython dispatches `__eq__` only between keys in the *same
             // hash bucket*; unequal hashes mean "not equal" without any
-            // user code. indexmap's small-table linear scan compares every
+            // user code. A dict's table compares stored hashes first, but
+            // a set's (`indexmap`'s) small-table linear scan compares every
             // entry through this `eq` with no hash check at all, so enforce
             // the bucket precondition here — sqlalchemy's
             // `constraints.discard(ColumnSet())` probes a 1-element set
@@ -4019,17 +4240,10 @@ pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     }
 }
 
-/// The table-level (Fx-mixed) hash for a Python hash value, matching what
-/// `DictKey::hash` feeds the [`DictData`] hasher.
-fn dict_table_hash(py_hash: i64) -> u64 {
-    use std::hash::BuildHasher;
-    crate::fasthash::FxBuildHasher.hash_one(py_hash)
-}
-
-/// Probe result of [`dict_reentrant_probe`]: the key's table-level hash
-/// plus the equal *stored* key, if any.
+/// Probe result of [`dict_reentrant_probe`]: the key's Python hash plus
+/// the equal *stored* key, if any.
 pub(crate) struct ReentrantProbe {
-    table_hash: u64,
+    hash: i64,
     stored: Option<Object>,
 }
 
@@ -4048,9 +4262,7 @@ pub(crate) fn dict_reentrant_probe(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<ReentrantProbe, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let kh = key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key));
-    let table_hash = dict_table_hash(kh);
     let mut memo: Vec<(Object, bool)> = Vec::new();
     loop {
         // Same-hash candidates, collected under a short borrow with a
@@ -4058,7 +4270,7 @@ pub(crate) fn dict_reentrant_probe(
         let mut cands: Vec<Object> = Vec::new();
         {
             let m = d.borrow();
-            let _ = m.raw_entry_v1().from_hash(table_hash, |k| {
+            let _ = m.find_by_hash(kh, |k| {
                 cands.push(k.0.clone());
                 false
             });
@@ -4083,19 +4295,8 @@ pub(crate) fn dict_reentrant_probe(
                 }
                 continue;
             }
-            // Same-bucket precondition: indexmap's small-table linear scan
-            // hands `from_hash` every entry regardless of hash, but CPython
-            // only ever dispatches `__eq__` between keys whose hashes match.
-            // The stored key's hash comes from its record (CPython reads the
-            // entry's `me_hash`); only a record-less key pays a dispatch.
-            let sh = match recorded_key_hash(stored) {
-                Some(h) => h,
-                None => key_cmp_scope(|| py_hash_value(stored))?
-                    .unwrap_or_else(|| identity_hash(stored)),
-            };
-            if sh != kh {
-                continue;
-            }
+            // (The table hands over only keys whose stored hash equals the
+            // probe's, CPython's `me_hash` check, so no hash is recomputed.)
             // Python `__eq__` (stored first, CPython's argument order) with
             // no borrow held; it may mutate `d` re-entrantly.
             let eq = key_cmp_scope(|| current_interp_eq(stored, key))?.unwrap_or(false);
@@ -4105,7 +4306,7 @@ pub(crate) fn dict_reentrant_probe(
         }
         if found.is_some() || !fresh_call {
             return Ok(ReentrantProbe {
-                table_hash,
+                hash: kh,
                 stored: found,
             });
         }
@@ -4130,25 +4331,22 @@ pub(crate) fn dict_reentrant_insert(
     key: Object,
     value: Object,
 ) -> Result<Option<Object>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, &key)?;
     let target = probe.stored.as_ref().unwrap_or(&key);
     let mut m = d.borrow_mut();
-    match m
-        .raw_entry_mut_v1()
-        .from_hash(probe.table_hash, |k| k.0.is_same(target))
-    {
-        RawEntryMut::Occupied(mut e) => {
-            let same = e.get().is_same(&value);
-            let old = e.insert(value);
+    match m.find_by_hash(probe.hash, |k| k.0.is_same(target)) {
+        Some(i) => {
+            let (_, slot) = m.get_index_mut(i).expect("found above");
+            let same = slot.is_same(&value);
+            let old = std::mem::replace(slot, value);
             drop(m);
             if !same {
                 dict_mutation_event(d);
             }
             Ok(Some(old))
         }
-        RawEntryMut::Vacant(e) => {
-            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), value);
+        None => {
+            m.insert_unique_hashed(probe.hash, DictKey(key), value);
             drop(m);
             dict_watch_bump(d);
             dict_mutation_event(d);
@@ -4165,17 +4363,13 @@ pub(crate) fn dict_reentrant_setdefault(
     key: Object,
     default: Object,
 ) -> Result<Object, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, &key)?;
     let target = probe.stored.as_ref().unwrap_or(&key);
     let mut m = d.borrow_mut();
-    match m
-        .raw_entry_mut_v1()
-        .from_hash(probe.table_hash, |k| k.0.is_same(target))
-    {
-        RawEntryMut::Occupied(e) => Ok(e.get().clone()),
-        RawEntryMut::Vacant(e) => {
-            e.insert_hashed_nocheck(probe.table_hash, DictKey(key), default.clone());
+    match m.find_by_hash(probe.hash, |k| k.0.is_same(target)) {
+        Some(i) => Ok(m.get_index(i).expect("found above").1.clone()),
+        None => {
+            m.insert_unique_hashed(probe.hash, DictKey(key), default.clone());
             drop(m);
             dict_watch_bump(d);
             dict_mutation_event(d);
@@ -4189,14 +4383,14 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
-        Some(stored) => Ok(d
-            .borrow()
-            .raw_entry_v1()
-            .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
-            .map(|(_, v)| v.clone())),
+        Some(stored) => {
+            let m = d.borrow();
+            Ok(m.find_by_hash(probe.hash, |k| k.0.is_same(&stored))
+                .and_then(|i| m.get_index(i))
+                .map(|(_, v)| v.clone()))
+        }
         None => Ok(None),
     }
 }
@@ -4208,13 +4402,11 @@ pub(crate) fn dict_index_of(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<usize>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => Ok(d
             .borrow()
-            .raw_entry_v1()
-            .index_from_hash(probe.table_hash, |k| k.0.is_same(&stored))),
+            .find_by_hash(probe.hash, |k| k.0.is_same(&stored))),
         None => Ok(None),
     }
 }
@@ -4224,23 +4416,19 @@ pub(crate) fn dict_reentrant_remove(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<(Object, Object)>, RuntimeError> {
-    use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
             let mut m = d.borrow_mut();
-            match m
-                .raw_entry_mut_v1()
-                .from_hash(probe.table_hash, |k| k.0.is_same(&stored))
-            {
-                RawEntryMut::Occupied(e) => {
-                    let (k, v) = e.shift_remove_entry();
+            match m.find_by_hash(probe.hash, |k| k.0.is_same(&stored)) {
+                Some(i) => {
+                    let (k, v) = m.shift_remove_index(i).expect("found above");
                     drop(m);
                     dict_watch_bump(d);
                     dict_mutation_event(d);
                     Ok(Some((k.0, v)))
                 }
-                RawEntryMut::Vacant(_) => Ok(None),
+                None => Ok(None),
             }
         }
         None => Ok(None),
@@ -4254,7 +4442,7 @@ pub(crate) fn dict_reentrant_remove(
 // same `ma_used`, so the size trip-wire stays silent — because the delete
 // leaves a tombstone and the reinsert *appends*: the iterator then finds an
 // entry beyond the `di->len` elements it expected and raises `RuntimeError:
-// dictionary keys changed during iteration`. Our `IndexMap` has no
+// dictionary keys changed during iteration`. Our table has no
 // tombstones (`shift_remove` compacts in place), so the layout carries no
 // trace of the churn. Instead, dict iterators register a *watch* on their
 // source dict; the centralized structural mutators (`dict_insert` on a new
@@ -4371,8 +4559,8 @@ pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
 // `_testcapi.dict_get_version` exposes it and `test_dict_version` asserts
 // the full semantics.
 //
-// WeavePy's `DictData` is a bare `IndexMap` with no room for a per-dict
-// field, so versions live in a side registry keyed by the dict's heap
+// WeavePy's `DictData` has no room for a per-dict PEP 509 field, so
+// versions live in a side registry keyed by the dict's heap
 // address and assigned lazily: the first `dict_version_get` on a dict
 // registers it with a fresh tag; the centralized mutators
 // (`dict_insert`/`dict_remove`/`clear`/`popitem`/`setdefault` and the
@@ -4456,8 +4644,20 @@ impl Hash for DictKey {
         // (functions, types, plain instances, …) fold in their allocation
         // identity; truly unhashable keys share a constant bucket and the
         // runtime raises lazily when used.
-        let h = py_hash_value(&self.0).unwrap_or_else(|| identity_hash(&self.0));
-        h.hash(state);
+        dict_key_hash(&self.0).hash(state);
+    }
+}
+
+/// The Python hash a dict or set stores for key `k`: its `hash()`, or its
+/// identity hash for an unhashable key (the runtime raises before such a
+/// key is stored).
+#[inline]
+pub(crate) fn dict_key_hash(k: &Object) -> i64 {
+    match k {
+        // (The commonest keys, without the general dispatch.)
+        Object::Str(s) => SharedStr::hash_cached(s),
+        Object::Int(i) => py_hash_long_i64(*i),
+        other => py_hash_value(other).unwrap_or_else(|| identity_hash(other)),
     }
 }
 
@@ -4469,7 +4669,7 @@ impl Hash for DictKey {
 /// (one multiply) instead of SipHash, which profiled as a top-ten CPU
 /// consumer under pandas. Not attacker-relevant: collision resistance
 /// comes from the Python-level hash, exactly as in CPython's own tables.
-pub type DictMap = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
+pub type DictMap = crate::dictmap::DictMap;
 
 /// The global source of [`DictData::mutation_stamp`] values: one
 /// monotonically increasing counter for every dict in the process, so a
@@ -4578,6 +4778,17 @@ impl DictData {
         }
         Self {
             map: DictMap::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher),
+            stamp: next_dict_stamp(),
+            deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
+            key_filter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// An instance `__dict__` holding `map`, guarding the deferred
+    /// tracking of the instance at `owner` (`0`: none).
+    pub(crate) fn from_map_for(owner: usize, map: DictMap) -> Self {
+        Self {
+            map,
             stamp: next_dict_stamp(),
             deferred_owner: std::sync::atomic::AtomicUsize::new(owner),
             key_filter: std::sync::atomic::AtomicU64::new(0),
@@ -4753,7 +4964,7 @@ impl Extend<(DictKey, Object)> for DictData {
 
 impl IntoIterator for DictData {
     type Item = (DictKey, Object);
-    type IntoIter = indexmap::map::IntoIter<DictKey, Object>;
+    type IntoIter = crate::dictmap::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.into_iter()
@@ -4762,7 +4973,7 @@ impl IntoIterator for DictData {
 
 impl<'a> IntoIterator for &'a DictData {
     type Item = (&'a DictKey, &'a Object);
-    type IntoIter = indexmap::map::Iter<'a, DictKey, Object>;
+    type IntoIter = crate::dictmap::Iter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.iter()
@@ -4771,7 +4982,7 @@ impl<'a> IntoIterator for &'a DictData {
 
 impl<'a> IntoIterator for &'a mut DictData {
     type Item = (&'a DictKey, &'a mut Object);
-    type IntoIter = indexmap::map::IterMut<'a, DictKey, Object>;
+    type IntoIter = crate::dictmap::IterMut<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         (**self).iter_mut()
@@ -4833,6 +5044,14 @@ pub struct PyFunction {
     /// slot-store probe for the overwhelmingly common function that never
     /// had them overridden.
     pub defaults_override: OverrideFlag,
+    /// The [`Self::slots`] state (its mutation stamp, `0` for none) in
+    /// which `__name__` and `__qualname__` were last found to be the
+    /// current code's own interned names (see [`Self::code_names_kept`]).
+    /// Cleared when `__code__` is rebound.
+    pub names_kept: crate::sync::Cell<u64>,
+    /// The function's slot in the cycle collector's registry (see
+    /// [`crate::gc_trace::GcSlot`]).
+    pub gc_slot: crate::gc_trace::GcSlot,
 }
 
 /// A function's getset slots before their first read (see
@@ -5039,6 +5258,35 @@ impl PyFunction {
             attr_str("__name__", name_hash),
             attr_str("__qualname__", qualname_hash),
         )
+    }
+
+    /// Whether `__name__` and `__qualname__` are the very objects `names`
+    /// gives (the current code's interned names, which a generator made
+    /// by this function then reports by default): the slots' seed, or
+    /// slots in a state already found to hold them, answer without a
+    /// probe.
+    pub fn code_names_kept(&self, names: impl FnOnce() -> (Object, Object)) -> bool {
+        if self.names_seeded() {
+            return true;
+        }
+        let Some(slots) = self.slots_raw.get() else {
+            return false;
+        };
+        let stamp = match slots.try_borrow() {
+            Ok(s) => s.mutation_stamp(),
+            Err(_) => return false,
+        };
+        if stamp == self.names_kept.get() {
+            return true;
+        }
+        let (name, qualname) = self.name_objects();
+        let (code_name, code_qualname) = names();
+        let kept = name.is_some_and(|n| n.is_same(&code_name))
+            && qualname.is_some_and(|q| q.is_same(&code_qualname));
+        if kept {
+            self.names_kept.set(stamp);
+        }
+        kept
     }
 
     /// Whether the function's slots are still its definition-time seed
@@ -5282,9 +5530,16 @@ pub struct PyGenerator {
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
-    /// Whether the cycle collector's index holds an entry for this
-    /// generator (one still in a young set has none).
-    pub gc_registered: crate::sync::Cell<bool>,
+    /// The generator's slot in the cycle collector's registry (see
+    /// [`crate::gc_trace::GcSlot`]); unregistered while it is still in a
+    /// young set.
+    pub gc_slot: crate::gc_trace::GcSlot,
+    /// Not yet handed to the collector: a coroutine an `await` started
+    /// as it was made runs on the spine (its frame's referents are
+    /// roots), so it can close no unreachable cycle until it first
+    /// suspends, which tracks it (see `Interpreter::park_suspended_boxed`).
+    /// One that finishes first is never tracked.
+    pub track_deferred: crate::sync::Cell<bool>,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5425,7 +5680,8 @@ impl PyGenerator {
             extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
-            gc_registered: crate::sync::Cell::new(false),
+            gc_slot: crate::gc_trace::GcSlot::new(),
+            track_deferred: crate::sync::Cell::new(false),
         }
     }
 
@@ -5480,17 +5736,13 @@ impl Drop for PyGenerator {
         // pipeline (`chain(chain(chain(…)))`); dropping it inline recurses
         // one native stack frame per link and overflows on long chains, so
         // route it through the iterative trampoline below.
-        if let Ok(mut state) = self.state.try_borrow_mut() {
-            let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
-            drop(state);
-            if matches!(
-                prev,
-                GeneratorState::Suspended(_)
-                    | GeneratorState::Created(_)
-                    | GeneratorState::Delegating(_)
-            ) {
-                defer_generator_state_drop(prev);
-            }
+        // (Exclusive: no borrow of the state can be live.)
+        let state = self.state.get_mut();
+        if matches!(
+            state,
+            GeneratorState::Suspended(_) | GeneratorState::Created(_) | GeneratorState::Delegating(_)
+        ) {
+            defer_generator_state_drop(std::mem::replace(state, GeneratorState::Finished));
         }
         crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
@@ -6540,6 +6792,46 @@ impl PyFile {
     /// rewritten to the configured line ending. Universal mode maps `\n`→
     /// `os.linesep` (a no-op on WeavePy's Unix targets); `''`/`'\n'` are
     /// pass-through.
+    /// `StringIO.write(s)` at the end of the buffer with nothing to
+    /// translate or encode (the common logging-handler shape): appends `s`
+    /// and returns `true`. `false` touches nothing; the general path then
+    /// runs (overwrites, newline translation, an explicit codec).
+    pub fn mem_text_append(&self, s: &str) -> bool {
+        if self.encoding.borrow().is_some()
+            || self
+                .errors
+                .borrow()
+                .as_deref()
+                .is_some_and(|e| e != "strict")
+        {
+            return false;
+        }
+        let collapse = match self.newline.borrow().as_deref() {
+            Some("\n" | "") => false,
+            None if self.io_kind.get() == IoKind::StringIO => true,
+            _ => return false,
+        };
+        if collapse && s.as_bytes().contains(&b'\r') {
+            return false;
+        }
+        let Ok(mut backend) = self.backend.try_borrow_mut() else {
+            return false;
+        };
+        let FileBackend::MemText { data, pos } = &mut *backend else {
+            return false;
+        };
+        if *pos != data.len() {
+            return false;
+        }
+        data.push_str(s);
+        *pos = data.len();
+        drop(backend);
+        if collapse {
+            self.record_seen_newlines(s);
+        }
+        true
+    }
+
     fn translate_newlines_write(&self, s: &str) -> String {
         match self.newline.borrow().as_deref() {
             Some("\r") => s.replace('\n', "\r"),
@@ -8879,7 +9171,7 @@ pub enum PyIterator {
         step: Box<BigInt>,
     },
     /// Live iterator over a dict (CPython's `dictiterobject`): walks the
-    /// `IndexMap` by entry index rather than snapshotting, so it pins no
+    /// table by entry index rather than snapshotting, so it pins no
     /// key/value `Rc`s of its own — an overwritten value is freed promptly
     /// even mid-loop (`test_oob_indexing_dictiter_iternextitem` relies on
     /// `d[k] = None` firing the old value's `__del__` during iteration),
@@ -11393,7 +11685,7 @@ impl Object {
                     .slot("__qualname__")
                     .as_ref()
                     .map(Object::to_str)
-                    .unwrap_or_else(|| f.code().qualname.clone());
+                    .unwrap_or_else(|| f.code().qualname.to_string());
                 format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => {
@@ -11439,7 +11731,7 @@ impl Object {
                         .slot("__qualname__")
                         .as_ref()
                         .map(Object::to_str)
-                        .unwrap_or_else(|| f.code().qualname.clone()),
+                        .unwrap_or_else(|| f.code().qualname.to_string()),
                     // A C function bound to its receiver is CPython's
                     // `builtin_function_or_method`, whose repr is
                     // `<built-in method split of str object at 0x…>`
@@ -11806,7 +12098,7 @@ impl Object {
                                 .slot("__qualname__")
                                 .as_ref()
                                 .map(Object::to_str)
-                                .unwrap_or_else(|| f.code().qualname.clone());
+                                .unwrap_or_else(|| f.code().qualname.to_string());
                             let module = f
                                 .slot("__module__")
                                 .or_else(|| {
@@ -12494,6 +12786,7 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
 
 /// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
 /// with the reserved `-1` remapped to `-2`.
+#[inline]
 pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
     // The modulus is the Mersenne prime `2**61 - 1`, so `|n| mod P` folds
     // the high bits onto the low ones instead of dividing: `|n| < 2**64`
@@ -12703,11 +12996,79 @@ fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
     (v0 ^ v1) ^ (v2 ^ v3)
 }
 
+/// The longest byte string [`sip_memo`] remembers.
+const SIP_MEMO_MAX: usize = 32;
+
+/// One remembered SipHash result: the bytes (`len` of them; `0` marks an
+/// empty slot) and their hash.
+#[derive(Clone, Copy)]
+struct SipMemoEntry {
+    len: u8,
+    hash: i64,
+    bytes: [u8; SIP_MEMO_MAX],
+}
+
+const SIP_MEMO_SLOTS: usize = 512;
+
+thread_local! {
+    /// A direct-mapped memo of the SipHash of short byte strings, by
+    /// content. With the seed pinned, a name hashed from a `&str` (a
+    /// probe of a large dict by `StrKey`, a fresh string's first hash)
+    /// costs a short compare instead of a SipHash run on a repeat; CPython
+    /// gets the same effect from the hash cached in each interned name.
+    static SIP_MEMO: std::cell::UnsafeCell<[SipMemoEntry; SIP_MEMO_SLOTS]> = const {
+        std::cell::UnsafeCell::new([SipMemoEntry { len: 0, hash: 0, bytes: [0; SIP_MEMO_MAX] }; SIP_MEMO_SLOTS])
+    };
+}
+
+/// `compute(bytes)`, remembered per thread for `bytes` of 1 to
+/// [`SIP_MEMO_MAX`] bytes.
+#[inline]
+fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
+    let n = bytes.len();
+    debug_assert!((1..=SIP_MEMO_MAX).contains(&n));
+    // SAFETY: the loads stay inside `bytes` (overlapping for short ones).
+    let fold = unsafe {
+        let p = bytes.as_ptr();
+        if n >= 8 {
+            p.cast::<u64>().read_unaligned()
+                ^ p.add(n - 8).cast::<u64>().read_unaligned().rotate_left(29)
+        } else if n >= 4 {
+            u64::from(p.cast::<u32>().read_unaligned())
+                | u64::from(p.add(n - 4).cast::<u32>().read_unaligned()) << 32
+        } else {
+            u64::from(*p) | u64::from(*p.add(n / 2)) << 8 | u64::from(*p.add(n - 1)) << 16
+        }
+    };
+    let slot = ((fold ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize;
+    // SAFETY (both accesses): this thread's memo, borrowed only for the
+    // statement (nothing inside runs code that could reach it).
+    let hit = SIP_MEMO.try_with(|memo| {
+        let e = unsafe { &(*memo.get())[slot] };
+        (usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]))
+            .then_some(e.hash)
+    });
+    if let Ok(Some(h)) = hit {
+        return h;
+    }
+    let h = compute(bytes);
+    let _ = SIP_MEMO.try_with(|memo| {
+        let e = unsafe { &mut (*memo.get())[slot] };
+        e.len = n as u8;
+        e.hash = h;
+        e.bytes[..n].copy_from_slice(bytes);
+    });
+    h
+}
+
 fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
     let v = match hash_algo() {
+        HashAlgo::Sip { k0, k1 } if bytes.len() <= SIP_MEMO_MAX => {
+            sip_memo(bytes, |b| siphash13(*k0, *k1, b) as i64)
+        }
         HashAlgo::Sip { k0, k1 } => siphash13(*k0, *k1, bytes) as i64,
         HashAlgo::Fx { salt } => {
             use std::hash::Hasher;
@@ -13038,6 +13399,12 @@ fn frozenset_style_hash<I: Iterator<Item = i64>>(lanes: I) -> i64 {
 }
 
 pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
+    // The commonest keys first, in line.
+    match obj {
+        Object::Int(i) => return Some(py_hash_long_i64(*i)),
+        Object::Str(s) => return Some(SharedStr::hash_cached(s)),
+        _ => {}
+    }
     if let Some(h) = numeric_hash(obj) {
         return Some(h);
     }
@@ -13076,6 +13443,24 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         }
         Object::Tuple(items) => {
             if let Some(hash) = items.cached_hash() {
+                return Some(hash);
+            }
+            // Ints and strings (the usual composite key): their hashes can
+            // neither fail nor run code, so no error scope is needed.
+            if items
+                .iter()
+                .all(|x| matches!(x, Object::Int(_) | Object::Str(_)))
+            {
+                let mut hash = TupleHasher::new();
+                for item in items.iter() {
+                    hash.push(match item {
+                        Object::Int(i) => py_hash_long_i64(*i),
+                        Object::Str(s) => SharedStr::hash_cached(s),
+                        _ => unreachable!("matched above"),
+                    });
+                }
+                let hash = hash.finish(items.len());
+                items.store_hash(hash);
                 return Some(hash);
             }
             // Hash table callbacks communicate errors through the ambient
@@ -13632,7 +14017,11 @@ impl Object {
     /// allocates nothing for them.
     #[inline]
     pub fn from_char(ch: char) -> Self {
-        // (Latin-1 characters come out of `SharedStr::small`'s table.)
+        // (Latin-1 characters come out of `SharedStr::small`'s table; an
+        // ASCII one is its table entry by index.)
+        if ch.is_ascii() {
+            return Object::Str(SharedStr::ascii_char(ch as u8));
+        }
         Object::Str(SharedStr::from(&*ch.encode_utf8(&mut [0; 4])))
     }
 
