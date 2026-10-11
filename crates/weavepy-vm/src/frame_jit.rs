@@ -5138,9 +5138,35 @@ unsafe extern "C" fn h_call(
             if st.sw.is_null() {
                 return CALL_DECLINED;
             }
+            let interp = &mut *st.interp.cast_mut();
+            // A simple body steps to its next yield in place, as the core
+            // loop's arm steps it (see `gen_fast`).
+            if let (Object::Generator(g), true) =
+                (&*base.add(start + 2), Interpreter::core_drops_plain())
+            {
+                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                    crate::gen_fast::GenNext::Yielded(v) => {
+                        // The builtin and the generator (the stack's own
+                        // slots hold them past the step) leave by plain
+                        // decrements; the value takes the callee's slot.
+                        crate::release_run(base.add(start), 3);
+                        base.add(start).write(v);
+                        st.len = start + 1;
+                        return 0;
+                    }
+                    // `next(gen)` raises `StopIteration(value)`.
+                    crate::gen_fast::GenNext::Exhausted(v) => {
+                        crate::release_run(base.add(start), 3);
+                        st.len = start;
+                        st.pc = pc + 1;
+                        st.err = Some(crate::error::stop_iteration_with(v));
+                        return RAISED;
+                    }
+                    crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
+                }
+            }
             sync(st);
             let sw = &mut *st.sw;
-            let interp = &mut *st.interp.cast_mut();
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextCall) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             }
@@ -5158,9 +5184,32 @@ unsafe extern "C" fn h_call(
             if st.sw.is_null() {
                 return CALL_DECLINED;
             }
+            let interp = &mut *st.interp.cast_mut();
+            // A simple body's step in place, as for `next(gen)` above.
+            if let (Object::Generator(g), true) =
+                (&*base.add(start + 2), Interpreter::core_drops_plain())
+            {
+                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                    crate::gen_fast::GenNext::Yielded(v) => {
+                        crate::release_run(base.add(start), 4);
+                        base.add(start).write(v);
+                        st.len = start + 1;
+                        return 0;
+                    }
+                    // The default is the result.
+                    crate::gen_fast::GenNext::Exhausted(v) => {
+                        drop(v);
+                        let default = base.add(start + 3).read();
+                        crate::release_run(base.add(start), 3);
+                        base.add(start).write(default);
+                        st.len = start + 1;
+                        return 0;
+                    }
+                    crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
+                }
+            }
             sync(st);
             let sw = &mut *st.sw;
-            let interp = &mut *st.interp.cast_mut();
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextDefault) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             }

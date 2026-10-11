@@ -19274,7 +19274,7 @@ impl Interpreter {
     /// no reference tracing), so a droppable value leaves by a plain
     /// decrement (see [`Self::core_droppable`]).
     #[inline(always)]
-    fn core_drops_plain() -> bool {
+    pub(crate) fn core_drops_plain() -> bool {
         // (The dict and function watchers' and the reftrace printer's
         // flags, tested with one load.)
         crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES == 0
@@ -44425,6 +44425,30 @@ impl Interpreter {
     /// on the frame or its cached shell), it suspended outside any
     /// handler (no detached exception state to restore), and its code
     /// is the interpreter's — else `None` and the general path runs.
+    /// [`Self::generator_send_fold`]'s resume of `gen` with `None` by fast
+    /// step (see `gen_fast`), on the lean resume's terms: `None` when the
+    /// generator or its body declines, with nothing run (or the body
+    /// stopped partway, parked for the lean resume to go on with).
+    #[inline]
+    fn generator_next_fast(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        raw_return: bool,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let snap_gen = self.lean_snapshot()?;
+        if self.dbg_sample
+            || crate::trace::eval_frame_record_active()
+            || crate::stdlib::greenlet_native::on_greenlet_stack()
+        {
+            return None;
+        }
+        match self.gen_fast_next(gen, snap_gen, 0, crate::gc_trace::maybe_dead_flag()) {
+            gen_fast::GenNext::Yielded(v) => Some(Ok(v)),
+            gen_fast::GenNext::Exhausted(v) => Some(Self::generator_returned(v, raw_return)),
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
+    }
+
     fn generator_send_lean(
         &mut self,
         gen: &Rc<PyGenerator>,
@@ -44768,6 +44792,18 @@ impl Interpreter {
         // Consumed here, so a generator this one resumes in turn raises
         // `StopIteration` as usual.
         let raw_return = GEN_RAW_RETURN.with(|r| r.replace(false));
+        // A simple body's resume steps to its next yield in place, as a
+        // `FOR_ITER` over it does (see `gen_fast`): no activation at all.
+        // (A draining consumer's fold takes the lean resume, which folds
+        // every yield it can in one step.)
+        if fold.is_none()
+            && matches!(sent, Object::None)
+            && gen.kind == crate::object::CoroutineKind::Generator
+        {
+            if let Some(r) = self.generator_next_fast(gen, raw_return) {
+                return r;
+            }
+        }
         if let Some(r) = self.generator_send_lean(gen, &sent, fold, raw_return) {
             return r;
         }
