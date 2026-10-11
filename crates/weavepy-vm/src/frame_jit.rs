@@ -1419,9 +1419,10 @@ unsafe extern "C" fn h_for_iter_rest(
                 *current = current.wrapping_add(*step);
                 return 0;
             }
-            if !unique {
-                return 3;
-            }
+            // The exhausted iterator leaves the stack, as the core loop's
+            // arm retires it: it holds nothing, so its release (the last
+            // or, a generator expression's `.0` holding it too, not) runs
+            // no code.
             // SAFETY: the iterator leaves the stack.
             drop(unsafe { it.read() });
             return 2;
@@ -1444,8 +1445,13 @@ unsafe extern "C" fn h_for_iter_rest(
                 // A shared iterator (a generator expression's `.0`, which
                 // its local holds too) detaches from the list, as the core
                 // loop's arm does, so a later append can't resurrect it
-                // (when the list lives on: its release frees nothing).
-                None if owner.is_none() && (unique || crate::sync::Rc::strong_count(items) > 1) => {
+                // (when the list lives on, or holds only plain scalars: its
+                // release frees nothing that could finalize).
+                None if owner.is_none()
+                    && (unique
+                        || crate::sync::Rc::strong_count(items) > 1
+                        || xs.iter().all(plain_scalar)) =>
+                {
                     if !unique {
                         *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
                     }
@@ -1466,16 +1472,7 @@ unsafe extern "C" fn h_for_iter_rest(
                 // tuple of names, `for k in key[:-1]`.)
                 if unique
                     && crate::shared_value::ThinArc::strong_count(items) == 1
-                    && !items.iter().all(|x| {
-                        matches!(
-                            x,
-                            Object::Int(_)
-                                | Object::Float(_)
-                                | Object::Bool(_)
-                                | Object::None
-                                | Object::Str(_)
-                        )
-                    })
+                    && !items.iter().all(plain_scalar)
                 {
                     return 3;
                 }
@@ -1536,7 +1533,14 @@ unsafe extern "C" fn h_for_iter_rest(
                 return 3;
             }
             let Some(k) = items.get_index(*index) else {
-                return 3;
+                // Exhausted: the iterator leaves the stack when its release
+                // can't free the set (shared, or the set lives on).
+                if unique && crate::sync::Rc::strong_count(set) == 1 {
+                    return 3;
+                }
+                // SAFETY: as above.
+                drop(unsafe { it.read() });
+                return 2;
             };
             let v = crate::clone_hot(&k.0);
             *index += 1;
@@ -1564,13 +1568,13 @@ unsafe extern "C" fn h_for_iter_rest(
             None => return 3,
         },
         // An exhausted string's or bytes' cursor leaves the stack, as a
-        // range's does: releasing it runs no code.
-        PyIterator::Str { s, index } if unique && *index >= s.len() => {
+        // range's does (shared or not): releasing it runs no code.
+        PyIterator::Str { s, index } if *index >= s.len() => {
             // SAFETY: as above.
             drop(unsafe { it.read() });
             return 2;
         }
-        PyIterator::Bytes { data, index } if unique && *index >= data.len() => {
+        PyIterator::Bytes { data, index } if *index >= data.len() => {
             // SAFETY: as above.
             drop(unsafe { it.read() });
             return 2;
@@ -1703,6 +1707,14 @@ unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
         }
         FOR_SWITCHED
     }
+}
+
+/// Whether releasing `x` frees nothing that could finalize.
+fn plain_scalar(x: &Object) -> bool {
+    matches!(
+        x,
+        Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None | Object::Str(_)
+    )
 }
 
 /// Whether the `FOR_ITER` at `pc` of `code` unpacks a pair (the
