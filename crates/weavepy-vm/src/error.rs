@@ -297,10 +297,22 @@ pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
     // Built in one step (message, `args` and both fields): a failing
     // lookup under `getattr(o, n, default)` or `except AttributeError`
     // is a hot path.
-    let type_name = obj.type_name_owned();
+    // (An instance's class name is borrowed, not copied.)
+    let cls = match obj {
+        Object::Instance(inst) => Some(inst.cls()),
+        _ => None,
+    };
+    let owned;
+    let type_name: &str = match &cls {
+        Some(c) if c.c_tp_name.get().is_none() => &c.name,
+        _ => {
+            owned = obj.type_name_owned();
+            &owned
+        }
+    };
     let mut message = String::with_capacity(type_name.len() + name.len() + 30);
     message.push('\'');
-    message.push_str(&type_name);
+    message.push_str(type_name);
     message.push_str("' object has no attribute '");
     message.push_str(name);
     message.push('\'');

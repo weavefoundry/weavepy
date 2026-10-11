@@ -48169,10 +48169,18 @@ impl Interpreter {
         let frame = unsafe { &mut *sw.cur };
         let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
             && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
+        // A site cooling down after a failed load (an odd count; see
+        // `specialized_load_attr`'s `Cooldown` arm) asks whether the
+        // attribute is certainly missing, ahead of the getter lanes.
+        let failing = matches!(
+            frame.code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
+        );
         // A property's or a Python data descriptor's getter runs as an
         // inline activation, as the core loop's own arm runs it.
         if frame.code.instructions[pc].op == OpCode::LoadAttr
             && !frame_field
+            && !failing
             && (self.core_property(sw) || self.core_getitem(sw, true))
         {
             return Ok(());
@@ -48198,13 +48206,6 @@ impl Interpreter {
         }
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        // (Only a site cooling down after a failed load, an odd count, asks
-        // whether the attribute is certainly missing; see
-        // `specialized_load_attr`'s `Cooldown` arm.)
-        let failing = matches!(
-            frame.code.caches.get(pc as u32),
-            weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
-        );
         let r = match ins.op {
             OpCode::LoadAttr if failing => match self.load_attr_certain_miss(frame, ins.arg) {
                 Some(err) => Err(err),
