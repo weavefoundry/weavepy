@@ -381,7 +381,7 @@ impl Interpreter {
     /// fast-step body the general machinery holds no extra state for (no
     /// Python-visible frame, no saved exception state, no parked native
     /// activation).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn gen_fast_frame_ok(frame: &Frame) -> bool {
         frame.py_frame.is_none()
             && !frame.has_saved_exc_info()
@@ -1077,7 +1077,7 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         let handed = match self.gen_native_yield(frame, snap_gen, depth, dead) {
             Ok(v) => {
-                Self::park_suspended_boxed(g, boxed);
+                Self::park_stepped(g, boxed);
                 return GenNext::Yielded(v);
             }
             Err(pc) => pc,
@@ -1119,7 +1119,26 @@ impl Interpreter {
                 GenNext::Partial
             }
         };
-        Self::park_suspended_boxed(g, boxed);
+        Self::park_stepped(g, boxed);
         out
+    }
+
+    /// [`Self::park_suspended_boxed`] for a generator a fast step ran:
+    /// its state is still the step's `Running` (no code ran that could
+    /// reach it), and it has no frame object to stamp.
+    #[inline(always)]
+    fn park_stepped(g: &Rc<PyGenerator>, boxed: Box<Frame>) {
+        debug_assert!(boxed.py_frame.is_none());
+        if g.track_deferred.get() {
+            Self::park_suspended_boxed(g, boxed);
+            return;
+        }
+        // SAFETY: as above: nothing borrows the state, and `Running` owns
+        // nothing (no drop glue for the displaced state).
+        unsafe {
+            let st = g.state_raw().as_ptr();
+            debug_assert!(matches!(*st, GeneratorState::Running));
+            std::ptr::write(st, GeneratorState::Suspended(boxed));
+        }
     }
 }
