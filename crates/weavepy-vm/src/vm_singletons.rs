@@ -160,9 +160,9 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
         // SAFETY: a read that runs no code (`peek_mut` rejects a live
         // borrow or shared cells, which take the borrow).
         let owes = !g.finalize_ran.get()
-            && match unsafe { g.state.peek_mut() } {
+            && match unsafe { g.state().peek_mut() } {
                 Some(state) => owes_for(state),
-                None => g.state.try_borrow().is_ok_and(|state| owes_for(&state)),
+                None => g.state().try_borrow().is_ok_and(|state| owes_for(&state)),
             };
         // A plain generator suspended outside any handler of its own
         // (CPython's `gen_close` shortcut) just finishes, here: nothing

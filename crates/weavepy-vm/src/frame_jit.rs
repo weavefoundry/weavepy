@@ -6115,7 +6115,7 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
             match top {
                 // A read between instructions.
                 Object::Coroutine(g) => g
-                    .state
+                    .state()
                     .peek()
                     .is_some_and(|s| matches!(s, crate::object::GeneratorState::Created(_))),
                 // A `types.coroutine` generator is its own.

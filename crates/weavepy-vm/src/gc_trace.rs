@@ -3177,7 +3177,7 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             // Dropping the suspended frame box breaks the cycle
             // (the finalizer — close() — has already run by the
             // time clear is reached; see collect phase 5c).
-            if let Ok(mut st) = g.state.try_borrow_mut() {
+            if let Ok(mut st) = g.state().try_borrow_mut() {
                 *st = crate::object::GeneratorState::Finished;
             }
         }

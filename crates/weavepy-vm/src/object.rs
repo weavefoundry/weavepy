@@ -5504,7 +5504,8 @@ pub struct PyGenerator {
     /// strong reference) so it stays readable after the generator
     /// finishes and the frame is dropped.
     pub code: Object,
-    pub state: RefCell<GeneratorState>,
+    /// The execution state, read through [`Self::state`].
+    gen_state: RefCell<GeneratorState>,
     /// [`Self::name`] and [`Self::qualname`] when they aren't the code's,
     /// [`Self::origin`] and [`Self::finalizer`]: the state few generators
     /// carry, allocated when first set.
@@ -5530,6 +5531,13 @@ pub struct PyGenerator {
     /// suspends, which tracks it (see `Interpreter::park_suspended_boxed`).
     /// One that finishes first is never tracked.
     pub track_deferred: crate::sync::Cell<bool>,
+    /// The collapsed `yield from` chain this generator is a level of (the
+    /// address of its `ChainRec`, see `Interpreter::core_send_collapse`),
+    /// or 0. A level of a parked chain is in
+    /// [`GeneratorState::Delegating`] although nothing runs it:
+    /// [`Self::state`] puts the chain back as running it would have left
+    /// it before anything sees the state.
+    pub(crate) chain: crate::sync::Cell<usize>,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5666,13 +5674,34 @@ impl PyGenerator {
         Self {
             kind,
             code,
-            state: RefCell::new(GeneratorState::Created(frame)),
+            gen_state: RefCell::new(GeneratorState::Created(frame)),
             extras: RefCell::new(None),
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
             gc_slot: crate::gc_trace::GcSlot::new(),
             track_deferred: crate::sync::Cell::new(false),
+            chain: crate::sync::Cell::new(0),
         }
+    }
+
+    /// The generator's state. A level of a parked `yield from` chain (see
+    /// [`Self::chain`]) is first suspended in its `yield from`, with the
+    /// rest of the chain, as resuming the chain level by level leaves it.
+    #[inline(always)]
+    pub fn state(&self) -> &RefCell<GeneratorState> {
+        let chain = self.chain.get();
+        if chain != 0 {
+            crate::settle_parked_chain(chain);
+        }
+        &self.gen_state
+    }
+
+    /// The state as it is, a parked chain's level still `Delegating`: for
+    /// the chain machinery, and for reads that treat a delegating frame
+    /// as a suspended one (the collector's traversal).
+    #[inline(always)]
+    pub(crate) fn state_raw(&self) -> &RefCell<GeneratorState> {
+        &self.gen_state
     }
 
     /// [`Self::new`] with the name objects already built (a function's
@@ -5697,7 +5726,7 @@ impl PyGenerator {
     }
 
     pub fn is_finished(&self) -> bool {
-        matches!(&*self.state.borrow(), GeneratorState::Finished)
+        matches!(&*self.state().borrow(), GeneratorState::Finished)
     }
 
     /// Has the body run at all? A generator still in `Created` has
@@ -5705,7 +5734,7 @@ impl PyGenerator {
     /// `gen_close` marks such a generator closed without throwing
     /// `GeneratorExit` at it, and `gen_dealloc` frees it outright.
     pub fn is_unstarted(&self) -> bool {
-        self.state
+        self.state()
             .try_borrow()
             .is_ok_and(|s| matches!(&*s, GeneratorState::Created(_)))
     }
@@ -5726,8 +5755,15 @@ impl Drop for PyGenerator {
         // pipeline (`chain(chain(chain(…)))`); dropping it inline recurses
         // one native stack frame per link and overflows on long chains, so
         // route it through the iterative trampoline below.
+        // A parked chain's level settles first (its levels are alive: each
+        // is held by the one above, the outermost by this generator's
+        // owners, and this one's frame is still here).
+        let chain = self.chain.get();
+        if chain != 0 {
+            crate::settle_parked_chain(chain);
+        }
         // (Exclusive: no borrow of the state can be live.)
-        let state = self.state.get_mut();
+        let state = self.gen_state.get_mut();
         if matches!(
             state,
             GeneratorState::Suspended(_) | GeneratorState::Created(_) | GeneratorState::Delegating(_)

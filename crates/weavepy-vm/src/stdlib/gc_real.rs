@@ -402,7 +402,7 @@ fn referrer_edges(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         // stack rather than in the generator's state box.
         Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)
             if matches!(
-                g.state.try_borrow().as_deref(),
+                g.state().try_borrow().as_deref(),
                 Ok(crate::object::GeneratorState::Running)
             ) =>
         {

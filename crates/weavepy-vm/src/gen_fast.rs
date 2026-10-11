@@ -1025,7 +1025,7 @@ impl Interpreter {
         // runs while it's held.
         // SAFETY: nothing below reaches the cell again until `state`'s
         // last use (`peek_mut` rejects a live guard or shared cells).
-        let Some(state) = (unsafe { g.state.peek_mut() }) else {
+        let Some(state) = (unsafe { g.state().peek_mut() }) else {
             return GenNext::Declined;
         };
         let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) = &*state else {
