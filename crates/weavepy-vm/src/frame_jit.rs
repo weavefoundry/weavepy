@@ -584,6 +584,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         if helped[k] || matches!(op, OpCode::Call | OpCode::CallKw | OpCode::CallEx) {
             return Some(1);
         }
+        // A forwarding call's merge runs with its call (`call_forward`).
+        if op == OpCode::DictUpdate && k >= 2 && crate::forward_call_shape(code, k - 2) {
+            return Some(1);
+        }
         if !native_at(code, k) {
             return None;
         }
@@ -3755,6 +3759,8 @@ unsafe extern "C" fn h_stack_attr(
                 crate::drop_hot(std::mem::replace(&mut *at, v));
                 return 0;
             }
+            // A function's stored attribute (`wrapper.calls`).
+            Object::Function(_) => return u32::from(!Interpreter::core_function_load(code, arg, at)),
             _ => None,
         };
         let Some(v) = v else {
@@ -3861,8 +3867,14 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
     unsafe {
         let (code, pc) = (&*code, pc as usize);
         let (val, recv) = (&*at, &*at.add(1));
-        let Object::Instance(inst) = recv else {
-            return 1;
+        let inst = match recv {
+            Object::Instance(inst) => inst,
+            // A function's attribute (`wrapper.calls += 1`): both leave.
+            Object::Function(_) => {
+                let arg = code.instructions[pc].arg;
+                return u32::from(!Interpreter::core_function_store(code, arg, at.add(1)));
+            }
+            _ => return 1,
         };
         if !droppable(recv)
             || !Interpreter::core_store_attr(code, inst, pc, code.instructions[pc].arg, val)
@@ -5801,6 +5813,58 @@ unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64,
     }
 }
 
+/// `f(*args, **kwargs)`'s forwarding run (see `forward_call_shape`)
+/// opening at the `BUILD_MAP` at `pc` on a stack `len` deep, as the core
+/// loop's arm runs it (`Interpreter::core_call_forward`), the frame synced
+/// first: `0` the call's result in place (as [`h_call_ex`]'s), `RELOAD`
+/// the core loop goes on, `CALL_DECLINED` untouched.
+unsafe extern "C" fn h_call_forward(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code, one of its
+    // forwarding `BUILD_MAP`s and its stack depth.
+    unsafe {
+        let _ = code;
+        let st = &mut *st;
+        let (pc, len) = (pc as usize, len as usize);
+        if st.sw.is_null() || len < 3 {
+            return CALL_DECLINED;
+        }
+        let start = len - 3;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        let sw = &mut *st.sw;
+        *sw.last = st.last;
+        let saved_last = sw.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_call_forward(sw, pc) {
+            return if sw.pending.is_some() {
+                RELOAD
+            } else {
+                CALL_DECLINED
+            };
+        }
+        if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+            // (The call's own pc, three on, is the caller's last.)
+            if let Some(r) = run_pushed_directly(st, pc + 3, start, saved_last) {
+                return r;
+            }
+            if run_callee_directly(st, start) {
+                st.len = start + 1;
+                return 0;
+            }
+        }
+        if finished_in_place(st, start) {
+            return 0;
+        }
+        RELOAD
+    }
+}
+
 /// `RETURN_VALUE` (the `pc`th instruction) of an inline activation with
 /// the value atop a `len`-deep stack: the frame synced and the caller
 /// switched back to as the core loop's arm does (`RELOAD`), the state
@@ -7443,6 +7507,15 @@ impl<'a> Lower<'a> {
             {
                 starts[pc + 2] = true;
             }
+            // A forwarding call (`f(*args, **kwargs)`) continues after its
+            // `CALL_FUNCTION_EX`.
+            if ins.op == OpCode::BuildMap
+                && ins.arg == 0
+                && crate::forward_call_shape(code, pc)
+                && pc + 4 < n
+            {
+                starts[pc + 4] = true;
+            }
             // A global's fused class-constant read continues after its
             // `LOAD_ATTR`.
             if ins.op == OpCode::LoadGlobal
@@ -7842,6 +7915,11 @@ impl<'a> Lower<'a> {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
+            OpCode::BuildMap
+                if ins.arg == 0 && !self.is_gen() && crate::forward_call_shape(self.code, pc) =>
+            {
+                return self.call_forward(pc)
+            }
             OpCode::BuildMap if (0..=8).contains(&ins.arg) => {
                 return self.build_map(pc, ins.arg as usize)
             }
@@ -10472,6 +10550,48 @@ impl<'a> Lower<'a> {
     /// `CALL_FUNCTION_EX` through [`h_call_ex`] (as [`Self::call_kw`]).
     fn call_ex(&mut self, pc: usize) -> bool {
         self.call_with(pc, h_call_ex as *const () as usize)
+    }
+
+    /// `f(*args, **kwargs)`'s forwarding run, `BUILD_MAP 0` at `pc` through
+    /// its `CALL_FUNCTION_EX`, through [`h_call_forward`] (as
+    /// [`Self::call_with`]): the block goes on past the call; a decline
+    /// leaves at the `BUILD_MAP`, where the core loop runs it.
+    fn call_forward(&mut self, pc: usize) -> bool {
+        let after = self.depths.get(pc + 4).copied().unwrap_or(-1);
+        if after < 0 || self.depth < 3 || self.blocks.get(pc + 4).copied().flatten().is_none() {
+            return self.build_map(pc, 0);
+        }
+        self.flush();
+        self.store_last();
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let r = self
+            .call(
+                h_call_forward as *const () as usize,
+                &[self.st, code, pcv, len],
+                true,
+            )
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        let ran = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(r, other, &[], ran, &[]);
+        self.b.switch_to_block(other);
+        let declined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+        let leave = self.b.create_block();
+        self.b.ins().brif(declined, out, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.leave(r);
+        self.b.switch_to_block(ran);
+        self.depth = after as usize;
+        self.set_last(pc + 3);
+        self.check_released(pc + 4);
+        self.goto(pc + 4);
+        false
     }
 
     /// A call instruction through `helper` (`h_call_kw`'s signature): the
