@@ -73722,40 +73722,49 @@ fn drop_hot(v: Object) {
     }
 }
 
-/// [`Interpreter::release`] of a call's operand with its commonest case in
-/// line: a scalar, or a shared value's plain decrement while nothing
-/// watches releases (one load of [`plain_release_gate`]'s flags). A last
-/// owner, or any release an observer wants, takes the full release.
+/// Whether a shared value's reference may be released by a plain
+/// decrement: one thread owns every count and no observer wants releases
+/// (one load of [`plain_release_gate`]'s flags; a debug build's counts are
+/// always atomic, as [`crate::rc::try_release_word`]'s are).
 #[inline(always)]
-fn release_hot(interp: &Interpreter, v: Object) {
-    if let Some(word) = v.strong_word() {
-        // SAFETY: the gates are four flags laid out as one `u32`; `v` owns
-        // a reference to the live allocation, released here unless it's
-        // the last one.
-        let plain = unsafe {
+fn release_gates_clear() -> bool {
+    // SAFETY: the gates are four flags laid out as one `u32`.
+    !cfg!(debug_assertions)
+        && unsafe {
             (*plain_release_gate().cast::<std::sync::atomic::AtomicU32>())
                 .load(std::sync::atomic::Ordering::Relaxed)
                 == 0
-                && crate::rc::try_release_word(word)
-        };
-        if !plain {
-            return interp.release(v);
         }
-    }
-    std::mem::forget(v);
 }
 
 /// Release the `n` call operands at `p` (moved out: the caller's stack no
-/// longer counts them) in order, as [`release_hot`] does.
+/// longer counts them) in order, as [`Interpreter::release`] does, with
+/// the commonest cases in line: a scalar, or a shared value's plain
+/// decrement while [`release_gates_clear`] holds. A last owner, or any
+/// release an observer wants, takes the full release.
 ///
 /// # Safety
 ///
 /// `p` holds `n` initialized values the caller owns and gives up.
 #[inline(always)]
 unsafe fn release_operands(interp: &Interpreter, p: *const Object, n: usize) {
+    let plain = release_gates_clear();
     for k in 0..n {
-        // SAFETY: the caller's contract.
-        release_hot(interp, unsafe { p.add(k).read() });
+        // SAFETY: the caller's contract: each value owns a reference to its
+        // live allocation, which (with the gates clear) only this thread
+        // counts; the value is read out only for the full release.
+        unsafe {
+            let at = p.add(k);
+            let Some(word) = (*at).strong_word() else {
+                continue;
+            };
+            let c = (*word).load(std::sync::atomic::Ordering::Relaxed);
+            if plain && c > 1 {
+                (*word).store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                interp.release(at.read());
+            }
+        }
     }
 }
 

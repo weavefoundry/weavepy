@@ -5418,20 +5418,61 @@ pub(crate) struct BuiltinSite {
     f: *const crate::object::BuiltinFn,
     argc: usize,
     kind: Option<crate::LeafKind>,
-    /// The leaf kind runs in place for any receiver (see
-    /// `LeafKind::runs_in_core`).
-    in_core: bool,
     kernel: Option<Kernel>,
     recv_tag: u8,
     via_call: bool,
 }
 
-/// [`h_call`] at a site settled on a leaf builtin `site` names: the
-/// callee checked to be that builtin by its address, then a container's or
-/// string's method through its [`Kernel`] on the receiver in the self slot,
-/// or the leaf body the site's kind names in place, the operands released
-/// after; anything else (another callee, a declined shape) through
-/// `h_call`.
+/// [`h_call`] at a site settled on a container's or string's leaf method
+/// with a [`Kernel`] (`site`'s): the callee checked to be that builtin by
+/// its address and the receiver in the self slot to be the kernel's
+/// variant, then the kernel run on the operands in place and the operands
+/// released; anything else (another callee or receiver, a declined call)
+/// through `h_call`.
+unsafe extern "C" fn h_call_kernel(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u64,
+    len: u64,
+    site: *const BuiltinSite,
+) -> u32 {
+    // SAFETY: as `h_call`'s; the site is this `CALL`'s, and the code holds
+    // its builtin.
+    unsafe {
+        let s = &mut *st;
+        let site = &*site;
+        let lenu = len as usize;
+        let start = lenu - site.argc - 2;
+        let base = s.stack;
+        let recv = base.add(start + 1);
+        if let (Object::Builtin(b), Some(kernel), false) = (&*base.add(start), site.kernel, s.sw.is_null()) {
+            if std::ptr::eq(Rc::as_ptr(b), site.f) && (*recv).tag() == site.recv_tag {
+                let arg = |k: usize| {
+                    if k <= site.argc {
+                        recv.add(k).cast_const()
+                    } else {
+                        std::ptr::null()
+                    }
+                };
+                let mut out = std::mem::MaybeUninit::<Object>::uninit();
+                if kernel(out.as_mut_ptr(), recv, arg(1), arg(2), site.f) == 0 {
+                    crate::release_operands(&*s.interp, base.add(start), lenu - start);
+                    base.add(start).write(out.assume_init());
+                    s.len = start + 1;
+                    return 0;
+                }
+            }
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// [`h_call`] at a site settled on a leaf builtin whose kind runs in place
+/// (see `LeafKind::runs_in_core`; `site`'s): the callee checked to be that
+/// builtin by its address, then the leaf body the kind names run on the
+/// operands in place, which are released after; anything else (another
+/// callee, a declined shape) through `h_call`.
 unsafe extern "C" fn h_call_leaf(
     st: *mut State,
     code: *const CodeObject,
@@ -5451,78 +5492,55 @@ unsafe extern "C" fn h_call_leaf(
         let base = s.stack;
         let hit = matches!(&*base.add(start), Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f));
         if hit && !s.sw.is_null() {
-            let recv = &*base.add(start + 1);
-            let r = match site.kernel {
-                // A container's or string's method with a kernel, on the
-                // receiver in the self slot.
-                Some(kernel) if recv.tag() == site.recv_tag => {
-                    let arg = |k: usize| {
-                        if k <= site.argc {
-                            base.add(start + 1 + k).cast_const()
-                        } else {
-                            std::ptr::null()
-                        }
-                    };
-                    let mut out = std::mem::MaybeUninit::<Object>::uninit();
-                    (kernel(out.as_mut_ptr(), recv, arg(1), arg(2), site.f) == 0)
-                        .then(|| Ok(out.assume_init()))
-                }
-                // (A kernel's kind runs nothing in place on another
-                // receiver: through `h_call`.)
-                Some(_) => None,
-                None if site.in_core => {
-                    let first = if matches!(recv, Object::Unbound) {
-                        start + 2
+            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                start + 2
+            } else {
+                start + 1
+            };
+            let args = std::slice::from_raw_parts(base.add(first), lenu - first);
+            let b = &*site.f;
+            // (A body that runs no Python code for any arguments, or for
+            // scalar ones: as `h_call` and `leaf_builtin_call` run them.)
+            let body = || {
+                Some(match b.call_kw.as_ref() {
+                    Some(ckw) => ckw(args, &[]),
+                    None => (b.call)(args),
+                })
+            };
+            let r = match site.kind {
+                Some(LeafKind::Fast(f)) => f(args),
+                Some(LeafKind::Len) => len_fast(args),
+                Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
+                Some(LeafKind::Opaque) => body(),
+                Some(LeafKind::Scalar) => {
+                    if args
+                        .iter()
+                        .all(|a| matches!(a, Object::Int(_) | Object::Float(_) | Object::Bool(_)))
+                    {
+                        body()
                     } else {
-                        start + 1
-                    };
-                    let args = std::slice::from_raw_parts(base.add(first), lenu - first);
-                    let b = &*site.f;
-                    // (A body that runs no Python code for any arguments,
-                    // or for scalar ones: as `h_call` and
-                    // `leaf_builtin_call` run them.)
-                    let body = || {
-                        Some(match b.call_kw.as_ref() {
-                            Some(ckw) => ckw(args, &[]),
-                            None => (b.call)(args),
-                        })
-                    };
-                    match site.kind {
-                        Some(LeafKind::Fast(f)) => f(args),
-                        Some(LeafKind::Len) => len_fast(args),
-                        Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
-                        Some(LeafKind::Opaque) => body(),
-                        Some(LeafKind::Scalar) => {
-                            if args.iter().all(|a| {
-                                matches!(a, Object::Int(_) | Object::Float(_) | Object::Bool(_))
-                            }) {
-                                body()
-                            } else {
-                                None
-                            }
-                        }
-                        Some(k) => (*s.interp).leaf_builtin_call(k, b, args),
-                        None => None,
+                        None
                     }
                 }
+                Some(k) => (*s.interp).leaf_builtin_call(k, b, args),
                 None => None,
             };
-            if let Some(r) = r {
-                // The operands leave by their releases.
-                crate::release_operands(&*s.interp, base.add(start), lenu - start);
-                return match r {
-                    Ok(v) => {
-                        base.add(start).write(v);
-                        s.len = start + 1;
-                        0
-                    }
-                    Err(e) => {
-                        s.len = start;
-                        s.pc = pc as usize + 1;
-                        s.err = Some(e);
-                        RAISED
-                    }
-                };
+            match r {
+                None => {}
+                Some(Ok(v)) => {
+                    // The operands leave by their releases.
+                    crate::release_operands(&*s.interp, base.add(start), lenu - start);
+                    base.add(start).write(v);
+                    s.len = start + 1;
+                    return 0;
+                }
+                Some(Err(e)) => {
+                    crate::release_operands(&*s.interp, base.add(start), lenu - start);
+                    s.len = start;
+                    s.pc = pc as usize + 1;
+                    s.err = Some(e);
+                    return RAISED;
+                }
             }
         }
         h_call(st, code, ext, pc, len)
@@ -10726,9 +10744,9 @@ impl<'a> Lower<'a> {
 
     /// The helper and its site for a `CALL` (of `argc` arguments) at `pc`
     /// whose site settled on a builtin (see [`BuiltinSite`]): a leaf kind
-    /// with a kernel or one run in place through [`h_call_leaf`], a body
-    /// through the core loop's lane through [`h_call_native`]; `None` for
-    /// anything else (`h_call` alone).
+    /// with a kernel through [`h_call_kernel`], one run in place through
+    /// [`h_call_leaf`], a body through the core loop's lane through
+    /// [`h_call_native`]; `None` for anything else (`h_call` alone).
     fn builtin_site(&mut self, pc: usize, argc: usize) -> Option<(usize, Value)> {
         use crate::LeafKind;
         let (f, kind, via_call) = crate::call_site_builtin(self.ext, pc)?;
@@ -10751,14 +10769,14 @@ impl<'a> Lower<'a> {
         let in_core = kind.is_some_and(LeafKind::runs_in_core);
         let helper = match kind {
             None => h_call_native as *const () as usize,
-            Some(_) if kernel.is_some() || in_core => h_call_leaf as *const () as usize,
+            Some(_) if kernel.is_some() => h_call_kernel as *const () as usize,
+            Some(_) if in_core => h_call_leaf as *const () as usize,
             Some(_) => return None,
         };
         let site = Box::new(BuiltinSite {
             f: Rc::as_ptr(&f),
             argc,
             kind,
-            in_core,
             kernel,
             recv_tag,
             via_call,
