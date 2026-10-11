@@ -18973,7 +18973,18 @@ impl Interpreter {
         let Object::Function(f) = (unsafe { &*top }) else {
             return false;
         };
-        let Some(v) = Self::leaf_function_read(code, f, name_idx) else {
+        // A plain name (no `function` descriptor is one) is the
+        // `__dict__` entry, probed with the name's interned bytes and
+        // stored hash; anything else, or a cell in use, takes the full read.
+        let plain = code_name_key(code, name_idx)
+            .filter(|key| !key.s.starts_with("__") && !crate::object::exotic_str_keys_possible())
+            .and_then(|key| {
+                // SAFETY: reads between two instructions, running no code;
+                // the views end with the value's clone.
+                let attrs = unsafe { f.attrs.peek() }?.as_ref()?;
+                unsafe { attrs.peek() }?.get(&key).map(Self::clone_operand)
+            });
+        let Some(v) = plain.or_else(|| Self::leaf_function_read(code, f, name_idx)) else {
             return false;
         };
         // SAFETY: as above; the function is held by the variable it was
@@ -19006,13 +19017,25 @@ impl Interpreter {
         {
             return false;
         }
-        let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
+        let (Some(name @ Object::Str(n)), Some(key)) =
+            (code_name_obj(code, name_idx), code_name_key(code, name_idx))
+        else {
             return false;
         };
         if n.starts_with("__") {
             return false;
         }
-        let dict = f.attrs();
+        // The existing dictionary in place (no code runs while it is
+        // read), else a new one.
+        let made;
+        // SAFETY: a read of the cell that holds the dictionary.
+        let dict = match unsafe { f.attrs.peek() } {
+            Some(Some(d)) => d,
+            _ => {
+                made = f.attrs();
+                &made
+            }
+        };
         let old = {
             let Ok(mut d) = dict.try_borrow_mut() else {
                 return false;
@@ -19020,7 +19043,8 @@ impl Interpreter {
             // SAFETY: the value moves into the dictionary; its slot is
             // forgotten below.
             let value = unsafe { std::ptr::read(value) };
-            match d.get_mut(&crate::object::StrKey(n)) {
+            // (Probed with the name's interned bytes and stored hash.)
+            match d.get_mut(&key) {
                 Some(slot) => Some(std::mem::replace(slot, value)),
                 None => {
                     d.insert(DictKey(name.clone()), value);
