@@ -304,6 +304,38 @@ def errors(n):
     return out
 
 
+class MyDict(dict):
+    pass
+
+
+def subclass_methods(n):
+    import collections
+
+    d = MyDict(a=1)
+    c = collections.Counter("abca")
+    dd = collections.defaultdict(list)
+    out = 0
+    for i in range(n):
+        out += d.get("a", 0) + d.get("z", 5)
+        d.setdefault("k%d" % (i % 3), i)
+        out += c.get("a")
+        dd["x"].append(i)
+        out += len(dd.get("x"))
+    return out, sorted(d), len(dd["x"])
+
+
+def unbound_descriptors(n):
+    bad = 0
+    lst = MyList()
+    for i in range(n):
+        list.append(lst, i)
+        try:
+            list.append({}, i)
+        except TypeError as e:
+            bad += "doesn't apply to a 'dict' object" in str(e)
+    return len(lst), bad
+
+
 class BuiltinSiteTest(unittest.TestCase):
     def test_leaf_and_rebinding(self):
         self.assertEqual(lengths([1, 2], N), 2 * N)
@@ -434,6 +466,14 @@ class BuiltinSiteTest(unittest.TestCase):
         errs = errors(N)
         self.assertEqual([type(e) for e in errs[:2]], [ValueError, ValueError])
         self.assertEqual(errs[5].args, ("v", 5))
+
+    def test_subclass_receivers(self):
+        out, keys, n = subclass_methods(300)
+        want = sum(1 + 5 + 2 + (i + 1) for i in range(300))
+        self.assertEqual(out, want)
+        self.assertEqual(keys, ["a", "k0", "k1", "k2"])
+        self.assertEqual(n, 300)
+        self.assertEqual(unbound_descriptors(300), (300, 300))
 
     def test_forced_frame_jit(self):
         if FORCED in sys.argv:
