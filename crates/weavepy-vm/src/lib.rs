@@ -26491,7 +26491,7 @@ impl Interpreter {
         if let Some(found) = Self::leaf_contains_table(container, item) {
             return Some(found);
         }
-        let member = Self::leaf_member_eq;
+        let member = Self::leaf_contains_eq;
         match container {
             Object::List(l) => {
                 // SAFETY: a read between two instructions (the member test
@@ -26654,6 +26654,68 @@ impl Interpreter {
             return Some(false);
         }
         None
+    }
+
+    /// [`Self::leaf_member_eq`] for a membership test (`in`), which settles
+    /// a few more pairs itself rather than through a native comparison.
+    fn leaf_contains_eq(x: &Object, item: &Object) -> Option<bool> {
+        if let Some(eq) = Self::leaf_member_eq(x, item) {
+            return Some(eq);
+        }
+        let scalar = |o: &Object| {
+            matches!(
+                o,
+                Object::None
+                    | Object::Bool(_)
+                    | Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Str(_)
+                    | Object::Bytes(_)
+            )
+        };
+        // An `int` subclass's instance under `int`'s own `__eq__` (an
+        // `IntEnum` or `IntFlag` member) equals what its value equals.
+        if let (Some(a), Some(b)) = (Self::int_eq_value(x), Self::int_eq_value(item)) {
+            return Some(a == b);
+        }
+        // A function, or a class under `type`'s own `__eq__`, equals
+        // nothing but itself, against anything whose `__eq__` doesn't
+        // know it either.
+        let identity = |o: &Object| match o {
+            Object::Function(_) => true,
+            Object::Type(t) => Self::plain_metaclass(t),
+            _ => false,
+        };
+        // (A builtin function's `__eq__` knows only builtin functions.)
+        let default_eq = |o: &Object| {
+            identity(o)
+                || scalar(o)
+                || matches!(o, Object::Builtin(_))
+                || (matches!(o, Object::Instance(i) if i.native.get().is_none())
+                    && !crate::object::instance_has_custom_eq(o))
+        };
+        if (identity(x) && default_eq(item)) || (identity(item) && default_eq(x)) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// The value `o` compares as under `int.__eq__`: a machine `int` or
+    /// `bool`, or an instance of an `int` subclass whose `__eq__` is
+    /// `int`'s own, over a machine `int`.
+    fn int_eq_value(o: &Object) -> Option<i64> {
+        match o {
+            Object::Int(i) => Some(*i),
+            Object::Bool(b) => Some(i64::from(*b)),
+            Object::Instance(inst) => {
+                let Some(Object::Int(i)) = inst.native.get() else {
+                    return None;
+                };
+                let eq = inst.cls_raw().dunder(crate::types::Dunder::Eq);
+                (eq.builtin_owner() && !eq.object_owner()).then_some(*i)
+            }
+            _ => None,
+        }
     }
 
     /// `len(v)` for an instance whose class serves `__len__` with a
