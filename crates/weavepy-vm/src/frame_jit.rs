@@ -3533,7 +3533,7 @@ unsafe extern "C" fn h_load_method(
                 // An attribute the instance holds itself (a stored callable):
                 // the value with an empty self slot, as the core loop's arm.
                 if crate::inst_may_shadow(inst, code, name) {
-                    return u32::from(!Interpreter::core_value_method(code, name, top));
+                    return u32::from(!Interpreter::core_value_method(code, name, pc, top));
                 }
                 let f = match ms.get_held(ver) {
                     Some(f) => {

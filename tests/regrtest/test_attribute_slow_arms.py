@@ -561,6 +561,33 @@ class ChainMapTest(unittest.TestCase):
         self.assertEqual(o["a"], 5)
 
 
+class StoredCallableTest(unittest.TestCase):
+    def test_stored_callable_method_form(self):
+        class Node:
+            def fn(self, x):
+                return "method"
+
+            def __init__(self, fn):
+                self.fn = fn
+
+            def run(self, x):
+                return self.fn(x)
+
+        a = Node(lambda x: x + 1)
+        b = Node(lambda x: x * 2)
+        for i in range(N):
+            self.assertEqual(a.run(i), i + 1)
+            self.assertEqual(b.run(i), 2 * i)
+        a.fn = lambda x: -x
+        self.assertEqual(a.run(3), -3)
+        del a.fn
+        self.assertEqual(a.run(3), "method")
+        b.__dict__  # publishes the dict
+        self.assertEqual(b.run(3), 6)
+        Node.fn = property(lambda self: (lambda x: "prop"))
+        self.assertEqual(b.run(3), "prop")
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)

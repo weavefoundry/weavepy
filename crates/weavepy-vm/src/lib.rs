@@ -14585,7 +14585,7 @@ impl Interpreter {
                             if inst_may_shadow(inst, code, ins.arg) {
                                 // SAFETY: `len < cap`: `top` and the slot
                                 // above it.
-                                if unsafe { Self::core_value_method(code, ins.arg, top) } {
+                                if unsafe { Self::core_value_method(code, ins.arg, pc, top) } {
                                     len += 1;
                                     last = pc;
                                     pc += 1;
@@ -18941,20 +18941,37 @@ impl Interpreter {
     ///
     /// `top` is the core loop's top stack slot (an instance), and the slot
     /// above it is free.
+    ///
+    /// The site at `pc` remembers the value's split position for the
+    /// receiver's class (see [`FieldSlot`]), as an instance-field
+    /// `LOAD_ATTR` does, so later loads skip the resolution.
     #[inline(never)]
     pub(crate) unsafe fn core_value_method(
         code: &CodeObject,
         name_idx: u32,
+        pc: usize,
         top: *mut Object,
     ) -> bool {
         // SAFETY: the caller's contract.
         let Object::Instance(inst) = (unsafe { &*top }) else {
             return false;
         };
-        let Some((LeafAttr::Value(v), _)) =
-            Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)
-        else {
-            return false;
+        let ext = code_vm_ext(code);
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let held = ext.and_then(|e| unsafe { field_slot_hit(e, pc, inst) });
+        let v = match held {
+            Some(v) => Self::clone_operand(v),
+            None => {
+                let Some((LeafAttr::Value(v), ix)) =
+                    Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)
+                else {
+                    return false;
+                };
+                if let (Some(ext), Some(ix), None) = (ext, ix, inst.dict.published()) {
+                    field_slot_note(ext, code, pc, inst, ix);
+                }
+                v
+            }
         };
         // SAFETY: as above.
         if !Self::core_droppable(unsafe { &*top }) {
