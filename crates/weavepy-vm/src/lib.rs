@@ -39521,7 +39521,7 @@ impl Interpreter {
                     None => Ok(default.expect("checked above")),
                 }
             }
-            Object::Generator(g) => self.generator_send(g, Object::None),
+            Object::Generator(g) => self.generator_next_raw(g, false),
             Object::Coroutine(_) => match self.gen_method_send(it, Object::None) {
                 Ok(v) => Ok(v),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
@@ -42869,7 +42869,7 @@ impl Interpreter {
         match iter {
             Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
-            Object::Generator(g) => match self.generator_send(g, Object::None) {
+            Object::Generator(g) => match self.generator_next_raw(g, false) {
                 Ok(v) => Ok(Some(v)),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                     Ok(None)
@@ -44944,10 +44944,33 @@ impl Interpreter {
     /// on the frame or its cached shell), it suspended outside any
     /// handler (no detached exception state to restore), and its code
     /// is the interpreter's — else `None` and the general path runs.
-    /// [`Self::generator_send_fold`]'s resume of `gen` with `None` by fast
-    /// step (see `gen_fast`), on the lean resume's terms: `None` when the
-    /// generator or its body declines, with nothing run (or the body
-    /// stopped partway, parked for the lean resume to go on with).
+    /// `next(gen)` from native code (`next()` outside the core loop, a
+    /// native iterator's step over a generator): a simple body steps to
+    /// its next yield in place, as a `FOR_ITER` over it does (see
+    /// `gen_fast`), and anything else resumes through
+    /// [`Self::generator_send`]. With `raw`, as [`Self::generator_resume`]
+    /// reports a return. (`gen.send(None)` keeps its activation: a body
+    /// tier 2 parks natively resumes there.)
+    fn generator_next_raw(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        raw: bool,
+    ) -> Result<Object, RuntimeError> {
+        if gen.kind == crate::object::CoroutineKind::Generator {
+            if let Some(r) = self.generator_next_fast(gen, raw) {
+                return r;
+            }
+        }
+        if raw {
+            GEN_RAW_RETURN.with(|r| r.set(true));
+        }
+        self.generator_send_fold(gen, Object::None, None)
+    }
+
+    /// [`Self::generator_next_raw`]'s fast step, on the lean resume's
+    /// terms: `None` when the generator or its body declines, with nothing
+    /// run (or the body stopped partway, parked for the general resume to
+    /// go on with).
     #[inline]
     fn generator_next_fast(
         &mut self,
@@ -45268,10 +45291,15 @@ impl Interpreter {
         fire: bool,
     ) -> Result<Option<Object>, RuntimeError> {
         let raw = !crate::trace::any_observers_active();
-        if raw {
-            GEN_RAW_RETURN.with(|r| r.set(true));
-        }
-        match self.generator_send_fold(g, Object::None, fold) {
+        let result = if fold.is_none() {
+            self.generator_next_raw(g, raw)
+        } else {
+            if raw {
+                GEN_RAW_RETURN.with(|r| r.set(true));
+            }
+            self.generator_send_fold(g, Object::None, fold)
+        };
+        match result {
             Ok(Object::Unbound) if raw => {
                 drop(GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()));
                 Ok(None)
@@ -45311,18 +45339,6 @@ impl Interpreter {
         // Consumed here, so a generator this one resumes in turn raises
         // `StopIteration` as usual.
         let raw_return = GEN_RAW_RETURN.with(|r| r.replace(false));
-        // A simple body's resume steps to its next yield in place, as a
-        // `FOR_ITER` over it does (see `gen_fast`): no activation at all.
-        // (A draining consumer's fold takes the lean resume, which folds
-        // every yield it can in one step.)
-        if fold.is_none()
-            && matches!(sent, Object::None)
-            && gen.kind == crate::object::CoroutineKind::Generator
-        {
-            if let Some(r) = self.generator_next_fast(gen, raw_return) {
-                return r;
-            }
-        }
         if let Some(r) = self.generator_send_lean(gen, &sent, fold, raw_return) {
             return r;
         }

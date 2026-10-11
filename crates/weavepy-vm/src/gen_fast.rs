@@ -1072,7 +1072,8 @@ impl Interpreter {
         } else {
             crate::push_fast(&mut frame.stack, Object::None);
         }
-        debug_assert!(!frame.stack.is_empty());
+        // (A partial body may have stopped with nothing on its stack.)
+        debug_assert!(partial || !frame.stack.is_empty());
         // A compiled body's resume usually runs natively to its next yield.
         #[cfg(feature = "jit")]
         let handed = match self.gen_native_yield(frame, snap_gen, depth, dead) {
