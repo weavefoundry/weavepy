@@ -503,6 +503,31 @@ class DunderClassTest(unittest.TestCase):
         self.assertIs(weakref.proxy(c).__class__, C)
 
 
+class BuiltinTypeHasattrTest(unittest.TestCase):
+    def test_repeated_misses(self):
+        for _ in range(N):
+            self.assertFalse(hasattr(int, "_asyncio_future_blocking"))
+            self.assertTrue(hasattr(int, "from_bytes"))
+            self.assertEqual(getattr(int, "nope", 7), 7)
+
+    def test_struct_sequence_attribute_set(self):
+        import os
+
+        cls = type(os.stat("."))
+        for _ in range(N):
+            self.assertFalse(hasattr(cls, "weavepy_probe"))
+        try:
+            cls.weavepy_probe = 1
+        except TypeError:
+            return
+        self.assertTrue(hasattr(cls, "weavepy_probe"))
+        try:
+            del cls.weavepy_probe
+        except TypeError:
+            return
+        self.assertFalse(hasattr(cls, "weavepy_probe"))
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)

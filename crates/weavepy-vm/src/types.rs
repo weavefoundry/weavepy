@@ -166,6 +166,11 @@ pub(crate) enum Verdict {
     /// attribute access and setting, and no class attribute in the way
     /// but a function or a plain value (see `Interpreter::leaf_store_attr`).
     PlainStore = 5,
+    /// A builtin class answered `name` with `AttributeError` (recorded
+    /// after the lookup, for `hasattr`; asyncio's `isfuture` asks
+    /// `hasattr(type(coro), '_asyncio_future_blocking')` for every
+    /// coroutine it is handed). See [`TypeObject::verdict_record`].
+    TypeAttrMissing = 6,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -2219,6 +2224,37 @@ impl TypeObject {
                 verdict
             }
         }
+    }
+
+    /// The verdict [`Self::verdict_record`] recorded for `name` under the
+    /// class's current version, if any.
+    #[inline]
+    pub(crate) fn verdict_cached(&self, family: Verdict, name: &str) -> Option<bool> {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match type_cache::probe(ty, ver, name, h)? {
+            type_cache::Hit::Absent => Some(true),
+            type_cache::Hit::At { .. } => Some(false),
+        }
+    }
+
+    /// Record a verdict observed (rather than computed, as
+    /// [`Self::memo_verdict`] does) for `name` under the class's current
+    /// version; the cache may forget it.
+    pub(crate) fn verdict_record(&self, family: Verdict, name: &str, verdict: bool) {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let hit = if verdict {
+            type_cache::Hit::Absent
+        } else {
+            type_cache::Hit::At {
+                mro_idx: 0,
+                dict_idx: 0,
+            }
+        };
+        type_cache::fill(ty, ver, name, h, hit);
     }
 
     /// The plain-`str`-keys MRO walk behind [`Self::lookup`] and

@@ -28339,9 +28339,6 @@ impl Interpreter {
                 return Some(v);
             }
         }
-        if let Some(v) = inst_dict_attr(code, inst, cache_pc as usize, name_idx) {
-            return Some(v);
-        }
         let poly = code_attr_poly(code, cache_pc);
         let ver = inst.cls_raw().attr_version.get();
         // A never-specialized site resolves once and takes the indexed
@@ -28351,6 +28348,9 @@ impl Interpreter {
             if let Some(v) = poly.and_then(|p| p.hit(code, inst, ver, name_idx)) {
                 return Some(v);
             }
+        }
+        if let Some(v) = inst_dict_attr(code, inst, cache_pc as usize, name_idx) {
+            return Some(v);
         }
         match Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)? {
             (LeafAttr::Value(v), ix) => {
@@ -41106,7 +41106,7 @@ impl Interpreter {
         args: &[Object],
         _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let name = match attr_name_arg(args.get(1)) {
+        let name = match attr_name_cow(args.get(1)) {
             Some(n) => n,
             None => {
                 return Err(type_error(format!(
@@ -41147,7 +41147,7 @@ impl Interpreter {
         args: &[Object],
         _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let name = match attr_name_arg(args.get(1)) {
+        let name = match attr_name_cow(args.get(1)) {
             Some(n) => n,
             None => {
                 return Err(type_error(format!(
@@ -41164,22 +41164,23 @@ impl Interpreter {
         if attr_certainly_missing(&args[0], &name) {
             return Ok(Object::Bool(false));
         }
-        let immutable_type = match &args[0] {
-            Object::Type(t) if t.flags.is_builtin && !crate::stdlib::os::is_struct_seq_type(t) => {
-                Some(t)
-            }
+        // A builtin class's miss, remembered per class version (a
+        // struct-sequence class, whose attributes can be set, moves its
+        // version when they are).
+        let builtin_type = match &args[0] {
+            Object::Type(t) if t.flags.is_builtin => Some(t),
             _ => None,
         };
-        if let Some(t) = immutable_type {
-            if builtin_type_misses::contains(t, &name) {
+        if let Some(t) = builtin_type {
+            if t.verdict_cached(crate::types::Verdict::TypeAttrMissing, &name) == Some(true) {
                 return Ok(Object::Bool(false));
             }
         }
         match self.load_attr(&args[0], &name) {
             Ok(_) => Ok(Object::Bool(true)),
             Err(e) if self.is_attribute_error(&e) => {
-                if let Some(t) = immutable_type {
-                    builtin_type_misses::insert(t, &name);
+                if let Some(t) = builtin_type {
+                    t.verdict_record(crate::types::Verdict::TypeAttrMissing, &name, true);
                 }
                 Ok(Object::Bool(false))
             }
@@ -69197,57 +69198,6 @@ thread_local! {
     > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
 }
 
-/// Attribute names a built-in type was found to lack. Built-in types are
-/// immutable, so a miss is permanent, and `hasattr` can answer a repeat
-/// without raising (asyncio's `isfuture` asks
-/// `hasattr(type(coro), '_asyncio_future_blocking')` for every coroutine
-/// it's handed). Their attributes resolve dynamically, so a first miss
-/// must still go through the full lookup. Entries are keyed by address
-/// and hold the type weakly, which keeps the address from being reused.
-mod builtin_type_misses {
-    use std::cell::RefCell;
-
-    use crate::fasthash::{FxHashMap, FxHashSet};
-    use crate::sync::{Rc, Weak};
-    use crate::types::TypeObject;
-
-    /// Past this many names the record starts over (a bound, not a cache
-    /// policy: real programs probe a handful of names).
-    const CAP: usize = 512;
-
-    type Misses = FxHashMap<usize, (Weak<TypeObject>, FxHashSet<Box<str>>)>;
-
-    thread_local! {
-        static MISSES: RefCell<(usize, Misses)> = RefCell::new((0, FxHashMap::default()));
-    }
-
-    pub(super) fn contains(ty: &Rc<TypeObject>, name: &str) -> bool {
-        MISSES.with(|m| {
-            m.borrow()
-                .1
-                .get(&(Rc::as_ptr(ty) as usize))
-                .is_some_and(|(w, names)| w.strong_count() > 0 && names.contains(name))
-        })
-    }
-
-    pub(super) fn insert(ty: &Rc<TypeObject>, name: &str) {
-        MISSES.with(|m| {
-            let mut m = m.borrow_mut();
-            let (count, map) = &mut *m;
-            if *count >= CAP {
-                *count = 0;
-                map.clear();
-            }
-            let entry = map
-                .entry(Rc::as_ptr(ty) as usize)
-                .or_insert_with(|| (Rc::downgrade(ty), FxHashSet::default()));
-            if entry.1.insert(name.into()) {
-                *count += 1;
-            }
-        });
-    }
-}
-
 /// Whether `obj.name` certainly raises `AttributeError` without running
 /// any code: an ordinary instance under the default attribute protocol,
 /// with no class attribute of that name and none in its `__dict__`. A
@@ -69556,8 +69506,13 @@ pub(crate) fn attr_name_of(o: &Object) -> Option<String> {
     }
 }
 
-fn attr_name_arg(o: Option<&Object>) -> Option<String> {
-    o.and_then(attr_name_of)
+/// A `getattr`/`hasattr` name argument (see [`attr_name_of`]), borrowing a
+/// plain `str`.
+fn attr_name_cow(o: Option<&Object>) -> Option<std::borrow::Cow<'_, str>> {
+    match o? {
+        Object::Str(s) => Some(std::borrow::Cow::Borrowed(&**s)),
+        other => attr_name_of(other).map(std::borrow::Cow::Owned),
+    }
 }
 
 /// `True` when `o` is a `StopAsyncIteration` instance (or one of
@@ -75327,17 +75282,23 @@ const INST_DICT: u64 = 0x5ca1_a770_0000_0009;
 /// protocol, the instance dict, after which the site remembers the class.
 /// `None` for any other name or shape. Runs no code (the dict may be
 /// created).
-#[inline(never)]
+#[inline(always)]
 fn inst_dict_attr(
     code: &CodeObject,
     inst: &PyInstance,
     pc: usize,
     name_idx: u32,
 ) -> Option<Object> {
-    if code.names.get(name_idx as usize)?.as_str() != "__dict__"
-        || inst.native.get().is_some()
-        || inst.c_body.get() != 0
-    {
+    if code.names.get(name_idx as usize)?.as_str() != "__dict__" {
+        return None;
+    }
+    inst_dict_attr_named(code, inst, pc)
+}
+
+/// [`inst_dict_attr`] once the name is `__dict__`.
+#[inline(never)]
+fn inst_dict_attr_named(code: &CodeObject, inst: &PyInstance, pc: usize) -> Option<Object> {
+    if inst.native.get().is_some() || inst.c_body.get() != 0 {
         return None;
     }
     let cls = inst.cls_raw();
