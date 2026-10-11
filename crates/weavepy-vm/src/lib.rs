@@ -45073,7 +45073,7 @@ impl Interpreter {
             // single send would then finish the whole generator on the
             // slow path. Service the breaker here (as the quiet loop's
             // checkpoint does) and keep stepping.
-            while fast.is_none()
+            while matches!(fast, gen_fast::GenStep::Bail)
                 && self.gil_countdown <= 1
                 && crate::hot_gates::loop_gen() == snap_gen
                 && !frame.sent_consumed
@@ -45085,8 +45085,10 @@ impl Interpreter {
                 }
                 fast = self.gen_fast_run(frame, snap_gen, fold);
             }
-            if let Some(v) = fast {
+            if let gen_fast::GenStep::Yielded(v) = fast {
                 Ok(FrameOutcome::Yielded(v))
+            } else if let gen_fast::GenStep::Returned(v) = fast {
+                Ok(FrameOutcome::Returned(v))
             } else {
                 // The draining consumer's sink, folded at this frame's yields.
                 let prev_fold = std::mem::replace(
