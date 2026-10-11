@@ -10867,9 +10867,21 @@ impl Interpreter {
     #[inline(never)]
     fn leaf_burst(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> LeafStop {
         // Which copy of the core loop runs: the native one drives the
-        // running code's native form (see `frame_jit`).
+        // running code's native form (see `frame_jit`). A burst starts in
+        // the copy its activation's code wants (the other would only switch
+        // over).
         #[cfg(feature = "jit")]
-        let mut native = false;
+        let mut native = {
+            // SAFETY: see `CoreSwitch` (the running activation's handles;
+            // nothing else borrows them here).
+            let frame = unsafe { &*sw.cur };
+            code_vm_ext(&frame.code).is_some_and(|e| {
+                // SAFETY: as in `leaf_core` (a GIL-serialized read of the
+                // locals vector's length).
+                let nlocals = unsafe { (*frame.locals.as_ptr()).len() };
+                e.frame_jit.get(nlocals).is_some()
+            })
+        };
         loop {
             #[cfg(feature = "jit")]
             let exit = if native {
@@ -10884,7 +10896,7 @@ impl Interpreter {
                 CoreExit::Switch => native = !native,
                 CoreExit::Stop(stop) => return stop,
                 CoreExit::Slow => {
-                    if let Some(stop) = self.core_offload(sw, snap_gen, false) {
+                    if let Some(stop) = self.core_offload(sw, snap_gen) {
                         return stop;
                     }
                 }
@@ -10893,19 +10905,27 @@ impl Interpreter {
         }
     }
 
-    /// Run the instruction the core loop handed over at `sw`'s (synced)
-    /// running activation's pc: out of line (`helper`: the fused shapes,
-    /// cache hits and leaf calls of [`Self::leaf_core_helper`] and the
-    /// lanes) or with the full leaf arms. `None` when the core loop goes on
-    /// (on the activation `sw` now runs), else how the burst ends.
+    /// [`Self::core_offload_run`] of a [`CoreExit::Slow`] handoff.
     #[inline(never)]
-    fn core_offload(
+    fn core_offload(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> Option<LeafStop> {
+        self.core_offload_run(sw, snap_gen, OFFLOAD_SLOW)
+    }
+
+    /// Run the instruction the core loop handed over at `sw`'s (synced)
+    /// running activation's pc, as `mode` says: [`OFFLOAD_HELPER`] out of
+    /// line (the fused shapes, cache hits and leaf calls of
+    /// [`Self::leaf_core_helper`] and the lanes), [`OFFLOAD_SLOW`] on a
+    /// lane or with the full leaf arms, [`OFFLOAD_ARMS`] with the full leaf
+    /// arms. `None` when the core loop goes on (on the activation `sw` now
+    /// runs), else how the burst ends.
+    #[inline(always)]
+    fn core_offload_run(
         &mut self,
         sw: &mut CoreSwitch,
         snap_gen: u64,
-        helper: bool,
+        mode: u8,
     ) -> Option<LeafStop> {
-        if helper {
+        if mode == OFFLOAD_HELPER {
             // SAFETY: see `CoreSwitch` (the running activation's handles;
             // nothing else borrows them here).
             let frame = unsafe { &mut *sw.cur };
@@ -10973,7 +10993,7 @@ impl Interpreter {
                     }
                 }
             }
-        } else {
+        } else if mode == OFFLOAD_SLOW {
             // SAFETY: as above.
             let frame = unsafe { &*sw.cur };
             match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
@@ -10997,7 +11017,7 @@ impl Interpreter {
         }
     }
 
-    /// [`Self::core_offload`] from inside [`Self::leaf_core`]'s loop, which
+    /// [`Self::core_offload_run`] from inside [`Self::leaf_core`]'s loop, which
     /// holds the running activation at `at` with its operand stack at
     /// `base` (capacity `cap`): synced, then run. `true` when the loop goes
     /// on in place, at the new `at`: the same activation, its stack where
@@ -11010,11 +11030,10 @@ impl Interpreter {
     /// `at`, `base` and `cap` are the running activation's, as the core
     /// loop holds them (every stack slot below `at.len` initialized).
     #[inline(never)]
-    unsafe fn core_offload_in_loop(
+    unsafe fn core_offload_in_loop<const MODE: u8>(
         &mut self,
         sw: &mut CoreSwitch,
         snap_gen: u64,
-        helper: bool,
         base: *mut Object,
         cap: usize,
         at: &mut CoreAt,
@@ -11026,7 +11045,7 @@ impl Interpreter {
             (*cur).pc = at.pc as u32;
             *last = at.last;
         }
-        if let Some(stop) = self.core_offload(sw, snap_gen, helper) {
+        if let Some(stop) = self.core_offload_run(sw, snap_gen, MODE) {
             // (What the burst's own end would drop with it.)
             sw.pending = Some(CoreExit::Stop(stop));
             return false;
@@ -11485,6 +11504,18 @@ impl Interpreter {
             // during an activation, and nothing here runs Python code).
             let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
             let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+            // The code's native form (see `frame_jit`): the native copy of
+            // this loop runs it from every pc the arms below leave it at,
+            // and the arms only run the instructions it returns at. (Tested
+            // before the rest of the prologue, which the other copy derives
+            // again.)
+            #[cfg(feature = "jit")]
+            let native = ext.and_then(|e| e.frame_jit.get(nlocals));
+            #[cfg(feature = "jit")]
+            if NATIVE != native.is_some() {
+                // (The activation is synced at every reload.)
+                return CoreExit::Switch;
+            }
             // (The namespaces are read off the frame at their uses: holding
             // them here costs every switch a spill.)
             // The arms' colder per-activation state (the global and class
@@ -11525,16 +11556,16 @@ impl Interpreter {
                     }
                 };
             }
-            // Hand the instruction at `pc` over (out of line with `true`,
-            // to the full leaf arms with `false`) without leaving the loop:
-            // when the activation goes on in place, so does the loop, with
-            // no reload (see `core_offload_in_loop`).
+            // Hand the instruction at `pc` over (see `core_offload_run`'s
+            // modes) without leaving the loop: when the activation goes on
+            // in place, so does the loop, with no reload (see
+            // `core_offload_in_loop`).
             macro_rules! offload {
-                ($helper:expr) => {{
+                ($mode:expr) => {{
                     let mut at = CoreAt { len, pc, last };
                     // SAFETY: the running activation's state, as held here.
                     if unsafe {
-                        self.core_offload_in_loop(sw, snap_gen, $helper, base, cap, &mut at)
+                        self.core_offload_in_loop::<{ $mode }>(sw, snap_gen, base, cap, &mut at)
                     } {
                         len = at.len;
                         pc = at.pc;
@@ -11547,16 +11578,6 @@ impl Interpreter {
                         break Some(CoreExit::Reload);
                     }
                 }};
-            }
-            // The code's native form (see `frame_jit`): the native copy of
-            // this loop runs it from every pc the arms below leave it at,
-            // and the arms only run the instructions it returns at.
-            #[cfg(feature = "jit")]
-            let native = ext.and_then(|e| e.frame_jit.get(nlocals));
-            #[cfg(feature = "jit")]
-            if NATIVE != native.is_some() {
-                // (The activation is synced at every reload.)
-                return CoreExit::Switch;
             }
             // The native code writes the stack at fixed offsets: a stack
             // that started small (a materialized frame's) grows first.
@@ -12140,6 +12161,35 @@ impl Interpreter {
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
                         unsafe { drop(std::mem::replace(&mut *top, bool_hot(b))) };
+                        last = pc;
+                        pc += 1;
+                    }
+                    // `not x`, `-x` and `~x` of a scalar, replaced in place
+                    // (nothing to release); any other shape is the full
+                    // leaf arm's.
+                    OpCode::UnaryOp => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        // SAFETY: as in the full handler (the compiler only
+                        // emits valid kinds).
+                        let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                        // SAFETY: as above.
+                        let r = match (unsafe { &*top }, kind) {
+                            (Object::Bool(b), UnaryKind::Not) => bool_hot(!*b),
+                            (Object::Int(i), UnaryKind::Not) => bool_hot(*i == 0),
+                            (Object::None, UnaryKind::Not) => bool_hot(true),
+                            (Object::Int(i), UnaryKind::Neg) => match i.checked_neg() {
+                                Some(r) => int_hot(r),
+                                None => break None,
+                            },
+                            (Object::Int(i), UnaryKind::Invert) => int_hot(!*i),
+                            _ => break None,
+                        };
+                        // SAFETY: a scalar operand is overwritten in place.
+                        unsafe { top.write(r) };
                         last = pc;
                         pc += 1;
                     }
@@ -13947,15 +13997,15 @@ impl Interpreter {
                                 // SAFETY: `len >= argc + 2`: the self slot.
                                 let recv = unsafe { &*base.add(len - argc - 1) };
                                 let Object::List(l) = recv else {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 if !Self::core_droppable(recv) {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 }
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 let result = match (kind, argc) {
                                     (Some(LeafKind::ListAppend), 1) => {
@@ -13968,9 +14018,9 @@ impl Interpreter {
                                         Some(v) => v,
                                         // `pop from empty list` raises: the
                                         // helper's path.
-                                        None => offload!(true),
+                                        None => offload!(OFFLOAD_HELPER),
                                     },
-                                    _ => offload!(true),
+                                    _ => offload!(OFFLOAD_HELPER),
                                 };
                                 // SAFETY: the list (droppable) and the builtin
                                 // (count above one) leave by plain decrements;
@@ -13999,12 +14049,12 @@ impl Interpreter {
                                         == Some(LeafKind::ListAppend)) =>
                             {
                                 let Object::List(l) = &bm.receiver else {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: the operand moves into the list; the
                                 // empty self slot and the bound method (held
@@ -14048,7 +14098,7 @@ impl Interpreter {
                                     std::slice::from_raw_parts(base.add(first), len - first)
                                 };
                                 if !Self::core_all_droppable(ops) {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 }
                                 let r = match kind {
                                     Some(LeafKind::Fast(f)) => f(ops),
@@ -14063,7 +14113,7 @@ impl Interpreter {
                                 };
                                 match r {
                                     // A fast half declined, untouched.
-                                    None => offload!(true),
+                                    None => offload!(OFFLOAD_HELPER),
                                     Some(Ok(v)) => {
                                         // SAFETY: every operand (checked) and
                                         // the builtin (count above one) leave
@@ -14107,7 +14157,7 @@ impl Interpreter {
                                     if matches!(&bm.function, Object::Builtin(b)
                                         if slot.get_leaf(b).is_some())
                                     {
-                                        offload!(true);
+                                        offload!(OFFLOAD_HELPER);
                                     }
                                 }
                                 break None;
@@ -14115,11 +14165,11 @@ impl Interpreter {
                             // A leaf builtin or directly constructible type, or
                             // a bound builtin method held in a local (`append =
                             // y.append`): out of line.
-                            Object::Builtin(_) | Object::Type(_) => offload!(true),
+                            Object::Builtin(_) | Object::Type(_) => offload!(OFFLOAD_HELPER),
                             Object::BoundMethod(bm)
                                 if matches!(&bm.function, Object::Builtin(_)) =>
                             {
-                                offload!(true)
+                                offload!(OFFLOAD_HELPER)
                             }
                             _ => break None,
                         }
@@ -14129,7 +14179,7 @@ impl Interpreter {
                     OpCode::LoadGlobal => {
                         use weavepy_compiler::InlineCache as IC;
                         let Some(slot) = stamps!(cold_stamps, frame, ext).get(pc) else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if len == cap {
                             break None;
@@ -14215,10 +14265,10 @@ impl Interpreter {
                                 }
                                 hit
                             }
-                            _ => offload!(true),
+                            _ => offload!(OFFLOAD_HELPER),
                         };
                         let Some((_, v)) = hit else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let v = match v {
                             s @ (Object::Int(_)
@@ -14330,14 +14380,14 @@ impl Interpreter {
                             break None;
                         }
                         let Some(cell) = frame.cells.get(ins.arg as usize) else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         // SAFETY: a read between two instructions.
                         let Some(v) = (unsafe { cell.peek() }) else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if matches!(v, Object::Unbound) {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         let c = Self::clone_operand(v);
                         // SAFETY: `len < cap`.
@@ -14356,7 +14406,7 @@ impl Interpreter {
                         // loop's initialized stack.
                         match unsafe { Self::core_super_attr(code, ins, pc, base, len) } {
                             Some(n) => len = n,
-                            None => offload!(true),
+                            None => offload!(OFFLOAD_HELPER),
                         }
                         last = pc;
                         pc += 1;
@@ -14368,12 +14418,12 @@ impl Interpreter {
                     // the site.
                     OpCode::LoadSpecial => {
                         if len == 0 || len == cap {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
                         let Object::Instance(inst) = (unsafe { &*top }) else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let ver = inst.cls_raw().attr_version.get();
                         let ms = mslots!(cold_mslots, ext).get(pc);
@@ -14382,7 +14432,7 @@ impl Interpreter {
                                 .map(Object::Function)
                                 .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
                         }) else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         // SAFETY: `len < cap`; the instance moves up into
                         // the self slot.
@@ -14401,7 +14451,7 @@ impl Interpreter {
                     // a class receiver leaves an empty self slot.
                     OpCode::LoadMethodAttr => {
                         if len == 0 || len == cap {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14421,7 +14471,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // `module.func(...)`: the attribute off the site's
                         // cached index (no method binds), with an empty self
@@ -14429,7 +14479,7 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Module(m) = unsafe { &*top } {
                             let Some(v) = Self::core_module_attr(code, m, pc, ins.arg) else {
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             };
                             // SAFETY: `len < cap`: `top` and the slot above.
                             unsafe {
@@ -14449,7 +14499,7 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Instance(inst) = unsafe { &*top } {
                             if !Self::default_getattribute(inst.cls_raw()) {
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
                             if inst_may_shadow(inst, code, ins.arg) {
                                 // SAFETY: `len < cap`: `top` and the slot
@@ -14460,7 +14510,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
@@ -14475,7 +14525,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let f = match unsafe { &*top } {
                             Object::Instance(inst) => {
@@ -14521,7 +14571,7 @@ impl Interpreter {
                                                 pc += 1;
                                                 continue;
                                             }
-                                            None => offload!(true),
+                                            None => offload!(OFFLOAD_HELPER),
                                         },
                                     },
                                 };
@@ -14541,7 +14591,7 @@ impl Interpreter {
                             Object::Type(cls) if Rc::strong_count(cls) > 1 => {
                                 match ms.get_held_unbound(cls.attr_version.get()) {
                                     Some(f) => f,
-                                    None => offload!(true),
+                                    None => offload!(OFFLOAD_HELPER),
                                 }
                             }
                             // A builtin receiver's site-cached method (the
@@ -14551,7 +14601,7 @@ impl Interpreter {
                                 let Some(b) =
                                     builtin_recv_tag(recv).and_then(|tag| ms.get_builtin(tag))
                                 else {
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: `len < cap`; the receiver moves up.
                                 unsafe {
@@ -14582,7 +14632,7 @@ impl Interpreter {
                     OpCode::LoadAttr => {
                         use weavepy_compiler::InlineCache as IC;
                         if len == 0 {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14613,7 +14663,7 @@ impl Interpreter {
                                             pc += 1;
                                             continue;
                                         }
-                                        offload!(true);
+                                        offload!(OFFLOAD_HELPER);
                                     }
                                 }
                             }
@@ -14628,7 +14678,7 @@ impl Interpreter {
                                         pc += 1;
                                         continue;
                                     }
-                                    _ => offload!(true),
+                                    _ => offload!(OFFLOAD_HELPER),
                                 }
                             }
                             // A function's stored attribute (`wrapper.calls`).
@@ -14640,7 +14690,7 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
                             // A builtin container's method read as a value
                             // (`append = y.append`), a frame's or code
@@ -14654,7 +14704,7 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
                         };
                         // A natively served instance's public field (see
@@ -14669,7 +14719,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                _ => offload!(true),
+                                _ => offload!(OFFLOAD_HELPER),
                             }
                         }
                         // SAFETY: a read between two instructions (see
@@ -14697,7 +14747,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
                         };
                         let cls = inst.cls_raw();
@@ -14705,16 +14755,16 @@ impl Interpreter {
                             || cls.native_kind.get() != 0
                             || !Self::core_droppable(unsafe { &*top })
                         {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: a read between two instructions (see
                         // `GilCell::peek`).
                         let Some((k, v)) = (unsafe { inst.attr_peek_index(key_idx as usize) })
                         else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if !slot_name_matches(code, ins.arg, k) {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         if let Some(e) = ext {
                             field_slot_note(e, code, pc, inst, key_idx);
@@ -14729,7 +14779,7 @@ impl Interpreter {
                     // droppable one (the helper's `leaf_store_attr` first case).
                     OpCode::StoreAttr => {
                         if len < 2 {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len >= 2`.
                         let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
@@ -14748,14 +14798,14 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                offload!(true);
+                                offload!(OFFLOAD_HELPER);
                             }
-                            _ => offload!(true),
+                            _ => offload!(OFFLOAD_HELPER),
                         };
                         if !Self::core_droppable(recv)
                             || !Self::core_store_attr(code, inst, pc, ins.arg, val)
                         {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: the value moved into the dict (its slot is a
                         // stand-in now) and the receiver leaves the stack by a
@@ -14799,7 +14849,7 @@ impl Interpreter {
                                 _ => false,
                             };
                         if !ok {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         last = pc;
                         pc += 1;
@@ -14843,7 +14893,7 @@ impl Interpreter {
                                             continue;
                                         }
                                     }
-                                    offload!(true);
+                                    offload!(OFFLOAD_HELPER);
                                 }
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
@@ -15027,7 +15077,7 @@ impl Interpreter {
                     // arm), when the iterable leaves by a plain decrement.
                     OpCode::GetIter => {
                         if len == 0 {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -15053,10 +15103,10 @@ impl Interpreter {
                                 | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         }
                         let Ok(it) = v.make_iter() else {
-                            offload!(true);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let it = Object::Iter(Rc::new(RefCell::new(it)));
                         // SAFETY: the iterable (droppable) is replaced in place.
@@ -15072,7 +15122,7 @@ impl Interpreter {
                     op if !SLOW_LEAF_OPS[op as u8 as usize] => {
                         break Some(CoreExit::Stop(LeafStop::Step))
                     }
-                    _ => offload!(false),
+                    _ => offload!(OFFLOAD_ARMS),
                 }
             };
             if matches!(stop, Some(CoreExit::Reload)) {
@@ -67631,6 +67681,13 @@ enum CoreExit {
     Switch,
 }
 
+/// [`Interpreter::core_offload_run`]'s modes: an out-of-line instruction
+/// (the helper, then its lanes), a handoff that may take a lane before the
+/// full leaf arms, and one only the full leaf arms run.
+const OFFLOAD_HELPER: u8 = 0;
+const OFFLOAD_SLOW: u8 = 1;
+const OFFLOAD_ARMS: u8 = 2;
+
 /// The core loop's view of its running activation as it hands an
 /// instruction over in place (see [`Interpreter::core_offload_in_loop`]).
 struct CoreAt {
@@ -67774,6 +67831,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::LoadDeref,
         OpCode::BuildList,
         OpCode::ContainsOp,
+        OpCode::UnaryOp,
     ];
     let mut i = 0;
     while i < ops.len() {
