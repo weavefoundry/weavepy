@@ -184,7 +184,13 @@ impl Interpreter {
         }
         // (A callback's `StopIteration` ends the drain, as it ends a step:
         // see `Interpreter::lazy_iter_next`.)
-        let stop = |e: RuntimeError| if is_stop_iteration(&e) { Ok(true) } else { Err(e) };
+        let stop = |e: RuntimeError| {
+            if is_stop_iteration(&e) {
+                Ok(true)
+            } else {
+                Err(e)
+            }
+        };
         if filter {
             loop {
                 match self.filter_next(&func, &source, globals) {
@@ -1849,11 +1855,14 @@ fn native_key_eq(a: &Object, b: &Object) -> Option<bool> {
     }
     Some(match (a, b) {
         (Object::Int(x), Object::Int(y)) => x == y,
-        (Object::Str(x), Object::Str(y)) => crate::dictmap::key_bytes_eq(x.as_bytes(), y.as_bytes()),
+        (Object::Str(x), Object::Str(y)) => {
+            crate::dictmap::key_bytes_eq(x.as_bytes(), y.as_bytes())
+        }
         (Object::Float(x), Object::Float(y)) => x == y,
         (Object::Bool(x), Object::Bool(y)) => x == y,
         (Object::Type(x), Object::Type(y))
-            if crate::object::type_hash_is_identity(x) && crate::object::type_hash_is_identity(y) =>
+            if crate::object::type_hash_is_identity(x)
+                && crate::object::type_hash_is_identity(y) =>
         {
             Rc::ptr_eq(x, y)
         }
@@ -1995,9 +2004,7 @@ impl Interpreter {
                     Object::None => scalar_truth(&v)?,
                     Object::Type(t) if Rc::ptr_eq(t, &builtin_types().bool_) => scalar_truth(&v)?,
                     // (The truth test may yet decline: no effects.)
-                    f => {
-                        scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v), false)?)?
-                    }
+                    f => scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v), false)?)?,
                 };
                 cursor_advance(c)?;
                 if keep {
@@ -2055,7 +2062,10 @@ impl Interpreter {
                 });
                 *currgrouper = Some(Rc::downgrade(&grouper));
                 drop(old);
-                Some(Some(Object::new_tuple_array([key, Object::LazyIter(grouper)])))
+                Some(Some(Object::new_tuple_array([
+                    key,
+                    Object::LazyIter(grouper),
+                ])))
             }
             LazyIterKind::Grouper { parent, tgtkey } => {
                 // `_grouper_next`.

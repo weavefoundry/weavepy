@@ -220,10 +220,7 @@ impl<V> Table<V> {
     /// the entries are laid down, then indexed once (no probe compares a
     /// key).
     #[inline]
-    pub fn from_unique_hashed(
-        n: usize,
-        mut entry: impl FnMut(usize) -> (i64, DictKey, V),
-    ) -> Self {
+    pub fn from_unique_hashed(n: usize, mut entry: impl FnMut(usize) -> (i64, DictKey, V)) -> Self {
         let mut entries: Vec<Bucket<V>> = Vec::with_capacity(n);
         let dst = entries.as_mut_ptr();
         for i in 0..n {
@@ -820,8 +817,15 @@ impl<V> Table<V> {
     }
 
     /// Remove the entries in `range`, yielding them.
-    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> std::vec::IntoIter<(DictKey, V)> {
-        let out: Vec<(DictKey, V)> = self.entries.drain(range).map(|b| (b.key, b.value)).collect();
+    pub fn drain<R: std::ops::RangeBounds<usize>>(
+        &mut self,
+        range: R,
+    ) -> std::vec::IntoIter<(DictKey, V)> {
+        let out: Vec<(DictKey, V)> = self
+            .entries
+            .drain(range)
+            .map(|b| (b.key, b.value))
+            .collect();
         self.reindex();
         out.into_iter()
     }
@@ -884,7 +888,10 @@ impl<V> Table<V> {
     }
 
     /// Sort the entries with `cmp` (stable).
-    pub fn sort_by(&mut self, mut cmp: impl FnMut(&DictKey, &V, &DictKey, &V) -> std::cmp::Ordering) {
+    pub fn sort_by(
+        &mut self,
+        mut cmp: impl FnMut(&DictKey, &V, &DictKey, &V) -> std::cmp::Ordering,
+    ) {
         self.entries
             .sort_by(|a, b| cmp(&a.key, &a.value, &b.key, &b.value));
         self.reindex();
@@ -1132,12 +1139,33 @@ macro_rules! entry_iter {
     };
 }
 
-entry_iter!(Iter, std::slice::Iter<'a, Bucket<V>>, (&'a DictKey, &'a V), |b| (&b.key, &b.value));
-entry_iter!(IterMut, std::slice::IterMut<'a, Bucket<V>>, (&'a DictKey, &'a mut V), |b| (&b.key, &mut b.value));
-entry_iter!(IterMut2, std::slice::IterMut<'a, Bucket<V>>, (&'a mut DictKey, &'a mut V), |b| (&mut b.key, &mut b.value));
-entry_iter!(Keys, std::slice::Iter<'a, Bucket<V>>, &'a DictKey, |b| &b.key);
+entry_iter!(
+    Iter,
+    std::slice::Iter<'a, Bucket<V>>,
+    (&'a DictKey, &'a V),
+    |b| (&b.key, &b.value)
+);
+entry_iter!(
+    IterMut,
+    std::slice::IterMut<'a, Bucket<V>>,
+    (&'a DictKey, &'a mut V),
+    |b| (&b.key, &mut b.value)
+);
+entry_iter!(
+    IterMut2,
+    std::slice::IterMut<'a, Bucket<V>>,
+    (&'a mut DictKey, &'a mut V),
+    |b| (&mut b.key, &mut b.value)
+);
+entry_iter!(Keys, std::slice::Iter<'a, Bucket<V>>, &'a DictKey, |b| &b
+    .key);
 entry_iter!(Values, std::slice::Iter<'a, Bucket<V>>, &'a V, |b| &b.value);
-entry_iter!(ValuesMut, std::slice::IterMut<'a, Bucket<V>>, &'a mut V, |b| &mut b.value);
+entry_iter!(
+    ValuesMut,
+    std::slice::IterMut<'a, Bucket<V>>,
+    &'a mut V,
+    |b| &mut b.value
+);
 
 impl<V> Clone for Iter<'_, V> {
     fn clone(&self) -> Self {
@@ -1376,7 +1404,11 @@ impl SetMap {
     /// Add a probe's key if absent: the key is built (by `make`) only
     /// then. `true` when it was added.
     #[inline]
-    pub fn insert_probe<Q: Probe + ?Sized>(&mut self, key: &Q, make: impl FnOnce() -> DictKey) -> bool {
+    pub fn insert_probe<Q: Probe + ?Sized>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce() -> DictKey,
+    ) -> bool {
         match self.0.probe_entry(key) {
             ProbeEntry::Occupied(_) => false,
             ProbeEntry::Vacant(v) => {
@@ -1512,7 +1544,10 @@ impl SetMap {
     }
 
     /// Remove the keys in `range`, yielding them.
-    pub fn drain<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> impl Iterator<Item = DictKey> {
+    pub fn drain<R: std::ops::RangeBounds<usize>>(
+        &mut self,
+        range: R,
+    ) -> impl Iterator<Item = DictKey> {
         self.0.drain(range).map(|(k, ())| k)
     }
 
