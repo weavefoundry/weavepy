@@ -13672,6 +13672,16 @@ impl Interpreter {
                             *last_pc = last;
                             let ran = match kind {
                                 1 => self.core_builtin_kw_lane(sw, pc),
+                                // A metaclass's own `__call__` takes the
+                                // call as its method (see `core_new`).
+                                // SAFETY: the running activation, synced.
+                                2 if Self::unpack_meta_call(
+                                    unsafe { &mut *sw.cur },
+                                    argc + kwc + 1,
+                                ) =>
+                                {
+                                    self.core_call_kw(sw, pc) || self.core_call_lane(sw)
+                                }
                                 2 => {
                                     let new = self.core_new_kw(sw, pc, snap_gen);
                                     if new {
@@ -17413,7 +17423,48 @@ impl Interpreter {
         else {
             return false;
         };
+        // A class whose metaclass replaces `__call__` with a plain Python
+        // function (`EnumType`): the call is that function's, with the
+        // class as its receiver.
+        // SAFETY: see `CoreSwitch`.
+        if Self::unpack_meta_call(unsafe { &mut *sw.cur }, argc) {
+            return self.core_call(sw, pc);
+        }
         self.core_new_n(sw, pc, argc, snap_gen)
+    }
+
+    /// Turn the operands of a call of a class (`argc` positionals, no
+    /// receiver) whose metaclass's `__call__` resolves to a plain Python
+    /// function into that function's call with the class as its receiver,
+    /// as `type(cls).__call__(cls, ...)` binds it (the generic call's
+    /// `bind_method`). `false` touches nothing.
+    fn unpack_meta_call(frame: &mut Frame, argc: usize) -> bool {
+        let n = frame.stack.len();
+        let Some(self_slot) = n.checked_sub(argc + 1) else {
+            return false;
+        };
+        let Some(callee_slot) = self_slot.checked_sub(1) else {
+            return false;
+        };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        if !matches!(frame.stack[self_slot], Object::Unbound) || Self::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        let Some(meta) = ty.metaclass.borrow().clone() else {
+            return false;
+        };
+        if meta.flags.is_builtin || meta.c_ext_ptr.get() != 0 {
+            return false;
+        }
+        let Some(call @ Object::Function(_)) = meta.lookup("__call__") else {
+            return false;
+        };
+        let cls = std::mem::replace(&mut frame.stack[callee_slot], call);
+        frame.stack[self_slot] = cls;
+        true
     }
 
     /// `cls(*args)` (the `CALL_FUNCTION_EX` at `pc` of `sw`'s synced
