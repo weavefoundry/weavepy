@@ -13179,11 +13179,18 @@ fn list_insert(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 3 {
         return Err(type_error("list.insert() expected 2 arguments"));
     }
+    let l = list_self(args)?;
+    // CPython converts the index with `PyNumber_AsSsize_t`: `__index__`,
+    // an `OverflowError` past `Py_ssize_t`.
     let i = match &args[1] {
         Object::Int(i) => *i,
-        _ => return Err(type_error("insert index must be int")),
+        Object::Long(_) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ))
+        }
+        other => coerce_index_i64(other)?,
     };
-    let l = list_self(args)?;
     let mut l = l.borrow_mut();
     let len = l.len() as i64;
     let idx = if i < 0 {

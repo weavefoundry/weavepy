@@ -1778,7 +1778,11 @@ fn kernel_for(tag: u64, kind: crate::LeafKind, nargs: usize) -> Option<Kernel> {
         (1, K::ListAppend, 1) => k_list_append,
         (1, K::ListPop, 0) => k_list_pop,
         (1, K::ListExtend, 1) => k_list_extend,
+        (1, K::ListInsert, 2) => k_list_insert,
+        (1, K::ListReverse | K::ListCopy, 0) => k_body,
         (2, K::DictGet, 1 | 2) => k_dict_get,
+        (2, K::DictKeys | K::DictValues | K::DictItems, 0) => k_body,
+        (3, K::SetPop, 0) => k_body,
         (3, K::SetAdd, 1) => k_set_add,
         (3, K::SetDiscard, 1) => k_set_discard,
         (3, K::SetRemove, 1) => k_set_remove,
@@ -1788,12 +1792,13 @@ fn kernel_for(tag: u64, kind: crate::LeafKind, nargs: usize) -> Option<Kernel> {
         (4, K::StrIsalpha, 0) => k_str_isalpha,
         (4, K::StrIsspace, 0) => k_str_isspace,
         (4, K::StrFind, 1 | 2) => k_str_find,
-        (4, K::StrLower | K::StrUpper, 0) => k_str_body,
+        (4, K::StrLower | K::StrUpper, 0) => k_body,
         (4, K::StrStrip | K::StrLstrip | K::StrRstrip, 0 | 1) => k_str_strip,
         (4, K::StrSplit, 0 | 1) => k_str_split,
         (4, K::StrJoin, 1) => k_str_join,
         (4, K::StrReplace, 2) => k_str_replace,
-        (4, K::Opaque, _) => k_str_body,
+        (4, K::StrFormat, 0..=2) => k_str_format,
+        (4, K::Opaque, _) => k_body,
         _ => return None,
     })
 }
@@ -2222,9 +2227,11 @@ unsafe extern "C" fn k_str_find(
     }
 }
 
-/// A `str` method whose body runs no Python code for any arguments
-/// (`lower`, `upper`, the registered pure bodies).
-unsafe extern "C" fn k_str_body(
+/// A method whose body runs no Python code for any arguments on its
+/// receiver variant (`str.lower`, the registered pure `str` bodies,
+/// `list.reverse`, `dict.items`, `set.pop`, which hands its element's
+/// reference over).
+unsafe extern "C" fn k_body(
     out: *mut Object,
     recv: *const Object,
     a: *const Object,
@@ -2233,6 +2240,48 @@ unsafe extern "C" fn k_str_body(
 ) -> u32 {
     // SAFETY: as `Kernel`'s.
     unsafe { run_body(out, recv, a, b, f) }
+}
+
+/// `lst.insert(i, x)` with an `int` index, whose conversion runs no code.
+unsafe extern "C" fn k_list_insert(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        if !matches!(&*a, Object::Int(_) | Object::Bool(_)) {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
+    }
+}
+
+/// `"...{}...".format(x, ...)` of arguments that render without Python
+/// dispatch (as `leaf_builtin_call` admits them).
+unsafe extern "C" fn k_str_format(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    f: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s.
+    unsafe {
+        let plain = |v: *const Object| {
+            v.is_null()
+                || matches!(
+                    &*v,
+                    Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::None
+                )
+        };
+        if !(plain(a) && plain(b)) {
+            return 1;
+        }
+        run_body(out, recv, a, b, f)
+    }
 }
 
 unsafe extern "C" fn k_str_strip(

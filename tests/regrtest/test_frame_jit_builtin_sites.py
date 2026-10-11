@@ -182,6 +182,88 @@ def profiled(n, events):
     return t
 
 
+def copies(xs):
+    out = []
+    for x in xs:
+        out.append(x.copy())
+    return out
+
+
+class ItemsDict(dict):
+    def items(self):
+        return [("overridden", 1)]
+
+
+def all_items(ds):
+    out = []
+    for d in ds:
+        for k, v in d.items():
+            out.append((k, v))
+        out.append(len(d.keys()) + len(d.values()))
+    return out
+
+
+class Index:
+    def __init__(self, i):
+        self.i = i
+
+    def __index__(self):
+        return self.i
+
+
+def inserts(n):
+    lst = []
+    bad = 0
+    for i in range(n):
+        lst.insert(0, i)
+        lst.insert(True, -i)
+        lst.insert(Index(-1), i * 2)
+        lst.reverse()
+        try:
+            lst.insert("0", i)
+        except TypeError:
+            bad += 1
+    return lst, bad
+
+
+class Fmt:
+    def __format__(self, spec):
+        return "fmt"
+
+
+def formats(n):
+    out = []
+    for i in range(n):
+        tmpl = "{}-{}"
+        out.append(tmpl.format(i, "x"))
+        out.append(tmpl.format(Fmt(), 1.5))
+    return out
+
+
+def set_pops(n):
+    taken = 0
+    s = set()
+    for i in range(n):
+        s.add(i)
+        taken += s.pop() == i
+        try:
+            s.pop()
+        except KeyError as e:
+            taken += e.__traceback__.tb_lineno == SET_POP_LINE
+    return taken
+
+
+SET_POP_LINE = set_pops.__code__.co_firstlineno + 7
+
+
+def bound_appends(n):
+    y = []
+    append = y.append
+    for i in range(n):
+        append(i)
+    return y
+
+
 class BuiltinSiteTest(unittest.TestCase):
     def test_leaf_and_rebinding(self):
         self.assertEqual(lengths([1, 2], N), 2 * N)
@@ -259,6 +341,47 @@ class BuiltinSiteTest(unittest.TestCase):
         calls = [name for ev, name in events if ev == "c_call"]
         self.assertEqual(calls.count("len"), N - N // 2)
         self.assertEqual(calls.count("count"), N - N // 2)
+
+    def test_method_load_variants(self):
+        lists = [[i] for i in range(N)]
+        self.assertEqual(copies(lists), lists)
+        mixed = [[1], {"a": 1}, {2}, "s"] * 50
+        try:
+            copies(mixed)
+        except AttributeError as e:
+            self.assertIn("'str' object has no attribute 'copy'", str(e))
+        else:
+            self.fail("no AttributeError")
+        out = copies([[1], {"a": 1}, {2}] * 50)
+        self.assertEqual(out[:3], [[1], {"a": 1}, {2}])
+        self.assertEqual([type(x) for x in out[:3]], [list, dict, set])
+
+    def test_dict_views(self):
+        ds = [{"a": 1, "b": 2}] * N + [ItemsDict(z=3)]
+        out = all_items(ds)
+        self.assertEqual(out[:3], [("a", 1), ("b", 2), 4])
+        self.assertEqual(out[-2:], [("overridden", 1), 2])
+
+    def test_list_insert_reverse(self):
+        got, bad = inserts(300)
+        want = []
+        for i in range(300):
+            want.insert(0, i)
+            want.insert(1, -i)
+            want.insert(-1, i * 2)
+            want.reverse()
+        self.assertEqual(got, want)
+        self.assertEqual(bad, 300)
+
+    def test_str_format(self):
+        out = formats(N)
+        self.assertEqual(out[:4], ["0-x", "fmt-1.5", "1-x", "fmt-1.5"])
+
+    def test_set_pop(self):
+        self.assertEqual(set_pops(N), 2 * N)
+
+    def test_bound_method_kernel(self):
+        self.assertEqual(bound_appends(N), list(range(N)))
 
     def test_forced_frame_jit(self):
         if FORCED in sys.argv:
