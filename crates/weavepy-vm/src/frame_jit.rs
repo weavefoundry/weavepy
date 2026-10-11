@@ -5445,12 +5445,23 @@ unsafe extern "C" fn h_call_kernel(
         let lenu = len as usize;
         let start = lenu - site.argc - 2;
         let base = s.stack;
-        let recv = base.add(start + 1);
-        if let (Object::Builtin(b), Some(kernel), false) = (&*base.add(start), site.kernel, s.sw.is_null()) {
-            if std::ptr::eq(Rc::as_ptr(b), site.f) && (*recv).tag() == site.recv_tag {
+        // The receiver: the self slot's, or a bound method's (`append =
+        // y.append`) with the slot empty.
+        let recv: *const Object = match (&*base.add(start), &*base.add(start + 1)) {
+            (Object::Builtin(b), _) if std::ptr::eq(Rc::as_ptr(b), site.f) => base.add(start + 1),
+            (Object::BoundMethod(bm), Object::Unbound)
+                if !bm.redispatch_descriptor
+                    && matches!(&bm.function, Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f)) =>
+            {
+                &raw const bm.receiver
+            }
+            _ => std::ptr::null(),
+        };
+        if let (false, Some(kernel), false) = (recv.is_null(), site.kernel, s.sw.is_null()) {
+            if (*recv).tag() == site.recv_tag {
                 let arg = |k: usize| {
                     if k <= site.argc {
-                        recv.add(k).cast_const()
+                        base.add(start + 1 + k).cast_const()
                     } else {
                         std::ptr::null()
                     }
@@ -5550,7 +5561,8 @@ unsafe extern "C" fn h_call_leaf(
 /// [`h_call`] at a site settled on a builtin whose body the core loop's
 /// lane runs (see `Interpreter::core_native_body`), named by `site`: the
 /// callee checked to be that builtin by its address (a method with its
-/// receiver in the self slot, or a function with the slot empty), the
+/// receiver in the self slot, a function with the slot empty, or a bound
+/// method of it with the slot empty), the
 /// frame synced, and the body run on the operands in place. `0` the result
 /// in the callee's slot (the same activation running, nothing pending),
 /// `RAISED` the body raised (likewise), `RELOAD` the core loop goes on
@@ -5579,6 +5591,16 @@ unsafe extern "C" fn h_call_native(
             (Object::Builtin(b), recv) => {
                 std::ptr::eq(Rc::as_ptr(b), site.f) && crate::lane_recv_ok(b, recv, site.via_call)
             }
+            // A bound method held in a local (`reductor = x.__reduce_ex__`).
+            // (A class's bound method may have a natively served half:
+            // `h_call`'s.)
+            (Object::BoundMethod(bm), Object::Unbound)
+                if !bm.redispatch_descriptor && !matches!(&bm.receiver, Object::Type(_)) =>
+            {
+                matches!(&bm.function, Object::Builtin(b)
+                    if std::ptr::eq(Rc::as_ptr(b), site.f)
+                        && crate::lane_recv_ok(b, &bm.receiver, site.via_call))
+            }
             _ => false,
         };
         if !hit || s.sw.is_null() {
@@ -5595,26 +5617,25 @@ unsafe extern "C" fn h_call_native(
             && std::ptr::eq(sw.cur, s.frame)
             && crate::hot_gates::loop_gen() == s.snap_gen;
         match r {
-            Ok(v) => {
-                base.add(start).write(v);
-                frame.stack.set_len(start + 1);
-                if in_place {
-                    s.len = start + 1;
-                    return 0;
-                }
+            // The result in the callee's slot.
+            None if in_place => {
+                s.len = start + 1;
+                0
+            }
+            None => {
                 *sw.last = pcu;
                 if sw.pending.is_none() && (*sw.maybe_dead).get() {
                     sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
                 }
                 RELOAD
             }
-            Err(e) if in_place => {
+            Some(e) if in_place => {
                 s.len = start;
                 s.pc = pcu + 1;
                 s.err = Some(e);
                 RAISED
             }
-            Err(e) => {
+            Some(e) => {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
                 RELOAD
             }
@@ -10468,6 +10489,39 @@ impl<'a> Lower<'a> {
         let cache: Box<MethodCache> = Box::default();
         let cache_at = std::ptr::from_ref::<MethodCache>(&cache) as i64;
         self.method_caches.push(cache);
+        // A site that loaded an exact `list`, `dict`, `set` or `str`
+        // receiver's method: for a receiver of that variant, the method
+        // (the code holds it) with a count taken, the receiver above it.
+        if let Some((want, f)) = self.builtin_method_load(pc) {
+            let recv = self.slot_addr(self.depth - 1);
+            let above = self.slot_addr(self.depth);
+            let tag = self.tag_at(recv);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.branch_out(other, helper);
+            let rflag = self.b.ins().iconst(
+                self.ptr,
+                std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+            );
+            let rshared = self.b.ins().uload8(types::I64, FLAGS, rflag, 0);
+            self.branch_out(rshared, helper);
+            let obj = Object::Builtin(f.clone());
+            let btag = obj.tag();
+            // SAFETY: an `Object` is 16 bytes; its second word is the
+            // payload, where a counted builtin's count is.
+            let word = unsafe { std::ptr::from_ref(&obj).cast::<[u64; 2]>().read() }[1];
+            drop(obj);
+            self.held.push(f);
+            let w = self.b.ins().iconst(types::I64, word as i64);
+            let count = self.b.ins().load(types::I64, FLAGS, w, 0);
+            let count = self.b.ins().iadd_imm(count, 1);
+            self.b.ins().store(FLAGS, count, w, 0);
+            self.copy16(above, recv);
+            self.write_tag(recv, btag);
+            self.b.ins().store(FLAGS, w, recv, 8);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(helper);
+            return self.load_method_helper(pc, cache_at, done);
+        }
         match self.layout {
             // An instance of the class the site last saw, which holds no
             // dictionary and fewer values than the name's position among
@@ -10543,6 +10597,32 @@ impl<'a> Lower<'a> {
             }
         }
         self.b.switch_to_block(helper);
+        self.load_method_helper(pc, cache_at, done)
+    }
+
+    /// The method load at `pc` whose site last loaded a builtin type's
+    /// method for an exact `list`, `dict`, `set` or `str` receiver whose
+    /// count compiled code may take in line: the receiver variant's tag
+    /// and the method.
+    fn builtin_method_load(&self, pc: usize) -> Option<(u8, Rc<crate::object::BuiltinFn>)> {
+        if self.cold {
+            return None;
+        }
+        let (tag, f) = crate::load_method_builtin(self.ext, pc)?;
+        let want = match tag {
+            1 => self.tags.list,
+            2 => self.tags.dict,
+            3 => self.tags.set,
+            4 => self.tags.str,
+            _ => return None,
+        };
+        let counted = Object::Builtin(f.clone()).tag();
+        (counted < 64 && self.tags.rc_counted & (1i64 << counted) != 0).then_some((want, f))
+    }
+
+    /// [`Self::load_method`]'s helper call, in the current block, then the
+    /// join at `done`.
+    fn load_method_helper(&mut self, pc: usize, cache_at: i64, done: Block) -> bool {
         let code = self.code_ptr();
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);

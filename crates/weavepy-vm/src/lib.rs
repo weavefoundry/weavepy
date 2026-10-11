@@ -15143,8 +15143,13 @@ impl Interpreter {
                 }
                 // `super().__init__(...)` in an exception class's own
                 // `__init__`: `BaseException.__init__` on the instance,
-                // through the full handler's dispatch.
-                if exception_init_call(b, recv) {
+                // through the full handler's dispatch; likewise
+                // `x.__reduce_ex__(4)` of a plain instance (`copy`,
+                // `pickle`), which may run `copyreg` code.
+                if exception_init_call(b, recv)
+                    || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                        && matches!(recv, Object::Instance(_)))
+                {
                     return Some(true);
                 }
                 // The names below are dispatched by the interpreter, which
@@ -15189,12 +15194,9 @@ impl Interpreter {
             };
         // SAFETY: the activation is synced, and the shape was checked.
         match unsafe { self.core_native_body(sw, frame, pc, callee_at, b, via_call) } {
-            Ok(v) => {
-                frame.stack.push(v);
-                // SAFETY: the running activation's last-pc slot.
-                unsafe { *sw.last = pc };
-            }
-            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+            // SAFETY: the running activation's last-pc slot.
+            None => unsafe { *sw.last = pc },
+            Some(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
         }
         // A finalizer queued by a dying operand runs before the next
         // instruction, as after the full handler's call.
@@ -15216,8 +15218,9 @@ impl Interpreter {
     /// stack holding them), with the activation waiting on the pending
     /// list: the body may run Python code (an element's `__eq__`, a key
     /// function). Then the operands leave as the full handler's do, the
-    /// arguments first, then the receiver and the callable, and the stack
-    /// ends at `start` (the result is the caller's to place).
+    /// arguments first, then the receiver and the callable, and the result
+    /// takes the callee's slot: `None`, the stack ending past it, or the
+    /// error raised, the stack ending at `start`.
     ///
     /// # Safety
     ///
@@ -15233,7 +15236,7 @@ impl Interpreter {
         start: usize,
         b: *const crate::object::BuiltinFn,
         via_call: bool,
-    ) -> Result<Object, RuntimeError> {
+    ) -> Option<RuntimeError> {
         let len = frame.stack.len();
         // SAFETY: the caller's contract: `start + 2 <= len`; the stack
         // isn't resized while the body runs (nested code runs activations
@@ -15275,7 +15278,14 @@ impl Interpreter {
             release_operands(self, base.add(start + 2), len - start - 2);
             release_operands(self, base.add(start + 1), 1);
             release_operands(self, base.add(start), 1);
-            result
+            match result {
+                Ok(v) => {
+                    base.add(start).write(v);
+                    frame.stack.set_len(start + 1);
+                    None
+                }
+                Err(e) => Some(e),
+            }
         }
     }
 
@@ -73393,6 +73403,25 @@ pub(crate) fn call_site_builtin(
     match unsafe { &(*slot.0.get()).1 } {
         MethodSlotFn::Leaf(f, kind) => Some((f.clone(), Some(*kind), false)),
         MethodSlotFn::NativeBody(f, via_call) => Some((f.clone(), None, *via_call)),
+        _ => None,
+    }
+}
+
+/// The builtin type's method the method load at `pc` last resolved, and
+/// the receiver variant it was resolved for (see [`builtin_recv_tag`]):
+/// an exact builtin receiver's method never changes, so the variant alone
+/// keys it.
+#[cfg(feature = "jit")]
+pub(crate) fn load_method_builtin(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(u64, Rc<crate::object::BuiltinFn>)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &*slot.0.get() } {
+        (key, MethodSlotFn::Builtin(f)) if key & MethodSlot::BUILTIN_TAG != 0 => {
+            Some((key & !MethodSlot::BUILTIN_TAG, f.clone()))
+        }
         _ => None,
     }
 }
