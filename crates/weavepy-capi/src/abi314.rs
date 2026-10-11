@@ -1574,13 +1574,13 @@ unsafe fn code_names(
 /// `PyCode_GetCellvars(code)` — new reference to `co_cellvars`.
 #[no_mangle]
 pub unsafe extern "C" fn PyCode_GetCellvars(code: *mut PyObject) -> *mut PyObject {
-    unsafe { code_names(code, |c| c.cellvars.clone()) }
+    unsafe { code_names(code, |c| c.cellvars.iter().map(String::from).collect()) }
 }
 
 /// `PyCode_GetFreevars(code)` — new reference to `co_freevars`.
 #[no_mangle]
 pub unsafe extern "C" fn PyCode_GetFreevars(code: *mut PyObject) -> *mut PyObject {
-    unsafe { code_names(code, |c| c.freevars.clone()) }
+    unsafe { code_names(code, |c| c.freevars.iter().map(String::from).collect()) }
 }
 
 // ---------------------------------------------------------------------------

@@ -496,10 +496,30 @@ impl LruField {
         }
     }
 
-    /// Whether `key` names this field.
+    /// The interned name every wrapper's dictionary is built with.
+    #[inline]
+    fn key(self) -> &'static crate::shared_value::SharedStr {
+        static KEYS: std::sync::OnceLock<[crate::shared_value::SharedStr; 7]> =
+            std::sync::OnceLock::new();
+        &KEYS.get_or_init(|| {
+            LruField::ALL.map(|field| match crate::stdlib::sys::intern_name(field.name()) {
+                Object::Str(s) => s,
+                _ => unreachable!("interned names are strs"),
+            })
+        })[self as usize]
+    }
+
+    /// The field's key, for a new entry.
+    fn key_object(self) -> DictKey {
+        DictKey(Object::Str(self.key().clone()))
+    }
+
+    /// Whether `key` names this field: the interned name itself (one
+    /// compare), or an equal string.
     #[inline]
     fn is(self, key: &DictKey) -> bool {
-        matches!(&key.0, Object::Str(s) if name_eq(s, self.name()))
+        matches!(&key.0, Object::Str(s)
+            if crate::shared_value::SharedStr::ptr_eq(s, self.key()) || name_eq(s, self.name()))
     }
 }
 
@@ -541,7 +561,7 @@ fn lru_set(inst: &crate::types::PyInstance, field: LruField, v: Object) {
     match lru_slot_mut(&mut dict, field) {
         Some(slot) => *slot = v,
         None => {
-            dict.insert(DictKey(Object::from_static(field.name())), v);
+            dict.insert(field.key_object(), v);
         }
     }
 }
@@ -578,7 +598,7 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let mut dict = inst.dict_cell().borrow_mut();
         for (field, value) in LruField::ALL.into_iter().zip(values) {
-            dict.insert(DictKey(Object::from_static(field.name())), value);
+            dict.insert(field.key_object(), value);
         }
     }
     // CPython's `lru_cache_new` GC-tracks the wrapper: its `__wrapped__`
@@ -623,12 +643,17 @@ fn lru_make_key(call_args: &[Object], kwargs: &[(String, Object)], typed: bool) 
 fn lru_counter_bump(inst: &crate::types::PyInstance, field: LruField) {
     // Keep the read and increment under one lock. Separate get/set borrows
     // lose updates when multiple threads hit a shared cache under gil=0.
-    let mut dict = inst.dict_cell().borrow_mut();
-    match lru_slot_mut(&mut dict, field) {
+    lru_bump(&mut inst.dict_cell().borrow_mut(), field);
+}
+
+/// Count one more of the counter `field` in the wrapper's `dict`.
+#[inline]
+fn lru_bump(dict: &mut DictData, field: LruField) {
+    match lru_slot_mut(dict, field) {
         Some(Object::Int(n)) => *n += 1,
         Some(count) => *count = Object::Int(1),
         None => {
-            dict.insert(DictKey(Object::from_static(field.name())), Object::Int(1));
+            dict.insert(field.key_object(), Object::Int(1));
         }
     }
 }
@@ -741,11 +766,11 @@ fn lru_state_links(state: &Object) -> Option<&Rc<RefCell<Vec<u8>>>> {
     }
 }
 
-fn lru_mode(dict: &DictData) -> Result<(bool, bool), RuntimeError> {
+fn lru_mode(state: Option<&Object>) -> Result<(bool, bool), RuntimeError> {
     // Read the tag without cloning active recency storage. The caller
     // releases its borrow before hashing the key or calling the wrapped
     // function.
-    match lru_slot(dict, LruField::State) {
+    match state {
         Some(Object::Bool(true)) => Ok((true, false)),
         Some(Object::Int(1)) => Ok((true, true)),
         Some(state @ Object::Tuple(_)) => {
@@ -769,7 +794,7 @@ fn scalar_lru_links(
     let mut dict = inst.dict_cell().borrow_mut();
     if lru_slot(&dict, LruField::State).is_none() {
         dict.insert(
-            DictKey(Object::from_static(LruField::State.name())),
+            LruField::State.key_object(),
             Object::Bool(false),
         );
     }
@@ -863,14 +888,32 @@ fn scalar_lru_operation(
             note_scalar_lru_event(2);
             return Ok(ScalarLru::Slow);
         }
-        // Deferral also protects against private-cache tampering: a foreign
-        // key must not invoke Python inside the paired borrow.
-        let (found, deferred) =
-            crate::object::key_cmp_deferred(|| data.get_index_of(&DictKey(key.clone())));
-        let found = found?;
-        if deferred {
-            return Err(invalid_lru_order());
-        }
+        // A `str` or `int` key settles by native equality in one probe;
+        // its hash is kept for the insert below.
+        let probe = crate::object::LeafProbe::new(key);
+        let exact = match &probe {
+            Some(p) => match data.get_index_of(p) {
+                Some(i) => Some(Some(i)),
+                None if p.miss_is_exact() => Some(None),
+                None => None,
+            },
+            None => None,
+        };
+        let (found, exact_miss) = match exact {
+            Some(found) => (found, found.is_none()),
+            None => {
+                // Deferral also protects against private-cache tampering: a
+                // foreign key must not invoke Python inside the paired borrow.
+                let (found, deferred) = crate::object::key_cmp_deferred(|| {
+                    data.get_index_of(&DictKey(key.clone()))
+                });
+                let found = found?;
+                if deferred {
+                    return Err(invalid_lru_order());
+                }
+                (found, false)
+            }
+        };
         if let Some(index) = found {
             let (stored, value) = data.get_index(index).ok_or_else(invalid_lru_order)?;
             if !native_lru_key(&stored.0) {
@@ -903,7 +946,15 @@ fn scalar_lru_operation(
         } else {
             None
         };
-        data.insert(DictKey(key.clone()), value.clone());
+        match &probe {
+            // Proven absent above (an eviction keeps it so): no second probe.
+            Some(p) if exact_miss => {
+                data.insert_unique_hashed(p.hash, DictKey(key.clone()), value.clone());
+            }
+            _ => {
+                data.insert(DictKey(key.clone()), value.clone());
+            }
+        }
         order.push(limit).ok_or_else(invalid_lru_order)?;
     }
     // Publish a consistent cache before releasing an evicted result.
@@ -911,20 +962,113 @@ fn scalar_lru_operation(
     Ok(ScalarLru::Complete(None))
 }
 
+/// What [`lru_fast_lookup`] settled.
+enum FastLookup {
+    /// The cached value, its hit counted and its recency refreshed.
+    Hit(Object),
+    /// An exact miss, counted: the wrapped function to call (`None` if the
+    /// wrapper lost it).
+    Miss(Option<Object>),
+}
+
+/// The lookup of a native `key` in a bounded cache whose recency links are
+/// live, under one hold of the cache and its links: the hit or the counted
+/// miss, or `None` (nothing touched) for the general path to settle.
+#[inline]
+fn lru_fast_lookup(
+    inst: &crate::types::PyInstance,
+    cache: &RefCell<DictData>,
+    links: &RefCell<Vec<u8>>,
+    probe: &crate::object::LeafProbe<'_>,
+) -> Option<FastLookup> {
+    // The cache lock also serializes the links and the counters under
+    // gil=0 (taken in the order `lru_cache_clear` takes them). Nothing
+    // here runs Python.
+    let data = cache.borrow_mut();
+    let mut bytes = links.borrow_mut();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut order = lru_order::Order::new(&mut bytes, data.len())?;
+    match data.get_index_of(probe) {
+        Some(index) => {
+            let (stored, value) = data.get_index(index)?;
+            if !native_lru_key(&stored.0) {
+                return None;
+            }
+            order.touch(index)?;
+            let value = value.clone();
+            lru_bump(&mut inst.dict_cell().borrow_mut(), LruField::Hits);
+            Some(FastLookup::Hit(value))
+        }
+        None if probe.miss_is_exact() => {
+            let mut dict = inst.dict_cell().borrow_mut();
+            lru_bump(&mut dict, LruField::Misses);
+            Some(FastLookup::Miss(lru_slot(&dict, LruField::Wrapped).cloned()))
+        }
+        None => None,
+    }
+}
+
+/// Store `result` under the native `key` after [`lru_fast_lookup`]'s miss,
+/// evicting the least recent entry of a full cache in place: `Some` with
+/// the evicted entry (to release once the cache is consistent and
+/// unborrowed) when stored or already present, `None` (nothing touched)
+/// for the general path.
+fn lru_fast_store(
+    cache: &RefCell<DictData>,
+    links: &Rc<RefCell<Vec<u8>>>,
+    key: &Object,
+    result: &Object,
+    limit: usize,
+) -> Result<Option<Option<(DictKey, Object)>>, RuntimeError> {
+    let Some(probe) = crate::object::LeafProbe::new(key) else {
+        return Ok(None);
+    };
+    let mut data = cache.borrow_mut();
+    let mut bytes = links.borrow_mut();
+    let len = data.len();
+    if bytes.is_empty() || len > limit {
+        return Ok(None);
+    }
+    let Some(mut order) = lru_order::Order::new(&mut bytes, len) else {
+        return Ok(None);
+    };
+    match data.get_index_of(&probe) {
+        // A recursive call populated the key: its entry and recency win.
+        Some(_) => return Ok(Some(None)),
+        None if !probe.miss_is_exact() => return Ok(None),
+        None => {}
+    }
+    if len == limit {
+        // The least recent entry's place takes the new one, which becomes
+        // the most recent.
+        let Some(head) = order.head() else {
+            return Ok(None);
+        };
+        if order.touch(head).is_none() {
+            return Err(invalid_lru_order());
+        }
+        let evicted =
+            data.replace_index_unique(head, probe.hash, DictKey(key.clone()), result.clone());
+        return Ok(Some(evicted));
+    }
+    crate::object::bytearray_check_resizable(links)?;
+    if order.push(limit).is_none() {
+        return Err(invalid_lru_order());
+    }
+    data.insert_unique_hashed(probe.hash, DictKey(key.clone()), result.clone());
+    Ok(Some(None))
+}
+
 fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let _depth_guard = lru_enter_native()?;
-    let inst = lru_self(args)?;
-    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
-        return Err(type_error("lru_cache requires a running interpreter"));
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("expected _lru_cache_wrapper instance"));
     };
-    // SAFETY: published by the enclosing VM frame on this thread.
-    let interp = unsafe { &mut *ptr };
-    let func = || {
-        lru_get(&inst, LruField::Wrapped)
-            .ok_or_else(|| type_error("lru_cache wrapper lost its function"))
-    };
-    // One borrow reads the size, the mode, and the cache.
-    let (maxsize, mode, cache) = {
+    let call_args = &args[1..];
+    // One borrow reads the size, the mode, the cache, and live links.
+    let (maxsize, mode, cache, links) = {
         let dict = inst.dict_cell().borrow();
         let cache = match lru_slot(&dict, LruField::Cache) {
             Some(Object::Dict(cache)) => Some(cache.clone()),
@@ -933,19 +1077,59 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         let maxsize = lru_slot(&dict, LruField::Maxsize)
             .cloned()
             .unwrap_or(Object::None);
-        (maxsize, lru_mode(&dict), cache)
+        let state = lru_slot(&dict, LruField::State);
+        let links = state.and_then(lru_state_links).cloned();
+        (maxsize, lru_mode(state), cache, links)
     };
-    let call_args = &args[1..];
-    let globals = interp.builtins_dict();
+    let interp = || match crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the enclosing VM frame on this thread.
+        Some(ptr) => Ok(unsafe { &mut *ptr }),
+        None => Err(type_error("lru_cache requires a running interpreter")),
+    };
+    let func = || {
+        lru_get(inst, LruField::Wrapped)
+            .ok_or_else(|| type_error("lru_cache wrapper lost its function"))
+    };
 
     // maxsize == 0: no caching, statistics only.
     if matches!(maxsize, Object::Int(0)) {
-        lru_counter_bump(&inst, LruField::Misses);
+        let interp = interp()?;
+        lru_counter_bump(inst, LruField::Misses);
+        let globals = interp.builtins_dict();
         return interp.call(&func()?, call_args, kwargs, &globals);
     }
 
     let (typed, scalar_enabled) = mode?;
     let key = lru_make_key(call_args, kwargs, typed);
+    // The warm shape: an `int`, `str`, or tuple of them in a bounded cache
+    // whose recency links are live.
+    if let (Object::Int(limit @ 1..), Some(cache), Some(links), true) =
+        (&maxsize, &cache, &links, scalar_enabled)
+    {
+        let probe = native_lru_key(&key)
+            .then(|| crate::object::LeafProbe::new(&key))
+            .flatten();
+        let found = probe.and_then(|p| lru_fast_lookup(inst, cache, links, &p));
+        match found {
+            Some(FastLookup::Hit(v)) => return Ok(v),
+            Some(FastLookup::Miss(func)) => {
+                let func = func.ok_or_else(|| type_error("lru_cache wrapper lost its function"))?;
+                let interp = interp()?;
+                let globals = interp.builtins_dict();
+                let result = interp.call(&func, call_args, kwargs, &globals)?;
+                let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
+                if let Some(evicted) = lru_fast_store(cache, links, &key, &result, limit)? {
+                    // Released with the cache consistent and unborrowed.
+                    drop(evicted);
+                    return Ok(result);
+                }
+                return lru_store(inst, cache, &key, result, &maxsize, true);
+            }
+            None => {}
+        }
+    }
+    let interp = interp()?;
+    let globals = interp.builtins_dict();
     // Compute a tuple key's hash before touching the cache. Successful
     // hashes are retained by the tuple, so lookup, recency updates, and
     // insertion invoke each argument's hash only once per call. Errors
@@ -960,7 +1144,7 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     let bounded = matches!(maxsize, Object::Int(m) if m > 0);
 
     let scalar_hit = if bounded && scalar_enabled {
-        scalar_lru_operation(&inst, &cache, &key, None)?
+        scalar_lru_operation(inst, &cache, &key, None)?
     } else {
         ScalarLru::Slow
     };
@@ -987,30 +1171,43 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         ),
     };
     if let Some(v) = hit {
-        lru_counter_bump(&inst, LruField::Hits);
+        lru_counter_bump(inst, LruField::Hits);
         return Ok(v);
     }
-    lru_counter_bump(&inst, LruField::Misses);
+    lru_counter_bump(inst, LruField::Misses);
     let result = interp.call(&func()?, call_args, kwargs, &globals)?;
+    lru_store(inst, &cache, &key, result, &maxsize, scalar)
+}
+
+/// Store a miss's `result` under `key` (through the scalar links when
+/// `scalar`), unless a reentrant call stored the key first.
+fn lru_store(
+    inst: &crate::types::PyInstance,
+    cache: &Rc<RefCell<DictData>>,
+    key: &Object,
+    result: Object,
+    maxsize: &Object,
+    scalar: bool,
+) -> Result<Object, RuntimeError> {
     if scalar {
-        let Object::Int(limit) = maxsize else {
+        let Object::Int(limit) = *maxsize else {
             unreachable!()
         };
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         if matches!(
-            scalar_lru_operation(&inst, &cache, &key, Some((&result, limit)))?,
+            scalar_lru_operation(inst, cache, key, Some((&result, limit)))?,
             ScalarLru::Complete(_)
         ) {
             return Ok(result);
         }
     }
     crate::object::key_cmp_scope(|| {
-        with_stolen_cache(&cache, |c| {
+        with_stolen_cache(cache, |c| {
             // A reentrant call may have populated the key while `func` ran;
             // keep the existing entry (CPython does the same).
             if !c.contains_key(&DictKey(key.clone())) {
                 c.insert(DictKey(key.clone()), result.clone());
-                if let Object::Int(m) = maxsize {
+                if let Object::Int(m) = *maxsize {
                     while c.len() > m.max(0) as usize {
                         c.shift_remove_index(0);
                     }

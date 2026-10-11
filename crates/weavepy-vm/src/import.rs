@@ -518,6 +518,10 @@ impl ModuleCache {
     /// is the `pythonXY.zip` landmark or any directory that is itself a
     /// stdlib tree (contains `os.py` — the landmark CPython's `getpath`
     /// uses), e.g. a vendored `Lib/`; scanning stops there.
+    ///
+    /// Every frozen import runs this scan, so it reads the cached directory
+    /// listings as [`Self::find_source`] does (one `stat` per directory
+    /// instead of one per candidate).
     pub fn find_source_shadowing_stdlib(&self, full_name: &str) -> Option<(PathBuf, bool)> {
         let rel: PathBuf = full_name.split('.').collect();
         for dir in self.search_dirs() {
@@ -527,20 +531,32 @@ impl ModuleCache {
             {
                 return None;
             }
-            if dir.join("os.py").is_file() {
+            if Self::has_stdlib_landmark(&dir) {
                 return None;
             }
             // Package directory before module file, as in `find_source`.
-            let pkg_init = dir.join(&rel).join("__init__.py");
-            if pkg_init.is_file() && Self::entry_case_ok(pkg_init.parent().unwrap_or(&pkg_init)) {
-                return Some((pkg_init, true));
-            }
-            let module_file = dir.join(&rel).with_extension("py");
-            if module_file.is_file() && Self::entry_case_ok(&module_file) {
-                return Some((module_file, false));
+            if let Some(hit) = Self::probe_source(&dir, &rel) {
+                return Some(hit);
             }
         }
         None
+    }
+
+    /// Whether `dir` holds an `os.py` file, the stdlib landmark. The
+    /// listing settles the usual miss; a name matching in any case is
+    /// confirmed with a `stat`, which also matches a differently cased
+    /// entry where the filesystem ignores case.
+    fn has_stdlib_landmark(dir: &Path) -> bool {
+        const LANDMARK: &str = "os.py";
+        let Some(names) = dir_listing(dir) else {
+            return false;
+        };
+        let candidate = names.contains(std::ffi::OsStr::new(LANDMARK))
+            || names.iter().any(|n| {
+                n.as_encoded_bytes()
+                    .eq_ignore_ascii_case(LANDMARK.as_bytes())
+            });
+        candidate && dir.join(LANDMARK).is_file()
     }
 
     /// Whether a frozen name is a bundled *third-party facade* rather

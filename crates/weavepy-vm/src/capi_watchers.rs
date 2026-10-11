@@ -21,11 +21,11 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Any dict currently watched?
-static DICTS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DICTS_ACTIVE: &AtomicBool = &crate::sync::RELEASE_GATES.dicts_watched;
 /// Any type currently watched?
 static TYPES_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Any function watcher registered?
-static FUNCS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FUNCS_ACTIVE: &AtomicBool = &crate::sync::RELEASE_GATES.funcs_watched;
 
 /// A watched dict: identity pointer, the bitmask of watcher IDs watching
 /// it, and a keep-check `Weak` so a stale entry (the dict died on a path
@@ -99,16 +99,6 @@ fn call_dispatcher(cb: &Object, args: Vec<Object>) {
 }
 
 // ---------------------------------------------------------------- dicts
-
-#[inline(always)]
-/// The dict and function watcher flags' bytes (nonzero while any is
-/// registered), for compiled code that tests them in line.
-pub(crate) fn release_flags() -> [*const u8; 2] {
-    [
-        DICTS_ACTIVE.as_ptr().cast_const().cast(),
-        FUNCS_ACTIVE.as_ptr().cast_const().cast(),
-    ]
-}
 
 pub fn dicts_active() -> bool {
     DICTS_ACTIVE.load(Ordering::Relaxed)

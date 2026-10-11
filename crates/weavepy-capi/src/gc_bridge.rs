@@ -144,8 +144,10 @@ fn has_clear(obj: &Object) -> bool {
 /// once from [`crate::interp::ensure_initialised`], before any extension
 /// code (hence any C GC type) can run.
 pub fn install() {
-    weavepy_vm::gc_trace::register_traverse(has_traverse, traverse);
-    weavepy_vm::gc_trace::register_clear(has_clear, clear);
+    // (Both match instances only; see `instance_type_ptr`.)
+    let kind = weavepy_vm::gc_trace::hook_kind::INSTANCE;
+    weavepy_vm::gc_trace::register_traverse_for(kind, has_traverse, traverse);
+    weavepy_vm::gc_trace::register_clear_for(kind, has_clear, clear);
 }
 
 // ====================================================================
@@ -253,8 +255,7 @@ pub unsafe extern "C" fn PyObject_GC_IsTracked(op: *mut c_void) -> c_int {
         return 0;
     }
     let obj = unsafe { crate::object::clone_object(op as *mut PyObject) };
-    let id = weavepy_vm::weakref_registry::id_of(&obj);
-    c_int::from(weavepy_vm::gc_trace::is_tracked(id))
+    c_int::from(weavepy_vm::gc_trace::is_tracked(&obj))
 }
 
 /// `PyObject_GC_Del(op)` — free a GC object's storage (a GC type's

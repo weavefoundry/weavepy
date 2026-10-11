@@ -42,7 +42,7 @@ impl InternIndex {
         i
     }
 
-    pub(crate) fn intern_name(&mut self, values: &mut Vec<String>, name: &str) -> u32 {
+    pub(crate) fn intern_name(&mut self, values: &mut Vec<crate::Name>, name: &str) -> u32 {
         if values.len() < 32 {
             if let Some(i) = values.iter().position(|v| v == name) {
                 return i as u32;
@@ -55,7 +55,7 @@ impl InternIndex {
             self.next.push(self.heads.insert(key, values.len() as u32));
         }
         let i = values.len() as u32;
-        values.push(name.to_owned());
+        values.push(crate::Name::new(name));
         i
     }
 

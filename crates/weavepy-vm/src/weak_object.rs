@@ -54,6 +54,42 @@ macro_rules! weak_object {
             pub fn is_dead(&self) -> bool {
                 self.strong_count() == 0
             }
+
+            /// Run `f` on the object, while it is alive, through a handle
+            /// that takes no reference (`None` once it died).
+            ///
+            /// # Safety
+            ///
+            /// Nothing `f` does may release the object's last reference.
+            #[inline]
+            pub unsafe fn with_borrowed<R>(&self, f: impl FnOnce(&Object) -> R) -> Option<R> {
+                if self.is_dead() {
+                    return None;
+                }
+                // SAFETY: the payload is alive (its strong count isn't
+                // zero), stays so per the caller, and the view is never
+                // dropped, so it releases nothing.
+                let obj = std::mem::ManuallyDrop::new(unsafe {
+                    match self {
+                        Self::Tuple(w) => {
+                            Object::Tuple(std::mem::ManuallyDrop::into_inner(w.borrowed_arc()))
+                        }
+                        $(Self::$variant(w) => Object::$variant(Rc::from_raw(w.as_ptr())),)*
+                    }
+                });
+                Some(f(&obj))
+            }
+
+            /// The payload's address, as [`Object::payload_addr`] reports
+            /// it for a strong owner (valid after the object died: the
+            /// handle keeps the allocation).
+            #[inline]
+            pub fn addr(&self) -> usize {
+                match self {
+                    Self::Tuple(w) => w.addr(),
+                    $(Self::$variant(w) => w.as_ptr().cast::<()>() as usize,)*
+                }
+            }
         }
     };
     (@payload Long) => { Weak<num_bigint::BigInt> };

@@ -245,6 +245,19 @@ impl<T: ?Sized + ThinPayload> ThinWeak<T> {
     pub fn upgrade(&self) -> Option<ThinArc<T>> {
         self.weak_view().upgrade().map(ThinArc::from_arc)
     }
+
+    /// A strong handle on the payload that owns no reference of its own.
+    ///
+    /// # Safety
+    ///
+    /// The payload must be alive, and stay so while the view is used; the
+    /// view must never be dropped (it owns no reference to release).
+    pub(crate) unsafe fn borrowed_arc(&self) -> ManuallyDrop<ThinArc<T>> {
+        ManuallyDrop::new(ThinArc {
+            data: self.data,
+            ownership: PhantomData,
+        })
+    }
     pub fn strong_count(&self) -> usize {
         self.weak_view().strong_count()
     }
@@ -615,6 +628,12 @@ impl SharedStr {
         storage.hash.store(h, Ordering::Relaxed);
         h
     }
+    /// The memoised `hash(s)` if it has been computed.
+    #[inline]
+    pub fn known_hash(this: &Self) -> Option<i64> {
+        let h = this.0.storage().hash.load(Ordering::Relaxed);
+        (h != -1).then_some(h)
+    }
     /// `len(s)` in code points, memoised in the string itself.
     #[inline]
     pub fn char_count(this: &Self) -> usize {
@@ -828,6 +847,15 @@ impl SharedStr {
             _ => return None,
         };
         Some(small_table()[code].clone())
+    }
+}
+
+impl SharedStr {
+    /// The shared one-character string of ASCII byte `c` (below `0x80`).
+    #[inline]
+    pub fn ascii_char(c: u8) -> Self {
+        debug_assert!(c.is_ascii());
+        small_table()[usize::from(c & 0x7f)].clone()
     }
 }
 

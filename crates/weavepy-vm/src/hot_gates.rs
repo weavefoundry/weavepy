@@ -64,13 +64,12 @@ static HOT: AtomicU32 = AtomicU32::new(0);
 
 /// RFC 0065 (WS1): the dispatch loop's *generation* word. Bumped by
 /// every mutation that can change the loop prologue's decisions —
-/// hot-gate bits ([`set`]/[`clear`] below), observer registration
-/// (`trace::bump_observer_gen`), and frame materialization
-/// (`FrameShell::materialize`). The dispatch loop caches a snapshot
+/// hot-gate bits ([`set`]/[`clear`] below) and observer registration
+/// (`trace::bump_observer_gen`). The dispatch loop caches a snapshot
 /// of the prologue's inputs keyed by this generation: while the
 /// generation is unchanged *and* the snapshot says "quiet" (no
-/// pending work, no observers, no materialized frame), the loop runs one relaxed load + compare per
-/// instruction instead of the full ten-plus-probe prologue.
+/// pending work, no observers), the loop runs one relaxed load + compare
+/// per instruction instead of the full ten-plus-probe prologue.
 ///
 /// Same producer/consumer discipline as [`HOT`]: a spurious bump is
 /// always safe (one cold re-snapshot); a missed bump is never

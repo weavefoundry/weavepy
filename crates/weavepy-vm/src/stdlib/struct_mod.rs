@@ -915,6 +915,16 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "pack_into", b_pack_into);
         register(&mut d, "unpack_from", b_unpack_from);
         register(&mut d, "iter_unpack", b_iter_unpack);
+        let install = Rc::new(BuiltinFn {
+            name: "_install_struct",
+            binds_instance: false,
+            call: Box::new(install_struct),
+            call_kw: None,
+        });
+        d.insert(
+            DictKey(Object::from_static("_install_struct")),
+            Object::Builtin(install),
+        );
     }
     Rc::new(PyModule {
         name: "_struct".to_owned(),
@@ -970,6 +980,155 @@ fn compiled(fmt: &str) -> Result<std::rc::Rc<CompiledFormat>, RuntimeError> {
 /// `_clearcache()`: flush the compiled formats.
 fn b_clearcache(_args: &[Object]) -> Result<Object, RuntimeError> {
     FORMATS.with(|c| c.borrow_mut().clear());
+    BY_STRING.with(|c| c.borrow_mut().clear());
+    Ok(Object::None)
+}
+
+/// The address of the exact `struct.Struct` class [`install_struct`]
+/// last served (its native methods keep it alive).
+static STRUCT_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// Compiled formats by the identity of a `Struct`'s format string
+    /// (each held here, so an address names one string), most recent
+    /// first: a `Struct` hands its methods the same string every call.
+    static BY_STRING: std::cell::RefCell<Vec<(crate::shared_value::SharedStr, std::rc::Rc<CompiledFormat>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many format strings [`BY_STRING`] remembers.
+const BY_STRING_MAX: usize = 8;
+
+/// The compiled format of a `Struct`'s format string `fmt`.
+fn compiled_for(fmt: &crate::shared_value::SharedStr) -> Option<std::rc::Rc<CompiledFormat>> {
+    let addr = crate::shared_value::SharedStr::addr(fmt);
+    let hit = BY_STRING.with(|c| {
+        c.try_borrow().ok().and_then(|c| {
+            c.iter()
+                .find(|(s, _)| crate::shared_value::SharedStr::addr(s) == addr)
+                .map(|(_, cf)| cf.clone())
+        })
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let cf = compiled(fmt).ok()?;
+    BY_STRING.with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            c.truncate(BY_STRING_MAX - 1);
+            c.insert(0, (fmt.clone(), cf.clone()));
+        }
+    });
+    Some(cf)
+}
+
+/// The compiled format of `recv` when it is an exact, initialized
+/// `struct.Struct` whose `_fmt` is a plain `str` in its own dictionary
+/// (anything else is the Python method's to serve).
+fn struct_format(recv: &Object) -> Option<std::rc::Rc<CompiledFormat>> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let class = std::ptr::from_ref(inst.cls_raw()) as usize;
+    if class != STRUCT_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match inst.attr_get_str("_fmt")? {
+        Object::Str(fmt) => compiled_for(&fmt),
+        _ => None,
+    }
+}
+
+/// `Struct.pack(self, *values)` over plain values (what `_pack_plain`
+/// packs), or `None` for the Python method, which also owns every error.
+fn struct_pack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, values) = args.split_first()?;
+    let plain = values.iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+        )
+    });
+    if !plain {
+        return None;
+    }
+    let cf = struct_format(recv)?;
+    let bytes = cf.pack(values).ok()?;
+    Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// `Struct.unpack(self, buffer)` of a `bytes` buffer, or `None` for the
+/// Python method, which also owns every error.
+fn struct_unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, Object::Bytes(buf)] = args else {
+        return None;
+    };
+    let cf = struct_format(recv)?;
+    let vals = cf.unpack(buf).ok()?;
+    Some(Ok(Object::new_tuple(vals)))
+}
+
+/// `_install_struct(Struct)`: serve the exact class's `pack` and
+/// `unpack` natively (CPython's `Struct` is a C type), each falling back
+/// to the Python method it replaces for every other shape.
+fn install_struct(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("_install_struct() expects the Struct class"));
+    };
+    let own = |name: &str| cls.dict.borrow().get(&crate::object::StrKey(name)).cloned();
+    let (Some(pack), Some(unpack)) = (own("pack"), own("unpack")) else {
+        return Err(type_error("_install_struct(): Struct lacks pack/unpack"));
+    };
+    type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
+    for (name, fast, orig) in [
+        ("pack", struct_pack_fast as Fast, pack),
+        ("unpack", struct_unpack_fast as Fast, unpack),
+    ] {
+        // (The natives keep the class alive: its address stays its own.)
+        let class = cls.clone();
+        let fallback = move |a: &[Object], kw: &[(String, Object)]| {
+            let _ = &class;
+            let f = orig.clone();
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("struct: no active interpreter"))?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            unsafe { &mut *ptr }.call_object(f, a, kw)
+        };
+        let fallback = Rc::new(fallback);
+        let fallback_kw = fallback.clone();
+        let b = Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(move |a: &[Object]| match fast(a) {
+                Some(r) => r,
+                None => fallback(a, &[]),
+            }),
+            call_kw: Some(Box::new(move |a: &[Object], kw: &[(String, Object)]| {
+                if kw.is_empty() {
+                    if let Some(r) = fast(a) {
+                        return r;
+                    }
+                }
+                fallback_kw(a, kw)
+            })),
+        });
+        crate::leaf_builtins::register_fast(&b, fast);
+        cls.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), Object::Builtin(b));
+    }
+    cls.bump_attr_version();
+    STRUCT_CLASS.store(
+        Rc::as_ptr(cls) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(Object::None)
 }
 

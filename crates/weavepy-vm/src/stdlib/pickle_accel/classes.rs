@@ -5,7 +5,6 @@
 //! could require a Python callback reports `None` so that the caller returns
 //! to the full pickler or unpickler.
 
-use std::hash::BuildHasher;
 
 use crate::builtin_types::builtin_types;
 use crate::object::{py_str_hash, DictData, Object, StrKey};
@@ -65,12 +64,10 @@ pub(super) fn ambient_state_is_plain() -> bool {
 /// The outer `None` reports a stored key that isn't an exact `str` in the
 /// probe sequence. Comparing with it could call a Python `__eq__`.
 pub(super) fn pure_get(dict: &DictData, name: &str) -> Option<Option<Object>> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
-    let hash = crate::fasthash::FxBuildHasher.hash_one(py_str_hash(name));
+    let hash = py_str_hash(name);
     let mut exotic = false;
     let found = dict
-        .raw_entry_v1()
-        .from_hash(hash, |key| match &key.0 {
+        .find_by_hash(hash, |key| match &key.0 {
             Object::Str(stored) => stored.as_ref() == name,
             Object::WStr(_) => false,
             _ => {
@@ -78,6 +75,7 @@ pub(super) fn pure_get(dict: &DictData, name: &str) -> Option<Option<Object>> {
                 false
             }
         })
+        .and_then(|i| dict.get_index(i))
         .map(|(_, value)| value.clone());
     if exotic {
         None

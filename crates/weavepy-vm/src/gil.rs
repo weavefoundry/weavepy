@@ -892,6 +892,14 @@ pub fn yield_checkpoint() {
     maybe_yield_gil();
 }
 
+/// Whether a checkpoint would return at once: no thread waits for the
+/// GIL and no waiter's clock is armed (see [`maybe_yield_gil`]). An
+/// expired countdown then starts over where it ran out.
+#[inline]
+pub(crate) fn handoff_idle() -> bool {
+    global_gil_ref().breaker.waiter_count() == 0 && !WAITER_CLOCK_ARMED.load(Ordering::Relaxed)
+}
+
 /// Hand the GIL to a waiting thread, if any. Drops the calling
 /// thread's guard stack (releasing the lock), spins briefly so a
 /// waiter can take it, then re-acquires. No-op when nobody is

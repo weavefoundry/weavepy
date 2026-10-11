@@ -201,6 +201,24 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             crate::leaf_builtins::register(f);
         }
         d.insert(DictKey(Object::from_static("getpid")), getpid);
+        // CPython's C accelerators for `posixpath.splitroot` and
+        // `posixpath.normpath`, which `posixpath` imports when present
+        // (`pathlib` splits every path it parses through `splitroot`).
+        #[cfg(not(windows))]
+        for (name, body, fast) in [
+            (
+                "_path_splitroot_ex",
+                os_path_splitroot_ex as fn(&[Object]) -> Result<Object, RuntimeError>,
+                path_splitroot_fast as crate::leaf_builtins::Fast,
+            ),
+            ("_path_normpath", os_path_normpath, path_normpath_fast),
+        ] {
+            let f = builtin(name, body);
+            if let Object::Builtin(b) = &f {
+                crate::leaf_builtins::register_fast(b, fast);
+            }
+            d.insert(DictKey(Object::from_static(name)), f);
+        }
         // 3.14 `posix._is_inputhook_installed()` (gh-121886): `_pyrepl`'s
         // console polls it for `PyOS_InputHook`; WeavePy has no C input
         // hook, so it is always `False`.
@@ -7688,8 +7706,11 @@ pub(crate) fn struct_seq_instance(
     let inst = crate::types::PyInstance::new(ty);
     {
         let mut d = inst.dict_cell().borrow_mut();
-        for (field, value) in fields.iter().zip(values.iter()) {
-            d.insert(DictKey(Object::from_static(field)), value.clone());
+        // (Room for the hidden extras `time.struct_time` adds.)
+        d.reserve(fields.len() + 2);
+        let keys = static_name_keys(fields);
+        for (key, value) in keys.iter().zip(values.iter()) {
+            d.insert(key.clone(), value.clone());
         }
     }
     // Struct sequences subclass `tuple`, so give the instance a native tuple
@@ -7699,6 +7720,215 @@ pub(crate) fn struct_seq_instance(
     // overrides expose — without us re-implementing every sequence method.
     let _ = inst.native.set(Object::new_tuple(values));
     Object::Instance(Rc::new(inst))
+}
+
+/// [`static_name_key`] for each of a struct sequence's `fields`, looked up
+/// once per instance.
+pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[DictKey]> {
+    thread_local! {
+        static KEYS: RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>> =
+            RefCell::new(std::collections::HashMap::default());
+    }
+    let id = (fields.as_ptr() as usize, fields.len());
+    if let Some(keys) = KEYS.with(|k| k.borrow().get(&id).cloned()) {
+        return keys;
+    }
+    let keys: std::rc::Rc<[DictKey]> = fields.iter().map(|f| static_name_key(f)).collect();
+    KEYS.with(|k| k.borrow_mut().insert(id, keys.clone()));
+    keys
+}
+
+/// The dictionary key for a static field name, built once per thread with
+/// its hash cached: a struct sequence's fields (an `os.stat` result, a
+/// `time.struct_time`) are stored and read without allocating or hashing
+/// their names each time.
+pub(crate) fn static_name_key(name: &'static str) -> DictKey {
+    thread_local! {
+        static KEYS: RefCell<std::collections::HashMap<(usize, usize), Object, crate::fasthash::FxBuildHasher>> =
+            RefCell::new(std::collections::HashMap::default());
+    }
+    KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        let key = keys
+            .entry((name.as_ptr() as usize, name.len()))
+            .or_insert_with(|| {
+                let s = crate::shared_value::SharedStr::from(name);
+                crate::shared_value::SharedStr::hash_cached(&s);
+                Object::Str(s)
+            });
+        DictKey(key.clone())
+    })
+}
+
+/// The length of a POSIX path's root (`posixpath.splitroot`'s middle part):
+/// none for a relative path, one separator for an absolute one, and two
+/// for exactly two leading separators (implementation defined by POSIX).
+fn posix_root_len<T: PartialEq>(p: &[T], sep: &T) -> usize {
+    if p.first() != Some(sep) {
+        0
+    } else if p.get(1) != Some(sep) || p.get(2) == Some(sep) {
+        1
+    } else {
+        2
+    }
+}
+
+/// `posixpath.normpath`'s pure-Python algorithm over the units of `path`
+/// (bytes, UTF-8 bytes or code points): `A//B`, `A/./B` and `A/foo/../B`
+/// all become `A/B`.
+fn posix_normpath_units<T: PartialEq + Copy>(path: &[T], sep: T, dot: T) -> Vec<T> {
+    if path.is_empty() {
+        return vec![dot];
+    }
+    let root = posix_root_len(path, &sep);
+    let (initial, rest) = path.split_at(root);
+    let dotdot = [dot, dot];
+    let mut comps: Vec<&[T]> = Vec::new();
+    for comp in rest.split(|c| *c == sep) {
+        if comp.is_empty() || comp == [dot] {
+            continue;
+        }
+        if comp != dotdot
+            || (initial.is_empty() && comps.is_empty())
+            || comps.last().is_some_and(|l| *l == dotdot)
+        {
+            comps.push(comp);
+        } else {
+            comps.pop();
+        }
+    }
+    let mut out = initial.to_vec();
+    for (i, comp) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push(sep);
+        }
+        out.extend_from_slice(comp);
+    }
+    if out.is_empty() {
+        out.push(dot);
+    }
+    out
+}
+
+/// A path argument of `func` as `str` or `bytes` (an `os.PathLike`'s
+/// `__fspath__()`), with CPython's `path_t` converter's message for
+/// anything else.
+fn path_arg(func: &str, p: &Object) -> Result<Object, RuntimeError> {
+    if matches!(p, Object::Instance(_)) {
+        return os_fspath(std::slice::from_ref(p));
+    }
+    if matches!(p, Object::Str(_) | Object::WStr(_) | Object::Bytes(_)) {
+        return Ok(p.clone());
+    }
+    Err(type_error(format!(
+        "{func}: path should be string, bytes or os.PathLike, not {}",
+        p.type_name()
+    )))
+}
+
+/// The leaf half of `_path_splitroot_ex` for a `str` or `bytes` path.
+fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let r = match args {
+        [p @ Object::Str(s)] => {
+            let n = posix_root_len(s.as_bytes(), &b'/');
+            let (root, tail) = s.split_at(n);
+            Object::new_tuple_array([
+                Object::from_static(""),
+                Object::from_str(root.to_owned()),
+                if n == 0 {
+                    p.clone()
+                } else {
+                    Object::from_str(tail.to_owned())
+                },
+            ])
+        }
+        [p @ Object::Bytes(b)] => {
+            let n = posix_root_len(b, &b'/');
+            let (root, tail) = b.split_at(n);
+            Object::new_tuple_array([
+                Object::new_bytes(Vec::new()),
+                Object::new_bytes(root.to_vec()),
+                if n == 0 {
+                    p.clone()
+                } else {
+                    Object::new_bytes(tail.to_vec())
+                },
+            ])
+        }
+        _ => return None,
+    };
+    Some(Ok(r))
+}
+
+/// `posix._path_splitroot_ex(p)`: split a pathname into drive (always
+/// empty on POSIX), root and tail, as `posixpath`'s fallback does.
+fn os_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [p] = args else {
+        return Err(type_error(format!(
+            "_path_splitroot_ex() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    };
+    if let Some(r) = path_splitroot_fast(args) {
+        return r;
+    }
+    let p = path_arg("_path_splitroot_ex", p)?;
+    if let Object::WStr(cps) = &p {
+        let n = posix_root_len(cps, &u32::from(b'/'));
+        return Ok(Object::new_tuple_array([
+            Object::from_static(""),
+            Object::str_from_codepoints(cps[..n].to_vec()),
+            if n == 0 {
+                p.clone()
+            } else {
+                Object::str_from_codepoints(cps[n..].to_vec())
+            },
+        ]));
+    }
+    path_splitroot_fast(std::slice::from_ref(&p))
+        .unwrap_or_else(|| Err(type_error("expected str, bytes or os.PathLike object")))
+}
+
+/// The leaf half of `_path_normpath` for a `str` or `bytes` path.
+fn path_normpath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let r = match args {
+        [Object::Str(s)] => {
+            // `/` and `.` are ASCII: splitting the UTF-8 bytes at them
+            // keeps every other character whole.
+            let out = posix_normpath_units(s.as_bytes(), b'/', b'.');
+            match String::from_utf8(out) {
+                Ok(out) => Object::from_str(out),
+                Err(_) => return None,
+            }
+        }
+        [Object::Bytes(b)] => Object::new_bytes(posix_normpath_units(b, b'/', b'.')),
+        _ => return None,
+    };
+    Some(Ok(r))
+}
+
+/// `posix._path_normpath(path)`: `posixpath.normpath`, as its pure-Python
+/// fallback computes it.
+fn os_path_normpath(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [p] = args else {
+        return Err(type_error(format!(
+            "_path_normpath() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    };
+    if let Some(r) = path_normpath_fast(args) {
+        return r;
+    }
+    let p = path_arg("_path_normpath", p)?;
+    if let Object::WStr(cps) = &p {
+        return Ok(Object::str_from_codepoints(posix_normpath_units(
+            cps,
+            u32::from(b'/'),
+            u32::from(b'.'),
+        )));
+    }
+    path_normpath_fast(std::slice::from_ref(&p))
+        .unwrap_or_else(|| Err(type_error("expected str, bytes or os.PathLike object")))
 }
 
 /// Construct an `os.terminal_size` instance with the given dimensions.

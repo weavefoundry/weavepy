@@ -583,58 +583,6 @@ impl JitEngine {
         })
     }
 
-    /// Compile and discard a small counted loop, through the whole
-    /// pipeline a real compile takes (mid-end, register allocation,
-    /// emission, finalizing executable memory). A process's first compile
-    /// otherwise pays the code generator's cold start (its code paged in,
-    /// its tables built, the module's first memory mapped), about a
-    /// millisecond, on whatever hot loop first gets compiled.
-    pub fn warm_up(&mut self) {
-        use cranelift_codegen::ir::condcodes::IntCC;
-        use cranelift_codegen::ir::InstBuilder;
-        let int = types::I64;
-        self.ctx.func.signature.params.push(AbiParam::new(int));
-        self.ctx.func.signature.returns.push(AbiParam::new(int));
-        {
-            let mut b =
-                cranelift_frontend::FunctionBuilder::new(&mut self.ctx.func, &mut self.fbctx);
-            let entry = b.create_block();
-            let head = b.create_block();
-            let body = b.create_block();
-            let exit = b.create_block();
-            b.append_block_params_for_function_params(entry);
-            b.append_block_param(head, int);
-            b.append_block_param(head, int);
-            b.switch_to_block(entry);
-            let n = b.block_params(entry)[0];
-            let zero = b.ins().iconst(int, 0);
-            b.ins().jump(head, &[zero.into(), zero.into()]);
-            b.switch_to_block(head);
-            let (i, acc) = (b.block_params(head)[0], b.block_params(head)[1]);
-            let more = b.ins().icmp(IntCC::SignedLessThan, i, n);
-            b.ins().brif(more, body, &[], exit, &[]);
-            b.switch_to_block(body);
-            let acc2 = b.ins().iadd(acc, i);
-            let i2 = b.ins().iadd_imm(i, 1);
-            b.ins().jump(head, &[i2.into(), acc2.into()]);
-            b.switch_to_block(exit);
-            b.ins().return_(&[acc]);
-            b.seal_all_blocks();
-            b.finalize();
-        }
-        let name = format!("wpjit_warm_{}", self.next_id);
-        self.next_id += 1;
-        let defined = self
-            .module
-            .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
-            .ok()
-            .and_then(|id| self.module.define_function(id, &mut self.ctx).ok());
-        self.module.clear_context(&mut self.ctx);
-        if defined.is_some() {
-            let _ = self.module.finalize_definitions();
-        }
-    }
-
     /// Analyze and compile a code object. `resolve` reports what each
     /// `LOAD_GLOBAL` name currently resolves to (see
     /// [`ResolvedGlobal`]); the caller must re-validate every resolution
@@ -718,17 +666,34 @@ impl JitEngine {
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
         slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
     ) -> Result<CompiledFrame, JitVerdict> {
-        let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
-        if calls_dynamically(&tfunc) {
-            return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
-        }
-        if mostly_generic(&tfunc) {
-            return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
-        }
-        for site in &mut tfunc.attr_sites {
-            site.slot_member = slot_member(site);
-        }
+        let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
+    }
+
+    /// [`Self::compile_frame_direct`] on the engine in `engine`, built
+    /// (see [`Self::new`]) only once the analysis admits the code: code
+    /// the analysis rejects never pays for building one. When the host
+    /// can't have one, `engine` stays empty and the verdict is
+    /// [`NO_HOST_ENGINE`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_frame_lazily(
+        engine: &mut Option<JitEngine>,
+        code: &CodeObject,
+        resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+        probes: &mut Probes<'_>,
+        direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
+        inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+    ) -> Result<CompiledFrame, JitVerdict> {
+        let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
+        if engine.is_none() {
+            *engine = JitEngine::new();
+        }
+        let Some(engine) = engine.as_mut() else {
+            return Err(JitVerdict::UnsupportedOpcode(NO_HOST_ENGINE));
+        };
+        engine.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
     }
 
     /// Compile an already-analyzed [`TFunc`] (also the unit-test entry).
@@ -1198,6 +1163,31 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// through a helper that redoes the lookups the interpreter's caches
 /// remember, while each typed one saves only a dispatch. A loop-free
 /// body is left alone: other compiled code calls it directly.
+/// The [`JitEngine::compile_frame_lazily`] verdict for a host the code
+/// generator can't target.
+pub const NO_HOST_ENGINE: &str = "no code generator for the host";
+
+/// Analyze `code` for [`JitEngine::compile_frame_direct`] and apply the
+/// admission rules that need no code generator.
+fn analyze_admitted(
+    code: &CodeObject,
+    resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
+    probes: &mut Probes<'_>,
+    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+) -> Result<TFunc, JitVerdict> {
+    let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+    if calls_dynamically(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
+    }
+    if mostly_generic(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
+    }
+    for site in &mut tfunc.attr_sites {
+        site.slot_member = slot_member(site);
+    }
+    Ok(tfunc)
+}
+
 fn mostly_generic(tfunc: &TFunc) -> bool {
     let Some((percent, loops_only)) = generic_share_limit() else {
         return false;

@@ -223,7 +223,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
 ///
 /// The fast path takes advantage of two facts:
 ///
-/// 1. The `IndexMap` underneath `DictData` exposes O(1) lookup
+/// 1. The table underneath `DictData` exposes O(1) lookup
 ///    by integer index once we know the slot. So caching the
 ///    slot index lets us skip the hash lookup.
 /// 2. Builtins and globals are stable across dispatches in steady
@@ -523,15 +523,44 @@ pub fn attempt_specialize_call_kw(
     kw_names: &[(String, crate::object::Object)],
 ) -> InlineCache {
     let code = f.code();
-    // Positional parameters, then the keyword-only ones.
-    let npos = code.arg_count as usize;
-    let total = npos + code.kwonly_count as usize;
-    let kwc = kw_names.len();
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
-        || code.has_varargs
         || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
+    {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    match kw_perm(f, &code, argc, kw_names.iter().map(|(n, _)| n.as_str())) {
+        Some((perm, _)) => InlineCache::CallPyKwNames {
+            func_id: rc_id(f),
+            perm,
+            argc: argc as u8,
+            kwc: kw_names.len() as u8,
+        },
+        None => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+/// The `CallPyKwNames` permutation of a keyword call of `f` (whose code is
+/// `code`) with `argc` positionals (a receiver included) and the keyword
+/// `names`, and the parameter slots the call fills: each keyword's slot in
+/// 4 bits (`KW_TO_VARKW` for one a `**kwargs` callee collects). Each name
+/// is tried first at the parameter its position gives it. `None` for any
+/// call the generic binder must take: `*args`, more than 8 keywords or 16
+/// parameter slots, replaced defaults, a keyword without a distinct
+/// keyword-bindable parameter (or `**kwargs`), a parameter left without a
+/// default.
+pub fn kw_perm<'a>(
+    f: &Rc<crate::object::PyFunction>,
+    code: &weavepy_compiler::CodeObject,
+    argc: usize,
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> Option<(u32, u32)> {
+    // Positional parameters, then the keyword-only ones.
+    let npos = code.arg_count as usize;
+    let total = npos + code.kwonly_count as usize;
+    let kwc = names.len();
+    if code.has_varargs
         || (f.defaults_maybe_overridden()
             && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         || total > 16
@@ -543,15 +572,18 @@ pub fn attempt_specialize_call_kw(
         || kwc > 8
         || argc > npos
     {
-        return InlineCache::Cooldown(COOLDOWN);
+        return None;
     }
     let mut perm: u32 = 0;
     let mut covered: u32 = (1u32 << argc) - 1;
-    for (j, (name, _)) in kw_names.iter().enumerate() {
-        let bindable = code.varnames[..total]
-            .iter()
-            .position(|v| v == name)
-            .filter(|&slot| slot >= code.posonly_count as usize);
+    for (j, name) in names.enumerate() {
+        let at = argc + j;
+        let bindable = if at < total && code.varnames[at] == name {
+            Some(at)
+        } else {
+            code.varnames[..total].iter().position(|v| v == name)
+        }
+        .filter(|&slot| slot >= code.posonly_count as usize);
         let slot = match bindable {
             Some(slot) => slot,
             // No keyword-bindable parameter of that name (a
@@ -561,23 +593,15 @@ pub fn attempt_specialize_call_kw(
                 perm |= KW_TO_VARKW << (4 * j);
                 continue;
             }
-            None => return InlineCache::Cooldown(COOLDOWN),
+            None => return None,
         };
         if covered & (1 << slot) != 0 {
-            return InlineCache::Cooldown(COOLDOWN);
+            return None;
         }
         perm |= (slot as u32) << (4 * j);
         covered |= 1 << slot;
     }
-    if !kw_uncovered_have_defaults(f, &code, covered) {
-        return InlineCache::Cooldown(COOLDOWN);
-    }
-    InlineCache::CallPyKwNames {
-        func_id: rc_id(f),
-        perm,
-        argc: argc as u8,
-        kwc: kwc as u8,
-    }
+    kw_uncovered_have_defaults(f, code, covered).then_some((perm, covered))
 }
 
 /// Every parameter slot `covered` leaves unbound carries a default:
@@ -599,7 +623,7 @@ pub fn kw_uncovered_have_defaults(
         covered & (1 << slot) != 0
             || f.kw_defaults
                 .iter()
-                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(String::as_str))
+                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(|n| n.as_str()))
     })
 }
 
