@@ -68,17 +68,17 @@ struct Scope {
     /// for functions; the parameter names themselves for
     /// [`ScopeKind::TypeParams`]. Consulted when resolving `nonlocal`
     /// declarations from nested scopes.
-    bound: std::collections::HashSet<String>,
+    bound: crate::fxhash::HashSet<String>,
     /// Names *read* so far, in source order (CPython's `USE` flag) —
     /// a later `global`/`nonlocal` for one of these is "used prior to
     /// … declaration".
-    used: std::collections::HashSet<String>,
+    used: crate::fxhash::HashSet<String>,
     /// Names assigned/deleted/bound so far (`DEF_LOCAL`) — a later
     /// declaration is "assigned to before … declaration".
-    assigned: std::collections::HashSet<String>,
+    assigned: crate::fxhash::HashSet<String>,
     /// Names annotated so far (`DEF_ANNOT`) — can never be declared
     /// global/nonlocal in this scope, before *or* after.
-    annotated: std::collections::HashSet<String>,
+    annotated: crate::fxhash::HashSet<String>,
 }
 
 impl Scope {
@@ -87,10 +87,10 @@ impl Scope {
             kind,
             params: Vec::new(),
             directives: Vec::new(),
-            bound: std::collections::HashSet::new(),
-            used: std::collections::HashSet::new(),
-            assigned: std::collections::HashSet::new(),
-            annotated: std::collections::HashSet::new(),
+            bound: crate::fxhash::HashSet::default(),
+            used: crate::fxhash::HashSet::default(),
+            assigned: crate::fxhash::HashSet::default(),
+            annotated: crate::fxhash::HashSet::default(),
         }
     }
 
@@ -281,12 +281,12 @@ impl Validator<'_> {
         // Body-level bindings (assignments, defs, imports, walrus
         // targets) participate in `nonlocal` resolution from nested
         // scopes.
-        let mut bound: std::collections::HashSet<String> =
+        let mut bound: crate::fxhash::HashSet<String> =
             params.iter().map(|(n, _)| (*n).to_owned()).collect();
         {
-            let mut globals = std::collections::HashSet::new();
-            let mut nonlocals = std::collections::HashSet::new();
-            let mut assigned = std::collections::HashSet::new();
+            let mut globals = crate::fxhash::HashSet::default();
+            let mut nonlocals = crate::fxhash::HashSet::default();
+            let mut assigned = crate::fxhash::HashSet::default();
             for s in body {
                 crate::collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
                 crate::collect_walrus_stmt(s, &mut assigned);

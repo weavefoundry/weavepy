@@ -20,12 +20,12 @@
 //!   peephole optimizer and adaptive specialization produce different
 //!   shapes that we deliberately don't reproduce.
 
+use fxhash::HashSet;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use bytecode::intrinsic;
-use indexmap::IndexMap;
+use fxhash::IndexMap;
 use thiserror::Error;
 use weavepy_parser::ast::{
     Arguments as AstArguments, BinOp, BoolOp, CmpOp, Comprehension, Constant as AstConstant,
@@ -38,6 +38,7 @@ pub mod bytecode;
 mod cache_snapshot;
 pub mod cpython_code;
 mod flowgraph;
+mod fxhash;
 mod intern;
 mod mangle;
 mod name;
@@ -1798,7 +1799,7 @@ fn collect_module_imports(body: &[Stmt]) -> HashSet<String> {
             }
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     walk(body, &mut out);
     out
 }
@@ -2447,7 +2448,7 @@ struct Compiler {
     /// `Nop`s standing in for a located `SETUP_*` pseudo-op (the `try:`
     /// line's NOP is really `SETUP_FINALLY`). The flowgraph keeps them
     /// as block-push instructions until `convert_pseudo_ops`.
-    setup_nops: std::collections::HashMap<u32, OpCode>,
+    setup_nops: fxhash::HashMap<u32, OpCode>,
     /// Suppress-path exit jumps parked by
     /// [`Self::emit_with_except_finish`] for its caller to patch.
     with_exit_jumps: Vec<u32>,
@@ -2820,10 +2821,10 @@ impl Compiler {
             name_index: intern::InternIndex::default(),
             kind,
             comp_kind: None,
-            bindings: IndexMap::new(),
-            explicit_globals: HashSet::new(),
-            comp_cell_only: HashSet::new(),
-            class_transparent_frees: HashSet::new(),
+            bindings: IndexMap::default(),
+            explicit_globals: HashSet::default(),
+            comp_cell_only: HashSet::default(),
+            class_transparent_frees: HashSet::default(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
@@ -2834,13 +2835,13 @@ impl Compiler {
             line_pinned: None,
             pinned_colspan: ColSpan::default(),
             current_span: (0, 0),
-            no_interrupt_jumps: HashSet::new(),
-            plain_jumps: HashSet::new(),
-            setup_nops: std::collections::HashMap::new(),
+            no_interrupt_jumps: HashSet::default(),
+            plain_jumps: HashSet::default(),
+            setup_nops: fxhash::HashMap::default(),
             with_exit_jumps: Vec::new(),
-            popblock_nops: HashSet::new(),
-            pseudo_cond_jumps: HashSet::new(),
-            backward_conds: HashSet::new(),
+            popblock_nops: HashSet::default(),
+            pseudo_cond_jumps: HashSet::default(),
+            backward_conds: HashSet::default(),
             stopiteration_wrap: true,
             inline_comp: 0,
             module_comp_plain_targets: Vec::new(),
@@ -2864,7 +2865,7 @@ impl Compiler {
             pep695_defaults: None,
             lazy_class_ctx: None,
             pending_lazy_class_ctx: None,
-            class_assigned: HashSet::new(),
+            class_assigned: HashSet::default(),
             deferred_annotations: Vec::new(),
             next_cond_annotation_index: 0,
             in_conditional_block: 0,
@@ -3752,7 +3753,7 @@ impl Compiler {
     fn analyze_scope_module(&mut self, module: &Module) {
         // At module scope every assigned name is a global (CPython
         // does the same — locals at module scope ARE the globals).
-        let mut assigned = HashSet::new();
+        let mut assigned = HashSet::default();
         for s in &module.body {
             collect_assigned(s, &mut assigned);
             collect_walrus_stmt(s, &mut assigned);
@@ -3766,7 +3767,7 @@ impl Compiler {
         // accesses compile to the *_GLOBAL opcodes instead of *_NAME.
         // Observable when `exec` runs with distinct globals/locals
         // mappings (test_scope.testGlobalInParallelNestedFunctions).
-        let mut explicit = HashSet::new();
+        let mut explicit = HashSet::default();
         for s in &module.body {
             collect_global_decls_deep(s, &mut explicit);
         }
@@ -3786,7 +3787,7 @@ impl Compiler {
             }
         }
         self.explicit_globals = explicit;
-        let mut comp_cells = HashSet::new();
+        let mut comp_cells = HashSet::default();
         for s in &module.body {
             self.collect_comp_cells_stmt(s, &mut comp_cells);
         }
@@ -3829,7 +3830,7 @@ impl Compiler {
         collect: impl Fn(&FreeScan, &mut HashSet<String>),
     ) -> HashSet<String> {
         let scan = self.free_scan(inline_comps);
-        let mut needed = HashSet::new();
+        let mut needed = HashSet::default();
         collect(&scan, &mut needed);
         needed
     }
@@ -3881,9 +3882,9 @@ impl Compiler {
         for p in params {
             self.bindings.insert(p.clone(), Binding::Local);
         }
-        let mut globals = HashSet::new();
-        let mut nonlocals = HashSet::new();
-        let mut assigned = HashSet::new();
+        let mut globals = HashSet::default();
+        let mut nonlocals = HashSet::default();
+        let mut assigned = HashSet::default();
         for s in body {
             collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
             // Walrus targets bind in this scope too (PEP 572) but live inside
@@ -3913,7 +3914,7 @@ impl Compiler {
             self.bindings.entry(n).or_insert(Binding::Local);
         }
         // Names referenced by directly-emitted bytecode in this scope.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         for s in body {
             collect_reads_stmt_fn(s, &mut reads);
         }
@@ -3983,7 +3984,7 @@ impl Compiler {
             }
         }
         if self.lazy_class_ctx.is_none() {
-            let mut comp_cells = HashSet::new();
+            let mut comp_cells = HashSet::default();
             for s in body {
                 self.collect_comp_cells_stmt(s, &mut comp_cells);
             }
@@ -3993,7 +3994,7 @@ impl Compiler {
             // (`return b` next to `[(lambda: b) for b in xs]` is a
             // LOAD_GLOBAL, test_listcomps
             // `test_global_outside_cellvar_inside_plus_freevar`).
-            let mut used = HashSet::new();
+            let mut used = HashSet::default();
             for s in body {
                 for_each_scope_expr(s, &mut |e| {
                     self.collect_uses_through_inlined(e, &mut Vec::new(), &mut used)
@@ -5613,7 +5614,7 @@ impl Compiler {
         // A class's own type parameters (and the header expressions
         // that mention them) mangle against the class's name.
         let mut type_params = type_params.clone();
-        let mut own_params: HashSet<String> = HashSet::new();
+        let mut own_params: HashSet<String> = HashSet::default();
         let mangle_header = is_class && !display.trim_start_matches('_').is_empty();
         if mangle_header {
             // Source spellings: `mangle_only_in_expr` renames exactly
@@ -6421,9 +6422,9 @@ impl Compiler {
         // never satisfies a nonlocal, and a class-body Local is a class
         // attribute, not a nonlocal binding target.
         {
-            let mut ng = HashSet::new();
-            let mut nl = HashSet::new();
-            let mut na = HashSet::new();
+            let mut ng = HashSet::default();
+            let mut nl = HashSet::default();
+            let mut na = HashSet::default();
             for s in body {
                 collect_decls(s, &mut ng, &mut nl, &mut na);
             }
@@ -7144,7 +7145,7 @@ impl Compiler {
                 class_body: false,
                 class_binds: None,
             };
-            let mut needed = HashSet::new();
+            let mut needed = HashSet::default();
             for s in body {
                 collect_inner_free(s, &self.bindings, &mut needed, &scan);
             }
@@ -7212,7 +7213,7 @@ impl Compiler {
                 .insert("__conditional_annotations__".to_owned(), Binding::Cell);
         }
 
-        let mut assigned = HashSet::new();
+        let mut assigned = HashSet::default();
         for s in body {
             collect_assigned(s, &mut assigned);
         }
@@ -7226,9 +7227,9 @@ impl Compiler {
         // nested `def X`/`class X` gets a bare qualname (see
         // `compute_child_qualname`).
         {
-            let mut globals = HashSet::new();
-            let mut nonlocals = HashSet::new();
-            let mut decl_assigned = HashSet::new();
+            let mut globals = HashSet::default();
+            let mut nonlocals = HashSet::default();
+            let mut decl_assigned = HashSet::default();
             for s in body {
                 collect_decls(s, &mut globals, &mut nonlocals, &mut decl_assigned);
             }
@@ -7269,7 +7270,7 @@ impl Compiler {
 
         // Resolve outer-scope free vars for names read by the body that
         // aren't bound locally.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         for s in body {
             collect_reads_stmt(s, &mut reads);
         }
@@ -7350,7 +7351,7 @@ impl Compiler {
         // `__classdict__` cells (`dictbytype` first, the implicit
         // cells appended by `compiler_enter_scope`).
         {
-            let mut comp_cells = HashSet::new();
+            let mut comp_cells = HashSet::default();
             for s in body {
                 inner.collect_comp_cells_stmt(s, &mut comp_cells);
             }
@@ -7536,7 +7537,7 @@ impl Compiler {
         // the class scope (nested functions included; nested classes
         // collect their own), regardless of parameter names.
         {
-            let mut attrs: HashSet<String> = HashSet::new();
+            let mut attrs: HashSet<String> = HashSet::default();
             collect_self_attr_stores(unmangled_body, "self", &mut attrs);
             let mut attrs: Vec<String> = attrs.into_iter().collect();
             attrs.sort();
@@ -11216,7 +11217,7 @@ impl Compiler {
         value: Option<&Expr>,
         generators: &[Comprehension],
     ) -> HashSet<String> {
-        let mut needed = HashSet::new();
+        let mut needed = HashSet::default();
         collect_comp_scope_inner_free(
             elt,
             value,
@@ -11225,7 +11226,7 @@ impl Compiler {
             &mut needed,
             &self.free_scan(true),
         );
-        let mut targets = HashSet::new();
+        let mut targets = HashSet::default();
         for g in generators {
             collect_target_names(&g.target, &mut targets);
         }
@@ -11280,7 +11281,7 @@ impl Compiler {
         // `[x for [x for x in r][0] in l]` keeps the outer `x` as the
         // enclosing scope's variable rather than a hidden local
         // (test_listcomps `test_nested_2`).
-        let mut used = HashSet::new();
+        let mut used = HashSet::default();
         for (gi, g) in generators.iter().enumerate() {
             Self::collect_names_shallow(&g.target, &mut used);
             if gi > 0 {
@@ -11365,7 +11366,7 @@ impl Compiler {
         }
         let depth = bound.len();
         for g in generators {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             collect_target_names(&g.target, &mut names);
             bound.extend(names);
         }
@@ -11857,7 +11858,7 @@ impl Compiler {
         // an extra strong reference for the whole activation, and pandas'
         // chained-assignment detection (`getrefcount(self) <= 3` in
         // `DataFrame.__setitem__`) is calibrated against CPython counts.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         collect_reads_expr(elt, &mut reads);
         if let Some(v) = value {
             collect_reads_expr(v, &mut reads);
@@ -11880,7 +11881,7 @@ impl Compiler {
         // one — silently aliasing later closure reads. CPython's symtable binds
         // comprehension targets first for exactly this reason.
         for g in generators {
-            let mut assigned = HashSet::new();
+            let mut assigned = HashSet::default();
             collect_target_names(&g.target, &mut assigned);
             for n in assigned {
                 inner.bindings.insert(n, Binding::Local);
@@ -12014,7 +12015,7 @@ impl Compiler {
                 }
             }
             if inner.lazy_class_ctx.is_none() {
-                let mut comp_cells = HashSet::new();
+                let mut comp_cells = HashSet::default();
                 for (gi, g) in generators.iter().enumerate() {
                     if gi > 0 {
                         inner.collect_comp_cells_expr(&g.iter, &mut comp_cells);
@@ -12659,7 +12660,7 @@ fn check_comp_walrus_nest(
         // iterable (test_named_expressions' "Lambda expression" /
         // "Nested comprehension body" cases).
         reject_walrus_in_iterable(&g.iter)?;
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         collect_target_names(&g.target, &mut names);
         for scope in stack.iter() {
             for n in &names {
@@ -13081,7 +13082,7 @@ fn collect_pep695_header_reads(
     out: &mut HashSet<String>,
     scan: &FreeScan,
 ) {
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     let mut read = |e: &Expr| collect_class_visible_reads(e, outer_bindings, &mut reads, scan);
     let (type_params, fn_parts) = match &stmt.kind {
         StmtKind::FunctionDef {
@@ -13353,7 +13354,7 @@ fn collect_inner_free(
     // enclosing `T = …` must not become a cell for a nested
     // `def f[T](x: T)`).
     if let Some(type_params) = generic_type_params(stmt) {
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         collect_pep695_header_reads(stmt, outer_bindings, &mut inner, scan);
         collect_inner_free_impl(stmt, outer_bindings, &mut inner, scan);
         remove_type_param_names(stmt, type_params, &mut inner);
@@ -13490,7 +13491,7 @@ fn collect_inner_free_impl(
             // The body is its own scope, no longer directly in a class
             // body.
             let scan = &scan.nested();
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
                 inner_locals.insert(a.name.clone());
             }
@@ -13506,9 +13507,9 @@ fn collect_inner_free_impl(
             if let Some(kw) = &args.kwarg {
                 inner_locals.insert(kw.name.clone());
             }
-            let mut inner_globals = HashSet::new();
-            let mut inner_nonlocals = HashSet::new();
-            let mut inner_assigned = HashSet::new();
+            let mut inner_globals = HashSet::default();
+            let mut inner_nonlocals = HashSet::default();
+            let mut inner_assigned = HashSet::default();
             for s in body {
                 collect_decls(
                     s,
@@ -13527,7 +13528,7 @@ fn collect_inner_free_impl(
             }
             // Reads inside the inner that aren't locals there →
             // candidates for promotion.
-            let mut inner_reads = HashSet::new();
+            let mut inner_reads = HashSet::default();
             for s in body {
                 collect_reads_stmt_fn(s, &mut inner_reads);
             }
@@ -13554,7 +13555,7 @@ fn collect_inner_free_impl(
             // the child's cell, not ours (`def _tp_cache(func): def
             // decorator(func): def inner(): func` must not promote the
             // outer `func`). `nonlocal` in the child reaches through.
-            let mut deeper = HashSet::new();
+            let mut deeper = HashSet::default();
             for s in body {
                 collect_inner_free(s, outer_bindings, &mut deeper, scan);
             }
@@ -13601,26 +13602,26 @@ fn collect_inner_free_impl(
                 mangled_body = b;
                 &mangled_body
             };
-            let mut class_assigned = HashSet::new();
-            let mut class_globals = HashSet::new();
-            let mut class_nonlocals = HashSet::new();
+            let mut class_assigned = HashSet::default();
+            let mut class_globals = HashSet::default();
+            let mut class_nonlocals = HashSet::default();
             for s in body {
                 collect_assigned(s, &mut class_assigned);
                 collect_decls(
                     s,
                     &mut class_globals,
                     &mut class_nonlocals,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 );
             }
             // Names referenced *anywhere* in the class body (including
             // method bodies) that aren't bound inside the class are
             // candidates for outer-scope free promotion.
-            let mut class_reads = HashSet::new();
+            let mut class_reads = HashSet::default();
             for s in body {
                 collect_reads_stmt(s, &mut class_reads);
             }
-            let mut from_body = HashSet::new();
+            let mut from_body = HashSet::default();
             for r in class_reads {
                 if !class_assigned.contains(&r) {
                     from_body.insert(r);
@@ -13780,7 +13781,7 @@ fn collect_inner_free_impl(
                 // (GLOBAL_IMPLICIT), never as a free variable of the
                 // enclosing function (`class D: C: C = field()` inside
                 // a `def` where `C` is a local).
-                let mut reads = HashSet::new();
+                let mut reads = HashSet::default();
                 collect_reads_expr(annotation, &mut reads);
                 for r in reads {
                     if !scan.class_binds.as_ref().is_some_and(|b| b.contains(&r)) {
@@ -13830,9 +13831,9 @@ fn collect_inner_free_impl(
 /// `True` when a method body references `super` or `__class__` so the
 /// compiler knows to capture the class's `__class__` cell.
 fn method_references_class(body: &[Stmt]) -> bool {
-    let mut globals = HashSet::new();
-    let mut nonlocals = HashSet::new();
-    let mut assigned = HashSet::new();
+    let mut globals = HashSet::default();
+    let mut nonlocals = HashSet::default();
+    let mut assigned = HashSet::default();
     for s in body {
         collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
         collect_walrus_stmt(s, &mut assigned);
@@ -13927,7 +13928,7 @@ fn body_reads_super_or_class(body: &[Stmt]) -> bool {
         }
         any_class(stmts)
     };
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     if has_nested_class(body) {
         // Only clone when there is a class body to blank out.
         let mut stripped = body.to_vec();
@@ -14694,7 +14695,7 @@ fn collect_class_visible_reads(
     out: &mut HashSet<String>,
     scan: &FreeScan,
 ) {
-    let mut all = HashSet::new();
+    let mut all = HashSet::default();
     collect_reads_expr(expr, &mut all);
     if let Some(binds) = &scan.class_binds {
         all.retain(|n| !binds.contains(n));
@@ -14750,7 +14751,7 @@ fn collect_inlined_comp_inner_free(
     if let Some(first) = generators.first() {
         collect_inner_free_expr(&first.iter, outer_bindings, out, scan);
     }
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     collect_comp_scope_inner_free(elt, value, generators, outer_bindings, &mut inner, scan);
     if scan.class_body {
         // The class namespace is invisible from inside the
@@ -14770,7 +14771,7 @@ fn collect_inlined_comp_inner_free(
         }
         collect_reads_expr(elt, &mut inner);
     }
-    let mut bound = HashSet::new();
+    let mut bound = HashSet::default();
     for g in generators {
         collect_target_names(&g.target, &mut bound);
     }
@@ -14821,7 +14822,7 @@ fn collect_inner_free_expr(
             collect_class_visible_reads(body, outer_bindings, out, scan);
         }
         ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
                 inner_locals.insert(a.name.clone());
             }
@@ -14837,7 +14838,7 @@ fn collect_inner_free_expr(
             if let Some(kw) = &args.kwarg {
                 inner_locals.insert(kw.name.clone());
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(body, &mut reads);
             for r in reads {
                 if !inner_locals.contains(&r) {
@@ -14871,11 +14872,11 @@ fn collect_inner_free_expr(
         ExprKind::ListComp { elt, generators }
         | ExprKind::SetComp { elt, generators }
         | ExprKind::GeneratorExp { elt, generators } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for g in generators {
                 collect_target_names(&g.target, &mut inner_locals);
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(elt, &mut reads);
             for (gi, g) in generators.iter().enumerate() {
                 // The outermost iterable evaluates in the *enclosing*
@@ -14907,11 +14908,11 @@ fn collect_inner_free_expr(
             value,
             generators,
         } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for g in generators {
                 collect_target_names(&g.target, &mut inner_locals);
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(key, &mut reads);
             collect_reads_deep(value, &mut reads);
             for (gi, g) in generators.iter().enumerate() {
@@ -15965,7 +15966,7 @@ fn class_level_reads_dunder(body: &[Stmt], name: &str) -> bool {
 /// enclosing function's `c`, while `class B: c: str` or `class B: x = 1;
 /// y = x` alone never does).
 fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut inner, false);
     }
@@ -15984,16 +15985,16 @@ fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
     // when read at class level, and through `__classdict__` in a
     // class-visible annotation scope; only a nested scope's free read
     // of it looks past the class.
-    let mut class_bound = HashSet::new();
-    let mut class_globals = HashSet::new();
-    let mut class_nonlocals = HashSet::new();
+    let mut class_bound = HashSet::default();
+    let mut class_globals = HashSet::default();
+    let mut class_nonlocals = HashSet::default();
     for s in body {
         collect_assigned(s, &mut class_bound);
         collect_decls(
             s,
             &mut class_globals,
             &mut class_nonlocals,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         );
     }
     let shadowed: Vec<String> = inner
@@ -16005,7 +16006,7 @@ fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
         .cloned()
         .collect();
     if !shadowed.is_empty() {
-        let mut nested = HashSet::new();
+        let mut nested = HashSet::default();
         class_nested_scope_reads(body, &mut nested);
         for n in shadowed {
             if !nested.contains(&n) {
@@ -16031,7 +16032,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
                 {
                     expr_nested(d, out);
                 }
-                let mut inner = HashSet::new();
+                let mut inner = HashSet::default();
                 collect_reads_expr(body, &mut inner);
                 for a in args
                     .posonlyargs
@@ -16071,7 +16072,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
         if let Some(first) = generators.first() {
             expr_nested(&first.iter, out);
         }
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         for (gi, g) in generators.iter().enumerate() {
             if gi > 0 {
                 collect_reads_expr(&g.iter, &mut inner);
@@ -16085,7 +16086,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
             collect_reads_expr(v, &mut inner);
         }
         collect_reads_expr(elt, &mut inner);
-        let mut bound = HashSet::new();
+        let mut bound = HashSet::default();
         for g in generators {
             collect_target_names(&g.target, &mut bound);
         }
@@ -16146,7 +16147,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
                     mangled_body = b;
                     &mangled_body
                 };
-                let mut through = HashSet::new();
+                let mut through = HashSet::default();
                 class_body_propagating_reads(body, &mut through);
                 for dunder in CLASS_DUNDERS {
                     through.remove(dunder);
@@ -16265,11 +16266,11 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
 /// reach up even when only written). Decorators, defaults and
 /// annotations are the enclosing scope's business.
 fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
-    let mut nested_reads = HashSet::new();
+    let mut nested_reads = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut nested_reads, true);
     }
-    let mut nested_locals: HashSet<String> = HashSet::new();
+    let mut nested_locals: HashSet<String> = HashSet::default();
     for a in args
         .posonlyargs
         .iter()
@@ -16280,9 +16281,9 @@ fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
     {
         nested_locals.insert(a.name.clone());
     }
-    let mut nested_globals = HashSet::new();
-    let mut nested_nonlocals = HashSet::new();
-    let mut nested_assigned = HashSet::new();
+    let mut nested_globals = HashSet::default();
+    let mut nested_nonlocals = HashSet::default();
+    let mut nested_assigned = HashSet::default();
     for s in body {
         collect_decls(
             s,
@@ -16433,7 +16434,7 @@ fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
             }
         }
     }
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     for s in body {
         stmt_reads(s, &mut reads, name);
     }
@@ -16445,7 +16446,7 @@ fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
 /// scope are skipped except for the parts evaluated in the enclosing
 /// scope (lambda defaults, a comprehension's outermost iterable).
 fn stmt_reads_dunder_at_class_level(stmt: &Stmt, name: &str) -> bool {
-    let mut all = HashSet::new();
+    let mut all = HashSet::default();
     collect_reads_stmt(stmt, &mut all);
     if !all.contains(name) {
         return false;
@@ -17139,7 +17140,7 @@ fn collect_reads_stmt_in(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: bool)
     // See `collect_inner_free`: a generic statement's type parameters
     // are its hidden scope's locals, never reads of this scope.
     if let Some(type_params) = generic_type_params(stmt) {
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         collect_reads_stmt_in_impl(stmt, &mut inner, fn_scope);
         remove_type_param_names(stmt, type_params, &mut inner);
         out.extend(inner);
@@ -17271,7 +17272,7 @@ fn collect_reads_stmt_in_impl(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: 
         StmtKind::TypeAlias {
             type_params, value, ..
         } => {
-            let mut nested = HashSet::new();
+            let mut nested = HashSet::default();
             collect_reads_expr(value, &mut nested);
             for tp in type_params {
                 if let TypeParamKind::TypeVar { bound: Some(b) } = &tp.kind {
@@ -17458,7 +17459,7 @@ fn collect_comp_reads(
     if let Some(first) = generators.first() {
         collect_reads_expr(&first.iter, out);
     }
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     for (gi, g) in generators.iter().enumerate() {
         if gi > 0 {
             collect_reads_expr(&g.iter, &mut inner);
@@ -17474,7 +17475,7 @@ fn collect_comp_reads(
         collect_reads_expr(v, &mut inner);
     }
     collect_reads_expr(elt, &mut inner);
-    let mut bound = HashSet::new();
+    let mut bound = HashSet::default();
     for g in generators {
         collect_target_names(&g.target, &mut bound);
     }
@@ -17554,7 +17555,7 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
             }
             // The body is its own scope: what it reads reaches us only
             // when the lambda doesn't bind it itself (its parameters).
-            let mut inner = HashSet::new();
+            let mut inner = HashSet::default();
             collect_reads_expr(body, &mut inner);
             for a in args
                 .posonlyargs

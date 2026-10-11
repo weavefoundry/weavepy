@@ -398,19 +398,19 @@ fn is_unary_not(i: &CfgInstr) -> bool {
 pub(crate) struct BuildInput<'a> {
     /// Unconditional jumps CPython's codegen emits as the plain `JUMP`
     /// pseudo-op; every other one is `JUMP_NO_INTERRUPT`.
-    pub plain_jumps: &'a std::collections::HashSet<u32>,
+    pub plain_jumps: &'a crate::fxhash::HashSet<u32>,
     /// Unconditional jumps codegen flagged `JUMP_NO_INTERRUPT`.
-    pub no_interrupt_jumps: &'a std::collections::HashSet<u32>,
+    pub no_interrupt_jumps: &'a crate::fxhash::HashSet<u32>,
     /// `Nop`s standing in for a `SETUP_*` pseudo-op.
-    pub setup_nops: &'a std::collections::HashMap<u32, OpCode>,
+    pub setup_nops: &'a crate::fxhash::HashMap<u32, OpCode>,
     /// `Nop`s standing in for a `POP_BLOCK` pseudo-op.
-    pub popblock_nops: &'a std::collections::HashSet<u32>,
+    pub popblock_nops: &'a crate::fxhash::HashSet<u32>,
     /// Conditional jumps that, together with the `COPY 1; TO_BOOL`
     /// preceding them, stand for a `JUMP_IF_FALSE` / `JUMP_IF_TRUE`
     /// pseudo-op.
-    pub pseudo_cond_jumps: &'a std::collections::HashSet<u32>,
+    pub pseudo_cond_jumps: &'a crate::fxhash::HashSet<u32>,
     /// Conditional jumps whose `arg` is a *backward* distance.
-    pub backward_conds: &'a std::collections::HashSet<u32>,
+    pub backward_conds: &'a crate::fxhash::HashSet<u32>,
     /// The code unit carries the PEP 479 `SETUP_CLEANUP` wrap (its
     /// range is the last exception-table entry).
     pub stopiteration_wrap: bool,

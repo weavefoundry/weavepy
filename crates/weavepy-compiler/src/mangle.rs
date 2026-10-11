@@ -15,7 +15,7 @@
 //! are mangled against their own (innermost) class name when their own
 //! body is compiled.
 
-use std::collections::HashSet;
+use crate::fxhash::HashSet;
 
 use weavepy_parser::ast::{
     Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Pattern, PatternKind, Stmt,
@@ -45,7 +45,7 @@ pub(crate) fn mangle_class_body(class_name: &str, body: &mut [Stmt]) {
     }
     let m = Mangler {
         prefix: format!("_{stripped}"),
-        skip: HashSet::new(),
+        skip: HashSet::default(),
         only: None,
     };
     for s in body {
@@ -82,7 +82,7 @@ pub(crate) fn mangle_only_in_expr(class_name: &str, names: &HashSet<String>, exp
     }
     let m = Mangler {
         prefix: format!("_{stripped}"),
-        skip: HashSet::new(),
+        skip: HashSet::default(),
         only: Some(names.clone()),
     };
     m.expr(expr);
