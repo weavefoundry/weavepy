@@ -1086,6 +1086,10 @@ pub struct InstancePlan {
     /// `Interpreter::core_store_init`): `0` not yet proven, `1` proven
     /// for this class version, `2` never.
     pub store_init: std::sync::atomic::AtomicU8,
+    /// A store-only `__init__`'s laid-out member positions, in store
+    /// order, once its stores proved them for this class version (see
+    /// `Interpreter::core_store_init`).
+    pub slot_members: std::sync::OnceLock<Box<[u8]>>,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see

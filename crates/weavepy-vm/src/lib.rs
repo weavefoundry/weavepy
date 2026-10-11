@@ -17164,15 +17164,17 @@ impl Interpreter {
                     Rc::as_ptr(code),
                 );
                 let missing = Self::missing_defaults(init, code, argc + 1).filter(|_| same)?;
-                Some((ty.clone(), init.clone(), code.clone(), missing))
+                Some((ty.clone(), plan.clone(), missing))
             });
-        if let Some((ty, init, code, missing)) = proven {
+        if let Some((ty, plan, missing)) = proven {
+            let (init, code) = plan.lean_init.as_ref().expect("checked above");
             if self.core_store_init(
                 frame,
                 &ty,
-                &init,
-                &code,
-                None,
+                &plan,
+                init,
+                code,
+                false,
                 argc,
                 missing,
                 self_slot,
@@ -17265,9 +17267,10 @@ impl Interpreter {
             && self.core_store_init(
                 frame,
                 &ty,
+                &plan,
                 init,
                 code,
-                Some(&plan.store_init),
+                true,
                 argc,
                 missing,
                 self_slot,
@@ -17379,16 +17382,18 @@ impl Interpreter {
     /// arguments the stores don't take are released. `false` touches
     /// nothing.
     ///
-    /// `proving` is the class plan's verdict to record when the stores
-    /// prove (or disprove) the shape; `None` when the plan proved it.
+    /// With `prove`, the stores prove (or disprove) the shape, which the
+    /// class's `plan` records; without, the plan proved it. A laid-out
+    /// class's member positions are proved once per plan.
     #[allow(clippy::too_many_arguments)]
     fn core_store_init(
         &self,
         frame: &mut Frame,
         ty: &Rc<TypeObject>,
+        plan: &crate::types::InstancePlan,
         init: &Rc<crate::object::PyFunction>,
         code: &Rc<CodeObject>,
-        proving: Option<&std::sync::atomic::AtomicU8>,
+        prove: bool,
         argc: usize,
         missing: usize,
         self_slot: usize,
@@ -17422,9 +17427,13 @@ impl Interpreter {
         // instances (sites another version recorded say nothing), whose
         // layout positions the stores then fill. A site that recorded
         // anything else for this version never will.
+        let proving = prove.then_some(&plan.store_init);
         let laid_out = ty.slot_layout.get().and_then(Option::as_ref);
         let mut members = [0u8; crate::inst_dict::SHARED_KEYS_CAP];
-        if laid_out.is_some() {
+        let n = shape.stores.len();
+        if let (Some(_), Some(proved)) = (laid_out, plan.slot_members.get()) {
+            members[..n].copy_from_slice(proved);
+        } else if laid_out.is_some() {
             let mut seen = 0u64;
             for (k, &(pc, _)) in shape.stores.iter().enumerate() {
                 match slots.get(pc as usize).map(FieldSlot::get) {
@@ -17447,6 +17456,8 @@ impl Interpreter {
                     _ => return false,
                 }
             }
+            // (The positions hold for this class version: its plan's.)
+            let _ = plan.slot_members.set(members[..n].into());
         } else if let Some(proving) = proving {
             // Every store's site must have last stored the next position
             // of this class version's instances. A site proven for another
@@ -17518,31 +17529,44 @@ impl Interpreter {
                 StoreSrc::Const(c) => consts[c as usize].clone(),
                 StoreSrc::Int(n) => Object::Int(n),
             };
-            if let Some(layout) = laid_out {
-                // The member's place (the write barrier first).
-                i.note_slot_store(&value);
-                // SAFETY: the instance is fresh and unshared; its slots
-                // were laid out over its class's layout at allocation.
-                let place = unsafe { i.slots.peek_mut() }
-                    .and_then(|s| s.values_for_layout_mut(layout))
-                    .and_then(|v| v.get_mut(usize::from(members[k])));
-                match place {
-                    Some(place) => drop(std::mem::replace(place, value)),
-                    None => {
-                        // (Unreachable for a fresh instance; the plain
-                        // store keeps it correct regardless.)
+            split_vals[k].write(value);
+        }
+        if let Some(layout) = laid_out {
+            // SAFETY: the first `n` entries were written above; each is
+            // read exactly once, below.
+            let vals = unsafe {
+                std::slice::from_raw_parts_mut(split_vals.as_mut_ptr().cast::<Object>(), n)
+            };
+            // The write barrier once (`note_slot_store`'s), then each value
+            // into its member's place through one borrow.
+            if !vals.iter().all(Object::is_gc_atomic) {
+                i.ensure_gc_tracked();
+            }
+            // SAFETY: the instance is fresh and unshared; its slots were
+            // laid out over its class's layout at allocation.
+            match unsafe { i.slots.peek_mut() }.and_then(|s| s.values_for_layout_mut(layout)) {
+                Some(places) if members[..n].iter().all(|&m| usize::from(m) < places.len()) => {
+                    for k in 0..n {
+                        // SAFETY: as above.
+                        let value = unsafe { std::ptr::read(&vals[k]) };
+                        drop(std::mem::replace(&mut places[usize::from(members[k])], value));
+                    }
+                }
+                _ => {
+                    // (Unreachable for a fresh instance; the plain stores
+                    // keep it correct regardless.)
+                    for k in 0..n {
+                        // SAFETY: as above.
+                        let value = unsafe { std::ptr::read(&vals[k]) };
                         let at = code.instructions[shape.stores[k].0 as usize].arg;
                         if let Some(name) = code.names.get(at as usize) {
                             i.slot_set(name, value);
                         }
                     }
                 }
-                continue;
             }
-            split_vals[k].write(value);
         }
         if let Some(keys) = keys {
-            let n = shape.stores.len();
             // SAFETY: the first `n` entries were written above; each is
             // read exactly once, by the fill or by the stores after it.
             let vals = unsafe {
@@ -55369,6 +55393,7 @@ impl Interpreter {
             tuple_new,
             bare_alloc,
             store_init: std::sync::atomic::AtomicU8::new(0),
+            slot_members: std::sync::OnceLock::new(),
         }
     }
 
