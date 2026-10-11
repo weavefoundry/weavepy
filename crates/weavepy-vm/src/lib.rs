@@ -10255,6 +10255,75 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
     }
 
+    /// `container[key] = value` (the `STORE_SUBSCR` at `pc` of `frame`)
+    /// for an instance whose class's `__setitem__` is a plain Python
+    /// function of `(self, key, value)`, as an inline activation of it
+    /// (CPython calls it from `STORE_SUBSCR` alike): the three operands
+    /// leave the stack as its arguments, and its result is discarded.
+    fn try_inline_setitem(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        // Stack (top-down): key, container, value.
+        let n = frame.stack.len();
+        if n < 3 {
+            return None;
+        }
+        let Object::Instance(inst) = &frame.stack[n - 2] else {
+            return None;
+        };
+        // The site remembers the function by the class's attribute version.
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(&frame.code, pc as u32);
+        let f = match slot.and_then(|s| s.get_held(ver)) {
+            Some(f) => f,
+            None => {
+                let Some(Object::Function(f)) = cls.lookup("__setitem__") else {
+                    return None;
+                };
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                f
+            }
+        };
+        let code = f.code();
+        if code.arg_count != 3
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let key = frame.stack.pop()?;
+        let container = frame.stack.pop()?;
+        let value = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(container);
+        locals.push(key);
+        locals.push(value);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
+        act.discard = true;
+        Some(act)
+    }
+
     /// `FOR_ITER` over a generator, from the quiet loop: the generator
     /// resumes as a lean activation (see `generator_send_lean`); its
     /// value is pushed, or on exhaustion the loop exits exactly as the
@@ -11008,6 +11077,7 @@ impl Interpreter {
             let frame = unsafe { &*sw.cur };
             match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
                 Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => return None,
+                Some(OpCode::StoreSubscr) if self.core_setitem(sw) => return None,
                 Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => return None,
                 Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => return None,
                 Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => return None,
@@ -16382,6 +16452,34 @@ impl Interpreter {
             } else {
                 self.try_inline_getitem(&mut *frame, shell, pc)
             }
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_getitem`] for a `STORE_SUBSCR` the instance's Python
+    /// `__setitem__` serves ([`Self::try_inline_setitem`]). `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_setitem(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_setitem(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
             return false;
