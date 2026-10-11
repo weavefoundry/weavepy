@@ -434,6 +434,23 @@ pub(crate) static RELEASE_GATES: ReleaseGates = ReleaseGates {
     reftrace_print: std::sync::atomic::AtomicBool::new(false),
 };
 
+/// The four [`RELEASE_GATES`] flags read with one 32-bit load, as compiled
+/// code reads them (see [`crate::plain_release_gate`]): zero when a shared
+/// value's release is a plain decrement.
+#[inline(always)]
+pub(crate) fn release_gates() -> u32 {
+    // SAFETY: `ReleaseGates` is four `AtomicBool`s, 4-aligned (`repr(C)`):
+    // its bytes are a valid `AtomicU32`, read (relaxed) as one word.
+    unsafe {
+        (*std::ptr::from_ref(&RELEASE_GATES).cast::<std::sync::atomic::AtomicU32>())
+            .load(Ordering::Relaxed)
+    }
+}
+
+/// The [`release_gates`] bits of the release observers alone (every flag
+/// but the reference-count bias's `rc_shared`).
+pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff, 0xff]);
+
 /// Whether reference counts must be updated atomically: set whenever the
 /// cell bias is revoked, and also before spawning a thread that may touch
 /// objects before it registers (see [`crate::rc`]). Never cleared.

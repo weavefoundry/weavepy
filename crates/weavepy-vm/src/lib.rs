@@ -2567,6 +2567,28 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::release`] with a shared value's plain decrement in line (the
+    /// core loop's arms that end a binding): only a last owner's release,
+    /// or one an observer watches, takes the full path.
+    #[inline(always)]
+    fn release_hot(&self, dropped: Object) {
+        let Some(word) = dropped.strong_word() else {
+            return std::mem::forget(dropped);
+        };
+        // A clear gate word: the bias holds (this thread alone updates
+        // counts) and no observer watches releases.
+        if crate::sync::release_gates() == 0 {
+            // SAFETY: `dropped` owns a reference to the live allocation.
+            let w = unsafe { &*word };
+            let c = w.load(std::sync::atomic::Ordering::Relaxed);
+            if c != 1 {
+                w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+                return std::mem::forget(dropped);
+            }
+        }
+        self.release(dropped);
+    }
+
     /// Release a finished call's arguments now, before the caller handles
     /// the result (CPython's `CALL` decrefs its operands first): an
     /// argument only the call held dies here, finalizers and all.
@@ -10859,117 +10881,180 @@ impl Interpreter {
             let exit = self.leaf_core::<false>(sw, snap_gen);
             match exit {
                 #[cfg(feature = "jit")]
-                CoreExit::Switch => {
-                    native = !native;
-                    continue;
-                }
+                CoreExit::Switch => native = !native,
                 CoreExit::Stop(stop) => return stop,
-                CoreExit::Helper => {
-                    // SAFETY: see `CoreSwitch` (the running activation's
-                    // handles; nothing else borrows them here).
-                    let frame = unsafe { &mut *sw.cur };
-                    if burst_stats::enabled() {
-                        if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
-                            burst_stats::note_helper(ins.op);
-                            let recv = frame.stack.last().map_or("-", |v| v.type_name());
-                            burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
-                        }
-                    }
-                    // A cached property site skips the helper's resolution: a
-                    // pure leaf getter is evaluated in place, any other runs
-                    // as an inline activation.
-                    let pc = frame.pc as usize;
-                    if frame
-                        .code
-                        .instructions
-                        .get(pc)
-                        .is_some_and(|i| i.op == OpCode::LoadAttr)
-                    {
-                        if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
-                            // SAFETY: as above.
-                            let last_pc = unsafe { &mut *sw.last };
-                            if self.core_leaf_property(frame, last_pc, pc, &getter, &code) {
-                                // SAFETY: the running thread's own flag.
-                                if unsafe { (*sw.maybe_dead).get() } {
-                                    return LeafStop::Marked;
-                                }
-                                continue;
-                            }
-                            if self.core_property(sw) {
-                                continue;
-                            }
-                        }
-                    }
-                    // SAFETY: as above (`core_property` declined untouched).
-                    let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
-                    match self.leaf_core_helper(frame, last_pc) {
-                        // A released receiver or argument may have queued
-                        // a finalizer (see `after_release!` in the core).
-                        // SAFETY: the running thread's own flag.
-                        CoreAttr::Done if unsafe { (*sw.maybe_dead).get() } => {
-                            return LeafStop::Marked;
-                        }
-                        CoreAttr::Done => continue,
-                        CoreAttr::Raised(e) => return LeafStop::Raised(e),
-                        CoreAttr::Full => return LeafStop::Step,
-                        CoreAttr::Decline => {
-                            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
-                                Some(OpCode::LoadAttr)
-                                    if self.core_property(sw) || self.core_getitem(sw, true) =>
-                                {
-                                    continue
-                                }
-                                Some(OpCode::StoreAttr) if self.core_setter(sw) => continue,
-                                Some(OpCode::CallKw | OpCode::CallEx)
-                                    if self.core_call_lane(sw) =>
-                                {
-                                    continue
-                                }
-                                Some(OpCode::Call)
-                                    if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
-                                {
-                                    continue
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
                 CoreExit::Slow => {
-                    // SAFETY: as above.
-                    let frame = unsafe { &*sw.cur };
-                    match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
-                        Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => continue,
-                        Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => continue,
-                        Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
-                            continue
-                        }
-                        Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => {
-                            continue
-                        }
-                        Some(OpCode::BinaryOp | OpCode::CompareOp)
-                            if self.core_operator_lane(sw) =>
-                        {
-                            continue
-                        }
-                        _ => {}
+                    if let Some(stop) = self.core_offload(sw, snap_gen, false) {
+                        return stop;
                     }
                 }
                 CoreExit::Reload => unreachable!("handled inside the core loop"),
             }
-            // SAFETY: as above.
-            let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
-            match self.leaf_burst_slow(frame, snap_gen, last_pc) {
-                // SAFETY: as above.
-                LeafStop::Core if unsafe { (*sw.maybe_dead).get() } => return LeafStop::Marked,
-                LeafStop::Core => {}
-                stop => return stop,
-            }
         }
     }
 
+    /// Run the instruction the core loop handed over at `sw`'s (synced)
+    /// running activation's pc: out of line (`helper`: the fused shapes,
+    /// cache hits and leaf calls of [`Self::leaf_core_helper`] and the
+    /// lanes) or with the full leaf arms. `None` when the core loop goes on
+    /// (on the activation `sw` now runs), else how the burst ends.
+    #[inline(never)]
+    fn core_offload(
+        &mut self,
+        sw: &mut CoreSwitch,
+        snap_gen: u64,
+        helper: bool,
+    ) -> Option<LeafStop> {
+        if helper {
+            // SAFETY: see `CoreSwitch` (the running activation's handles;
+            // nothing else borrows them here).
+            let frame = unsafe { &mut *sw.cur };
+            if burst_stats::enabled() {
+                if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
+                    burst_stats::note_helper(ins.op);
+                    let recv = frame.stack.last().map_or("-", |v| v.type_name());
+                    burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
+                }
+            }
+            // A cached property site skips the helper's resolution: a
+            // pure leaf getter is evaluated in place, any other runs as an
+            // inline activation.
+            let pc = frame.pc as usize;
+            if frame
+                .code
+                .instructions
+                .get(pc)
+                .is_some_and(|i| i.op == OpCode::LoadAttr)
+            {
+                if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
+                    // SAFETY: as above.
+                    let last_pc = unsafe { &mut *sw.last };
+                    if self.core_leaf_property(frame, last_pc, pc, &getter, &code) {
+                        // SAFETY: the running thread's own flag.
+                        if unsafe { (*sw.maybe_dead).get() } {
+                            return Some(LeafStop::Marked);
+                        }
+                        return None;
+                    }
+                    if self.core_property(sw) {
+                        return None;
+                    }
+                }
+            }
+            // SAFETY: as above (`core_property` declined untouched).
+            let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+            match self.leaf_core_helper(frame, last_pc) {
+                // A released receiver or argument may have queued a
+                // finalizer (see `after_release!` in the core).
+                // SAFETY: the running thread's own flag.
+                CoreAttr::Done if unsafe { (*sw.maybe_dead).get() } => {
+                    return Some(LeafStop::Marked);
+                }
+                CoreAttr::Done => return None,
+                CoreAttr::Raised(e) => return Some(LeafStop::Raised(e)),
+                CoreAttr::Full => return Some(LeafStop::Step),
+                CoreAttr::Decline => {
+                    match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                        Some(OpCode::LoadAttr)
+                            if self.core_property(sw) || self.core_getitem(sw, true) =>
+                        {
+                            return None
+                        }
+                        Some(OpCode::StoreAttr) if self.core_setter(sw) => return None,
+                        Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
+                            return None
+                        }
+                        Some(OpCode::Call)
+                            if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
+                        {
+                            return None
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            // SAFETY: as above.
+            let frame = unsafe { &*sw.cur };
+            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => return None,
+                Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => return None,
+                Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => return None,
+                Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => return None,
+                Some(OpCode::BinaryOp | OpCode::CompareOp) if self.core_operator_lane(sw) => {
+                    return None
+                }
+                _ => {}
+            }
+        }
+        // SAFETY: as above.
+        let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+        match self.leaf_burst_slow(frame, snap_gen, last_pc) {
+            // SAFETY: as above.
+            LeafStop::Core if unsafe { (*sw.maybe_dead).get() } => Some(LeafStop::Marked),
+            LeafStop::Core => None,
+            stop => Some(stop),
+        }
+    }
+
+    /// [`Self::core_offload`] from inside [`Self::leaf_core`]'s loop, which
+    /// holds the running activation at `at` with its operand stack at
+    /// `base` (capacity `cap`): synced, then run. `true` when the loop goes
+    /// on in place, at the new `at`: the same activation, its stack where
+    /// it was, nothing pending (what a reload would derive again is
+    /// unchanged). Otherwise the loop reloads, which ends the burst first
+    /// if it must (`sw.pending`).
+    ///
+    /// # Safety
+    ///
+    /// `at`, `base` and `cap` are the running activation's, as the core
+    /// loop holds them (every stack slot below `at.len` initialized).
+    #[inline(never)]
+    unsafe fn core_offload_in_loop(
+        &mut self,
+        sw: &mut CoreSwitch,
+        snap_gen: u64,
+        helper: bool,
+        base: *mut Object,
+        cap: usize,
+        at: &mut CoreAt,
+    ) -> bool {
+        let (cur, last) = (sw.cur, sw.last);
+        // SAFETY: see `CoreSwitch`; the caller's contract.
+        unsafe {
+            (*cur).stack.set_len(at.len);
+            (*cur).pc = at.pc as u32;
+            *last = at.last;
+        }
+        if let Some(stop) = self.core_offload(sw, snap_gen, helper) {
+            // (What the burst's own end would drop with it.)
+            sw.pending = Some(CoreExit::Stop(stop));
+            return false;
+        }
+        if sw.pending.is_some() || sw.cur != cur || sw.last != last {
+            return false;
+        }
+        // SAFETY: the same activation, unborrowed here.
+        let frame = unsafe { &mut *cur };
+        let pc = frame.pc as usize;
+        // (A reload would also count an entry at pc 0 as a call, and check
+        // the pc against the code.)
+        if frame.stack.as_mut_ptr() != base
+            || frame.stack.capacity() != cap
+            || pc == 0
+            || pc >= frame.code.instructions.len()
+        {
+            return false;
+        }
+        at.len = frame.stack.len();
+        at.pc = pc;
+        // SAFETY: the activation's last-pc slot.
+        at.last = unsafe { *last };
+        true
+    }
+
     /// Run the core loop's out-of-line instruction at `frame.pc` (the
-    /// ones [`Self::leaf_core`] hands over as [`CoreExit::Helper`]): the
+    /// ones [`Self::leaf_core`] hands over to [`Self::core_offload`]): the
     /// fused `len(x)` and `x.attr` shapes, the global/attribute cache hits,
     /// and leaf builtin/type calls. Advances `frame.pc` past what ran;
     /// `Decline` touches nothing.
@@ -11440,6 +11525,29 @@ impl Interpreter {
                     }
                 };
             }
+            // Hand the instruction at `pc` over (out of line with `true`,
+            // to the full leaf arms with `false`) without leaving the loop:
+            // when the activation goes on in place, so does the loop, with
+            // no reload (see `core_offload_in_loop`).
+            macro_rules! offload {
+                ($helper:expr) => {{
+                    let mut at = CoreAt { len, pc, last };
+                    // SAFETY: the running activation's state, as held here.
+                    if unsafe {
+                        self.core_offload_in_loop(sw, snap_gen, $helper, base, cap, &mut at)
+                    } {
+                        len = at.len;
+                        pc = at.pc;
+                        last = at.last;
+                        // (The run may have allocated a site table.)
+                        cold_stamps = None;
+                        cold_mslots = None;
+                        continue;
+                    } else {
+                        break Some(CoreExit::Reload);
+                    }
+                }};
+            }
             // The code's native form (see `frame_jit`): the native copy of
             // this loop runs it from every pc the arms below leave it at,
             // and the arms only run the instructions it returns at.
@@ -11552,6 +11660,10 @@ impl Interpreter {
                                             // The scalar shapes copy inline, as
                                             // the single-load arm does.
                                             let ca = match a {
+                                                s @ (Object::Int(_)
+                                                | Object::Float(_)
+                                                | Object::Bool(_)
+                                                | Object::None) => scalar_copy(s),
                                                 Object::Unbound => break None,
                                                 other => clone_hot(other),
                                             };
@@ -11838,7 +11950,10 @@ impl Interpreter {
                                     break None;
                                 }
                                 len -= 1;
-                                self.release(std::mem::replace(&mut *slot, base.add(len).read()));
+                                self.release_hot(std::mem::replace(
+                                    &mut *slot,
+                                    base.add(len).read(),
+                                ));
                                 last = pc;
                                 pc += 1;
                                 after_release!();
@@ -11870,7 +11985,7 @@ impl Interpreter {
                                 if !Self::core_droppable(&*slot) {
                                     break None;
                                 }
-                                self.release(std::mem::replace(&mut *slot, Object::Unbound));
+                                self.release_hot(std::mem::replace(&mut *slot, Object::Unbound));
                                 last = pc;
                                 pc += 1;
                                 after_release!();
@@ -12063,7 +12178,13 @@ impl Interpreter {
                         // next instruction stores it back): the local lets go of
                         // the string, which then grows in place when nothing else
                         // holds it (CPython's `BINARY_OP_INPLACE_ADD_UNICODE`).
-                        if kind == BinOpKind::Add && pc + 1 < ninstrs {
+                        // (The left operand's tag first: a numeric add skips
+                        // the rest.)
+                        // SAFETY: `len >= 2`.
+                        if kind == BinOpKind::Add
+                            && matches!(unsafe { &*base.add(len - 2) }, Object::Str(_))
+                            && pc + 1 < ninstrs
+                        {
                             // SAFETY: `pc + 1 < ninstrs`.
                             let next = unsafe { *instrs.add(pc + 1) };
                             let li = next.arg as usize;
@@ -13826,15 +13947,15 @@ impl Interpreter {
                                 // SAFETY: `len >= argc + 2`: the self slot.
                                 let recv = unsafe { &*base.add(len - argc - 1) };
                                 let Object::List(l) = recv else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 };
                                 if !Self::core_droppable(recv) {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 }
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 };
                                 let result = match (kind, argc) {
                                     (Some(LeafKind::ListAppend), 1) => {
@@ -13847,9 +13968,9 @@ impl Interpreter {
                                         Some(v) => v,
                                         // `pop from empty list` raises: the
                                         // helper's path.
-                                        None => break Some(CoreExit::Helper),
+                                        None => offload!(true),
                                     },
-                                    _ => break Some(CoreExit::Helper),
+                                    _ => offload!(true),
                                 };
                                 // SAFETY: the list (droppable) and the builtin
                                 // (count above one) leave by plain decrements;
@@ -13878,12 +13999,12 @@ impl Interpreter {
                                         == Some(LeafKind::ListAppend)) =>
                             {
                                 let Object::List(l) = &bm.receiver else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 };
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 };
                                 // SAFETY: the operand moves into the list; the
                                 // empty self slot and the bound method (held
@@ -13927,7 +14048,7 @@ impl Interpreter {
                                     std::slice::from_raw_parts(base.add(first), len - first)
                                 };
                                 if !Self::core_all_droppable(ops) {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 }
                                 let r = match kind {
                                     Some(LeafKind::Fast(f)) => f(ops),
@@ -13942,7 +14063,7 @@ impl Interpreter {
                                 };
                                 match r {
                                     // A fast half declined, untouched.
-                                    None => break Some(CoreExit::Helper),
+                                    None => offload!(true),
                                     Some(Ok(v)) => {
                                         // SAFETY: every operand (checked) and
                                         // the builtin (count above one) leave
@@ -13986,7 +14107,7 @@ impl Interpreter {
                                     if matches!(&bm.function, Object::Builtin(b)
                                         if slot.get_leaf(b).is_some())
                                     {
-                                        break Some(CoreExit::Helper);
+                                        offload!(true);
                                     }
                                 }
                                 break None;
@@ -13994,11 +14115,11 @@ impl Interpreter {
                             // A leaf builtin or directly constructible type, or
                             // a bound builtin method held in a local (`append =
                             // y.append`): out of line.
-                            Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
+                            Object::Builtin(_) | Object::Type(_) => offload!(true),
                             Object::BoundMethod(bm)
                                 if matches!(&bm.function, Object::Builtin(_)) =>
                             {
-                                break Some(CoreExit::Helper)
+                                offload!(true)
                             }
                             _ => break None,
                         }
@@ -14008,7 +14129,7 @@ impl Interpreter {
                     OpCode::LoadGlobal => {
                         use weavepy_compiler::InlineCache as IC;
                         let Some(slot) = stamps!(cold_stamps, frame, ext).get(pc) else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         if len == cap {
                             break None;
@@ -14094,10 +14215,10 @@ impl Interpreter {
                                 }
                                 hit
                             }
-                            _ => break Some(CoreExit::Helper),
+                            _ => offload!(true),
                         };
                         let Some((_, v)) = hit else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         let v = match v {
                             s @ (Object::Int(_)
@@ -14209,14 +14330,14 @@ impl Interpreter {
                             break None;
                         }
                         let Some(cell) = frame.cells.get(ins.arg as usize) else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         // SAFETY: a read between two instructions.
                         let Some(v) = (unsafe { cell.peek() }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         if matches!(v, Object::Unbound) {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         let c = Self::clone_operand(v);
                         // SAFETY: `len < cap`.
@@ -14235,7 +14356,7 @@ impl Interpreter {
                         // loop's initialized stack.
                         match unsafe { Self::core_super_attr(code, ins, pc, base, len) } {
                             Some(n) => len = n,
-                            None => break Some(CoreExit::Helper),
+                            None => offload!(true),
                         }
                         last = pc;
                         pc += 1;
@@ -14247,12 +14368,12 @@ impl Interpreter {
                     // the site.
                     OpCode::LoadSpecial => {
                         if len == 0 || len == cap {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
                         let Object::Instance(inst) = (unsafe { &*top }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         let ver = inst.cls_raw().attr_version.get();
                         let ms = mslots!(cold_mslots, ext).get(pc);
@@ -14261,7 +14382,7 @@ impl Interpreter {
                                 .map(Object::Function)
                                 .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
                         }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         // SAFETY: `len < cap`; the instance moves up into
                         // the self slot.
@@ -14280,7 +14401,7 @@ impl Interpreter {
                     // a class receiver leaves an empty self slot.
                     OpCode::LoadMethodAttr => {
                         if len == 0 || len == cap {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14300,7 +14421,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // `module.func(...)`: the attribute off the site's
                         // cached index (no method binds), with an empty self
@@ -14308,7 +14429,7 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Module(m) = unsafe { &*top } {
                             let Some(v) = Self::core_module_attr(code, m, pc, ins.arg) else {
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             };
                             // SAFETY: `len < cap`: `top` and the slot above.
                             unsafe {
@@ -14328,7 +14449,7 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Instance(inst) = unsafe { &*top } {
                             if !Self::default_getattribute(inst.cls_raw()) {
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
                             if inst_may_shadow(inst, code, ins.arg) {
                                 // SAFETY: `len < cap`: `top` and the slot
@@ -14339,7 +14460,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
@@ -14354,7 +14475,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         let f = match unsafe { &*top } {
                             Object::Instance(inst) => {
@@ -14400,7 +14521,7 @@ impl Interpreter {
                                                 pc += 1;
                                                 continue;
                                             }
-                                            None => break Some(CoreExit::Helper),
+                                            None => offload!(true),
                                         },
                                     },
                                 };
@@ -14420,7 +14541,7 @@ impl Interpreter {
                             Object::Type(cls) if Rc::strong_count(cls) > 1 => {
                                 match ms.get_held_unbound(cls.attr_version.get()) {
                                     Some(f) => f,
-                                    None => break Some(CoreExit::Helper),
+                                    None => offload!(true),
                                 }
                             }
                             // A builtin receiver's site-cached method (the
@@ -14430,7 +14551,7 @@ impl Interpreter {
                                 let Some(b) =
                                     builtin_recv_tag(recv).and_then(|tag| ms.get_builtin(tag))
                                 else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 };
                                 // SAFETY: `len < cap`; the receiver moves up.
                                 unsafe {
@@ -14461,7 +14582,7 @@ impl Interpreter {
                     OpCode::LoadAttr => {
                         use weavepy_compiler::InlineCache as IC;
                         if len == 0 {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14492,7 +14613,7 @@ impl Interpreter {
                                             pc += 1;
                                             continue;
                                         }
-                                        break Some(CoreExit::Helper);
+                                        offload!(true);
                                     }
                                 }
                             }
@@ -14507,7 +14628,7 @@ impl Interpreter {
                                         pc += 1;
                                         continue;
                                     }
-                                    _ => break Some(CoreExit::Helper),
+                                    _ => offload!(true),
                                 }
                             }
                             // A function's stored attribute (`wrapper.calls`).
@@ -14519,7 +14640,7 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
                             // A builtin container's method read as a value
                             // (`append = y.append`), a frame's or code
@@ -14533,7 +14654,7 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
                         };
                         // A natively served instance's public field (see
@@ -14548,7 +14669,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                _ => break Some(CoreExit::Helper),
+                                _ => offload!(true),
                             }
                         }
                         // SAFETY: a read between two instructions (see
@@ -14576,7 +14697,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
                         };
                         let cls = inst.cls_raw();
@@ -14584,16 +14705,16 @@ impl Interpreter {
                             || cls.native_kind.get() != 0
                             || !Self::core_droppable(unsafe { &*top })
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: a read between two instructions (see
                         // `GilCell::peek`).
                         let Some((k, v)) = (unsafe { inst.attr_peek_index(key_idx as usize) })
                         else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         if !slot_name_matches(code, ins.arg, k) {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         if let Some(e) = ext {
                             field_slot_note(e, code, pc, inst, key_idx);
@@ -14608,7 +14729,7 @@ impl Interpreter {
                     // droppable one (the helper's `leaf_store_attr` first case).
                     OpCode::StoreAttr => {
                         if len < 2 {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: `len >= 2`.
                         let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
@@ -14627,14 +14748,14 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(true);
                             }
-                            _ => break Some(CoreExit::Helper),
+                            _ => offload!(true),
                         };
                         if !Self::core_droppable(recv)
                             || !Self::core_store_attr(code, inst, pc, ins.arg, val)
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: the value moved into the dict (its slot is a
                         // stand-in now) and the receiver leaves the stack by a
@@ -14678,7 +14799,7 @@ impl Interpreter {
                                 _ => false,
                             };
                         if !ok {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         last = pc;
                         pc += 1;
@@ -14722,7 +14843,7 @@ impl Interpreter {
                                             continue;
                                         }
                                     }
-                                    break Some(CoreExit::Helper);
+                                    offload!(true);
                                 }
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
@@ -14906,7 +15027,7 @@ impl Interpreter {
                     // arm), when the iterable leaves by a plain decrement.
                     OpCode::GetIter => {
                         if len == 0 {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14932,10 +15053,10 @@ impl Interpreter {
                                 | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         }
                         let Ok(it) = v.make_iter() else {
-                            break Some(CoreExit::Helper);
+                            offload!(true);
                         };
                         let it = Object::Iter(Rc::new(RefCell::new(it)));
                         // SAFETY: the iterable (droppable) is replaced in place.
@@ -14951,7 +15072,7 @@ impl Interpreter {
                     op if !SLOW_LEAF_OPS[op as u8 as usize] => {
                         break Some(CoreExit::Stop(LeafStop::Step))
                     }
-                    _ => break None,
+                    _ => offload!(false),
                 }
             };
             if matches!(stop, Some(CoreExit::Reload)) {
@@ -19060,9 +19181,9 @@ impl Interpreter {
     /// decrement (see [`Self::core_droppable`]).
     #[inline(always)]
     fn core_drops_plain() -> bool {
-        !crate::capi_watchers::dicts_active()
-            && !crate::capi_watchers::funcs_active()
-            && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+        // (The dict and function watchers' and the reftrace printer's
+        // flags, tested with one load.)
+        crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES == 0
     }
 
     /// [`Self::core_droppable`] for every one of `ops`, with the global
@@ -67497,10 +67618,8 @@ enum DictStep {
 enum CoreExit {
     /// End the burst.
     Stop(LeafStop),
-    /// The instruction at `frame.pc` runs out of line
-    /// (`leaf_core_helper`).
-    Helper,
-    /// The instruction at `frame.pc` needs the full leaf arms.
+    /// The instruction at `frame.pc` needs the full leaf arms (see
+    /// [`Interpreter::core_offload`]).
     Slow,
     /// (Inside [`Interpreter::leaf_core`] only.) An in-loop call or
     /// return synced and moved the running activation: reload.
@@ -67510,6 +67629,14 @@ enum CoreExit {
     /// (see `frame_jit`).
     #[cfg(feature = "jit")]
     Switch,
+}
+
+/// The core loop's view of its running activation as it hands an
+/// instruction over in place (see [`Interpreter::core_offload_in_loop`]).
+struct CoreAt {
+    len: usize,
+    pc: usize,
+    last: usize,
 }
 
 /// How [`Interpreter::leaf_core_attr`] ran its instruction.
@@ -73718,8 +73845,15 @@ fn scalar_copy(v: &Object) -> Object {
         v,
         Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_)
     ));
-    // SAFETY: a scalar owns nothing: its bits are a complete copy.
-    unsafe { std::ptr::read(v) }
+    // SAFETY: a scalar owns nothing: its bits are a complete copy. (Read
+    // as opaque bytes: typed as an `Object` known to be a scalar, the copy
+    // is split into the variants' fields, a byte, a word and padding moved
+    // apart through the stack.)
+    unsafe {
+        std::mem::transmute::<std::mem::MaybeUninit<[u64; 2]>, Object>(std::ptr::read(
+            std::ptr::from_ref(v).cast::<std::mem::MaybeUninit<[u64; 2]>>(),
+        ))
+    }
 }
 
 /// `Object::Int(v)` built as two whole words (see [`clone_hot`]): the
