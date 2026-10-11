@@ -517,6 +517,10 @@ pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
         Object::File(f) if f.extra_attrs.borrow().is_empty() => {
             16 + (f.io_kind.get() as u8) * 4 + u8::from(f.binary) * 2 + u8::from(f.is_memory())
         }
+        // A class's `__dict__` view (`cls.__dict__.get(name)`, as enum and
+        // `inspect` read it). A view over another mapping
+        // (`MappingProxyObj`) calls that mapping's own methods instead.
+        Object::MappingProxy(_) => 120,
         _ => return None,
     };
     Some(tag)
