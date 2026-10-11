@@ -16500,8 +16500,9 @@ impl Interpreter {
     /// nothing.
     #[inline(never)]
     /// The `CALL` at the running activation's pc of an exact builtin
-    /// container type over one positional argument (`set(genexpr)`,
-    /// `list(xs)`), through the ordinary call with the caller published
+    /// container type (or `weakref.ref`, or `types.MappingProxyType`) over
+    /// one positional argument (`set(genexpr)`, `list(xs)`), through the
+    /// ordinary call with the caller published
     /// (consuming the argument may run Python code), as the builtin lane
     /// runs a builtin function. `false` touches nothing.
     fn core_type_lane(&mut self, sw: &mut CoreSwitch) -> bool {
@@ -16528,6 +16529,9 @@ impl Interpreter {
         if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_]
             .iter()
             .any(|t| Rc::ptr_eq(t, ty))
+            // (`weakref.ref(obj)` and `types.MappingProxyType(mapping)`,
+            // as `inspect` makes them, read no frame either.)
+            && !(ty.flags.is_builtin && matches!(ty.name.as_str(), "ReferenceType" | "mappingproxy"))
         {
             return false;
         }
@@ -26547,6 +26551,9 @@ impl Interpreter {
                 }
                 found.ok().flatten()
             }
+            // A class's `__dict__` view (`'__dict__' in type.__dict__`, as
+            // `inspect` asks) tests the class dict it wraps.
+            Object::MappingProxy(d) => Self::leaf_contains(&Object::Dict(d.clone()), item),
             _ => None,
         }
     }
@@ -74163,7 +74170,7 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
             // sys
-            | "_getframe" | "_getframemodulename"
+            | "_getframe" | "_getframemodulename" | "getrecursionlimit"
             // warnings (which reads the whole stack, lean activations included)
             | "warn"
             // asyncio (`gather` reads the running loop's current task)
