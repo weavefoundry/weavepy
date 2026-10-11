@@ -74,6 +74,22 @@ pub(crate) type FxBuild = BuildHasherDefault<FxHasher>;
 /// A `HashSet` over [`FxHasher`]; build one with `HashSet::default()`.
 pub(crate) type HashSet<T> = std::collections::HashSet<T, FxBuild>;
 
+/// Adding a borrowed name to a set of owned names, allocating only when
+/// the name is new: scope scans see the same few names (`self`, the
+/// parameters) over and over.
+pub(crate) trait NameSet {
+    fn add_name(&mut self, name: &str);
+}
+
+impl NameSet for HashSet<String> {
+    #[inline]
+    fn add_name(&mut self, name: &str) {
+        if !self.contains(name) {
+            self.insert(name.to_owned());
+        }
+    }
+}
+
 /// A `HashMap` over [`FxHasher`]; build one with `HashMap::default()`.
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
 

@@ -20,7 +20,7 @@
 //!   peephole optimizer and adaptive specialization produce different
 //!   shapes that we deliberately don't reproduce.
 
-use fxhash::HashSet;
+use fxhash::{HashSet, NameSet};
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -1751,12 +1751,12 @@ fn collect_module_imports(body: &[Stmt]) -> HashSet<String> {
                     for a in aliases {
                         match &a.asname {
                             Some(n) => {
-                                out.insert(n.clone());
+                                out.add_name(n);
                             }
                             // `import a.b.c` binds the first segment.
                             None => {
                                 let first = a.name.split('.').next().unwrap_or(&a.name);
-                                out.insert(first.to_owned());
+                                out.add_name(first);
                             }
                         }
                     }
@@ -4002,7 +4002,7 @@ impl Compiler {
             }
             for name in &comp_cells {
                 if used.contains(name) && !self.bindings.contains_key(name) {
-                    self.comp_cell_only.insert(name.clone());
+                    self.comp_cell_only.add_name(name);
                 }
             }
             self.register_comp_cells(comp_cells);
@@ -7336,7 +7336,7 @@ impl Compiler {
                     // the class scope (PEP 227) and still reach the
                     // enclosing function's `y` — forward the cell
                     // without touching the class-level binding.
-                    inner.class_transparent_frees.insert(name.clone());
+                    inner.class_transparent_frees.add_name(name);
                 } else {
                     inner
                         .bindings
@@ -11329,7 +11329,7 @@ impl Compiler {
         let (kind, elt, value, generators) = match &expr.kind {
             ExprKind::Name(n) => {
                 if !bound.contains(n) {
-                    out.insert(n.clone());
+                    out.add_name(n);
                 }
                 return;
             }
@@ -11394,7 +11394,7 @@ impl Compiler {
     fn collect_names_shallow(expr: &Expr, out: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Name(n) => {
-                out.insert(n.clone());
+                out.add_name(n);
             }
             ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
                 for d in &args.defaults {
@@ -12531,7 +12531,7 @@ fn check_comp_walrus_nest(
                         ));
                     }
                     for scope in stack.iter_mut() {
-                        scope.walrus_targets.insert(n.clone());
+                        scope.walrus_targets.add_name(n);
                     }
                 }
                 visit(value, in_class_body, stack)
@@ -13493,19 +13493,19 @@ fn collect_inner_free_impl(
             let scan = &scan.nested();
             let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             for a in &args.args {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(va) = &args.vararg {
-                inner_locals.insert(va.name.clone());
+                inner_locals.add_name(&va.name);
             }
             for a in &args.kwonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(kw) = &args.kwarg {
-                inner_locals.insert(kw.name.clone());
+                inner_locals.add_name(&kw.name);
             }
             let mut inner_globals = HashSet::default();
             let mut inner_nonlocals = HashSet::default();
@@ -13524,7 +13524,7 @@ fn collect_inner_free_impl(
             // needed-from-outer regardless of whether `outer_bindings`
             // knows about it yet (it'll be promoted on the way down).
             for n in &inner_nonlocals {
-                out.insert(n.clone());
+                out.add_name(n);
             }
             // Reads inside the inner that aren't locals there →
             // candidates for promotion.
@@ -13632,7 +13632,7 @@ fn collect_inner_free_impl(
             // enclosing function's `__firstlineno__` a cell even though
             // the body never reads it).
             for n in &class_nonlocals {
-                from_body.insert(n.clone());
+                from_body.add_name(n);
             }
             // The nested scopes are analyzed as *the class body* sees
             // them, not as this scope does: an inlined comprehension in
@@ -14824,19 +14824,19 @@ fn collect_inner_free_expr(
         ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
             let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             for a in &args.args {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(va) = &args.vararg {
-                inner_locals.insert(va.name.clone());
+                inner_locals.add_name(&va.name);
             }
             for a in &args.kwonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(kw) = &args.kwarg {
-                inner_locals.insert(kw.name.clone());
+                inner_locals.add_name(&kw.name);
             }
             let mut reads = HashSet::default();
             collect_reads_deep(body, &mut reads);
@@ -15044,7 +15044,7 @@ fn collect_self_attr_stores(stmts: &[Stmt], self_name: &str, out: &mut HashSet<S
         match &e.kind {
             ExprKind::Attribute { value, attr } => {
                 if matches!(&value.kind, ExprKind::Name(n) if n == self_name) {
-                    out.insert(attr.clone());
+                    out.add_name(attr);
                 }
             }
             ExprKind::Tuple(elts) | ExprKind::List(elts) => {
@@ -15504,7 +15504,7 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
         | StmtKind::AsyncFunctionDef { name, .. }
         | StmtKind::ClassDef { name, .. }
         | StmtKind::TypeAlias { name, .. } => {
-            out.insert(name.clone());
+            out.add_name(name);
         }
         StmtKind::Try {
             body,
@@ -15517,7 +15517,7 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
             }
             for h in handlers {
                 if let Some(n) = &h.name {
-                    out.insert(n.clone());
+                    out.add_name(n);
                 }
                 for s in &h.body {
                     collect_assigned(s, out);
@@ -15830,7 +15830,7 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
         | ExprKind::SetComp { elt, generators }
         | ExprKind::GeneratorExp { elt, generators } => {
             collect_comp_scope_walruses(elt, None, generators, &mut |n| {
-                out.insert(n.to_owned());
+                out.add_name(n);
             });
         }
         ExprKind::DictComp {
@@ -15839,7 +15839,7 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
             generators,
         } => {
             collect_comp_scope_walruses(key, Some(value), generators, &mut |n| {
-                out.insert(n.to_owned());
+                out.add_name(n);
             });
         }
         ExprKind::Yield(value) => {
@@ -15875,7 +15875,7 @@ fn collect_global_decls_deep(stmt: &Stmt, out: &mut HashSet<String>) {
     match &stmt.kind {
         StmtKind::Global(ns) => {
             for n in ns {
-                out.insert(n.clone());
+                out.add_name(n);
             }
         }
         StmtKind::FunctionDef { body, .. }
@@ -16279,7 +16279,7 @@ fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
         .chain(&args.vararg)
         .chain(&args.kwarg)
     {
-        nested_locals.insert(a.name.clone());
+        nested_locals.add_name(&a.name);
     }
     let mut nested_globals = HashSet::default();
     let mut nested_nonlocals = HashSet::default();
@@ -16429,7 +16429,7 @@ fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
             // function.
             _ => {
                 if stmt_reads_dunder_at_class_level(stmt, name) {
-                    out.insert(name.to_owned());
+                    out.add_name(name);
                 }
             }
         }
@@ -16512,12 +16512,12 @@ fn collect_decls(
     match &stmt.kind {
         StmtKind::Global(ns) => {
             for n in ns {
-                globals.insert(n.clone());
+                globals.add_name(n);
             }
         }
         StmtKind::Nonlocal(ns) => {
             for n in ns {
-                nonlocals.insert(n.clone());
+                nonlocals.add_name(n);
             }
         }
         StmtKind::Assign { targets, .. } => {
@@ -16583,7 +16583,7 @@ fn collect_decls(
         | StmtKind::AsyncFunctionDef { name, .. }
         | StmtKind::ClassDef { name, .. }
         | StmtKind::TypeAlias { name, .. } => {
-            assigned.insert(name.clone());
+            assigned.add_name(name);
         }
         StmtKind::Try {
             body,
@@ -16596,7 +16596,7 @@ fn collect_decls(
             }
             for h in handlers {
                 if let Some(n) = &h.name {
-                    assigned.insert(n.clone());
+                    assigned.add_name(n);
                 }
                 for s in &h.body {
                     collect_decls(s, globals, nonlocals, assigned);
@@ -16731,7 +16731,7 @@ fn collect_target_names_ordered(expr: &Expr, out: &mut Vec<String>) {
 fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Name(n) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         ExprKind::Tuple(items) | ExprKind::List(items) => {
             for x in items {
@@ -16757,7 +16757,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
         | PatternKind::Capture(None)
         | PatternKind::Star(None) => {}
         PatternKind::Capture(Some(n)) | PatternKind::Star(Some(n)) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         PatternKind::Sequence(items) => {
             for p in items {
@@ -16769,7 +16769,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 collect_pattern_names(p, out);
             }
             if let Some(Some(n)) = rest {
-                out.insert(n.clone());
+                out.add_name(n);
             }
         }
         PatternKind::Class {
@@ -16790,7 +16790,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
             }
         }
         PatternKind::As { pattern, name } => {
-            out.insert(name.clone());
+            out.add_name(name);
             collect_pattern_names(pattern, out);
         }
     }
@@ -17488,7 +17488,7 @@ fn collect_comp_reads(
 fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Name(n) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => {
             collect_reads_expr(value, out);

@@ -16,6 +16,7 @@ use weavepy_parser::ast::{
     PatternKind, Stmt, StmtKind,
 };
 
+use crate::fxhash::NameSet;
 use crate::CompileError;
 
 /// `__future__` features understood by CPython 3.13. All are mandatory
@@ -168,7 +169,7 @@ impl Validator<'_> {
 
     /// Record a *read* of `name` in the current scope (CPython `USE`).
     fn mark_use(&mut self, name: &str) {
-        self.scope_mut().used.insert(name.to_owned());
+        self.scope_mut().used.add_name(name);
     }
 
     /// Record a binding of `name` (CPython `DEF_LOCAL`). Comprehension
@@ -180,7 +181,7 @@ impl Validator<'_> {
             .iter()
             .rposition(|s| s.kind != ScopeKind::Comprehension)
             .expect("scope stack always has a non-comprehension scope");
-        self.scopes[idx].assigned.insert(name.to_owned());
+        self.scopes[idx].assigned.add_name(name);
     }
 
     /// Visit an annotation expression. Under PEP 563 the annotation is
@@ -583,7 +584,7 @@ impl Validator<'_> {
                                 }
                             }
                             let n = n.clone();
-                            self.scope_mut().annotated.insert(n.clone());
+                            self.scope_mut().annotated.add_name(&n);
                             self.mark_assigned(&n);
                         } else {
                             let n = n.clone();
