@@ -717,7 +717,9 @@ pub fn native_fn_id(b: &Rc<crate::object::BuiltinFn>) -> u64 {
 /// would invalidate the simple "dict slot" fast path. We bail out
 /// of LOAD_ATTR / STORE_ATTR specialization for these.
 pub(crate) fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
-    if ty.lookup("__getattr__").is_some() {
+    // A `super` proxy resolves attributes along its target's MRO (CPython's
+    // `super_getattro`), never its own class's.
+    if ty.lookup("__getattr__").is_some() || ty.is_super_proxy_type() {
         return true;
     }
     // `object.__getattribute__` lives in `object`'s dict as a sentinel, so a

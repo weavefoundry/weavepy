@@ -28719,9 +28719,12 @@ impl Interpreter {
         // `__getattribute__` (a `super` proxy resolves `__init__` in the
         // MRO *after* its own class), where the class-MRO answer the
         // class cache holds would be wrong. `__new__` keeps its historic
-        // exception.
+        // exception, except through a `super` proxy.
         let name = code.names.get(name_idx as usize)?;
-        if name.len() > 4 && name.starts_with("__") && name != "__new__" {
+        if name.len() > 4
+            && name.starts_with("__")
+            && (name != "__new__" || cls.is_super_proxy_type())
+        {
             return None;
         }
         let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
