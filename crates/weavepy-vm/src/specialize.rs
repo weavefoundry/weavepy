@@ -523,6 +523,37 @@ pub fn attempt_specialize_call_kw(
     argc: usize,
     kw_names: &[(String, crate::object::Object)],
 ) -> InlineCache {
+    specialize_call_kw_by(f, argc, kw_names.iter().map(|(n, _)| n.as_str()))
+}
+
+/// [`attempt_specialize_call_kw`] for keyword names that are the call
+/// site's own `str` objects (the core loop's `CALL_KW` lane).
+pub fn attempt_specialize_call_kw_names(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+    names: &[crate::object::Object],
+) -> InlineCache {
+    if !names
+        .iter()
+        .all(|n| matches!(n, crate::object::Object::Str(_)))
+    {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    specialize_call_kw_by(
+        f,
+        argc,
+        names.iter().map(|n| match n {
+            crate::object::Object::Str(s) => &**s,
+            _ => "",
+        }),
+    )
+}
+
+fn specialize_call_kw_by<'a>(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> InlineCache {
     let code = f.code();
     if code.is_generator
         || code.is_coroutine
@@ -531,12 +562,13 @@ pub fn attempt_specialize_call_kw(
     {
         return InlineCache::Cooldown(COOLDOWN);
     }
-    match kw_perm(f, &code, argc, kw_names.iter().map(|(n, _)| n.as_str())) {
+    let kwc = names.len();
+    match kw_perm(f, &code, argc, names) {
         Some((perm, _)) => InlineCache::CallPyKwNames {
             func_id: rc_id(f),
             perm,
             argc: argc as u8,
-            kwc: kw_names.len() as u8,
+            kwc: kwc as u8,
         },
         None => InlineCache::Cooldown(COOLDOWN),
     }
@@ -596,7 +628,9 @@ pub fn kw_perm<'a>(
             }
             None => return None,
         };
-        if covered & (1 << slot) != 0 {
+        // Nibble 15 means "collected by `**kwargs`" (see `KW_TO_VARKW`):
+        // a keyword can't name the sixteenth parameter slot.
+        if covered & (1 << slot) != 0 || slot as u32 == KW_TO_VARKW {
             return None;
         }
         perm |= (slot as u32) << (4 * j);

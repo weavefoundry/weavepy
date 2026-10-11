@@ -13652,25 +13652,34 @@ impl Interpreter {
                             // `CALL`'s does (see `core_call_kw`); a common
                             // builtin function (`sorted(xs, key=f)`) runs in
                             // the builtin lane.
-                            let builtin = match &ops[0] {
-                                Object::Function(_) => false,
+                            // (0: a Python function, 1: a builtin, 2: a
+                            // plain class, constructed in place.)
+                            let kind = match &ops[0] {
+                                Object::Function(_) => 0,
                                 Object::Builtin(b)
                                     if !b.binds_instance
                                         && matches!(&ops[1], Object::Unbound)
                                         && builtin_fn_lane_ok(b.name) =>
                                 {
-                                    true
+                                    1
                                 }
+                                Object::Type(t) if !t.flags.is_builtin => 2,
                                 _ => break None,
                             };
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
-                            let ran = if builtin {
-                                self.core_builtin_kw_lane(sw, pc)
-                            } else {
-                                self.core_call_kw(sw, pc) || self.core_call_lane(sw)
+                            let ran = match kind {
+                                1 => self.core_builtin_kw_lane(sw, pc),
+                                2 => {
+                                    let new = self.core_new_kw(sw, pc, snap_gen);
+                                    if new {
+                                        burst_stats::note_call(burst_stats::CALL_NEW);
+                                    }
+                                    new || self.core_call_lane(sw)
+                                }
+                                _ => self.core_call_kw(sw, pc) || self.core_call_lane(sw),
                             };
                             if !ran && sw.pending.is_none() {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
@@ -13686,6 +13695,8 @@ impl Interpreter {
                         len = start + 1;
                         last = pc;
                         pc += 1;
+                        // (An argument the call held last died.)
+                        after_release!();
                     }
                     OpCode::Call => {
                         let argc = ins.arg as usize;
@@ -16556,6 +16567,15 @@ impl Interpreter {
         if builtin && !kwnames.is_empty() {
             return false;
         }
+        // A keyword call of a plain function decides the site's
+        // `CallPyKwNames` specialization here, as the full handler does:
+        // the core loop takes every execution of the site, so without it
+        // the in-place and inline keyword calls would never apply.
+        if ins.op == OpCode::CallKw {
+            if let Object::Function(f) = &frame.stack[callee_at] {
+                Self::core_specialize_call_kw(&frame.code, pc, f, args.len(), &kwnames);
+            }
+        }
         // Committed: the operands leave the stack.
         let callee = frame.stack[callee_at].clone();
         let operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
@@ -16606,6 +16626,69 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// The `CALL_KW` handler's specialization step for the site at `pc` of
+    /// `code`, calling the plain function `f` with `eff_argc` positionals
+    /// (a receiver included) and the keyword `names`: an empty site
+    /// decides, a cooling one counts down, and a specialized one that no
+    /// longer binds this call cools down.
+    #[cold]
+    #[inline(never)]
+    fn core_specialize_call_kw(
+        code: &CodeObject,
+        pc: usize,
+        f: &Rc<PyFunction>,
+        eff_argc: usize,
+        names: &[Object],
+    ) {
+        use weavepy_compiler::InlineCache as IC;
+        let kw_op = OpCode::CallKw as u8;
+        if crate::trace::any_observers_active()
+            && crate::trace::monitoring_union_mask_cached()
+                & crate::trace::event_mask(crate::trace::EVENT_CALL)
+                != 0
+        {
+            return;
+        }
+        let at = pc as u32;
+        match code.caches.get(at) {
+            IC::Empty => {
+                specialize::record_specialize_attempt(kw_op);
+                let decision = specialize::attempt_specialize_call_kw_names(f, eff_argc, names);
+                code.caches.set(at, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(kw_op);
+                } else {
+                    specialize::record_specialize_success(kw_op);
+                }
+            }
+            IC::Cooldown(n) => {
+                code.caches.set(
+                    at,
+                    if n > 0 {
+                        IC::Cooldown(n - 1)
+                    } else {
+                        IC::Empty
+                    },
+                );
+            }
+            IC::CallPyKwNames {
+                func_id,
+                perm,
+                argc,
+                kwc,
+            } => {
+                let binds = argc as usize == eff_argc
+                    && kwc as usize == names.len()
+                    && Self::kw_names_bind_check(f, func_id, perm, names, eff_argc).is_some();
+                if !binds {
+                    specialize::record_miss(kw_op);
+                    code.caches.set(at, IC::Cooldown(COOLDOWN));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `FOR_ITER` at the running activation's pc over a native adapter
@@ -17378,6 +17461,135 @@ impl Interpreter {
         frame.stack.push(spread);
         frame.stack.push(mapping);
         false
+    }
+
+    /// `cls(..., name=value)` (the `CALL_KW` at `pc` of `sw`'s synced
+    /// running activation) of a plain class whose `__init__` a lean
+    /// activation can run: the arguments bind by name as the generic
+    /// binder would (see [`Self::lean_bind_keywords`]), and the `__init__`
+    /// activation runs inline as [`Self::core_new_n`]'s does. `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_new_kw(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        if !self.inline_calls_ok()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || self.lean_snapshot() != Some(snap_gen)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
+            return false;
+        };
+        let len = frame.stack.len();
+        let Some(Object::Tuple(names)) = frame.stack.last() else {
+            return false;
+        };
+        let kwc = names.len();
+        // Stack: class, self-or-null, positionals, keyword values, names.
+        let Some(callee_slot) = len.checked_sub(kwc + argc + 3) else {
+            return false;
+        };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        if !matches!(frame.stack[callee_slot + 1], Object::Unbound)
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || !Self::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        let ty = ty.clone();
+        let plan = self.instance_plan(&ty);
+        if plan.seeds_exception_args {
+            return false;
+        }
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only the pointer is compared.
+        if !std::ptr::eq(
+            unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+            Rc::as_ptr(code),
+        ) || !Self::lean_code_ok(code)
+            // The instance binds to the first positional parameter.
+            || code.arg_count == 0
+            || (init.defaults_maybe_overridden()
+                && (init.slot("__defaults__").is_some() || init.slot("__kwdefaults__").is_some()))
+        {
+            return false;
+        }
+        let Some(cells) = init.lean_cells_ref(code) else {
+            return false;
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        // (The instance isn't made until the binding holds: `None` keeps
+        // its parameter's place.)
+        let receiver = Object::None;
+        let values = &frame.stack[len - 1 - kwc..len - 1];
+        let bound = Self::lean_bind_keywords(
+            init,
+            code,
+            std::iter::once(&receiver).chain(&frame.stack[callee_slot + 2..len - 1 - kwc]),
+            names.iter().zip(values),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed.
+        let (init, code) = (init.clone(), code.clone());
+        let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
+        drop(plan);
+        locals[0] = inst.clone();
+        if tracked && gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+        }
+        // SAFETY: as above (finalizers ran against the synced frame).
+        let frame = unsafe { &mut *sw.cur };
+        // The operands leave the stack, as the full call handler releases
+        // them once the parameters are bound.
+        self.release_call_operands(&mut frame.stack, callee_slot);
+        drop(ty);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`.
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
     }
 
     /// [`Self::core_new`] of the class `argc` positional arguments below
