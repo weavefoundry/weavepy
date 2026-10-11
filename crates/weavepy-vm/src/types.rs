@@ -171,6 +171,11 @@ pub(crate) enum Verdict {
     /// `hasattr(type(coro), '_asyncio_future_blocking')` for every
     /// coroutine it is handed). See [`TypeObject::verdict_record`].
     TypeAttrMissing = 6,
+    /// A value of the builtin class (one whose attributes all come from
+    /// the class, see `builtin_value_class`) answered `name` with
+    /// `AttributeError`: enum asks `hasattr(value, '__get__')` of every
+    /// member value. Recorded like [`Self::TypeAttrMissing`].
+    ValueAttrMissing = 7,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

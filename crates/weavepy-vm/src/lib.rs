@@ -41442,12 +41442,26 @@ impl Interpreter {
                 ))),
             };
         }
-        if args.len() >= 3 && attr_certainly_missing(&args[0], &name) {
+        if args.len() < 3 {
+            return self.load_attr(&args[0], &name);
+        }
+        if attr_certainly_missing(&args[0], &name) {
             return Ok(args[2].clone());
+        }
+        let value_class = builtin_value_class(&args[0]);
+        if let Some(c) = &value_class {
+            if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
+                return Ok(args[2].clone());
+            }
         }
         match self.load_attr(&args[0], &name) {
             Ok(v) => Ok(v),
-            Err(e) if args.len() >= 3 && self.is_attribute_error(&e) => Ok(args[2].clone()),
+            Err(e) if self.is_attribute_error(&e) => {
+                if let Some(c) = value_class {
+                    c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
+                }
+                Ok(args[2].clone())
+            }
             Err(e) => Err(e),
         }
     }
@@ -41490,11 +41504,20 @@ impl Interpreter {
                 return Ok(Object::Bool(false));
             }
         }
+        let value_class = builtin_value_class(&args[0]);
+        if let Some(c) = &value_class {
+            if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
+                return Ok(Object::Bool(false));
+            }
+        }
         match self.load_attr(&args[0], &name) {
             Ok(_) => Ok(Object::Bool(true)),
             Err(e) if self.is_attribute_error(&e) => {
                 if let Some(t) = builtin_type {
                     t.verdict_record(crate::types::Verdict::TypeAttrMissing, &name, true);
+                }
+                if let Some(c) = value_class {
+                    c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
                 }
                 Ok(Object::Bool(false))
             }
@@ -69508,6 +69531,28 @@ thread_local! {
     static SLOT_WRAPPER_CACHE: std::cell::RefCell<
         crate::fasthash::FxHashMap<usize, crate::fasthash::FxHashMap<Box<str>, Option<Object>>>,
     > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
+}
+
+/// The built-in class whose attributes are all of `obj`'s: a value of a
+/// built-in type that carries none of its own (no instance dict, no
+/// per-object attribute store), so what `obj.name` resolves to depends on
+/// the class and the name alone. `None` for anything else.
+fn builtin_value_class(obj: &Object) -> Option<Rc<TypeObject>> {
+    matches!(
+        obj,
+        Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+    )
+    .then(|| crate::builtins::class_of(obj))
 }
 
 /// Whether `obj.name` certainly raises `AttributeError` without running
