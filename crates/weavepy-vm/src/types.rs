@@ -159,6 +159,9 @@ pub(crate) enum Verdict {
     /// A builtin class's own dict has no class method `name` (see
     /// `Interpreter::leaf_load_type_attr`).
     NoNativeClassMethod = 3,
+    /// No builtin base on the class's MRO supplies a slot wrapper or a
+    /// type-dict entry `name` (see `builtin_slot_wrapper`).
+    NoSlotWrapper = 4,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

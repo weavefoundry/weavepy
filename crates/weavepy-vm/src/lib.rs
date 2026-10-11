@@ -15401,6 +15401,12 @@ impl Interpreter {
                 {
                     return Some(true);
                 }
+                // `super().__init__(...)` reaching `object.__init__` (or
+                // another native `__init__`) on a plain instance: the
+                // dispatch's only `__init__` case is a dict payload's.
+                if native_init_call(b, recv) {
+                    return Some(false);
+                }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
                 builtins::method_memo_tag(recv)?;
@@ -18223,7 +18229,8 @@ impl Interpreter {
         base: *mut Object,
         len: usize,
     ) -> Option<usize> {
-        if ins.arg & 2 != 0 || len < 3 {
+        // (Either form; see `load_super_attr_direct`.)
+        if len < 3 {
             return None;
         }
         // SAFETY: `len >= 3`.
@@ -23279,9 +23286,57 @@ impl Interpreter {
     }
 
     /// A module attribute through the `LOAD_ATTR` site's cached index:
-    /// the value, cloned, or `None` for the helper's full path.
+    /// the value, cloned, or `None` for the helper's full path. A site
+    /// remembers the module dict's stamp and the entry's position once a
+    /// read proves them (see [`MODULE_ENTRY`]), so a warm read is a stamp
+    /// compare and an indexed load (CPython's `LOAD_ATTR_MODULE`).
     #[inline]
     fn core_module_attr(
+        code: &CodeObject,
+        m: &crate::object::PyModule,
+        pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let dict = unsafe { m.dict.peek() }?;
+        if let Some(slot) = code_vm_ext(code).and_then(|ext| ext.stamp_slot(pc)) {
+            let [stamp, tag, idx] = slot.get();
+            if tag == MODULE_ENTRY && stamp == dict.mutation_stamp() {
+                if let Some((_, v)) = dict.get_index(idx as usize) {
+                    return Some(Self::clone_operand(v));
+                }
+            }
+        }
+        Self::core_module_attr_indexed(code, m, pc, name_idx)
+    }
+
+    /// [`Self::core_module_attr`] through the site's inline cache, which
+    /// on a hit also fills the site's [`MODULE_ENTRY`] stamp.
+    #[inline(never)]
+    fn core_module_attr_indexed(
+        code: &CodeObject,
+        m: &crate::object::PyModule,
+        pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let v = Self::core_module_attr_cached(code, m, pc, name_idx)?;
+        // SAFETY: as above (the read above ran no code).
+        if let (Some(dict), Some(slot)) =
+            (unsafe { m.dict.peek() }, code_stamp_slot(code, pc as u32))
+        {
+            if let weavepy_compiler::InlineCache::LoadAttrModule { key_idx, .. } =
+                code.caches.get(pc as u32)
+            {
+                slot.set([dict.mutation_stamp(), MODULE_ENTRY, u64::from(key_idx)]);
+            }
+        }
+        Some(v)
+    }
+
+    /// [`Self::core_module_attr_indexed`]'s read of the site's inline
+    /// cache.
+    #[inline]
+    fn core_module_attr_cached(
         code: &CodeObject,
         m: &crate::object::PyModule,
         pc: usize,
@@ -23373,7 +23428,10 @@ impl Interpreter {
         }
         // `leaf_fused_local_attr`, over the decoded cache.
         if matches!(cache, IC::Empty) {
-            return None;
+            return match local {
+                Object::Instance(inst) => inst_dict_attr(code, inst, attr_pc, name_idx),
+                _ => None,
+            };
         }
         match local {
             Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
@@ -23915,7 +23973,10 @@ impl Interpreter {
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
         if matches!(code.caches.get(attr_pc as u32), IC::Empty) {
-            return None;
+            return match local {
+                Object::Instance(inst) => inst_dict_attr(code, inst, attr_pc, name_idx),
+                _ => None,
+            };
         }
         match local {
             Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
@@ -25466,10 +25527,7 @@ impl Interpreter {
                     // pushed in the elided-method shape (function, self)
                     // — the `CALL` folds `self` in — or bound, without the
                     // super proxy the full handler builds. Stack (top-
-                    // down): self, class, global `super`.
-                    if ins.arg & 2 != 0 {
-                        break;
-                    }
+                    // down): self, class, global `super` (either form).
                     let n = stack.len();
                     if n < 3 || !is_super_callable(&stack[n - 3]) {
                         break;
@@ -28208,6 +28266,9 @@ impl Interpreter {
             if let Some(v) = tuple_field_hit(slot, inst) {
                 return Some(v);
             }
+        }
+        if let Some(v) = inst_dict_attr(code, inst, cache_pc as usize, name_idx) {
+            return Some(v);
         }
         let poly = code_attr_poly(code, cache_pc);
         let ver = inst.cls_raw().attr_version.get();
@@ -35962,29 +36023,48 @@ impl Interpreter {
                 &self.builtins.clone(),
             )
         } else {
+            // The default lookup would only raise for the hook to catch:
+            // call the hook without building that `AttributeError` (CPython's
+            // `slot_tp_getattr_hook` suppresses it the same way).
+            let hook = inst.cls_raw().dunder(crate::types::Dunder::GetAttr).present();
+            if hook && default_lookup_misses(instance_obj, name, true) {
+                if let Some(getattr) = inst.cls().lookup("__getattr__") {
+                    return self.call_getattr_hook(instance_obj, getattr, name);
+                }
+            }
             self.load_attr_instance_default(inst, instance_obj, name)
         };
         match result {
             Err(e) if self.is_attribute_error(&e) => {
                 if let Some(getattr) = inst.cls().lookup("__getattr__") {
-                    // `dispatch` so a descriptor `__getattr__` also honours
-                    // its `__get__` (test_descr test_getattr_hooks).
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                        instance_obj.clone(),
-                        getattr,
-                    )));
-                    self.call(
-                        &bound,
-                        &[Object::from_str(name)],
-                        &[],
-                        &self.builtins.clone(),
-                    )
+                    self.call_getattr_hook(instance_obj, getattr, name)
                 } else {
                     Err(e)
                 }
             }
             other => other,
         }
+    }
+
+    /// `type(obj).__getattr__(obj, name)`, the hook `getattr` resolved.
+    fn call_getattr_hook(
+        &mut self,
+        instance_obj: &Object,
+        getattr: Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        // `dispatch` so a descriptor `__getattr__` also honours its
+        // `__get__` (test_descr test_getattr_hooks).
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
+            instance_obj.clone(),
+            getattr,
+        )));
+        self.call(
+            &bound,
+            &[Object::from_str(name)],
+            &[],
+            &self.builtins.clone(),
+        )
     }
 
     /// A user-defined `__getattribute__` override, if any. Returns `None`
@@ -36117,7 +36197,10 @@ impl Interpreter {
         frame: &mut Frame,
         arg: u32,
     ) -> Result<Option<Object>, RuntimeError> {
-        if arg & 2 != 0 || crate::trace::any_observers_active() {
+        // (Both forms: the explicit `super(C, obj)` puts its arguments
+        // where the implicit one puts the `__class__` cell and the first
+        // argument, and CPython specializes either.)
+        if crate::trace::any_observers_active() {
             return Ok(None);
         }
         let n = frame.stack.len();
@@ -68997,6 +69080,15 @@ mod builtin_type_misses {
 /// `getattr` default or `hasattr` then needs no exception at all. Dunder
 /// names, which the lookup special-cases, never qualify.
 fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
+    default_lookup_misses(obj, name, false)
+}
+
+/// Whether the default `object.__getattribute__` lookup of `obj.name`
+/// certainly ends in its `AttributeError` without running any code (see
+/// [`attr_certainly_missing`]), ignoring a `__getattr__` hook on the class
+/// when `hooked` (the caller then calls the hook itself, as CPython's
+/// `slot_tp_getattr_hook` does after a suppressed generic lookup).
+fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
     use crate::types::Dunder;
     let Object::Instance(inst) = obj else {
         return false;
@@ -69009,11 +69101,17 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     if cls.native_kind.get() != 0 {
         return false;
     }
+    // (A builtin class's hook, a weak proxy's among them, may stand in for
+    // special cases of the default lookup.)
+    let hook = cls.dunder(Dunder::GetAttr).present();
+    if hook && (!hooked || cls.flags.is_builtin) {
+        return false;
+    }
     // The class's part of the verdict depends only on its attributes
     // (memoized until it or a base changes).
     let class_missing = cls.memo_verdict(crate::types::Verdict::AttrMissing, name, || {
         if !cls.dunder(Dunder::GetAttribute).object_owner()
-            || cls.dunder(Dunder::GetAttr).present()
+            || cls.is_super_proxy_type()
             || cls.lookup(name).is_some()
         {
             return false;
@@ -69075,6 +69173,18 @@ pub(crate) fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Ob
             _ => Object::None,
         });
     }
+    // A name no builtin base supplies (the common case: the rescue of every
+    // failed instance lookup asks) is settled once per class version.
+    if ty.memo_verdict(crate::types::Verdict::NoSlotWrapper, name, || {
+        builtin_slot_wrapper_walk(ty, name).is_none()
+    }) {
+        return None;
+    }
+    builtin_slot_wrapper_walk(ty, name)
+}
+
+/// [`builtin_slot_wrapper`]'s walk of `ty`'s builtin bases.
+fn builtin_slot_wrapper_walk(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
     for base in ty.mro.borrow().iter() {
         if !base.flags.is_builtin {
             continue;
@@ -73332,11 +73442,26 @@ fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
 #[inline]
 fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> bool {
     b.binds_instance
+        // (A site settled on a plain instance's native `__init__` may see
+        // a dict payload later, which the dispatch routes.)
+        && (via_call || b.name != "__init__" || native_init_call(b, recv))
         && (!via_call
             || builtins::method_memo_tag(recv).is_some()
             || exception_init_call(b, recv)
             || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
                 && matches!(recv, Object::Instance(_))))
+}
+
+/// Whether `b` called on `recv` is a native `__init__` (`object.__init__`,
+/// typically through `super().__init__()`) on a plain instance: no native
+/// payload (a dict's routes through the dispatch) and not an exception
+/// (see [`exception_init_call`]), so its body runs directly.
+fn native_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
+    b.name == "__init__"
+        && b.call_kw.is_none()
+        && matches!(recv, Object::Instance(i) if i.native.get().is_none()
+            && i.c_body.get() == 0
+            && !i.cls_raw().flags.is_exception)
 }
 
 /// The builtin function a bound method of one wraps, as its own callable.
@@ -74964,6 +75089,56 @@ const LAID_OUT_SLOT: u64 = 0x5ca1_a770_0000_0006;
 /// `__delattr__`, with no class attribute of that name in the way (see
 /// [`Interpreter::core_delete_attr`]).
 const DELETE_OWN_ATTR: u64 = 0x5ca1_a770_0000_0007;
+
+/// A `LOAD_ATTR` site's stamp tag for a module attribute: the first word
+/// is the module dict's mutation stamp, the bits the entry's position.
+/// A stamp names one key layout of one dict (values stored in place keep
+/// it), so while it matches, that position holds the site's name.
+const MODULE_ENTRY: u64 = 0x5ca1_a770_0000_0008;
+
+/// A `LOAD_ATTR` site's stamp tag for `inst.__dict__` where the class (at
+/// that version) resolves the name to its own `__dict__` member, a data
+/// descriptor serving the instance dict (CPython's `subtype_dict`).
+const INST_DICT: u64 = 0x5ca1_a770_0000_0009;
+
+/// `inst.__dict__` for the `LOAD_ATTR` site at `pc` (name `name_idx`):
+/// through the site's [`INST_DICT`] stamp, or, for a class that resolves
+/// `__dict__` to its plain dict member under the default attribute
+/// protocol, the instance dict, after which the site remembers the class.
+/// `None` for any other name or shape. Runs no code (the dict may be
+/// created).
+#[inline(never)]
+fn inst_dict_attr(
+    code: &CodeObject,
+    inst: &PyInstance,
+    pc: usize,
+    name_idx: u32,
+) -> Option<Object> {
+    if code.names.get(name_idx as usize)?.as_str() != "__dict__"
+        || inst.native.get().is_some()
+        || inst.c_body.get() != 0
+    {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    let ver = cls.attr_version.get();
+    let warm = code_vm_ext(code)
+        .and_then(|ext| ext.stamp_slot(pc))
+        .is_some_and(|slot| slot.get()[..2] == [ver, INST_DICT]);
+    if !warm {
+        if !cls.has_managed_dict()
+            || cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || !Interpreter::default_getattribute(cls)
+            || cls.is_super_proxy_type()
+            || !matches!(cls.lookup("__dict__"), Some(Object::SlotDescriptor(s)) if s.name == "__dict__")
+        {
+            return None;
+        }
+        code_stamp_slot(code, pc as u32)?.set([ver, INST_DICT, 0]);
+    }
+    Some(Object::Dict(inst.dict_shared()))
+}
 
 /// The named tuple field a `LOAD_ATTR` site's stamp remembers for
 /// `inst`'s class at its current version (see [`TUPLE_FIELD`]): the item

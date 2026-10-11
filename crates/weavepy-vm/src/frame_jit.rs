@@ -930,6 +930,10 @@ struct Tags {
     dict: u8,
     set: u8,
     str: u8,
+    /// A module's tag, and where its dict's data is (see
+    /// [`module_layout`]).
+    module: u8,
+    module_layout: Option<(i32, i32)>,
     /// The heap variants whose payload word is an `Rc`'s allocation, its
     /// strong count the allocation's first word (a clone is an increment
     /// there): instances, lists, dicts and classes, as far as measured.
@@ -1029,6 +1033,8 @@ fn tags() -> Option<Tags> {
         dict: tag(&Object::new_dict()),
         set: tag(&Object::new_set()),
         str: tag(&Object::from_str("")),
+        module: tag(&sample_module()),
+        module_layout: module_layout(),
         rc_counted_hdr: if cfg!(debug_assertions) {
             0
         } else {
@@ -1133,6 +1139,38 @@ fn tuple_layout() -> Option<(i32, i32)> {
     let at = |i: usize| words.get(i).copied();
     (at(items / 8 + 1)? == MARK as u64 && items % 8 == 0 && len * 8 < items)
         .then(|| Some((i32::try_from(len * 8).ok()?, i32::try_from(items).ok()?)))?
+}
+
+/// A private module to measure against (never seen by Python code).
+fn sample_module() -> Object {
+    Object::Module(Rc::new(crate::object::PyModule {
+        name: String::new(),
+        filename: None,
+        dict: Rc::new(crate::sync::RefCell::new(crate::object::DictData::default())),
+    }))
+}
+
+/// Where a module's dict is, read off a sample module (`None` if it isn't
+/// the shape the code assumes): the byte offset, from its payload word, of
+/// its dict handle (a word), and from that handle's value, of the dict's
+/// data (where its stamp and entries are). A module's dict is fixed for
+/// its lifetime.
+fn module_layout() -> Option<(i32, i32)> {
+    let m = sample_module();
+    // SAFETY: every `Object` is 16 bytes; a module's second word addresses
+    // its payload.
+    let word = unsafe { *std::ptr::from_ref(&m).cast::<u64>().add(1) } as usize;
+    let Object::Module(pm) = &m else {
+        return None;
+    };
+    let field = std::ptr::from_ref(&pm.dict) as usize;
+    let handle_at = field.checked_sub(word)?;
+    // SAFETY: the dict handle is one word inside the live sample.
+    let handle = unsafe { std::ptr::read(field as *const usize) };
+    let cell: &crate::sync::RefCell<crate::object::DictData> = &pm.dict;
+    let data_at = (cell.as_ptr() as usize).checked_sub(handle)?;
+    (std::mem::size_of::<Rc<crate::sync::RefCell<crate::object::DictData>>>() == 8)
+        .then(|| Some((i32::try_from(handle_at).ok()?, i32::try_from(data_at).ok()?)))?
 }
 
 /// Whether cloning `o` (whose payload word is `w`) adds one to the word at
@@ -3666,10 +3704,48 @@ impl ModCache {
 /// A `LOAD_ATTR` site's `__slots__` member shortcut: the class version and
 /// the member's position the site's cache last proved (`ver` 0 empty),
 /// read without decoding the site's cache.
+///
+/// A module receiver's read keeps its own pair: the module dict's stamp
+/// when the site last read it (`0` empty: no dict has that stamp) and
+/// the address of the entry's value, which compiled code reads in line
+/// while the stamp stands (as [`GlobalCache`] does a global's).
 #[derive(Default)]
+#[repr(C)]
 pub(crate) struct SlotCache {
     ver: std::cell::Cell<u64>,
     idx: std::cell::Cell<u32>,
+    mstamp: std::cell::Cell<u64>,
+    mvalue: std::cell::Cell<u64>,
+}
+
+const SC_MSTAMP: i32 = std::mem::offset_of!(SlotCache, mstamp) as i32;
+const SC_MVALUE: i32 = std::mem::offset_of!(SlotCache, mvalue) as i32;
+
+/// Remember in the `LOAD_ATTR` site's `cache` the entry of `m`'s dict the
+/// site's stamp (see `MODULE_ENTRY`) just proved, for compiled code's
+/// in-line read.
+fn mod_attr_note(
+    ext: &CodeConstObjects,
+    m: &crate::object::PyModule,
+    pc: usize,
+    cache: &SlotCache,
+) {
+    let Some(slot) = ext.stamp_slot(pc) else {
+        return;
+    };
+    let [stamp, tag, idx] = slot.get();
+    if tag != crate::MODULE_ENTRY {
+        return;
+    }
+    // SAFETY: a read between two instructions, running no code.
+    if let Some(d) = unsafe { m.dict.peek() } {
+        if d.mutation_stamp() == stamp {
+            if let Some((_, v)) = d.get_index(idx as usize) {
+                cache.mstamp.set(stamp);
+                cache.mvalue.set(std::ptr::from_ref(v) as u64);
+            }
+        }
+    }
 }
 
 /// The `__slots__` member `recv` holds for the `LOAD_ATTR` at `pc`, through
@@ -3775,8 +3851,16 @@ unsafe extern "C" fn h_stack_attr(
                 }
             },
             Object::Type(cls) if Rc::strong_count(cls) > 1 => type_attr(code, ext, cls, pc, arg),
-            Object::Module(m) => Interpreter::core_module_attr(code, m, pc, arg)
-                .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg)),
+            Object::Module(m) => {
+                let Some(v) = Interpreter::core_module_attr(code, m, pc, arg)
+                    .or_else(|| Interpreter::leaf_fused_local_attr(code, recv, pc, arg))
+                else {
+                    return 1;
+                };
+                mod_attr_note(ext, m, pc, &*cache);
+                crate::drop_hot(std::mem::replace(&mut *at, v));
+                return 0;
+            }
             Object::Code(_) | Object::Frame(_) => {
                 let Some(v) = code
                     .names
@@ -3854,9 +3938,17 @@ unsafe extern "C" fn h_local_attr(
             Object::Instance(inst) if inst.cls_raw().native_kind.get() != 0 => {
                 Interpreter::core_native_field(Some(ext), inst, arg, pc, code.instructions.len())
             }
-            Object::Instance(_) | Object::Module(_) => {
-                Interpreter::core_local_attr(Some(ext), code, recv, pc, arg)
+            Object::Module(m) => {
+                let Some(v) = Interpreter::core_module_attr(code, m, pc, arg)
+                    .or_else(|| Interpreter::core_local_attr(Some(ext), code, recv, pc, arg))
+                else {
+                    return 1;
+                };
+                mod_attr_note(ext, m, pc, &*cache);
+                dst.write(v);
+                return 0;
             }
+            Object::Instance(_) => Interpreter::core_local_attr(Some(ext), code, recv, pc, arg),
             Object::Type(cls) => type_attr(code, ext, cls, pc, arg),
             // A frame's or code object's plain field (a live frame's line
             // needs the full lane, which makes its `lasti` current).
@@ -10376,6 +10468,50 @@ impl<'a> Lower<'a> {
     /// [`h_local_attr`] / [`h_stack_attr`]. The value goes onto the stack
     /// (a scalar copied, anything else with a reference taken); a stack
     /// receiver is released after. A miss is the core loop's.
+    /// An in-line attribute read's value at `v` into the free slot `dst`
+    /// (stack slot `slot`) in place of the receiver `item`, then on to
+    /// `done`: a local receiver stays, a stack receiver is released first
+    /// (a declined release leaves through `exit`).
+    fn attr_value_out(
+        &mut self,
+        item: Item,
+        dst: Value,
+        slot: usize,
+        v: Value,
+        exit: Block,
+        done: Block,
+    ) {
+        match item {
+            // The receiver is the local's: the value just takes a copy.
+            Item::Local(_) => {
+                self.copy_value(dst, v);
+                self.b.ins().jump(done, &[]);
+            }
+            _ => {
+                // The receiver is the stack's: the value goes above it
+                // (copied) until the receiver is released, then down.
+                let above = self.slot_addr(slot + 1);
+                self.copy_value(above, v);
+                let r = self
+                    .call(h_pop as *const () as usize, &[dst], true)
+                    .expect("returns");
+                let undo = self.b.create_block();
+                let released = self.b.create_block();
+                self.b.ins().brif(r, undo, &[], released, &[]);
+                // Declined: the copy goes, and the core loop takes the
+                // instruction from the start.
+                self.b.switch_to_block(undo);
+                // (A fresh copy has another owner: its release is a plain
+                // decrement.)
+                self.call(h_pop as *const () as usize, &[above], true);
+                self.b.ins().jump(exit, &[]);
+                self.b.switch_to_block(released);
+                self.copy16(dst, above);
+                self.b.ins().jump(done, &[]);
+            }
+        }
+    }
+
     fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
         // A property's getter may run here (see `h_property`), which needs
         // the whole stack on the frame's.
@@ -10397,8 +10533,41 @@ impl<'a> Lower<'a> {
         let dst = self.slot_addr(slot);
         let miss = self.b.create_block();
         let done = self.b.create_block();
+        let cache: Box<SlotCache> = Box::default();
+        let cache_at = std::ptr::from_ref::<SlotCache>(&cache) as i64;
+        self.slot_caches.push(cache);
+        let module_site = matches!(
+            self.code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::LoadAttrModule { .. }
+        );
         // (A site with no field shortcut yet goes straight to the helper.)
         match (self.layout, self.field_slots.get(pc)) {
+            // A module attribute (CPython's `LOAD_ATTR_MODULE`): the value
+            // the site's helper last read, while the module's dict is
+            // exactly as it was then (its stamp moves with every key
+            // change; a value stored in place stays at its address).
+            _ if module_site && self.tags.module_layout.is_some() => {
+                let (handle_at, data_at) = self.tags.module_layout.expect("checked");
+                let ptr = self.ptr;
+                let otag = self.tag_at(at);
+                let not_mod =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.module));
+                self.branch_out(not_mod, miss);
+                let m = self.b.ins().load(ptr, FLAGS, at, 8);
+                let handle = self.b.ins().load(ptr, FLAGS, m, handle_at);
+                let stamp = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, handle, data_at + DICT_STAMP);
+                let c = self.b.ins().iconst(ptr, cache_at);
+                let want = self.b.ins().load(types::I64, FLAGS, c, SC_MSTAMP);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, stamp, want);
+                self.branch_out(stale, miss);
+                let v = self.b.ins().load(ptr, FLAGS, c, SC_MVALUE);
+                self.attr_value_out(item, dst, slot, v, exit, done);
+            }
             (Some(l), Some(cache_slot)) if cache_slot.get().0 != 0 => {
                 let l = *l;
                 let otag = self.tag_at(at);
@@ -10486,37 +10655,7 @@ impl<'a> Lower<'a> {
                     let v = self.b.ins().iadd(block, off);
                     self.b.ins().iadd_imm(v, i64::from(l.split_values))
                 };
-                match item {
-                    // The receiver is the local's: the value just takes a
-                    // copy.
-                    Item::Local(_) => {
-                        self.copy_value(dst, v);
-                        self.b.ins().jump(done, &[]);
-                    }
-                    _ => {
-                        // The receiver is the stack's: the value goes above
-                        // it (copied) until the receiver is released, then
-                        // down.
-                        let above = self.slot_addr(slot + 1);
-                        self.copy_value(above, v);
-                        let r = self
-                            .call(h_pop as *const () as usize, &[dst], true)
-                            .expect("returns");
-                        let undo = self.b.create_block();
-                        let released = self.b.create_block();
-                        self.b.ins().brif(r, undo, &[], released, &[]);
-                        // Declined: the copy goes, and the core loop takes
-                        // the instruction from the start.
-                        self.b.switch_to_block(undo);
-                        // (A fresh copy has another owner: its release is a
-                        // plain decrement.)
-                        self.call(h_pop as *const () as usize, &[above], true);
-                        self.b.ins().jump(exit, &[]);
-                        self.b.switch_to_block(released);
-                        self.copy16(dst, above);
-                        self.b.ins().jump(done, &[]);
-                    }
-                }
+                self.attr_value_out(item, dst, slot, v, exit, done);
             }
             _ => {
                 self.b.ins().jump(miss, &[]);
@@ -10527,12 +10666,7 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let ext = self.ext_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
-        let cache: Box<SlotCache> = Box::default();
-        let c = self
-            .b
-            .ins()
-            .iconst(self.ptr, std::ptr::from_ref::<SlotCache>(&cache) as i64);
-        self.slot_caches.push(cache);
+        let c = self.b.ins().iconst(self.ptr, cache_at);
         let r = match item {
             Item::Local(_) => self.call(
                 h_local_attr as *const () as usize,
