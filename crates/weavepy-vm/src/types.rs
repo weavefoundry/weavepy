@@ -162,6 +162,10 @@ pub(crate) enum Verdict {
     /// No builtin base on the class's MRO supplies a slot wrapper or a
     /// type-dict entry `name` (see `builtin_slot_wrapper`).
     NoSlotWrapper = 4,
+    /// An instance store of `name` is a plain instance-dict store: default
+    /// attribute access and setting, and no class attribute in the way
+    /// but a function or a plain value (see `Interpreter::leaf_store_attr`).
+    PlainStore = 5,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -337,12 +341,29 @@ pub(crate) mod type_cache {
                 u64::from_le_bytes(b[n - 8..].try_into().expect("8 bytes")),
             )
         } else {
-            let mut w = [0u8; 8];
-            w[..n].copy_from_slice(b);
-            (u64::from_le_bytes(w), 0)
+            (short_word(b), 0)
         };
         let x = (head ^ tail.rotate_left(29) ^ (n as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         x ^ (x >> 29)
+    }
+
+    /// The bytes of a name shorter than eight bytes as one word, from two
+    /// overlapping loads that together cover it (so two names of the same
+    /// length are equal exactly when their words are).
+    #[inline(always)]
+    fn short_word(b: &[u8]) -> u64 {
+        let n = b.len();
+        if n >= 4 {
+            let lo = u32::from_le_bytes(b[..4].try_into().expect("4 bytes"));
+            let hi = u32::from_le_bytes(b[n - 4..].try_into().expect("4 bytes"));
+            u64::from(lo) | u64::from(hi) << 32
+        } else if n >= 2 {
+            let lo = u16::from_le_bytes(b[..2].try_into().expect("2 bytes"));
+            let hi = u16::from_le_bytes(b[n - 2..].try_into().expect("2 bytes"));
+            u64::from(lo) | u64::from(hi) << 16
+        } else {
+            b.first().map_or(0, |&c| u64::from(c))
+        }
     }
 
     /// `a == b` for attribute names, in line for the short ones (most
@@ -361,13 +382,7 @@ pub(crate) mod type_cache {
         if n >= 8 {
             return w(a, 0) == w(b, 0) && w(a, n - 8) == w(b, n - 8);
         }
-        let mut x = 0u64;
-        let mut y = 0u64;
-        for i in 0..n {
-            x |= u64::from(a[i]) << (8 * i);
-            y |= u64::from(b[i]) << (8 * i);
-        }
-        x == y
+        short_word(a) == short_word(b)
     }
 
     #[inline]

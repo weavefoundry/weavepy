@@ -382,6 +382,54 @@ class PropertySiteTest(unittest.TestCase):
         self.assertEqual(read(a), 3)
 
 
+class ReflectedCompareTest(unittest.TestCase):
+    def test_subclass_reflected_first(self):
+        log = []
+
+        class A:
+            def __lt__(self, other):
+                log.append("A.lt")
+                return "A"
+
+            def __eq__(self, other):
+                log.append("A.eq")
+                return False
+
+        class B(A):
+            def __gt__(self, other):
+                log.append("B.gt")
+                return "B"
+
+            def __eq__(self, other):
+                log.append("B.eq")
+                return NotImplemented
+
+        a, b = A(), B()
+        for _ in range(N):
+            log.clear()
+            self.assertEqual(a < b, "B")
+            self.assertEqual(log, ["B.gt"])
+        log.clear()
+        self.assertFalse(a == b)
+        self.assertEqual(log, ["B.eq", "A.eq"])
+        B.__gt__ = lambda self, other: NotImplemented
+        log.clear()
+        self.assertEqual(a < b, "A")
+        self.assertEqual(log, ["A.lt"])
+
+    def test_unorderable(self):
+        class A:
+            pass
+
+        class B(A):
+            def __gt__(self, other):
+                return NotImplemented
+
+        for _ in range(N):
+            with self.assertRaises(TypeError):
+                A() < B()
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)

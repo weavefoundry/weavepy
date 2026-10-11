@@ -29109,22 +29109,27 @@ impl Interpreter {
                     // establishes, read from the class's own caches).
                     _ => {
                         let cls = inst.cls_raw();
-                        if !Self::default_getattribute(cls)
-                            || cls.flags.is_builtin
-                            || !cls.setattr_is_default()
-                            || cls.forbids_dict
-                            || crate::object::exotic_str_keys_possible()
-                            || (name.starts_with("__") && name != "__doc__")
-                            // An exception's `args` is a `BaseException`
-                            // descriptor.
-                            || (name == "args"
-                                && cls.is_subclass_of(&builtin_types().base_exception))
+                        if crate::object::exotic_str_keys_possible()
                             || inst.c_body.get() != 0
-                            || !matches!(
-                                cls.lookup(name),
-                                None | Some(Object::Function(_) | Object::Str(_) | Object::None)
-                            )
                             || crate::capi_watchers::dicts_active()
+                            // (The class's part, settled per class version.)
+                            || !cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
+                                Self::default_getattribute(cls)
+                                    && !cls.flags.is_builtin
+                                    && cls.setattr_is_default()
+                                    && !cls.forbids_dict
+                                    && !(name.starts_with("__") && name != "__doc__")
+                                    // An exception's `args` is a
+                                    // `BaseException` descriptor.
+                                    && !(name == "args"
+                                        && cls.is_subclass_of(&builtin_types().base_exception))
+                                    && matches!(
+                                        cls.lookup(name),
+                                        None | Some(
+                                            Object::Function(_) | Object::Str(_) | Object::None
+                                        )
+                                    )
+                            })
                         {
                             return None;
                         }
@@ -46698,6 +46703,23 @@ impl Interpreter {
         }
     }
 
+    /// `type(x).<op's dunder>` for an instance `x` when it is a plain
+    /// Python function, from the class's cache (see
+    /// [`Self::instance_dunder_function`]): called with `x` first, it is
+    /// what [`Self::cmp_method`] binds.
+    fn cmp_function(x: &Object, op: CompareKind) -> Option<Rc<PyFunction>> {
+        /// Class cache keys per comparison dunder.
+        static CMP_KEYS: [u8; 8] = [0; 8];
+        let Object::Instance(inst) = x else {
+            return None;
+        };
+        Self::instance_dunder_function(
+            inst,
+            std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
+            cmp_dunder(op).0,
+        )
+    }
+
     /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].
     /// Used everywhere a comparison feeds control flow or a native algorithm
     /// (`min`/`max`, `in`, sort merges, the `==` sentinel probes).
@@ -46835,14 +46857,7 @@ impl Interpreter {
             if std::ptr::eq(ia.cls_raw(), ib.cls_raw())
                 || !ib.cls_raw().is_subclass_of(ia.cls_raw())
             {
-                /// Class cache keys per comparison (see
-                /// `instance_dunder_function`).
-                static CMP_KEYS: [u8; 8] = [0; 8];
-                if let Some(f) = Self::instance_dunder_function(
-                    ia,
-                    std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
-                    cmp_dunder(op).0,
-                ) {
+                if let Some(f) = Self::cmp_function(a, op) {
                     let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
                     if !r.is_same(&crate::vm_singletons::not_implemented()) {
                         return Ok(r);
@@ -46961,9 +46976,12 @@ impl Interpreter {
         // interface's richer `__eq__` first (test_ipaddress), and
         // `addr < intf` must run the interface's total_ordering
         // `__gt__` first.
+        // (A plain function on an instance's class, from the class's
+        // cache, is called directly below, as `cmp_method` would bind it.)
+        let b_function = Self::cmp_function(b, cmp_swapped(op));
         let reflected_first = !Rc::ptr_eq(&cls_b, &cls_a)
             && cls_b.is_subclass_of(&cls_a)
-            && (cls_b.lookup(swapped).is_some() || b_foreign);
+            && (b_function.is_some() || b_foreign || cls_b.lookup(swapped).is_some());
         let mut tried_reflected = false;
         // Track whether each operand's *own* `__ne__` slot actually ran.
         // `object.__ne__` (installed on every class) already derives from the
@@ -46983,7 +47001,13 @@ impl Interpreter {
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(method) = self.cmp_method(b, swapped, globals) {
+            if let Some(f) = b_function.clone() {
+                b_slot_ran = true;
+                let r = self.call_dunder_function(f, &[b.clone(), a.clone()])?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+            } else if let Some(method) = self.cmp_method(b, swapped, globals) {
                 b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
@@ -47002,6 +47026,12 @@ impl Interpreter {
         }
         if forward_ran {
             a_slot_ran = true;
+        } else if let Some(f) = Self::cmp_function(a, op) {
+            a_slot_ran = true;
+            let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
+            if !r.is_same(&not_impl) {
+                return Ok(r);
+            }
         } else if let Some(method) = self.cmp_method(a, dunder, globals) {
             a_slot_ran = true;
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
@@ -47019,7 +47049,13 @@ impl Interpreter {
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(method) = self.cmp_method(b, swapped, globals) {
+            if let Some(f) = b_function {
+                b_slot_ran = true;
+                let r = self.call_dunder_function(f, &[b.clone(), a.clone()])?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+            } else if let Some(method) = self.cmp_method(b, swapped, globals) {
                 b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
@@ -73437,6 +73473,19 @@ fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
         B::BitOr => ("__or__", "__ror__"),
         B::BitXor => ("__xor__", "__rxor__"),
         B::BitAnd => ("__and__", "__rand__"),
+    }
+}
+
+/// The comparison whose forward dunder is `op`'s reflected one.
+fn cmp_swapped(op: CompareKind) -> CompareKind {
+    use CompareKind as C;
+    match op {
+        C::Eq => C::Eq,
+        C::NotEq => C::NotEq,
+        C::Lt => C::Gt,
+        C::LtE => C::GtE,
+        C::Gt => C::Lt,
+        C::GtE => C::LtE,
     }
 }
 
