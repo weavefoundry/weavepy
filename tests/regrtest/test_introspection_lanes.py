@@ -1,5 +1,5 @@
-"""Operations `inspect` leans on, at warm sites: membership in a class's
-`__dict__` view, `sys.getrecursionlimit()`, and constructing `weakref.ref`
+"""Operations `inspect` leans on, at warm sites: membership in and
+subscripts of a class's `__dict__` view, `sys.getrecursionlimit()`, and constructing `weakref.ref`
 and `types.MappingProxyType` objects."""
 
 import sys
@@ -17,8 +17,17 @@ for i in range(300):
     assert ("x" not in A.__dict__) is False
     assert "__dict__" in A.__dict__
     assert "__mro__" in type.__dict__
+for i in range(300):
+    assert A.__dict__["x"] == 1
+    assert type.__dict__["__mro__"].__get__(A) == (A, object)
+    try:
+        A.__dict__["missing"]
+    except KeyError as e:
+        assert e.args == ("missing",)
+    else:
+        raise AssertionError("expected KeyError")
 A.y = 2
-assert "y" in A.__dict__
+assert "y" in A.__dict__ and A.__dict__["y"] == 2
 del A.y
 assert "y" not in A.__dict__
 

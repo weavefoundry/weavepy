@@ -18683,12 +18683,25 @@ impl Interpreter {
                 // grades its own release.)
                 if !matches!(
                     c,
-                    Object::List(_) | Object::Tuple(_) | Object::Dict(_) | Object::Str(_)
+                    Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Dict(_)
+                        | Object::Str(_)
+                        | Object::MappingProxy(_)
                 ) || !Self::core_droppable(c)
                 {
                     return None;
                 }
                 let r = match (c, k) {
+                    // A class's `__dict__` view (`type.__dict__['__mro__']`,
+                    // as `inspect` reads it): a present key's value (a miss
+                    // raises on the full path).
+                    (Object::MappingProxy(d), Object::Str(_)) => {
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        // SAFETY: as for a dict below.
+                        let d = unsafe { d.peek() }?;
+                        clone_hot(d.get_hot(&probe)?)
+                    }
                     (Object::List(xs), Object::Int(i)) => {
                         // SAFETY: a read between two instructions.
                         let xs = unsafe { xs.peek() }?;
