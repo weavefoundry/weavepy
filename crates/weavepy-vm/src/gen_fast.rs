@@ -144,7 +144,7 @@ const CODE_NATIVE: u8 = 3;
 /// (cached in the code's extension table). The prologue may hold others
 /// (`range(n)` built before the loop): the first resume's step stops at
 /// them, and the general loop runs them once.
-#[inline]
+#[inline(always)]
 fn code_ok(code: &CodeObject) -> u8 {
     use std::sync::atomic::Ordering;
     let Some(ext) = crate::code_vm_ext(code) else {
@@ -154,6 +154,19 @@ fn code_ok(code: &CodeObject) -> u8 {
         0 => code_ok_scan(code, ext),
         v => v,
     }
+}
+
+/// Whether a fast step may run `g`'s body at all (see [`code_ok`]).
+#[inline(always)]
+pub(crate) fn steps_body(g: &PyGenerator) -> bool {
+    matches!(&g.code, Object::Code(code) if code_ok(code) != CODE_NO)
+}
+
+/// Whether a fast step may run `g`'s body at all (see [`code_ok`]), and
+/// `g` isn't a collapsed chain's level (see `Interpreter::gen_fast_next`).
+#[inline(always)]
+pub(crate) fn may_step(g: &PyGenerator) -> bool {
+    g.chain.get() == 0 && steps_body(g)
 }
 
 /// [`code_ok`]'s first verdict for a code object, remembered in its
@@ -1015,15 +1028,18 @@ impl Interpreter {
         depth: u8,
         dead: *const std::cell::Cell<bool>,
     ) -> GenNext {
+        // A level of a collapsed `yield from` chain is the inline resume's
+        // (which resumes a parked chain without settling it), and a body no
+        // fast step runs declines at once (its code's verdict is cached:
+        // see `code_ok`).
+        if g.chain.get() != 0 || matches!(&g.code, Object::Code(code) if code_ok(code) == CODE_NO)
+        {
+            return GenNext::Declined;
+        }
         if depth > MAX_DEPTH
             || crate::recursion::current_depth() + usize::from(depth) + 2
                 >= crate::recursion::recursion_limit()
         {
-            return GenNext::Declined;
-        }
-        // A level of a collapsed `yield from` chain is the inline resume's
-        // (which resumes a parked chain without settling it).
-        if g.chain.get() != 0 {
             return GenNext::Declined;
         }
         // Validate and take the frame under one exclusive view; no Python

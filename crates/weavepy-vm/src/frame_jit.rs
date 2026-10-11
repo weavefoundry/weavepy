@@ -1328,6 +1328,11 @@ unsafe extern "C" fn h_for_iter_rest(
                     sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
                     return FOR_SWITCHED;
                 }
+                // A collapsed chain's fast step delivered the value without
+                // a switch (see `Interpreter::chain_step`).
+                if std::ptr::eq(sw.cur, st.frame) {
+                    return if sw.pending.is_none() { 1 } else { FOR_SWITCHED };
+                }
                 // A compiled body runs from here; its yield (the value on
                 // top, past the instruction) or its return (the iterator
                 // gone, past the loop) continues this code natively.
@@ -5123,6 +5128,11 @@ unsafe extern "C" fn h_call(
             let interp = &mut *st.interp.cast_mut();
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::SendCall) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            } else if std::ptr::eq(sw.cur, st.frame) && sw.pending.is_none() {
+                // A collapsed chain's fast step delivered the result (see
+                // `Interpreter::chain_step`).
+                st.len = (*st.frame).stack.len();
+                return 0;
             }
             return RELOAD;
         }
@@ -5169,6 +5179,11 @@ unsafe extern "C" fn h_call(
             let sw = &mut *st.sw;
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextCall) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            } else if std::ptr::eq(sw.cur, st.frame) && sw.pending.is_none() {
+                // A collapsed chain's fast step delivered the result (see
+                // `Interpreter::chain_step`).
+                st.len = (*st.frame).stack.len();
+                return 0;
             }
             return RELOAD;
         }
@@ -5212,6 +5227,10 @@ unsafe extern "C" fn h_call(
             let sw = &mut *st.sw;
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextDefault) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            } else if std::ptr::eq(sw.cur, st.frame) && sw.pending.is_none() {
+                // As for `next(gen)` above.
+                st.len = (*st.frame).stack.len();
+                return 0;
             }
             return RELOAD;
         }
@@ -6196,13 +6215,18 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
     }
 }
 
+/// [`h_send`]'s status for a delegate's fast step that yielded: the value
+/// in the sent one's place, for the code to go on at the `YIELD_VALUE`.
+const SEND_YIELDED: u32 = 2;
+
 /// `SEND` at `pc` of the running activation, its stack `len` deep: the
 /// generator or coroutine below the top resumed and switched to as the
 /// core loop's arm does (`RELOAD`), or, a compiled delegate run from here
-/// that returned into this `SEND`, its result in the sent value's place
-/// for the code to go on at the `END_SEND` (`0`); anything else (another
-/// delegate, or a generator's fast step, which never switches) declined
-/// untouched.
+/// (or a simple one's fast step) that returned into this `SEND`, its
+/// result in the sent value's place for the code to go on at the
+/// `END_SEND` (`0`), or a fast step's yield ([`SEND_YIELDED`]); anything
+/// else (another delegate, or a generator's fast step, which never
+/// switches) declined untouched.
 unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
     // SAFETY: the code passes its live state and its stack depth (the
     // delegate and the sent value on top).
@@ -6218,15 +6242,30 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
         {
             return 1;
         }
+        // A simple generator steps to its next yield in place, as the core
+        // loop's arm steps it (see `gen_fast`).
+        if let (Object::Generator(g), Object::None) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1)) {
+            if crate::gen_fast::may_step(g) {
+                if let Some(r) = h_send_step(st, pc, len) {
+                    return r;
+                }
+            }
+        }
+        let interp = &mut *st.interp.cast_mut();
         let sw = &mut *st.sw;
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
         *sw.last = st.last;
-        let interp = &mut *st.interp.cast_mut();
         if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::Send) {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             return RELOAD;
+        }
+        // A collapsed chain's fast step delivered the yield without a
+        // switch (see `Interpreter::chain_step`).
+        if std::ptr::eq(sw.cur, st.frame) && sw.pending.is_none() {
+            st.len = len;
+            return SEND_YIELDED;
         }
         if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) && run_switched_directly(st) {
             let frame = &*st.frame;
@@ -6237,6 +6276,53 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
             }
         }
         RELOAD
+    }
+}
+
+/// [`h_send`]'s fast step of the generator below the sent `None` (one a
+/// step may run): what it yields takes the sent value's slot (the code
+/// goes on at its yield, [`SEND_YIELDED`]), or its return value does as
+/// the `SEND` exits (`0`); `None` when the step declined, untouched.
+///
+/// # Safety
+///
+/// As [`h_send`]'s, the generator and `None` atop the stack.
+#[inline(never)]
+unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let arg = (&*st.frame).code.instructions[pc as usize].arg;
+        if arg & crate::GEN_SEND != 0 {
+            return None;
+        }
+        let Object::Generator(g) = &*st.stack.add(len - 2) else {
+            return None;
+        };
+        let interp = &mut *st.interp.cast_mut();
+        let (v, exit) = match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+            crate::gen_fast::GenNext::Yielded(v) => (v, false),
+            crate::gen_fast::GenNext::Exhausted(v) => (v, true),
+            crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
+                return None;
+            }
+        };
+        // The sent `None`'s slot (no drop glue owed).
+        st.stack.add(len - 1).write(v);
+        let to = pc as usize + 1 + if exit { arg as usize } else { 0 };
+        // Anything the step released may have queued a finalizer, run
+        // before the next instruction: the core loop takes over there,
+        // synced as for a switch.
+        if (*st.maybe_dead).get() {
+            let sw = &mut *st.sw;
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len);
+            frame.pc = to as u32;
+            *sw.last = pc as usize;
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+            return Some(RELOAD);
+        }
+        st.len = len;
+        Some(if exit { 0 } else { SEND_YIELDED })
     }
 }
 
@@ -8485,11 +8571,24 @@ impl<'a> Lower<'a> {
                 let switched = self.b.create_block();
                 let other = self.b.create_block();
                 let returned = self.b.create_block();
+                let rest = self.b.create_block();
+                let yielded = self.b.create_block();
                 let reload = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RELOAD));
                 self.b.ins().brif(reload, switched, &[], other, &[]);
                 self.b.switch_to_block(switched);
                 self.b.ins().return_(&[r]);
                 self.b.switch_to_block(other);
+                // A delegate's fast step yielded: the value took the sent
+                // one's place, for this code's own `YIELD_VALUE`.
+                let is_yield = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(SEND_YIELDED));
+                self.b.ins().brif(is_yield, yielded, &[], rest, &[]);
+                self.b.switch_to_block(yielded);
+                self.set_last(pc);
+                self.goto(next);
+                self.b.switch_to_block(rest);
                 self.b.ins().brif(r, out, &[], returned, &[]);
                 // The delegate returned into this `SEND`: its result took the
                 // sent value's place.

@@ -7755,7 +7755,8 @@ impl Interpreter {
                     Some(stop) => stop,
                     None => {
                         let calls_ok = self.inline_calls_ok();
-                        let mut sw = CoreSwitch::enter(roots, frame, shell, last, calls_ok);
+                        let mut sw =
+                            CoreSwitch::enter(roots, frame, shell, last, calls_ok, snap_gen);
                         let stop = self.leaf_burst(&mut sw, snap_gen);
                         if sw.switched() {
                             return FrameEv::Switched(stop);
@@ -12883,6 +12884,37 @@ impl Interpreter {
                                 continue;
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        // A simple generator steps to its next yield in
+                        // place, as a `FOR_ITER` over it does (see
+                        // `gen_fast`): what it yields takes the sent `None`'s
+                        // slot, or its return value does as the `SEND` exits.
+                        // SAFETY: `len >= 2` (checked above).
+                        if let (Object::Generator(g), Object::None, 0) = unsafe {
+                            (&*base.add(len - 2), &*base.add(len - 1), ins.arg & GEN_SEND)
+                        } {
+                            let (v, exit) = match gen_fast::may_step(g)
+                                .then(|| self.gen_fast_next(g, snap_gen, 0, pending_work))
+                            {
+                                None => (None, false),
+                                Some(gen_fast::GenNext::Yielded(v)) => (Some(v), false),
+                                Some(gen_fast::GenNext::Exhausted(v)) => (Some(v), true),
+                                Some(gen_fast::GenNext::Declined | gen_fast::GenNext::Partial) => {
+                                    (None, false)
+                                }
+                            };
+                            if let Some(v) = v {
+                                // SAFETY: the sent `None`'s slot (no drop
+                                // glue owed).
+                                unsafe { base.add(len - 1).write(v) };
+                                last = pc;
+                                pc += 1;
+                                if exit {
+                                    pc += ins.arg as usize;
+                                }
+                                after_release!();
+                                continue;
+                            }
                         }
                         // SAFETY: `len <= cap`, every slot initialized.
                         unsafe { frame.stack.set_len(len) };
@@ -20880,15 +20912,13 @@ impl Interpreter {
             },
             // A generator suspended in a `yield from` collapses its chain
             // as a `SEND` to it would (see `Self::core_iter_collapse`).
-            InlineResume::ForIter | InlineResume::NextCall | InlineResume::NextDefault => {
+            InlineResume::ForIter
+            | InlineResume::NextCall
+            | InlineResume::NextDefault
+            | InlineResume::SendCall => {
                 if self.core_iter_collapse(sw, pc, mode) == SendHop::Collapsed {
                     return true;
                 }
-                if !self.core_gen_resume_one(sw, pc, mode) {
-                    return false;
-                }
-            }
-            InlineResume::SendCall => {
                 if !self.core_gen_resume_one(sw, pc, mode) {
                     return false;
                 }
@@ -20927,12 +20957,7 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced, the
         // generator where `mode` puts it (checked by the caller).
         let frame = unsafe { &*sw.cur };
-        let n = frame.stack.len();
-        let at = match mode {
-            InlineResume::ForIter | InlineResume::NextCall => n.checked_sub(1),
-            _ => n.checked_sub(2),
-        };
-        let Some(Object::Generator(g)) = at.and_then(|at| frame.stack.get(at)) else {
+        let Some(g) = Self::resumed_gen(frame, mode) else {
             return SendHop::Declined;
         };
         if g.chain.get() != 0 {
@@ -20948,6 +20973,14 @@ impl Interpreter {
         let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
             return SendHop::Declined;
         };
+        // A simple delegate takes a fast step (see `Self::delegate_step`).
+        if gen_fast::may_step(next) {
+            let next: *const Rc<PyGenerator> = next;
+            // SAFETY: `next` lives on `g`'s stack, which the step leaves.
+            if let Some(hop) = self.delegate_step(sw, pc, mode, gf, unsafe { &*next }, next_send) {
+                return hop;
+            }
+        }
         // Its delegate heads a parked chain: the generator joins it.
         if let Some(addr) = Self::parked_head(next) {
             // SAFETY: `g` is suspended in a `yield from` of the chain's
@@ -20974,6 +21007,39 @@ impl Interpreter {
             SendHop::Collapsed
         } else {
             SendHop::Declined
+        }
+    }
+
+    /// The generator a `FOR_ITER`, `next()` or `send(None)` call (`mode`)
+    /// atop `frame`'s stack resumes, if a collapsed chain may take it.
+    #[inline(always)]
+    fn resumed_gen(frame: &Frame, mode: InlineResume) -> Option<&Rc<PyGenerator>> {
+        let stack = &frame.stack;
+        let n = stack.len();
+        match mode {
+            InlineResume::ForIter | InlineResume::NextCall => match stack.last()? {
+                Object::Generator(g) => Some(g),
+                _ => None,
+            },
+            InlineResume::NextDefault => match stack.get(n.checked_sub(2)?)? {
+                Object::Generator(g) => Some(g),
+                _ => None,
+            },
+            // `gen.send(None)` / `coro.send(None)` (see `try_inline_gen`).
+            InlineResume::SendCall => {
+                if !matches!(stack.last()?, Object::None) {
+                    return None;
+                }
+                match (stack.get(n.checked_sub(3)?)?, &stack[n - 2]) {
+                    (Object::BoundMethod(bm), Object::Unbound) => match &bm.receiver {
+                        Object::Generator(g) | Object::Coroutine(g) => Some(g),
+                        _ => None,
+                    },
+                    (_, Object::Generator(g) | Object::Coroutine(g)) => Some(g),
+                    _ => None,
+                }
+            }
+            InlineResume::Send => None,
         }
     }
 
@@ -21030,6 +21096,24 @@ impl Interpreter {
         if sent_none && !gf.sent_consumed && g.kind != crate::object::CoroutineKind::AsyncGenerator
         {
             if let Some((next, next_send)) = Self::collapse_next(gf) {
+                // A simple delegate of its own takes a fast step (see
+                // `Self::delegate_step`).
+                if gen_fast::may_step(next) {
+                    let (next, gf): (*const Rc<PyGenerator>, *mut Frame) =
+                        (next, std::ptr::from_ref(gf).cast_mut());
+                    // SAFETY: `next` lives on the delegate's stack, which the
+                    // step leaves; nothing else reaches its state meanwhile.
+                    if let Some(hop) = self.delegate_step(
+                        sw,
+                        send_pc,
+                        InlineResume::Send,
+                        gf,
+                        unsafe { &*next },
+                        next_send,
+                    ) {
+                        return hop;
+                    }
+                }
                 // Its delegate heads a parked chain: the delegate joins it.
                 if let Some(addr) = Self::parked_head(next) {
                     // SAFETY: `g` is suspended in a `yield from` of the
@@ -21290,6 +21374,18 @@ impl Interpreter {
                 inner_frame,
             )
         };
+        let (inner, inner_frame) = match self.chain_step(sw, send_pc, mode, &mut rec) {
+            ChainStep::No => (inner, inner_frame),
+            ChainStep::Inner(inner, inner_frame) => (inner, inner_frame),
+            ChainStep::Delivered => {
+                self.chain_repark(rec);
+                return true;
+            }
+            ChainStep::Resume => {
+                self.chain_recycle(rec);
+                return false;
+            }
+        };
         match self.collapse_commit(sw, send_pc, mode, rec, inner, inner_frame) {
             Ok(()) => true,
             Err(mut rec) => {
@@ -21301,6 +21397,207 @@ impl Interpreter {
                 false
             }
         }
+    }
+
+    /// The innermost generator of the collapsed chain `rec` (taken to run
+    /// for the consumer's `mode` at `pc`, see [`Self::collapse_commit`])
+    /// by fast step (see `gen_fast`) instead of as an activation: a yield
+    /// passes every level by, leaving each where it was, so it goes to
+    /// the consumer directly ([`ChainStep::Delivered`]); a return resumes
+    /// the innermost level in its `SEND`'s exit with the value
+    /// ([`ChainStep::Inner`], or [`ChainStep::Resume`] when that level is
+    /// the chain's only one, for the consumer to resume as usual).
+    #[inline(always)]
+    fn chain_step(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        rec: &mut ChainRec,
+    ) -> ChainStep {
+        let last = rec.levels.last().expect("a collapsed chain");
+        // SAFETY: the innermost level is alive and delegating: its frame
+        // sits in its `SEND`, its delegate on top.
+        match (unsafe { &*last.act.frame }).stack.last() {
+            Some(Object::Generator(inner)) if gen_fast::may_step(inner) => {
+                let inner: *const Rc<PyGenerator> = inner;
+                self.chain_step_run(sw, pc, mode, rec, inner)
+            }
+            _ => ChainStep::No,
+        }
+    }
+
+    /// [`Self::chain_step`] for an innermost generator `inner` a fast step
+    /// may run.
+    #[inline(never)]
+    fn chain_step_run(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        rec: &mut ChainRec,
+        inner: *const Rc<PyGenerator>,
+    ) -> ChainStep {
+        // (Its levels count against the recursion limit, as when resumed.)
+        // SAFETY: the running thread's own cell.
+        if unsafe { (*sw.depth_cell).get() } + rec.levels.len() + 2
+            >= crate::recursion::recursion_limit()
+        {
+            return ChainStep::No;
+        }
+        // SAFETY: held by the innermost level's stack, which nothing below
+        // changes before the step ends.
+        let inner = unsafe { &*inner };
+        match self.gen_fast_next(inner, sw.snap_gen, 0, sw.maybe_dead) {
+            gen_fast::GenNext::Yielded(v) => {
+                // The outermost level goes once the chain parks.
+                rec.hold = self.step_deliver(sw, pc, mode, v);
+                ChainStep::Delivered
+            }
+            gen_fast::GenNext::Exhausted(v) => {
+                // The innermost level's `SEND` exits with the return value,
+                // the level suspended there having taken it.
+                let level = rec.levels.pop().expect("a collapsed chain");
+                // SAFETY: alive and delegating (see `Delegate`); its frame
+                // just past its `SEND`, its delegate on top.
+                unsafe {
+                    level.suspend();
+                    let frame = &mut *level.act.frame;
+                    let jump = frame.code.instructions[level.send_pc].arg;
+                    frame.pc = level.send_pc as u32 + 1 + jump;
+                    frame.stack.push(v);
+                    frame.sent_consumed = true;
+                }
+                if rec.levels.is_empty() {
+                    ChainStep::Resume
+                } else {
+                    ChainStep::Inner(level.gen, level.act.frame)
+                }
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => ChainStep::No,
+        }
+    }
+
+    /// The value `v` a fast step of the generator the consumer's `mode`
+    /// at `pc` resumes (or of that generator's delegate) yielded, as the
+    /// consumer's result: its operands leave as the instruction's own
+    /// resume takes them, and the generator a `next()` or `send()` call
+    /// held is returned, for the caller to release once the chain is
+    /// settled.
+    fn step_deliver(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        v: Object,
+    ) -> Option<Rc<PyGenerator>> {
+        // SAFETY: see `CoreSwitch`: the consumer is the running activation,
+        // synced, its operands as `mode` has them.
+        let frame = unsafe { &mut *sw.cur };
+        let mut held = None;
+        match mode {
+            InlineResume::Send => {
+                // The value takes the sent `None`'s place.
+                if let Some(top) = frame.stack.last_mut() {
+                    drop(std::mem::replace(top, v));
+                }
+            }
+            InlineResume::ForIter => frame.stack.push(v),
+            InlineResume::NextCall | InlineResume::NextDefault => {
+                if mode == InlineResume::NextDefault {
+                    drop(frame.stack.pop());
+                }
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                if let Some(Object::Generator(g)) = g {
+                    held = Some(g);
+                }
+                drop((a, b));
+                frame.stack.push(v);
+            }
+            InlineResume::SendCall => {
+                held = Self::send_call_pop(frame);
+                frame.stack.push(v);
+            }
+        }
+        frame.pc = pc as u32 + 1;
+        // SAFETY: as above.
+        unsafe { *sw.last = pc };
+        // Anything the step released may have queued a finalizer, run
+        // before the consumer's next instruction.
+        // SAFETY: the running thread's own flag.
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        held
+    }
+
+    /// The resume (the consumer's `mode` at `pc`) of a generator (frame
+    /// `gf`) suspended in the `yield from` at `send_pc` of `inner`, a
+    /// simple generator, by `inner`'s fast step (see `gen_fast`): a yield
+    /// passes the generator by, leaving it where it was, and goes to the
+    /// consumer directly (`Collapsed`); a return lands in the generator's
+    /// `SEND` exit, which it takes as its sent value, for the consumer to
+    /// resume it as usual (`Declined`). `None` when the step declined.
+    #[inline(never)]
+    fn delegate_step(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        gf: *mut Frame,
+        inner: &Rc<PyGenerator>,
+        send_pc: usize,
+    ) -> Option<SendHop> {
+        // (The generator counts against the recursion limit, as resumed.)
+        // SAFETY: the running thread's own cell.
+        if unsafe { (*sw.depth_cell).get() } + 3 >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        match self.gen_fast_next(inner, sw.snap_gen, 0, sw.maybe_dead) {
+            gen_fast::GenNext::Yielded(v) => {
+                drop(self.step_deliver(sw, pc, mode, v));
+                Some(SendHop::Collapsed)
+            }
+            gen_fast::GenNext::Exhausted(v) => {
+                // SAFETY: the generator is suspended (checked by the
+                // caller), its frame at the `RESUME` after the yield.
+                unsafe {
+                    let frame = &mut *gf;
+                    let jump = frame.code.instructions[send_pc].arg;
+                    frame.pc = send_pc as u32 + 1 + jump;
+                    frame.stack.push(v);
+                    frame.sent_consumed = true;
+                }
+                Some(SendHop::Declined)
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
+    }
+
+    /// A `send(None)` call's operands (see [`Self::resumed_gen`]) off
+    /// `frame`'s stack: the generator it resumes, which the caller keeps.
+    fn send_call_pop(frame: &mut Frame) -> Option<Rc<PyGenerator>> {
+        let (v, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+        let g = match (&a, &b) {
+            (Some(Object::BoundMethod(bm)), _) => match &bm.receiver {
+                Object::Generator(g) | Object::Coroutine(g) => Some(g.clone()),
+                _ => None,
+            },
+            (_, Some(Object::Generator(g) | Object::Coroutine(g))) => Some(g.clone()),
+            _ => None,
+        };
+        drop((v, b, a));
+        g
+    }
+
+    /// Park `rec` again (see [`ChainRec`]) after its innermost generator's
+    /// yield went to the consumer directly ([`Self::chain_step`]).
+    fn chain_repark(&mut self, mut rec: Box<ChainRec>) {
+        rec.parked = true;
+        let hold = rec.hold.take();
+        let _ = Box::into_raw(rec);
+        // (Last: its release may settle the chain.)
+        drop(hold);
     }
 
     /// Add `g` (frame `gf`, suspended in the `yield from` at `level_send`
@@ -21415,6 +21712,9 @@ impl Interpreter {
         };
         debug_assert!(std::ptr::eq::<Frame>(&*boxed, inner_frame));
         boxed.gen_first_resume = false;
+        // (A step that stopped partway, or the innermost level's delegate's
+        // return delivered by one, already gave it its value.)
+        let sent_consumed = std::mem::take(&mut boxed.sent_consumed);
         // SAFETY: see `CoreSwitch`: the running activation is synced, its
         // stack as `mode` has it (checked by the caller).
         let frame = unsafe { &mut *sw.cur };
@@ -21447,10 +21747,15 @@ impl Interpreter {
                 drop((a, b));
                 GEN_NEXT_DEFAULT
             }
-            InlineResume::SendCall => unreachable!("a send call never collapses"),
+            InlineResume::SendCall => {
+                rec.hold = Self::send_call_pop(frame);
+                GEN_NEXT_CALL
+            }
         };
         // The resume's `None` goes in.
-        boxed.stack.push(Object::None);
+        if !sent_consumed {
+            boxed.stack.push(Object::None);
+        }
         frame.pc = pc as u32 + 1;
         let gen_frame: *mut Frame = &raw mut *boxed;
         let mut act = self.inline_slot();
@@ -21509,42 +21814,68 @@ impl Interpreter {
         // SAFETY: a parked record owns itself (see `ChainRec`); taken
         // here, put back below unless the chain runs.
         let mut rec = unsafe { Box::from_raw(addr as *mut ChainRec) };
-        let repark = |rec: Box<ChainRec>| {
+        rec.parked = false;
+        let repark = |mut rec: Box<ChainRec>| {
+            rec.parked = true;
             let _ = Box::into_raw(rec);
             SendHop::Declined
         };
         let last = rec.levels.last().expect("a collapsed chain");
         // SAFETY: the innermost level is alive and parked: its frame sits
-        // in its `SEND`, its delegate on top.
-        let (inner, inner_frame) = match unsafe { &*last.act.frame }.stack.last() {
-            Some(Object::Generator(g) | Object::Coroutine(g)) => match Self::collapse_frame(g) {
-                Some(frame) => (Rc::as_ptr(g), frame),
-                None => return repark(rec),
-            },
+        // in its `SEND`, its delegate on top (held there until it runs).
+        let inner: &Rc<PyGenerator> = match unsafe { &*last.act.frame }.stack.last() {
+            Some(Object::Generator(g) | Object::Coroutine(g)) => unsafe { &*std::ptr::from_ref(g) },
             _ => return repark(rec),
         };
-        // The innermost generator may since have started delegating
-        // (a `yield from` of a fresh generator): its own chain joins.
-        let base = rec.levels.len();
-        // SAFETY: as `core_send_collapse` (the innermost generator was
-        // just qualified, and with it the generator it delegates to).
-        let (inner, inner_frame) = match Self::collapse_next(unsafe { &*inner_frame }) {
-            Some((next, next_send)) => match Self::collapse_frame(next) {
-                Some(next_frame) => unsafe {
-                    Self::collapse_walk(
-                        &mut rec,
-                        inner,
-                        inner_frame,
-                        Rc::as_ptr(next),
-                        next_send,
-                        next_frame,
-                    )
-                },
-                None => (inner, inner_frame),
-            },
-            None => (inner, inner_frame),
+        // A simple innermost generator takes a fast step first.
+        let stepped = if gen_fast::steps_body(inner) {
+            match self.chain_step_run(sw, pc, mode, &mut rec, inner) {
+                ChainStep::No => None,
+                ChainStep::Inner(inner, inner_frame) => Some((inner, inner_frame)),
+                ChainStep::Delivered => {
+                    self.chain_repark(rec);
+                    return SendHop::Collapsed;
+                }
+                ChainStep::Resume => {
+                    self.chain_recycle(rec);
+                    return SendHop::Declined;
+                }
+            }
+        } else {
+            None
         };
-        rec.parked = false;
+        let base = rec.levels.len();
+        let (inner, inner_frame) = match stepped {
+            // The innermost level took its delegate's return value.
+            Some(stepped) => stepped,
+            None => {
+                let (inner, inner_frame) = match Self::collapse_frame(inner) {
+                    Some(frame) => (Rc::as_ptr(inner), frame),
+                    None => return repark(rec),
+                };
+                // The innermost generator may since have started delegating
+                // (a `yield from` of a fresh generator): its own chain joins.
+                // SAFETY: as `core_send_collapse` (the innermost generator
+                // was just qualified, and with it the generator it
+                // delegates to).
+                match Self::collapse_next(unsafe { &*inner_frame }) {
+                    Some((next, next_send)) => match Self::collapse_frame(next) {
+                        Some(next_frame) => unsafe {
+                            Self::collapse_walk(
+                                &mut rec,
+                                inner,
+                                inner_frame,
+                                Rc::as_ptr(next),
+                                next_send,
+                                next_frame,
+                            )
+                        },
+                        None => (inner, inner_frame),
+                    },
+                    None => (inner, inner_frame),
+                }
+            }
+        };
         match self.collapse_commit(sw, pc, mode, rec, inner, inner_frame) {
             Ok(()) => SendHop::Collapsed,
             Err(mut rec) => {
@@ -21552,7 +21883,6 @@ impl Interpreter {
                     // SAFETY: delegating since the walk.
                     unsafe { level.suspend() };
                 }
-                rec.parked = true;
                 repark(rec)
             }
         }
@@ -66837,13 +67167,28 @@ const GEN_NEXT_CALL: u32 = u32::MAX;
 /// Set in [`InlineAct::exhaust_arg`] (with the `SEND`'s jump below it) for
 /// a sub-generator resumed by `yield from` or `await`: exhaustion leaves
 /// its return value on the delegator's stack and takes the jump.
-const GEN_SEND: u32 = 1 << 31;
+pub(crate) const GEN_SEND: u32 = 1 << 31;
 
 /// [`InlineAct::exhaust_arg`] of a generator resumed by `next(gen,
 /// default)`: the default waits atop the caller's stack, replaced by a
 /// yielded value, or left as the call's result when the generator
 /// finishes. (Checked before [`GEN_SEND`], whose bit it has.)
 const GEN_NEXT_DEFAULT: u32 = u32::MAX - 1;
+
+/// How [`Interpreter::chain_step`] went.
+enum ChainStep {
+    /// Nothing happened.
+    No,
+    /// The innermost generator yielded, its value delivered to the
+    /// consumer: the chain parks again.
+    Delivered,
+    /// The innermost generator returned into the innermost level, now the
+    /// chain's innermost generator (its frame), to run.
+    Inner(*const PyGenerator, *mut Frame),
+    /// The innermost generator returned into the chain's only level, out
+    /// of the chain: the consumer resumes it as usual.
+    Resume,
+}
 
 /// How [`Interpreter::core_send_hop`] went.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66973,6 +67318,8 @@ struct CoreSwitch {
     /// or bump the loop generation when they change (the eval-frame
     /// recorder), which every direct call compares first.
     calls_ok: bool,
+    /// The loop generation the burst runs under (see `quiet_run`).
+    snap_gen: u64,
 }
 
 impl CoreSwitch {
@@ -66983,6 +67330,7 @@ impl CoreSwitch {
         shell: &mut QuietShell<'_>,
         last: &mut usize,
         calls_ok: bool,
+        snap_gen: u64,
     ) -> Self {
         let frame: *mut Frame = frame;
         let shell: *mut QuietShell<'static> = std::ptr::from_mut(shell).cast();
@@ -67008,6 +67356,7 @@ impl CoreSwitch {
             depth_cell: crate::recursion::depth_cell(),
             obs_gen: crate::trace::observer_gen(),
             calls_ok,
+            snap_gen,
         }
     }
 
