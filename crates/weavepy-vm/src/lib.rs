@@ -34147,6 +34147,18 @@ impl Interpreter {
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         let result = self.load_attr_inner(obj, name);
+        self.load_attr_finish(obj, name, result)
+    }
+
+    /// The end of [`Self::load_attr`] for the per-variant lookup's
+    /// `result`: the slot-wrapper rescue, and an `AttributeError`'s
+    /// `name`/`obj` context.
+    fn load_attr_finish(
+        &mut self,
+        obj: &Object,
+        name: &str,
+        result: Result<Object, RuntimeError>,
+    ) -> Result<Object, RuntimeError> {
         // CPython's `object.__getattribute__` final step: after the
         // per-variant lookup misses, resolve the name through
         // `type(obj)`'s MRO slot-wrapper table and bind it
@@ -34223,6 +34235,9 @@ impl Interpreter {
             if self.is_attribute_error(err) {
                 if let RuntimeError::PyException(pe) = err {
                     if let Object::Instance(inst) = &pe.instance {
+                        if attr_error_context_laid_out(inst, obj, name) {
+                            return result;
+                        }
                         let need = matches!(
                             crate::builtin_types::exc_attr(inst, "name"),
                             None | Some(Object::None)
@@ -36026,7 +36041,7 @@ impl Interpreter {
             // The default lookup would only raise for the hook to catch:
             // call the hook without building that `AttributeError` (CPython's
             // `slot_tp_getattr_hook` suppresses it the same way).
-            let hook = inst.cls_raw().dunder(crate::types::Dunder::GetAttr).present();
+            let hook = inst.cls().dunder(crate::types::Dunder::GetAttr).present();
             if hook && default_lookup_misses(instance_obj, name, true) {
                 if let Some(getattr) = inst.cls().lookup("__getattr__") {
                     return self.call_getattr_hook(instance_obj, getattr, name);
@@ -36036,10 +36051,12 @@ impl Interpreter {
         };
         match result {
             Err(e) if self.is_attribute_error(&e) => {
-                if let Some(getattr) = inst.cls().lookup("__getattr__") {
-                    self.call_getattr_hook(instance_obj, getattr, name)
-                } else {
-                    Err(e)
+                // (The memoized answer first: most classes have no hook.)
+                let cls = inst.cls();
+                let hook = cls.dunder(crate::types::Dunder::GetAttr).present();
+                match hook.then(|| cls.lookup("__getattr__")).flatten() {
+                    Some(getattr) => self.call_getattr_hook(instance_obj, getattr, name),
+                    None => Err(e),
                 }
             }
             other => other,
@@ -37303,13 +37320,19 @@ impl Interpreter {
                         None if slot.default.is_some() => Ok(slot.default.clone().unwrap()),
                         // CPython's member descriptor reports the
                         // owning type's *fully qualified* name here
-                        // (e.g. `pkg.mod.Cls`), unlike the generic
-                        // "has no attribute" path which uses `tp_name`.
-                        None => Err(attribute_error(format!(
-                            "'{}' object has no attribute '{}'",
-                            inst.cls().qualified_display_name(),
-                            slot.name
-                        ))),
+                        // (`%T`: e.g. `pkg.mod.Cls`, but `Cls` in
+                        // `__main__`), unlike the generic "has no
+                        // attribute" path which uses `tp_name`.
+                        None => {
+                            let ty = inst.cls().fully_qualified_name();
+                            let mut msg = String::with_capacity(ty.len() + slot.name.len() + 30);
+                            msg.push('\'');
+                            msg.push_str(&ty);
+                            msg.push_str("' object has no attribute '");
+                            msg.push_str(&slot.name);
+                            msg.push('\'');
+                            Err(attribute_error(msg))
+                        }
                     }
                 }
                 _ => Err(type_error("slot descriptor requires an instance")),
@@ -48042,8 +48065,15 @@ impl Interpreter {
         }
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
+        // (Only a site cooling down after a failed load, an odd count, asks
+        // whether the attribute is certainly missing; see
+        // `specialized_load_attr`'s `Cooldown` arm.)
+        let failing = matches!(
+            frame.code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
+        );
         let r = match ins.op {
-            OpCode::LoadAttr => match self.load_attr_certain_miss(frame, ins.arg) {
+            OpCode::LoadAttr if failing => match self.load_attr_certain_miss(frame, ins.arg) {
                 Some(err) => Err(err),
                 None => self.load_attr_step(frame, pc as u32, ins.arg),
             },
@@ -48162,9 +48192,19 @@ impl Interpreter {
                                 specialize::record_hit(op_idx);
                                 return Ok(v);
                             }
+                            // Unset slot: the member descriptor raises its
+                            // `AttributeError`, as the default lookup's data
+                            // descriptor step would (the guard rules out a
+                            // `__getattr__` hook), and the site stays as it is
+                            // (CPython's `LOAD_ATTR_SLOT` deopts for this
+                            // execution only).
+                            let cls = inst.cls();
+                            if let Some(sd @ Object::SlotDescriptor(_)) = cls.lookup(name) {
+                                let owner = Object::Type(cls);
+                                let result = self.descriptor_get(&sd, &receiver, &owner);
+                                return self.load_attr_finish(&receiver, name, result);
+                            }
                         }
-                        // Unset slot: the slow path raises the faithful
-                        // AttributeError.
                     }
                 }
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
@@ -49325,6 +49365,7 @@ impl Interpreter {
                 )));
             };
             *ty.qualname.borrow_mut() = Some(s.to_string());
+            ty.forget_display_names();
             return Ok(());
         }
         // The `type.__dict__` / `type.__mro__` getsets have no setter in
@@ -69081,6 +69122,39 @@ mod builtin_type_misses {
 /// names, which the lookup special-cases, never qualify.
 fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
+}
+
+/// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
+/// (`exc`) with `.name` and `.obj`, for one built natively, whose storage
+/// lays both fields out (see `error::attribute_error`): stored in place
+/// when neither is set. `true` once settled; `false` leaves the decision
+/// to the general path (any other storage, or attributes in a `__dict__`).
+fn attr_error_context_laid_out(exc: &PyInstance, obj: &Object, name: &str) -> bool {
+    if exc.attr_count() != 0 {
+        return false;
+    }
+    // (Noted before the slots are borrowed: the exception holds `obj`
+    // from here on, or already holds another one.)
+    exc.note_slot_store(obj);
+    let Ok(mut slots) = exc.slots.try_borrow_mut() else {
+        return false;
+    };
+    let Some((name_at, obj_at)) = slots.laid_out_pair_mut("name", "obj") else {
+        return false;
+    };
+    let unset = |v: &Object| matches!(v, Object::Unbound | Object::None);
+    if !(unset(name_at) && unset(obj_at)) {
+        return true;
+    }
+    // (A `str` needs no note.)
+    let name = Object::from_str(name);
+    let old = [
+        std::mem::replace(name_at, name),
+        std::mem::replace(obj_at, obj.clone()),
+    ];
+    drop(slots);
+    drop(old);
+    true
 }
 
 /// Whether the default `object.__getattribute__` lookup of `obj.name`

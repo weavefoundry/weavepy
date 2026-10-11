@@ -913,6 +913,10 @@ pub struct TypeObject {
     /// The leaf burst's per-class attribute-kind cache (see
     /// [`LeafAttrCache`]).
     pub leaf_attrs: LeafAttrCache,
+    /// [`Self::display_names`]'s memo: the version, dict stamp and C
+    /// `tp_name` it was computed under, the qualified name, and whether
+    /// the module is `__main__`.
+    display_name_memo: RefCell<Option<(u64, u64, usize, String, bool)>>,
     /// The most attributes an instance's `__dict__` was seen to hold
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
@@ -1378,6 +1382,7 @@ impl TypeObject {
             flags,
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
+            display_name_memo: RefCell::new(None),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
@@ -2283,13 +2288,60 @@ impl TypeObject {
         }
     }
 
+    /// CPython's `_PyType_GetFullyQualifiedName(type, '.')` (the `%T`
+    /// format): [`Self::qualified_display_name`], but without a
+    /// `__main__` prefix either.
+    pub fn fully_qualified_name(&self) -> String {
+        let (full, main) = self.display_names();
+        match full.strip_prefix("__main__.") {
+            Some(rest) if main => rest.to_owned(),
+            _ => full,
+        }
+    }
+
+    /// `module.qualname` as CPython's `type_repr` prints it (no module for
+    /// `builtins`).
     pub fn qualified_display_name(&self) -> String {
+        self.display_names().0
+    }
+
+    /// [`Self::qualified_display_name`], and whether the module is
+    /// `__main__`, memoized while the class's version, its dict's key
+    /// layout and its C `tp_name` stand (a `__qualname__` assignment
+    /// clears the memo).
+    fn display_names(&self) -> (String, bool) {
+        let ver = self.attr_version.get();
+        let stamp = self.dict.try_borrow().map_or(0, |d| d.mutation_stamp());
+        let tp_name = self.c_tp_name.get().map_or(0, |n| n.as_ptr() as usize);
+        if let Ok(memo) = self.display_name_memo.try_borrow() {
+            if let Some((v, s, t, name, main)) = &*memo {
+                if *v == ver && *s == stamp && *t == tp_name && stamp != 0 {
+                    return (name.clone(), *main);
+                }
+            }
+        }
+        let names = self.compute_display_names();
+        if let Ok(mut memo) = self.display_name_memo.try_borrow_mut() {
+            *memo = Some((ver, stamp, tp_name, names.0.clone(), names.1));
+        }
+        names
+    }
+
+    /// Forget [`Self::display_names`]'s memo (the class's qualified name
+    /// changed under an unchanged version).
+    pub(crate) fn forget_display_names(&self) {
+        if let Ok(mut memo) = self.display_name_memo.try_borrow_mut() {
+            *memo = None;
+        }
+    }
+
+    fn compute_display_names(&self) -> (String, bool) {
         let dict = self.dict.borrow();
         // Only honour *string* entries — some built-in types carry a
         // `__qualname__`/`__module__` *property descriptor* (for their
         // instances) in the dict, which must not leak into the class
         // repr (`type(gen)` printing `<class '<property object>'>`).
-        let as_str = |name: &'static str| match dict.get(&DictKey(Object::from_static(name))) {
+        let as_str = |name: &'static str| match dict.get(&crate::object::StrKey(name)) {
             Some(Object::Str(s)) => Some(s.as_ref().to_owned()),
             _ => None,
         };
@@ -2306,10 +2358,18 @@ impl TypeObject {
         let qual = as_str("__qualname__")
             .or_else(|| self.qualname.borrow().clone())
             .unwrap_or_else(|| self.name.clone());
-        match module.as_deref() {
+        let main = module.as_deref() == Some("__main__");
+        let full = match module.as_deref() {
             None | Some("builtins") | Some("") => qual,
-            Some(m) => format!("{m}.{qual}"),
-        }
+            Some(m) => {
+                let mut s = String::with_capacity(m.len() + 1 + qual.len());
+                s.push_str(m);
+                s.push('.');
+                s.push_str(&qual);
+                s
+            }
+        };
+        (full, main)
     }
 
     /// The name CPython's `tp_name`-based error text prints: the full
@@ -3341,6 +3401,36 @@ impl SlotStorage {
         }
     }
 
+    /// The laid-out places (holding `Unbound` while unset) of the two
+    /// distinct slots `a` and `b`, when the storage's fixed layout holds
+    /// both (an `AttributeError`'s `name` and `obj`). `None` otherwise.
+    pub(crate) fn laid_out_pair_mut(
+        &mut self,
+        a: &str,
+        b: &str,
+    ) -> Option<(&mut Object, &mut Object)> {
+        let SlotData::Fixed { layout, values } = &mut self.data else {
+            return None;
+        };
+        let pos = |name: &str| {
+            layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            )
+        };
+        let (i, j) = (pos(a)?, pos(b)?);
+        if i == j || values.len() != layout.len() {
+            return None;
+        }
+        let (lo, hi) = (i.min(j), i.max(j));
+        let (head, tail) = values.split_at_mut(hi);
+        let (first, second) = (&mut head[lo], &mut tail[0]);
+        Some(if i < j {
+            (first, second)
+        } else {
+            (second, first)
+        })
+    }
+
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
         self.insert_with_key(name, value, || slot_key(name))
     }
@@ -3558,6 +3648,15 @@ impl SlotStorage {
     /// 64-bit variant).
     pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
         self.get_mut(name)
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    pub(crate) fn laid_out_pair_mut(
+        &mut self,
+        _a: &str,
+        _b: &str,
+    ) -> Option<(&mut Object, &mut Object)> {
+        None
     }
 
     /// Never laid out here (see the 64-bit variant).

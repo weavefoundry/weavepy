@@ -275,7 +275,19 @@ pub fn name_error(message: impl Into<String>) -> RuntimeError {
 }
 
 pub fn attribute_error(message: impl Into<String>) -> RuntimeError {
-    RuntimeError::PyException(PyException::from_builtin("AttributeError", message))
+    // `name` and `obj` are laid out unset, so the attribute load the
+    // error propagates through stores them in place (see
+    // `attr_error_context_laid_out`).
+    let message: String = message.into();
+    let arg = (!message.is_empty()).then(|| Object::from_str(message));
+    let instance = crate::builtin_types::exception_from_parts_with(
+        crate::builtin_types::builtin_types()
+            .attribute_error
+            .clone(),
+        arg,
+        [("name", Object::Unbound), ("obj", Object::Unbound)],
+    );
+    RuntimeError::PyException(PyException::new(instance))
 }
 
 /// `AttributeError` carrying the structured `.name`/`.obj` fields

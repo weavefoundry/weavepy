@@ -180,6 +180,77 @@ class GetattrHookTest(unittest.TestCase):
         self.assertEqual(str(cm.exception), "'C' object has no attribute 'xy'")
 
 
+class Slotted:
+    __slots__ = ("_s", "_t")
+
+    def __init__(self):
+        self._t = 1
+
+    def get(self):
+        try:
+            return self._s
+        except AttributeError as e:
+            return e
+
+
+class SlotMissTest(unittest.TestCase):
+    def test_unset_slot_errors(self):
+        o = Slotted()
+        for _ in range(N):
+            e = o.get()
+        self.assertIsInstance(e, AttributeError)
+        self.assertEqual(e.name, "_s")
+        self.assertIs(e.obj, o)
+        # `%T`: the module, unless it is `builtins` or `__main__`.
+        mod = Slotted.__module__
+        prefix = "" if mod in ("builtins", "__main__") else mod + "."
+        self.assertEqual(str(e), f"'{prefix}Slotted' object has no attribute '_s'")
+
+    def test_site_serves_set_and_unset(self):
+        objs = [Slotted() for _ in range(4)]
+        for i, o in enumerate(objs):
+            if i % 2:
+                o._s = i
+        for _ in range(N):
+            got = [o.get() for o in objs]
+        self.assertIsInstance(got[0], AttributeError)
+        self.assertEqual(got[1], 1)
+        self.assertIsInstance(got[2], AttributeError)
+        self.assertEqual(got[3], 3)
+        objs[0]._s = "now"
+        del objs[1]._s
+        self.assertEqual(objs[0].get(), "now")
+        self.assertIsInstance(objs[1].get(), AttributeError)
+
+    def test_renamed_class(self):
+        class R:
+            __slots__ = ("_s",)
+
+        o = R()
+        for _ in range(N):
+            with self.assertRaises(AttributeError):
+                o._s
+        R.__qualname__ = "Renamed"
+        with self.assertRaises(AttributeError) as cm:
+            o._s
+        self.assertIn("Renamed' object has no attribute '_s'", str(cm.exception))
+        R.__module__ = "elsewhere"
+        with self.assertRaises(AttributeError) as cm:
+            o._s
+        self.assertEqual(str(cm.exception), "'elsewhere.Renamed' object has no attribute '_s'")
+
+    def test_getattr_added_later(self):
+        class H:
+            __slots__ = ("_s",)
+
+        o = H()
+        for _ in range(N):
+            with self.assertRaises(AttributeError):
+                o._s
+        H.__getattr__ = lambda self, name: "hook"
+        self.assertEqual(o._s, "hook")
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)
