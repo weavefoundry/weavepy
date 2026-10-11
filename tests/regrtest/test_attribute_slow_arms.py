@@ -528,6 +528,39 @@ class BuiltinTypeHasattrTest(unittest.TestCase):
         self.assertFalse(hasattr(cls, "weavepy_probe"))
 
 
+class ChainMapTest(unittest.TestCase):
+    def test_maps_changes(self):
+        from collections import ChainMap
+
+        c = ChainMap({"a": 1}, {"b": 2})
+        for _ in range(N):
+            self.assertEqual(c["a"] + c["b"], 3)
+        c.maps = [{"a": 10}]
+        self.assertEqual(c["a"], 10)
+        with self.assertRaises(KeyError):
+            c["b"]
+        c.maps.append({"b": 20})
+        self.assertEqual(c["b"], 20)
+
+    def test_subclass_with_class_level_maps(self):
+        from collections import ChainMap
+
+        class Odd(ChainMap):
+            pass
+
+        o = Odd({"a": 1})
+        for _ in range(N):
+            self.assertEqual(o["a"], 1)
+        o.__dict__["maps"] = [{"a": 5}]
+        self.assertEqual(o["a"], 5)
+        Odd.maps = property(lambda self: [{"a": 7}], lambda self, v: None)
+        try:
+            self.assertEqual(o["a"], 7)
+        finally:
+            del Odd.maps
+        self.assertEqual(o["a"], 5)
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)
