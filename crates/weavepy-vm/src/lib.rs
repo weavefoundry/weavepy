@@ -20878,7 +20878,17 @@ impl Interpreter {
                     }
                 }
             },
-            _ => {
+            // A generator suspended in a `yield from` collapses its chain
+            // as a `SEND` to it would (see `Self::core_iter_collapse`).
+            InlineResume::ForIter | InlineResume::NextCall | InlineResume::NextDefault => {
+                if self.core_iter_collapse(sw, pc, mode) == SendHop::Collapsed {
+                    return true;
+                }
+                if !self.core_gen_resume_one(sw, pc, mode) {
+                    return false;
+                }
+            }
+            InlineResume::SendCall => {
                 if !self.core_gen_resume_one(sw, pc, mode) {
                     return false;
                 }
@@ -20905,6 +20915,66 @@ impl Interpreter {
             }
         }
         true
+    }
+
+    /// [`Self::core_gen_resume`]'s `FOR_ITER` or `next()` (`mode`) at `pc`
+    /// of a generator suspended in a `yield from`: the generator becomes
+    /// the outermost level of a collapsed chain, as the delegate of a
+    /// `SEND` does (see [`Self::core_send_collapse`]), or resumes its
+    /// parked one. Anything else is declined, touching nothing.
+    #[inline(never)]
+    fn core_iter_collapse(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> SendHop {
+        // SAFETY: see `CoreSwitch`: the running activation is synced, the
+        // generator where `mode` puts it (checked by the caller).
+        let frame = unsafe { &*sw.cur };
+        let n = frame.stack.len();
+        let at = match mode {
+            InlineResume::ForIter | InlineResume::NextCall => n.checked_sub(1),
+            _ => n.checked_sub(2),
+        };
+        let Some(Object::Generator(g)) = at.and_then(|at| frame.stack.get(at)) else {
+            return SendHop::Declined;
+        };
+        if g.chain.get() != 0 {
+            return match Self::parked_head(g) {
+                Some(addr) => self.core_send_unpark(sw, pc, mode, addr),
+                None => SendHop::Declined,
+            };
+        }
+        let Some(gf) = Self::collapse_frame(g) else {
+            return SendHop::Declined;
+        };
+        // SAFETY: suspended (checked): a read between instructions.
+        let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
+            return SendHop::Declined;
+        };
+        // Its delegate heads a parked chain: the generator joins it.
+        if let Some(addr) = Self::parked_head(next) {
+            // SAFETY: `g` is suspended in a `yield from` of the chain's
+            // outermost level (checked).
+            unsafe { Self::collapse_prepend(addr, Rc::as_ptr(g), gf, next_send) };
+            return self.core_send_unpark(sw, pc, mode, addr);
+        }
+        let Some(next_frame) = Self::collapse_frame(next) else {
+            return SendHop::Declined;
+        };
+        let next: *const Rc<PyGenerator> = next;
+        // SAFETY: `next` lives on `g`'s stack, which nothing changes before
+        // the walk reads it.
+        if self.core_send_collapse(
+            sw,
+            pc,
+            mode,
+            Rc::as_ptr(g),
+            gf,
+            unsafe { &*next },
+            next_send,
+            next_frame,
+        ) {
+            SendHop::Collapsed
+        } else {
+            SendHop::Declined
+        }
     }
 
     /// One level of [`Self::core_gen_resume`]'s `yield from` chain: the
@@ -20934,13 +21004,8 @@ impl Interpreter {
         let GeneratorState::Suspended(boxed) = &*state else {
             // The outermost level of a parked chain: its innermost
             // generator resumes directly (anything else settles it).
-            let chain = g.chain.get();
-            if chain != 0 && sent_none {
-                // SAFETY: a level's record is alive (see `ChainRec`).
-                let rec = unsafe { &*(chain as *const ChainRec) };
-                if rec.parked && std::ptr::eq(rec.levels[0].gen, Rc::as_ptr(g)) {
-                    return self.core_send_unpark(sw, send_pc, chain);
-                }
+            if let (true, Some(addr)) = (sent_none, Self::parked_head(g)) {
+                return self.core_send_unpark(sw, send_pc, InlineResume::Send, addr);
             }
             return SendHop::Declined;
         };
@@ -20965,11 +21030,32 @@ impl Interpreter {
         if sent_none && !gf.sent_consumed && g.kind != crate::object::CoroutineKind::AsyncGenerator
         {
             if let Some((next, next_send)) = Self::collapse_next(gf) {
+                // Its delegate heads a parked chain: the delegate joins it.
+                if let Some(addr) = Self::parked_head(next) {
+                    // SAFETY: `g` is suspended in a `yield from` of the
+                    // chain's outermost level (checked above).
+                    unsafe {
+                        Self::collapse_prepend(
+                            addr,
+                            Rc::as_ptr(g),
+                            std::ptr::from_ref(gf).cast_mut(),
+                            next_send,
+                        );
+                    }
+                    return self.core_send_unpark(sw, send_pc, InlineResume::Send, addr);
+                }
                 if let Some(next_frame) = Self::collapse_frame(next) {
                     let (g, gf) = (Rc::as_ptr(g), std::ptr::from_ref(gf).cast_mut());
-                    return if self
-                        .core_send_collapse(sw, send_pc, g, gf, next, next_send, next_frame)
-                    {
+                    return if self.core_send_collapse(
+                        sw,
+                        send_pc,
+                        InlineResume::Send,
+                        g,
+                        gf,
+                        next,
+                        next_send,
+                        next_frame,
+                    ) {
                         SendHop::Collapsed
                     } else {
                         SendHop::Declined
@@ -21026,6 +21112,59 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         SendHop::Hopped
+    }
+
+    /// The address of the parked chain `g` is the outermost level of (see
+    /// [`ChainRec`]), if any.
+    #[inline(always)]
+    fn parked_head(g: &PyGenerator) -> Option<usize> {
+        let addr = g.chain.get();
+        if addr == 0 {
+            return None;
+        }
+        // SAFETY: a level's record is alive (see `ChainRec`).
+        let rec = unsafe { &*(addr as *const ChainRec) };
+        (rec.parked && std::ptr::eq(rec.levels[0].gen, g)).then_some(addr)
+    }
+
+    /// Make `g` (frame `gf`, suspended in the `yield from` at `level_send`
+    /// of the outermost level of the parked chain at `addr`) the chain's
+    /// new outermost level, delegating just past its `SEND`.
+    ///
+    /// # Safety
+    ///
+    /// As described: `g` is alive, qualified as a level (see
+    /// [`Self::collapse_frame`]), and nothing borrows its state.
+    #[cold]
+    #[inline(never)]
+    unsafe fn collapse_prepend(
+        addr: usize,
+        g: *const PyGenerator,
+        gf: *mut Frame,
+        level_send: usize,
+    ) {
+        // SAFETY: the caller's contract; a parked record owns itself.
+        unsafe {
+            let rec = &mut *(addr as *mut ChainRec);
+            let st = (*g).state_raw().as_ptr();
+            let GeneratorState::Suspended(boxed) = std::ptr::read(st) else {
+                unreachable!("checked by the caller");
+            };
+            std::ptr::write(st, GeneratorState::Delegating(boxed));
+            (*g).chain.set(addr);
+            (*gf).pc = level_send as u32 + 1;
+            rec.levels.insert(
+                0,
+                Delegate {
+                    gen: g,
+                    act: LeanAct {
+                        frame: gf,
+                        shell: None,
+                    },
+                    send_pc: level_send,
+                },
+            );
+        }
     }
 
     /// `g` as a collapsed chain's level or innermost generator (see
@@ -21131,6 +21270,7 @@ impl Interpreter {
         &mut self,
         sw: &mut CoreSwitch,
         send_pc: usize,
+        mode: InlineResume,
         first: *const PyGenerator,
         first_frame: *mut Frame,
         inner: &Rc<PyGenerator>,
@@ -21150,7 +21290,7 @@ impl Interpreter {
                 inner_frame,
             )
         };
-        match self.collapse_commit(sw, send_pc, rec, inner, inner_frame) {
+        match self.collapse_commit(sw, send_pc, mode, rec, inner, inner_frame) {
             Ok(()) => true,
             Err(mut rec) => {
                 for level in rec.levels.drain(..).rev() {
@@ -21231,13 +21371,15 @@ impl Interpreter {
 
     /// Run `inner` (frame `inner_frame`, suspended and qualified), the
     /// innermost generator of the chain whose delegating levels `rec`
-    /// holds, as the delegate of the running activation's `SEND` of `None`
-    /// at `send_pc` (see [`Self::core_send_collapse`]). Past the recursion
-    /// limit, `rec` comes back untouched.
+    /// holds, for the running activation's resume of the outermost level
+    /// at `pc`: a `SEND` of `None` (see [`Self::core_send_collapse`]), a
+    /// `FOR_ITER` or a `next()` (`mode`, as [`Self::try_inline_gen`]
+    /// takes them). Past the recursion limit, `rec` comes back untouched.
     fn collapse_commit(
         &mut self,
         sw: &mut CoreSwitch,
-        send_pc: usize,
+        pc: usize,
+        mode: InlineResume,
         mut rec: Box<ChainRec>,
         inner: *const PyGenerator,
         inner_frame: *mut Frame,
@@ -21274,13 +21416,42 @@ impl Interpreter {
         debug_assert!(std::ptr::eq::<Frame>(&*boxed, inner_frame));
         boxed.gen_first_resume = false;
         // SAFETY: see `CoreSwitch`: the running activation is synced, its
-        // stack `[.., first, None]` (checked by `core_send_hop`).
+        // stack as `mode` has it (checked by the caller).
         let frame = unsafe { &mut *sw.cur };
-        let jump = frame.code.instructions[send_pc].arg;
-        // The sent `None` goes in.
-        frame.stack.pop();
+        // The consumer's operands leave as `inline_gen_commit` takes them;
+        // the outermost level's activation keeps a `next()`'s generator.
+        let arg = match mode {
+            InlineResume::Send => {
+                // The sent `None`.
+                frame.stack.pop();
+                frame.code.instructions[pc].arg | GEN_SEND
+            }
+            InlineResume::ForIter => frame.code.instructions[pc].arg,
+            InlineResume::NextCall => {
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                let Some(Object::Generator(g)) = g else {
+                    unreachable!("checked by `core_iter_collapse`");
+                };
+                rec.hold = Some(g);
+                drop((a, b));
+                GEN_NEXT_CALL
+            }
+            InlineResume::NextDefault => {
+                let default = frame.stack.pop().expect("checked above");
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                let Some(Object::Generator(g)) = g else {
+                    unreachable!("checked by `core_iter_collapse`");
+                };
+                rec.hold = Some(g);
+                frame.stack.push(default);
+                drop((a, b));
+                GEN_NEXT_DEFAULT
+            }
+            InlineResume::SendCall => unreachable!("a send call never collapses"),
+        };
+        // The resume's `None` goes in.
         boxed.stack.push(Object::None);
-        frame.pc = send_pc as u32 + 1;
+        frame.pc = pc as u32 + 1;
         let gen_frame: *mut Frame = &raw mut *boxed;
         let mut act = self.inline_slot();
         debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
@@ -21292,17 +21463,23 @@ impl Interpreter {
             std::ptr::write(&raw mut act.guard, Some(guard));
         }
         act.gen_frame = gen_frame;
-        act.exhaust_arg = jump | GEN_SEND;
+        act.exhaust_arg = arg;
         act.act.frame = gen_frame;
-        act.call_pc = send_pc;
-        act.caller_pending = self.core_pending_enter(sw, frame, send_pc);
+        act.call_pc = pc;
+        act.caller_pending = self.core_pending_enter(sw, frame, pc);
         act.exc_depth = self.exc_info_len();
         // The levels wait on the pending list, outermost first, as each
         // would while the next one ran (the buffer stays put from here).
         rec.pend_at = self.lean_pending.len();
         self.lean_pending.reserve(levels);
-        for level in &mut rec.levels {
-            self.lean_pending.push(&raw mut level.act as usize);
+        // SAFETY: reserved: each entry is written in place, and the length
+        // covers them once all are.
+        unsafe {
+            let base = self.lean_pending.as_mut_ptr().add(rec.pend_at);
+            for (k, level) in rec.levels.iter_mut().enumerate() {
+                base.add(k).write(&raw mut level.act as usize);
+            }
+            self.lean_pending.set_len(rec.pend_at + levels);
         }
         act.chain = Some(rec);
         // SAFETY: see `CoreSwitch`.
@@ -21313,15 +21490,22 @@ impl Interpreter {
         Ok(())
     }
 
-    /// The `SEND` of `None` at `send_pc` of `sw`'s (synced) running
-    /// activation to the outermost level of the parked chain whose record
-    /// is at `addr` (see [`ChainRec`]): its innermost generator resumes
-    /// directly, as [`Self::core_send_collapse`] resumes it, with any
-    /// generators that innermost one has since started delegating to
-    /// added as levels. Anything that doesn't qualify leaves the chain
-    /// parked (the `SEND`'s full handler settles it).
+    /// The `SEND` of `None` (or the `FOR_ITER` or `next()`, `mode`) at
+    /// `pc` of `sw`'s (synced) running activation to the outermost level
+    /// of the parked chain whose record is at `addr` (see [`ChainRec`]):
+    /// its innermost generator resumes directly, as
+    /// [`Self::core_send_collapse`] resumes it, with any generators that
+    /// innermost one has since started delegating to added as levels.
+    /// Anything that doesn't qualify leaves the chain parked (the
+    /// instruction's full handler settles it).
     #[inline(never)]
-    fn core_send_unpark(&mut self, sw: &mut CoreSwitch, send_pc: usize, addr: usize) -> SendHop {
+    fn core_send_unpark(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        addr: usize,
+    ) -> SendHop {
         // SAFETY: a parked record owns itself (see `ChainRec`); taken
         // here, put back below unless the chain runs.
         let mut rec = unsafe { Box::from_raw(addr as *mut ChainRec) };
@@ -21361,7 +21545,7 @@ impl Interpreter {
             None => (inner, inner_frame),
         };
         rec.parked = false;
-        match self.collapse_commit(sw, send_pc, rec, inner, inner_frame) {
+        match self.collapse_commit(sw, pc, mode, rec, inner, inner_frame) {
             Ok(()) => SendHop::Collapsed,
             Err(mut rec) => {
                 for level in rec.levels.drain(base..).rev() {
@@ -21387,7 +21571,10 @@ impl Interpreter {
         self.lean_pending.truncate(rec.pend_at);
         crate::recursion::leave_n(crate::recursion::depth_cell(), rec.levels.len());
         rec.parked = true;
+        let hold = rec.hold.take();
         let _ = Box::into_raw(rec);
+        // (Last: its release may settle the chain.)
+        drop(hold);
     }
 
     /// An empty [`ChainRec`], from the pool or fresh.
@@ -21398,6 +21585,7 @@ impl Interpreter {
                 levels: Vec::new(),
                 parked: false,
                 pend_at: 0,
+                hold: None,
             })
         })
     }
@@ -21407,6 +21595,7 @@ impl Interpreter {
     fn chain_recycle(&mut self, mut rec: Box<ChainRec>) {
         debug_assert!(rec.levels.is_empty());
         rec.parked = false;
+        drop(rec.hold.take());
         if self.chain_pool.len() < 16 {
             self.chain_pool.push(rec);
         }
@@ -66448,6 +66637,10 @@ struct ChainRec {
     /// Where the levels' entries start on the pending list while the
     /// chain runs unflushed (see `Interpreter::collapse_flushed`).
     pend_at: usize,
+    /// The outermost level, while the chain runs for a `next()` call
+    /// (whose operands held it); otherwise its holder is the consumer's
+    /// stack, or (parked) whoever holds it.
+    hold: Option<Rc<PyGenerator>>,
 }
 
 // SAFETY: a record moves between threads with its generators, under the

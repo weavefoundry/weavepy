@@ -1021,11 +1021,16 @@ impl Interpreter {
         {
             return GenNext::Declined;
         }
+        // A level of a collapsed `yield from` chain is the inline resume's
+        // (which resumes a parked chain without settling it).
+        if g.chain.get() != 0 {
+            return GenNext::Declined;
+        }
         // Validate and take the frame under one exclusive view; no Python
         // runs while it's held.
         // SAFETY: nothing below reaches the cell again until `state`'s
         // last use (`peek_mut` rejects a live guard or shared cells).
-        let Some(state) = (unsafe { g.state().peek_mut() }) else {
+        let Some(state) = (unsafe { g.state_raw().peek_mut() }) else {
             return GenNext::Declined;
         };
         let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) = &*state else {

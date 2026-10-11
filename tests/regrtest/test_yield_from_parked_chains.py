@@ -307,6 +307,60 @@ class ParkedChainTest(unittest.TestCase):
         )
         self.assertEqual(list(top), list(range(4, N)))
 
+    def test_temporary_chain_from_next(self):
+        log = []
+        for _ in range(20):
+            log.clear()
+            self.assertEqual(next(level(5, N, log)), 0)
+            # The chain's only owner was the call: released at once.
+            self.assertEqual(log, ["leaf", 0, 1, 2, 3, 4, 5])
+
+    def test_next_default_through_chain(self):
+        marker = object()
+        top = level(4, 3)
+        self.assertEqual([next(top, marker) for _ in range(5)], [0, 1, 2, marker, marker])
+
+    def test_for_loop_with_break(self):
+        top, gens = started(5, items=0)
+        seen = []
+        for x in top:
+            seen.append(x)
+            if x == 4:
+                break
+        for g in gens:
+            self.assertFalse(g.gi_running)
+            self.assertEqual(inspect.getgeneratorstate(g), inspect.GEN_SUSPENDED)
+        self.assertEqual(top.gi_frame.f_locals["depth"], 5)
+        for x in top:
+            seen.append(x)
+            if x == 9:
+                break
+        self.assertEqual(seen, list(range(10)))
+        self.assertEqual(next(top), 10)
+        self.assertEqual(list(top), list(range(11, N)))
+
+    def test_raise_through_for_loop(self):
+        def failing(n):
+            for i in range(n):
+                yield i
+            raise ValueError("deep")
+
+        def wrap(depth):
+            if depth == 0:
+                yield from failing(30)
+            else:
+                yield from wrap(depth - 1)
+
+        for _ in range(10):
+            out = []
+            try:
+                for x in wrap(4):
+                    out.append(x)
+            except ValueError as e:
+                names = [f.name for f in traceback.extract_tb(e.__traceback__)]
+            self.assertEqual(out, list(range(30)))
+            self.assertEqual(names, ["test_raise_through_for_loop"] + ["wrap"] * 5 + ["failing"])
+
     def test_generator_expression_consumer(self):
         top, gens = started(6)
         self.assertEqual(sum(x for x in top if x % 2), sum(i for i in range(3, N) if i % 2))
