@@ -3800,18 +3800,6 @@ fn slot_note(code: &CodeObject, recv: &Object, pc: usize, cache: *const SlotCach
     }
 }
 
-/// Whether the `LOAD_ATTR` at `pc` is cooling down after a failed load
-/// (an odd count; see `Interpreter::specialized_load_attr`): its cached
-/// reads are skipped for an instance, whose miss the full handler raises
-/// without its resolution passes (`try: o.x except AttributeError:`).
-#[inline(always)]
-fn failing_site(code: &CodeObject, pc: usize) -> bool {
-    matches!(
-        code.caches.get(pc as u32),
-        weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
-    )
-}
-
 /// `LOAD_ATTR` (the `pc`th instruction of `code`) on the receiver at
 /// stack slot `at`, as the core loop's arm runs it (and, for an instance
 /// or module, the leaf arm's cached reads): `0` the value in place of the
@@ -3838,7 +3826,7 @@ unsafe extern "C" fn h_stack_attr(
             crate::drop_hot(std::mem::replace(&mut *at, v));
             return 0;
         }
-        if matches!(recv, Object::Instance(_)) && failing_site(code, pc) {
+        if matches!(recv, Object::Instance(_)) && crate::failing_attr_site(code, pc) {
             return 1;
         }
         let arg = code.instructions[pc].arg;
@@ -3948,7 +3936,7 @@ unsafe extern "C" fn h_local_attr(
             dst.write(v);
             return 0;
         }
-        if matches!(recv, Object::Instance(_)) && failing_site(code, pc) {
+        if matches!(recv, Object::Instance(_)) && crate::failing_attr_site(code, pc) {
             return 1;
         }
         let arg = code.instructions[pc].arg;

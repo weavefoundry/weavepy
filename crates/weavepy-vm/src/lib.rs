@@ -7933,16 +7933,20 @@ impl Interpreter {
                         return FrameEv::Call(act);
                     }
                 }
+                // (A site whose loads keep failing goes straight to the full
+                // handler, which raises a certain miss without the lanes.)
+                let attr_failing =
+                    op_before == Some(OpCode::LoadAttr) && failing_attr_site(&frame.code, cur_pc);
                 // `inst.prop` for a plain `property`: its getter runs as an
                 // inline activation, like an inline call.
-                if op_before == Some(OpCode::LoadAttr) && self.inline_calls_ok() {
+                if op_before == Some(OpCode::LoadAttr) && !attr_failing && self.inline_calls_ok() {
                     if let Some(act) = self.try_inline_property(frame, shell, cur_pc) {
                         return FrameEv::Call(act);
                     }
                 }
                 // Otherwise as a lean activation; `for x in gen` resumes
                 // the generator as one.
-                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) {
+                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) && !attr_failing {
                     let loaded = if op_before == Some(OpCode::LoadAttr) {
                         self.try_lean_property(frame, shell, snap_gen, cur_pc)
                     } else {
@@ -10950,6 +10954,7 @@ impl Interpreter {
                 .instructions
                 .get(pc)
                 .is_some_and(|i| i.op == OpCode::LoadAttr)
+                && !failing_attr_site(&frame.code, pc)
             {
                 if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
                     // SAFETY: as above.
@@ -48172,10 +48177,7 @@ impl Interpreter {
         // A site cooling down after a failed load (an odd count; see
         // `specialized_load_attr`'s `Cooldown` arm) asks whether the
         // attribute is certainly missing, ahead of the getter lanes.
-        let failing = matches!(
-            frame.code.caches.get(pc as u32),
-            weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
-        );
+        let failing = failing_attr_site(&frame.code, pc);
         // A property's or a Python data descriptor's getter runs as an
         // inline activation, as the core loop's own arm runs it.
         if frame.code.instructions[pc].op == OpCode::LoadAttr
@@ -75265,6 +75267,18 @@ const LAID_OUT_SLOT: u64 = 0x5ca1_a770_0000_0006;
 /// `__delattr__`, with no class attribute of that name in the way (see
 /// [`Interpreter::core_delete_attr`]).
 const DELETE_OWN_ATTR: u64 = 0x5ca1_a770_0000_0007;
+
+/// Whether the `LOAD_ATTR` at `pc` is cooling down after a failed load
+/// (an odd count; see `Interpreter::specialized_load_attr`'s `Cooldown`
+/// arm): its lanes are skipped for the full handler, whose certainly
+/// missing check raises (`try: o.x except AttributeError:`).
+#[inline(always)]
+pub(crate) fn failing_attr_site(code: &CodeObject, pc: usize) -> bool {
+    matches!(
+        code.caches.get(pc as u32),
+        weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
+    )
+}
 
 /// A `LOAD_ATTR` site's stamp tag for a module attribute: the first word
 /// is the module dict's mutation stamp, the bits the entry's position.
