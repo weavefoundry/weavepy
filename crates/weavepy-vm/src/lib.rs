@@ -20916,7 +20916,10 @@ impl Interpreter {
             | InlineResume::NextCall
             | InlineResume::NextDefault
             | InlineResume::SendCall => {
-                if self.core_iter_collapse(sw, pc, mode) == SendHop::Collapsed {
+                // SAFETY: see `CoreSwitch`: the running activation is synced.
+                if Self::iter_may_collapse(unsafe { &*sw.cur }, mode)
+                    && self.core_iter_collapse(sw, pc, mode) == SendHop::Collapsed
+                {
                     return true;
                 }
                 if !self.core_gen_resume_one(sw, pc, mode) {
@@ -20945,6 +20948,27 @@ impl Interpreter {
             }
         }
         true
+    }
+
+    /// Whether the generator a `FOR_ITER`, `next()` or `send(None)` call
+    /// (`mode`) atop `frame`'s stack resumes is a collapsed chain's level
+    /// or suspended in a `yield from` (see [`Self::core_iter_collapse`]):
+    /// a cheap first look, so most generators skip that call.
+    #[inline(always)]
+    fn iter_may_collapse(frame: &Frame, mode: InlineResume) -> bool {
+        let Some(g) = Self::resumed_gen(frame, mode) else {
+            return false;
+        };
+        if g.chain.get() != 0 {
+            return true;
+        }
+        // SAFETY: a read between instructions; the view ends here.
+        match unsafe { g.state_raw().peek() } {
+            Some(GeneratorState::Suspended(gf)) => {
+                yield_from_resend(&gf.code.instructions, gf.pc as usize).is_some()
+            }
+            _ => false,
+        }
     }
 
     /// [`Self::core_gen_resume`]'s `FOR_ITER` or `next()` (`mode`) at `pc`
