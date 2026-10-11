@@ -744,6 +744,31 @@ impl<V> Table<V> {
         Some((b.key, b.value))
     }
 
+    /// Put `key` (hash `hash`), known to be absent, in entry `i`'s place,
+    /// leaving every other entry where it is: the replaced key and value.
+    pub fn replace_index_unique(
+        &mut self,
+        i: usize,
+        hash: i64,
+        key: DictKey,
+        value: V,
+    ) -> Option<(DictKey, V)> {
+        let old = self.entries.get(i)?.hash;
+        if !self.slots.is_empty() {
+            let pos = self.slot_of(old, i);
+            self.erase_slot(pos);
+            let m = mix(hash);
+            let mask = self.slots.len() - 1;
+            let mut pos = (m >> self.shift) as usize;
+            while self.slots[pos] != 0 {
+                pos = (pos + 1) & mask;
+            }
+            self.slots[pos] = (m & !IX_MASK) | (i as u64 + 1);
+        }
+        let b = std::mem::replace(&mut self.entries[i], Bucket { hash, key, value });
+        Some((b.key, b.value))
+    }
+
     /// Remove the last entry.
     pub fn pop(&mut self) -> Option<(DictKey, V)> {
         let n = self.entries.len();
@@ -1732,5 +1757,29 @@ mod tests {
         check(&c);
         assert_eq!(c.get(&k(5)).map(|o| matches!(o, Object::Int(5))), Some(true));
         assert!(c.get(&k(50)).is_none());
+    }
+
+    #[test]
+    fn replace_in_place() {
+        for n in [5_i64, 40] {
+            let mut m = DictMap::new();
+            for i in 0..n {
+                m.insert(k(i * 1024), Object::Int(i));
+            }
+            for (step, i) in (0..n).rev().enumerate() {
+                let new = 100_000 + step as i64;
+                let key = k(new);
+                let hash = key.probe_hash();
+                let at = (i as usize * 7) % m.len();
+                let (old, _) = m
+                    .replace_index_unique(at, hash, key, Object::Int(new))
+                    .expect("in range");
+                assert!(m.get(&old).is_none());
+                assert_eq!(m.get_index_of(&k(new)), Some(at));
+                assert_eq!(m.len(), n as usize);
+                check(&m);
+            }
+            assert!(m.replace_index_unique(n as usize, 0, k(-1), Object::None).is_none());
+        }
     }
 }

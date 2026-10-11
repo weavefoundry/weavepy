@@ -20,14 +20,18 @@ pub(super) fn empty() -> Vec<u8> {
 pub(super) struct Order<'a> {
     bytes: &'a mut Vec<u8>,
     len: usize,
+    /// The words the buffer holds: the header's two and two per node.
+    words: usize,
 }
 
 impl<'a> Order<'a> {
+    #[inline]
     pub(super) fn new(bytes: &'a mut Vec<u8>, len: usize) -> Option<Self> {
-        if bytes.len() != len.checked_add(1)?.checked_mul(2 * WORD)? {
+        let words = len.checked_add(1)?.checked_mul(2)?;
+        if bytes.len() != words.checked_mul(WORD)? {
             return None;
         }
-        let order = Self { bytes, len };
+        let order = Self { bytes, len, words };
         let head = order.word(HEAD)?;
         let tail = order.word(TAIL)?;
         if (len == 0 && (head != NONE || tail != NONE))
@@ -38,24 +42,33 @@ impl<'a> Order<'a> {
         Some(order)
     }
 
+    #[inline(always)]
     fn word(&self, index: usize) -> Option<usize> {
-        let start = index.checked_mul(WORD)?;
-        Some(usize::from_ne_bytes(
-            self.bytes
-                .get(start..start.checked_add(WORD)?)?
-                .try_into()
-                .ok()?,
-        ))
+        if index >= self.words {
+            return None;
+        }
+        // SAFETY: the buffer holds `words` whole words (checked by `new`,
+        // kept by `push` and `swap_remove`).
+        Some(unsafe { self.bytes.as_ptr().cast::<usize>().add(index).read_unaligned() })
     }
 
+    #[inline(always)]
     fn set_word(&mut self, index: usize, value: usize) -> Option<()> {
-        let start = index.checked_mul(WORD)?;
-        self.bytes
-            .get_mut(start..start.checked_add(WORD)?)?
-            .copy_from_slice(&value.to_ne_bytes());
+        if index >= self.words {
+            return None;
+        }
+        // SAFETY: as in `word`.
+        unsafe {
+            self.bytes
+                .as_mut_ptr()
+                .cast::<usize>()
+                .add(index)
+                .write_unaligned(value);
+        }
         Some(())
     }
 
+    #[inline(always)]
     fn node(&self, index: usize) -> Option<(usize, usize)> {
         if index >= self.len {
             return None;
@@ -63,6 +76,7 @@ impl<'a> Order<'a> {
         Some((self.word(2 + 2 * index)?, self.word(3 + 2 * index)?))
     }
 
+    #[inline]
     fn detach(&mut self, index: usize) -> Option<()> {
         let (prev, next) = self.node(index)?;
         if prev == index || next == index {
@@ -93,6 +107,7 @@ impl<'a> Order<'a> {
         (head != NONE).then_some(head)
     }
 
+    #[inline]
     pub(super) fn touch(&mut self, index: usize) -> Option<()> {
         if index >= self.len {
             return None;
@@ -127,6 +142,7 @@ impl<'a> Order<'a> {
         self.bytes.extend_from_slice(&tail.to_ne_bytes());
         self.bytes.extend_from_slice(&NONE.to_ne_bytes());
         self.len += 1;
+        self.words += 2;
         if tail == NONE {
             self.set_word(HEAD, index)?;
         } else {
@@ -162,7 +178,8 @@ impl<'a> Order<'a> {
             }
         }
         self.len -= 1;
-        self.bytes.truncate((self.len + 1) * 2 * WORD);
+        self.words -= 2;
+        self.bytes.truncate(self.words * WORD);
         Some(())
     }
 
