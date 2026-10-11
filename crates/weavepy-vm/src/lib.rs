@@ -11018,33 +11018,41 @@ impl Interpreter {
     }
 
     /// [`Self::core_offload_run`] from inside [`Self::leaf_core`]'s loop, which
-    /// holds the running activation at `at` with its operand stack at
-    /// `base` (capacity `cap`): synced, then run. `true` when the loop goes
-    /// on in place, at the new `at`: the same activation, its stack where
-    /// it was, nothing pending (what a reload would derive again is
-    /// unchanged). Otherwise the loop reloads, which ends the burst first
-    /// if it must (`sw.pending`).
+    /// holds the running activation at `at`: synced, then run. `true` when
+    /// the loop goes on in place, at the new `at`: the same activation, its
+    /// stack where it was, its site tables as they were, nothing pending:
+    /// what a reload would derive again is unchanged. Otherwise the loop
+    /// reloads, which ends the burst first if it must (`sw.pending`).
     ///
     /// # Safety
     ///
-    /// `at`, `base` and `cap` are the running activation's, as the core
-    /// loop holds them (every stack slot below `at.len` initialized).
+    /// `at` is the running activation's, as the core loop holds it (every
+    /// stack slot below `at.len` initialized).
     #[inline(never)]
     unsafe fn core_offload_in_loop<const MODE: u8>(
         &mut self,
         sw: &mut CoreSwitch,
         snap_gen: u64,
-        base: *mut Object,
-        cap: usize,
         at: &mut CoreAt,
     ) -> bool {
         let (cur, last) = (sw.cur, sw.last);
-        // SAFETY: see `CoreSwitch`; the caller's contract.
-        unsafe {
-            (*cur).stack.set_len(at.len);
+        // SAFETY: see `CoreSwitch`; the caller's contract. (The core loop
+        // writes its operand stack in place, so its base and capacity are
+        // the vector's.)
+        let (base, cap) = unsafe {
+            let stack = &mut (*cur).stack;
+            stack.set_len(at.len);
             (*cur).pc = at.pc as u32;
             *last = at.last;
-        }
+            (stack.as_mut_ptr(), stack.capacity())
+        };
+        // The site tables the loop holds views of (empty until allocated).
+        let tables = |frame: &Frame| {
+            code_vm_ext(&frame.code)
+                .map(|e| (e.stamp_slots.is_allocated(), e.method_slots.is_allocated()))
+        };
+        // SAFETY: as above.
+        let tables_before = tables(unsafe { &*cur });
         if let Some(stop) = self.core_offload_run(sw, snap_gen, MODE) {
             // (What the burst's own end would drop with it.)
             sw.pending = Some(CoreExit::Stop(stop));
@@ -11056,12 +11064,13 @@ impl Interpreter {
         // SAFETY: the same activation, unborrowed here.
         let frame = unsafe { &mut *cur };
         let pc = frame.pc as usize;
-        // (A reload would also count an entry at pc 0 as a call, and check
-        // the pc against the code.)
+        // (A reload would also count an entry at pc 0 as a call, check the
+        // pc against the code, and view a site table the run allocated.)
         if frame.stack.as_mut_ptr() != base
             || frame.stack.capacity() != cap
             || pc == 0
             || pc >= frame.code.instructions.len()
+            || tables(frame) != tables_before
         {
             return false;
         }
@@ -11564,15 +11573,10 @@ impl Interpreter {
                 ($mode:expr) => {{
                     let mut at = CoreAt { len, pc, last };
                     // SAFETY: the running activation's state, as held here.
-                    if unsafe {
-                        self.core_offload_in_loop::<{ $mode }>(sw, snap_gen, base, cap, &mut at)
-                    } {
+                    if unsafe { self.core_offload_in_loop::<{ $mode }>(sw, snap_gen, &mut at) } {
                         len = at.len;
                         pc = at.pc;
                         last = at.last;
-                        // (The run may have allocated a site table.)
-                        cold_stamps = None;
-                        cold_mslots = None;
                         continue;
                     } else {
                         break Some(CoreExit::Reload);
@@ -11666,7 +11670,8 @@ impl Interpreter {
                         // every pc keeps its own unit, so the pair is fused
                         // here instead — one dispatch, and `x = y` never
                         // touches the stack at all.
-                        match fast_pairs.get(pc).copied().unwrap_or(0) {
+                        let kind = fast_pairs.get(pc).copied().unwrap_or(0);
+                        match kind {
                             1 => {
                                 // SAFETY: a pair kind is only recorded where
                                 // `pc + 1` names an instruction.
@@ -11743,7 +11748,7 @@ impl Interpreter {
                                 // pair kind is only recorded where the branch
                                 // instruction exists.
                                 let v = unsafe { &*lbase.add(i) };
-                                let jump_pc = pc + 1 + usize::from(fast_pairs[pc] == 4);
+                                let jump_pc = pc + 1 + usize::from(kind == 4);
                                 let jump = unsafe { *instrs.add(jump_pc) };
                                 let taken = match (jump.op, v) {
                                     (_, Object::Unbound) => None,
@@ -11793,111 +11798,104 @@ impl Interpreter {
                                 | Object::Bool(_)
                                 | Object::None) => scalar_copy(s),
                                 Object::Unbound => break None,
-                                other => {
-                                    // `x.attr` on a local receiver: read straight
-                                    // off the local (no receiver clone pushed and
-                                    // released); a miss loads the receiver and
-                                    // leaves `LOAD_ATTR` to its own arm.
-                                    // `x.m(...)` of a leaf or native method on the
-                                    // borrowed local (see `core_local_method`).
-                                    if pc + 1 < ninstrs
-                                        && len < cap
-                                        && (*instrs.add(pc + 1)).op == OpCode::LoadMethodAttr
-                                    {
-                                        if let Some((r, call_pc)) = self.core_local_method(
-                                            code,
-                                            ext,
-                                            other,
-                                            pc,
-                                            lbase,
-                                            nlocals,
-                                            consts,
-                                            sw.depth_cell,
-                                        ) {
-                                            last = call_pc;
-                                            pc = call_pc + 1;
-                                            match r {
-                                                Ok(v) => {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    break Some(CoreExit::Stop(LeafStop::Raised(
-                                                        e,
-                                                    )));
-                                                }
+                                // A plain load (kind 0) of a heap value is a
+                                // clone; the kinds past the pairs fuse the
+                                // instruction after it (see `code_fast_pairs`).
+                                other if kind < FAST_METHOD => clone_hot(other),
+                                // `x.m(...)` of a leaf or native method on the
+                                // borrowed local (see `core_local_method`).
+                                other if kind == FAST_METHOD => {
+                                    if let Some((r, call_pc)) = self.core_local_method(
+                                        code,
+                                        ext,
+                                        other,
+                                        pc,
+                                        lbase,
+                                        nlocals,
+                                        consts,
+                                        sw.depth_cell,
+                                    ) {
+                                        last = call_pc;
+                                        pc = call_pc + 1;
+                                        match r {
+                                            Ok(v) => {
+                                                base.add(len).write(v);
+                                                len += 1;
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                break Some(CoreExit::Stop(LeafStop::Raised(e)));
                                             }
                                         }
                                     }
-                                    if matches!(other, Object::Instance(_) | Object::Module(_))
-                                        && pc + 1 < ninstrs
-                                    {
-                                        let next = *instrs.add(pc + 1);
-                                        if next.op == OpCode::LoadAttr {
-                                            if code
-                                                .instructions
-                                                .get(pc + 2)
-                                                .is_some_and(|ins| ins.op == OpCode::LoadAttr)
-                                            {
-                                                if let Some((v, end)) =
-                                                    Self::core_local_attr_chain(code, other, pc + 1)
-                                                {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    last = end;
-                                                    pc = end + 1;
-                                                    continue;
-                                                }
-                                            } else if let (Some(ext), Object::Instance(inst)) =
-                                                (ext, other)
-                                            {
-                                                // The site's field shortcut, in line (the
-                                                // common monomorphic read).
-                                                if let Some(v) = field_slot_hit(ext, pc + 1, inst) {
-                                                    base.add(len).write(clone_hot(v));
-                                                    len += 1;
-                                                    last = pc + 1;
-                                                    pc += 2;
-                                                    continue;
-                                                }
-                                            }
-                                            if let Some(v) = Self::core_local_attr(
-                                                ext,
-                                                code,
-                                                other,
-                                                pc + 1,
-                                                next.arg,
-                                            ) {
-                                                base.add(len).write(v);
+                                    clone_hot(other)
+                                }
+                                // `x.attr` on a local receiver: read straight off
+                                // the local (no receiver clone pushed and
+                                // released); a miss loads the receiver and leaves
+                                // `LOAD_ATTR` to its own arm.
+                                other @ (Object::Instance(_) | Object::Module(_)) => {
+                                    // SAFETY: an attribute kind is only recorded
+                                    // where `pc + 1` names an instruction.
+                                    let next = *instrs.add(pc + 1);
+                                    if kind == FAST_ATTR_CHAIN {
+                                        if let Some((v, end)) =
+                                            Self::core_local_attr_chain(code, other, pc + 1)
+                                        {
+                                            base.add(len).write(v);
+                                            len += 1;
+                                            last = end;
+                                            pc = end + 1;
+                                            continue;
+                                        }
+                                    } else if kind == FAST_ATTR {
+                                        // The site's field shortcut, in line (the
+                                        // common monomorphic read).
+                                        if let (Some(ext), Object::Instance(inst)) = (ext, other) {
+                                            if let Some(v) = field_slot_hit(ext, pc + 1, inst) {
+                                                base.add(len).write(clone_hot(v));
                                                 len += 1;
                                                 last = pc + 1;
                                                 pc += 2;
                                                 continue;
                                             }
                                         }
-                                        // `x.attr = v` on a local receiver:
-                                        // store straight into it, so the
-                                        // receiver is never pushed, cloned and
-                                        // dropped (a drop the collector grades).
-                                        if next.op == OpCode::StoreAttr
-                                            && len > 0
-                                            && Self::core_store_local_attr(
-                                                code,
-                                                other,
-                                                pc + 1,
-                                                next.arg,
-                                                &*base.add(len - 1),
-                                            )
-                                        {
-                                            len -= 1;
+                                    }
+                                    if kind != FAST_STORE_ATTR {
+                                        if let Some(v) = Self::core_local_attr(
+                                            ext,
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            next.arg,
+                                        ) {
+                                            base.add(len).write(v);
+                                            len += 1;
                                             last = pc + 1;
                                             pc += 2;
                                             continue;
                                         }
+                                    } else if len > 0
+                                        // `x.attr = v` on a local receiver: store
+                                        // straight into it, so the receiver is
+                                        // never pushed, cloned and dropped (a
+                                        // drop the collector grades).
+                                        && Self::core_store_local_attr(
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            next.arg,
+                                            &*base.add(len - 1),
+                                        )
+                                    {
+                                        len -= 1;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
                                     }
                                     clone_hot(other)
                                 }
+                                other => clone_hot(other),
                             };
                             base.add(len).write(c);
                         }
@@ -14190,86 +14188,99 @@ impl Interpreter {
                         let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
                         let gid = specialize::rc_id(&frame.globals);
                         let g_stamp = unsafe { (*gdict).mutation_stamp() };
-                        let hit = match code.caches.get(pc as u32) {
-                            IC::LoadGlobalModule {
-                                globals_id,
-                                key_idx,
-                            } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
-                                (*gdict).get_index(key_idx as usize)
-                            },
-                            IC::LoadGlobalBuiltin {
-                                builtins_id,
-                                key_idx,
-                            } if builtins_id == specialize::rc_id(&frame.builtins)
-                                && !self.globals_missing_any.get()
-                                && slot.get()
-                                    == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
-                            {
-                                let hit = unsafe { (*bdict).get_index(key_idx as usize) };
-                                // `len(local)`: the length straight off the local.
-                                if let Some((_, Object::Builtin(f))) = hit {
-                                    if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
-                                        && pc + 3 < ninstrs
+                        let stamp = slot.get();
+                        // The value the site last read, in place while the
+                        // stamp holds (see `StampSlot::value`); else the
+                        // inline cache's entry under the stamp, recorded.
+                        let held = slot.value();
+                        let (v, builtin): (&Object, bool) = if held != 0
+                            && stamp[0] == gid
+                            && stamp[1] == g_stamp
+                            && if held & 1 == 0 {
+                                stamp[2] == 0
+                            } else {
+                                !self.globals_missing_any.get()
+                                    && stamp[2] == unsafe { (*bdict).mutation_stamp() }
+                            } {
+                            // SAFETY: the dicts are as they were when the
+                            // value was read (see `StampSlot::value`).
+                            (unsafe { &*((held & !1) as *const Object) }, held & 1 != 0)
+                        } else {
+                            let (hit, builtin) = match code.caches.get(pc as u32) {
+                                IC::LoadGlobalModule {
+                                    globals_id,
+                                    key_idx,
+                                } if globals_id == gid && stamp == [gid, g_stamp, 0] => {
+                                    (unsafe { (*gdict).get_index(key_idx as usize) }, false)
+                                }
+                                IC::LoadGlobalBuiltin {
+                                    builtins_id,
+                                    key_idx,
+                                } if builtins_id == specialize::rc_id(&frame.builtins)
+                                    && !self.globals_missing_any.get()
+                                    && stamp
+                                        == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+                                {
+                                    (unsafe { (*bdict).get_index(key_idx as usize) }, true)
+                                }
+                                _ => offload!(OFFLOAD_HELPER),
+                            };
+                            let Some((_, v)) = hit else {
+                                offload!(OFFLOAD_HELPER);
+                            };
+                            slot.set_value(v, builtin);
+                            (v, builtin)
+                        };
+                        // `len(local)`: the length straight off the local.
+                        if builtin {
+                            if let Object::Builtin(f) = v {
+                                if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
+                                    && pc + 3 < ninstrs
+                                {
+                                    // SAFETY: `pc + 3 < ninstrs`.
+                                    let (null, load, call) = unsafe {
+                                        (
+                                            *instrs.add(pc + 1),
+                                            *instrs.add(pc + 2),
+                                            *instrs.add(pc + 3),
+                                        )
+                                    };
+                                    if null.op == OpCode::PushNull
+                                        && load.op == OpCode::LoadFast
+                                        && call.op == OpCode::Call
+                                        && call.arg == 1
+                                        && (load.arg as usize) < nlocals
                                     {
-                                        // SAFETY: `pc + 3 < ninstrs`.
-                                        let (null, load, call) = unsafe {
-                                            (
-                                                *instrs.add(pc + 1),
-                                                *instrs.add(pc + 2),
-                                                *instrs.add(pc + 3),
-                                            )
-                                        };
-                                        if null.op == OpCode::PushNull
-                                            && load.op == OpCode::LoadFast
-                                            && call.op == OpCode::Call
-                                            && call.arg == 1
-                                            && (load.arg as usize) < nlocals
-                                        {
-                                            // SAFETY: `load.arg < nlocals`.
-                                            let n = match unsafe { &*lbase.add(load.arg as usize) }
-                                            {
-                                                // SAFETY: a read between two
-                                                // instructions.
-                                                Object::List(l) => {
-                                                    unsafe { l.peek() }.map(Vec::len)
+                                        // SAFETY: `load.arg < nlocals`.
+                                        let n = match unsafe { &*lbase.add(load.arg as usize) } {
+                                            // SAFETY: a read between two
+                                            // instructions.
+                                            Object::List(l) => unsafe { l.peek() }.map(Vec::len),
+                                            Object::Tuple(t) => Some(t.len()),
+                                            Object::Str(s) => Some(crate::object::str_char_len(s)),
+                                            // SAFETY: as above.
+                                            Object::Dict(d) => unsafe { d.peek() }.map(|d| d.len()),
+                                            // A native `__len__` (a deque's).
+                                            v @ Object::Instance(_) => {
+                                                match self.leaf_instance_len(v) {
+                                                    Some(Object::Int(n)) => usize::try_from(n).ok(),
+                                                    _ => None,
                                                 }
-                                                Object::Tuple(t) => Some(t.len()),
-                                                Object::Str(s) => {
-                                                    Some(crate::object::str_char_len(s))
-                                                }
-                                                // SAFETY: as above.
-                                                Object::Dict(d) => {
-                                                    unsafe { d.peek() }.map(|d| d.len())
-                                                }
-                                                // A native `__len__` (a deque's).
-                                                v @ Object::Instance(_) => {
-                                                    match self.leaf_instance_len(v) {
-                                                        Some(Object::Int(n)) => {
-                                                            usize::try_from(n).ok()
-                                                        }
-                                                        _ => None,
-                                                    }
-                                                }
-                                                _ => None,
-                                            };
-                                            if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
-                                                // SAFETY: `len < cap`.
-                                                unsafe { base.add(len).write(int_hot(n)) };
-                                                len += 1;
-                                                last = pc + 3;
-                                                pc += 4;
-                                                continue;
                                             }
+                                            _ => None,
+                                        };
+                                        if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                                            // SAFETY: `len < cap`.
+                                            unsafe { base.add(len).write(int_hot(n)) };
+                                            len += 1;
+                                            last = pc + 3;
+                                            pc += 4;
+                                            continue;
                                         }
                                     }
                                 }
-                                hit
                             }
-                            _ => offload!(OFFLOAD_HELPER),
-                        };
-                        let Some((_, v)) = hit else {
-                            offload!(OFFLOAD_HELPER);
-                        };
+                        }
                         let v = match v {
                             s @ (Object::Int(_)
                             | Object::Float(_)
@@ -72754,10 +72765,11 @@ struct CodeConstObjects {
     leaf_tries: std::sync::atomic::AtomicU64,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
-    /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
-    /// fuses exactly these pairs into one instruction and the decoder
-    /// splits them back apart; the core loop reads one byte to run the
-    /// pair as a single dispatch. Empty when the code has no pair.
+    /// it is a `STORE_FAST`, `3` and `4` for a branch on the local, the
+    /// receiver-fused kinds from [`FAST_METHOD`] on, `0` everywhere else.
+    /// CPython's compiler fuses the first pairs into one instruction and
+    /// the decoder splits them back apart; the core loop reads one byte to
+    /// run the pair as a single dispatch. Empty when the code has none.
     fast_pairs: std::sync::OnceLock<Box<[u8]>>,
     /// Whether the code is a generator body fast steps run (see
     /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
@@ -73348,8 +73360,14 @@ fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
 /// and (for a builtin hit) the builtins dict's stamp. While all three
 /// match, the dicts are exactly as they were when the site last ran its
 /// full guards, so the cached index can be read straight away.
-#[repr(transparent)]
-struct StampSlot(std::cell::UnsafeCell<[u64; 3]>);
+///
+/// The second field is the address of the value the core loop's
+/// `LOAD_GLOBAL` arm last read under the stamp (with bit 0 set for a
+/// builtin), `0` when none: a dict's stamp moves with every mutation, so
+/// while the stamp holds the value stays where it is (see
+/// [`Self::value`]). Every other write of the stamp clears it.
+#[repr(C)]
+struct StampSlot(std::cell::UnsafeCell<[u64; 3]>, std::cell::Cell<u64>);
 
 // SAFETY: as `MethodSlot`: read and written only from the dispatch loop
 // with the GIL held.
@@ -73358,7 +73376,7 @@ unsafe impl Sync for StampSlot {}
 
 impl StampSlot {
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new([0; 3]))
+        Self(std::cell::UnsafeCell::new([0; 3]), std::cell::Cell::new(0))
     }
 
     #[inline]
@@ -73372,6 +73390,25 @@ impl StampSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = v };
+        self.1.set(0);
+    }
+
+    /// The value the `LOAD_GLOBAL` site last read under its stamp, as its
+    /// address with bit 0 set for a builtin (`0`: none). It is the value
+    /// while the stamp matches the frame's namespaces: the module dict's,
+    /// and for a builtin also the builtins dict's (stamps are unique to a
+    /// dict and its state).
+    #[inline(always)]
+    fn value(&self) -> u64 {
+        self.1.get()
+    }
+
+    /// Record the value a `LOAD_GLOBAL` read under the stamp just proved
+    /// (see [`Self::value`]).
+    #[inline]
+    fn set_value(&self, v: &Object, builtin: bool) {
+        self.1
+            .set(std::ptr::from_ref(v) as u64 | u64::from(builtin));
     }
 }
 
@@ -74738,16 +74775,15 @@ pub(crate) fn code_is_pure_leaf_pub(code: &CodeObject) -> bool {
 }
 
 /// The fused-pair kind of every instruction (see
-/// [`CodeConstObjects::fast_pairs`]), built once per code object.
-/// Empty for code with no pair at all — the common shape, whose
-/// `LOAD_FAST` arm then reads nothing.
+/// [`CodeConstObjects::fast_pairs`]), built once per code object: past
+/// the local-to-local pairs, the receiver-fused kinds ([`FAST_METHOD`] and
+/// on), which `LOAD_FAST` reads instead of decoding the next instruction.
+/// Empty for code with none at all, whose `LOAD_FAST` arm then reads
+/// nothing.
 fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> &'a [u8] {
     let Some(ext) = ext else { return &[] };
     ext.fast_pairs.get_or_init(|| {
-        // (`WEAVEPY_NO_PAIRS`, a bisection aid, leaves every table empty.)
-        if crate::hot_gates::env_flags::no_pairs() {
-            return Box::new([]);
-        }
+        let no_pairs = crate::hot_gates::env_flags::no_pairs();
         let ops = &code.instructions;
         let mut any = false;
         let mut kinds = vec![0u8; ops.len()];
@@ -74756,6 +74792,19 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
                 continue;
             }
             let kind = match ops.get(pc + 1).map(|i| i.op) {
+                // The receiver-fused shapes: a method call, an attribute
+                // read (a chain of them) or store on the local.
+                Some(OpCode::LoadMethodAttr) => FAST_METHOD,
+                Some(OpCode::LoadAttr)
+                    if ops.get(pc + 2).map(|i| i.op) == Some(OpCode::LoadAttr) =>
+                {
+                    FAST_ATTR_CHAIN
+                }
+                Some(OpCode::LoadAttr) => FAST_ATTR,
+                Some(OpCode::StoreAttr) => FAST_STORE_ATTR,
+                // (`WEAVEPY_NO_PAIRS`, a bisection aid, leaves out the
+                // local-to-local pairs.)
+                _ if no_pairs => 0,
                 // A second load whose own successor reads an attribute
                 // off it keeps the receiver-fused arm instead.
                 Some(OpCode::LoadFast) => u8::from(!matches!(
@@ -74786,6 +74835,14 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
         }
     })
 }
+
+/// [`code_fast_pairs`]'s receiver-fused kinds: the `LOAD_FAST` is followed
+/// by a `LOAD_METHOD_ATTR`, a `LOAD_ATTR` (followed by another, for the
+/// chain), or a `STORE_ATTR`.
+const FAST_METHOD: u8 = 5;
+const FAST_ATTR: u8 = 6;
+const FAST_ATTR_CHAIN: u8 = 7;
+const FAST_STORE_ATTR: u8 = 8;
 
 /// A leaf's parameter count: its positional parameters, its keyword-only
 /// ones, then its `**kwargs` dictionary when it has one (bound by keyword
