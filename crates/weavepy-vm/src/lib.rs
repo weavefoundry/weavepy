@@ -15159,129 +15159,38 @@ impl Interpreter {
     /// The core loop's `CALL` at `pc` of a non-leaf builtin the site settled
     /// on (see [`Self::builtin_lane`]), in `sw`'s synced running activation:
     /// a builtin type's method on its exact receiver, as `(method, receiver)`
-    /// or as a bound method with an empty self slot, or a builtin function.
-    /// The body runs directly, or with `via_call` through [`Self::call`], as
-    /// the full handler's dispatch ends up running it, without that
-    /// handler's chain of special cases. The body may run Python code (an
-    /// element's `__eq__`, a key function), so the operands leave the stack
-    /// first, the activation waits on the pending list meanwhile, and the
-    /// core loop reloads after. `false` touches nothing.
+    /// or as a bound method with an empty self slot, or a builtin function,
+    /// run by [`Self::core_native_body`]. The core loop reloads after.
+    /// `false` touches nothing.
     #[inline(never)]
     fn core_builtin_lane(&mut self, sw: &mut CoreSwitch, pc: usize, via_call: bool) -> bool {
-        const MAX_ARGS: usize = 8;
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
         let Some(ins) = frame.code.instructions.get(pc) else {
             return false;
         };
-        let argc = ins.arg as usize;
-        let n = frame.stack.len();
-        let Some(callee_at) = n.checked_sub(argc + 2) else {
+        let Some(callee_at) = frame.stack.len().checked_sub(ins.arg as usize + 2) else {
             return false;
         };
-        if argc >= MAX_ARGS {
-            return false;
-        }
-        let recv_ok = |b: &crate::object::BuiltinFn, recv: &Object| {
-            b.binds_instance
-                && (!via_call
-                    || builtins::method_memo_tag(recv).is_some()
-                    || exception_init_call(b, recv)
-                    || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
-                        && matches!(recv, Object::Instance(_))))
-        };
-        let ok = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
-            (Object::Builtin(b), Object::Unbound) => !b.binds_instance,
-            (Object::Builtin(b), recv) => recv_ok(b, recv),
-            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
-                match &bm.function {
-                    Object::Builtin(b) => recv_ok(b, &bm.receiver),
-                    _ => false,
+        let b: *const crate::object::BuiltinFn =
+            match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+                (Object::Builtin(b), Object::Unbound) if !b.binds_instance => Rc::as_ptr(b),
+                (Object::Builtin(b), recv) if lane_recv_ok(b, recv, via_call) => Rc::as_ptr(b),
+                (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                    match &bm.function {
+                        Object::Builtin(b) if lane_recv_ok(b, &bm.receiver, via_call) => {
+                            Rc::as_ptr(b)
+                        }
+                        _ => return false,
+                    }
                 }
-            }
-            _ => false,
-        };
-        if !ok {
-            return false;
-        }
-        // Committed. The callable and the self slot leave the stack, the
-        // receiver (the self slot's, moved, or a bound method's) and the
-        // arguments into `buf`.
-        let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX_ARGS + 1];
-        // SAFETY: the callable, the self slot and the `argc` operands
-        // above it leave the stack, which forgets them (`argc < MAX_ARGS`).
-        let (callable, moved_self) = unsafe {
-            let base = frame.stack.as_ptr().add(callee_at);
-            let callable = base.read();
-            let self_slot = base.add(1).read();
-            let moved_self = !matches!(self_slot, Object::Unbound);
-            if moved_self {
-                buf[0].write(self_slot);
-            } else if let Object::BoundMethod(bm) = &callable {
-                buf[0].write(bm.receiver.clone());
-            }
-            let first = usize::from(moved_self || matches!(callable, Object::BoundMethod(_)));
-            for k in 0..argc {
-                buf[first + k].write(base.add(2 + k).read());
-            }
-            frame.stack.set_len(callee_at);
-            (callable, moved_self)
-        };
-        let b: &crate::object::BuiltinFn = match &callable {
-            Object::Builtin(b) => b,
-            Object::BoundMethod(bm) => match &bm.function {
-                Object::Builtin(b) => b,
-                _ => unreachable!("checked above"),
-            },
-            _ => unreachable!("checked above"),
-        };
-        let first = usize::from(moved_self || matches!(callable, Object::BoundMethod(_)));
-        frame.pc = pc as u32 + 1;
-        // SAFETY: the first `first + argc` entries were written above.
-        let ops = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), first + argc)
-        };
-        // The body may run Python code that looks up the stack.
-        let pending = self.core_pending_enter_fast(sw, frame, pc);
-        let result = if via_call {
-            let globals = frame.globals.clone();
-            match &callable {
-                Object::Builtin(_) => self.call(&callable, ops, &[], &globals),
-                _ => self.call(&bm_builtin(&callable), ops, &[], &globals),
-            }
-        } else {
-            match b.call_kw.as_ref() {
-                Some(call_kw) => call_kw(ops, &[]),
-                None => (b.call)(ops),
-            }
-        };
-        self.core_pending_exit(sw, pending);
-        // The operands drop as the full handler's do, after the call: the
-        // arguments plainly, the receiver the self slot held and the
-        // callable as the full handler releases them (a scalar or a shared
-        // builtin by a plain drop).
-        // SAFETY: each initialized entry drops exactly once; `buf` itself
-        // has no drop glue.
-        unsafe {
-            if moved_self {
-                let receiver = ops.as_ptr().read();
-                std::ptr::drop_in_place(&mut ops[1..]);
-                self.release(receiver);
-            } else {
-                std::ptr::drop_in_place(ops);
-            }
-        }
-        if matches!(callable, Object::Builtin(_)) {
-            drop(callable);
-        } else {
-            self.release(callable);
-        }
-        match result {
+                _ => return false,
+            };
+        // SAFETY: the activation is synced, and the shape was checked.
+        match unsafe { self.core_native_body(sw, frame, pc, callee_at, b, via_call) } {
             Ok(v) => {
-                // SAFETY: as above (the body ran nested activations of its
-                // own, never this one).
-                unsafe { (*sw.cur).stack.push(v) };
+                frame.stack.push(v);
                 // SAFETY: the running activation's last-pc slot.
                 unsafe { *sw.last = pc };
             }
@@ -15294,6 +15203,80 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// The body of the non-leaf builtin `b` for the `CALL` at `pc` of `sw`'s
+    /// running activation `frame` (synced, its operands from `start` to the
+    /// top of its stack): `b` is the callee itself (a method with its
+    /// receiver in the self slot, or a function with the slot empty) or a
+    /// bound method's function, whose receiver fills the empty self slot
+    /// here. The body runs directly, or with `via_call` through
+    /// [`Self::call`], as the full handler's dispatch ends up running it,
+    /// on the operands where they are (as a vectorcall reads them, the
+    /// stack holding them), with the activation waiting on the pending
+    /// list: the body may run Python code (an element's `__eq__`, a key
+    /// function). Then the operands leave as the full handler's do, the
+    /// arguments first, then the receiver and the callable, and the stack
+    /// ends at `start` (the result is the caller's to place).
+    ///
+    /// # Safety
+    ///
+    /// `frame` is `sw`'s synced running activation, unborrowed elsewhere;
+    /// the callee at `start` is `b` (or a bound method of it) in a shape
+    /// [`Self::core_builtin_lane`] admits.
+    #[inline(never)]
+    pub(crate) unsafe fn core_native_body(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+        start: usize,
+        b: *const crate::object::BuiltinFn,
+        via_call: bool,
+    ) -> Result<Object, RuntimeError> {
+        let len = frame.stack.len();
+        // SAFETY: the caller's contract: `start + 2 <= len`; the stack
+        // isn't resized while the body runs (nested code runs activations
+        // of its own).
+        unsafe {
+            let base = frame.stack.as_mut_ptr();
+            if matches!(&*base.add(start + 1), Object::Unbound) {
+                if let Object::BoundMethod(bm) = &*base.add(start) {
+                    // (The empty self slot needs no release.)
+                    base.add(start + 1).write(bm.receiver.clone());
+                }
+            }
+            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                start + 2
+            } else {
+                start + 1
+            };
+            frame.pc = pc as u32 + 1;
+            // The body may run Python code that looks up the stack.
+            let pending = self.core_pending_enter_fast(sw, frame, pc);
+            let args = std::slice::from_raw_parts(base.add(first), len - first);
+            let result = if via_call {
+                let globals = frame.globals.clone();
+                match &*base.add(start) {
+                    callable @ Object::Builtin(_) => self.call(callable, args, &[], &globals),
+                    callable => self.call(&bm_builtin(callable), args, &[], &globals),
+                }
+            } else {
+                let b = &*b;
+                match b.call_kw.as_ref() {
+                    Some(call_kw) => call_kw(args, &[]),
+                    None => (b.call)(args),
+                }
+            };
+            self.core_pending_exit(sw, pending);
+            // The operands leave the stack, then are released: the
+            // arguments, the receiver, the callable.
+            frame.stack.set_len(start);
+            release_operands(self, base.add(start + 2), len - start - 2);
+            release_operands(self, base.add(start + 1), 1);
+            release_operands(self, base.add(start), 1);
+            result
+        }
     }
 
     /// A `BINARY_OP` or `COMPARE_OP` at `sw`'s running activation's `pc`
@@ -72268,6 +72251,20 @@ fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
     b.name == "__init__" && matches!(recv, Object::Instance(i) if i.cls_raw().flags.is_exception)
 }
 
+/// Whether the core loop's builtin lane may call the method body `b` on
+/// `recv` (see `Interpreter::core_builtin_lane`): a body that binds
+/// instances, and with `via_call` one whose receiver the interpreter's
+/// dispatch knows by name.
+#[inline]
+fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> bool {
+    b.binds_instance
+        && (!via_call
+            || builtins::method_memo_tag(recv).is_some()
+            || exception_init_call(b, recv)
+            || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                && matches!(recv, Object::Instance(_))))
+}
+
 /// The builtin function a bound method of one wraps, as its own callable.
 #[cold]
 fn bm_builtin(callable: &Object) -> Object {
@@ -73382,6 +73379,24 @@ pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKi
     }
 }
 
+/// The builtin the `CALL` at `pc` last settled on: its leaf kind, or
+/// `None` and whether its body runs through `Interpreter::call` for a
+/// builtin whose body the core loop's lane runs (see
+/// [`MethodSlotFn::NativeBody`]).
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_builtin(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::BuiltinFn>, Option<LeafKind>, bool)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::Leaf(f, kind) => Some((f.clone(), Some(*kind), false)),
+        MethodSlotFn::NativeBody(f, via_call) => Some((f.clone(), None, *via_call)),
+        _ => None,
+    }
+}
+
 /// Whether the `CALL` at `pc` last settled on a leaf builtin the core
 /// loop's arm (and the frame JIT's helper) runs in place.
 #[cfg(feature = "jit")]
@@ -73704,6 +73719,43 @@ fn drop_hot(v: Object) {
         // here unless it's the last one.
         Some(word) if unsafe { crate::rc::try_release_word(word) } => std::mem::forget(v),
         Some(_) => drop(v),
+    }
+}
+
+/// [`Interpreter::release`] of a call's operand with its commonest case in
+/// line: a scalar, or a shared value's plain decrement while nothing
+/// watches releases (one load of [`plain_release_gate`]'s flags). A last
+/// owner, or any release an observer wants, takes the full release.
+#[inline(always)]
+fn release_hot(interp: &Interpreter, v: Object) {
+    if let Some(word) = v.strong_word() {
+        // SAFETY: the gates are four flags laid out as one `u32`; `v` owns
+        // a reference to the live allocation, released here unless it's
+        // the last one.
+        let plain = unsafe {
+            (*plain_release_gate().cast::<std::sync::atomic::AtomicU32>())
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+                && crate::rc::try_release_word(word)
+        };
+        if !plain {
+            return interp.release(v);
+        }
+    }
+    std::mem::forget(v);
+}
+
+/// Release the `n` call operands at `p` (moved out: the caller's stack no
+/// longer counts them) in order, as [`release_hot`] does.
+///
+/// # Safety
+///
+/// `p` holds `n` initialized values the caller owns and gives up.
+#[inline(always)]
+unsafe fn release_operands(interp: &Interpreter, p: *const Object, n: usize) {
+    for k in 0..n {
+        // SAFETY: the caller's contract.
+        release_hot(interp, unsafe { p.add(k).read() });
     }
 }
 
