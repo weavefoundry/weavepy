@@ -4712,6 +4712,37 @@ unsafe extern "C" fn h_call_direct(
     }
 }
 
+/// `CALL` from a lean body (see [`Lower::call_op`]): a Python function's
+/// call tries [`h_call_direct`] first, unless its site found the callee
+/// without a native body and has retries left to count down; anything
+/// else goes through [`h_call`]. A lean body makes this choice here
+/// rather than in line: its code is large enough that compile memory
+/// matters more than the branches.
+unsafe extern "C" fn h_call_site(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc_argc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    let argc = (pc_argc >> 32) as usize;
+    // SAFETY: as `h_call_direct`'s: the callee's slot is on the stack
+    // below the arguments and its self slot, and `site` is this `CALL`'s
+    // own cache.
+    unsafe {
+        let callee = &*(*st).stack.add(len as usize - argc - 2);
+        if matches!(callee, Object::Function(_)) {
+            let site = &mut *site;
+            if site.hot != 0 || site.retry == 0 {
+                return h_call_direct(st, code, ext, pc_argc, len, site);
+            }
+            site.retry -= 1;
+        }
+        h_call(st, code, ext, pc_argc & u64::from(u32::MAX), len)
+    }
+}
+
 /// Whether a site may evaluate a call of `f` (running `code`) with `nargs`
 /// positional arguments as a frameless leaf ([`leaf_site_call`]): a leaf
 /// with only positional parameters, at most eight, `nargs` of them given.
@@ -7254,6 +7285,9 @@ struct Lower<'a> {
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
     /// first use.
     catch: Option<Block>,
+    /// The block every [`Self::leave`] jumps to with its status, made on
+    /// first use.
+    leave_tail: Option<Block>,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -7433,6 +7467,7 @@ impl<'a> Lower<'a> {
             held: Vec::new(),
             mod_caches: Vec::new(),
             catch: None,
+            leave_tail: None,
         }
     }
 
@@ -7777,6 +7812,24 @@ impl<'a> Lower<'a> {
     /// Return a helper's status `r` from the native code, a raise first
     /// trying the running activation's handlers (see [`h_catch`]).
     fn leave(&mut self, r: Value) {
+        // (One shared tail: a test, a branch and a return per helper call
+        // cost more compile memory than a jump.)
+        let tail = *self.leave_tail.get_or_insert_with(|| {
+            let tail = self.b.create_block();
+            self.b.append_block_param(tail, types::I32);
+            tail
+        });
+        self.b.ins().jump(tail, &[r.into()]);
+    }
+
+    /// Fill the shared tail of [`Self::leave`]: a raise tries the running
+    /// activation's handlers, any other status returns.
+    fn leave_tail(&mut self) {
+        let Some(tail) = self.leave_tail else {
+            return;
+        };
+        self.b.switch_to_block(tail);
+        let r = self.b.block_params(tail)[0];
         let catch = *self.catch.get_or_insert_with(|| self.b.create_block());
         let ret = self.b.create_block();
         let raised = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RAISED));
@@ -7788,6 +7841,7 @@ impl<'a> Lower<'a> {
     /// Fill the side exits' blocks, and the catch block: a raise its
     /// handler caught goes on through the dispatch (at the handler).
     fn side_exits(&mut self) {
+        self.leave_tail();
         if let Some(catch) = self.catch {
             self.b.switch_to_block(catch);
             let r = self
@@ -9570,7 +9624,11 @@ impl<'a> Lower<'a> {
     /// raise or switch, which leaves the whole stack on the frame's: only
     /// a stack with nothing virtual below the operands tries it.
     fn binop_declined(&mut self, pc: usize, slot: usize, r: Value, out: Block, ok: Block) {
-        if !self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+        // (A lean body tries the method only at a site that has run on
+        // instances: elsewhere the core loop runs it.)
+        if !self.vs.iter().all(|i| matches!(i, Item::Mem(_)))
+            || (self.cold && !crate::instance_site(self.ext, pc))
+        {
             self.b.ins().brif(r, out, &[], ok, &[]);
             return;
         }
@@ -11223,15 +11281,45 @@ impl<'a> Lower<'a> {
                 .expect("returns");
             return self.called(pc, argc, r);
         }
-        // A Python function's call tries a direct call first, unless its
-        // site found the callee without a native body and has retries
-        // left to count down.
         let site: Box<DirectSite> = Box::default();
         let site_at = self
             .b
             .ins()
             .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
         self.direct_sites.push(site);
+        let r = if self.cold {
+            // A lean body makes [`Self::call_choice`]'s choice in a helper.
+            let pc_argc = self
+                .b
+                .ins()
+                .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+            self.call(
+                h_call_site as *const () as usize,
+                &[self.st, code, ext, pc_argc, len, site_at],
+                true,
+            )
+            .expect("returns")
+        } else {
+            self.call_choice(pc, argc, code, ext, pcv, len, site_at)
+        };
+        self.called(pc, argc, r)
+    }
+
+    /// [`Self::call_op`]'s choice in line: a Python function's call tries
+    /// a direct call first, unless its site found the callee without a
+    /// native body and has retries left to count down (as
+    /// [`h_call_site`]). The helper's status.
+    #[allow(clippy::too_many_arguments)]
+    fn call_choice(
+        &mut self,
+        pc: usize,
+        argc: usize,
+        code: Value,
+        ext: Value,
+        pcv: Value,
+        len: Value,
+        site_at: Value,
+    ) -> Value {
         let callee = self.slot_addr(self.depth - argc - 2);
         let tag = self.tag_at(callee);
         let is_fn = self
@@ -11280,8 +11368,7 @@ impl<'a> Lower<'a> {
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(called);
-        let r = self.b.block_params(called)[0];
-        self.called(pc, argc, r)
+        self.b.block_params(called)[0]
     }
 
     /// The helper and its site for a `CALL` (of `argc` arguments) at `pc`
