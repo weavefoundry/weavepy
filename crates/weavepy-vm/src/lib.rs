@@ -12732,6 +12732,26 @@ impl Interpreter {
                             CompareKind::Gt => ord.is_gt(),
                             CompareKind::GtE => ord.is_ge(),
                         };
+                        // A branch on the result (`if a < b:`) runs with the
+                        // compare: the bool is never pushed. (A compare can
+                        // fall through, so it never ends the code.)
+                        // SAFETY: `pc + 1 < ninstrs` (see `code_dispatch_len`).
+                        let next = unsafe { *instrs.add(pc + 1) };
+                        if matches!(next.op, OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue) {
+                            // SAFETY: both operands are scalars (no drop owed).
+                            len -= 2;
+                            last = pc + 1;
+                            pc += 2;
+                            if r == (next.op == OpCode::PopJumpIfTrue) {
+                                pc += next.arg as usize;
+                            } else if
+                            // SAFETY: a branch never ends the code (see
+                            // `code_dispatch_len`).
+                            unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken {
+                                pc += 1;
+                            }
+                            continue;
+                        }
                         // SAFETY: both operands are scalars (no drop owed);
                         // the result takes the lower one's slot.
                         len -= 1;
@@ -14282,10 +14302,19 @@ impl Interpreter {
                             }
                         }
                         let v = match v {
+                            // (Written here: a scalar copy that joins the
+                            // other arms' values is split into field moves.)
                             s @ (Object::Int(_)
                             | Object::Float(_)
                             | Object::Bool(_)
-                            | Object::None) => scalar_copy(s),
+                            | Object::None) => {
+                                // SAFETY: `len < cap`.
+                                unsafe { base.add(len).write(scalar_copy(s)) };
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             // `f(...)` of a pure leaf global function with
                             // simple arguments (see `core_pure_global_call`).
                             Object::Function(f)

@@ -122,6 +122,63 @@ class CoreUnaryTest(unittest.TestCase):
         self.assertTrue(any(issubclass(x.category, DeprecationWarning) for x in w))
 
 
+def branch_counts(pairs):
+    counts = [0] * 6
+    for a, b in pairs:
+        if a < b:
+            counts[0] += 1
+        if a <= b:
+            counts[1] += 1
+        if a == b:
+            counts[2] += 1
+        if not a != b:
+            counts[3] += 1
+        if a > b:
+            counts[4] += 1
+        while a >= b:
+            counts[5] += 1
+            break
+    return counts
+
+
+def raise_after_compare(xs):
+    for x in xs:
+        if x > 2:
+            raise ValueError(x)  # line B
+    return None
+
+
+class CompareBranchTest(unittest.TestCase):
+    def test_counts(self):
+        nan = float("nan")
+        pairs = [(1, 2), (2, 1), (3, 3), (1.5, 2), (2, 1.5), (2.0, 2), (-1, -1.0),
+                 (2**53, float(2**53)), (2**53 + 1, float(2**53)), (nan, 1.0),
+                 (1.0, nan), (nan, nan), (True, 1), (False, 0.5), (-(2**63), 2**63 - 1)]
+        expect = [0] * 6
+        for a, b in pairs:
+            expect[0] += a < b
+            expect[1] += a <= b
+            expect[2] += a == b
+            expect[3] += not a != b
+            expect[4] += a > b
+            expect[5] += a >= b
+        for _ in range(100):
+            self.assertEqual(branch_counts(pairs), expect)
+
+    def test_traceback_line(self):
+        for _ in range(100):
+            self.assertIsNone(raise_after_compare([0, 1, 2]))
+        try:
+            raise_after_compare([0, 1, 2, 3])
+        except ValueError as e:
+            tb = e.__traceback__
+        else:
+            self.fail("no ValueError")
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        self.assertEqual(tb.tb_lineno, raise_after_compare.__code__.co_firstlineno + 3)
+
+
 class HandoffTest(unittest.TestCase):
     def test_mixed_loop(self):
         def reference(n):
