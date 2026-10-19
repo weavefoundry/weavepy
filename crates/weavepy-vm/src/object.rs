@@ -5766,7 +5766,9 @@ impl Drop for PyGenerator {
         let state = self.gen_state.get_mut();
         if matches!(
             state,
-            GeneratorState::Suspended(_) | GeneratorState::Created(_) | GeneratorState::Delegating(_)
+            GeneratorState::Suspended(_)
+                | GeneratorState::Created(_)
+                | GeneratorState::Delegating(_)
         ) {
             defer_generator_state_drop(std::mem::replace(state, GeneratorState::Finished));
         }

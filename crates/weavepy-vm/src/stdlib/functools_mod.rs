@@ -502,10 +502,12 @@ impl LruField {
         static KEYS: std::sync::OnceLock<[crate::shared_value::SharedStr; 7]> =
             std::sync::OnceLock::new();
         &KEYS.get_or_init(|| {
-            LruField::ALL.map(|field| match crate::stdlib::sys::intern_name(field.name()) {
-                Object::Str(s) => s,
-                _ => unreachable!("interned names are strs"),
-            })
+            LruField::ALL.map(
+                |field| match crate::stdlib::sys::intern_name(field.name()) {
+                    Object::Str(s) => s,
+                    _ => unreachable!("interned names are strs"),
+                },
+            )
         })[self as usize]
     }
 
@@ -793,10 +795,7 @@ fn scalar_lru_links(
 ) -> Result<Option<Rc<RefCell<Vec<u8>>>>, RuntimeError> {
     let mut dict = inst.dict_cell().borrow_mut();
     if lru_slot(&dict, LruField::State).is_none() {
-        dict.insert(
-            LruField::State.key_object(),
-            Object::Bool(false),
-        );
+        dict.insert(LruField::State.key_object(), Object::Bool(false));
     }
     let Some(state) = lru_slot_mut(&mut dict, LruField::State) else {
         unreachable!("just inserted")
@@ -904,9 +903,8 @@ fn scalar_lru_operation(
             None => {
                 // Deferral also protects against private-cache tampering: a
                 // foreign key must not invoke Python inside the paired borrow.
-                let (found, deferred) = crate::object::key_cmp_deferred(|| {
-                    data.get_index_of(&DictKey(key.clone()))
-                });
+                let (found, deferred) =
+                    crate::object::key_cmp_deferred(|| data.get_index_of(&DictKey(key.clone())));
                 let found = found?;
                 if deferred {
                     return Err(invalid_lru_order());
@@ -1004,7 +1002,9 @@ fn lru_fast_lookup(
         None if probe.miss_is_exact() => {
             let mut dict = inst.dict_cell().borrow_mut();
             lru_bump(&mut dict, LruField::Misses);
-            Some(FastLookup::Miss(lru_slot(&dict, LruField::Wrapped).cloned()))
+            Some(FastLookup::Miss(
+                lru_slot(&dict, LruField::Wrapped).cloned(),
+            ))
         }
         None => None,
     }

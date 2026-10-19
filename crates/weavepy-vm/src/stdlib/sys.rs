@@ -400,11 +400,7 @@ pub fn build_with_state(
                         {
                             // 3.12+: the value is the handled exception
                             // *instance* (None outside any `except`).
-                            let value = exc
-                                .borrow()
-                                .last()
-                                .cloned()
-                                .unwrap_or(Object::None);
+                            let value = exc.borrow().last().cloned().unwrap_or(Object::None);
                             d.insert(DictKey(Object::Int(ident as i64)), value);
                         }
                         Ok(Object::Dict(Rc::new(RefCell::new(d))))
@@ -1660,9 +1656,7 @@ fn sys_getframemodulename(
 /// `sys.exception()` (PEP 3134 / 3.11+): the exception instance currently
 /// being handled, or `None` if not in an `except`. Equivalent to
 /// `sys.exc_info()[1]`. The verbatim CPython `contextlib` relies on this.
-fn sys_exception(
-    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
-) -> Result<Object, RuntimeError> {
+fn sys_exception(exc_info_stack: &Rc<RefCell<Vec<Object>>>) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     Ok(stack
         .last()
@@ -1681,9 +1675,7 @@ fn capi_handled_exception_instance() -> Option<Object> {
     crate::foreign::capi_handled_exception()
 }
 
-fn sys_exc_info(
-    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
-) -> Result<Object, RuntimeError> {
+fn sys_exc_info(exc_info_stack: &Rc<RefCell<Vec<Object>>>) -> Result<Object, RuntimeError> {
     let stack = exc_info_stack.borrow();
     let inst = stack
         .last()

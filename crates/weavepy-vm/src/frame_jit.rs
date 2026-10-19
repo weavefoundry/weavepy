@@ -291,7 +291,9 @@ impl Native {
             } else {
                 ""
             };
-            stats::note(&self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail);
+            stats::note(
+                &self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail,
+            );
         }
     }
 
@@ -321,7 +323,9 @@ impl Native {
             } else {
                 ""
             };
-            stats::note(&self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail);
+            stats::note(
+                &self.name, &self.ops, from, st.pc, st.last, st.sw, status, bail,
+            );
         }
         status
     }
@@ -885,15 +889,20 @@ mod stats {
             // (Where it switched: the last instruction it ran, and the
             // activation it switched to.)
             (super::RELOAD, _) => {
-                // SAFETY: a live switch's running activation.
-                let to = (!sw.is_null())
-                    .then(|| unsafe {
+                let to = if sw.is_null() {
+                    weavepy_compiler::Name::default()
+                } else {
+                    // SAFETY: a live switch's running activation.
+                    unsafe {
                         let cur: &crate::Frame = &*(*sw).cur;
                         cur.code.qualname.clone()
-                    })
-                    .unwrap_or_default();
+                    }
+                };
                 match ops.get(last) {
-                    Some(op) => format!("<switched> at {op:?}@{last}, {:?} to {to}", ops.get(last + 1)),
+                    Some(op) => format!(
+                        "<switched> at {op:?}@{last}, {:?} to {to}",
+                        ops.get(last + 1)
+                    ),
                     None => "<switched>".to_owned(),
                 }
             }
@@ -1375,7 +1384,11 @@ unsafe extern "C" fn h_for_iter_rest(
                 // A collapsed chain's fast step delivered the value without
                 // a switch (see `Interpreter::chain_step`).
                 if std::ptr::eq(sw.cur, st.frame) {
-                    return if sw.pending.is_none() { 1 } else { FOR_SWITCHED };
+                    return if sw.pending.is_none() {
+                        1
+                    } else {
+                        FOR_SWITCHED
+                    };
                 }
                 // A compiled body runs from here; its yield (the value on
                 // top, past the instruction) or its return (the iterator
@@ -2125,10 +2138,10 @@ unsafe fn two_strs<'s>(
 /// # Safety
 ///
 /// As [`Kernel`]'s.
-unsafe fn ascii_from<'s>(
-    s: &'s crate::shared_value::SharedStr,
+unsafe fn ascii_from(
+    s: &crate::shared_value::SharedStr,
     start: *const Object,
-) -> Option<Option<(&'s [u8], usize)>> {
+) -> Option<Option<(&[u8], usize)>> {
     let bytes = s.as_bytes();
     if start.is_null() {
         return Some(Some((bytes, 0)));
@@ -2325,7 +2338,11 @@ unsafe extern "C" fn k_str_format(
             v.is_null()
                 || matches!(
                     &*v,
-                    Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::None
+                    Object::Str(_)
+                        | Object::Int(_)
+                        | Object::Bool(_)
+                        | Object::Float(_)
+                        | Object::None
                 )
         };
         if !(plain(a) && plain(b)) {
@@ -3700,7 +3717,7 @@ impl ModCache {
         };
         // SAFETY: a read between two instructions.
         if let Some(d) = unsafe { m.dict.peek() } {
-            self.dict.set(Rc::as_ptr(&m.dict) as *const u8 as usize);
+            self.dict.set(Rc::as_ptr(&m.dict).cast::<u8>() as usize);
             self.stamp.set(d.mutation_stamp());
             self.idx.set(key_idx as usize);
         }
@@ -3882,7 +3899,9 @@ unsafe extern "C" fn h_stack_attr(
                 return 0;
             }
             // A function's stored attribute (`wrapper.calls`).
-            Object::Function(_) => return u32::from(!Interpreter::core_function_load(code, arg, at)),
+            Object::Function(_) => {
+                return u32::from(!Interpreter::core_function_load(code, arg, at))
+            }
             _ => None,
         };
         let Some(v) = v else {
@@ -5104,8 +5123,7 @@ unsafe fn direct_run<const PUSHED: bool>(
                     a.act.shell.is_none()
                         && (!PUSHED
                             || ((cframe.code.cellvars.is_empty() || a.owns_cells)
-                                && (a.init_inst.is_none()
-                                    || matches!(&*cst.stack, Object::None))))
+                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))))
                 })
                 && Rc::strong_count(&cframe.locals) == 1
                 && !interp.countdown_out(2)
@@ -5778,7 +5796,8 @@ unsafe extern "C" fn h_call_leaf(
         let lenu = len as usize;
         let start = lenu - site.argc - 2;
         let base = s.stack;
-        let hit = matches!(&*base.add(start), Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f));
+        let hit =
+            matches!(&*base.add(start), Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f));
         if hit && !s.sw.is_null() {
             let first = if matches!(&*base.add(start + 1), Object::Unbound) {
                 start + 2
@@ -6221,7 +6240,11 @@ unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64,
             if sw.pending.is_none() && !interp.core_call_lane(sw) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             }
-            return if finished_in_place(st, start) { 0 } else { RELOAD };
+            return if finished_in_place(st, start) {
+                0
+            } else {
+                RELOAD
+            };
         }
         if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
             if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
@@ -6400,7 +6423,9 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
         }
         // A simple generator steps to its next yield in place, as the core
         // loop's arm steps it (see `gen_fast`).
-        if let (Object::Generator(g), Object::None) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1)) {
+        if let (Object::Generator(g), Object::None) =
+            (&*st.stack.add(len - 2), &*st.stack.add(len - 1))
+        {
             if crate::gen_fast::may_step(g) {
                 if let Some(r) = h_send_step(st, pc, len) {
                     return r;
@@ -7268,6 +7293,7 @@ struct Lower<'a> {
     global_caches: Vec<Box<GlobalCache>>,
     #[allow(clippy::vec_box)]
     slot_caches: Vec<Box<SlotCache>>,
+    #[allow(clippy::vec_box)]
     method_caches: Vec<Box<MethodCache>>,
     #[allow(clippy::vec_box)]
     direct_sites: Vec<Box<DirectSite>>,
@@ -8925,15 +8951,15 @@ impl<'a> Lower<'a> {
     fn native_body_call(&self, pc: usize) -> bool {
         let ins = &self.code.instructions;
         let mut n = 0;
-        for k in pc..ins.len().min(pc + 16) {
-            match ins[k].op {
+        for (k, i) in ins.iter().enumerate().skip(pc).take(16) {
+            match i.op {
                 OpCode::LoadFast
                 | OpCode::LoadFastBorrow
                 | OpCode::LoadConst
                 | OpCode::LoadSmallInt
                 | OpCode::BinaryOp => n += 1,
                 OpCode::Call => {
-                    return n >= ins[k].arg as usize
+                    return n >= i.arg as usize
                         && matches!(crate::call_site_builtin(self.ext, k), Some((_, None, _)));
                 }
                 _ => return false,
@@ -10706,7 +10732,10 @@ impl<'a> Lower<'a> {
                     self.branch_out(bad, miss);
                     let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(&l));
                     let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
-                    let form = self.b.ins().uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
+                    let form = self
+                        .b
+                        .ins()
+                        .uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
                     let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
                     let vals = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
                     let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
@@ -11698,7 +11727,8 @@ impl<'a> Lower<'a> {
 /// from its pointer (measured as `layout`'s `type_attr_version` is).
 fn type_slot_layout(l: &weavepy_jit::ObjLayout) -> i32 {
     use crate::types::TypeObject;
-    let base = l.type_attr_version as isize - std::mem::offset_of!(TypeObject, attr_version) as isize;
+    let base =
+        l.type_attr_version as isize - std::mem::offset_of!(TypeObject, attr_version) as isize;
     (base + std::mem::offset_of!(TypeObject, slot_layout_word) as isize) as i32
 }
 

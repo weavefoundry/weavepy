@@ -5,7 +5,6 @@
 //! could require a Python callback reports `None` so that the caller returns
 //! to the full pickler or unpickler.
 
-
 use crate::builtin_types::builtin_types;
 use crate::object::{py_str_hash, DictData, Object, StrKey};
 use crate::sync::{Rc, RefCell};

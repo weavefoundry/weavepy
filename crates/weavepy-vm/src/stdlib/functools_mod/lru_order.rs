@@ -48,8 +48,15 @@ impl<'a> Order<'a> {
             return None;
         }
         // SAFETY: the buffer holds `words` whole words (checked by `new`,
-        // kept by `push` and `swap_remove`).
-        Some(unsafe { self.bytes.as_ptr().cast::<usize>().add(index).read_unaligned() })
+        // kept by `push` and `swap_remove`); the read is unaligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        Some(unsafe {
+            self.bytes
+                .as_ptr()
+                .cast::<usize>()
+                .add(index)
+                .read_unaligned()
+        })
     }
 
     #[inline(always)]
@@ -57,7 +64,8 @@ impl<'a> Order<'a> {
         if index >= self.words {
             return None;
         }
-        // SAFETY: as in `word`.
+        // SAFETY: as in `word`; the write is unaligned.
+        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             self.bytes
                 .as_mut_ptr()

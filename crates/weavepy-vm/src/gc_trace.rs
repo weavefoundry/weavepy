@@ -1949,7 +1949,7 @@ impl GcState {
             }
         }
         if stats_debug() {
-            let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut kinds = std::collections::BTreeMap::<String, usize>::default();
             for t in &temps {
                 *kinds.entry(t.obj.type_name_owned()).or_default() += 1;
             }

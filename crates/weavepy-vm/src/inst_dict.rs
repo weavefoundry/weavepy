@@ -740,12 +740,7 @@ impl SplitValues {
     /// that position (the name there, in case the table's address was
     /// reused); anything else searches and remembers.
     #[inline]
-    pub fn get_memo(
-        &self,
-        name: &str,
-        hash: i64,
-        memo: &PosMemo,
-    ) -> Option<&Object> {
+    pub fn get_memo(&self, name: &str, hash: i64, memo: &PosMemo) -> Option<&Object> {
         let keys = self.keys()?;
         let n = self.len();
         let at = std::ptr::from_ref(keys) as usize;
@@ -759,8 +754,7 @@ impl SplitValues {
             let h = unsafe { *keys.hashes[i].get() };
             if h == hash
                 && keys.get(i).is_some_and(|key| {
-                    key_text(key) == memo.text.load(Ordering::Relaxed)
-                        || key_names_str(key, name)
+                    key_text(key) == memo.text.load(Ordering::Relaxed) || key_names_str(key, name)
                 })
             {
                 return self.values().get(i);

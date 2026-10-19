@@ -1530,17 +1530,19 @@ impl TypeObject {
 
     /// [`Self::slot_layout`], decided now if it isn't yet.
     #[inline]
-    fn slot_layout_init(&self) -> &Option<SharedSlice<DictKey>> {
-        self.slot_layout.get_or_init(|| {
-            let layout = self.member_slot_layout();
-            if let Some(layout) = &layout {
-                self.slot_layout_word.store(
-                    SharedSlice::word(layout),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            layout
-        })
+    fn slot_layout_init(&self) -> Option<&SharedSlice<DictKey>> {
+        self.slot_layout
+            .get_or_init(|| {
+                let layout = self.member_slot_layout();
+                if let Some(layout) = &layout {
+                    self.slot_layout_word.store(
+                        SharedSlice::word(layout),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                layout
+            })
+            .as_ref()
     }
 
     /// Whether the class is one whose native method bodies read its slots
@@ -2900,7 +2902,11 @@ impl SlotStorage {
     /// that size (the caller builds fresh storage).
     #[inline]
     pub(crate) fn reuse_unset_over(&mut self, layout: &SharedSlice<DictKey>) -> bool {
-        let SlotData::Fixed { layout: own, values } = &mut self.data else {
+        let SlotData::Fixed {
+            layout: own,
+            values,
+        } = &mut self.data
+        else {
             return false;
         };
         if values.len() != layout.len() {
@@ -4264,9 +4270,7 @@ impl PyInstance {
         if let Some(place) = slots.exc_tail_mut(which) {
             return std::mem::replace(place, value);
         }
-        slots
-            .insert(which.name(), value)
-            .unwrap_or(Object::Unbound)
+        slots.insert(which.name(), value).unwrap_or(Object::Unbound)
     }
 
     /// Delete slot `name` from the side table; `false` when unset.

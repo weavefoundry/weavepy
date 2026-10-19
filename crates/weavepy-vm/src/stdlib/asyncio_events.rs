@@ -257,12 +257,10 @@ fn names() -> &'static Names {
 #[inline]
 fn inst_attr_with<R>(inst: &PyInstance, n: &AttrName, f: impl FnOnce(Option<&Object>) -> R) -> R {
     match inst.dict.published() {
-        Some(d) => f(d
-            .borrow()
-            .get(&crate::object::StrKeyHashed {
-                s: n.name,
-                hash: n.hash,
-            })),
+        Some(d) => f(d.borrow().get(&crate::object::StrKeyHashed {
+            s: n.name,
+            hash: n.hash,
+        })),
         None => {
             // SAFETY: a read that runs no code; the view ends with `f`,
             // which only inspects or clones the value.
@@ -570,10 +568,7 @@ fn loop_create_task_method(
             let Object::Instance(li) = loop_ else {
                 unreachable!("plain_loop checks for an instance")
             };
-            let no_factory = matches!(
-                inst_attr(li, &names().task_factory),
-                Some(Object::None)
-            );
+            let no_factory = matches!(inst_attr(li, &names().task_factory), Some(Object::None));
             let native =
                 global_module_type_ptr(&ls.globals, &names().tasks, &names().task, &TASK_MEMO)
                     == crate::stdlib::asyncio_mod::task_class_addr();

@@ -1084,8 +1084,7 @@ impl Interpreter {
         // (which resumes a parked chain without settling it), and a body no
         // fast step runs declines at once (its code's verdict is cached:
         // see `code_ok`).
-        if g.chain.get() != 0 || matches!(&g.code, Object::Code(code) if code_ok(code) == CODE_NO)
-        {
+        if g.chain.get() != 0 || matches!(&g.code, Object::Code(code) if code_ok(code) == CODE_NO) {
             return GenNext::Declined;
         }
         if depth > MAX_DEPTH

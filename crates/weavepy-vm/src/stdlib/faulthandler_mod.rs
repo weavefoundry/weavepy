@@ -97,11 +97,7 @@ pub fn note_thread_start(
 /// `sys._current_exceptions()`. Safe to materialize under the GIL:
 /// peer threads are parked, exactly as during a faulthandler dump.
 #[allow(clippy::type_complexity)]
-pub fn thread_snapshots() -> Vec<(
-    u64,
-    crate::object::FrameStack,
-    Rc<RefCell<Vec<Object>>>,
-)> {
+pub fn thread_snapshots() -> Vec<(u64, crate::object::FrameStack, Rc<RefCell<Vec<Object>>>)> {
     THREADS
         .lock()
         .unwrap()

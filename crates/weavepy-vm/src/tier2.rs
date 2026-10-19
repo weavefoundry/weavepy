@@ -6330,9 +6330,7 @@ unsafe fn try_native_call(
             if finalizer_queued() {
                 ctx.parked = Some(match expect {
                     SlotTag::Int | SlotTag::Float | SlotTag::Bool => unpack(bits, expect_tag),
-                    SlotTag::ObjPin if bits != u64::MAX => {
-                        unpack_pins(bits, expect_tag, &ctx.pins)
-                    }
+                    SlotTag::ObjPin if bits != u64::MAX => unpack_pins(bits, expect_tag, &ctx.pins),
                     _ => Object::None,
                 });
                 return Some(CallStatus::Boxed as i64);

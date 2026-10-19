@@ -1008,7 +1008,9 @@ pub struct Interpreter {
     /// ever dereferenced on the thread that pushed them, while the
     /// activations they name are live.
     lean_pending: Vec<usize>,
-    /// Spare [`ChainRec`]s (empty).
+    /// Spare [`ChainRec`]s (empty), boxed: a parked chain's levels point
+    /// at their record.
+    #[allow(clippy::vec_box)]
     chain_pool: Vec<Box<ChainRec>>,
     /// The builtins the leaf burst may call directly (see [`LeafFns`]),
     /// resolved on first use.
@@ -3338,11 +3340,7 @@ impl Interpreter {
                     Object::Instance(i) => Object::Type(i.cls()),
                     _ => Object::None,
                 };
-                (
-                    inst,
-                    ty,
-                    pyexc.traceback_entries(),
-                )
+                (inst, ty, pyexc.traceback_entries())
             }
             other => {
                 let inst = crate::builtin_types::make_exception("RuntimeError", other.to_string());
@@ -11658,9 +11656,8 @@ impl Interpreter {
                         pc = at.pc;
                         last = at.last;
                         continue;
-                    } else {
-                        break Some(CoreExit::Reload);
                     }
+                    break Some(CoreExit::Reload);
                 }};
             }
             // The native code writes the stack at fixed offsets: a stack
@@ -15901,8 +15898,7 @@ impl Interpreter {
             let act = self.inline_slot();
             // SAFETY: a parked slot's locals storage is its own, and empty.
             let locals = &mut *act.frame.locals.as_ptr();
-            let callable =
-                Self::lean_call_fill(frame, &code, true, n - 4, n - 5, missing, locals);
+            let callable = Self::lean_call_fill(frame, &code, true, n - 4, n - 5, missing, locals);
             frame.pc = pc as u32 + 1;
             self.inline_bind(frame, shell, pc, act, code, callable, guard)
         };
@@ -16041,7 +16037,16 @@ impl Interpreter {
         // SAFETY: as above; the checks above hold.
         unsafe {
             self.core_bind_plain::<false>(
-                sw, pc, callee_slot, has_self, missing, false, fp, act, guard, false,
+                sw,
+                pc,
+                callee_slot,
+                has_self,
+                missing,
+                false,
+                fp,
+                act,
+                guard,
+                false,
             )
         };
         true
@@ -16130,7 +16135,9 @@ impl Interpreter {
         };
         // SAFETY: as above.
         unsafe {
-            self.core_bind_act::<DIRECT>(sw, frame, pc, fp, code_rc, act, guard, held, cells, callable)
+            self.core_bind_act::<DIRECT>(
+                sw, frame, pc, fp, code_rc, act, guard, held, cells, callable,
+            )
         }
     }
 
@@ -16185,7 +16192,9 @@ impl Interpreter {
                 frame.stack.set_len(n - 1);
             }
             let callable = frame.stack.pop().expect("the callee");
-            self.core_bind_act::<true>(sw, frame, pc, fp, code_rc, act, guard, false, false, callable)
+            self.core_bind_act::<true>(
+                sw, frame, pc, fp, code_rc, act, guard, false, false, callable,
+            )
         }
     }
 
@@ -18169,8 +18178,8 @@ impl Interpreter {
         left[..shape.uses.len()].copy_from_slice(&shape.uses);
         let defaults = &init.defaults[init.defaults.len() - missing..];
         // A split instance's values, all computed, go down in one pass.
-        let mut split_vals =
-            [const { std::mem::MaybeUninit::<Object>::uninit() }; crate::inst_dict::SHARED_KEYS_CAP];
+        let mut split_vals = [const { std::mem::MaybeUninit::<Object>::uninit() };
+            crate::inst_dict::SHARED_KEYS_CAP];
         for (k, &(_, src)) in shape.stores.iter().enumerate() {
             let value = match src {
                 StoreSrc::Param(0) => inst.clone(),
@@ -18208,19 +18217,19 @@ impl Interpreter {
             // laid out over its class's layout at allocation.
             match unsafe { i.slots.peek_mut() }.and_then(|s| s.values_for_layout_mut(layout)) {
                 Some(places) if members[..n].iter().all(|&m| usize::from(m) < places.len()) => {
-                    for k in 0..n {
+                    for (v, &m) in vals[..n].iter().zip(&members[..n]) {
                         // SAFETY: as above.
-                        let value = unsafe { std::ptr::read(&vals[k]) };
-                        drop(std::mem::replace(&mut places[usize::from(members[k])], value));
+                        let value = unsafe { std::ptr::read(v) };
+                        drop(std::mem::replace(&mut places[usize::from(m)], value));
                     }
                 }
                 _ => {
                     // (Unreachable for a fresh instance; the plain stores
                     // keep it correct regardless.)
-                    for k in 0..n {
+                    for (v, store) in vals[..n].iter().zip(&shape.stores[..n]) {
                         // SAFETY: as above.
-                        let value = unsafe { std::ptr::read(&vals[k]) };
-                        let at = code.instructions[shape.stores[k].0 as usize].arg;
+                        let value = unsafe { std::ptr::read(v) };
+                        let at = code.instructions[store.0 as usize].arg;
                         if let Some(name) = code.names.get(at as usize) {
                             i.slot_set(name, value);
                         }
@@ -18246,14 +18255,17 @@ impl Interpreter {
                 && unsafe { i.dict.split_peek_mut() }.is_some_and(|split| {
                     let at = vals.as_ptr();
                     // SAFETY: as above.
-                    split.fill_fresh(keys, || ty.shared_keys.share(), n, |k| unsafe {
-                        at.add(k).read()
-                    })
+                    split.fill_fresh(
+                        keys,
+                        || ty.shared_keys.share(),
+                        n,
+                        |k| unsafe { at.add(k).read() },
+                    )
                 });
             if !filled {
-                for k in 0..n {
+                for (k, v) in vals[..n].iter().enumerate() {
                     // SAFETY: as above.
-                    let value = unsafe { std::ptr::read(&vals[k]) };
+                    let value = unsafe { std::ptr::read(v) };
                     // SAFETY: a store with nothing else running; the
                     // positions are the instance's next ones (proved above).
                     if let Err(value) = unsafe { i.split_append(k, value) } {
@@ -18317,8 +18329,7 @@ impl Interpreter {
         }
         // The arguments leave by plain decrements (whatever `__init__`
         // stored holds its own reference).
-        if !Self::core_all_droppable(&frame.stack[self_slot + 1..])
-        {
+        if !Self::core_all_droppable(&frame.stack[self_slot + 1..]) {
             return false;
         }
         let (inst, _) = self.alloc_plain_instance_obj(ty);
@@ -20697,8 +20708,7 @@ impl Interpreter {
                 }
             }
         }
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         #[cfg(test)]
@@ -20759,11 +20769,14 @@ impl Interpreter {
         if depth >= crate::recursion::recursion_limit() {
             return None;
         }
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
-        let first = if matches!(ops[1], Object::Unbound) { 2 } else { 1 };
+        let first = if matches!(ops[1], Object::Unbound) {
+            2
+        } else {
+            1
+        };
         let nargs = ops.len() - first;
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
         for (k, o) in ops[first..].iter().enumerate() {
@@ -20820,8 +20833,7 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         // Its keyword-only parameters follow the positional ones, then its
@@ -21456,7 +21468,12 @@ impl Interpreter {
     /// `SEND` does (see [`Self::core_send_collapse`]), or resumes its
     /// parked one. Anything else is declined, touching nothing.
     #[inline(never)]
-    fn core_iter_collapse(&mut self, sw: &mut CoreSwitch, pc: usize, mode: InlineResume) -> SendHop {
+    fn core_iter_collapse(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+    ) -> SendHop {
         // SAFETY: see `CoreSwitch`: the running activation is synced, the
         // generator where `mode` puts it (checked by the caller).
         let frame = unsafe { &*sw.cur };
@@ -22213,7 +22230,7 @@ impl Interpreter {
         ) else {
             unreachable!("checked by `collapse_frame`");
         };
-        debug_assert!(std::ptr::eq::<Frame>(&*boxed, inner_frame));
+        debug_assert!(std::ptr::eq::<Frame>(&raw const *boxed, inner_frame));
         boxed.gen_first_resume = false;
         // (A step that stopped partway, or the innermost level's delegate's
         // return delivered by one, already gave it its value.)
@@ -22400,7 +22417,7 @@ impl Interpreter {
     fn collapse_park(&mut self, done: &mut InlineAct) {
         let mut rec = done.chain.take().expect("a collapsed chain");
         debug_assert!(rec.levels.iter().all(|l| l.act.shell.is_none()));
-        debug_assert!(self.lean_pending.len() == rec.pend_at + rec.levels.len());
+        debug_assert_eq!(self.lean_pending.len(), rec.pend_at + rec.levels.len());
         self.lean_pending.truncate(rec.pend_at);
         crate::recursion::leave_n(crate::recursion::depth_cell(), rec.levels.len());
         rec.parked = true;
@@ -22410,8 +22427,10 @@ impl Interpreter {
         drop(hold);
     }
 
-    /// An empty [`ChainRec`], from the pool or fresh.
+    /// An empty [`ChainRec`], from the pool or fresh (boxed: see
+    /// [`Self::chain_pool`]).
     #[inline]
+    #[allow(clippy::unnecessary_box_returns)]
     fn chain_rec(&mut self) -> Box<ChainRec> {
         self.chain_pool.pop().unwrap_or_else(|| {
             Box::new(ChainRec {
@@ -22476,9 +22495,10 @@ impl Interpreter {
             Rc::from_raw(level.gen)
         };
         // SAFETY: delegating (see `Delegate`); nothing borrows the state.
-        let GeneratorState::Delegating(boxed) =
-            std::mem::replace(unsafe { &mut *gen.state_raw().as_ptr() }, GeneratorState::Running)
-        else {
+        let GeneratorState::Delegating(boxed) = std::mem::replace(
+            unsafe { &mut *gen.state_raw().as_ptr() },
+            GeneratorState::Running,
+        ) else {
             unreachable!("a collapsed level is delegating");
         };
         let mut act = self.inline_slot();
@@ -23419,7 +23439,11 @@ impl Interpreter {
             && (crate::object::is_function_slot(n)
                 || matches!(
                     &**n,
-                    "__code__" | "__globals__" | "__closure__" | "__builtins__" | "__dict__"
+                    "__code__"
+                        | "__globals__"
+                        | "__closure__"
+                        | "__builtins__"
+                        | "__dict__"
                         | "__class__"
                 ))
         {
@@ -23608,8 +23632,7 @@ impl Interpreter {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
-            if !Self::core_all_droppable(ops)
-            {
+            if !Self::core_all_droppable(ops) {
                 return None;
             }
             return if cls.flags.is_builtin {
@@ -23627,8 +23650,7 @@ impl Interpreter {
         } else {
             (&[], &[])
         };
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
@@ -23640,8 +23662,7 @@ impl Interpreter {
     /// for the full handler, which also raises every error.
     #[inline(never)]
     fn core_native_method_kw(ops: &[Object], argc: usize) -> Option<Object> {
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         crate::stdlib::decimal_native::method_kw(ops, argc)
@@ -23691,9 +23712,7 @@ impl Interpreter {
             bound[i] = Some(value);
         }
         let n = bound.iter().take_while(|a| a.is_some()).count();
-        if bound[n..].iter().any(Option::is_some)
-            || !Self::core_all_droppable(ops)
-        {
+        if bound[n..].iter().any(Option::is_some) || !Self::core_all_droppable(ops) {
             return None;
         }
         let mut args = Vec::with_capacity(n + 1);
@@ -23718,8 +23737,7 @@ impl Interpreter {
             return None;
         }
         let fast = crate::stdlib::datetime_native::bound_fast(&bm.function, &bm.receiver)?;
-        if !Self::core_all_droppable(ops)
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         // Bitwise views of the receiver and the arguments, never dropped:
@@ -28087,11 +28105,7 @@ impl Interpreter {
             Object::Module(m)
                 if !name.starts_with("__") && !crate::object::module_classes_possible() =>
             {
-                return m
-                    .dict
-                    .borrow()
-                    .get(&crate::object::StrKey(name))
-                    .cloned();
+                return m.dict.borrow().get(&crate::object::StrKey(name)).cloned();
             }
             // A built-in kind's method (`hasattr(stream, "write")`): its
             // lookup runs no code, and a found method means the attribute
@@ -28581,14 +28595,7 @@ impl Interpreter {
                         let v = Self::clone_operand(v);
                         drop(slots);
                         if let Some(ext) = code_vm_ext_existing(code) {
-                            slot_field_note(
-                                code,
-                                ext,
-                                cache_pc as usize,
-                                inst,
-                                key_idx,
-                                name_idx,
-                            );
+                            slot_field_note(code, ext, cache_pc as usize, inst, key_idx, name_idx);
                         }
                         Some(v)
                     }
@@ -45904,7 +45911,7 @@ impl Interpreter {
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
-                Self::finish_running_gen(&gen);
+                Self::finish_running_gen(gen);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
@@ -49041,10 +49048,10 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         specialize::record_miss(OpCode::LoadAttr as u8);
         // (An even count: see `specialized_load_attr`'s `Cooldown` arm.)
-        frame
-            .code
-            .caches
-            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(2 * COOLDOWN));
+        frame.code.caches.set(
+            cache_pc,
+            weavepy_compiler::InlineCache::Cooldown(2 * COOLDOWN),
+        );
         let name = Self::name_ref(&frame.code, name_idx)?;
         self.load_attr(&receiver, name)
     }
@@ -56923,8 +56930,7 @@ impl Interpreter {
                 // `SlotStorage::exception`), so a raise fills its slots in
                 // place. As there, only a non-atomic argument can close a
                 // cycle through the instance.
-                if matches!(&args, Object::Tuple(t) if t.iter().any(|x| !gc_trace::is_atomic(x)))
-                {
+                if matches!(&args, Object::Tuple(t) if t.iter().any(|x| !gc_trace::is_atomic(x))) {
                     i.ensure_gc_tracked();
                 }
                 *i.slots.borrow_mut() = crate::types::SlotStorage::exception(args, []);
@@ -75355,7 +75361,10 @@ pub(crate) fn load_method_builtin(
 
 /// The builtin type the `CALL` at `pc` last constructed in place.
 #[cfg(feature = "jit")]
-pub(crate) fn call_site_type(ext: &CodeConstObjects, pc: usize) -> Option<Rc<crate::types::TypeObject>> {
+pub(crate) fn call_site_type(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<Rc<crate::types::TypeObject>> {
     let slot = ext.method_slot(pc)?;
     // SAFETY: GIL-serialized; the borrow ends here.
     match unsafe { &(*slot.0.get()).1 } {

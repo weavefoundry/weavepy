@@ -14,7 +14,6 @@
 mod classes;
 mod encode;
 
-
 use crate::shared_value::{SharedSlice, SharedStr};
 use num_bigint::BigInt;
 use weavepy_compiler::CodeObject;

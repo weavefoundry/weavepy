@@ -79,10 +79,14 @@ impl Probe for DictKey {
         // A new string (its hash not yet computed) compares with the
         // stored strings instead.
         match (&self.0, &stored.0) {
-            (Object::Str(a), Object::Str(b)) if crate::shared_value::SharedStr::known_hash(a).is_none() => {
+            (Object::Str(a), Object::Str(b))
+                if crate::shared_value::SharedStr::known_hash(a).is_none() =>
+            {
                 Some(a.as_bytes() == b.as_bytes())
             }
-            (Object::Str(a), Object::WStr(_)) if crate::shared_value::SharedStr::known_hash(a).is_none() => {
+            (Object::Str(a), Object::WStr(_))
+                if crate::shared_value::SharedStr::known_hash(a).is_none() =>
+            {
                 Some(false)
             }
             _ => None,
@@ -279,7 +283,10 @@ impl<V> Table<V> {
 
     /// [`Self::reserve`], reporting an allocation failure instead of
     /// aborting.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+    pub fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
         self.entries.try_reserve(additional)?;
         self.reserve_slots(additional);
         Ok(())
@@ -450,12 +457,9 @@ impl<V> Table<V> {
     fn scan_unhashed<Q: Probe + ?Sized>(&self, key: &Q) -> Option<Option<usize>> {
         let mut found = None;
         for (i, b) in self.entries.iter().enumerate() {
-            match key.probe_eq_unhashed(&b.key)? {
-                true => {
-                    found = Some(i);
-                    break;
-                }
-                false => {}
+            if key.probe_eq_unhashed(&b.key)? {
+                found = Some(i);
+                break;
             }
         }
         Some(found)
@@ -547,7 +551,7 @@ impl<V> Table<V> {
     pub fn keys_with_hash(&self, hash: i64) -> Vec<&DictKey> {
         let mut out = Vec::new();
         let _ = self.find_by_hash(hash, |k| {
-            out.push(k as *const DictKey);
+            out.push(std::ptr::from_ref::<DictKey>(k));
             false
         });
         // SAFETY: the pointers address entries of `self`, borrowed for the
@@ -923,7 +927,10 @@ impl<V> Table<V> {
     }
 
     /// Sort the entries by key with `cmp` (stable).
-    pub fn sort_by_key_with(&mut self, mut cmp: impl FnMut(&DictKey, &DictKey) -> std::cmp::Ordering) {
+    pub fn sort_by_key_with(
+        &mut self,
+        mut cmp: impl FnMut(&DictKey, &DictKey) -> std::cmp::Ordering,
+    ) {
         self.entries.sort_by(|a, b| cmp(&a.key, &b.key));
         self.reindex();
     }
@@ -1087,7 +1094,7 @@ impl<'a, V> VacantEntry<'a, V> {
     }
 }
 
-impl<'a, V> ProbeVacancy<'a, V> {
+impl<V> ProbeVacancy<'_, V> {
     /// The probe's Python hash.
     #[inline]
     pub fn hash(&self) -> i64 {
@@ -1755,7 +1762,10 @@ mod tests {
         assert!(!m.slots.is_empty());
         let c = m.clone();
         check(&c);
-        assert_eq!(c.get(&k(5)).map(|o| matches!(o, Object::Int(5))), Some(true));
+        assert_eq!(
+            c.get(&k(5)).map(|o| matches!(o, Object::Int(5))),
+            Some(true)
+        );
         assert!(c.get(&k(50)).is_none());
     }
 
@@ -1779,7 +1789,9 @@ mod tests {
                 assert_eq!(m.len(), n as usize);
                 check(&m);
             }
-            assert!(m.replace_index_unique(n as usize, 0, k(-1), Object::None).is_none());
+            assert!(m
+                .replace_index_unique(n as usize, 0, k(-1), Object::None)
+                .is_none());
         }
     }
 }
