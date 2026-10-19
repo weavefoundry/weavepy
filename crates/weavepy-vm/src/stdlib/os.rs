@@ -7763,6 +7763,7 @@ pub(crate) fn static_name_key(name: &'static str) -> DictKey {
 /// The length of a POSIX path's root (`posixpath.splitroot`'s middle part):
 /// none for a relative path, one separator for an absolute one, and two
 /// for exactly two leading separators (implementation defined by POSIX).
+#[cfg(not(windows))]
 fn posix_root_len<T: PartialEq>(p: &[T], sep: &T) -> usize {
     if p.first() != Some(sep) {
         0
@@ -7776,6 +7777,7 @@ fn posix_root_len<T: PartialEq>(p: &[T], sep: &T) -> usize {
 /// `posixpath.normpath`'s pure-Python algorithm over the units of `path`
 /// (bytes, UTF-8 bytes or code points): `A//B`, `A/./B` and `A/foo/../B`
 /// all become `A/B`.
+#[cfg(not(windows))]
 fn posix_normpath_units<T: PartialEq + Copy>(path: &[T], sep: T, dot: T) -> Vec<T> {
     if path.is_empty() {
         return vec![dot];
@@ -7813,6 +7815,7 @@ fn posix_normpath_units<T: PartialEq + Copy>(path: &[T], sep: T, dot: T) -> Vec<
 /// A path argument of `func` as `str` or `bytes` (an `os.PathLike`'s
 /// `__fspath__()`), with CPython's `path_t` converter's message for
 /// anything else.
+#[cfg(not(windows))]
 fn path_arg(func: &str, p: &Object) -> Result<Object, RuntimeError> {
     if matches!(p, Object::Instance(_)) {
         return os_fspath(std::slice::from_ref(p));
@@ -7827,6 +7830,7 @@ fn path_arg(func: &str, p: &Object) -> Result<Object, RuntimeError> {
 }
 
 /// The leaf half of `_path_splitroot_ex` for a `str` or `bytes` path.
+#[cfg(not(windows))]
 fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let r = match args {
         [p @ Object::Str(s)] => {
@@ -7862,6 +7866,7 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
 
 /// `posix._path_splitroot_ex(p)`: split a pathname into drive (always
 /// empty on POSIX), root and tail, as `posixpath`'s fallback does.
+#[cfg(not(windows))]
 fn os_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     let [p] = args else {
         return Err(type_error(format!(
@@ -7890,6 +7895,7 @@ fn os_path_splitroot_ex(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// The leaf half of `_path_normpath` for a `str` or `bytes` path.
+#[cfg(not(windows))]
 fn path_normpath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let r = match args {
         [Object::Str(s)] => {
@@ -7909,6 +7915,7 @@ fn path_normpath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 
 /// `posix._path_normpath(path)`: `posixpath.normpath`, as its pure-Python
 /// fallback computes it.
+#[cfg(not(windows))]
 fn os_path_normpath(args: &[Object]) -> Result<Object, RuntimeError> {
     let [p] = args else {
         return Err(type_error(format!(
