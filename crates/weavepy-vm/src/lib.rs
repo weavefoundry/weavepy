@@ -11380,11 +11380,12 @@ impl Interpreter {
     /// `CALL`'s pc; `None` touches nothing (the instructions run one by
     /// one).
     ///
-    /// `CALLING_EFFECTS` runs an effect leaf (one that stores) whose body
-    /// itself calls in place too. Compiled callers pass `false`: for them
-    /// the method load and direct call cost less than the leaf evaluator
-    /// with its callee nested in it. The core loop passes `true`, since
-    /// its alternative is a full activation, which costs more.
+    /// `CALLING_EFFECTS` runs a recursive effect leaf (one that stores and
+    /// may call itself, see [`code_recurses`]) in place too. Compiled
+    /// callers pass `false`: for them the method load and direct call cost
+    /// less than the leaf evaluator nesting its own evaluation. The core
+    /// loop passes `true`, since its alternative is a full activation,
+    /// which costs more.
     ///
     /// # Safety
     ///
@@ -11408,14 +11409,14 @@ impl Interpreter {
         match other {
             Object::Instance(_) | Object::Module(_) => {
                 // A site that verified its callee for this class version
-                // (its call checks the argument shape itself); a calling
+                // (its call checks the argument shape itself); a recursive
                 // effect leaf only when `CALLING_EFFECTS` (see above).
                 let mut missed = false;
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
                     if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
                         // SAFETY: the site's code is its live function's.
                         .filter(|&(_, c, effect)| {
-                            CALLING_EFFECTS || !effect || !code_calls(unsafe { &*c })
+                            CALLING_EFFECTS || !effect || !code_recurses(unsafe { &*c })
                         })
                     {
                         match self.core_leaf_site_call(
@@ -11474,7 +11475,7 @@ impl Interpreter {
                                 fn_is_pure_leaf(f)
                                     || (fn_is_leaf(f)
                                         && (CALLING_EFFECTS
-                                            || !code_calls(unsafe { &*f.code.as_ptr() })))
+                                            || !code_recurses(unsafe { &*f.code.as_ptr() })))
                             }),
                         _ => false,
                     };
@@ -74523,8 +74524,8 @@ struct CodeConstObjects {
     /// The body's store-only `__init__` shape (see [`code_store_init`]),
     /// or `None` when it isn't one.
     store_init: std::sync::OnceLock<Option<Box<StoreInit>>>,
-    /// Whether the body makes a call (see [`code_calls`]): `0` not yet
-    /// decided, `1` no, `2` yes.
+    /// Whether the body may call itself (see [`code_recurses`]): `0` not
+    /// yet decided, `1` no, `2` yes.
     calls: std::sync::atomic::AtomicU8,
     /// Per `co_names` entry, its position among the shared names of the
     /// instances last checked for shadowing it (see [`inst_may_shadow`]).
@@ -75405,7 +75406,7 @@ pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 /// without an activation of its own.
 #[cfg(feature = "jit")]
 pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
-    // (An effect leaf that calls runs as an ordinary call, not in place:
+    // (A recursive effect leaf runs as an ordinary call, not in place:
     // `core_local_method` declines it, so a native method-call helper
     // there would only cost every call its probes.)
     // SAFETY: GIL-serialized; the borrows end before any refill; a live
@@ -75415,7 +75416,7 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
         .get(pc)
         .and_then(|s| unsafe { &*s.0.get() }.as_ref())
         .is_some_and(|site| {
-            site.func.strong_count() > 0 && !(site.effect && code_calls(unsafe { &*site.code }))
+            site.func.strong_count() > 0 && !(site.effect && code_recurses(unsafe { &*site.code }))
         });
     leaf || ext
         .method_slot(pc)
@@ -75425,7 +75426,7 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
                 // SAFETY: the function is alive while the upgrade holds it.
                 w.upgrade().is_some_and(|f| {
                     fn_is_pure_leaf(&f)
-                        || (fn_is_leaf(&f) && !code_calls(unsafe { &*f.code.as_ptr() }))
+                        || (fn_is_leaf(&f) && !code_recurses(unsafe { &*f.code.as_ptr() }))
                 })
             }
             _ => false,
@@ -76925,10 +76926,14 @@ fn code_returns_only_none(code: &CodeObject) -> bool {
     yes
 }
 
-/// Whether `code`'s body makes a call of any kind (cached in its
-/// extension). An effect leaf that calls costs more evaluated frameless,
-/// its callee's evaluation nested in it, than called directly.
-fn code_calls(code: &CodeObject) -> bool {
+/// Whether `code`'s body may call itself: it makes a call, and its names
+/// include its own (`self.find(...)` in a method `find`, or a recursive
+/// function's global). Cached in its extension. Evaluated frameless, a
+/// recursive effect leaf nests its own evaluation at every level, which
+/// costs more than calling it directly (go's `Square.find`); an effect
+/// leaf that calls other code costs less frameless (deltablue's
+/// constraint methods, whose direct calls compiled them to no gain).
+fn code_recurses(code: &CodeObject) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(ext) = code_vm_ext(code) else {
         return true;
@@ -76938,10 +76943,11 @@ fn code_calls(code: &CodeObject) -> bool {
         2 => return true,
         _ => {}
     }
-    let yes = code
-        .instructions
-        .iter()
-        .any(|i| matches!(i.op, OpCode::Call | OpCode::CallKw | OpCode::CallEx));
+    let yes = code.names.contains(&code.name)
+        && code
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, OpCode::Call | OpCode::CallKw | OpCode::CallEx));
     ext.calls.store(if yes { 2 } else { 1 }, Relaxed);
     yes
 }
