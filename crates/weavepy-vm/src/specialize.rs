@@ -503,7 +503,8 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
 }
 
 /// The `CallPyKwNames` permutation nibble of a keyword a `**kwargs`
-/// callee collects into its dict (parameter slots stay below 15 there).
+/// callee collects into its dict. Its consumers read it without checking
+/// the callee, so no parameter slot may be 15 (see [`kw_perm`]).
 pub const KW_TO_VARKW: u32 = 0xF;
 
 /// Decide on a `CALL_KW` specialization (RFC 0069 WS3): a plain Python
@@ -513,7 +514,7 @@ pub const KW_TO_VARKW: u32 = 0xF;
 /// positional count, and every slot left uncovered is filled by a
 /// trailing default. The kw→slot permutation packs 4 bits per keyword
 /// into `perm`; anything that doesn't fit (more than 8 keywords, more
-/// than 16 parameter slots) stays generic. Binder *errors* (multiple
+/// than 15 parameter slots) stays generic. Binder *errors* (multiple
 /// values, unexpected keyword, posonly-as-keyword, missing arguments)
 /// all fail these checks, so the generic binder keeps owning the
 /// error messages.
@@ -546,7 +547,7 @@ pub fn attempt_specialize_call_kw(
 /// `names`, and the parameter slots the call fills: each keyword's slot in
 /// 4 bits (`KW_TO_VARKW` for one a `**kwargs` callee collects). Each name
 /// is tried first at the parameter its position gives it. `None` for any
-/// call the generic binder must take: `*args`, more than 8 keywords or 16
+/// call the generic binder must take: `*args`, more than 8 keywords or 15
 /// parameter slots, replaced defaults, a keyword without a distinct
 /// keyword-bindable parameter (or `**kwargs`), a parameter left without a
 /// default.
@@ -563,11 +564,11 @@ pub fn kw_perm<'a>(
     if code.has_varargs
         || (f.defaults_maybe_overridden()
             && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
-        || total > 16
-        // A `**kwargs` callee reserves nibble 15 for the keywords it
-        // collects (see `KW_TO_VARKW`), and its dict slot follows the
-        // parameters.
-        || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
+        // Nibble 15 is `KW_TO_VARKW`, which the binders take as "into
+        // the `**kwargs` dict" for any callee: slot 15 can't be encoded.
+        || total > 15
+        // A `**kwargs` callee's dict slot follows the parameters.
+        || (code.has_varkeywords && code.varnames.len() <= total)
         || kwc == 0
         || kwc > 8
         || argc > npos

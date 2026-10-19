@@ -9441,8 +9441,8 @@ impl Interpreter {
         let npos = code.arg_count as usize;
         let total = npos + code.kwonly_count as usize;
         if specialize::rc_id(f) != func_id
-            || total > 16
-            || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
+            || total > 15
+            || (code.has_varkeywords && code.varnames.len() <= total)
             || eff_argc > npos
             || code.is_generator
             || code.is_coroutine
