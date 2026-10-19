@@ -1058,6 +1058,7 @@ mod tests {
 
     #[test]
     fn subscr_decisions_cover_ws3_shapes() {
+        let _gil = crate::gil::hold_gil();
         let xs = Object::new_list(vec![Object::Int(1)]);
         let idx = Object::Int(0);
         assert_eq!(
@@ -1094,6 +1095,7 @@ mod tests {
 
     #[test]
     fn store_subscr_decisions_cover_ws3_shapes() {
+        let _gil = crate::gil::hold_gil();
         let xs = Object::new_list(vec![Object::Int(1)]);
         let idx = Object::Int(0);
         assert_eq!(
@@ -1114,6 +1116,7 @@ mod tests {
 
     #[test]
     fn for_iter_str_and_dict_specialize() {
+        let _gil = crate::gil::hold_gil();
         let s_iter = Object::Iter(Rc::new(RefCell::new(PyIterator::Str {
             s: crate::shared_value::SharedStr::from("abc"),
             index: 0,

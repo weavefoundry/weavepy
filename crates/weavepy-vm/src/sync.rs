@@ -2021,6 +2021,11 @@ impl GilLock {
         self.0.try_lock()
     }
 
+    /// Whether the calling thread holds the lock.
+    pub fn is_owned_by_current_thread(&self) -> bool {
+        self.0.is_owned_by_current_thread()
+    }
+
     pub fn try_lock_for(
         &self,
         timeout: std::time::Duration,

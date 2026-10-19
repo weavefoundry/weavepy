@@ -298,6 +298,30 @@ impl GilState {
         }
     }
 
+    /// [`Self::acquire`], giving up after `timeout`.
+    pub(crate) fn acquire_within(self: &Arc<Self>, timeout: Duration) -> Option<GilGuard> {
+        if free_threading_enabled() {
+            return Some(self.acquire());
+        }
+        self.breaker.add_waiter();
+        let lock_guard = self.lock.try_lock_for(timeout);
+        self.breaker.remove_waiter();
+        let lock_guard = lock_guard?;
+        self.note_acquired();
+        let me = current_thread_id();
+        crate::sync::note_vm_thread(me);
+        self.holder.store(me, Ordering::Release);
+        self.depth.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: as in `acquire`.
+        let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
+            unsafe { std::mem::transmute(lock_guard) };
+        Some(GilGuard {
+            state: Arc::clone(self),
+            _lock_guard: Some(static_guard),
+            lock_free: false,
+        })
+    }
+
     /// Try to acquire without blocking.
     pub fn try_acquire(self: &Arc<Self>) -> Option<GilGuard> {
         if free_threading_enabled() {
@@ -688,6 +712,113 @@ pub fn current_thread_holds_gil() -> bool {
     GIL_GUARD_STACK.with(|cell| !cell.borrow().is_empty())
 }
 
+/// Hold the GIL for a scope: take it (on the guard stack, so the
+/// cooperative hand-off can still pass it on) unless the calling thread
+/// already holds it. The returned [`GilScope`] gives it back on drop.
+///
+/// Every thread that touches VM objects must hold the GIL, not only the
+/// one running bytecode: the cycle collector is process-wide, and a
+/// collection on one thread reads every tracked object, including
+/// another interpreter's, without taking their cells' borrows. Code that
+/// builds, mutates or releases objects outside an eval loop -- an
+/// embedder constructing or dropping an [`crate::Interpreter`], a
+/// thread's teardown, a native unit test -- holds one of these.
+pub fn hold_gil() -> GilScope {
+    let mut scope = GilScope::idle();
+    scope.engage();
+    scope
+}
+
+/// The GIL held for a scope (see [`hold_gil`]).
+#[derive(Debug, Default)]
+#[must_use = "the GIL is released when the scope is dropped"]
+pub struct GilScope {
+    /// Whether this scope pushed a guard it must pop.
+    engaged: bool,
+}
+
+impl GilScope {
+    /// A scope that holds nothing until [`Self::engage`]d.
+    pub const fn idle() -> Self {
+        Self { engaged: false }
+    }
+
+    /// Take the GIL unless this scope or the calling thread already holds
+    /// it.
+    pub fn engage(&mut self) {
+        if self.engaged {
+            return;
+        }
+        // (`try_with`: an interpreter may be dropped by a thread-local
+        // destructor, after this thread's guard stack is gone; there is
+        // nothing to push the guard onto then, and no bytecode can run.)
+        let held = GIL_GUARD_STACK.try_with(|cell| !cell.borrow().is_empty());
+        if held != Ok(false) {
+            return;
+        }
+        push_gil_guard(global_gil_ref().acquire());
+        note_gil_acquired();
+        self.engaged = true;
+    }
+}
+
+impl Drop for GilScope {
+    fn drop(&mut self) {
+        if self.engaged {
+            // The cooperative hand-off may have replaced the stack's
+            // guards meanwhile, but it restores as many as it took.
+            drop(GIL_GUARD_STACK.try_with(|cell| cell.borrow_mut().pop()));
+        }
+    }
+}
+
+/// A thread-local value that holds objects, released under the GIL when
+/// its thread exits.
+///
+/// A thread's destructors run after it has given the GIL back (and after
+/// its guard stack may be gone), so a cache that holds the last reference
+/// to a tracked object would otherwise free it while another thread's
+/// collection reads it. The destructor takes the GIL directly, without
+/// the guard stack, for the length of the release. If the GIL stays busy
+/// for [`EXIT_GIL_WAIT`] (another thread blocked while holding it), the
+/// value is leaked instead: a thread's exit, or the process's, must not
+/// hang on it.
+pub(crate) struct ReleaseUnderGil<T>(std::mem::ManuallyDrop<T>);
+
+/// How long a thread-local destructor waits for the GIL (see
+/// [`ReleaseUnderGil`]).
+const EXIT_GIL_WAIT: Duration = Duration::from_secs(1);
+
+impl<T> ReleaseUnderGil<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self(std::mem::ManuallyDrop::new(value))
+    }
+}
+
+impl<T> std::ops::Deref for ReleaseUnderGil<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> Drop for ReleaseUnderGil<T> {
+    fn drop(&mut self) {
+        let gil = global_gil_ref();
+        let _guard = if gil.lock.is_owned_by_current_thread() {
+            None
+        } else {
+            match gil.acquire_within(EXIT_GIL_WAIT) {
+                Some(guard) => Some(guard),
+                None => return,
+            }
+        };
+        // SAFETY: dropped exactly once, here.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+    }
+}
+
 /// RFC 0025: drop the GIL, run `f`, re-acquire the GIL, then
 /// return `f`'s result. Used by every blocking-I/O / lock-acquire
 /// path that would otherwise prevent other threads from running.
@@ -820,8 +951,8 @@ fn no_yield_active() -> bool {
 /// blocking-release re-acquire in [`GilGuard::allow_threads`].
 #[inline]
 pub fn note_gil_acquired() {
-    GIL_HELD_SINCE.with(|c| c.set(Some(std::time::Instant::now())));
-    WAITER_SEEN_SINCE.with(|c| c.set(None));
+    let _ = GIL_HELD_SINCE.try_with(|c| c.set(Some(std::time::Instant::now())));
+    let _ = WAITER_SEEN_SINCE.try_with(|c| c.set(None));
 }
 
 /// Whether a waiter has been waiting on this holder for at least the

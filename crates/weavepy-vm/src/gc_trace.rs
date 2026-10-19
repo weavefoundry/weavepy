@@ -3760,6 +3760,7 @@ mod tests {
 
     #[test]
     fn registry_entries_stay_compact_and_slots_are_reused() {
+        let _gil = crate::gil::hold_gil();
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Entry>(), 32);
         let state = GcState::new();
@@ -3799,6 +3800,7 @@ mod tests {
 
     #[test]
     fn removals_keep_generation_and_frozen_positions() {
+        let _gil = crate::gil::hold_gil();
         for frozen in [false, true] {
             let state = GcState::new();
             let roots: Vec<_> = (0..4)
@@ -3847,6 +3849,7 @@ mod tests {
 
     #[test]
     fn live_roots_promote_freeze_and_untrack() {
+        let _gil = crate::gil::hold_gil();
         let state = GcState::new();
         let roots: Vec<Object> = (0..4)
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
@@ -3883,6 +3886,7 @@ mod tests {
 
     #[test]
     fn track_and_untrack() {
+        let _gil = crate::gil::hold_gil();
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
         // `track_now`, not `track`: an empty dict holds nothing that could
@@ -3896,6 +3900,7 @@ mod tests {
 
     #[test]
     fn collect_clears_simple_cycle() {
+        let _gil = crate::gil::hold_gil();
         let s = GcState::new();
         let dict = Rc::new(RefCell::new(DictData::default()));
         let outer = Object::Dict(dict.clone());
@@ -3917,6 +3922,7 @@ mod tests {
 
     #[test]
     fn tracked_objects_die_by_refcount() {
+        let _gil = crate::gil::hold_gil();
         let s = GcState::new();
         let dict = Rc::new(RefCell::new(DictData::default()));
         let obj = Object::Dict(dict.clone());
@@ -3933,6 +3939,7 @@ mod tests {
 
     #[test]
     fn freeze_unfreeze_round_trip() {
+        let _gil = crate::gil::hold_gil();
         let s = GcState::new();
         let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
         // See `track_and_untrack` on `track_now`.

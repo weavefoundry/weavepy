@@ -1407,6 +1407,16 @@ fn spawn_python_worker(
                 std::thread::yield_now();
             };
             entry.mark_started();
+            // Acquire the process-wide GIL before touching any
+            // Python state -- building the worker's interpreter included
+            // (a fresh one, or a fork of the seed, populates and clones
+            // objects a peer's collection may be reading). Push onto the
+            // shared [`crate::gil::push_gil_guard`] stack so any builtin
+            // we call (e.g. `lock.acquire()`) can drop the GIL via
+            // `allow_threads_then` for the duration of the blocking
+            // section, then re-acquire on return.
+            let gil = crate::gil::global_gil();
+            crate::gil::push_gil_guard(gil.acquire());
             let mut worker_interp = match parent_fork {
                 Some(fork) => {
                     // Forked on the spawning thread; still install the
@@ -1421,14 +1431,6 @@ fn spawn_python_worker(
                     None => crate::Interpreter::new(),
                 },
             };
-            // Acquire the process-wide GIL before touching any
-            // Python state. Push onto the shared
-            // [`crate::gil::push_gil_guard`] stack so any builtin
-            // we call (e.g. `lock.acquire()`) can drop the GIL via
-            // `allow_threads_then` for the duration of the blocking
-            // section, then re-acquire on return.
-            let gil = crate::gil::global_gil();
-            crate::gil::push_gil_guard(gil.acquire());
             let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.call_object(worker_func.clone(), &positional, &kwargs_pairs)
             }));
@@ -1983,6 +1985,7 @@ mod tests {
 
     #[test]
     fn allocate_lock_returns_lock_object() {
+        let _gil = crate::gil::hold_gil();
         let l = allocate_lock(&[]).unwrap();
         match l {
             Object::Instance(inst) => {

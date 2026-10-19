@@ -1679,6 +1679,7 @@ mod tests {
 
     #[test]
     fn decoded_strings_keep_utf8_and_memo_aliases() {
+        let _gil = crate::gil::hold_gil();
         let empty = decode(b"\x80\x05\x8c\x00.").unwrap();
         assert!(matches!(empty, Object::Str(value) if value.is_empty()));
         let result = decode(b"\x80\x05]\x94(\x8c\x05\xc3\xa9\xe2\x82\xac\x94h\x01e.").unwrap();
@@ -1693,6 +1694,7 @@ mod tests {
 
     #[test]
     fn decode_scalars_frames_and_memo_aliases() {
+        let _gil = crate::gil::hold_gil();
         assert!(matches!(decode(b"\x80\x04N."), Some(Object::None)));
         let value = decode(b"\x80\x05\x95\x04\0\0\0\0\0\0\0K\x07\x85.").unwrap();
         let Object::Tuple(tuple) = value else {
@@ -1711,6 +1713,7 @@ mod tests {
 
     #[test]
     fn preflight_rejects_cycles_deep_graphs_and_unsupported_keys() {
+        let _gil = crate::gil::hold_gil();
         for data in [
             &b"\x80\x05]\x94h\x00a."[..],
             &b"\x80\x05]\x94(h\x00\x85e."[..],

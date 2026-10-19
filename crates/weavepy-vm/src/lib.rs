@@ -1029,20 +1029,33 @@ pub struct Interpreter {
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
+    /// The GIL, held while the fields above drop (see the `Drop` impl).
+    /// Last, so that it is released after every other field.
+    drop_gil: crate::gil::GilScope,
+}
+
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        // The fields release the interpreter's objects: its module cache,
+        // pools and caches hold the last references to most of them, and
+        // tracked objects are visible to every thread's collections. Hold
+        // the GIL while they go, as construction does (`drop_gil` is the
+        // last field, so it gives the GIL back after the others).
+        self.drop_gil.engage();
+    }
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
-        // Register this thread before touching any cell. Construction
-        // populates the *process-global* collector and module cache, and
-        // `GilCell`'s lock-free path is only sound while a single thread
-        // owns every cell — a second thread building its own interpreter
-        // (an embedder, or `cargo test`'s parallel harness) has to flip
-        // cells to shared first, or both take the unlocked path over the
-        // same `GcState` and one loses with `BorrowMutError`. The GIL
-        // acquire path registers for every *later* entry; this covers the
-        // window before a thread has ever held it.
-        crate::sync::note_vm_thread(crate::gil::current_thread_id());
+        // Construction populates the *process-global* collector and module
+        // cache, so it holds the GIL like any other code that touches
+        // objects: a collection running on another thread (another
+        // interpreter's, in an embedder or `cargo test`'s parallel harness)
+        // reads every tracked object and the collector's own lists without
+        // taking their cells' borrows. Taking the GIL also registers this
+        // thread before it touches any cell, which `GilCell`'s lock-free
+        // path requires.
+        let _gil = crate::gil::hold_gil();
         install_parser_unicode_hook();
         // The UCRT's default response to an invalid parameter (e.g. a CRT
         // call on a stale fd) is a *silent* process fast-fail (exit
@@ -1270,6 +1283,7 @@ impl Default for Interpreter {
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
+            drop_gil: crate::gil::GilScope::idle(),
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -1402,6 +1416,7 @@ impl Interpreter {
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
+            drop_gil: crate::gil::GilScope::idle(),
         }
     }
 
@@ -80313,6 +80328,7 @@ next(gen)
 
     #[test]
     fn sum_streaming_integer_fastpath_preserves_boundaries_and_fallbacks() {
+        let _gil = crate::gil::hold_gil();
         let zero = Object::Int(0);
         for sequence in [
             Object::new_list(vec![Object::Int(i64::MAX), Object::Int(1), Object::Int(-1)]),
@@ -80340,6 +80356,11 @@ next(gen)
 
     fn run(src: &str) -> String {
         let module = parse_module(src).expect("parse");
+        // Tests run in parallel, each with its own interpreter, and share
+        // the process-wide collector: hold the GIL while this thread's
+        // objects are built, read and released (it still passes the GIL
+        // on at the eval loop's hand-off points).
+        let _gil = crate::gil::hold_gil();
         let code = compile_module(&module).expect("compile");
         let mut interp = Interpreter::new();
         let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
@@ -80555,6 +80576,7 @@ assert loop(2000) == 1999000
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
+                let _gil = crate::gil::hold_gil();
                 crate::tier2::force_enable_for_test(4);
                 crate::tier2::note_startup_finished();
                 let mut interp = Interpreter::new();
@@ -82257,6 +82279,7 @@ assert loop(2000) == 1999000
     }
 
     fn check_cold_instance_dictionaries() {
+        let _gil = crate::gil::hold_gil();
         let source = r"
 import gc
 class Plain:
@@ -82339,6 +82362,49 @@ assert namespace is exported.__dict__
         })
         .join()
         .expect("jit worker thread");
+    }
+
+    /// Building and dropping an interpreter waits for the GIL. Both
+    /// touch objects of the process-wide collector -- construction tracks
+    /// thousands, and the drop releases them -- and a collection on another
+    /// thread reads every tracked object, and the collector's own lists,
+    /// without taking cell borrows. The parallel unit tests, each with its
+    /// own interpreter, corrupted the collector's deferred list and freed
+    /// lists under a collection's mark walk while they did either outside
+    /// the GIL.
+    #[test]
+    fn interpreters_build_and_drop_under_the_gil() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // Hold the GIL for a while and check that `work`, on another
+        // thread, did not finish meanwhile.
+        fn waits_for_the_gil(work: impl FnOnce() + Send + 'static) {
+            let done = Arc::new(AtomicBool::new(false));
+            let gil = crate::gil::hold_gil();
+            let worker = {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    work();
+                    done.store(true, Ordering::Release);
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !done.load(Ordering::Acquire),
+                "the interpreter was built or dropped without the GIL"
+            );
+            drop(gil);
+            worker.join().expect("interpreter thread");
+            assert!(done.load(Ordering::Acquire));
+        }
+        // Warm the process-wide caches, so the timed construction is fast.
+        drop(Interpreter::new());
+        waits_for_the_gil(|| drop(Interpreter::new()));
+        let mut interp = Interpreter::new();
+        let module = parse_module("data = {i: [i] for i in range(100)}\n").expect("parse");
+        let code = compile_module(&module).expect("compile");
+        interp.run_module(&code).expect("run");
+        waits_for_the_gil(move || drop(interp));
     }
 
     #[test]
@@ -87486,6 +87552,7 @@ print("native pickle coverage: ok")
 
     #[test]
     fn native_leaf_lookup_uses_body_identity() {
+        let _gil = crate::gil::hold_gil();
         let interp = Interpreter::new();
         let receiver = Object::new_list(Vec::new());
         let Object::Builtin(first) = interp.lookup_method(&receiver, "__len__").unwrap() else {
@@ -87507,6 +87574,7 @@ print("native pickle coverage: ok")
 
     #[test]
     fn native_bound_rejection_cache_does_not_own_methods() {
+        let _gil = crate::gil::hold_gil();
         let receiver = Rc::new(RefCell::new(Vec::new()));
         let weak_receiver = Rc::downgrade(&receiver);
         let object = Object::List(receiver);

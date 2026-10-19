@@ -1426,6 +1426,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn native_wrapper_storage_stays_authoritative_after_dict_materialization() {
+        let _gil = crate::gil::hold_gil();
         let target = Object::Type(
             TypeObject::new_user("FixedWeakrefTarget", vec![], DictData::default()).unwrap(),
         );
@@ -1510,6 +1511,7 @@ mod tests {
 
     #[test]
     fn ref_returns_alive_target_then_none_after_clear() {
+        let _gil = crate::gil::hold_gil();
         // Use a supported target: the unchecked string fixture can be
         // cleared by another test's weakref-only collection.
         let target = Object::Type(

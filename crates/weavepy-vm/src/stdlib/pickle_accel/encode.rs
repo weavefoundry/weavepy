@@ -908,6 +908,7 @@ mod tests {
 
     #[test]
     fn list_batches_preserve_shared_children() {
+        let _gil = crate::gil::hold_gil();
         let child = Object::new_list(vec![Object::Int(7)]);
         let value = Object::new_list(vec![child; 2001]);
         let bytes = encode_with_headroom(&value, 5, 1000).unwrap();
@@ -922,6 +923,7 @@ mod tests {
 
     #[test]
     fn list_encoding_tolerates_concurrent_resizing() {
+        let _gil = crate::gil::hold_gil();
         // Two raw threads share a cell with no GIL between them: the
         // contract `GilCell` documents is that such threads announce
         // themselves before touching objects. (The bias alone is

@@ -14381,6 +14381,7 @@ mod tests {
 
     #[test]
     fn clone_counts_every_layout() {
+        let _gil = crate::gil::hold_gil();
         use crate::object::Object;
         let tags = [
             (Object::None, 0),
@@ -14428,6 +14429,7 @@ mod tests {
 
     #[test]
     fn small_int_range_collection_preserves_boundary_values() {
+        let _gil = crate::gil::hold_gil();
         for (start, stop, step, expected) in [
             (i64::MAX, i64::MIN, i64::MIN, vec![i64::MAX, -1]),
             (
@@ -14470,6 +14472,7 @@ mod tests {
 
     #[test]
     fn small_int_range_collection_rejects_impossible_capacities() {
+        let _gil = crate::gil::hold_gil();
         // Neither case can attempt a large allocation: the first fails
         // length conversion, and the second exceeds Vec's layout limit.
         for (range, expected) in [
@@ -14537,6 +14540,7 @@ mod tests {
 
     #[test]
     fn truthiness_matches_python_basics() {
+        let _gil = crate::gil::hold_gil();
         assert!(!Object::None.is_truthy());
         assert!(!Object::Bool(false).is_truthy());
         assert!(Object::Bool(true).is_truthy());
@@ -14561,6 +14565,7 @@ mod tests {
 
     #[test]
     fn identity_of_same_list_handle() {
+        let _gil = crate::gil::hold_gil();
         let a = Object::new_list(vec![Object::Int(1)]);
         let b = a.clone();
         let c = Object::new_list(vec![Object::Int(1)]);
@@ -14570,6 +14575,7 @@ mod tests {
 
     #[test]
     fn list_iter_yields_elements_in_order() {
+        let _gil = crate::gil::hold_gil();
         let lst = Object::new_list(vec![Object::Int(1), Object::Int(2), Object::Int(3)]);
         let mut it = lst.make_iter().expect("iter");
         let a = it.next_value().and_then(|x| match x {

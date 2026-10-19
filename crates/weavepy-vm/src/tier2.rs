@@ -2517,7 +2517,10 @@ fn native_method_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
 }
 
 thread_local! {
-    static JIT: RefCell<JitState> = RefCell::new(JitState::new());
+    /// This thread's compiled code and its tables, which hold functions,
+    /// classes and constants: released under the GIL at thread exit.
+    static JIT: crate::gil::ReleaseUnderGil<RefCell<JitState>> =
+        crate::gil::ReleaseUnderGil::new(RefCell::new(JitState::new()));
 
     /// Memoized callee return typing (RFC 0059 WS3 / RFC 0069 WS1):
     /// `(scalar lane, provably-returns-None)`, keyed by code object
@@ -10457,6 +10460,7 @@ mod scalar_update_guard_tests {
 
     #[test]
     fn mutable_descriptor_classes_never_certify_an_update() {
+        let _gil = crate::gil::hold_gil();
         let object = crate::builtin_types::builtin_types().object_.clone();
         let descriptor_type =
             TypeObject::new_user("MutableValue", vec![object.clone()], DictData::default())
@@ -10527,6 +10531,7 @@ mod attr_pin_tests {
 
     #[test]
     fn stale_hints_check_the_current_activation_and_object_identity() {
+        let _gil = crate::gil::hold_gil();
         let class = TypeObject::new_user("PinValue", vec![], DictData::default()).unwrap();
         let a = Object::Instance(Rc::new(crate::types::PyInstance::new(class.clone())));
         let b = Object::Instance(Rc::new(crate::types::PyInstance::new(class)));
@@ -16037,6 +16042,7 @@ mod native_pair_tests {
 
     #[test]
     fn shares_cursors_with_interpreted_steps_and_stays_exhausted() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[10, 20, 30], -2);
         assert!(matches!(
             inner.borrow_mut().next_value(),
@@ -16065,6 +16071,7 @@ mod native_pair_tests {
 
     #[test]
     fn counter_overflow_leaves_the_value_for_generic_promotion() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[11, 22, 33], i64::MAX - 1);
         assert_eq!(
             next_enumerated_byte(&outer),
@@ -16094,6 +16101,7 @@ mod native_pair_tests {
 
     #[test]
     fn unsupported_sources_do_not_advance_either_cursor() {
+        let _gil = crate::gil::hold_gil();
         let inner = Rc::new(RefCell::new(PyIterator::Bytes {
             data: crate::shared_value::SharedSlice::from([42_u8].as_slice()),
             index: 0,
@@ -16124,6 +16132,7 @@ mod native_pair_tests {
 
     #[test]
     fn a_live_borrow_does_not_consume_a_byte() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[42], 0);
         let borrowed = inner.borrow();
         assert_eq!(next_enumerated_byte(&outer), NativeBytePair::Unsupported);
@@ -16146,6 +16155,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_pairs_preserve_identity_shared_cursors_and_exhaustion() {
+        let _gil = crate::gil::hold_gil();
         let value = Object::from_str("retained value");
         let (outer, inner) =
             tuple_enumeration(vec![Object::Int(5), value.clone(), Object::None], -2);
@@ -16182,6 +16192,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_pin_pressure_preserves_values_and_allows_none() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = tuple_enumeration(vec![Object::Int(42), Object::None], 0);
         assert!(matches!(
             next_enumerated_tuple(&outer, false),
@@ -16207,6 +16218,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_mutable_values_and_counter_overflow_keep_generic_continuations() {
+        let _gil = crate::gil::hold_gil();
         let mutable = Object::List(Rc::new(RefCell::new(vec![Object::Int(1)])));
         let (outer, inner) = tuple_enumeration(vec![mutable.clone(), Object::Int(7)], 7);
         assert!(matches!(
@@ -16263,6 +16275,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_borrows_and_wrappers_do_not_consume_values() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = tuple_enumeration(vec![Object::Int(42)], 0);
         let borrowed = inner.borrow();
         assert!(matches!(
