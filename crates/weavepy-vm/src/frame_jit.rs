@@ -3950,6 +3950,7 @@ unsafe extern "C" fn h_local_attr(
             }
             Object::Instance(_) => Interpreter::core_local_attr(Some(ext), code, recv, pc, arg),
             Object::Type(cls) => type_attr(code, ext, cls, pc, arg),
+            Object::Function(f) => Interpreter::leaf_function_read(code, f, arg),
             // A frame's or code object's plain field (a live frame's line
             // needs the full lane, which makes its `lasti` current).
             Object::Code(_) | Object::Frame(_) => {

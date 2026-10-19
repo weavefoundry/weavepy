@@ -33910,6 +33910,15 @@ impl Interpreter {
 
     // ---------- helpers ----------
 
+    /// [`Self::name_at`] without the copy, for a caller that keeps the
+    /// code alive across the use.
+    fn name_ref(code: &CodeObject, arg: u32) -> Result<&str, RuntimeError> {
+        code.names
+            .get(arg as usize)
+            .map(|n| n.as_str())
+            .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))
+    }
+
     fn name_at(&self, code: &CodeObject, arg: u32) -> Result<String, RuntimeError> {
         code.names
             .get(arg as usize)
@@ -36098,6 +36107,17 @@ impl Interpreter {
                 inst.c_body.get(),
                 Rc::strong_count(inst),
             );
+        }
+        // `inst.__class__` (`_abc_instancecheck`, `isinstance` misses,
+        // `copy`): `object`'s descriptor answering the class, when nothing
+        // on the MRO overrides `__class__` or `__getattribute__` (a
+        // builtin class's instances, weak proxies among them, keep the
+        // full lookup).
+        if name == "__class__" && inst.c_body.get() == 0 {
+            let cls = inst.cls();
+            if !cls.flags.is_builtin && cls.class_attr_is_plain() {
+                return Ok(Object::Type(cls));
+            }
         }
         let result = if let Some(getattribute) = self.user_getattribute(&inst.cls()) {
             // `dispatch` (not `new`): a `__getattribute__` that is itself a
@@ -48435,9 +48455,9 @@ impl Interpreter {
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
-                let name = self.name_at(&frame.code, name_idx)?;
+                let name = Self::name_ref(&frame.code, name_idx)?;
                 let obj = receiver;
-                let result = self.load_attr(&obj, &name);
+                let result = self.load_attr(&obj, name);
                 // Specialize *after* the generic lookup. The decision's
                 // dict-index probe hashes `name` into the instance dict and
                 // can run a hostile key's `__eq__` (test_descr
@@ -48449,7 +48469,7 @@ impl Interpreter {
                 // when its load failed, an even one otherwise (see the
                 // `Cooldown` arm).
                 let decision = if result.is_ok() {
-                    match specialize::attempt_specialize_load_attr(&obj, &name) {
+                    match specialize::attempt_specialize_load_attr(&obj, name) {
                         IC::Cooldown(n) => IC::Cooldown(n.saturating_mul(2) & !1),
                         decision => decision,
                     }
@@ -48482,12 +48502,12 @@ impl Interpreter {
                         return Err(err);
                     }
                 }
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&receiver, &name)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.load_attr(&receiver, name)
             }
             _ => {
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&receiver, &name)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.load_attr(&receiver, name)
             }
         }
     }
@@ -48509,8 +48529,8 @@ impl Interpreter {
             .code
             .caches
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(2 * COOLDOWN));
-        let name = self.name_at(&frame.code, name_idx)?;
-        self.load_attr(&receiver, &name)
+        let name = Self::name_ref(&frame.code, name_idx)?;
+        self.load_attr(&receiver, name)
     }
 
     /// Specialized `STORE_ATTR`. Stack discipline matches the
@@ -48768,9 +48788,10 @@ impl Interpreter {
                 self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
-                let name = self.name_at(&frame.code, name_idx)?;
+                let code = frame.code.clone();
+                let name = Self::name_ref(&code, name_idx)?;
                 specialize::record_specialize_attempt(op_idx);
-                let decision = specialize::attempt_specialize_store_attr(&receiver, &name);
+                let decision = specialize::attempt_specialize_store_attr(&receiver, name);
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
                     specialize::record_specialize_skip(op_idx);
@@ -48778,7 +48799,7 @@ impl Interpreter {
                     specialize::record_specialize_success(op_idx);
                 }
                 let val = frame.pop()?;
-                self.store_attr(&receiver, &name, val)
+                self.store_attr(&receiver, name, val)
             }
             IC::Cooldown(n) => {
                 let next = if n > 0 {
@@ -48788,13 +48809,13 @@ impl Interpreter {
                 };
                 frame.code.caches.set(cache_pc, next);
                 let val = frame.pop()?;
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&receiver, &name, val)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.store_attr(&receiver, name, val)
             }
             _ => {
                 let val = frame.pop()?;
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&receiver, &name, val)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.store_attr(&receiver, name, val)
             }
         }
     }
@@ -48815,8 +48836,8 @@ impl Interpreter {
             .caches
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
         let val = frame.pop()?;
-        let name = self.name_at(&frame.code, name_idx)?;
-        self.store_attr(&receiver, &name, val)
+        let name = Self::name_ref(&frame.code, name_idx)?;
+        self.store_attr(&receiver, name, val)
     }
 
     /// Specialized `FOR_ITER`. Returns `Ok(true)` when the fast

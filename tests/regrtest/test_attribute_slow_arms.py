@@ -430,6 +430,79 @@ class ReflectedCompareTest(unittest.TestCase):
                 A() < B()
 
 
+class FunctionAttrTest(unittest.TestCase):
+    def test_counter_on_wrapper(self):
+        def counted(fn):
+            def wrapper(*args):
+                wrapper.calls += 1
+                return fn(*args)
+
+            wrapper.calls = 0
+            return wrapper
+
+        @counted
+        def double(x):
+            return 2 * x
+
+        for i in range(N):
+            self.assertEqual(double(i), 2 * i)
+        self.assertEqual(double.calls, N)
+        double.__dict__ = {"calls": 100}
+        double(1)
+        self.assertEqual(double.calls, 101)
+        del double.calls
+        with self.assertRaises(AttributeError):
+            double(1)
+
+    def test_function_dunders(self):
+        def f():
+            pass
+
+        def read(fn):
+            return fn.__name__, fn.__qualname__
+
+        for _ in range(N):
+            self.assertEqual(read(f)[0], "f")
+        f.__name__ = "g"
+        self.assertEqual(read(f)[0], "g")
+
+
+class DunderClassTest(unittest.TestCase):
+    def test_class_reads(self):
+        import abc
+        import weakref
+
+        class A(abc.ABC):
+            pass
+
+        class B(A):
+            pass
+
+        class C:
+            pass
+
+        class D(A):
+            pass
+
+        class Lying:
+            @property
+            def __class__(self):
+                return int
+
+        b = B()
+        for _ in range(N):
+            self.assertIsInstance(b, A)
+            self.assertNotIsInstance(C(), A)
+            self.assertIs(b.__class__, B)
+        b.__class__ = D
+        self.assertIs(b.__class__, D)
+        self.assertNotIsInstance(b, B)
+        self.assertIs(Lying().__class__, int)
+        self.assertIsInstance(Lying(), int)
+        c = C()
+        self.assertIs(weakref.proxy(c).__class__, C)
+
+
 class Base:
     def __new__(cls, *args):
         return super().__new__(cls)
