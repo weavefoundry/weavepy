@@ -82278,6 +82278,29 @@ assert loop(2000) == 1999000
         .expect("jit worker thread")
     }
 
+    /// Run `body` for the test `name` (its path in the test binary) in a
+    /// child process of its own: `sys.setrecursionlimit` sets a
+    /// process-wide limit, which a test must not change under the
+    /// interpreters the other tests run on concurrent threads (or have
+    /// changed under it).
+    #[cfg(feature = "jit")]
+    fn with_own_recursion_limit(name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "WEAVEPY_RECURSION_LIMIT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            body();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn recursion-limit test");
+        assert!(
+            status.success(),
+            "isolated recursion-limit test failed: {status}"
+        );
+    }
+
     fn check_cold_instance_dictionaries() {
         let _gil = crate::gil::hold_gil();
         let source = r"
@@ -85732,6 +85755,14 @@ assert namespace is exported.__dict__
                    sys.setrecursionlimit(limit)\n\
                    print('depth', depth)\n\
                    print(run(c, 3000, rebind, 1000))\n";
+        with_own_recursion_limit(
+            "tests::jit_direct_method_call_guard_changes_match_interpreter",
+            || check_direct_method_call_guard_changes(src),
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    fn check_direct_method_call_guard_changes(src: &str) {
         let (out, compiled, _deopts) = run_jit(src);
         assert!(compiled >= 2, "the method kernels never compiled");
         assert_eq!(out, run(src));
@@ -87093,10 +87124,15 @@ print("native pickle coverage: ok")
                    \x20   return down(n - 1)\n\
                    k = 0\nwhile k < 10:\n    down(5)\n    k = k + 1\n\
                    try:\n    down(100000)\nexcept RecursionError:\n    print('rec ok')\n";
-        let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
-        assert!(calls >= 1, "down never took the native call path");
-        assert_eq!(out, "rec ok\n");
-        assert_eq!(out, run(src));
+        with_own_recursion_limit(
+            "tests::jit_native_recursion_limit_matches_interpreter",
+            || {
+                let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
+                assert!(calls >= 1, "down never took the native call path");
+                assert_eq!(out, "rec ok\n");
+                assert_eq!(out, run(src));
+            },
+        );
     }
 
     #[cfg(feature = "jit")]

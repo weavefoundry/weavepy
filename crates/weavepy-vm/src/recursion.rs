@@ -160,8 +160,14 @@ pub fn depth_cell() -> *const Cell<usize> {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline]
 pub fn enter_with(cell: *const Cell<usize>) -> Enter {
-    let limit = recursion_limit();
-    // SAFETY: this thread's own thread-local, alive for the thread.
+    enter_under(cell, recursion_limit())
+}
+
+/// [`enter_with`] against `limit` rather than the process-wide limit.
+#[inline(always)]
+fn enter_under(cell: *const Cell<usize>, limit: usize) -> Enter {
+    // SAFETY: this thread's own thread-local, alive for the thread (see
+    // `enter_with`).
     let d = unsafe { &*cell };
     let n = d.get() + 1;
     if n > limit {
@@ -231,10 +237,10 @@ mod tests {
 
     #[test]
     fn over_limit_raises_every_time_without_inflating_depth() {
-        // Use a tiny limit on this thread's view via the global atomic.
-        // (Tests run single-threaded per #[test] body.)
-        let saved = recursion_limit();
-        RECURSION_LIMIT.store(4, Ordering::Relaxed);
+        // A tiny limit, for this thread's activations only: the
+        // process-wide limit is shared with the interpreters other tests
+        // run concurrently, which a limit of 4 would break.
+        let enter = || enter_under(depth_cell(), 4);
 
         let mut guards = Vec::new();
         for _ in 0..4 {
@@ -255,6 +261,5 @@ mod tests {
 
         drop(guards);
         assert_eq!(current_depth(), 0);
-        RECURSION_LIMIT.store(saved, Ordering::Relaxed);
     }
 }
