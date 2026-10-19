@@ -11380,13 +11380,19 @@ impl Interpreter {
     /// `CALL`'s pc; `None` touches nothing (the instructions run one by
     /// one).
     ///
+    /// `CALLING_EFFECTS` runs an effect leaf (one that stores) whose body
+    /// itself calls in place too. Compiled callers pass `false`: for them
+    /// the method load and direct call cost less than the leaf evaluator
+    /// with its callee nested in it. The core loop passes `true`, since
+    /// its alternative is a full activation, which costs more.
+    ///
     /// # Safety
     ///
     /// `lbase` is the running activation's `nlocals` locals; nothing else
     /// borrows them.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn core_local_method(
+    unsafe fn core_local_method<const CALLING_EFFECTS: bool>(
         &self,
         code: &CodeObject,
         ext: Option<&CodeConstObjects>,
@@ -11401,15 +11407,16 @@ impl Interpreter {
         let mslots: Sites<'_, MethodSlot> = ext.map_or(Sites::empty(), |e| e.method_sites());
         match other {
             Object::Instance(_) | Object::Module(_) => {
-                // A site that verified its pure callee for this class version
-                // (its call checks the argument shape itself). An effect
-                // leaf (one that stores) costs more evaluated frameless than
-                // called: the method loads and its call runs directly.
+                // A site that verified its callee for this class version
+                // (its call checks the argument shape itself); a calling
+                // effect leaf only when `CALLING_EFFECTS` (see above).
                 let mut missed = false;
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
                     if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
                         // SAFETY: the site's code is its live function's.
-                        .filter(|&(_, c, effect)| !effect || !code_calls(unsafe { &*c }))
+                        .filter(|&(_, c, effect)| {
+                            CALLING_EFFECTS || !effect || !code_calls(unsafe { &*c })
+                        })
                     {
                         match self.core_leaf_site_call(
                             code,
@@ -11465,7 +11472,9 @@ impl Interpreter {
                             .is_some_and(|fp| {
                                 let f = unsafe { &*fp };
                                 fn_is_pure_leaf(f)
-                                    || (fn_is_leaf(f) && !code_calls(unsafe { &*f.code.as_ptr() }))
+                                    || (fn_is_leaf(f)
+                                        && (CALLING_EFFECTS
+                                            || !code_calls(unsafe { &*f.code.as_ptr() })))
                             }),
                         _ => false,
                     };
@@ -11882,7 +11891,7 @@ impl Interpreter {
                                 // `x.m(...)` of a leaf or native method on the
                                 // borrowed local (see `core_local_method`).
                                 other if kind == FAST_METHOD => {
-                                    if let Some((r, call_pc)) = self.core_local_method(
+                                    if let Some((r, call_pc)) = self.core_local_method::<true>(
                                         code,
                                         ext,
                                         other,

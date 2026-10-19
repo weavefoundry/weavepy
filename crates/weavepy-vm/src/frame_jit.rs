@@ -3180,7 +3180,7 @@ unsafe extern "C" fn h_local_method(
         let st = &mut *st;
         let (code, ext, pc) = (&*code, &*ext, pc as usize);
         let local = &*st.locals.add(code.instructions[pc].arg as usize);
-        let Some((r, call_pc)) = (*st.interp).core_local_method(
+        let Some((r, call_pc)) = (*st.interp).core_local_method::<false>(
             code,
             Some(ext),
             local,
