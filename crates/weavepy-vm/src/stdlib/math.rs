@@ -978,13 +978,88 @@ fn libm_fmod(x: f64, y: f64) -> f64 {
 }
 
 fn math_gcd(args: &[Object]) -> Result<Object, RuntimeError> {
-    use num_integer::Integer;
+    // Machine-word arguments, the common call: a binary GCD of their
+    // magnitudes (`gcd(i64::MIN, 0)` is 2**63, past `i64`).
+    let small = |o: &Object| match o {
+        Object::Int(i) => Some(i.unsigned_abs()),
+        Object::Bool(b) => Some(u64::from(*b)),
+        _ => None,
+    };
+    if let Some(words) = args.iter().map(small).collect::<Option<Vec<u64>>>() {
+        let g = words
+            .into_iter()
+            .fold(0u64, |a, b| gcd_u128(u128::from(a), u128::from(b)) as u64);
+        return Ok(i64::try_from(g).map_or_else(
+            |_| Object::int_from_bigint(num_bigint::BigInt::from(g)),
+            Object::Int,
+        ));
+    }
     let mut acc = num_bigint::BigInt::from(0);
     for a in args {
         let v = index_bigint(a)?;
-        acc = acc.gcd(&v); // num_integer::gcd is always non-negative
+        acc = gcd_bigint(&acc, &v);
     }
     Ok(Object::int_from_bigint(acc))
+}
+
+/// Binary GCD of two machine words.
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    let shift = (a | b).trailing_zeros();
+    a >>= a.trailing_zeros();
+    loop {
+        b >>= b.trailing_zeros();
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        b -= a;
+        if b == 0 {
+            return a << shift;
+        }
+    }
+}
+
+/// The non-negative GCD of two integers (`num_integer`'s answer), with
+/// the shapes `fractions` and `statistics` produce settled cheaply: a
+/// power-of-two factor (every float's ratio has a power-of-two
+/// denominator), magnitudes that fit 128 bits, and one small operand
+/// (a single remainder reduces the other to a word).
+pub(crate) fn gcd_bigint(a: &num_bigint::BigInt, b: &num_bigint::BigInt) -> num_bigint::BigInt {
+    use num_bigint::{BigInt, BigUint};
+    use num_integer::Integer;
+    use num_traits::{ToPrimitive, Zero};
+    let (a, b) = (a.magnitude(), b.magnitude());
+    if a.is_zero() {
+        return BigInt::from(b.clone());
+    }
+    if b.is_zero() {
+        return BigInt::from(a.clone());
+    }
+    let (za, zb) = (
+        a.trailing_zeros().unwrap_or(0),
+        b.trailing_zeros().unwrap_or(0),
+    );
+    let shift = za.min(zb);
+    let (a, b) = (a >> za, b >> zb);
+    let odd = if a == BigUint::from(1u8) || b == BigUint::from(1u8) {
+        BigUint::from(1u8)
+    } else if let (Some(x), Some(y)) = (a.to_u128(), b.to_u128()) {
+        BigUint::from(gcd_u128(x, y))
+    } else if let Some(y) = b.to_u64() {
+        let r = (&a % y).to_u64().expect("a remainder below a word");
+        BigUint::from(gcd_u128(u128::from(r), u128::from(y)))
+    } else if let Some(x) = a.to_u64() {
+        let r = (&b % x).to_u64().expect("a remainder below a word");
+        BigUint::from(gcd_u128(u128::from(r), u128::from(x)))
+    } else {
+        a.gcd(&b)
+    };
+    BigInt::from(odd << shift)
 }
 
 fn math_lcm(args: &[Object]) -> Result<Object, RuntimeError> {

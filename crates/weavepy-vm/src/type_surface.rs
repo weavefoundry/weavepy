@@ -1179,6 +1179,30 @@ fn as_native(o: &Object) -> Object {
     o.clone()
 }
 
+/// `body` on `args` with `recv` in place of the first: the other
+/// arguments as bitwise views (never dropped: `args` keeps them alive, and
+/// a body clones what it keeps), without allocating for the usual few.
+fn with_receiver<R>(args: &[Object], recv: Object, body: impl FnOnce(&[Object]) -> R) -> R {
+    const N: usize = 8;
+    if args.len() > N {
+        let mut v = args.to_vec();
+        v[0] = recv;
+        return body(&v);
+    }
+    let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; N];
+    buf[0].write(recv);
+    for (slot, a) in buf[1..].iter_mut().zip(&args[1..]) {
+        // SAFETY: a view of a live argument, never dropped.
+        slot.write(unsafe { std::ptr::read(a) });
+    }
+    // SAFETY: the first `args.len()` entries were written.
+    let view = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<Object>(), args.len()) };
+    let r = body(view);
+    // SAFETY: the receiver is the one owned entry.
+    unsafe { buf[0].assume_init_drop() };
+    r
+}
+
 /// Wrap a `lookup_method`-table builtin so an `Instance` receiver
 /// (built-in subclass) is unwrapped to its native payload before the
 /// underlying implementation runs.
@@ -1199,6 +1223,17 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
         owner: &crate::sync::Weak<TypeObject>,
         first: &Object,
     ) -> Result<(), RuntimeError> {
+        // An instance (a subclass's) of the owner, its class borrowed: the
+        // commonest receiver here. (A live weak handle keeps its
+        // allocation, so the owner's address names it.)
+        if let Object::Instance(inst) = first {
+            let cls = inst.class.borrow();
+            if std::ptr::eq(Rc::as_ptr(&cls), owner.as_ptr())
+                || owner.upgrade().is_some_and(|o| cls.is_subclass_of(&o))
+            {
+                return Ok(());
+            }
+        }
         if let Some(owner) = owner.upgrade() {
             let cls = crate::builtins::class_of(first);
             if !cls.is_subclass_of(&owner) {
@@ -1235,9 +1270,7 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 if !keep_instance {
                     let unwrapped = as_native(first);
                     if !unwrapped.is_same(first) {
-                        let mut v = args.to_vec();
-                        v[0] = unwrapped;
-                        return (inner_pos.call)(&v);
+                        return with_receiver(args, unwrapped, |v| (inner_pos.call)(v));
                     }
                 }
             }
@@ -1258,9 +1291,7 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 }
                 let unwrapped = as_native(first);
                 if !unwrapped.is_same(first) {
-                    let mut v = args.to_vec();
-                    v[0] = unwrapped;
-                    return kw(&v, kwargs);
+                    return with_receiver(args, unwrapped, |v| kw(v, kwargs));
                 }
             }
             kw(args, kwargs)
@@ -1608,7 +1639,7 @@ fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
 /// bpo-46615 regression tests, can re-enter and `clear()` the operands)
 /// *without* holding a borrow on any live `Object::Set` cell. We snapshot
 /// the elements out under a short-lived borrow (`set_items`) and rebuild a
-/// detached `IndexSet`, so a re-entrant mutation touches a cell we are no
+/// detached set table, so a re-entrant mutation touches a cell we are no
 /// longer borrowing instead of panicking with `BorrowMutError`.
 fn snapshot_set(o: &Object) -> crate::object::SetData {
     let mut out = crate::object::SetData::default();

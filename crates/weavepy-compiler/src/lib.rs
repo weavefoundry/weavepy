@@ -20,12 +20,12 @@
 //!   peephole optimizer and adaptive specialization produce different
 //!   shapes that we deliberately don't reproduce.
 
+use fxhash::{HashSet, NameSet};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use bytecode::intrinsic;
-use indexmap::IndexMap;
+use fxhash::IndexMap;
 use thiserror::Error;
 use weavepy_parser::ast::{
     Arguments as AstArguments, BinOp, BoolOp, CmpOp, Comprehension, Constant as AstConstant,
@@ -38,8 +38,10 @@ pub mod bytecode;
 mod cache_snapshot;
 pub mod cpython_code;
 mod flowgraph;
+mod fxhash;
 mod intern;
 mod mangle;
+mod name;
 pub mod native_code;
 mod validate;
 
@@ -50,6 +52,7 @@ pub use bytecode::{
     COMPARE_OP_TO_BOOL_FLAG, COOLDOWN, SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
 };
 pub use cpython_code::{CpythonCode, Position};
+pub use name::Name;
 
 /// CPython compile.c `STACK_USE_GUIDELINE`: literal displays and call
 /// sites with more operands than this compile through accumulator
@@ -145,6 +148,11 @@ pub use weavepy_parser::ast::expr_name;
 
 // ---------- code object ----------
 
+/// Whether `names` holds `name`.
+fn has_name(names: &[Name], name: &str) -> bool {
+    names.iter().any(|n| n.as_str() == name)
+}
+
 /// RFC 0061 (WS2a): an opaque, VM-owned per-code-object extension slot.
 ///
 /// The VM stashes derived, execution-only state here (today: the
@@ -158,20 +166,27 @@ pub use weavepy_parser::ast::expr_name;
 /// cloned code object starts with an empty slot), never participates in
 /// equality, and is not serialized.
 ///
-/// The slot holds the payload's address (the VM's hot accessor reads one
-/// thin pointer) and the function that drops it, two words in all.
+/// The slot is one word: the address of the payload, which starts with
+/// the function that drops it (the VM's hot accessor reads one thin
+/// pointer).
 #[derive(Default)]
 pub struct VmExt {
-    /// The payload, a leaked `Box`, or null.
+    /// The payload, a leaked `Box<Payload<T>>`, or null.
     payload: std::sync::atomic::AtomicPtr<()>,
-    /// The payload's `drop_payload` instance, stored once `payload` is.
-    drop: std::sync::atomic::AtomicPtr<()>,
+}
+
+/// A [`VmExt`] payload: the value, after the function that drops the box.
+#[repr(C)]
+struct Payload<T> {
+    drop: fn(*mut ()),
+    value: T,
 }
 
 /// Drop a [`VmExt`] payload of type `T`.
 fn drop_payload<T>(payload: *mut ()) {
-    // SAFETY: `payload` is the `Box<T>` `VmExt::get_or_init` leaked.
-    drop(unsafe { Box::from_raw(payload.cast::<T>()) });
+    // SAFETY: `payload` is the `Box<Payload<T>>` `VmExt::get_or_init`
+    // leaked.
+    drop(unsafe { Box::from_raw(payload.cast::<Payload<T>>()) });
 }
 
 impl VmExt {
@@ -183,9 +198,9 @@ impl VmExt {
     #[inline]
     pub unsafe fn get<T>(&self) -> Option<&T> {
         let p = self.payload.load(std::sync::atomic::Ordering::Acquire);
-        // SAFETY: a non-null payload is a live `T` (the caller's contract)
-        // that lives as long as the slot.
-        (!p.is_null()).then(|| unsafe { &*p.cast::<T>() })
+        // SAFETY: a non-null payload is a live `Payload<T>` (the caller's
+        // contract) that lives as long as the slot.
+        (!p.is_null()).then(|| unsafe { &(*p.cast::<Payload<T>>()).value })
     }
 
     /// The payload, set from `init` if there is none yet. Racing
@@ -200,26 +215,23 @@ impl VmExt {
         if let Some(payload) = unsafe { self.get::<T>() } {
             return payload;
         }
-        let fresh = Box::into_raw(Box::new(init())).cast::<()>();
+        let fresh = Box::into_raw(Box::new(Payload {
+            drop: drop_payload::<T>,
+            value: init(),
+        }))
+        .cast::<()>();
         match self.payload.compare_exchange(
             std::ptr::null_mut(),
             fresh,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                // Read only by `drop`, which has the slot to itself.
-                self.drop.store(
-                    drop_payload::<T> as fn(*mut ()) as *mut (),
-                    Ordering::Release,
-                );
-                // SAFETY: just published; it lives as long as the slot.
-                unsafe { &*fresh.cast::<T>() }
-            }
+            // SAFETY: just published; it lives as long as the slot.
+            Ok(_) => unsafe { &(*fresh.cast::<Payload<T>>()).value },
             Err(won) => {
                 drop_payload::<T>(fresh);
-                // SAFETY: the winner's `T` (the caller's contract).
-                unsafe { &*won.cast::<T>() }
+                // SAFETY: the winner's `Payload<T>` (the caller's contract).
+                unsafe { &(*won.cast::<Payload<T>>()).value }
             }
         }
     }
@@ -235,11 +247,11 @@ impl VmExt {
 
 impl Drop for VmExt {
     fn drop(&mut self) {
-        let (payload, drop_fn) = (*self.payload.get_mut(), *self.drop.get_mut());
-        if !payload.is_null() && !drop_fn.is_null() {
-            // SAFETY: `drop_fn` was stored from a `fn(*mut ())` for this
-            // payload's type.
-            let drop_fn = unsafe { std::mem::transmute::<*mut (), fn(*mut ())>(drop_fn) };
+        let payload = *self.payload.get_mut();
+        if !payload.is_null() {
+            // SAFETY: every payload starts with its own drop function
+            // (`Payload` is `repr(C)`).
+            let drop_fn = unsafe { *payload.cast::<fn(*mut ())>() };
             drop_fn(payload);
         }
     }
@@ -574,13 +586,13 @@ impl std::fmt::Debug for JitHint {
 /// `PyCodeObject` we need to emulate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodeObject {
-    pub name: String,
+    pub name: Name,
     /// Dotted qualified name (PEP 3155), computed at compile time from the
     /// lexical scope nesting: `outer.<locals>.inner` for a function nested
     /// in `outer`, `C.method` for a method of class `C`. Equals `name` for
     /// module-level definitions. Drives `function.__qualname__` /
     /// `type.__qualname__` (and thus reprs, error messages, and pickling).
-    pub qualname: String,
+    pub qualname: Name,
     /// Source filename or `<string>`. Used for diagnostics only. Shared:
     /// every code object compiled or decoded from one module holds the
     /// same allocation.
@@ -597,13 +609,14 @@ pub struct CodeObject {
     pub jit_hint: JitHint,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
-    pub names: Vec<String>,
+    /// These and the other name tables hold pooled [`Name`]s.
+    pub names: Vec<Name>,
     /// Local variable names (positional + keyword + `*args`/`**kwargs` + locals).
-    pub varnames: Vec<String>,
+    pub varnames: Vec<Name>,
     /// Free variables — read from an enclosing scope.
-    pub freevars: Vec<String>,
+    pub freevars: Vec<Name>,
     /// Cell variables — locally defined but referenced by an inner scope.
-    pub cellvars: Vec<String>,
+    pub cellvars: Vec<Name>,
     /// Out-of-line exception handlers. Looked up by current PC when a
     /// `RuntimeError::PyException` propagates through this code object.
     pub exception_table: Vec<ExcHandler>,
@@ -776,10 +789,10 @@ impl PartialEq for CodeRare {
 }
 
 // A decoded module holds a code object per function, class body and
-// comprehension, each behind an `Arc`'s two counts: at 432 bytes or
-// fewer, the allocation fits mimalloc's 448-byte size class.
+// comprehension, each behind an `Arc`'s two counts: at 368 bytes or
+// fewer, the allocation fits mimalloc's 384-byte size class.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<CodeObject>() <= 432);
+const _: () = assert!(std::mem::size_of::<CodeObject>() <= 368);
 
 impl CodeObject {
     /// See [`RareFields::no_interrupt_jumps`].
@@ -814,49 +827,218 @@ pub struct WireOverrides {
     pub exec_error: Option<String>,
 }
 
-/// A per-instruction source-column span (PEP-657). `col`/`end_col` are
-/// 0-based UTF-8 byte offsets within their respective source lines, and
+/// A table decoded on first read from the code cache's encoding of it
+/// (see `native_code`), or a vector: the state behind [`LineTable`],
+/// [`ColTable`] and [`WireMarks`].
+///
+/// Two words: the encoding's range of the buffer every code object of a
+/// module shares, and one word of state. State `0` is an empty table not
+/// yet materialized; an address with [`LAZY_ENCODED`] set is the shared
+/// buffer's `Arc` (one count), still encoded; any other address is the
+/// decoded table, which takes over that count. (It keeps the buffer
+/// alive while a racing reader may still decode from it, until the table
+/// is dropped or borrowed mutably.)
+struct LazyTable<T> {
+    state: std::sync::atomic::AtomicUsize,
+    start: u32,
+    end: u32,
+    _items: std::marker::PhantomData<Vec<T>>,
+}
+
+/// The table section of a module in the code cache's native form (see
+/// `native_code`): its own bytes, or, say, a mapping of the cache file
+/// that only the tables something reads ever page in.
+pub struct TableBuffer(Box<dyn AsRef<[u8]> + Send + Sync>);
+
+impl TableBuffer {
+    pub fn new(bytes: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+        TableBuffer(Box::new(bytes))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
+impl std::fmt::Debug for TableBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TableBuffer({} bytes)", self.bytes().len())
+    }
+}
+
+/// The tag of an encoded [`LazyTable`]'s state.
+const LAZY_ENCODED: usize = 1;
+
+/// A decoded [`LazyTable`].
+struct Decoded<T> {
+    items: Vec<T>,
+    /// The buffer the table was decoded from, if any.
+    source: Option<std::sync::Arc<TableBuffer>>,
+}
+
+// SAFETY: the state is either nothing, an `Arc` of a shareable buffer, or
+// an owned `Box<Decoded<T>>` published through the atomic.
+unsafe impl<T: Send> Send for LazyTable<T> {}
+unsafe impl<T: Send + Sync> Sync for LazyTable<T> {}
+
+impl<T> LazyTable<T> {
+    fn new(state: usize, start: u32, end: u32) -> Self {
+        LazyTable {
+            state: std::sync::atomic::AtomicUsize::new(state),
+            start,
+            end,
+            _items: std::marker::PhantomData,
+        }
+    }
+
+    fn from_vec(items: Vec<T>) -> Self {
+        let decoded = Box::new(Decoded {
+            items,
+            source: None,
+        });
+        Self::new(Box::into_raw(decoded) as usize, 0, 0)
+    }
+
+    fn encoded(encoded: Encoded) -> Self {
+        let Encoded { buffer, start, end } = encoded;
+        Self::new(
+            std::sync::Arc::into_raw(buffer) as usize | LAZY_ENCODED,
+            start,
+            end,
+        )
+    }
+
+    /// The table, decoded with `decode` (or empty when that fails) if
+    /// this is its first read.
+    #[inline]
+    fn get(&self, decode: fn(&[u8]) -> Option<Vec<T>>) -> &Vec<T> {
+        use std::sync::atomic::Ordering;
+        let state = self.state.load(Ordering::Acquire);
+        if state != 0 && state & LAZY_ENCODED == 0 {
+            // SAFETY: a decoded table lives as long as `self`.
+            return unsafe { &(*(state as *const Decoded<T>)).items };
+        }
+        self.decode(state, decode)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode(&self, state: usize, decode: fn(&[u8]) -> Option<Vec<T>>) -> &Vec<T> {
+        use std::sync::atomic::Ordering;
+        let buffer = (state & !LAZY_ENCODED) as *const TableBuffer;
+        let (items, source) = if buffer.is_null() {
+            (Vec::new(), None)
+        } else {
+            // SAFETY: the state holds a count of this `Arc`, which the
+            // decoded table takes over if it is published (and which a
+            // published table keeps alive for any racing reader).
+            let source = unsafe { std::sync::Arc::from_raw(buffer) };
+            let items = source
+                .bytes()
+                .get(self.start as usize..self.end as usize)
+                .and_then(decode)
+                .unwrap_or_default();
+            (items, Some(source))
+        };
+        let fresh = Box::into_raw(Box::new(Decoded { items, source }));
+        match self.state.compare_exchange(
+            state,
+            fresh as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: just published; it lives as long as `self`.
+            Ok(_) => unsafe { &(*fresh).items },
+            Err(won) => {
+                // SAFETY: never published; the count it holds is the
+                // state's, which the winner took over.
+                let lost = unsafe { Box::from_raw(fresh) };
+                if let Some(source) = lost.source {
+                    let _ = std::sync::Arc::into_raw(source);
+                }
+                // SAFETY: the winner's decoded table lives as long as
+                // `self`.
+                unsafe { &(*(won as *const Decoded<T>)).items }
+            }
+        }
+    }
+
+    fn get_mut(&mut self, decode: fn(&[u8]) -> Option<Vec<T>>) -> &mut Vec<T> {
+        self.get(decode);
+        let state = *self.state.get_mut();
+        // SAFETY: `get` left a decoded table, and the exclusive borrow
+        // means no reader can still be decoding from its source.
+        let decoded = unsafe { &mut *(state as *mut Decoded<T>) };
+        decoded.source = None;
+        &mut decoded.items
+    }
+}
+
+impl<T> Drop for LazyTable<T> {
+    fn drop(&mut self) {
+        let state = *self.state.get_mut();
+        if state == 0 {
+            return;
+        }
+        // SAFETY: the state owns what it points at (see the type docs).
+        unsafe {
+            if state & LAZY_ENCODED != 0 {
+                drop(std::sync::Arc::from_raw(
+                    (state & !LAZY_ENCODED) as *const TableBuffer,
+                ));
+            } else {
+                drop(Box::from_raw(state as *mut Decoded<T>));
+            }
+        }
+    }
+}
+
+impl<T> Default for LazyTable<T> {
+    fn default() -> Self {
+        Self::new(0, 0, 0)
+    }
+}
+
+impl<T: Clone> Clone for LazyTable<T> {
+    fn clone(&self) -> Self {
+        let state = self.state.load(std::sync::atomic::Ordering::Acquire);
+        if state == 0 {
+            Self::default()
+        } else if state & LAZY_ENCODED != 0 {
+            // SAFETY: the state holds a count of this `Arc`; the clone
+            // takes another.
+            unsafe {
+                std::sync::Arc::increment_strong_count(
+                    (state & !LAZY_ENCODED) as *const TableBuffer,
+                );
+            }
+            Self::new(state, self.start, self.end)
+        } else {
+            // SAFETY: a decoded table lives as long as `self`.
+            Self::from_vec(unsafe { &(*(state as *const Decoded<T>)).items }.clone())
+        }
+    }
+}
+
 /// A code object's column spans (see [`CodeObject::coltable`]): a
 /// vector, or the code cache's encoding of one, decoded on first use.
 /// Most code never reports a column (only tracebacks and
 /// `co_positions()` read them), so a module loaded from the cache skips
 /// the work until something does.
 #[derive(Clone, Default)]
-pub struct ColTable {
-    // Boxed so that the (usual) undecoded table costs one word here.
-    #[allow(clippy::box_collection)]
-    spans: std::sync::OnceLock<Box<Vec<ColSpan>>>,
-    encoded: Option<Encoded>,
-}
+pub struct ColTable(LazyTable<ColSpan>);
 
 impl ColTable {
     /// The spans `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        ColTable {
-            spans: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
-    }
-
-    fn spans(&self) -> &Vec<ColSpan> {
-        self.spans.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_coltable(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        ColTable(LazyTable::encoded(encoded))
     }
 }
 
 impl From<Vec<ColSpan>> for ColTable {
     fn from(spans: Vec<ColSpan>) -> Self {
-        ColTable {
-            spans: std::sync::OnceLock::from(Box::new(spans)),
-            encoded: None,
-        }
+        ColTable(LazyTable::from_vec(spans))
     }
 }
 
@@ -864,15 +1046,13 @@ impl std::ops::Deref for ColTable {
     type Target = Vec<ColSpan>;
 
     fn deref(&self) -> &Vec<ColSpan> {
-        self.spans()
+        self.0.get(native_code::decode_coltable)
     }
 }
 
 impl std::ops::DerefMut for ColTable {
     fn deref_mut(&mut self) -> &mut Vec<ColSpan> {
-        self.spans();
-        self.encoded = None;
-        self.spans.get_mut().expect("decoded above")
+        self.0.get_mut(native_code::decode_coltable)
     }
 }
 
@@ -895,32 +1075,13 @@ impl std::fmt::Debug for ColTable {
 /// a module loaded from the cache keeps the compact form until something
 /// does, instead of four bytes per instruction.
 #[derive(Clone, Default)]
-pub struct LineTable {
-    // Boxed so that the (usual) undecoded table costs one word here.
-    #[allow(clippy::box_collection)]
-    lines: std::sync::OnceLock<Box<Vec<u32>>>,
-    encoded: Option<Encoded>,
-}
+pub struct LineTable(LazyTable<u32>);
 
 impl LineTable {
     /// The lines `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        LineTable {
-            lines: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
-    }
-
-    fn lines(&self) -> &Vec<u32> {
-        self.lines.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_linetable(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        LineTable(LazyTable::encoded(encoded))
     }
 }
 
@@ -928,28 +1089,19 @@ impl LineTable {
 /// encoding: a range of a buffer that every code object decoded from one
 /// module shares (see `native_code::decode`), so a module's tables take
 /// one allocation rather than three per code object.
-#[derive(Clone)]
 pub(crate) struct Encoded {
-    /// Set once the module's decoding finishes, before any table is read.
-    buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
+    buffer: std::sync::Arc<TableBuffer>,
     start: u32,
     end: u32,
 }
 
 impl Encoded {
-    pub(crate) fn new(
-        buffer: std::sync::Arc<std::sync::OnceLock<Box<[u8]>>>,
-        start: u32,
-        end: u32,
-    ) -> Self {
+    pub(crate) fn new(buffer: std::sync::Arc<TableBuffer>, start: u32, end: u32) -> Self {
         Encoded { buffer, start, end }
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.buffer
-            .get()
-            .and_then(|b| b.get(self.start as usize..self.end as usize))
-            .unwrap_or_default()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 }
 
@@ -957,30 +1109,19 @@ impl Encoded {
 /// or the code cache's encoding of one (two marks a byte), decoded on
 /// first use. Only the CPython wire form of the code reads them.
 #[derive(Clone, Default)]
-pub struct WireMarks {
-    // Boxed so that the (usual) undecoded marks cost one word here.
-    #[allow(clippy::box_collection)]
-    marks: std::sync::OnceLock<Box<Vec<u8>>>,
-    encoded: Option<Encoded>,
-}
+pub struct WireMarks(LazyTable<u8>);
 
 impl WireMarks {
     /// The marks `encoded` holds in the code cache's form (see
     /// `native_code`), decoded when first read.
     pub(crate) fn encoded(encoded: Encoded) -> Self {
-        WireMarks {
-            marks: std::sync::OnceLock::new(),
-            encoded: Some(encoded),
-        }
+        WireMarks(LazyTable::encoded(encoded))
     }
 }
 
 impl From<Vec<u8>> for WireMarks {
     fn from(marks: Vec<u8>) -> Self {
-        WireMarks {
-            marks: std::sync::OnceLock::from(Box::new(marks)),
-            encoded: None,
-        }
+        WireMarks(LazyTable::from_vec(marks))
     }
 }
 
@@ -988,14 +1129,7 @@ impl std::ops::Deref for WireMarks {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        self.marks.get_or_init(|| {
-            Box::new(
-                self.encoded
-                    .as_ref()
-                    .and_then(|e| native_code::decode_wire_marks(e.bytes()))
-                    .unwrap_or_default(),
-            )
-        })
+        self.0.get(native_code::decode_wire_marks)
     }
 }
 
@@ -1013,10 +1147,7 @@ impl std::fmt::Debug for WireMarks {
 
 impl From<Vec<u32>> for LineTable {
     fn from(lines: Vec<u32>) -> Self {
-        LineTable {
-            lines: std::sync::OnceLock::from(Box::new(lines)),
-            encoded: None,
-        }
+        LineTable(LazyTable::from_vec(lines))
     }
 }
 
@@ -1024,15 +1155,13 @@ impl std::ops::Deref for LineTable {
     type Target = Vec<u32>;
 
     fn deref(&self) -> &Vec<u32> {
-        self.lines()
+        self.0.get(native_code::decode_linetable)
     }
 }
 
 impl std::ops::DerefMut for LineTable {
     fn deref_mut(&mut self) -> &mut Vec<u32> {
-        self.lines();
-        self.encoded = None;
-        self.lines.get_mut().expect("decoded above")
+        self.0.get_mut(native_code::decode_linetable)
     }
 }
 
@@ -1048,6 +1177,8 @@ impl std::fmt::Debug for LineTable {
     }
 }
 
+/// A per-instruction source-column span (PEP-657). `col`/`end_col` are
+/// 0-based UTF-8 byte offsets within their respective source lines, and
 /// are `-1` when the column was not tracked. `end_lineno` is `0` when
 /// unknown (callers fall back to the instruction's start line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,7 +1357,7 @@ impl CodeObject {
                     }
                 }
                 OpCode::LoadDeref | OpCode::StoreDeref | OpCode::LoadClosure => {
-                    let combined: Vec<&String> =
+                    let combined: Vec<&Name> =
                         self.cellvars.iter().chain(self.freevars.iter()).collect();
                     if let Some(n) = combined.get(ins.arg as usize) {
                         out.push('(');
@@ -1620,12 +1751,12 @@ fn collect_module_imports(body: &[Stmt]) -> HashSet<String> {
                     for a in aliases {
                         match &a.asname {
                             Some(n) => {
-                                out.insert(n.clone());
+                                out.add_name(n);
                             }
                             // `import a.b.c` binds the first segment.
                             None => {
                                 let first = a.name.split('.').next().unwrap_or(&a.name);
-                                out.insert(first.to_owned());
+                                out.add_name(first);
                             }
                         }
                     }
@@ -1668,7 +1799,7 @@ fn collect_module_imports(body: &[Stmt]) -> HashSet<String> {
             }
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     walk(body, &mut out);
     out
 }
@@ -2317,7 +2448,7 @@ struct Compiler {
     /// `Nop`s standing in for a located `SETUP_*` pseudo-op (the `try:`
     /// line's NOP is really `SETUP_FINALLY`). The flowgraph keeps them
     /// as block-push instructions until `convert_pseudo_ops`.
-    setup_nops: std::collections::HashMap<u32, OpCode>,
+    setup_nops: fxhash::HashMap<u32, OpCode>,
     /// Suppress-path exit jumps parked by
     /// [`Self::emit_with_except_finish`] for its caller to patch.
     with_exit_jumps: Vec<u32>,
@@ -2678,6 +2809,7 @@ impl Compiler {
         let mut co = CodeObject::default();
         // Default qualname == name; nested scopes overwrite this via
         // `compute_child_qualname` once the parent context is known.
+        let name = Name::from(name);
         co.qualname = name.clone();
         co.name = name;
         co.filename = filename;
@@ -2689,10 +2821,10 @@ impl Compiler {
             name_index: intern::InternIndex::default(),
             kind,
             comp_kind: None,
-            bindings: IndexMap::new(),
-            explicit_globals: HashSet::new(),
-            comp_cell_only: HashSet::new(),
-            class_transparent_frees: HashSet::new(),
+            bindings: IndexMap::default(),
+            explicit_globals: HashSet::default(),
+            comp_cell_only: HashSet::default(),
+            class_transparent_frees: HashSet::default(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
@@ -2703,13 +2835,13 @@ impl Compiler {
             line_pinned: None,
             pinned_colspan: ColSpan::default(),
             current_span: (0, 0),
-            no_interrupt_jumps: HashSet::new(),
-            plain_jumps: HashSet::new(),
-            setup_nops: std::collections::HashMap::new(),
+            no_interrupt_jumps: HashSet::default(),
+            plain_jumps: HashSet::default(),
+            setup_nops: fxhash::HashMap::default(),
             with_exit_jumps: Vec::new(),
-            popblock_nops: HashSet::new(),
-            pseudo_cond_jumps: HashSet::new(),
-            backward_conds: HashSet::new(),
+            popblock_nops: HashSet::default(),
+            pseudo_cond_jumps: HashSet::default(),
+            backward_conds: HashSet::default(),
             stopiteration_wrap: true,
             inline_comp: 0,
             module_comp_plain_targets: Vec::new(),
@@ -2733,7 +2865,7 @@ impl Compiler {
             pep695_defaults: None,
             lazy_class_ctx: None,
             pending_lazy_class_ctx: None,
-            class_assigned: HashSet::new(),
+            class_assigned: HashSet::default(),
             deferred_annotations: Vec::new(),
             next_cond_annotation_index: 0,
             in_conditional_block: 0,
@@ -2828,7 +2960,7 @@ impl Compiler {
         if force_global && self.explicit_globals.contains(name) {
             return name.to_owned();
         }
-        let mut base = self.co.qualname.clone();
+        let mut base = self.co.qualname.to_string();
         if matches!(self.kind, CodeKind::Function) {
             base.push_str(".<locals>");
         }
@@ -2847,7 +2979,7 @@ impl Compiler {
         if matches!(self.kind, CodeKind::Module) {
             return String::new();
         }
-        let mut base = self.co.qualname.clone();
+        let mut base = self.co.qualname.to_string();
         if matches!(self.kind, CodeKind::Function) && self.annotation_qualname.is_none() {
             base.push_str(".<locals>");
         }
@@ -2865,10 +2997,10 @@ impl Compiler {
         // cell index. Keeping the internal order equal to slot order
         // makes the RFC 0068 wire codec's deref mapping invertible.
         if self.co.cellvars.len() > 1 {
-            let mut sorted: Vec<String> = self.co.cellvars.clone();
+            let mut sorted: Vec<Name> = self.co.cellvars.clone();
             sorted.sort_unstable_by_key(|c| match self.co.varnames.iter().position(|v| v == c) {
                 Some(p) => (0usize, p, String::new()),
-                None => (1usize, 0, c.clone()),
+                None => (1usize, 0, c.to_string()),
             });
             if sorted != self.co.cellvars {
                 let remap: Vec<u32> = self
@@ -2928,7 +3060,7 @@ impl Compiler {
                 self.free_order = sorted;
             }
         }
-        self.co.freevars = self.free_order.clone();
+        self.co.freevars = self.free_order.iter().map(Name::from).collect();
 
         // `codegen_wrap_in_stopiteration_handler` (PEP 479): the
         // generator-family body ends in an explicit `return None`, and
@@ -3559,7 +3691,7 @@ impl Compiler {
         if has_annotations {
             self.co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             if let Some(loc) = module_loc {
                 self.apply_annotate_loc(loc);
             }
@@ -3621,7 +3753,7 @@ impl Compiler {
     fn analyze_scope_module(&mut self, module: &Module) {
         // At module scope every assigned name is a global (CPython
         // does the same — locals at module scope ARE the globals).
-        let mut assigned = HashSet::new();
+        let mut assigned = HashSet::default();
         for s in &module.body {
             collect_assigned(s, &mut assigned);
             collect_walrus_stmt(s, &mut assigned);
@@ -3635,7 +3767,7 @@ impl Compiler {
         // accesses compile to the *_GLOBAL opcodes instead of *_NAME.
         // Observable when `exec` runs with distinct globals/locals
         // mappings (test_scope.testGlobalInParallelNestedFunctions).
-        let mut explicit = HashSet::new();
+        let mut explicit = HashSet::default();
         for s in &module.body {
             collect_global_decls_deep(s, &mut explicit);
         }
@@ -3655,7 +3787,7 @@ impl Compiler {
             }
         }
         self.explicit_globals = explicit;
-        let mut comp_cells = HashSet::new();
+        let mut comp_cells = HashSet::default();
         for s in &module.body {
             self.collect_comp_cells_stmt(s, &mut comp_cells);
         }
@@ -3698,7 +3830,7 @@ impl Compiler {
         collect: impl Fn(&FreeScan, &mut HashSet<String>),
     ) -> HashSet<String> {
         let scan = self.free_scan(inline_comps);
-        let mut needed = HashSet::new();
+        let mut needed = HashSet::default();
         collect(&scan, &mut needed);
         needed
     }
@@ -3731,10 +3863,10 @@ impl Compiler {
                 _ => {}
             }
         }
-        let mut all: Vec<String> = self.co.cellvars.clone();
+        let mut all: Vec<Name> = self.co.cellvars.clone();
         for name in comp_cells {
-            if !all.contains(&name) {
-                all.push(name);
+            if !all.iter().any(|c| *c == name) {
+                all.push(Name::from(name));
             }
         }
         all.sort_unstable();
@@ -3750,9 +3882,9 @@ impl Compiler {
         for p in params {
             self.bindings.insert(p.clone(), Binding::Local);
         }
-        let mut globals = HashSet::new();
-        let mut nonlocals = HashSet::new();
-        let mut assigned = HashSet::new();
+        let mut globals = HashSet::default();
+        let mut nonlocals = HashSet::default();
+        let mut assigned = HashSet::default();
         for s in body {
             collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
             // Walrus targets bind in this scope too (PEP 572) but live inside
@@ -3782,7 +3914,7 @@ impl Compiler {
             self.bindings.entry(n).or_insert(Binding::Local);
         }
         // Names referenced by directly-emitted bytecode in this scope.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         for s in body {
             collect_reads_stmt_fn(s, &mut reads);
         }
@@ -3846,13 +3978,13 @@ impl Compiler {
         for name in needed_in_inner {
             if matches!(self.bindings.get(&name), Some(Binding::Local)) {
                 self.bindings.insert(name.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(&name) {
-                    self.co.cellvars.push(name);
+                if !has_name(&self.co.cellvars, &name) {
+                    self.co.cellvars.push(Name::from(name));
                 }
             }
         }
         if self.lazy_class_ctx.is_none() {
-            let mut comp_cells = HashSet::new();
+            let mut comp_cells = HashSet::default();
             for s in body {
                 self.collect_comp_cells_stmt(s, &mut comp_cells);
             }
@@ -3862,7 +3994,7 @@ impl Compiler {
             // (`return b` next to `[(lambda: b) for b in xs]` is a
             // LOAD_GLOBAL, test_listcomps
             // `test_global_outside_cellvar_inside_plus_freevar`).
-            let mut used = HashSet::new();
+            let mut used = HashSet::default();
             for s in body {
                 for_each_scope_expr(s, &mut |e| {
                     self.collect_uses_through_inlined(e, &mut Vec::new(), &mut used)
@@ -3870,7 +4002,7 @@ impl Compiler {
             }
             for name in &comp_cells {
                 if used.contains(name) && !self.bindings.contains_key(name) {
-                    self.comp_cell_only.insert(name.clone());
+                    self.comp_cell_only.add_name(name);
                 }
             }
             self.register_comp_cells(comp_cells);
@@ -5482,7 +5614,7 @@ impl Compiler {
         // A class's own type parameters (and the header expressions
         // that mention them) mangle against the class's name.
         let mut type_params = type_params.clone();
-        let mut own_params: HashSet<String> = HashSet::new();
+        let mut own_params: HashSet<String> = HashSet::default();
         let mangle_header = is_class && !display.trim_start_matches('_').is_empty();
         if mangle_header {
             // Source spellings: `mangle_only_in_expr` renames exactly
@@ -5767,9 +5899,9 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(hidden_name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(hidden_name));
         inner.co.arg_count = arg_count;
-        inner.co.varnames = hidden_params.to_vec();
+        inner.co.varnames = hidden_params.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         if class_scope {
             // `.type_params` is read by the class body (always a cell,
@@ -5778,7 +5910,10 @@ impl Compiler {
             inner
                 .bindings
                 .insert(".type_params".to_owned(), Binding::Cell);
-            inner.co.cellvars.push(".type_params".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from(".type_params".to_owned()));
             inner
                 .bindings
                 .insert(".generic_base".to_owned(), Binding::Local);
@@ -5787,8 +5922,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6248,13 +6383,13 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_child_qualname(display);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(display));
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
         inner.co.kwonly_count = kwonly_count;
         inner.co.has_varargs = args.vararg.is_some();
         inner.co.has_varkeywords = args.kwarg.is_some();
-        inner.co.varnames = param_names.clone();
+        inner.co.varnames = param_names.iter().map(Name::from).collect();
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // Methods compiled inside a class body get an implicit
         // `__class__` free variable so `super()` (and explicit
@@ -6287,9 +6422,9 @@ impl Compiler {
         // never satisfies a nonlocal, and a class-body Local is a class
         // attribute, not a nonlocal binding target.
         {
-            let mut ng = HashSet::new();
-            let mut nl = HashSet::new();
-            let mut na = HashSet::new();
+            let mut ng = HashSet::default();
+            let mut nl = HashSet::default();
+            let mut na = HashSet::default();
             for s in body {
                 collect_decls(s, &mut ng, &mut nl, &mut na);
             }
@@ -6347,8 +6482,8 @@ impl Compiler {
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6504,7 +6639,7 @@ impl Compiler {
                 .insert("__classdict__".to_owned(), Binding::Free);
             inner.free_order.push("__classdict__".to_owned());
         }
-        inner.co.qualname = self.compute_annotation_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_annotation_child_qualname(name));
         // A lambda or comprehension inside the annotation scope is
         // named from *this* scope (`compiler_set_qualname` looks
         // through the annotation parent).
@@ -6512,14 +6647,14 @@ impl Compiler {
             Some((String::new(), String::new(), self.annotation_child_prefix()));
         inner.co.arg_count = 1;
         inner.co.posonly_count = 1;
-        inner.co.varnames = vec![FORMAT_PARAM.to_owned()];
+        inner.co.varnames = vec![Name::from(FORMAT_PARAM)];
         inner.current_line = loc.line;
         inner.analyze_scope_function(&[FORMAT_PARAM.to_owned()], analysis_body, &[&self.bindings]);
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
                 self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
-                    self.co.cellvars.push(free.clone());
+                if !has_name(&self.co.cellvars, free) {
+                    self.co.cellvars.push(Name::from(free.clone()));
                 }
             }
         }
@@ -6551,7 +6686,7 @@ impl Compiler {
         let mut code = inner.finish();
         // `co->co_localsplusnames = ("format", *co->co_localsplusnames[1:])`
         if is_annotate {
-            code.varnames[0] = "format".to_owned();
+            code.varnames[0] = Name::from("format");
             code.annotate_scope = true;
         }
         Ok(code)
@@ -6988,7 +7123,7 @@ impl Compiler {
         // A class body never reports `CO_NESTED` itself (no
         // `CO_OPTIMIZED`), but its methods inherit the nesting.
         inner.co.is_nested = self.child_is_nested();
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.current_line = entry_line.unwrap_or(self.current_line);
         // CPython only gives a class body the `__class__` closure cell —
         // and the trailing `__classcell__` store — when a method actually
@@ -7010,7 +7145,7 @@ impl Compiler {
                 class_body: false,
                 class_binds: None,
             };
-            let mut needed = HashSet::new();
+            let mut needed = HashSet::default();
             for s in body {
                 collect_inner_free(s, &self.bindings, &mut needed, &scan);
             }
@@ -7037,7 +7172,7 @@ impl Compiler {
                 || class_body_defs_claim_class_cell(body)
         };
         if needs_class_closure {
-            inner.co.cellvars.push("__class__".to_owned());
+            inner.co.cellvars.push(Name::from("__class__".to_owned()));
             inner.bindings.insert("__class__".to_owned(), Binding::Cell);
         }
         // PEP 695 (RFC 0051): annotation scopes created in this class
@@ -7053,7 +7188,10 @@ impl Compiler {
             .any(|s| stmt_needs_classdict(s, future_annotations))
             || needed.contains("__classdict__");
         if needs_classdict {
-            inner.co.cellvars.push("__classdict__".to_owned());
+            inner
+                .co
+                .cellvars
+                .push(Name::from("__classdict__".to_owned()));
             inner
                 .bindings
                 .insert("__classdict__".to_owned(), Binding::Cell);
@@ -7069,13 +7207,13 @@ impl Compiler {
             inner
                 .co
                 .cellvars
-                .push("__conditional_annotations__".to_owned());
+                .push(Name::from("__conditional_annotations__"));
             inner
                 .bindings
                 .insert("__conditional_annotations__".to_owned(), Binding::Cell);
         }
 
-        let mut assigned = HashSet::new();
+        let mut assigned = HashSet::default();
         for s in body {
             collect_assigned(s, &mut assigned);
         }
@@ -7089,9 +7227,9 @@ impl Compiler {
         // nested `def X`/`class X` gets a bare qualname (see
         // `compute_child_qualname`).
         {
-            let mut globals = HashSet::new();
-            let mut nonlocals = HashSet::new();
-            let mut decl_assigned = HashSet::new();
+            let mut globals = HashSet::default();
+            let mut nonlocals = HashSet::default();
+            let mut decl_assigned = HashSet::default();
             for s in body {
                 collect_decls(s, &mut globals, &mut nonlocals, &mut decl_assigned);
             }
@@ -7132,7 +7270,7 @@ impl Compiler {
 
         // Resolve outer-scope free vars for names read by the body that
         // aren't bound locally.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         for s in body {
             collect_reads_stmt(s, &mut reads);
         }
@@ -7198,7 +7336,7 @@ impl Compiler {
                     // the class scope (PEP 227) and still reach the
                     // enclosing function's `y` — forward the cell
                     // without touching the class-level binding.
-                    inner.class_transparent_frees.insert(name.clone());
+                    inner.class_transparent_frees.add_name(name);
                 } else {
                     inner
                         .bindings
@@ -7213,12 +7351,12 @@ impl Compiler {
         // `__classdict__` cells (`dictbytype` first, the implicit
         // cells appended by `compiler_enter_scope`).
         {
-            let mut comp_cells = HashSet::new();
+            let mut comp_cells = HashSet::default();
             for s in body {
                 inner.collect_comp_cells_stmt(s, &mut comp_cells);
             }
             if !comp_cells.is_empty() {
-                let implicit: Vec<String> = inner
+                let implicit: Vec<Name> = inner
                     .co
                     .cellvars
                     .iter()
@@ -7257,7 +7395,7 @@ impl Compiler {
             inner.emit_load_name("__name__");
             inner.emit_store_name("__module__");
             let qualname_str = inner.co.qualname.clone();
-            let qualname_const = inner.intern_constant(Constant::Str(qualname_str));
+            let qualname_const = inner.intern_constant(Constant::Str(qualname_str.to_string()));
             inner.emit(OpCode::LoadConst, qualname_const);
             inner.emit_store_name("__qualname__");
             // A `nonlocal __firstlineno__` declaration in the class body
@@ -7399,7 +7537,7 @@ impl Compiler {
         // the class scope (nested functions included; nested classes
         // collect their own), regardless of parameter names.
         {
-            let mut attrs: HashSet<String> = HashSet::new();
+            let mut attrs: HashSet<String> = HashSet::default();
             collect_self_attr_stores(unmangled_body, "self", &mut attrs);
             let mut attrs: Vec<String> = attrs.into_iter().collect();
             attrs.sort();
@@ -7432,9 +7570,9 @@ impl Compiler {
         let inner_freevars = inner_code.freevars.clone();
 
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
                     self.co.cellvars.push(free.clone());
                 }
             }
@@ -9554,7 +9692,7 @@ impl Compiler {
         if let Some(i) = self.co.varnames.iter().position(|n| n == name) {
             return i as u32;
         }
-        self.co.varnames.push(name.to_owned());
+        self.co.varnames.push(Name::from(name.to_owned()));
         (self.co.varnames.len() - 1) as u32
     }
 
@@ -11079,7 +11217,7 @@ impl Compiler {
         value: Option<&Expr>,
         generators: &[Comprehension],
     ) -> HashSet<String> {
-        let mut needed = HashSet::new();
+        let mut needed = HashSet::default();
         collect_comp_scope_inner_free(
             elt,
             value,
@@ -11088,7 +11226,7 @@ impl Compiler {
             &mut needed,
             &self.free_scan(true),
         );
-        let mut targets = HashSet::new();
+        let mut targets = HashSet::default();
         for g in generators {
             collect_target_names(&g.target, &mut targets);
         }
@@ -11143,7 +11281,7 @@ impl Compiler {
         // `[x for [x for x in r][0] in l]` keeps the outer `x` as the
         // enclosing scope's variable rather than a hidden local
         // (test_listcomps `test_nested_2`).
-        let mut used = HashSet::new();
+        let mut used = HashSet::default();
         for (gi, g) in generators.iter().enumerate() {
             Self::collect_names_shallow(&g.target, &mut used);
             if gi > 0 {
@@ -11191,7 +11329,7 @@ impl Compiler {
         let (kind, elt, value, generators) = match &expr.kind {
             ExprKind::Name(n) => {
                 if !bound.contains(n) {
-                    out.insert(n.clone());
+                    out.add_name(n);
                 }
                 return;
             }
@@ -11228,7 +11366,7 @@ impl Compiler {
         }
         let depth = bound.len();
         for g in generators {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             collect_target_names(&g.target, &mut names);
             bound.extend(names);
         }
@@ -11256,7 +11394,7 @@ impl Compiler {
     fn collect_names_shallow(expr: &Expr, out: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Name(n) => {
-                out.insert(n.clone());
+                out.add_name(n);
             }
             ExprKind::Lambda { args, .. } | ExprKind::TypeParamFn { args, .. } => {
                 for d in &args.defaults {
@@ -11507,11 +11645,11 @@ impl Compiler {
                     let pos = self.free_order.iter().position(|n| n == name).unwrap_or(0);
                     (self.co.cellvars.len() + pos) as u32
                 } else {
-                    if !self.co.cellvars.contains(name) {
+                    if !has_name(&self.co.cellvars, name) {
                         // Normally pre-registered by the scope's
                         // analysis (`register_comp_cells`); a late
                         // arrival still gets its slot.
-                        self.co.cellvars.push(name.clone());
+                        self.co.cellvars.push(Name::from(name.clone()));
                     }
                     self.co.cellvars.iter().position(|n| n == name).unwrap_or(0) as u32
                 };
@@ -11684,9 +11822,9 @@ impl Compiler {
         // PEP 3155: a comprehension scope gets a dotted qualname like any
         // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
         // `compiler_set_qualname` doesn't special-case comprehensions.
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.co.qualname = Name::unpooled(&self.compute_child_qualname(name));
         inner.co.arg_count = 1;
-        inner.co.varnames.push(".0".to_owned());
+        inner.co.varnames.push(Name::from(".0".to_owned()));
         inner.bindings.insert(".0".to_owned(), Binding::Local);
         if is_async_comp && !matches!(kind, CompKind::Generator) {
             inner.co.is_coroutine = true;
@@ -11720,7 +11858,7 @@ impl Compiler {
         // an extra strong reference for the whole activation, and pandas'
         // chained-assignment detection (`getrefcount(self) <= 3` in
         // `DataFrame.__setitem__`) is calibrated against CPython counts.
-        let mut reads = HashSet::new();
+        let mut reads = HashSet::default();
         collect_reads_expr(elt, &mut reads);
         if let Some(v) = value {
             collect_reads_expr(v, &mut reads);
@@ -11743,7 +11881,7 @@ impl Compiler {
         // one — silently aliasing later closure reads. CPython's symtable binds
         // comprehension targets first for exactly this reason.
         for g in generators {
-            let mut assigned = HashSet::new();
+            let mut assigned = HashSet::default();
             collect_target_names(&g.target, &mut assigned);
             for n in assigned {
                 inner.bindings.insert(n, Binding::Local);
@@ -11786,8 +11924,8 @@ impl Compiler {
                     _ => {
                         if matches!(enclosing, None | Some(Binding::Local)) {
                             self.bindings.insert(name.clone(), Binding::Cell);
-                            if !self.co.cellvars.contains(&name) {
-                                self.co.cellvars.push(name.clone());
+                            if !has_name(&self.co.cellvars, &name) {
+                                self.co.cellvars.push(Name::from(name.clone()));
                             }
                         }
                         Binding::Free
@@ -11871,13 +12009,13 @@ impl Compiler {
             for name in needed_in_inner {
                 if matches!(inner.bindings.get(&name), Some(Binding::Local)) {
                     inner.bindings.insert(name.clone(), Binding::Cell);
-                    if !inner.co.cellvars.contains(&name) {
-                        inner.co.cellvars.push(name);
+                    if !has_name(&inner.co.cellvars, &name) {
+                        inner.co.cellvars.push(Name::from(name));
                     }
                 }
             }
             if inner.lazy_class_ctx.is_none() {
-                let mut comp_cells = HashSet::new();
+                let mut comp_cells = HashSet::default();
                 for (gi, g) in generators.iter().enumerate() {
                     if gi > 0 {
                         inner.collect_comp_cells_expr(&g.iter, &mut comp_cells);
@@ -11949,9 +12087,9 @@ impl Compiler {
 
         // Promote our locals to cells where needed.
         for free in &inner_freevars {
-            if matches!(self.bindings.get(free), Some(Binding::Local)) {
-                self.bindings.insert(free.clone(), Binding::Cell);
-                if !self.co.cellvars.contains(free) {
+            if matches!(self.bindings.get(free.as_str()), Some(Binding::Local)) {
+                self.bindings.insert(free.to_string(), Binding::Cell);
+                if !has_name(&self.co.cellvars, free) {
                     self.co.cellvars.push(free.clone());
                 }
             }
@@ -12393,7 +12531,7 @@ fn check_comp_walrus_nest(
                         ));
                     }
                     for scope in stack.iter_mut() {
-                        scope.walrus_targets.insert(n.clone());
+                        scope.walrus_targets.add_name(n);
                     }
                 }
                 visit(value, in_class_body, stack)
@@ -12522,7 +12660,7 @@ fn check_comp_walrus_nest(
         // iterable (test_named_expressions' "Lambda expression" /
         // "Nested comprehension body" cases).
         reject_walrus_in_iterable(&g.iter)?;
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         collect_target_names(&g.target, &mut names);
         for scope in stack.iter() {
             for n in &names {
@@ -12944,7 +13082,7 @@ fn collect_pep695_header_reads(
     out: &mut HashSet<String>,
     scan: &FreeScan,
 ) {
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     let mut read = |e: &Expr| collect_class_visible_reads(e, outer_bindings, &mut reads, scan);
     let (type_params, fn_parts) = match &stmt.kind {
         StmtKind::FunctionDef {
@@ -13216,7 +13354,7 @@ fn collect_inner_free(
     // enclosing `T = …` must not become a cell for a nested
     // `def f[T](x: T)`).
     if let Some(type_params) = generic_type_params(stmt) {
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         collect_pep695_header_reads(stmt, outer_bindings, &mut inner, scan);
         collect_inner_free_impl(stmt, outer_bindings, &mut inner, scan);
         remove_type_param_names(stmt, type_params, &mut inner);
@@ -13353,25 +13491,25 @@ fn collect_inner_free_impl(
             // The body is its own scope, no longer directly in a class
             // body.
             let scan = &scan.nested();
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             for a in &args.args {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(va) = &args.vararg {
-                inner_locals.insert(va.name.clone());
+                inner_locals.add_name(&va.name);
             }
             for a in &args.kwonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(kw) = &args.kwarg {
-                inner_locals.insert(kw.name.clone());
+                inner_locals.add_name(&kw.name);
             }
-            let mut inner_globals = HashSet::new();
-            let mut inner_nonlocals = HashSet::new();
-            let mut inner_assigned = HashSet::new();
+            let mut inner_globals = HashSet::default();
+            let mut inner_nonlocals = HashSet::default();
+            let mut inner_assigned = HashSet::default();
             for s in body {
                 collect_decls(
                     s,
@@ -13386,11 +13524,11 @@ fn collect_inner_free_impl(
             // needed-from-outer regardless of whether `outer_bindings`
             // knows about it yet (it'll be promoted on the way down).
             for n in &inner_nonlocals {
-                out.insert(n.clone());
+                out.add_name(n);
             }
             // Reads inside the inner that aren't locals there →
             // candidates for promotion.
-            let mut inner_reads = HashSet::new();
+            let mut inner_reads = HashSet::default();
             for s in body {
                 collect_reads_stmt_fn(s, &mut inner_reads);
             }
@@ -13417,7 +13555,7 @@ fn collect_inner_free_impl(
             // the child's cell, not ours (`def _tp_cache(func): def
             // decorator(func): def inner(): func` must not promote the
             // outer `func`). `nonlocal` in the child reaches through.
-            let mut deeper = HashSet::new();
+            let mut deeper = HashSet::default();
             for s in body {
                 collect_inner_free(s, outer_bindings, &mut deeper, scan);
             }
@@ -13464,26 +13602,26 @@ fn collect_inner_free_impl(
                 mangled_body = b;
                 &mangled_body
             };
-            let mut class_assigned = HashSet::new();
-            let mut class_globals = HashSet::new();
-            let mut class_nonlocals = HashSet::new();
+            let mut class_assigned = HashSet::default();
+            let mut class_globals = HashSet::default();
+            let mut class_nonlocals = HashSet::default();
             for s in body {
                 collect_assigned(s, &mut class_assigned);
                 collect_decls(
                     s,
                     &mut class_globals,
                     &mut class_nonlocals,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 );
             }
             // Names referenced *anywhere* in the class body (including
             // method bodies) that aren't bound inside the class are
             // candidates for outer-scope free promotion.
-            let mut class_reads = HashSet::new();
+            let mut class_reads = HashSet::default();
             for s in body {
                 collect_reads_stmt(s, &mut class_reads);
             }
-            let mut from_body = HashSet::new();
+            let mut from_body = HashSet::default();
             for r in class_reads {
                 if !class_assigned.contains(&r) {
                     from_body.insert(r);
@@ -13494,7 +13632,7 @@ fn collect_inner_free_impl(
             // enclosing function's `__firstlineno__` a cell even though
             // the body never reads it).
             for n in &class_nonlocals {
-                from_body.insert(n.clone());
+                from_body.add_name(n);
             }
             // The nested scopes are analyzed as *the class body* sees
             // them, not as this scope does: an inlined comprehension in
@@ -13643,7 +13781,7 @@ fn collect_inner_free_impl(
                 // (GLOBAL_IMPLICIT), never as a free variable of the
                 // enclosing function (`class D: C: C = field()` inside
                 // a `def` where `C` is a local).
-                let mut reads = HashSet::new();
+                let mut reads = HashSet::default();
                 collect_reads_expr(annotation, &mut reads);
                 for r in reads {
                     if !scan.class_binds.as_ref().is_some_and(|b| b.contains(&r)) {
@@ -13693,9 +13831,9 @@ fn collect_inner_free_impl(
 /// `True` when a method body references `super` or `__class__` so the
 /// compiler knows to capture the class's `__class__` cell.
 fn method_references_class(body: &[Stmt]) -> bool {
-    let mut globals = HashSet::new();
-    let mut nonlocals = HashSet::new();
-    let mut assigned = HashSet::new();
+    let mut globals = HashSet::default();
+    let mut nonlocals = HashSet::default();
+    let mut assigned = HashSet::default();
     for s in body {
         collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
         collect_walrus_stmt(s, &mut assigned);
@@ -13790,7 +13928,7 @@ fn body_reads_super_or_class(body: &[Stmt]) -> bool {
         }
         any_class(stmts)
     };
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     if has_nested_class(body) {
         // Only clone when there is a class body to blank out.
         let mut stripped = body.to_vec();
@@ -14557,7 +14695,7 @@ fn collect_class_visible_reads(
     out: &mut HashSet<String>,
     scan: &FreeScan,
 ) {
-    let mut all = HashSet::new();
+    let mut all = HashSet::default();
     collect_reads_expr(expr, &mut all);
     if let Some(binds) = &scan.class_binds {
         all.retain(|n| !binds.contains(n));
@@ -14613,7 +14751,7 @@ fn collect_inlined_comp_inner_free(
     if let Some(first) = generators.first() {
         collect_inner_free_expr(&first.iter, outer_bindings, out, scan);
     }
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     collect_comp_scope_inner_free(elt, value, generators, outer_bindings, &mut inner, scan);
     if scan.class_body {
         // The class namespace is invisible from inside the
@@ -14633,7 +14771,7 @@ fn collect_inlined_comp_inner_free(
         }
         collect_reads_expr(elt, &mut inner);
     }
-    let mut bound = HashSet::new();
+    let mut bound = HashSet::default();
     for g in generators {
         collect_target_names(&g.target, &mut bound);
     }
@@ -14684,23 +14822,23 @@ fn collect_inner_free_expr(
             collect_class_visible_reads(body, outer_bindings, out, scan);
         }
         ExprKind::Lambda { args, body } | ExprKind::TypeParamFn { args, body } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for a in &args.posonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             for a in &args.args {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(va) = &args.vararg {
-                inner_locals.insert(va.name.clone());
+                inner_locals.add_name(&va.name);
             }
             for a in &args.kwonlyargs {
-                inner_locals.insert(a.name.clone());
+                inner_locals.add_name(&a.name);
             }
             if let Some(kw) = &args.kwarg {
-                inner_locals.insert(kw.name.clone());
+                inner_locals.add_name(&kw.name);
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(body, &mut reads);
             for r in reads {
                 if !inner_locals.contains(&r) {
@@ -14734,11 +14872,11 @@ fn collect_inner_free_expr(
         ExprKind::ListComp { elt, generators }
         | ExprKind::SetComp { elt, generators }
         | ExprKind::GeneratorExp { elt, generators } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for g in generators {
                 collect_target_names(&g.target, &mut inner_locals);
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(elt, &mut reads);
             for (gi, g) in generators.iter().enumerate() {
                 // The outermost iterable evaluates in the *enclosing*
@@ -14770,11 +14908,11 @@ fn collect_inner_free_expr(
             value,
             generators,
         } => {
-            let mut inner_locals: HashSet<String> = HashSet::new();
+            let mut inner_locals: HashSet<String> = HashSet::default();
             for g in generators {
                 collect_target_names(&g.target, &mut inner_locals);
             }
-            let mut reads = HashSet::new();
+            let mut reads = HashSet::default();
             collect_reads_deep(key, &mut reads);
             collect_reads_deep(value, &mut reads);
             for (gi, g) in generators.iter().enumerate() {
@@ -14906,7 +15044,7 @@ fn collect_self_attr_stores(stmts: &[Stmt], self_name: &str, out: &mut HashSet<S
         match &e.kind {
             ExprKind::Attribute { value, attr } => {
                 if matches!(&value.kind, ExprKind::Name(n) if n == self_name) {
-                    out.insert(attr.clone());
+                    out.add_name(attr);
                 }
             }
             ExprKind::Tuple(elts) | ExprKind::List(elts) => {
@@ -15366,7 +15504,7 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
         | StmtKind::AsyncFunctionDef { name, .. }
         | StmtKind::ClassDef { name, .. }
         | StmtKind::TypeAlias { name, .. } => {
-            out.insert(name.clone());
+            out.add_name(name);
         }
         StmtKind::Try {
             body,
@@ -15379,7 +15517,7 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
             }
             for h in handlers {
                 if let Some(n) = &h.name {
-                    out.insert(n.clone());
+                    out.add_name(n);
                 }
                 for s in &h.body {
                     collect_assigned(s, out);
@@ -15692,7 +15830,7 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
         | ExprKind::SetComp { elt, generators }
         | ExprKind::GeneratorExp { elt, generators } => {
             collect_comp_scope_walruses(elt, None, generators, &mut |n| {
-                out.insert(n.to_owned());
+                out.add_name(n);
             });
         }
         ExprKind::DictComp {
@@ -15701,7 +15839,7 @@ fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
             generators,
         } => {
             collect_comp_scope_walruses(key, Some(value), generators, &mut |n| {
-                out.insert(n.to_owned());
+                out.add_name(n);
             });
         }
         ExprKind::Yield(value) => {
@@ -15737,7 +15875,7 @@ fn collect_global_decls_deep(stmt: &Stmt, out: &mut HashSet<String>) {
     match &stmt.kind {
         StmtKind::Global(ns) => {
             for n in ns {
-                out.insert(n.clone());
+                out.add_name(n);
             }
         }
         StmtKind::FunctionDef { body, .. }
@@ -15828,7 +15966,7 @@ fn class_level_reads_dunder(body: &[Stmt], name: &str) -> bool {
 /// enclosing function's `c`, while `class B: c: str` or `class B: x = 1;
 /// y = x` alone never does).
 fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut inner, false);
     }
@@ -15847,16 +15985,16 @@ fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
     // when read at class level, and through `__classdict__` in a
     // class-visible annotation scope; only a nested scope's free read
     // of it looks past the class.
-    let mut class_bound = HashSet::new();
-    let mut class_globals = HashSet::new();
-    let mut class_nonlocals = HashSet::new();
+    let mut class_bound = HashSet::default();
+    let mut class_globals = HashSet::default();
+    let mut class_nonlocals = HashSet::default();
     for s in body {
         collect_assigned(s, &mut class_bound);
         collect_decls(
             s,
             &mut class_globals,
             &mut class_nonlocals,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         );
     }
     let shadowed: Vec<String> = inner
@@ -15868,7 +16006,7 @@ fn class_body_propagating_reads(body: &[Stmt], out: &mut HashSet<String>) {
         .cloned()
         .collect();
     if !shadowed.is_empty() {
-        let mut nested = HashSet::new();
+        let mut nested = HashSet::default();
         class_nested_scope_reads(body, &mut nested);
         for n in shadowed {
             if !nested.contains(&n) {
@@ -15894,7 +16032,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
                 {
                     expr_nested(d, out);
                 }
-                let mut inner = HashSet::new();
+                let mut inner = HashSet::default();
                 collect_reads_expr(body, &mut inner);
                 for a in args
                     .posonlyargs
@@ -15934,7 +16072,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
         if let Some(first) = generators.first() {
             expr_nested(&first.iter, out);
         }
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         for (gi, g) in generators.iter().enumerate() {
             if gi > 0 {
                 collect_reads_expr(&g.iter, &mut inner);
@@ -15948,7 +16086,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
             collect_reads_expr(v, &mut inner);
         }
         collect_reads_expr(elt, &mut inner);
-        let mut bound = HashSet::new();
+        let mut bound = HashSet::default();
         for g in generators {
             collect_target_names(&g.target, &mut bound);
         }
@@ -16009,7 +16147,7 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
                     mangled_body = b;
                     &mangled_body
                 };
-                let mut through = HashSet::new();
+                let mut through = HashSet::default();
                 class_body_propagating_reads(body, &mut through);
                 for dunder in CLASS_DUNDERS {
                     through.remove(dunder);
@@ -16128,11 +16266,11 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
 /// reach up even when only written). Decorators, defaults and
 /// annotations are the enclosing scope's business.
 fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
-    let mut nested_reads = HashSet::new();
+    let mut nested_reads = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut nested_reads, true);
     }
-    let mut nested_locals: HashSet<String> = HashSet::new();
+    let mut nested_locals: HashSet<String> = HashSet::default();
     for a in args
         .posonlyargs
         .iter()
@@ -16141,11 +16279,11 @@ fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
         .chain(&args.vararg)
         .chain(&args.kwarg)
     {
-        nested_locals.insert(a.name.clone());
+        nested_locals.add_name(&a.name);
     }
-    let mut nested_globals = HashSet::new();
-    let mut nested_nonlocals = HashSet::new();
-    let mut nested_assigned = HashSet::new();
+    let mut nested_globals = HashSet::default();
+    let mut nested_nonlocals = HashSet::default();
+    let mut nested_assigned = HashSet::default();
     for s in body {
         collect_decls(
             s,
@@ -16291,12 +16429,12 @@ fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
             // function.
             _ => {
                 if stmt_reads_dunder_at_class_level(stmt, name) {
-                    out.insert(name.to_owned());
+                    out.add_name(name);
                 }
             }
         }
     }
-    let mut reads = HashSet::new();
+    let mut reads = HashSet::default();
     for s in body {
         stmt_reads(s, &mut reads, name);
     }
@@ -16308,7 +16446,7 @@ fn class_body_reads_dunder(body: &[Stmt], name: &str) -> bool {
 /// scope are skipped except for the parts evaluated in the enclosing
 /// scope (lambda defaults, a comprehension's outermost iterable).
 fn stmt_reads_dunder_at_class_level(stmt: &Stmt, name: &str) -> bool {
-    let mut all = HashSet::new();
+    let mut all = HashSet::default();
     collect_reads_stmt(stmt, &mut all);
     if !all.contains(name) {
         return false;
@@ -16374,12 +16512,12 @@ fn collect_decls(
     match &stmt.kind {
         StmtKind::Global(ns) => {
             for n in ns {
-                globals.insert(n.clone());
+                globals.add_name(n);
             }
         }
         StmtKind::Nonlocal(ns) => {
             for n in ns {
-                nonlocals.insert(n.clone());
+                nonlocals.add_name(n);
             }
         }
         StmtKind::Assign { targets, .. } => {
@@ -16445,7 +16583,7 @@ fn collect_decls(
         | StmtKind::AsyncFunctionDef { name, .. }
         | StmtKind::ClassDef { name, .. }
         | StmtKind::TypeAlias { name, .. } => {
-            assigned.insert(name.clone());
+            assigned.add_name(name);
         }
         StmtKind::Try {
             body,
@@ -16458,7 +16596,7 @@ fn collect_decls(
             }
             for h in handlers {
                 if let Some(n) = &h.name {
-                    assigned.insert(n.clone());
+                    assigned.add_name(n);
                 }
                 for s in &h.body {
                     collect_decls(s, globals, nonlocals, assigned);
@@ -16593,7 +16731,7 @@ fn collect_target_names_ordered(expr: &Expr, out: &mut Vec<String>) {
 fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Name(n) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         ExprKind::Tuple(items) | ExprKind::List(items) => {
             for x in items {
@@ -16619,7 +16757,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
         | PatternKind::Capture(None)
         | PatternKind::Star(None) => {}
         PatternKind::Capture(Some(n)) | PatternKind::Star(Some(n)) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         PatternKind::Sequence(items) => {
             for p in items {
@@ -16631,7 +16769,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 collect_pattern_names(p, out);
             }
             if let Some(Some(n)) = rest {
-                out.insert(n.clone());
+                out.add_name(n);
             }
         }
         PatternKind::Class {
@@ -16652,7 +16790,7 @@ fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
             }
         }
         PatternKind::As { pattern, name } => {
-            out.insert(name.clone());
+            out.add_name(name);
             collect_pattern_names(pattern, out);
         }
     }
@@ -17002,7 +17140,7 @@ fn collect_reads_stmt_in(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: bool)
     // See `collect_inner_free`: a generic statement's type parameters
     // are its hidden scope's locals, never reads of this scope.
     if let Some(type_params) = generic_type_params(stmt) {
-        let mut inner = HashSet::new();
+        let mut inner = HashSet::default();
         collect_reads_stmt_in_impl(stmt, &mut inner, fn_scope);
         remove_type_param_names(stmt, type_params, &mut inner);
         out.extend(inner);
@@ -17134,7 +17272,7 @@ fn collect_reads_stmt_in_impl(stmt: &Stmt, out: &mut HashSet<String>, fn_scope: 
         StmtKind::TypeAlias {
             type_params, value, ..
         } => {
-            let mut nested = HashSet::new();
+            let mut nested = HashSet::default();
             collect_reads_expr(value, &mut nested);
             for tp in type_params {
                 if let TypeParamKind::TypeVar { bound: Some(b) } = &tp.kind {
@@ -17321,7 +17459,7 @@ fn collect_comp_reads(
     if let Some(first) = generators.first() {
         collect_reads_expr(&first.iter, out);
     }
-    let mut inner = HashSet::new();
+    let mut inner = HashSet::default();
     for (gi, g) in generators.iter().enumerate() {
         if gi > 0 {
             collect_reads_expr(&g.iter, &mut inner);
@@ -17337,7 +17475,7 @@ fn collect_comp_reads(
         collect_reads_expr(v, &mut inner);
     }
     collect_reads_expr(elt, &mut inner);
-    let mut bound = HashSet::new();
+    let mut bound = HashSet::default();
     for g in generators {
         collect_target_names(&g.target, &mut bound);
     }
@@ -17350,7 +17488,7 @@ fn collect_comp_reads(
 fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Name(n) => {
-            out.insert(n.clone());
+            out.add_name(n);
         }
         ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => {
             collect_reads_expr(value, out);
@@ -17417,7 +17555,7 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
             }
             // The body is its own scope: what it reads reaches us only
             // when the lambda doesn't bind it itself (its parameters).
-            let mut inner = HashSet::new();
+            let mut inner = HashSet::default();
             collect_reads_expr(body, &mut inner);
             for a in args
                 .posonlyargs

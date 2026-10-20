@@ -322,7 +322,7 @@ pub(super) fn run<const EFFECT: bool>(
 /// [`run`] for a plan whose native code is already compiled, with the
 /// caller's recursion `depth` in hand: `None` when there is no native
 /// code (yet), otherwise the evaluation's outcome.
-#[inline]
+#[inline(always)]
 pub(super) fn run_compiled<const EFFECT: bool>(
     interp: &Interpreter,
     code: &CodeObject,
@@ -400,8 +400,8 @@ unsafe fn cx<'a>(ctx: *mut Ctx<'static>) -> &'a mut Ctx<'a> {
 
 /// A frame's stamp slots (its global and class attribute caches).
 #[inline(always)]
-fn stamps(ext: &CodeConstObjects) -> &[crate::StampSlot] {
-    ext.stamp_slots.get().map_or(&[], |s| &s[..])
+fn stamps(ext: &CodeConstObjects) -> crate::Sites<'_, crate::StampSlot> {
+    ext.stamp_sites()
 }
 
 unsafe extern "C" fn h_global(
@@ -539,10 +539,7 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         let ver = inst.cls_raw().attr_version.get();
         // A property's getter answered (see `plan_getter`): nothing to
         // remember.
-        let site = ext
-            .method_slots
-            .get()
-            .and_then(|s| s.get((pc_name & 0xffff) as usize));
+        let site = ext.method_slot((pc_name & 0xffff) as usize);
         // SAFETY: GIL-serialized; the references don't outlive the check.
         if site.is_some_and(|s| unsafe { s.getter_peek(ver) }.is_some()) {
             return status;
@@ -901,6 +898,13 @@ unsafe impl Send for Engine {}
 static ENGINE: std::sync::Mutex<Option<Option<Engine>>> = std::sync::Mutex::new(None);
 
 impl Engine {
+    /// Drop the function and builder contexts for empty ones (see the
+    /// frame compiler's `Engine::release`).
+    fn release(&mut self) {
+        self.ctx = self.module.make_context();
+        self.fbctx = FunctionBuilderContext::new();
+    }
+
     fn new() -> Option<Engine> {
         if !tags_match() {
             return None;
@@ -1032,8 +1036,7 @@ fn compile_with(
     };
     let Some((depth, frames, keep, fields, globals, methods)) = lowered else {
         // An unfinished function leaves the builder's state behind.
-        engine.fbctx = FunctionBuilderContext::new();
-        engine.module.clear_context(&mut engine.ctx);
+        engine.release();
         return None;
     };
     let defined = engine.module.define_function(id, &mut engine.ctx);
@@ -1043,7 +1046,7 @@ fn compile_with(
             code.qualname
         );
     }
-    engine.module.clear_context(&mut engine.ctx);
+    engine.release();
     defined.ok()?;
     engine.module.finalize_definitions().ok()?;
     let func = engine.module.get_finalized_function(id);

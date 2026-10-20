@@ -16,6 +16,7 @@ use weavepy_parser::ast::{
     PatternKind, Stmt, StmtKind,
 };
 
+use crate::fxhash::NameSet;
 use crate::CompileError;
 
 /// `__future__` features understood by CPython 3.13. All are mandatory
@@ -68,17 +69,17 @@ struct Scope {
     /// for functions; the parameter names themselves for
     /// [`ScopeKind::TypeParams`]. Consulted when resolving `nonlocal`
     /// declarations from nested scopes.
-    bound: std::collections::HashSet<String>,
+    bound: crate::fxhash::HashSet<String>,
     /// Names *read* so far, in source order (CPython's `USE` flag) —
     /// a later `global`/`nonlocal` for one of these is "used prior to
     /// … declaration".
-    used: std::collections::HashSet<String>,
+    used: crate::fxhash::HashSet<String>,
     /// Names assigned/deleted/bound so far (`DEF_LOCAL`) — a later
     /// declaration is "assigned to before … declaration".
-    assigned: std::collections::HashSet<String>,
+    assigned: crate::fxhash::HashSet<String>,
     /// Names annotated so far (`DEF_ANNOT`) — can never be declared
     /// global/nonlocal in this scope, before *or* after.
-    annotated: std::collections::HashSet<String>,
+    annotated: crate::fxhash::HashSet<String>,
 }
 
 impl Scope {
@@ -87,10 +88,10 @@ impl Scope {
             kind,
             params: Vec::new(),
             directives: Vec::new(),
-            bound: std::collections::HashSet::new(),
-            used: std::collections::HashSet::new(),
-            assigned: std::collections::HashSet::new(),
-            annotated: std::collections::HashSet::new(),
+            bound: crate::fxhash::HashSet::default(),
+            used: crate::fxhash::HashSet::default(),
+            assigned: crate::fxhash::HashSet::default(),
+            annotated: crate::fxhash::HashSet::default(),
         }
     }
 
@@ -168,7 +169,7 @@ impl Validator<'_> {
 
     /// Record a *read* of `name` in the current scope (CPython `USE`).
     fn mark_use(&mut self, name: &str) {
-        self.scope_mut().used.insert(name.to_owned());
+        self.scope_mut().used.add_name(name);
     }
 
     /// Record a binding of `name` (CPython `DEF_LOCAL`). Comprehension
@@ -180,7 +181,7 @@ impl Validator<'_> {
             .iter()
             .rposition(|s| s.kind != ScopeKind::Comprehension)
             .expect("scope stack always has a non-comprehension scope");
-        self.scopes[idx].assigned.insert(name.to_owned());
+        self.scopes[idx].assigned.add_name(name);
     }
 
     /// Visit an annotation expression. Under PEP 563 the annotation is
@@ -281,12 +282,12 @@ impl Validator<'_> {
         // Body-level bindings (assignments, defs, imports, walrus
         // targets) participate in `nonlocal` resolution from nested
         // scopes.
-        let mut bound: std::collections::HashSet<String> =
+        let mut bound: crate::fxhash::HashSet<String> =
             params.iter().map(|(n, _)| (*n).to_owned()).collect();
         {
-            let mut globals = std::collections::HashSet::new();
-            let mut nonlocals = std::collections::HashSet::new();
-            let mut assigned = std::collections::HashSet::new();
+            let mut globals = crate::fxhash::HashSet::default();
+            let mut nonlocals = crate::fxhash::HashSet::default();
+            let mut assigned = crate::fxhash::HashSet::default();
             for s in body {
                 crate::collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
                 crate::collect_walrus_stmt(s, &mut assigned);
@@ -583,7 +584,7 @@ impl Validator<'_> {
                                 }
                             }
                             let n = n.clone();
-                            self.scope_mut().annotated.insert(n.clone());
+                            self.scope_mut().annotated.add_name(&n);
                             self.mark_assigned(&n);
                         } else {
                             let n = n.clone();

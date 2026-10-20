@@ -51,10 +51,11 @@ pub enum Dunder {
     Call,
     Set,
     Delete,
+    Class,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -69,6 +70,7 @@ impl Dunder {
             Self::Call => "__call__",
             Self::Set => "__set__",
             Self::Delete => "__delete__",
+            Self::Class => "__class__",
         }
     }
 }
@@ -142,6 +144,38 @@ impl DunderInfo {
     pub fn user_defined(self) -> bool {
         self.present() && !self.is_none() && !self.builtin_owner()
     }
+}
+
+/// The questions [`TypeObject::memo_verdict`] memoizes per class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Verdict {
+    /// An instance attribute `name` that no class-level source supplies
+    /// (see `attr_certainly_missing`).
+    AttrMissing = 1,
+    /// The class reduces as `copyreg._reduce_newobj` would for a plain
+    /// instance (see `Interpreter::reduce_newobj_plain`); `name` unused.
+    PlainNewobj = 2,
+    /// A builtin class's own dict has no class method `name` (see
+    /// `Interpreter::leaf_load_type_attr`).
+    NoNativeClassMethod = 3,
+    /// No builtin base on the class's MRO supplies a slot wrapper or a
+    /// type-dict entry `name` (see `builtin_slot_wrapper`).
+    NoSlotWrapper = 4,
+    /// An instance store of `name` is a plain instance-dict store: default
+    /// attribute access and setting, and no class attribute in the way
+    /// but a function or a plain value (see `Interpreter::leaf_store_attr`).
+    PlainStore = 5,
+    /// A builtin class answered `name` with `AttributeError` (recorded
+    /// after the lookup, for `hasattr`; asyncio's `isfuture` asks
+    /// `hasattr(type(coro), '_asyncio_future_blocking')` for every
+    /// coroutine it is handed). See [`TypeObject::verdict_record`].
+    TypeAttrMissing = 6,
+    /// A value of the builtin class (one whose attributes all come from
+    /// the class, see `builtin_value_class`) answered `name` with
+    /// `AttributeError`: enum asks `hasattr(value, '__get__')` of every
+    /// member value. Recorded like [`Self::TypeAttrMissing`].
+    ValueAttrMissing = 7,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -266,7 +300,6 @@ mod attr_version_tests {
 /// whose hash and length happen to collide.
 pub(crate) mod type_cache {
     use std::cell::RefCell;
-    use std::hash::Hasher;
     use std::rc::Rc;
 
     /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). The
@@ -305,11 +338,61 @@ pub(crate) mod type_cache {
         Absent,
     }
 
+    /// A slot hash for `name` from its length and at most its first and
+    /// last eight bytes: constant time for any name (entries still
+    /// compare the whole name), and attribute names differ there.
     #[inline]
     pub(crate) fn name_hash(name: &str) -> u64 {
-        let mut h = crate::fasthash::FxHasher::default();
-        h.write(name.as_bytes());
-        h.finish()
+        let b = name.as_bytes();
+        let n = b.len();
+        let (head, tail) = if n >= 8 {
+            (
+                u64::from_le_bytes(b[..8].try_into().expect("8 bytes")),
+                u64::from_le_bytes(b[n - 8..].try_into().expect("8 bytes")),
+            )
+        } else {
+            (short_word(b), 0)
+        };
+        let x = (head ^ tail.rotate_left(29) ^ (n as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^ (x >> 29)
+    }
+
+    /// The bytes of a name shorter than eight bytes as one word, from two
+    /// overlapping loads that together cover it (so two names of the same
+    /// length are equal exactly when their words are).
+    #[inline(always)]
+    fn short_word(b: &[u8]) -> u64 {
+        let n = b.len();
+        if n >= 4 {
+            let lo = u32::from_le_bytes(b[..4].try_into().expect("4 bytes"));
+            let hi = u32::from_le_bytes(b[n - 4..].try_into().expect("4 bytes"));
+            u64::from(lo) | u64::from(hi) << 32
+        } else if n >= 2 {
+            let lo = u16::from_le_bytes(b[..2].try_into().expect("2 bytes"));
+            let hi = u16::from_le_bytes(b[n - 2..].try_into().expect("2 bytes"));
+            u64::from(lo) | u64::from(hi) << 16
+        } else {
+            b.first().map_or(0, |&c| u64::from(c))
+        }
+    }
+
+    /// `a == b` for attribute names, in line for the short ones (most
+    /// dunders and identifiers fit in sixteen bytes).
+    #[inline]
+    pub(crate) fn name_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let n = a.len();
+        if n != b.len() {
+            return false;
+        }
+        if n > 16 {
+            return a == b;
+        }
+        let w = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().expect("8"));
+        if n >= 8 {
+            return w(a, 0) == w(b, 0) && w(a, n - 8) == w(b, n - 8);
+        }
+        short_word(a) == short_word(b)
     }
 
     #[inline]
@@ -327,7 +410,7 @@ pub(crate) mod type_cache {
             let c = c.try_borrow().ok()?;
             let table = c.as_ref()?;
             let e = &table[slot(ty, ver, name_hash)];
-            if e.ver == ver && e.name.as_deref() == Some(name) {
+            if e.ver == ver && e.name.as_deref().is_some_and(|n| name_eq(n, name)) {
                 Some(if e.mro_idx == ABSENT {
                     Hit::Absent
                 } else {
@@ -432,12 +515,24 @@ pub(crate) mod type_cache {
 /// address and the class's attribute version. A small direct-mapped
 /// cache per class: polymorphic sites (one receiver class per iteration)
 /// find every class's answer here with no site cache at all. Storage is
-/// allocated on the first fill; unused classes occupy only one pointer.
+/// allocated on the first fill, [`LEAF_ATTRS_SMALL`] entries at first and
+/// [`LEAF_ATTRS_LARGE`] once two names compete for a full slot pair (most
+/// classes answer only a few names); unused classes occupy only one
+/// pointer.
 ///
 /// Read and written only from the dispatch loop with the GIL held (the
 /// burst is off in free-threaded mode), like the dispatch loop's other
-/// side caches.
-pub struct LeafAttrCache(std::cell::UnsafeCell<Option<Box<[LeafAttrEntry; 32]>>>);
+/// side caches. A reference [`LeafAttrCache::get`] returns must not be
+/// held across a [`LeafAttrCache::set`], which may move the entries.
+pub struct LeafAttrCache(std::cell::Cell<usize>);
+
+/// The entries a class's first [`LeafAttrCache`] fill allocates.
+const LEAF_ATTRS_SMALL: usize = 8;
+/// The entries a [`LeafAttrCache`] grows to.
+const LEAF_ATTRS_LARGE: usize = 32;
+/// The tag bit of a [`LeafAttrCache`]'s table address that marks a
+/// table of [`LEAF_ATTRS_SMALL`] entries (entries are word-aligned).
+const LEAF_ATTRS_SMALL_TAG: usize = 1;
 
 // SAFETY: see the type docs — GIL-serialized access from one thread at a
 // time, never across a Python call.
@@ -502,7 +597,85 @@ pub enum LeafAttrKind {
 
 impl LeafAttrCache {
     pub fn new() -> Self {
-        Self(std::cell::UnsafeCell::new(None))
+        Self(std::cell::Cell::new(0))
+    }
+
+    /// The table, if one was allocated.
+    #[cfg(test)]
+    fn table(&self) -> Option<&[LeafAttrEntry]> {
+        let t = self.0.get();
+        if t == 0 {
+            return None;
+        }
+        let len = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL
+        } else {
+            LEAF_ATTRS_LARGE
+        };
+        // SAFETY: a nonzero address (tag removed) is a live table of `len`
+        // entries; GIL-serialized, and no `&mut` escapes `set`.
+        Some(unsafe {
+            std::slice::from_raw_parts((t & !LEAF_ATTRS_SMALL_TAG) as *const LeafAttrEntry, len)
+        })
+    }
+
+    /// The table for writing, allocated (small) on first use.
+    #[allow(clippy::mut_from_ref)]
+    fn table_mut(&self) -> &mut [LeafAttrEntry] {
+        if self.0.get() == 0 {
+            let t: Box<[LeafAttrEntry; LEAF_ATTRS_SMALL]> =
+                Box::new(std::array::from_fn(|_| LeafAttrEntry::EMPTY));
+            self.0.set(Box::into_raw(t) as usize | LEAF_ATTRS_SMALL_TAG);
+        }
+        let t = self.0.get();
+        let len = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL
+        } else {
+            LEAF_ATTRS_LARGE
+        };
+        // SAFETY: as `table`; the exclusive reference lives only for the
+        // caller's update.
+        unsafe {
+            std::slice::from_raw_parts_mut((t & !LEAF_ATTRS_SMALL_TAG) as *mut LeafAttrEntry, len)
+        }
+    }
+
+    /// Release the table, leaving none.
+    fn free(&self) {
+        let t = self.0.replace(0);
+        if t == 0 {
+            return;
+        }
+        let p = t & !LEAF_ATTRS_SMALL_TAG;
+        // SAFETY: the table was allocated as this boxed array (see
+        // `table_mut` and `grow`) and is no longer reachable.
+        unsafe {
+            if t & LEAF_ATTRS_SMALL_TAG != 0 {
+                drop(Box::from_raw(p as *mut [LeafAttrEntry; LEAF_ATTRS_SMALL]));
+            } else {
+                drop(Box::from_raw(p as *mut [LeafAttrEntry; LEAF_ATTRS_LARGE]));
+            }
+        }
+    }
+
+    /// Move a small table's entries into a large one.
+    #[cold]
+    fn grow(&self) {
+        let mut large: Box<[LeafAttrEntry; LEAF_ATTRS_LARGE]> =
+            Box::new(std::array::from_fn(|_| LeafAttrEntry::EMPTY));
+        for e in self.table_mut() {
+            let e = std::mem::replace(e, LeafAttrEntry::EMPTY);
+            if e.name == 0 {
+                continue;
+            }
+            let (i, j) = (Self::index(e.name), Self::alt(e.name));
+            let k = if large[i].name == 0 { i } else { j };
+            if large[k].name == 0 {
+                large[k] = e;
+            }
+        }
+        self.free();
+        self.0.set(Box::into_raw(large) as usize);
     }
 
     #[inline]
@@ -521,34 +694,60 @@ impl LeafAttrCache {
     /// The cached kind for `name` under `ver`, if present.
     #[inline]
     pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
-        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
-        let t = unsafe { &*self.0.get() }.as_deref()?;
-        let e = &t[Self::index(name)];
+        let t = self.0.get();
+        if t == 0 {
+            return None;
+        }
+        // (Both table lengths are powers of two.)
+        let mask = if t & LEAF_ATTRS_SMALL_TAG != 0 {
+            LEAF_ATTRS_SMALL - 1
+        } else {
+            LEAF_ATTRS_LARGE - 1
+        };
+        let base = (t & !LEAF_ATTRS_SMALL_TAG) as *const LeafAttrEntry;
+        // SAFETY: a nonzero address (tag removed) is a live table of
+        // `mask + 1` entries, indexed below within the mask; GIL-serialized,
+        // and no `&mut` escapes `set`.
+        let e = unsafe { &*base.add(Self::index(name) & mask) };
         if e.name == name && e.ver == ver {
             return Some(&e.kind);
         }
-        let e = &t[Self::alt(name)];
+        // SAFETY: as above.
+        let e = unsafe { &*base.add(Self::alt(name) & mask) };
         (e.name == name && e.ver == ver).then_some(&e.kind)
     }
 
     #[inline]
     pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
-        // SAFETY: GIL-serialized; the exclusive reference lives only for
-        // the assignment.
-        let t = unsafe { &mut *self.0.get() }.get_or_insert_with(|| {
-            Box::new(std::array::from_fn(|_| LeafAttrEntry {
-                name: 0,
-                ver: 0,
-                kind: LeafAttrKind::Other,
-            }))
-        });
-        let (i, j) = (Self::index(name), Self::alt(name));
         // The first slot unless it holds another name that is still
         // current; then the second, unless that one is too (evict the
-        // first).
+        // first, or grow a small table instead).
         let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != name && e.ver == ver;
+        let mut t = self.table_mut();
+        let mut mask = t.len() - 1;
+        let (i, j) = (Self::index(name), Self::alt(name));
+        if t.len() == LEAF_ATTRS_SMALL && busy(&t[i & mask]) && busy(&t[j & mask]) {
+            self.grow();
+            t = self.table_mut();
+            mask = t.len() - 1;
+        }
+        let (i, j) = (i & mask, j & mask);
         let k = if !busy(&t[i]) || busy(&t[j]) { i } else { j };
         t[k] = LeafAttrEntry { name, ver, kind };
+    }
+}
+
+impl LeafAttrEntry {
+    const EMPTY: LeafAttrEntry = LeafAttrEntry {
+        name: 0,
+        ver: 0,
+        kind: LeafAttrKind::Other,
+    };
+}
+
+impl Drop for LeafAttrCache {
+    fn drop(&mut self) {
+        self.free();
     }
 }
 
@@ -572,22 +771,61 @@ impl std::fmt::Debug for LeafAttrCache {
 
 #[cfg(test)]
 mod leaf_attr_cache_tests {
-    use super::{LeafAttrCache, LeafAttrKind};
+    use super::{LeafAttrCache, LeafAttrKind, LEAF_ATTRS_LARGE, LEAF_ATTRS_SMALL};
     use crate::object::Object;
     use crate::shared_value::SharedStr;
+
+    #[test]
+    fn small_table_grows_when_names_compete_and_keeps_values() {
+        let cache = LeafAttrCache::new();
+        let text = SharedStr::from("moved value");
+        let first = 16;
+        cache.set(first, 1, LeafAttrKind::Value(Object::Str(text.clone())));
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_SMALL));
+        // Two names sharing `first`'s slot pair in the small table, but
+        // neither of its slot in the large one.
+        let small = |n: usize| {
+            (
+                LeafAttrCache::index(n) % LEAF_ATTRS_SMALL,
+                LeafAttrCache::alt(n) % LEAF_ATTRS_SMALL,
+            )
+        };
+        let home = LeafAttrCache::index(first);
+        let rivals: Vec<usize> = (17..1_000_000)
+            .filter(|&n| {
+                small(n) == small(first)
+                    && LeafAttrCache::index(n) != home
+                    && LeafAttrCache::alt(n) != home
+            })
+            .take(2)
+            .collect();
+        cache.set(rivals[0], 1, LeafAttrKind::InstanceOnly);
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_SMALL));
+        cache.set(rivals[1], 1, LeafAttrKind::InstanceOnly);
+        assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_LARGE));
+        assert!(matches!(
+            cache.get(first, 1),
+            Some(LeafAttrKind::Value(Object::Str(value))) if SharedStr::ptr_eq(value, &text)
+        ));
+        assert!(matches!(
+            cache.get(rivals[1], 1),
+            Some(LeafAttrKind::InstanceOnly)
+        ));
+        assert_eq!(SharedStr::strong_count(&text), 2);
+        drop(cache);
+        assert_eq!(SharedStr::strong_count(&text), 1);
+    }
 
     #[test]
     fn cold_cache_and_its_clone_do_not_allocate_entries() {
         let cache = LeafAttrCache::new();
         assert_eq!(std::mem::size_of_val(&cache), std::mem::size_of::<usize>());
         assert!(cache.get(16, 1).is_none());
-        // SAFETY: this test owns the cache exclusively.
-        assert!(unsafe { &*cache.0.get() }.is_none());
+        assert!(cache.table().is_none());
         cache.set(16, 1, LeafAttrKind::InstanceOnly);
         let other = cache.clone();
         assert!(other.get(16, 1).is_none());
-        // SAFETY: this test owns the clone exclusively.
-        assert!(unsafe { &*other.0.get() }.is_none());
+        assert!(other.table().is_none());
     }
 
     #[test]
@@ -700,6 +938,10 @@ pub struct TypeObject {
     /// The leaf burst's per-class attribute-kind cache (see
     /// [`LeafAttrCache`]).
     pub leaf_attrs: LeafAttrCache,
+    /// [`Self::display_names`]'s memo: the version, dict stamp and C
+    /// `tp_name` it was computed under, the qualified name, and whether
+    /// the module is `__main__`.
+    display_name_memo: RefCell<Option<(u64, u64, usize, String, bool)>>,
     /// The most attributes an instance's `__dict__` was seen to hold
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
@@ -731,6 +973,10 @@ pub struct TypeObject {
     /// slots out over (see [`TypeObject::fresh_slots`]), decided at the
     /// first instance: `None` for a class that doesn't qualify.
     pub slot_layout: std::sync::OnceLock<Option<SharedSlice<DictKey>>>,
+    /// [`Self::slot_layout`]'s word (see [`SharedSlice::word`]) once it is
+    /// decided and present, `0` otherwise: compiled code compares an
+    /// instance's laid-out slots' names against it in line.
+    pub slot_layout_word: std::sync::atomic::AtomicUsize,
     /// Cached "do instances of this type carry a `__del__` finalizer
     /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
     /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
@@ -798,6 +1044,11 @@ pub struct TypeObject {
     /// Every exception construction asked the MRO for nine names. Last
     /// field: the hot ones above keep their offsets.
     pub exc_families: Cell<u64>,
+    /// The class's slot in the cycle collector's registry, or
+    /// [`crate::gc_trace::NO_SLOT`] while it isn't registered (as
+    /// [`PyInstance::gc_slot`]: every instance's traversal visits its
+    /// class, so finding the class's entry must not cost a hash probe).
+    pub gc_slot: crate::gc_trace::GcSlot,
 }
 
 /// A dying TypeObject clears the weak references watching it.
@@ -858,6 +1109,19 @@ pub struct InstancePlan {
     /// its field count. A call with exactly that many positional arguments builds
     /// the tuple directly while the function still runs that code.
     pub tuple_new: Option<(usize, usize)>,
+    /// `C()` with no arguments is the allocation alone: the default
+    /// `__new__` and `object.__init__`, no native payload, not abstract,
+    /// and not a module or generic-alias subclass (whose allocators
+    /// differ).
+    pub bare_alloc: bool,
+    /// Whether construction is the stores of a store-only `__init__` (see
+    /// `Interpreter::core_store_init`): `0` not yet proven, `1` proven
+    /// for this class version, `2` never.
+    pub store_init: std::sync::atomic::AtomicU8,
+    /// A store-only `__init__`'s laid-out member positions, in store
+    /// order, once its stores proved them for this class version (see
+    /// `Interpreter::core_store_init`).
+    pub slot_members: std::sync::OnceLock<Box<[u8]>>,
 }
 
 /// How a fresh instance's `native` payload is provisioned (see
@@ -1135,6 +1399,7 @@ impl TypeObject {
         }
         let ty = Rc::new(TypeObject {
             name: name.to_owned(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
             qualname: RefCell::new(qualname),
             bases: RefCell::new(bases.clone()),
             mro: RefCell::new(Vec::new()),
@@ -1142,6 +1407,7 @@ impl TypeObject {
             flags,
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
+            display_name_memo: RefCell::new(None),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
@@ -1150,6 +1416,7 @@ impl TypeObject {
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
             slot_layout: std::sync::OnceLock::new(),
+            slot_layout_word: std::sync::atomic::AtomicUsize::new(0),
             slot_names: RefCell::new(Vec::new()),
             declares_slots: Cell::new(false),
             forbids_dict: false,
@@ -1239,10 +1506,43 @@ impl TypeObject {
     /// in place, with no per-instance names and no growth.
     #[inline]
     pub fn fresh_slots(&self) -> SlotStorage {
-        match self.slot_layout.get_or_init(|| self.member_slot_layout()) {
+        match self.slot_layout_init() {
             Some(layout) => SlotStorage::unset_over(layout.clone()),
             None => SlotStorage::default(),
         }
+    }
+
+    /// Make `slots` this class's [`Self::fresh_slots`], leaving storage
+    /// that is already the empty default alone, and reusing a retired
+    /// instance's unset laid-out values (see [`SlotStorage::retire`]).
+    #[inline]
+    pub(crate) fn reset_slots(&self, slots: &mut SlotStorage) {
+        match self.slot_layout_init() {
+            Some(layout) => {
+                if !slots.reuse_unset_over(layout) {
+                    *slots = SlotStorage::unset_over(layout.clone());
+                }
+            }
+            None if slots.is_empty_default() => {}
+            None => *slots = SlotStorage::default(),
+        }
+    }
+
+    /// [`Self::slot_layout`], decided now if it isn't yet.
+    #[inline]
+    fn slot_layout_init(&self) -> Option<&SharedSlice<DictKey>> {
+        self.slot_layout
+            .get_or_init(|| {
+                let layout = self.member_slot_layout();
+                if let Some(layout) = &layout {
+                    self.slot_layout_word.store(
+                        SharedSlice::word(layout),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                layout
+            })
+            .as_ref()
     }
 
     /// Whether the class is one whose native method bodies read its slots
@@ -1587,9 +1887,17 @@ impl TypeObject {
     /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
     pub fn bump_attr_version(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         self.attr_version.bump();
         self.mro_kind.store(0, Relaxed);
+        // (A leaf class, the common case, has nothing to walk.)
+        if self
+            .subclasses
+            .try_borrow()
+            .is_ok_and(|subs| subs.iter().all(|w| w.strong_count() == 0))
+        {
+            return;
+        }
+        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
         while let Some(t) = queue.pop() {
             let ptr = Rc::as_ptr(&t);
@@ -1855,6 +2163,16 @@ impl TypeObject {
         info
     }
 
+    /// Whether `inst.__class__` on an instance of this type is
+    /// `object`'s descriptor answering the real class: neither
+    /// `__class__` nor `__getattribute__` is overridden anywhere in the
+    /// MRO. An `isinstance` miss then needs no `__class__` read.
+    #[inline]
+    pub fn class_attr_is_plain(&self) -> bool {
+        self.dunder(Dunder::Class).object_owner()
+            && self.dunder(Dunder::GetAttribute).object_owner()
+    }
+
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         // Fast pass — see `lookup` for the gate rationale.
         if !crate::object::exotic_str_keys_possible() {
@@ -1876,6 +2194,76 @@ impl TypeObject {
         None
     }
 
+    /// A per-class yes/no verdict about `name`, memoized in the type
+    /// cache until the class or a base changes: `compute` runs only on
+    /// a miss, and must be a pure function of the class's attributes
+    /// (it runs no Python code). Each [`Verdict`] family's entries live
+    /// under the class's version with the family in its top byte, which
+    /// no real version has (the dunder memo already keeps versions below
+    /// 2**56), so they never answer an attribute lookup or another
+    /// family's question.
+    #[inline]
+    pub(crate) fn memo_verdict(
+        &self,
+        family: Verdict,
+        name: &str,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        // (The slot ignores the version's top byte: a family moves its
+        // entries off the ones the attribute lookups use.)
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match type_cache::probe(ty, ver, name, h) {
+            Some(type_cache::Hit::Absent) => true,
+            Some(type_cache::Hit::At { .. }) => false,
+            None => {
+                let verdict = compute();
+                let hit = if verdict {
+                    type_cache::Hit::Absent
+                } else {
+                    type_cache::Hit::At {
+                        mro_idx: 0,
+                        dict_idx: 0,
+                    }
+                };
+                type_cache::fill(ty, ver, name, h, hit);
+                verdict
+            }
+        }
+    }
+
+    /// The verdict [`Self::verdict_record`] recorded for `name` under the
+    /// class's current version, if any.
+    #[inline]
+    pub(crate) fn verdict_cached(&self, family: Verdict, name: &str) -> Option<bool> {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match type_cache::probe(ty, ver, name, h)? {
+            type_cache::Hit::Absent => Some(true),
+            type_cache::Hit::At { .. } => Some(false),
+        }
+    }
+
+    /// Record a verdict observed (rather than computed, as
+    /// [`Self::memo_verdict`] does) for `name` under the class's current
+    /// version; the cache may forget it.
+    pub(crate) fn verdict_record(&self, family: Verdict, name: &str, verdict: bool) {
+        let ty = std::ptr::from_ref::<TypeObject>(self) as usize;
+        let ver = self.attr_version.get() | (family as u64) << 56;
+        let h = type_cache::name_hash(name) ^ (family as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let hit = if verdict {
+            type_cache::Hit::Absent
+        } else {
+            type_cache::Hit::At {
+                mro_idx: 0,
+                dict_idx: 0,
+            }
+        };
+        type_cache::fill(ty, ver, name, h, hit);
+    }
+
     /// The plain-`str`-keys MRO walk behind [`Self::lookup`] and
     /// [`Self::lookup_with_owner`], fronted by the per-thread
     /// [`type_cache`]. Returns the value and the MRO index of its owner.
@@ -1887,6 +2275,20 @@ impl TypeObject {
         match type_cache::probe(ty, ver, name, h) {
             Some(type_cache::Hit::Absent) => return None,
             Some(type_cache::Hit::At { mro_idx, dict_idx }) => {
+                // (Guard-free views when they are free: nothing below runs
+                // code before the value is cloned.)
+                // SAFETY: both views end before anything else runs.
+                if let Some(owner) =
+                    unsafe { self.mro.peek() }.and_then(|m| m.get(mro_idx as usize))
+                {
+                    if let Some(d) = unsafe { owner.dict.peek() } {
+                        if let Some((k, v)) = d.get_index(dict_idx as usize) {
+                            if matches!(&k.0, Object::Str(s) if type_cache::name_eq(s, name)) {
+                                return Some((v.clone(), mro_idx as usize));
+                            }
+                        }
+                    }
+                }
                 let mro = self.mro.borrow();
                 if let Some(owner) = mro.get(mro_idx as usize) {
                     let d = owner.dict.borrow();
@@ -1901,7 +2303,8 @@ impl TypeObject {
             }
             None => {}
         }
-        let key = crate::object::StrKey(name);
+        // (Hashed at most once for the whole walk.)
+        let key = crate::object::StrKeyLazy::new(name);
         let mro = self.mro.borrow();
         for (i, owner) in mro.iter().enumerate() {
             let d = owner.dict.borrow();
@@ -1951,13 +2354,60 @@ impl TypeObject {
         }
     }
 
+    /// CPython's `_PyType_GetFullyQualifiedName(type, '.')` (the `%T`
+    /// format): [`Self::qualified_display_name`], but without a
+    /// `__main__` prefix either.
+    pub fn fully_qualified_name(&self) -> String {
+        let (full, main) = self.display_names();
+        match full.strip_prefix("__main__.") {
+            Some(rest) if main => rest.to_owned(),
+            _ => full,
+        }
+    }
+
+    /// `module.qualname` as CPython's `type_repr` prints it (no module for
+    /// `builtins`).
     pub fn qualified_display_name(&self) -> String {
+        self.display_names().0
+    }
+
+    /// [`Self::qualified_display_name`], and whether the module is
+    /// `__main__`, memoized while the class's version, its dict's key
+    /// layout and its C `tp_name` stand (a `__qualname__` assignment
+    /// clears the memo).
+    fn display_names(&self) -> (String, bool) {
+        let ver = self.attr_version.get();
+        let stamp = self.dict.try_borrow().map_or(0, |d| d.mutation_stamp());
+        let tp_name = self.c_tp_name.get().map_or(0, |n| n.as_ptr() as usize);
+        if let Ok(memo) = self.display_name_memo.try_borrow() {
+            if let Some((v, s, t, name, main)) = &*memo {
+                if *v == ver && *s == stamp && *t == tp_name && stamp != 0 {
+                    return (name.clone(), *main);
+                }
+            }
+        }
+        let names = self.compute_display_names();
+        if let Ok(mut memo) = self.display_name_memo.try_borrow_mut() {
+            *memo = Some((ver, stamp, tp_name, names.0.clone(), names.1));
+        }
+        names
+    }
+
+    /// Forget [`Self::display_names`]'s memo (the class's qualified name
+    /// changed under an unchanged version).
+    pub(crate) fn forget_display_names(&self) {
+        if let Ok(mut memo) = self.display_name_memo.try_borrow_mut() {
+            *memo = None;
+        }
+    }
+
+    fn compute_display_names(&self) -> (String, bool) {
         let dict = self.dict.borrow();
         // Only honour *string* entries — some built-in types carry a
         // `__qualname__`/`__module__` *property descriptor* (for their
         // instances) in the dict, which must not leak into the class
         // repr (`type(gen)` printing `<class '<property object>'>`).
-        let as_str = |name: &'static str| match dict.get(&DictKey(Object::from_static(name))) {
+        let as_str = |name: &'static str| match dict.get(&crate::object::StrKey(name)) {
             Some(Object::Str(s)) => Some(s.as_ref().to_owned()),
             _ => None,
         };
@@ -1974,10 +2424,18 @@ impl TypeObject {
         let qual = as_str("__qualname__")
             .or_else(|| self.qualname.borrow().clone())
             .unwrap_or_else(|| self.name.clone());
-        match module.as_deref() {
+        let main = module.as_deref() == Some("__main__");
+        let full = match module.as_deref() {
             None | Some("builtins") | Some("") => qual,
-            Some(m) => format!("{m}.{qual}"),
-        }
+            Some(m) => {
+                let mut s = String::with_capacity(m.len() + 1 + qual.len());
+                s.push_str(m);
+                s.push('.');
+                s.push_str(&qual);
+                s
+            }
+        };
+        (full, main)
     }
 
     /// The name CPython's `tp_name`-based error text prints: the full
@@ -2178,38 +2636,88 @@ fn slot_name_eq(stored: &str, name: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    if a.len() > 16 {
+    let n = a.len();
+    // (Two overlapping words cover every length from one word to two.)
+    let word = |s: &[u8], at: usize| u64::from_ne_bytes(s[at..at + 8].try_into().unwrap());
+    let half = |s: &[u8], at: usize| u32::from_ne_bytes(s[at..at + 4].try_into().unwrap());
+    match n {
         // Past a couple of words the library routine's vector loop wins.
-        return a == b;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
+        17.. => a == b,
+        8..=16 => word(a, 0) == word(b, 0) && word(a, n - 8) == word(b, n - 8),
+        4..=7 => half(a, 0) == half(b, 0) && half(a, n - 4) == half(b, n - 4),
+        _ => {
+            let mut i = 0;
+            while i < n {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
         }
-        i += 1;
     }
-    true
+}
+
+/// The slot names every raise populates (`args`, `__traceback__`, the
+/// chaining links) and the commonest family fields, in [`common_slot_keys`]
+/// order. `__traceback__` through `__suppress_context__` are [`ExcTail`]'s.
+const COMMON_SLOT_NAMES: [&str; 10] = [
+    "args",
+    "__traceback__",
+    "__context__",
+    "__cause__",
+    "__suppress_context__",
+    "message",
+    "value",
+    "msg",
+    "name",
+    "obj",
+];
+
+/// [`COMMON_SLOT_NAMES`], interned once.
+fn common_slot_keys() -> &'static [Object; 10] {
+    static KEYS: std::sync::OnceLock<[Object; 10]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| COMMON_SLOT_NAMES.map(crate::stdlib::sys::intern_name))
+}
+
+/// A `BaseException` pseudo-slot, laid out at the end of every exception
+/// instance's slots (see [`SlotStorage::exception`]).
+#[derive(Clone, Copy)]
+pub(crate) enum ExcTail {
+    Traceback = 0,
+    Context = 1,
+    Cause = 2,
+    SuppressContext = 3,
+}
+
+impl ExcTail {
+    /// The slot's name.
+    pub(crate) fn name(self) -> &'static str {
+        COMMON_SLOT_NAMES[1 + self as usize]
+    }
 }
 
 /// The key for a newly populated slot `name`. The slots every raise
 /// populates (`args`, `__traceback__`, the chaining links) share one
 /// interned key each instead of allocating a string per exception.
 pub(crate) fn slot_key(name: &str) -> DictKey {
-    const COMMON: [&str; 8] = [
-        "args",
-        "__traceback__",
-        "__context__",
-        "__cause__",
-        "__suppress_context__",
-        "message",
-        "value",
-        "msg",
-    ];
-    static KEYS: std::sync::OnceLock<[Object; 8]> = std::sync::OnceLock::new();
-    if let Some(i) = COMMON.iter().position(|c| *c == name) {
-        let keys = KEYS.get_or_init(|| COMMON.map(crate::stdlib::sys::intern_name));
-        return DictKey(keys[i].clone());
+    // (By length first: one comparison settles each common name.)
+    let common = match name.len() {
+        3 if name == "msg" => Some(7),
+        3 if name == "obj" => Some(9),
+        4 if name == "args" => Some(0),
+        4 if name == "name" => Some(8),
+        5 if name == "value" => Some(6),
+        7 if name == "message" => Some(5),
+        9 if name == "__cause__" => Some(3),
+        11 if name == "__context__" => Some(2),
+        13 if name == "__traceback__" => Some(1),
+        20 if name == "__suppress_context__" => Some(4),
+        _ => None,
+    };
+    if let Some(i) = common {
+        debug_assert_eq!(COMMON_SLOT_NAMES[i], name);
+        return DictKey(common_slot_keys()[i].clone());
     }
     // Interned, as instance-dict keys are: a guard holding the interned
     // name settles a slot's key by identity, and no instance allocates
@@ -2217,7 +2725,79 @@ pub(crate) fn slot_key(name: &str) -> DictKey {
     DictKey(crate::stdlib::sys::intern_name(name))
 }
 
+/// How many [`ExcTail`] pseudo-slots end an exception layout.
+#[cfg(target_pointer_width = "64")]
+const EXC_TAIL_LEN: usize = 4;
+
+/// The shared slot layout of an exception instance whose families' own
+/// fields are `extra`: `args`, `extra`, then the [`ExcTail`] pseudo-slots,
+/// which raising and chaining populate. `None` for a shape without one
+/// (its slots are stored per key).
+#[cfg(target_pointer_width = "64")]
+fn exception_layout(extra: &[&'static str]) -> Option<SharedSlice<DictKey>> {
+    type Layout = std::sync::OnceLock<SharedSlice<DictKey>>;
+    static PLAIN: Layout = Layout::new();
+    static VALUE: Layout = Layout::new();
+    static MSG: Layout = Layout::new();
+    static NAME_OBJ: Layout = Layout::new();
+    static NAME: Layout = Layout::new();
+    let cell = match extra {
+        [] => &PLAIN,
+        ["value"] => &VALUE,
+        ["msg"] => &MSG,
+        ["name", "obj"] => &NAME_OBJ,
+        ["name"] => &NAME,
+        _ => return None,
+    };
+    Some(
+        cell.get_or_init(|| {
+            std::iter::once("args")
+                .chain(extra.iter().copied())
+                .chain(COMMON_SLOT_NAMES[1..=EXC_TAIL_LEN].iter().copied())
+                .map(slot_key)
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .clone(),
+    )
+}
+
 impl SlotStorage {
+    /// The slots of a new exception instance: `args`, then its families'
+    /// own fields `extra` (`StopIteration.value`, `AttributeError`'s
+    /// `name` and `obj`), with the `BaseException` pseudo-slots laid out
+    /// unset after them, so a raise stores its traceback and chaining
+    /// links in place.
+    pub(crate) fn exception<const N: usize>(
+        args: Object,
+        extra: [(&'static str, Object); N],
+    ) -> Self {
+        let names: [&'static str; N] = std::array::from_fn(|i| extra[i].0);
+        #[cfg(target_pointer_width = "64")]
+        if let Some(layout) = exception_layout(&names) {
+            // Written in place: `args`, the fields, then the unset tail.
+            let mut values = Box::<[Object]>::new_uninit_slice(layout.len());
+            values[0].write(args);
+            for (slot, (_, v)) in values[1..].iter_mut().zip(extra) {
+                slot.write(v);
+            }
+            for slot in &mut values[1 + N..] {
+                slot.write(Object::Unbound);
+            }
+            // SAFETY: every element was written above (the layout holds
+            // `args`, the `N` fields and the tail).
+            let values = unsafe { values.assume_init() };
+            return Self {
+                data: SlotData::Fixed { layout, values },
+            };
+        }
+        let _ = names;
+        let mut entries = Vec::with_capacity(N + 2);
+        entries.push((slot_key("args"), args));
+        entries.extend(extra.into_iter().map(|(k, v)| (slot_key(k), v)));
+        Self::from_entries(entries)
+    }
+
     /// Storage holding exactly `entries` (distinct `str` keys, in slot
     /// order), built in one step.
     pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
@@ -2256,7 +2836,7 @@ impl SlotStorage {
 
     /// Access native fields only when the shared layout is the same
     /// allocation. Equal user-defined slot names aren't sufficient.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn values_for_layout(&self, expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
         match &self.data {
             SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
@@ -2288,6 +2868,55 @@ impl SlotStorage {
         Self {
             data: SlotData::Fixed { layout, values },
         }
+    }
+
+    /// Whether this is the empty [`Default`] storage, which a reset to the
+    /// default would only rebuild (through the enum's drop glue).
+    #[inline(always)]
+    pub(crate) fn is_empty_default(&self) -> bool {
+        matches!(
+            self.data,
+            SlotData::Single {
+                key: None,
+                value: Object::None
+            }
+        )
+    }
+
+    /// Empty the storage of a retiring instance whose values are all
+    /// atomic (releasing them runs no code): laid-out values are unset in
+    /// place, keeping their allocation for the next tenant (see
+    /// [`Self::reuse_unset_over`]); any other form becomes the default.
+    pub(crate) fn retire(&mut self) {
+        if let SlotData::Fixed { values, .. } = &mut self.data {
+            for v in values.iter_mut() {
+                *v = Object::Unbound;
+            }
+        } else if !self.is_empty_default() {
+            *self = Self::default();
+        }
+    }
+
+    /// Lay a retired storage (see [`Self::retire`]) out over `layout`, all
+    /// unset, reusing its values' allocation: `false` when it has none of
+    /// that size (the caller builds fresh storage).
+    #[inline]
+    pub(crate) fn reuse_unset_over(&mut self, layout: &SharedSlice<DictKey>) -> bool {
+        let SlotData::Fixed {
+            layout: own,
+            values,
+        } = &mut self.data
+        else {
+            return false;
+        };
+        if values.len() != layout.len() {
+            return false;
+        }
+        if !SharedSlice::ptr_eq(own, layout) {
+            *own = layout.clone();
+        }
+        debug_assert!(values.iter().all(|v| matches!(v, Object::Unbound)));
+        true
     }
 
     /// Storage holding a natively packed value (see [`SlotData::Packed`]).
@@ -2378,6 +3007,23 @@ impl SlotStorage {
         Self::default()
     }
 
+    /// Never skipped here (see the 64-bit variant).
+    #[inline(always)]
+    pub(crate) fn is_empty_default(&self) -> bool {
+        false
+    }
+
+    /// Empty a retiring instance's storage (see the 64-bit variant).
+    pub(crate) fn retire(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn reuse_unset_over(&mut self, _layout: &SharedSlice<DictKey>) -> bool {
+        false
+    }
+
     /// [`Self::index_of`] (never laid out here; see the 64-bit variant).
     pub fn store_position(&self, name: &str) -> Option<u32> {
         self.index_of(name)
@@ -2462,6 +3108,16 @@ impl SlotStorage {
                 )
                 .map(|index| index as u32),
         }
+    }
+
+    /// [`Self::get_index`] with the common layout of a few `__slots__`
+    /// members read in line (a cached member load's hot path).
+    #[inline(always)]
+    pub fn get_index_hot(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        if let SlotData::Small(entries) = &self.data {
+            return entries.get(index).map(|(key, value)| (key, value));
+        }
+        self.get_index(index)
     }
 
     /// Read an ordered entry. Callers caching an index must also validate
@@ -2765,6 +3421,86 @@ impl SlotStorage {
         }
     }
 
+    /// The place of the exception pseudo-slot `which` (holding `Unbound`
+    /// while unset) in storage laid out over an exception layout (see
+    /// [`Self::exception`]): one identity compare of the laid-out key.
+    /// `None` for any other storage.
+    #[inline]
+    pub(crate) fn exc_tail_mut(&mut self, which: ExcTail) -> Option<&mut Object> {
+        let SlotData::Fixed { layout, values } = &mut self.data else {
+            return None;
+        };
+        let i = layout.len().checked_sub(EXC_TAIL_LEN)? + which as usize;
+        match (&layout[i].0, &common_slot_keys()[1 + which as usize]) {
+            (Object::Str(laid), Object::Str(key))
+                if crate::shared_value::SharedStr::ptr_eq(laid, key) =>
+            {
+                values.get_mut(i)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
+    /// [`Self::exc_tail_mut`] when the storage has an exception layout.
+    #[inline]
+    pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
+        if self.exc_tail_mut(which).is_some() {
+            return self.exc_tail_mut(which);
+        }
+        self.place_mut(which.name())
+    }
+
+    /// Where slot `name` lives: its laid-out place (holding `Unbound`
+    /// while unset), else its populated slot. `None` when a store must
+    /// add the slot.
+    pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.unpack();
+        let laid_out = match &self.data {
+            SlotData::Fixed { layout, .. } => Some(layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            )?),
+            _ => None,
+        };
+        match laid_out {
+            Some(i) => match &mut self.data {
+                SlotData::Fixed { values, .. } => values.get_mut(i),
+                _ => None,
+            },
+            None => self.get_mut(name),
+        }
+    }
+
+    /// The laid-out places (holding `Unbound` while unset) of the two
+    /// distinct slots `a` and `b`, when the storage's fixed layout holds
+    /// both (an `AttributeError`'s `name` and `obj`). `None` otherwise.
+    pub(crate) fn laid_out_pair_mut(
+        &mut self,
+        a: &str,
+        b: &str,
+    ) -> Option<(&mut Object, &mut Object)> {
+        let SlotData::Fixed { layout, values } = &mut self.data else {
+            return None;
+        };
+        let pos = |name: &str| {
+            layout.iter().position(
+                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
+            )
+        };
+        let (i, j) = (pos(a)?, pos(b)?);
+        if i == j || values.len() != layout.len() {
+            return None;
+        }
+        let (lo, hi) = (i.min(j), i.max(j));
+        let (head, tail) = values.split_at_mut(hi);
+        let (first, second) = (&mut head[lo], &mut tail[0]);
+        Some(if i < j {
+            (first, second)
+        } else {
+            (second, first)
+        })
+    }
+
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
         self.insert_with_key(name, value, || slot_key(name))
     }
@@ -2901,6 +3637,44 @@ impl SlotStorage {
             // (An unset laid-out slot.)
             .filter(|(_, value)| !matches!(value, Object::Unbound))
     }
+
+    /// Call `f` on each populated slot, as [`Self::iter`] yields them, by
+    /// a direct walk of the representation (the collector's traversal).
+    #[inline]
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&DictKey, &Object)) {
+        let mut each = |k: &DictKey, v: &Object| {
+            if !matches!(v, Object::Unbound) {
+                f(k, v);
+            }
+        };
+        match &self.data {
+            SlotData::Single { key, value } => {
+                if let Some(key) = key {
+                    each(key, value);
+                }
+            }
+            SlotData::Small(entries) => {
+                for (k, v) in entries {
+                    each(k, v);
+                }
+            }
+            SlotData::Many(table) => {
+                for (k, v) in table.iter() {
+                    each(k, v);
+                }
+            }
+            SlotData::Fixed { layout, values } => {
+                for (k, v) in layout.iter().zip(values.iter()) {
+                    each(k, v);
+                }
+            }
+            SlotData::Packed(p) => {
+                for (k, v) in p.layout().iter().zip(p.values().iter()) {
+                    each(k, v);
+                }
+            }
+        }
+    }
 }
 
 /// Slot storage for targets where an inline object pair would enlarge
@@ -2923,6 +3697,11 @@ impl SlotStorage {
     }
 
     #[inline]
+    pub fn get_index_hot(&self, index: usize) -> Option<(&DictKey, &Object)> {
+        self.0.get_index(index)
+    }
+
+    #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
         self.0.get_index_mut(index)
     }
@@ -2933,6 +3712,33 @@ impl SlotStorage {
 
     pub fn get(&self, name: &str) -> Option<&Object> {
         self.0.get(&crate::object::StrKey(name))
+    }
+
+    /// The populated slot `name` (nothing is laid out here; see the
+    /// 64-bit variant).
+    pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
+        self.get_mut(name)
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    pub(crate) fn laid_out_pair_mut(
+        &mut self,
+        _a: &str,
+        _b: &str,
+    ) -> Option<(&mut Object, &mut Object)> {
+        None
+    }
+
+    /// Never laid out here (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_mut(&mut self, _which: ExcTail) -> Option<&mut Object> {
+        None
+    }
+
+    /// The populated pseudo-slot `which` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
+        self.get_mut(which.name())
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
@@ -2966,6 +3772,14 @@ impl SlotStorage {
 
     pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
         self.0.iter()
+    }
+
+    /// Call `f` on each populated slot.
+    #[inline]
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&DictKey, &Object)) {
+        for (k, v) in self.0.iter() {
+            f(k, v);
+        }
     }
 }
 
@@ -3039,6 +3853,12 @@ pub struct PyInstance {
     /// mutation reached through the dict alone (`vars(obj)['x'] = y`)
     /// still starts tracking; the two are set and cleared together.
     pub deferred: Cell<bool>,
+    /// The instance's slot in the cycle collector's registry, or
+    /// [`crate::gc_trace::NO_SLOT`] while it isn't registered. The
+    /// registry keeps no id index for instances: this field is how a
+    /// collection finds an instance's entry, and how the instance's
+    /// `Drop` removes it.
+    pub gc_slot: crate::gc_trace::GcSlot,
     /// The stable C "inline body" this instance owns once it has crossed
     /// into a C extension that reads its fields at fixed `tp_basicsize`
     /// offsets (RFC 0045, wave 3). `0` for the overwhelmingly common case
@@ -3070,6 +3890,7 @@ impl PyInstance {
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
             c_body: CBody::default(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         }
     }
 
@@ -3087,6 +3908,7 @@ impl PyInstance {
             finalize_ran: Cell::new(false),
             deferred: Cell::new(false),
             c_body: CBody::default(),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         }
     }
 
@@ -3107,7 +3929,7 @@ impl PyInstance {
             // class changes. A pooled instance keeps whatever dict it
             // was retired with, already cleared and carrying the record.
             if let Some(m) = Rc::get_mut(&mut inst) {
-                *m.slots.get_mut() = class.fresh_slots();
+                class.reset_slots(m.slots.get_mut());
                 *m.class.get_mut() = class;
                 m.deferred.set(true);
                 if hint > 0 {
@@ -3172,20 +3994,35 @@ impl PyInstance {
     /// pool for `new_deferred` (CPython's per-type freelist), or drop it.
     /// The caller established that `obj` is its only reference, the
     /// instance is still deferred and owns no C body.
-    pub fn try_recycle(mut inst: Rc<Self>) {
+    pub fn try_recycle(inst: Rc<Self>) {
+        if let Err(inst) = Self::recycle(inst) {
+            // (A plain drop: the caller found no finalizer owed.)
+            crate::rc::drop_arc(Rc::into_arc(inst));
+        }
+    }
+
+    /// [`Self::try_recycle`], handing back an instance it doesn't pool
+    /// (whose state may be partly reset: it is dying) for the caller to
+    /// free without its last-release hook, which may be what called this.
+    pub(crate) fn recycle(mut inst: Rc<Self>) -> Result<(), Rc<Self>> {
         // SAFETY: the caller holds the only reference.
         if unsafe { &*inst.class.as_ptr() }.native_kind.get() != 0 {
-            if let Err(inst) = crate::stdlib::datetime_native::recycle(inst) {
-                drop(Rc::into_arc(inst));
-            }
-            return;
+            return crate::stdlib::datetime_native::recycle(inst);
+        }
+        // A full pool (the program discards more instances than it makes
+        // through the pool) takes nothing: skip the reset.
+        let room = INSTANCE_POOL
+            .try_with(|p| p.try_borrow().is_ok_and(|p| p.len() < INSTANCE_POOL_CAP))
+            .unwrap_or(false);
+        if !room {
+            return Err(inst);
         }
         let Some(m) = Rc::get_mut(&mut inst) else {
-            return;
+            return Err(inst);
         };
         let owner = std::ptr::from_ref(&*m) as usize;
         if m.native.get().is_some() || m.finalize_ran.get() || m.c_body.get() != 0 {
-            return;
+            return Err(inst);
         }
         // Split values are atomic (the instance is deferred): clearing
         // them runs no code. The allocation stays for the next tenant.
@@ -3198,32 +4035,40 @@ impl PyInstance {
             // hand out the same `Arc`, and a holder must keep seeing the
             // dead instance's attributes, not the next tenant's.
             if m.dict.strong_count() != 1 {
-                return;
+                return Err(inst);
             }
             // Reset in place: values are atomic, so clearing runs no code
             // that could observe the instance.
             let Ok(mut d) = dict.try_borrow_mut() else {
-                return;
+                return Err(inst);
             };
             if d.capacity() > 32 {
-                return;
+                drop(d);
+                return Err(inst);
             }
             d.map_mut_atomic_store().clear();
             d.reset_deferred_owner(owner);
         }
-        *m.slots.get_mut() = SlotStorage::default();
+        m.slots.get_mut().retire();
         m.inline_values.set(true);
         m.deferred.set(true);
         m.hash_cache = crate::sync::CachedHash::new(None);
         // A pooled instance must not keep its class alive (a transient
         // class is collected as soon as its last instance dies).
         *m.class.get_mut() = crate::builtin_types::builtin_types().object_.clone();
-        INSTANCE_POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.len() < INSTANCE_POOL_CAP {
-                p.push(inst);
+        let mut inst = Some(inst);
+        // (A thread whose locals are being torn down pools nothing.)
+        let _ = INSTANCE_POOL.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut() {
+                if p.len() < INSTANCE_POOL_CAP {
+                    p.extend(inst.take());
+                }
             }
         });
+        match inst {
+            None => Ok(()),
+            Some(inst) => Err(inst),
+        }
     }
 
     /// Whether tracking is still deferred (the `__dict__` carries the
@@ -3345,6 +4190,42 @@ impl PyInstance {
         (!matches!(v, Object::Unbound)).then_some(v)
     }
 
+    /// [`Self::laid_out_slot`], set or not: what a store to the member
+    /// would replace.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline(always)]
+    pub(crate) unsafe fn laid_out_slot_any(&self, i: usize) -> Option<&Object> {
+        let layout = self.cls_raw().slot_layout.get()?.as_ref()?;
+        // SAFETY: forwarded contract.
+        unsafe { self.slots.peek() }?
+            .values_for_layout(layout)?
+            .get(i)
+    }
+
+    /// [`Self::laid_out_slot`] for a store of a value of atomicity
+    /// `atomic`, set or not (a store fills an unset member): the write
+    /// barrier runs first (a non-atomic value starts tracking a deferred
+    /// instance), then the member's place.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek_mut`].
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn laid_out_slot_mut(&self, i: usize, atomic: bool) -> Option<&mut Object> {
+        let layout = self.cls_raw().slot_layout.get()?.as_ref()?;
+        if !atomic && self.deferred.get() {
+            self.ensure_gc_tracked();
+        }
+        // SAFETY: forwarded contract.
+        unsafe { self.slots.peek_mut() }?
+            .values_for_layout_mut(layout)?
+            .get_mut(i)
+    }
+
     /// Where [`Self::laid_out_slot`] finds member slot `name` on this
     /// instance: its position in the class's slot layout, when the
     /// instance's slots are laid out over it (set or not), and the
@@ -3377,6 +4258,19 @@ impl PyInstance {
     pub fn slot_set(&self, name: &str, value: Object) {
         self.note_slot_store(&value);
         self.slots.borrow_mut().insert(name, value);
+    }
+
+    /// [`Self::slot_set`] of an exception pseudo-slot: in its laid-out
+    /// place when the instance has one (see `SlotStorage::exc_tail_mut`).
+    /// Returns the displaced value (`Unbound` if unset), dropped by the
+    /// caller once the slots are released.
+    pub(crate) fn exc_tail_set(&self, which: ExcTail, value: Object) -> Object {
+        self.note_slot_store(&value);
+        let mut slots = self.slots.borrow_mut();
+        if let Some(place) = slots.exc_tail_mut(which) {
+            return std::mem::replace(place, value);
+        }
+        slots.insert(which.name(), value).unwrap_or(Object::Unbound)
     }
 
     /// Delete slot `name` from the side table; `false` when unset.
@@ -3437,7 +4331,10 @@ impl Drop for PyInstance {
         crate::weakref_registry::on_death(id);
         // A collector registry entry's weak handle would keep this
         // allocation until its generation is next collected.
-        crate::gc_trace::forget_dead(id);
+        let slot = self.gc_slot.get();
+        if slot != crate::gc_trace::NO_SLOT {
+            crate::gc_trace::forget_instance(slot, id as usize);
+        }
     }
 }
 

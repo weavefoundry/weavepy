@@ -67,7 +67,7 @@ static WATCHDOG_GEN: AtomicU64 = AtomicU64::new(0);
 struct RegisteredThread {
     ident: u64,
     frame_stack: crate::object::FrameStack,
-    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: Rc<RefCell<Vec<Object>>>,
 }
 
 /// Registration order == thread creation order; CPython's
@@ -79,7 +79,7 @@ static THREADS: Mutex<Vec<RegisteredThread>> = Mutex::new(Vec::new());
 pub fn note_thread_start(
     ident: u64,
     frame_stack: crate::object::FrameStack,
-    exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    exc_info_stack: Rc<RefCell<Vec<Object>>>,
 ) {
     let mut g = THREADS.lock().unwrap();
     if g.iter().any(|t| t.ident == ident) {
@@ -97,11 +97,7 @@ pub fn note_thread_start(
 /// `sys._current_exceptions()`. Safe to materialize under the GIL:
 /// peer threads are parked, exactly as during a faulthandler dump.
 #[allow(clippy::type_complexity)]
-pub fn thread_snapshots() -> Vec<(
-    u64,
-    crate::object::FrameStack,
-    Rc<RefCell<Vec<crate::error::PyException>>>,
-)> {
+pub fn thread_snapshots() -> Vec<(u64, crate::object::FrameStack, Rc<RefCell<Vec<Object>>>)> {
     THREADS
         .lock()
         .unwrap()

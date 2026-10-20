@@ -712,7 +712,33 @@ impl<T: 'static> Weak<T> {
 impl<T: ?Sized + 'static> Weak<T> {
     #[inline]
     pub fn upgrade(&self) -> Option<Rc<T>> {
+        if refcounts_biased() {
+            // `Weak::upgrade`'s compare-and-swap loop guards against another
+            // thread's release racing the increment, which the bias rules
+            // out. (A dangling handle reads a count of zero.)
+            if self.0.strong_count() == 0 {
+                return None;
+            }
+            let p = self.0.as_ptr();
+            // SAFETY: the payload is live (its strong count is not zero),
+            // and the new owner accounts for the added reference.
+            unsafe {
+                increment_strong(p);
+                return Some(Self::from_raw_rc(p));
+            }
+        }
         self.0.upgrade().map(Rc::from_arc)
+    }
+
+    /// The [`Rc`] owning the strong reference the caller added for `p`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Rc::from_raw`].
+    #[inline(always)]
+    unsafe fn from_raw_rc(p: *const T) -> Rc<T> {
+        // SAFETY: forwarded to the caller.
+        unsafe { Rc::from_raw(p) }
     }
 
     pub fn strong_count(&self) -> usize {

@@ -1184,11 +1184,16 @@ impl Scan {
         // Names never pass through the compiler's constant cache, so an
         // equal string *constant* keeps its own object: the canonical
         // constant is not decided here, only the identifier set.
-        for name in co.names.iter().chain(cp.localsplusnames.iter()) {
-            self.identifiers.insert(name.clone());
+        for name in co
+            .names
+            .iter()
+            .map(|n| n.as_str())
+            .chain(cp.localsplusnames.iter().map(String::as_str))
+        {
+            self.identifiers.insert(name.to_owned());
         }
-        self.identifiers.insert(co.name.clone());
-        self.qualnames_done.insert(co.qualname.clone());
+        self.identifiers.insert(co.name.to_string());
+        self.qualnames_done.insert(co.qualname.to_string());
     }
 
     /// Strings nested in tuple/frozenset constants: plain literals,
@@ -1258,8 +1263,8 @@ fn bigint_to_15bit(b: &BigInt) -> (i32, Vec<u16>) {
 }
 
 /// Build a `marshal` tuple of interned-string objects.
-fn strs_to_tuple(items: &[String]) -> Object {
-    Object::new_tuple(items.iter().map(|s| Object::from_str(s.clone())).collect())
+fn strs_to_tuple<S: AsRef<str>>(items: &[S]) -> Object {
+    Object::new_tuple(items.iter().map(|s| Object::from_str(s.as_ref())).collect())
 }
 
 // ---------- reader ----------
@@ -1733,18 +1738,33 @@ impl<'a> MarshalReader<'a> {
         // (test_capi.test_eval_code_ex test_custom_locals).
         let is_class_body = flags & CO_OPTIMIZED == 0 && co_name != "<module>";
         let mut co = CodeObject {
-            name: co_name,
-            qualname: co_qualname,
+            name: co_name.into(),
+            qualname: co_qualname.into(),
             filename: string_of(&filename, "co_filename")?.into(),
             caches: CacheTable::with_len(decoded.instructions.len()),
             vm_ext: weavepy_compiler::VmExt::default(),
             jit_hint: weavepy_compiler::JitHint::default(),
             instructions: decoded.instructions,
             constants,
-            names: tuple_of_strings(&names, "co_names")?,
-            varnames: decoded.varnames,
-            freevars: decoded.freevars,
-            cellvars: decoded.cellvars,
+            names: tuple_of_strings(&names, "co_names")?
+                .iter()
+                .map(weavepy_compiler::Name::from)
+                .collect(),
+            varnames: decoded
+                .varnames
+                .iter()
+                .map(weavepy_compiler::Name::from)
+                .collect(),
+            freevars: decoded
+                .freevars
+                .iter()
+                .map(weavepy_compiler::Name::from)
+                .collect(),
+            cellvars: decoded
+                .cellvars
+                .iter()
+                .map(weavepy_compiler::Name::from)
+                .collect(),
             exception_table: decoded.exception_table,
             linetable: decoded.linetable.into(),
             // PEP-657 columns recovered from long-form location entries

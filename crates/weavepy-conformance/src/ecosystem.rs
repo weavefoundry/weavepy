@@ -100,7 +100,9 @@ pub struct SelftestSpec {
     pub command: String,
     /// `pytest --deselect` arguments — the measured, enumerated escapes.
     /// Every entry carries an inline manifest comment naming the failure
-    /// class.
+    /// class. Holds `deselect` plus the host OS's `deselect_<os>` list
+    /// (`deselect_linux`, `deselect_macos`, `deselect_windows`), for an
+    /// escape that only one OS's runner needs.
     pub deselect: Vec<String>,
     /// Optional wall budget for the self-test stage alone.
     pub timeout_seconds: Option<u64>,
@@ -311,13 +313,12 @@ impl Manifest {
             .and_then(simple_tables::Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| anyhow::anyhow!("[{section}] missing command"))?;
-        let deselect = match kv.get("deselect") {
-            Some(simple_tables::Value::List(items)) => items.clone(),
-            Some(simple_tables::Value::Str(_)) => {
-                anyhow::bail!("[{section}] deselect must be an array of strings")
-            }
-            None => Vec::new(),
-        };
+        let mut deselect = parse_deselect(kv, &section, "deselect")?;
+        deselect.extend(parse_deselect(
+            kv,
+            &section,
+            &format!("deselect_{}", std::env::consts::OS),
+        )?);
         let timeout_seconds = parse_timeout(kv, &section)?;
         Ok(SelftestSpec {
             mode,
@@ -328,6 +329,17 @@ impl Manifest {
             deselect,
             timeout_seconds,
         })
+    }
+}
+
+/// A selftest's `key` deselect list (see [`SelftestSpec::deselect`]).
+fn parse_deselect(kv: &simple_tables::Table, section: &str, key: &str) -> Result<Vec<String>> {
+    match kv.get(key) {
+        Some(simple_tables::Value::List(items)) => Ok(items.clone()),
+        Some(simple_tables::Value::Str(_)) => {
+            anyhow::bail!("[{section}] {key} must be an array of strings")
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -1947,6 +1959,46 @@ timeout_seconds = 900
             vec!["tests/test_mypy.py", "tests/test_abc.py::test_x[a-b]"]
         );
         assert_eq!(st.timeout_seconds, Some(900));
+    }
+
+    /// `deselect_<os>` adds to `deselect` on that OS only.
+    #[test]
+    fn manifest_parses_os_scoped_deselect() {
+        let host = std::env::consts::OS;
+        let other = if host == "macos" { "linux" } else { "macos" };
+        let body = format!(
+            "[packages.pkg]\nrequirements = \"pkg==1.0\"\nprobe = \"probes/pkg_probe.py\"\n\n\
+             [packages.pkg.selftest]\nsource = \"pkg==1.0\"\ncommand = \"tests\"\n\
+             deselect = [\"tests/test_a.py\"]\n\
+             deselect_{host} = [\"tests/test_host.py::test_x\"]\n\
+             deselect_{other} = [\"tests/test_other.py\"]\n"
+        );
+        let m = Manifest::from_body(&body, Path::new(".")).unwrap();
+        let st = m.rows[0].selftest.as_ref().expect("selftest spec");
+        assert_eq!(
+            st.deselect,
+            vec!["tests/test_a.py", "tests/test_host.py::test_x"]
+        );
+    }
+
+    /// The checked-in manifest parses, and Pillow's macOS-only escape
+    /// applies on macOS alone.
+    #[test]
+    fn checked_in_manifest_scopes_pillow_avif_leak_to_macos() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/ecosystem/manifest.toml");
+        let m = Manifest::load(&path).unwrap();
+        let pillow = m
+            .rows
+            .iter()
+            .find(|r| r.name == "pillow")
+            .expect("pillow row");
+        let st = pillow.selftest.as_ref().expect("pillow selftest");
+        let avif = "Tests/test_file_avif.py::TestAvifLeaks::test_leak_load";
+        assert_eq!(
+            st.deselect.iter().any(|d| d == avif),
+            std::env::consts::OS == "macos"
+        );
     }
 
     /// The RFC 0075 WS9 overlay shape (lxml): installed mode carrying a

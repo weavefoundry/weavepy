@@ -382,7 +382,7 @@ fn fq_type_name(target: &Object) -> String {
 fn referent_display_name(target: &Object) -> Option<String> {
     match target {
         Object::Type(t) => Some(t.name.clone()),
-        Object::Function(f) => Some(f.name.clone()),
+        Object::Function(f) => Some(f.name.to_string()),
         Object::Module(m) => Some(m.name.clone()),
         Object::Instance(i) => match i.cls().lookup("__name__")? {
             Object::Str(s) => Some(s.to_string()),
@@ -1189,6 +1189,7 @@ fn make_ref_object_with_class(
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
         c_body: crate::types::CBody::default(),
+        gc_slot: crate::gc_trace::GcSlot::new(),
     });
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
     // this same wrapper object.
@@ -1425,6 +1426,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn native_wrapper_storage_stays_authoritative_after_dict_materialization() {
+        let _gil = crate::gil::hold_gil();
         let target = Object::Type(
             TypeObject::new_user("FixedWeakrefTarget", vec![], DictData::default()).unwrap(),
         );
@@ -1509,6 +1511,7 @@ mod tests {
 
     #[test]
     fn ref_returns_alive_target_then_none_after_clear() {
+        let _gil = crate::gil::hold_gil();
         // Use a supported target: the unchecked string fixture can be
         // cleared by another test's weakref-only collection.
         let target = Object::Type(

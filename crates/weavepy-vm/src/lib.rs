@@ -47,6 +47,7 @@ pub mod builtins;
 pub mod capi_watchers;
 pub mod cpython_headers;
 pub mod descr_registry;
+pub mod dictmap;
 pub mod error;
 pub mod ext_loader;
 pub mod fasthash;
@@ -101,7 +102,7 @@ use crate::error::{
     attribute_error, import_error, index_error, key_error, key_error_object,
     module_not_found_error, name_error, overflow_error, recursion_error, runtime_error,
     stop_async_iteration, stop_iteration, stop_iteration_with, type_error, value_error,
-    zero_division_error, TracebackEntry,
+    zero_division_error,
 };
 pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
@@ -262,12 +263,6 @@ struct FrameRare {
 /// handled an exception carries.
 #[derive(Default)]
 struct FrameExc {
-    /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
-    /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
-    /// Each entry is tagged with the pc just past its handler body
-    /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
-    /// exception propagates *out of* (see `handle_exception`).
-    handlers: Vec<(u32, PyException)>,
     /// A *generator/coroutine* frame's own handled-exception entries,
     /// detached from the interpreter-wide `exc_info_stack` while it is
     /// suspended at a `yield`. CPython stores this as the generator's
@@ -277,7 +272,7 @@ struct FrameExc {
     /// are peeled back off so they don't leak into the *resumer's*
     /// `sys.exc_info()`. Always empty for ordinary frames (they never
     /// suspend).
-    saved: Vec<PyException>,
+    saved: Vec<Object>,
     /// pc of the instruction whose exception is being handled by a
     /// *cleanup* handler (`push_lasti` exception-table entries: `with`
     /// exits, except-variable unbind blocks). CPython pushes this on
@@ -325,12 +320,6 @@ impl Frame {
         self.exc.get_or_insert_with(Box::default)
     }
 
-    /// Pop the innermost [`FrameExc::handlers`] entry.
-    #[inline]
-    fn exc_handlers_pop(&mut self) -> Option<(u32, PyException)> {
-        self.exc.as_mut()?.handlers.pop()
-    }
-
     /// Whether the frame holds detached [`FrameExc::saved`] entries.
     #[inline]
     fn has_saved_exc_info(&self) -> bool {
@@ -338,12 +327,12 @@ impl Frame {
     }
 
     /// The innermost [`FrameExc::saved`] entry.
-    fn saved_exc_info_last(&self) -> Option<&PyException> {
+    fn saved_exc_info_last(&self) -> Option<&Object> {
         self.exc.as_ref()?.saved.last()
     }
 
     /// Take the [`FrameExc::saved`] entries.
-    fn take_saved_exc_info(&mut self) -> Vec<PyException> {
+    fn take_saved_exc_info(&mut self) -> Vec<Object> {
         self.exc
             .as_mut()
             .map(|e| std::mem::take(&mut e.saved))
@@ -351,7 +340,7 @@ impl Frame {
     }
 
     /// Set the [`FrameExc::saved`] entries.
-    fn set_saved_exc_info(&mut self, saved: Vec<PyException>) {
+    fn set_saved_exc_info(&mut self, saved: Vec<Object>) {
         if saved.is_empty() && self.exc.is_none() {
             return;
         }
@@ -463,7 +452,7 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g,
         _ => return,
     };
-    let Ok(state) = g.state.try_borrow() else {
+    let Ok(state) = g.state_raw().try_borrow() else {
         return;
     };
     let boxed = match &*state {
@@ -878,7 +867,7 @@ pub struct Interpreter {
     /// Stack of currently-handled exceptions across all frames. The
     /// top is what `sys.exc_info()` returns. Pushed by
     /// `PUSH_EXC_INFO`; popped by `POP_EXCEPT`.
-    pub(crate) exc_info_stack: Rc<RefCell<Vec<PyException>>>,
+    pub(crate) exc_info_stack: Rc<RefCell<Vec<Object>>>,
     /// User-installable hook called when an exception escapes the
     /// top-level frame. Defaults to a Rust builtin that prints the
     /// canonical CPython-style traceback to `sys.stderr`.
@@ -909,9 +898,16 @@ pub struct Interpreter {
     /// native dict alive (CPython's function keeps the mapping itself),
     /// so a weak owner would die with the caller's last direct reference.
     globals_missing_hooks: RefCell<Vec<(usize, Rc<PyInstance>)>>,
-    /// Whether `globals_missing_hooks` has ever been non-empty: the leaf
-    /// paths' one-load gate before the cell borrow.
+    /// Whether `globals_missing_hooks` is non-empty (as of its last
+    /// prune): the leaf paths' one-load gate before the cell borrow. While
+    /// it's set, every builtin `LOAD_GLOBAL` takes the slow path.
     globals_missing_any: Cell<bool>,
+    /// Finalizer drains left before the next prune of
+    /// `globals_missing_hooks` while `globals_missing_any` is set.
+    globals_missing_prune_in: Cell<u32>,
+    /// Builtin lookups that asked for a `__missing__` owner since the
+    /// last forced prune (see `globals_missing_owner`).
+    globals_missing_asks: Cell<u32>,
     /// Non-zero while the VM is lazily loading one of its own machinery
     /// modules (e.g. `importlib._bootstrap` for `module.__repr__`). In
     /// CPython those are frozen and fully initialized before user code
@@ -934,6 +930,15 @@ pub struct Interpreter {
     /// invalidate on every growth.
     #[allow(clippy::vec_box)]
     inline_pool: Vec<Box<InlineAct>>,
+    /// Emptied activation stacks of finished quiet runs (see
+    /// [`Self::quiet_run`]), for the next run: a generator its native
+    /// consumer resumes item by item starts a quiet run per item.
+    #[allow(clippy::vec_box)]
+    inl_spares: Vec<Vec<Box<InlineAct>>>,
+    /// Finished generators' frame boxes, their frames dropped, for the
+    /// next generators' frames (see [`Self::box_gen_frame`]).
+    #[allow(clippy::vec_box)]
+    gen_box_pool: ThreadCell<Vec<Box<std::mem::MaybeUninit<Frame>>>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -988,11 +993,6 @@ pub struct Interpreter {
     /// exact per-instruction event stream. Refreshed from the dispatch
     /// loop's [`crate::trace::ObserverSnapshot`] every iteration.
     fuse_off: bool,
-    /// A handled exception was just released (`POP_EXCEPT`): the running
-    /// frame's object may have lost its last outside holder (the
-    /// traceback), so the dispatch loop re-probes it on the next
-    /// instruction instead of waiting for its stride.
-    recheck_frame_observed: bool,
     /// `WEAVEPY_NO_QUIET`: pin every dispatch-loop iteration to the full
     /// prologue (RFC 0065 bisection aid). Read once at construction so a
     /// frame entry does not pay a `OnceLock` probe for it (RFC 0077 WS3).
@@ -1008,6 +1008,10 @@ pub struct Interpreter {
     /// ever dereferenced on the thread that pushed them, while the
     /// activations they name are live.
     lean_pending: Vec<usize>,
+    /// Spare [`ChainRec`]s (empty), boxed: a parked chain's levels point
+    /// at their record.
+    #[allow(clippy::vec_box)]
+    chain_pool: Vec<Box<ChainRec>>,
     /// The builtins the leaf burst may call directly (see [`LeafFns`]),
     /// resolved on first use.
     leaf_fns: std::cell::OnceCell<LeafFns>,
@@ -1025,20 +1029,33 @@ pub struct Interpreter {
     core_truth: ThreadCell<Option<(u64, NativeTruth)>>,
     /// `WP_DBG_SAMPLE`: periodic frame-entry sampling to stderr.
     dbg_sample: bool,
+    /// The GIL, held while the fields above drop (see the `Drop` impl).
+    /// Last, so that it is released after every other field.
+    drop_gil: crate::gil::GilScope,
+}
+
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        // The fields release the interpreter's objects: its module cache,
+        // pools and caches hold the last references to most of them, and
+        // tracked objects are visible to every thread's collections. Hold
+        // the GIL while they go, as construction does (`drop_gil` is the
+        // last field, so it gives the GIL back after the others).
+        self.drop_gil.engage();
+    }
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
-        // Register this thread before touching any cell. Construction
-        // populates the *process-global* collector and module cache, and
-        // `GilCell`'s lock-free path is only sound while a single thread
-        // owns every cell — a second thread building its own interpreter
-        // (an embedder, or `cargo test`'s parallel harness) has to flip
-        // cells to shared first, or both take the unlocked path over the
-        // same `GcState` and one loses with `BorrowMutError`. The GIL
-        // acquire path registers for every *later* entry; this covers the
-        // window before a thread has ever held it.
-        crate::sync::note_vm_thread(crate::gil::current_thread_id());
+        // Construction populates the *process-global* collector and module
+        // cache, so it holds the GIL like any other code that touches
+        // objects: a collection running on another thread (another
+        // interpreter's, in an embedder or `cargo test`'s parallel harness)
+        // reads every tracked object and the collector's own lists without
+        // taking their cells' borrows. Taking the GIL also registers this
+        // thread before it touches any cell, which `GilCell`'s lock-free
+        // path requires.
+        let _gil = crate::gil::hold_gil();
         install_parser_unicode_hook();
         // The UCRT's default response to an invalid parameter (e.g. a CRT
         // call on a stale fd) is a *silent* process fast-fail (exit
@@ -1147,7 +1164,8 @@ impl Default for Interpreter {
         // frames (their `Frame` type is private to this module).
         static GEN_TRAVERSE: std::sync::Once = std::sync::Once::new();
         GEN_TRAVERSE.call_once(|| {
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::GENERATOR,
                 |o| {
                     matches!(
                         o,
@@ -1161,17 +1179,23 @@ impl Default for Interpreter {
             // live set it walks. Teach the cycle GC to trace through it so
             // e.g. `obj.x = iter(set_containing_obj)` is collectable
             // (`test_set.test_container_iterator`).
-            crate::gc_trace::register_traverse(|o| matches!(o, Object::Iter(_)), iter_traverse);
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::ITER,
+                |o| matches!(o, Object::Iter(_)),
+                iter_traverse,
+            );
             // A dying exception's `__traceback__` is often the sole owner of
             // the unwound frames — and their locals — below it; CPython's
             // refcounting frees that whole chain the instant the exception
             // dies. Teach the prompt-reap cascade (and anything else walking
             // `traverse_object`) to follow traceback → frame → locals.
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::TRACEBACK,
                 |o| matches!(o, Object::Traceback(_)),
                 py_traceback_traverse,
             );
-            crate::gc_trace::register_traverse(
+            crate::gc_trace::register_traverse_for(
+                crate::gc_trace::hook_kind::FRAME,
                 |o| matches!(o, Object::Frame(_)),
                 py_frame_traverse,
             );
@@ -1233,9 +1257,13 @@ impl Default for Interpreter {
             unraisable_hook,
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
+            globals_missing_prune_in: Cell::new(0),
+            globals_missing_asks: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            inl_spares: Vec::new(),
+            gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1244,17 +1272,18 @@ impl Default for Interpreter {
             direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
-            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
+            drop_gil: crate::gil::GilScope::idle(),
         };
         // RFC 0025: publish the shared parts of this interpreter
         // (builtins / module cache / stdout / hooks) so workers
@@ -1361,9 +1390,13 @@ impl Interpreter {
             unraisable_hook: self.unraisable_hook.clone(),
             globals_missing_hooks: RefCell::new(Vec::new()),
             globals_missing_any: Cell::new(false),
+            globals_missing_prune_in: Cell::new(0),
+            globals_missing_asks: Cell::new(0),
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            inl_spares: Vec::new(),
+            gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1372,17 +1405,18 @@ impl Interpreter {
             direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
-            recheck_frame_observed: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
             burst_on: !crate::hot_gates::env_flags::no_burst()
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
+            drop_gil: crate::gil::GilScope::idle(),
         }
     }
 
@@ -1875,6 +1909,8 @@ impl Interpreter {
     /// `-S` is active; another explicit call would repeat `.pth` processing.
     /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "jit")]
+        crate::tier2::prewarm_at_startup();
         #[cfg(feature = "jit")]
         let _compile_guard = crate::tier2::startup_compilation_scope();
         // Startup runs bytecode too (site/.pth imports can allocate enough
@@ -2554,6 +2590,28 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::release`] with a shared value's plain decrement in line (the
+    /// core loop's arms that end a binding): only a last owner's release,
+    /// or one an observer watches, takes the full path.
+    #[inline(always)]
+    fn release_hot(&self, dropped: Object) {
+        let Some(word) = dropped.strong_word() else {
+            return std::mem::forget(dropped);
+        };
+        // A clear gate word: the bias holds (this thread alone updates
+        // counts) and no observer watches releases.
+        if crate::sync::release_gates() == 0 {
+            // SAFETY: `dropped` owns a reference to the live allocation.
+            let w = unsafe { &*word };
+            let c = w.load(std::sync::atomic::Ordering::Relaxed);
+            if c != 1 {
+                w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+                return std::mem::forget(dropped);
+            }
+        }
+        self.release(dropped);
+    }
+
     /// Release a finished call's arguments now, before the caller handles
     /// the result (CPython's `CALL` decrefs its operands first): an
     /// argument only the call held dies here, finalizers and all.
@@ -2705,6 +2763,10 @@ impl Interpreter {
     /// `sys.unraisablehook` (the default hook prints `Exception ignored
     /// in: …` to stderr, exactly like CPython) so they don't propagate.
     pub fn run_pending_finalizers(&mut self) -> usize {
+        // (Before the drain: an owner the prune lets go of may queue one.)
+        if self.globals_missing_any.get() {
+            self.prune_globals_missing_hooks_sometimes();
+        }
         // RFC 0077 (WS2): the prompt reaper drains after every node it
         // tears down, and for the overwhelming majority nothing was
         // queued. Answer that without publishing the interpreter pointer
@@ -2751,7 +2813,7 @@ impl Interpreter {
                 // finalized and clear its deferral flag so the next collection
                 // treats it as plain garbage (if it wasn't resurrected) and
                 // never runs `__del__` a second time.
-                crate::gc_trace::complete_finalizer(crate::weakref_registry::id_of(&obj));
+                crate::gc_trace::complete_finalizer(&obj);
             }
             // Weakref callbacks run after finalizers (CPython's order);
             // errors route through the unraisable hook. WeavePy reaps at
@@ -3062,29 +3124,22 @@ impl Interpreter {
             Some(Object::Module(m)) => m.dict.borrow().iter().map(|(_k, v)| v.clone()).collect(),
             _ => Vec::new(),
         };
-        let mut sys_deferred: Vec<(crate::sync::Rc<crate::gc_trace::TrackedHandle>, Object)> =
-            Vec::new();
+        let mut sys_deferred: Vec<Object> = Vec::new();
         for _ in 0..8 {
             let candidates = crate::gc_trace::finalization_candidates();
             if candidates.is_empty() {
                 break;
             }
-            for (handle, obj) in candidates {
+            for obj in candidates {
                 if sys_values.iter().any(|v| v.is_same(&obj)) {
-                    if !sys_deferred
-                        .iter()
-                        .any(|(h, _)| crate::sync::Rc::ptr_eq(h, &handle))
-                    {
-                        sys_deferred.push((handle, obj));
+                    if !sys_deferred.iter().any(|o| o.is_same(&obj)) {
+                        sys_deferred.push(obj);
                     }
                     continue;
                 }
-                // `swap` claims the finalizer so the cycle collector
-                // and a later shutdown pass can't double-run it.
-                if handle
-                    .finalized
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
+                // Claiming the finalizer means the cycle collector and a
+                // later shutdown pass can't double-run it.
+                if !crate::gc_trace::claim_finalizer(&obj) {
                     continue;
                 }
                 self.invoke_finalizer(&obj);
@@ -3094,11 +3149,8 @@ impl Interpreter {
         }
         if !sys_deferred.is_empty() {
             crate::vm_singletons::set_unraisable_silenced(true);
-            for (handle, obj) in sys_deferred {
-                if handle
-                    .finalized
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
+            for obj in sys_deferred {
+                if !crate::gc_trace::claim_finalizer(&obj) {
                     continue;
                 }
                 self.invoke_finalizer(&obj);
@@ -3204,8 +3256,8 @@ impl Interpreter {
         // the raised warning routes through the unraisable hook,
         // with the coroutine itself as the hook's object.
         if let Object::Coroutine(g) = obj {
-            if matches!(&*g.state.borrow(), GeneratorState::Created(_)) {
-                *g.state.borrow_mut() = GeneratorState::Finished;
+            if matches!(&*g.state().borrow(), GeneratorState::Created(_)) {
+                *g.state().borrow_mut() = GeneratorState::Finished;
                 let qualname = g.qualname().to_str();
                 self.warn_unawaited_coroutine(obj, &qualname);
                 return true;
@@ -3305,11 +3357,7 @@ impl Interpreter {
                     Object::Instance(i) => Object::Type(i.cls()),
                     _ => Object::None,
                 };
-                (
-                    inst,
-                    ty,
-                    pyexc.traceback.iter().cloned().collect::<Vec<_>>(),
-                )
+                (inst, ty, pyexc.traceback_entries())
             }
             other => {
                 let inst = crate::builtin_types::make_exception("RuntimeError", other.to_string());
@@ -3900,6 +3948,34 @@ impl Interpreter {
         Rc::new(RefCell::new(v))
     }
 
+    /// An empty locals vector with room for `n`, recycled when the pool
+    /// has one this frame can own (see [`Self::pooled_locals_from_args`]).
+    #[inline]
+    fn pooled_locals_empty(&self, n: usize) -> Rc<RefCell<Vec<Object>>> {
+        let pooled = {
+            let mut pool = self.frame_locals_pool.borrow_mut();
+            loop {
+                match pool.pop() {
+                    Some(rc) if Rc::strong_count(&rc) == 1 => break Some(rc),
+                    // Still shared: only our clone is dropped (no element
+                    // destructor runs under the borrow).
+                    Some(_) => (),
+                    None => break None,
+                }
+            }
+        };
+        match pooled {
+            Some(rc) => {
+                // SAFETY: sole owner, checked at the pop above.
+                let v = unsafe { &mut *rc.as_ptr() };
+                debug_assert!(v.is_empty());
+                v.reserve(n);
+                rc
+            }
+            None => Rc::new(RefCell::new(Vec::with_capacity(n))),
+        }
+    }
+
     /// RFC 0061 (WS3b): fetch a recycled argument-staging vector, or
     /// allocate one. Deliberately a separate pool from
     /// [`Self::pooled_stack`] — see the `scratch_pool` field docs.
@@ -3953,11 +4029,41 @@ impl Interpreter {
             // bookkeeping), which must not observe a held pool borrow.
             // SAFETY: sole owner (checked above) — no other path can
             // reach this vector, including the drop glue of its elements.
-            unsafe { (*frame.locals.as_ptr()).clear() };
+            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.clone());
             }
+        }
+    }
+
+    /// `frame` boxed for a new generator: in a finished generator's box
+    /// (see [`Self::recycle_gen_box`]) when the pool has one.
+    #[inline]
+    fn box_gen_frame(&self, frame: Frame) -> Box<Frame> {
+        let spare = self.gen_box_pool.borrow_mut().pop();
+        match spare {
+            Some(b) => Box::write(b, frame),
+            None => Box::new(frame),
+        }
+    }
+
+    /// A finished generator's frame box: the frame is dropped here (what
+    /// dropping the box would do) and the allocation kept for the next
+    /// generator's (see [`Self::box_gen_frame`]).
+    fn recycle_gen_box(&self, boxed: Box<Frame>) {
+        const POOL_CAP: usize = 32;
+        let raw = Box::into_raw(boxed);
+        // SAFETY: the frame is dropped in place once, and its allocation
+        // goes on as uninitialized storage (freed as such past the cap).
+        // The frame's drop glue runs before the pool's borrow.
+        let spare = unsafe {
+            std::ptr::drop_in_place(raw);
+            Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>())
+        };
+        let mut pool = self.gen_box_pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(spare);
         }
     }
 
@@ -4308,7 +4414,7 @@ impl Interpreter {
                     shell
                         .lasti
                         .store(pc as u32, std::sync::atomic::Ordering::Relaxed);
-                    py_frame.lasti.set(pc as u32);
+                    py_frame.set_lasti(pc as u32);
                 }
             }
             if let Err(e) = self.fire_call_event(&py_frame, mon_event, Object::None) {
@@ -4511,11 +4617,6 @@ impl Interpreter {
         let quiet_off = self.quiet_off;
         let mut loop_snap_gen: u64 = 0; // stale → first iteration derives
         let mut loop_quiet = false;
-        // The loops are off only because a frame object is observed (see
-        // `frame_object_observed`): re-derive once nothing outside the
-        // activation holds it any more (an `except` clause dropped the
-        // traceback).
-        let mut frame_blocks_quiet = false;
         let result = 'activation: loop {
             // RFC 0039 (WS2) / RFC 0059 (WS2): cooperative GIL hand-off.
             // A plain interpreter-local countdown — one register
@@ -4532,25 +4633,13 @@ impl Interpreter {
             // a prologue input changed. The observer snapshot refresh
             // rides the same generation (observer mutation bumps it).
             let lgen = crate::hot_gates::loop_gen();
-            // The frame object's holder (a live traceback, a
-            // `sys._getframe` handle) is re-probed on a stride, not per
-            // instruction: the probe reads a cell and a reference count,
-            // and an exception handler paid it for every instruction it
-            // ran. A few extra instructions on the full path after the
-            // holder goes away cost far less.
-            let rederive = frame_blocks_quiet
-                && (std::mem::take(&mut self.recheck_frame_observed)
-                    || self.gil_countdown.trailing_zeros() >= 4)
-                && !Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
-            if lgen != loop_snap_gen || rederive {
+            if lgen != loop_snap_gen {
                 loop_snap_gen = lgen;
                 obs.refresh();
                 self.fuse_off = obs.any;
-                let unobserved = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
-                let frame_observed =
-                    Self::frame_object_observed(&shell, py_frame_slot.as_ref(), frame);
-                frame_blocks_quiet = unobserved && frame_observed;
-                loop_quiet = unobserved && !frame_observed;
+                // A frame object of this activation doesn't keep the loops
+                // off: it reads `lasti` from the shell (see `PyFrame::live`).
+                loop_quiet = !quiet_off && crate::hot_gates::load() == 0 && !obs.any;
             }
             // The leaf burst: while the loop is quiet, run the straight
             // run of leaf instructions at `frame.pc` in one tight loop
@@ -4585,27 +4674,11 @@ impl Interpreter {
                 } else {
                     None
                 };
-                // A frame object only this activation holds skipped the
-                // per-instruction `lasti` sync: bring it current before the
-                // prologue (or a raise's traceback) reads it.
-                if quiet_exit.is_some()
-                    && shell
-                        .has_materialized
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    // The instruction that just ran (or raised), as the
-                    // per-instruction sync would have left it; after a
-                    // yield back to the prologue, the next one.
-                    let at = match &quiet_exit {
-                        Some(QuietExit::Outcome { cur_pc, .. }) => *cur_pc as u32,
-                        _ => frame.pc,
-                    };
-                    if let Some(py) = shell.materialized.borrow().as_ref() {
-                        py.lasti.set(at);
-                    }
-                } else if let Some(exit) = &quiet_exit {
-                    // Likewise the shell a lazy traceback entry will
-                    // materialize from (see `pop_frame_shell`).
+                // The shell a frame object reads its `lasti` from, or a lazy
+                // traceback entry will materialize from (see
+                // `pop_frame_shell`), at the instruction that just ran (or
+                // raised); a yield back to the prologue left it at the next.
+                if let Some(exit) = &quiet_exit {
                     Self::sync_lazy_tb_lasti(Some(&shell), &frame.code, exit);
                 }
                 match quiet_exit {
@@ -4623,37 +4696,10 @@ impl Interpreter {
                         shell
                             .lasti
                             .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                        if shell
-                            .has_materialized
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            if let Some(py) = shell.materialized.borrow().as_ref() {
-                                py.lasti.set(frame.pc);
-                            }
-                        }
                         instruction_ran = true;
                         self.step_hot(frame)
                     }
                 }
-            } else if frame_blocks_quiet {
-                // Quiet but for a frame object something outside holds (an
-                // exception's traceback, while its handler runs): nothing
-                // the full prologue serves is pending, so each instruction
-                // only brings the frame's `lasti` current before it runs.
-                cur_pc = frame.pc as usize;
-                shell
-                    .lasti
-                    .store(frame.pc, std::sync::atomic::Ordering::Relaxed);
-                if shell
-                    .has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.ensure_top_py_frame(&mut py_frame_slot)
-                        .lasti
-                        .set(frame.pc);
-                }
-                instruction_ran = true;
-                self.step_hot(frame)
             } else {
                 // RFC 0059 (WS2): the unified eval-breaker word. One relaxed
                 // load answers "is *any* deferred work pending?" for the six
@@ -4745,7 +4791,7 @@ impl Interpreter {
                 self.fuse_off = obs.any;
                 if obs.any && !is_gen_bootstrap {
                     let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                    py_frame.lasti.set(frame.pc);
+                    py_frame.set_lasti(frame.pc);
                     let line = py_frame.current_lineno();
                     // RFC 0051 (WS4): CPython 3.13 line-event semantics.
                     // A `'line'` event fires when execution reaches an
@@ -5219,7 +5265,7 @@ impl Interpreter {
                                 // fires at the handler entry.
                                 if let Some(inst) = handled_arg {
                                     let py_frame = self.ensure_top_py_frame(&mut py_frame_slot);
-                                    py_frame.lasti.set(frame.pc);
+                                    py_frame.set_lasti(frame.pc);
                                     if let Err(mon_e) = self.fire_monitoring_event(
                                         &py_frame,
                                         crate::trace::EVENT_EXCEPTION_HANDLED,
@@ -5428,7 +5474,7 @@ impl Interpreter {
             }
             let materialized = frame.py_frame.clone();
             if let Some(existing) = &materialized {
-                existing.lasti.set(frame.pc);
+                existing.set_lasti(frame.pc);
                 existing.invalidate_locals();
                 existing.on_stack.set(existing.on_stack.get() + 1);
             }
@@ -5443,6 +5489,9 @@ impl Interpreter {
             cached
                 .has_materialized
                 .store(materialized.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if let Some(py) = &materialized {
+                cached.link(py);
+            }
             *cached.materialized.borrow_mut() = materialized;
             let shell = cached.clone();
             self.frame_stack.borrow_mut().push(shell.clone());
@@ -5452,7 +5501,7 @@ impl Interpreter {
             frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator;
         let materialized = frame.py_frame.clone();
         if let Some(existing) = &materialized {
-            existing.lasti.set(frame.pc);
+            existing.set_lasti(frame.pc);
             existing.invalidate_locals();
             existing.on_stack.set(existing.on_stack.get() + 1);
         }
@@ -5505,6 +5554,9 @@ impl Interpreter {
                 *m.gen_owner.get_mut() = gen_owner;
                 m.lasti = std::sync::atomic::AtomicU32::new(frame.pc);
                 m.has_materialized = std::sync::atomic::AtomicBool::new(materialized.is_some());
+                if let Some(py) = &materialized {
+                    m.link(py);
+                }
                 *m.materialized.get_mut() = materialized;
                 self.frame_stack.borrow_mut().push(pooled.clone());
                 return pooled;
@@ -5526,6 +5578,9 @@ impl Interpreter {
             materialized: RefCell::new(materialized),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
         });
+        if let Some(py) = shell.materialized.borrow().as_ref() {
+            shell.link(py);
+        }
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
     }
@@ -5539,13 +5594,30 @@ impl Interpreter {
     /// nothing may stay pinned until reuse.
     fn recycle_frame_shell(&self, mut shell: Rc<crate::object::FrameShell>) {
         const FRAME_SHELL_POOL_CAP: usize = 64;
-        if shell.is_gen
-            || shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-            || self.frame_shell_pool.borrow().len() >= FRAME_SHELL_POOL_CAP
-        {
+        if shell.is_gen || self.frame_shell_pool.borrow().len() >= FRAME_SHELL_POOL_CAP {
             return;
+        }
+        if shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // A frame object nothing but the shell holds (a `sys._getframe`
+            // handle since dropped) dies with the activation, as CPython's
+            // does; one anything else holds keeps the shell too.
+            let Some(m) = Rc::get_mut(&mut shell) else {
+                return;
+            };
+            if !m
+                .materialized
+                .get_mut()
+                .as_ref()
+                .is_some_and(|py| Rc::strong_count(py) == 1)
+            {
+                return;
+            }
+            let py = m.materialized.get_mut().take();
+            *m.has_materialized.get_mut() = false;
+            drop(py);
         }
         if let Some(m) = Rc::get_mut(&mut shell) {
             m.code.clear();
@@ -5567,6 +5639,7 @@ impl Interpreter {
     fn push_materialized_frame(&self, py: &Rc<PyFrame>) {
         py.on_stack.set(py.on_stack.get() + 1);
         let shell = Rc::new(crate::object::FrameShell::from_py_frame(py));
+        shell.link(py);
         self.frame_stack.borrow_mut().push(shell);
     }
 
@@ -5609,40 +5682,6 @@ impl Interpreter {
 
     /// Dispatch-loop helper: materialise the current activation's
     /// `PyFrame` once and cache it in the loop-local slot.
-    /// Whether this activation's frame object (if one was materialized)
-    /// is reachable from anything but the activation's own bookkeeping —
-    /// the shell's cell, the loop's slot, the frame's link: a traceback
-    /// or a Python reference that may read `f_lineno` at any moment, so
-    /// the loop keeps its `lasti` current instruction by instruction.
-    /// Otherwise the quiet loops may run, syncing it whenever they hand
-    /// back and whenever the object is fetched again (see
-    /// `FrameShell::materialize`).
-    fn frame_object_observed(
-        shell: &crate::object::FrameShell,
-        slot: Option<&Rc<PyFrame>>,
-        frame: &Frame,
-    ) -> bool {
-        if !shell
-            .has_materialized
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-        // Borrowed, not cloned: this runs per instruction while a
-        // traceback holds the frame object, and the clone's own count
-        // would be two more atomics each time.
-        let Ok(cell) = shell.materialized.try_borrow() else {
-            return true;
-        };
-        let Some(py) = cell.as_ref() else {
-            return false;
-        };
-        let own = 1
-            + usize::from(slot.is_some_and(|s| Rc::ptr_eq(s, py)))
-            + usize::from(frame.py_frame.as_ref().is_some_and(|p| Rc::ptr_eq(p, py)));
-        Rc::strong_count(py) > own
-    }
-
     fn ensure_top_py_frame(&self, slot: &mut Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         if let Some(py) = slot {
             return py.clone();
@@ -5697,6 +5736,7 @@ impl Interpreter {
             extra_locals: RefCell::new(None),
             cleared: Cell::new(false),
             lazy_back: RefCell::new(None),
+            live: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         })
     }
 
@@ -5712,11 +5752,10 @@ impl Interpreter {
             frame.stack.pop();
         }
         for _ in 0..jump.exc_pops {
-            frame.exc_handlers_pop();
             self.exc_info_stack.borrow_mut().pop();
         }
         frame.pc = jump.target_pc;
-        py_frame.lasti.set(jump.target_pc);
+        py_frame.set_lasti(jump.target_pc);
         py_frame.override_lineno.set(None);
         // Force a fresh 'line' event at the landing site.
         py_frame.last_line.set(None);
@@ -5772,7 +5811,7 @@ impl Interpreter {
         }
         let suspended = event == TraceEvent::Yield;
         let (jump, resolved_line) =
-            crate::linejump::compute_jump(&fr.code, fr.lasti.get(), new_lineno, suspended)?;
+            crate::linejump::compute_jump(&fr.code, fr.lasti_now(), new_lineno, suspended)?;
         // CPython binds `None` to any still-unbound local at the target
         // (rather than crashing on a LOAD_FAST of a name the compiler
         // "proved" bound), warning first so an escalating filter can
@@ -5841,7 +5880,7 @@ impl Interpreter {
         }
         let owner = py.gen_owner.borrow().as_ref().and_then(|w| w.upgrade());
         if let Some(g) = owner {
-            let state_kind = match &*g.state.borrow() {
+            let state_kind = match &*g.state().borrow() {
                 GeneratorState::Running | GeneratorState::Delegating(_) => 0u8,
                 GeneratorState::Suspended(_) => 1,
                 GeneratorState::Created(_) => 2,
@@ -5870,7 +5909,7 @@ impl Interpreter {
                     // Tear down the never-started generator: its frame
                     // locals (bound arguments) die now, like CPython's
                     // refcount-driven dealloc.
-                    *g.state.borrow_mut() = GeneratorState::Finished;
+                    *g.state().borrow_mut() = GeneratorState::Finished;
                     Self::wipe_frame_locals(py);
                     return Ok(Object::None);
                 }
@@ -6059,9 +6098,10 @@ impl Interpreter {
     }
 
     /// A quiet loop leaves its shell's `lasti` behind the instruction it
-    /// stopped on. A lazy traceback entry materializes from the shell
-    /// once the activation leaves the spine (see `pop_frame_shell`), so
-    /// bring it current for the frame object's final `f_lineno`.
+    /// stopped on. A frame object reads it from there (see
+    /// `PyFrame::live`), and a lazy traceback entry materializes from the
+    /// shell once the activation leaves the spine (see `pop_frame_shell`),
+    /// so bring it current for the frame object's final `f_lineno`.
     /// A `RERAISE` leaves the restored raise site there itself (PEP 626).
     #[inline]
     fn sync_lazy_tb_lasti(
@@ -6070,12 +6110,11 @@ impl Interpreter {
         exit: &QuietExit,
     ) {
         if let (Some(shell), QuietExit::Outcome { cur_pc, stepped }) = (shell, exit) {
-            if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && !(stepped.is_err()
-                    && code
-                        .instructions
-                        .get(*cur_pc)
-                        .is_some_and(|i| i.op == OpCode::Reraise))
+            if !(stepped.is_err()
+                && code
+                    .instructions
+                    .get(*cur_pc)
+                    .is_some_and(|i| i.op == OpCode::Reraise))
             {
                 shell
                     .lasti
@@ -6106,11 +6145,8 @@ impl Interpreter {
         let existing = caller.materialized.borrow().clone();
         match existing {
             Some(back) => {
-                // A new holder of the caller's frame object: its loop
-                // re-derives whether the object is observed.
                 caller.refresh_materialized(&back);
                 py.set_back(Some(back));
-                crate::hot_gates::bump_loop_gen();
             }
             None => {
                 *py.lazy_back.borrow_mut() = Some(crate::object::LazyShellRef::new(caller));
@@ -6148,6 +6184,7 @@ impl Interpreter {
                 return popped;
             }
             if let Some(py) = shell.materialized.borrow().as_ref() {
+                py.unlink_live(shell);
                 py.on_stack.set(py.on_stack.get().saturating_sub(1));
                 // A generator-family frame that just suspended (yielded)
                 // or finished is no longer reachable from a live caller.
@@ -6176,7 +6213,7 @@ impl Interpreter {
         if !matches!(g.code, Object::None) {
             return g.code.clone();
         }
-        match &*g.state.borrow() {
+        match &*g.state().borrow() {
             GeneratorState::Created(frame)
             | GeneratorState::Suspended(frame)
             | GeneratorState::Delegating(frame) => Object::Code(frame.code.clone()),
@@ -6191,7 +6228,7 @@ impl Interpreter {
     /// single `gi_frame` alive for the generator's lifetime). `None` once
     /// the generator has finished.
     fn gen_py_frame(&self, g: &Rc<PyGenerator>) -> Object {
-        let mut state = g.state.borrow_mut();
+        let mut state = g.state().borrow_mut();
         // A collapsed chain's generator is executing: its frame is on the
         // spine once anything flushed it (see `Self::gen_frame_attr`), and
         // otherwise as a suspended one's would be.
@@ -6286,7 +6323,7 @@ impl Interpreter {
     /// not delegating. A frame parked in a delegation sits just past the
     /// `SEND`/`YIELD_VALUE` pair with the delegate at top-of-stack.
     fn gen_yieldfrom(&self, g: &Rc<PyGenerator>) -> Object {
-        let state = g.state.borrow();
+        let state = g.state().borrow();
         if let GeneratorState::Suspended(frame) = &*state {
             {
                 let pc = frame.pc as usize;
@@ -6703,7 +6740,7 @@ impl Interpreter {
             let tb = PyTraceback::new(
                 py_frame.clone(),
                 py_frame.last_line.get().unwrap_or(1),
-                py_frame.lasti.get(),
+                py_frame.lasti_now(),
                 None,
             );
             *tb.next.borrow_mut() = inherited_tb.clone();
@@ -6974,7 +7011,7 @@ impl Interpreter {
         if crate::trace::monitoring_union_mask_cached() & crate::trace::event_mask(event_idx) == 0 {
             return Ok(());
         }
-        let pc = py_frame.lasti.get();
+        let pc = py_frame.lasti_now();
         let code = py_frame.code.clone();
         let code_obj = Object::Code(code.clone());
         let offset = Object::Int(i64::from(code.cpython_lasti(pc)));
@@ -7473,8 +7510,9 @@ impl Interpreter {
         let maybe_dead = gc_trace::maybe_dead_flag();
         // The root activation's last executed pc (its `prev_pc` feed).
         let mut last = usize::MAX;
-        // The inline activations, innermost last.
-        let mut inl: Vec<Box<InlineAct>> = Vec::new();
+        // The inline activations, innermost last (in a finished run's
+        // emptied vector, when one is spare).
+        let mut inl: Vec<Box<InlineAct>> = self.inl_spares.pop().unwrap_or_default();
         // Every access below goes through these handles (see
         // `CoreSwitch`): the core loop's in-loop calls and returns move
         // the running activation through the same ones.
@@ -7546,15 +7584,20 @@ impl Interpreter {
                 FrameEv::Switched(stop) => QuietEntry::Stop(stop),
                 FrameEv::Exit(exit) => {
                     let Some(mut done) = inl.pop() else {
+                        // (Empty: the vector goes back for the next run.)
+                        const SPARES_CAP: usize = 16;
+                        if inl.capacity() != 0 && self.inl_spares.len() < SPARES_CAP {
+                            self.inl_spares.push(std::mem::take(inl));
+                        }
                         return exit;
                     };
                     if done.gen.is_some() {
                         let result = self.inline_gen_finish(&mut done, exit);
-                        if !done.delegates.is_empty() {
+                        if done.chain.is_some() {
                             if matches!(result, Ok(GenStep::Yielded(_)))
-                                && !Self::collapse_flushed(&done)
+                                && !self.collapse_flushed(&done)
                             {
-                                self.core_uncollapse(&mut done);
+                                self.collapse_park(&mut done);
                             } else {
                                 // The chain's innermost level takes the
                                 // result (a yield on the spine, all of
@@ -7562,7 +7605,7 @@ impl Interpreter {
                                 let all = matches!(result, Ok(GenStep::Yielded(_)));
                                 let mut levels = Vec::new();
                                 let mut level = self.collapse_expand_one(&mut done);
-                                while all && !level.delegates.is_empty() {
+                                while all && level.chain.is_some() {
                                     let outer = self.collapse_expand_one(&mut level);
                                     levels.push(level);
                                     level = outer;
@@ -7622,6 +7665,29 @@ impl Interpreter {
         }
     }
 
+    /// Whether the GIL countdown is down to `floor` with a hand-off to
+    /// make: the quiet paths' calls, returns and back edges then yield to
+    /// the outer loop's checkpoint. A countdown that runs out with no
+    /// thread waiting starts over in place instead (the checkpoint would
+    /// do nothing else), so a busy single thread doesn't unwind its whole
+    /// native call nest every 128 calls.
+    #[inline(always)]
+    pub(crate) fn countdown_out(&mut self, floor: u32) -> bool {
+        self.gil_countdown <= floor && !self.countdown_refill()
+    }
+
+    /// [`Self::countdown_out`]'s cold half: `true` when the countdown
+    /// started over.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn countdown_refill(&mut self) -> bool {
+        if crate::gil::handoff_idle() {
+            self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
+            return true;
+        }
+        false
+    }
+
     /// After the quiet loop caught an exception: whether the activation
     /// yields as the outer loop's per-instruction prologue would (the GIL
     /// countdown, a hot gate). Code that only calls and catches, such as
@@ -7629,7 +7695,7 @@ impl Interpreter {
     /// never let another thread or a signal in.
     #[inline]
     fn quiet_caught_yields(&mut self, snap_gen: u64) -> bool {
-        if self.gil_countdown <= 2 {
+        if self.countdown_out(2) {
             return true;
         }
         self.gil_countdown -= 1;
@@ -7663,7 +7729,7 @@ impl Interpreter {
                 // lean paths below.
                 QuietEntry::Returned { cur_pc } => {
                     *last = cur_pc;
-                    if self.gil_countdown <= 2 {
+                    if self.countdown_out(2) {
                         break 'run QuietExit::Yield;
                     }
                     self.gil_countdown -= 1;
@@ -7703,7 +7769,9 @@ impl Interpreter {
                 let stop = match pending.take() {
                     Some(stop) => stop,
                     None => {
-                        let mut sw = CoreSwitch::enter(roots, frame, shell, last);
+                        let calls_ok = self.inline_calls_ok();
+                        let mut sw =
+                            CoreSwitch::enter(roots, frame, shell, last, calls_ok, snap_gen);
                         let stop = self.leaf_burst(&mut sw, snap_gen);
                         if sw.switched() {
                             return FrameEv::Switched(stop);
@@ -7833,7 +7901,7 @@ impl Interpreter {
                             });
                         }
                         *last = cur_pc;
-                        if self.gil_countdown <= 2 {
+                        if self.countdown_out(2) {
                             break 'run QuietExit::Yield;
                         }
                         self.gil_countdown -= 1;
@@ -7880,16 +7948,20 @@ impl Interpreter {
                         return FrameEv::Call(act);
                     }
                 }
+                // (A site whose loads keep failing goes straight to the full
+                // handler, which raises a certain miss without the lanes.)
+                let attr_failing =
+                    op_before == Some(OpCode::LoadAttr) && failing_attr_site(&frame.code, cur_pc);
                 // `inst.prop` for a plain `property`: its getter runs as an
                 // inline activation, like an inline call.
-                if op_before == Some(OpCode::LoadAttr) && self.inline_calls_ok() {
+                if op_before == Some(OpCode::LoadAttr) && !attr_failing && self.inline_calls_ok() {
                     if let Some(act) = self.try_inline_property(frame, shell, cur_pc) {
                         return FrameEv::Call(act);
                     }
                 }
                 // Otherwise as a lean activation; `for x in gen` resumes
                 // the generator as one.
-                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) {
+                if matches!(op_before, Some(OpCode::LoadAttr | OpCode::ForIter)) && !attr_failing {
                     let loaded = if op_before == Some(OpCode::LoadAttr) {
                         self.try_lean_property(frame, shell, snap_gen, cur_pc)
                     } else {
@@ -7917,7 +7989,7 @@ impl Interpreter {
                             });
                         }
                         *last = cur_pc;
-                        if self.gil_countdown <= 2 {
+                        if self.countdown_out(2) {
                             break 'run QuietExit::Yield;
                         }
                         self.gil_countdown -= 1;
@@ -7951,7 +8023,7 @@ impl Interpreter {
                                 .code
                                 .names
                                 .get(arg as usize)
-                                .map_or("?", String::as_str),
+                                .map_or("?", |n| n.as_str()),
                             recv,
                         );
                     }
@@ -7972,7 +8044,7 @@ impl Interpreter {
                 }
                 *last = cur_pc;
                 // The outer loop's per-instruction prologue, in its order.
-                if self.gil_countdown <= 2 {
+                if self.countdown_out(2) {
                     break 'run QuietExit::Yield;
                 }
                 self.gil_countdown -= 1;
@@ -8128,7 +8200,7 @@ impl Interpreter {
     /// Park a finished inline slot (its callable already taken): release
     /// what the activation owned and return the slot to the pool.
     fn inline_park(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(!act.parked && act.delegates.is_empty());
+        debug_assert!(!act.parked && act.chain.is_none());
         let fr: &mut Frame = &mut act.frame;
         // Leftover operands drop before anything is reused (their drop
         // glue is arbitrary Rust code).
@@ -8136,21 +8208,8 @@ impl Interpreter {
         if Rc::strong_count(&fr.locals) == 1 {
             // SAFETY: sole owner — no other path reaches this vector.
             let v = unsafe { &mut *fr.locals.as_ptr() };
-            if v.iter().all(|o| {
-                matches!(
-                    o,
-                    Object::Int(_)
-                        | Object::Float(_)
-                        | Object::Bool(_)
-                        | Object::None
-                        | Object::Unbound
-                )
-            }) {
-                // SAFETY: scalars own nothing; no drop glue is skipped.
-                unsafe { v.set_len(0) };
-            } else {
-                v.clear();
-            }
+            // SAFETY: sole owner (checked above).
+            unsafe { release_locals(v) };
         } else {
             // The storage escaped (a materialized frame shares it): the
             // slot takes fresh storage.
@@ -8164,7 +8223,6 @@ impl Interpreter {
         // activation never left the quiet loop's leaf paths).
         if !act.clean {
             if let Some(exc) = fr.exc.as_mut() {
-                exc.handlers.clear();
                 exc.saved.clear();
                 exc.cleanup_lasti = None;
                 exc.pending_lasti = None;
@@ -8211,7 +8269,7 @@ impl Interpreter {
     /// only the code handle and the slot's own fields remain.
     #[inline(always)]
     fn inline_park_clean(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(act.clean && act.frame.stack.is_empty() && act.delegates.is_empty());
+        debug_assert!(act.clean && act.frame.stack.is_empty() && act.chain.is_none());
         // SAFETY: as `inline_park`: the code handle is owned while active.
         unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         if act.owns_cells {
@@ -8229,6 +8287,60 @@ impl Interpreter {
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
+    }
+
+    /// [`Self::inline_park_clean`] for a direct call's activation (see
+    /// `frame_jit::direct_call`) after its clean return: it never owns
+    /// cells, and of the fields the park resets only `direct` was set
+    /// (its guard is gone already).
+    #[inline(always)]
+    pub(crate) fn inline_park_direct(&mut self, mut act: Box<InlineAct>) {
+        debug_assert!(
+            act.frame.stack.is_empty()
+                && !act.owns_cells
+                && act.binop.is_none()
+                && !act.discard
+                && act.guard.is_none()
+                && act.init_inst.is_none()
+                && act.act.shell.is_none()
+        );
+        // SAFETY: as `inline_park`: the code handle is owned while active;
+        // a function holds the code too, so this is rarely its last owner.
+        unsafe {
+            let code = std::ptr::read(&raw const act.frame.code);
+            if crate::rc::try_release_shared(Rc::as_ptr(&code)) {
+                std::mem::forget(code);
+            } else {
+                drop(code);
+            }
+        }
+        act.parked = true;
+        act.direct = false;
+        act.caller_pending = None;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, act);
+        }
+    }
+
+    /// [`Self::inline_park_direct`] for a slot that stays with its direct
+    /// call's site (`frame_jit::DirectSite`) instead of the pool: parked,
+    /// but still holding its code's count, so the site's next call of the
+    /// same code binds it without one.
+    #[inline(always)]
+    pub(crate) fn inline_park_warm(&mut self, mut act: Box<InlineAct>) -> Box<InlineAct> {
+        debug_assert!(
+            act.frame.stack.is_empty()
+                && !act.owns_cells
+                && act.binop.is_none()
+                && !act.discard
+                && act.guard.is_none()
+                && act.init_inst.is_none()
+                && act.act.shell.is_none()
+        );
+        act.parked = true;
+        act.direct = false;
+        act.caller_pending = None;
+        act
     }
 
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
@@ -8251,6 +8363,7 @@ impl Interpreter {
     ) -> Option<Box<InlineAct>> {
         let arg = match mode {
             InlineResume::NextCall | InlineResume::SendCall => GEN_NEXT_CALL,
+            InlineResume::NextDefault => GEN_NEXT_DEFAULT,
             InlineResume::ForIter => frame.code.instructions.get(pc)?.arg,
             InlineResume::Send => {
                 let jump = frame.code.instructions.get(pc)?.arg;
@@ -8278,6 +8391,14 @@ impl Interpreter {
                         _ => return None,
                     }
                 }
+                // The method form `gen.send` loads (see `core_gen_method`).
+                (
+                    Some(Object::Builtin(b)),
+                    Some(Object::Generator(g) | Object::Coroutine(g)),
+                    Some(v),
+                ) if matches!(b.name, ".u.gen_send" | ".u.cor_send") => {
+                    (g, matches!(v, Object::None))
+                }
                 _ => return None,
             }
         } else if send {
@@ -8287,6 +8408,12 @@ impl Interpreter {
                 }
                 _ => return None,
             }
+        } else if mode == InlineResume::NextDefault {
+            // `[next, NULL, gen, default]`.
+            let Some(Object::Generator(g)) = frame.stack.get(n.checked_sub(2)?) else {
+                return None;
+            };
+            (g, true)
         } else {
             let Some(Object::Generator(g)) = frame.stack.last() else {
                 return None;
@@ -8297,7 +8424,7 @@ impl Interpreter {
         // runs while it is held; it ends before the activation resumes.
         // SAFETY: nothing below reaches the cell again until `state`'s last
         // use (`peek_mut` rejects a live guard or shared cells).
-        let state = unsafe { g.state.peek_mut() }?;
+        let state = unsafe { g.state().peek_mut() }?;
         let first_resume;
         {
             let boxed = match &*state {
@@ -8335,11 +8462,41 @@ impl Interpreter {
         // Committed.
         let prev_state = std::mem::replace(state, GeneratorState::Running);
         let g = g.clone();
-        let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
-            prev_state
-        else {
+        let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) = prev_state else {
             unreachable!("checked above");
         };
+        let sent = if send {
+            frame.stack.pop().unwrap_or(Object::None)
+        } else {
+            Object::None
+        };
+        Some(self.inline_gen_commit(
+            frame,
+            shell,
+            pc,
+            mode,
+            arg,
+            (g, boxed, first_resume, sent),
+            guard,
+        ))
+    }
+
+    /// [`Self::try_inline_gen`]'s commit, once the generator `g` (its
+    /// frame `boxed`, running from here) passed its checks: the sent value
+    /// goes in (unless a fast step already consumed one), the consumer's
+    /// operands leave by `mode`, and the activation is built.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn inline_gen_commit(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+        mode: InlineResume,
+        arg: u32,
+        (g, mut boxed, first_resume, sent): (Rc<PyGenerator>, Box<Frame>, bool, Object),
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
         let gf: &mut Frame = &mut boxed;
         // A native activation parked at the yield is rebuilt into the
         // interpreted suspension resumed here.
@@ -8347,11 +8504,6 @@ impl Interpreter {
         crate::tier2::materialize_parked(gf);
         gf.gen_first_resume = first_resume;
         // (A fast step that stopped partway already consumed it.)
-        let sent = if send {
-            frame.stack.pop().unwrap_or(Object::None)
-        } else {
-            Object::None
-        };
         if !std::mem::take(&mut gf.sent_consumed) {
             gf.push(sent);
         }
@@ -8360,13 +8512,22 @@ impl Interpreter {
         match mode {
             // `next`, its empty self slot and the generator (held above).
             InlineResume::NextCall => {
-                let n = frame.stack.len();
-                drop(frame.stack.drain(n - 3..));
+                let (a, b, c) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                drop((a, b, c));
             }
-            // The bound `send` and its empty self slot (the value went in).
+            // Likewise, the default staying on top (see
+            // [`GEN_NEXT_DEFAULT`]).
+            InlineResume::NextDefault => {
+                let default = frame.stack.pop().expect("checked above");
+                let (a, b, c) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                frame.stack.push(default);
+                drop((a, b, c));
+            }
+            // The bound `send` and its empty self slot, or the method and
+            // the generator (the value went in).
             InlineResume::SendCall => {
-                let n = frame.stack.len();
-                drop(frame.stack.drain(n - 2..));
+                let (a, b) = (frame.stack.pop(), frame.stack.pop());
+                drop((a, b));
             }
             _ => {}
         }
@@ -8391,7 +8552,7 @@ impl Interpreter {
         act.call_pc = pc;
         act.caller_pending = self.lean_pending_enter(frame, shell, pc);
         act.exc_depth = self.exc_info_len();
-        Some(act)
+        act
     }
 
     /// Finish an inline generator resume that left the quiet loop with
@@ -8455,20 +8616,20 @@ impl Interpreter {
                 Ok(GenStep::Yielded(v))
             }
             Ok(FrameOutcome::Returned(v)) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Self::finish_running_gen(&gen);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(&gen);
                 Ok(GenStep::Exhausted(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 Err(RuntimeError::Internal(
                     "RETURN_GENERATOR in already-running generator".to_owned(),
                 ))
             }
             Err(err) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(&gen, err);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
@@ -8501,6 +8662,10 @@ impl Interpreter {
         }
         match result {
             Ok(GenStep::Yielded(v)) => {
+                // `next(gen, default)`: the value takes the default's place.
+                if arg == GEN_NEXT_DEFAULT {
+                    drop(frame.stack.pop());
+                }
                 frame.stack.push(v);
                 QuietEntry::Returned { cur_pc: call_pc }
             }
@@ -8509,6 +8674,11 @@ impl Interpreter {
                 err: crate::error::stop_iteration_with(v),
                 cur_pc: call_pc,
             },
+            // `next(gen, default)`: the default is the result.
+            Ok(GenStep::Exhausted(v)) if arg == GEN_NEXT_DEFAULT => {
+                drop(v);
+                QuietEntry::Returned { cur_pc: call_pc }
+            }
             // `SEND`: the return value is the `yield from`/`await` result;
             // the sub-generator stays for `END_SEND`.
             Ok(GenStep::Exhausted(v)) if arg & GEN_SEND != 0 => {
@@ -8561,29 +8731,23 @@ impl Interpreter {
                     && Rc::strong_count(&frame.locals) == 1
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    unsafe { (*frame.locals.as_ptr()).clear() };
+                    unsafe { release_locals(&mut *frame.locals.as_ptr()) };
                     drop(done.guard.take());
                     return Ok(v);
                 }
                 Ok(FrameOutcome::Returned(v))
             }
-            // A shell, but nothing the full epilogue would act on.
+            // A shell, and no observer for the general loop's return
+            // events: its epilogue, without entering it (see
+            // `Self::finish_quiet_return`).
             (
                 QuietExit::Outcome {
                     stepped: Ok(StepOutcome::Return(v)),
                     ..
                 },
                 Some(shell),
-            ) if !shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && self.exc_info_len() <= exc_depth =>
-            {
-                self.pop_frame_shell();
-                // A lazy traceback entry still holding the shell had its
-                // frame object built by the pop.
-                Self::settle_exited_frame_object(&shell, frame, true);
-                self.recycle_frame_shell(shell);
+            ) if self.return_settles_quietly(&shell, exc_depth) => {
+                self.finish_quiet_return(frame, shell, exc_depth);
                 Ok(FrameOutcome::Returned(v))
             }
             // An exception leaving an unobserved activation with no handler
@@ -9292,8 +9456,8 @@ impl Interpreter {
         let npos = code.arg_count as usize;
         let total = npos + code.kwonly_count as usize;
         if specialize::rc_id(f) != func_id
-            || total > 16
-            || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
+            || total > 15
+            || (code.has_varkeywords && code.varnames.len() <= total)
             || eff_argc > npos
             || code.is_generator
             || code.is_coroutine
@@ -9797,7 +9961,7 @@ impl Interpreter {
         let Some(Object::Instance(inst)) = frame.stack.last() else {
             return None;
         };
-        let slot = code_vm_ext(&frame.code)?.method_slots.get()?.get(pc)?;
+        let slot = code_vm_ext(&frame.code)?.method_slot(pc)?;
         slot.getter(inst.cls_raw().attr_version.get())
     }
 
@@ -10106,6 +10270,75 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
     }
 
+    /// `container[key] = value` (the `STORE_SUBSCR` at `pc` of `frame`)
+    /// for an instance whose class's `__setitem__` is a plain Python
+    /// function of `(self, key, value)`, as an inline activation of it
+    /// (CPython calls it from `STORE_SUBSCR` alike): the three operands
+    /// leave the stack as its arguments, and its result is discarded.
+    fn try_inline_setitem(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        // Stack (top-down): key, container, value.
+        let n = frame.stack.len();
+        if n < 3 {
+            return None;
+        }
+        let Object::Instance(inst) = &frame.stack[n - 2] else {
+            return None;
+        };
+        // The site remembers the function by the class's attribute version.
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(&frame.code, pc as u32);
+        let f = match slot.and_then(|s| s.get_held(ver)) {
+            Some(f) => f,
+            None => {
+                let Some(Object::Function(f)) = cls.lookup("__setitem__") else {
+                    return None;
+                };
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                f
+            }
+        };
+        let code = f.code();
+        if code.arg_count != 3
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        f.lean_cells_ref(&code)?;
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let key = frame.stack.pop()?;
+        let container = frame.stack.pop()?;
+        let value = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        locals.push(container);
+        locals.push(key);
+        locals.push(value);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
+        act.discard = true;
+        Some(act)
+    }
+
     /// `FOR_ITER` over a generator, from the quiet loop: the generator
     /// resumes as a lean activation (see `generator_send_lean`); its
     /// value is pushed, or on exhaustion the loop exits exactly as the
@@ -10248,7 +10481,7 @@ impl Interpreter {
         }
         if Rc::strong_count(&locals) == 1 {
             // SAFETY: sole owner — no other path reaches this vector.
-            unsafe { (*locals.as_ptr()).clear() };
+            unsafe { release_locals(&mut *locals.as_ptr()) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(locals);
@@ -10517,6 +10750,80 @@ impl Interpreter {
         self.run_frame(frame)
     }
 
+    /// Make the activation `depth` levels up the whole stack (the spine,
+    /// then the pending lean activations, which are always newer than
+    /// every shell on it) the spine's, pushing the shells of the pending
+    /// ones up to it and leaving the newer ones pending. Returns its depth
+    /// from the spine's top.
+    pub(crate) fn flush_pending_through(&mut self, depth: usize) -> usize {
+        let n = self.lean_pending.len();
+        if depth >= n {
+            return depth - n;
+        }
+        let mut pending = std::mem::take(&mut self.lean_pending);
+        for addr in &pending[..n - depth] {
+            // SAFETY: see `flush_lean_cold`.
+            let caller = unsafe { &mut *(*addr as *mut LeanAct) };
+            if caller.shell.is_none() {
+                caller.shell = Some(self.push_pending_caller_shell(caller));
+            }
+        }
+        pending.drain(..n - depth);
+        self.lean_pending = pending;
+        0
+    }
+
+    /// How many activations the whole stack holds (see
+    /// [`Self::flush_pending_through`]).
+    pub(crate) fn stack_depth(&self) -> usize {
+        self.lean_pending.len() + self.frame_stack.borrow().len()
+    }
+
+    /// The code, current line and globals of the activation `depth` levels
+    /// up the whole stack (see [`Self::flush_pending_through`]), without
+    /// pushing any shell. A pending activation is suspended in a call, its
+    /// `pc` past it.
+    pub(crate) fn frame_context_at(
+        &self,
+        depth: usize,
+    ) -> Option<(Rc<CodeObject>, u32, Rc<RefCell<DictData>>)> {
+        let n = self.lean_pending.len();
+        if depth < n {
+            // SAFETY: as in `frame_globals_at`.
+            let frame = unsafe {
+                let act = &*(self.lean_pending[n - 1 - depth] as *const LeanAct);
+                &*act.frame
+            };
+            let lasti = frame.pc.saturating_sub(1) as usize;
+            let line = frame.code.linetable.get(lasti).copied().unwrap_or(0);
+            return Some((frame.code.clone(), line, frame.globals.clone()));
+        }
+        let stack = self.frame_stack.borrow();
+        let shell = stack.get(stack.len().checked_sub(1 + depth - n)?)?;
+        Some((
+            (*shell.code).clone(),
+            shell.current_lineno(),
+            (*shell.globals).clone(),
+        ))
+    }
+
+    /// The globals of the activation `depth` levels up the whole stack
+    /// (see [`Self::flush_pending_through`]), without pushing any shell.
+    pub(crate) fn frame_globals_at(&self, depth: usize) -> Option<Rc<RefCell<DictData>>> {
+        let n = self.lean_pending.len();
+        if depth < n {
+            // SAFETY: a pending address names a live `LeanAct` whose
+            // frame pointer its `lean_pending_enter` re-derived (see
+            // `flush_lean_cold`).
+            let act = unsafe { &*(self.lean_pending[n - 1 - depth] as *const LeanAct) };
+            // SAFETY: as above.
+            return Some(unsafe { (*act.frame).globals.clone() });
+        }
+        let stack = self.frame_stack.borrow();
+        let idx = stack.len().checked_sub(1 + depth - n)?;
+        Some((*stack[idx].globals).clone())
+    }
+
     /// Push the shells of every pending lean *caller* (see
     /// [`Self::flush_lean_cold`], which also pushes the running one's).
     pub(crate) fn flush_pending_callers(&mut self) {
@@ -10566,23 +10873,16 @@ impl Interpreter {
                 },
                 None,
             ) => FrameOutcome::Returned(v),
-            // A shell, but nothing the full epilogue would act on.
+            // A shell, and no observer for the general loop's return
+            // events: its epilogue, without entering it.
             (
                 QuietExit::Outcome {
                     stepped: Ok(StepOutcome::Return(v)),
                     ..
                 },
                 Some(shell),
-            ) if !shell
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && self.exc_info_len() <= exc_depth_on_entry =>
-            {
-                self.pop_frame_shell();
-                // A lazy traceback entry still holding the shell had its
-                // frame object built by the pop.
-                Self::settle_exited_frame_object(&shell, frame, true);
-                self.recycle_frame_shell(shell);
+            ) if self.return_settles_quietly(&shell, exc_depth_on_entry) => {
+                self.finish_quiet_return(frame, shell, exc_depth_on_entry);
                 FrameOutcome::Returned(v)
             }
             // Everything else finishes in the general loop, which takes
@@ -10660,9 +10960,21 @@ impl Interpreter {
     #[inline(never)]
     fn leaf_burst(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> LeafStop {
         // Which copy of the core loop runs: the native one drives the
-        // running code's native form (see `frame_jit`).
+        // running code's native form (see `frame_jit`). A burst starts in
+        // the copy its activation's code wants (the other would only switch
+        // over).
         #[cfg(feature = "jit")]
-        let mut native = false;
+        let mut native = {
+            // SAFETY: see `CoreSwitch` (the running activation's handles;
+            // nothing else borrows them here).
+            let frame = unsafe { &*sw.cur };
+            code_vm_ext(&frame.code).is_some_and(|e| {
+                // SAFETY: as in `leaf_core` (a GIL-serialized read of the
+                // locals vector's length).
+                let nlocals = unsafe { (*frame.locals.as_ptr()).len() };
+                e.frame_jit.get(nlocals).is_some()
+            })
+        };
         loop {
             #[cfg(feature = "jit")]
             let exit = if native {
@@ -10674,117 +10986,198 @@ impl Interpreter {
             let exit = self.leaf_core::<false>(sw, snap_gen);
             match exit {
                 #[cfg(feature = "jit")]
-                CoreExit::Switch => {
-                    native = !native;
-                    continue;
-                }
+                CoreExit::Switch => native = !native,
                 CoreExit::Stop(stop) => return stop,
-                CoreExit::Helper => {
-                    // SAFETY: see `CoreSwitch` (the running activation's
-                    // handles; nothing else borrows them here).
-                    let frame = unsafe { &mut *sw.cur };
-                    if burst_stats::enabled() {
-                        if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
-                            burst_stats::note_helper(ins.op);
-                            let recv = frame.stack.last().map_or("-", |v| v.type_name());
-                            burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
-                        }
-                    }
-                    // A cached property site skips the helper's resolution: a
-                    // pure leaf getter is evaluated in place, any other runs
-                    // as an inline activation.
-                    let pc = frame.pc as usize;
-                    if frame
-                        .code
-                        .instructions
-                        .get(pc)
-                        .is_some_and(|i| i.op == OpCode::LoadAttr)
-                    {
-                        if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
-                            // SAFETY: as above.
-                            let last_pc = unsafe { &mut *sw.last };
-                            if self.core_leaf_property(frame, last_pc, pc, &getter, &code) {
-                                // SAFETY: the running thread's own flag.
-                                if unsafe { (*sw.maybe_dead).get() } {
-                                    return LeafStop::Marked;
-                                }
-                                continue;
-                            }
-                            if self.core_property(sw) {
-                                continue;
-                            }
-                        }
-                    }
-                    // SAFETY: as above (`core_property` declined untouched).
-                    let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
-                    match self.leaf_core_helper(frame, last_pc) {
-                        // A released receiver or argument may have queued
-                        // a finalizer (see `after_release!` in the core).
-                        // SAFETY: the running thread's own flag.
-                        CoreAttr::Done if unsafe { (*sw.maybe_dead).get() } => {
-                            return LeafStop::Marked;
-                        }
-                        CoreAttr::Done => continue,
-                        CoreAttr::Raised(e) => return LeafStop::Raised(e),
-                        CoreAttr::Full => return LeafStop::Step,
-                        CoreAttr::Decline => {
-                            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
-                                Some(OpCode::LoadAttr)
-                                    if self.core_property(sw) || self.core_getitem(sw, true) =>
-                                {
-                                    continue
-                                }
-                                Some(OpCode::StoreAttr) if self.core_setter(sw) => continue,
-                                Some(OpCode::CallKw | OpCode::CallEx)
-                                    if self.core_call_lane(sw) =>
-                                {
-                                    continue
-                                }
-                                Some(OpCode::Call)
-                                    if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
-                                {
-                                    continue
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
                 CoreExit::Slow => {
-                    // SAFETY: as above.
-                    let frame = unsafe { &*sw.cur };
-                    match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
-                        Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => continue,
-                        Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => continue,
-                        Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
-                            continue
-                        }
-                        Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => {
-                            continue
-                        }
-                        Some(OpCode::BinaryOp | OpCode::CompareOp)
-                            if self.core_operator_lane(sw) =>
-                        {
-                            continue
-                        }
-                        _ => {}
+                    if let Some(stop) = self.core_offload(sw, snap_gen) {
+                        return stop;
                     }
                 }
                 CoreExit::Reload => unreachable!("handled inside the core loop"),
             }
-            // SAFETY: as above.
-            let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
-            match self.leaf_burst_slow(frame, snap_gen, last_pc) {
-                // SAFETY: as above.
-                LeafStop::Core if unsafe { (*sw.maybe_dead).get() } => return LeafStop::Marked,
-                LeafStop::Core => {}
-                stop => return stop,
-            }
         }
     }
 
+    /// [`Self::core_offload_run`] of a [`CoreExit::Slow`] handoff.
+    #[inline(never)]
+    fn core_offload(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> Option<LeafStop> {
+        self.core_offload_run(sw, snap_gen, OFFLOAD_SLOW)
+    }
+
+    /// Run the instruction the core loop handed over at `sw`'s (synced)
+    /// running activation's pc, as `mode` says: [`OFFLOAD_HELPER`] out of
+    /// line (the fused shapes, cache hits and leaf calls of
+    /// [`Self::leaf_core_helper`] and the lanes), [`OFFLOAD_SLOW`] on a
+    /// lane or with the full leaf arms, [`OFFLOAD_ARMS`] with the full leaf
+    /// arms. `None` when the core loop goes on (on the activation `sw` now
+    /// runs), else how the burst ends.
+    #[inline(always)]
+    fn core_offload_run(
+        &mut self,
+        sw: &mut CoreSwitch,
+        snap_gen: u64,
+        mode: u8,
+    ) -> Option<LeafStop> {
+        if mode == OFFLOAD_HELPER {
+            // SAFETY: see `CoreSwitch` (the running activation's handles;
+            // nothing else borrows them here).
+            let frame = unsafe { &mut *sw.cur };
+            if burst_stats::enabled() {
+                if let Some(ins) = frame.code.instructions.get(frame.pc as usize) {
+                    burst_stats::note_helper(ins.op);
+                    let recv = frame.stack.last().map_or("-", |v| v.type_name());
+                    burst_stats::note_site(&frame.code.qualname, frame.pc, ins.op, recv);
+                }
+            }
+            // A cached property site skips the helper's resolution: a
+            // pure leaf getter is evaluated in place, any other runs as an
+            // inline activation.
+            let pc = frame.pc as usize;
+            if frame
+                .code
+                .instructions
+                .get(pc)
+                .is_some_and(|i| i.op == OpCode::LoadAttr)
+                && !failing_attr_site(&frame.code, pc)
+            {
+                if let Some((getter, code)) = Self::cached_property_getter(frame, pc) {
+                    // SAFETY: as above.
+                    let last_pc = unsafe { &mut *sw.last };
+                    if self.core_leaf_property(frame, last_pc, pc, &getter, &code) {
+                        // SAFETY: the running thread's own flag.
+                        if unsafe { (*sw.maybe_dead).get() } {
+                            return Some(LeafStop::Marked);
+                        }
+                        return None;
+                    }
+                    if self.core_property(sw) {
+                        return None;
+                    }
+                }
+            }
+            // SAFETY: as above (`core_property` declined untouched).
+            let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+            match self.leaf_core_helper(frame, last_pc) {
+                // A released receiver or argument may have queued a
+                // finalizer (see `after_release!` in the core).
+                // SAFETY: the running thread's own flag.
+                CoreAttr::Done if unsafe { (*sw.maybe_dead).get() } => {
+                    return Some(LeafStop::Marked);
+                }
+                CoreAttr::Done => return None,
+                CoreAttr::Raised(e) => return Some(LeafStop::Raised(e)),
+                CoreAttr::Full => return Some(LeafStop::Step),
+                CoreAttr::Decline => {
+                    match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                        Some(OpCode::LoadAttr)
+                            if self.core_property(sw) || self.core_getitem(sw, true) =>
+                        {
+                            return None
+                        }
+                        Some(OpCode::StoreAttr) if self.core_setter(sw) => return None,
+                        Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
+                            return None
+                        }
+                        Some(OpCode::Call)
+                            if self.core_leaf_call_lane(sw) || self.core_type_lane(sw) =>
+                        {
+                            return None
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if mode == OFFLOAD_SLOW {
+            // SAFETY: as above.
+            let frame = unsafe { &*sw.cur };
+            match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
+                Some(OpCode::BinarySubscr) if self.core_getitem(sw, false) => return None,
+                Some(OpCode::StoreSubscr) if self.core_setitem(sw) => return None,
+                Some(OpCode::ForIter) if self.core_for_iter_lane(sw) => return None,
+                Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => return None,
+                Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => return None,
+                Some(OpCode::BinaryOp | OpCode::CompareOp) if self.core_operator_lane(sw) => {
+                    return None
+                }
+                _ => {}
+            }
+        }
+        // SAFETY: as above.
+        let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
+        match self.leaf_burst_slow(frame, snap_gen, last_pc) {
+            // SAFETY: as above.
+            LeafStop::Core if unsafe { (*sw.maybe_dead).get() } => Some(LeafStop::Marked),
+            LeafStop::Core => None,
+            stop => Some(stop),
+        }
+    }
+
+    /// [`Self::core_offload_run`] from inside [`Self::leaf_core`]'s loop, which
+    /// holds the running activation at `at`: synced, then run. `true` when
+    /// the loop goes on in place, at the new `at`: the same activation, its
+    /// stack where it was, its site tables as they were, nothing pending:
+    /// what a reload would derive again is unchanged. Otherwise the loop
+    /// reloads, which ends the burst first if it must (`sw.pending`).
+    ///
+    /// # Safety
+    ///
+    /// `at` is the running activation's, as the core loop holds it (every
+    /// stack slot below `at.len` initialized).
+    #[inline(never)]
+    unsafe fn core_offload_in_loop<const MODE: u8>(
+        &mut self,
+        sw: &mut CoreSwitch,
+        snap_gen: u64,
+        at: &mut CoreAt,
+    ) -> bool {
+        let (cur, last) = (sw.cur, sw.last);
+        // SAFETY: see `CoreSwitch`; the caller's contract. (The core loop
+        // writes its operand stack in place, so its base and capacity are
+        // the vector's.)
+        let (base, cap) = unsafe {
+            let stack = &mut (*cur).stack;
+            stack.set_len(at.len);
+            (*cur).pc = at.pc as u32;
+            *last = at.last;
+            (stack.as_mut_ptr(), stack.capacity())
+        };
+        // The site tables the loop holds views of (empty until allocated).
+        let tables = |frame: &Frame| {
+            code_vm_ext(&frame.code)
+                .map(|e| (e.stamp_slots.is_allocated(), e.method_slots.is_allocated()))
+        };
+        // SAFETY: as above.
+        let tables_before = tables(unsafe { &*cur });
+        if let Some(stop) = self.core_offload_run(sw, snap_gen, MODE) {
+            // (What the burst's own end would drop with it.)
+            sw.pending = Some(CoreExit::Stop(stop));
+            return false;
+        }
+        if sw.pending.is_some() || sw.cur != cur || sw.last != last {
+            return false;
+        }
+        // SAFETY: the same activation, unborrowed here.
+        let frame = unsafe { &mut *cur };
+        let pc = frame.pc as usize;
+        // (A reload would also count an entry at pc 0 as a call, check the
+        // pc against the code, and view a site table the run allocated.)
+        if frame.stack.as_mut_ptr() != base
+            || frame.stack.capacity() != cap
+            || pc == 0
+            || pc >= frame.code.instructions.len()
+            || tables(frame) != tables_before
+        {
+            return false;
+        }
+        at.len = frame.stack.len();
+        at.pc = pc;
+        // SAFETY: the activation's last-pc slot.
+        at.last = unsafe { *last };
+        true
+    }
+
     /// Run the core loop's out-of-line instruction at `frame.pc` (the
-    /// ones [`Self::leaf_core`] hands over as [`CoreExit::Helper`]): the
+    /// ones [`Self::leaf_core`] hands over to [`Self::core_offload`]): the
     /// fused `len(x)` and `x.attr` shapes, the global/attribute cache hits,
     /// and leaf builtin/type calls. Advances `frame.pc` past what ran;
     /// `Decline` touches nothing.
@@ -10849,7 +11242,13 @@ impl Interpreter {
             } else {
                 "__iter__"
             };
-            let Some(gen) = self.instance_gen_call(v, name) else {
+            // (`await fut` of a native asyncio future: its `FutureIter`.)
+            let made = if ins.op == OpCode::GetAwaitable {
+                crate::stdlib::asyncio_mod::native_future_await(v)
+            } else {
+                None
+            };
+            let Some(gen) = made.or_else(|| self.instance_gen_call(v, name)) else {
                 return CoreAttr::Decline;
             };
             let top = frame.stack.last_mut().expect("checked above");
@@ -10921,6 +11320,75 @@ impl Interpreter {
         CoreAttr::Done
     }
 
+    /// [`Self::leaf_load_special`] over the `len` stack slots at `base`
+    /// (room to `cap`), for compiled code: `LOAD_SPECIAL` (`ins`, at `pc`
+    /// of `code`) of an instance whose class resolves the method to a
+    /// plain function or a native class's method, from the site's slot or
+    /// filling it. Returns the new stack length, or `None`, having touched
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    pub(crate) unsafe fn core_load_special(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<usize> {
+        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        if len == 0 || len >= cap {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        let top = unsafe { base.add(len - 1) };
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let ms = code_method_slot(code, pc as u32);
+        let held = ms.and_then(|ms| {
+            ms.get_held(ver)
+                .map(Object::Function)
+                .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
+        });
+        let method = match held {
+            Some(m) => m,
+            None => {
+                let name = match ins.arg {
+                    SPECIAL_ENTER => "__enter__",
+                    SPECIAL_EXIT => "__exit__",
+                    _ => return None,
+                };
+                match cls.lookup(name) {
+                    Some(Object::Function(f)) => {
+                        if let Some(ms) = ms {
+                            ms.set(ver, &f);
+                        }
+                        Object::Function(f)
+                    }
+                    Some(Object::Builtin(b)) if b.binds_instance && native_call_ic_safe(b.name) => {
+                        if let Some(ms) = ms {
+                            ms.set_inst_builtin(ver, &b);
+                        }
+                        Object::Builtin(b)
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        // SAFETY: `len < cap`; the instance moves up into the self slot.
+        unsafe {
+            let recv = top.read();
+            top.write(method);
+            base.add(len).write(recv);
+        }
+        Some(len + 1)
+    }
+
     /// The core loop's `LOAD_FAST x` (at `pc`, of the heap local `other`)
     /// followed by `x.m(<simple arguments>)`: a native method the site
     /// cached for the receiver's class, a leaf method the site verified,
@@ -10929,13 +11397,20 @@ impl Interpreter {
     /// `CALL`'s pc; `None` touches nothing (the instructions run one by
     /// one).
     ///
+    /// `CALLING_EFFECTS` runs a recursive effect leaf (one that stores and
+    /// may call itself, see [`code_recurses`]) in place too. Compiled
+    /// callers pass `false`: for them the method load and direct call cost
+    /// less than the leaf evaluator nesting its own evaluation. The core
+    /// loop passes `true`, since its alternative is a full activation,
+    /// which costs more.
+    ///
     /// # Safety
     ///
     /// `lbase` is the running activation's `nlocals` locals; nothing else
     /// borrows them.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn core_local_method(
+    unsafe fn core_local_method<const CALLING_EFFECTS: bool>(
         &self,
         code: &CodeObject,
         ext: Option<&CodeConstObjects>,
@@ -10947,16 +11422,20 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<(Result<Object, RuntimeError>, usize)> {
         let next = *code.instructions.get(pc + 1)?;
-        let mslots: &[MethodSlot] = ext
-            .and_then(|e| e.method_slots.get())
-            .map_or(&[][..], |s| &s[..]);
+        let mslots: Sites<'_, MethodSlot> = ext.map_or(Sites::empty(), |e| e.method_sites());
         match other {
             Object::Instance(_) | Object::Module(_) => {
                 // A site that verified its callee for this class version
-                // (its call checks the argument shape itself).
+                // (its call checks the argument shape itself); a recursive
+                // effect leaf only when `CALLING_EFFECTS` (see above).
                 let mut missed = false;
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
-                    if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get()) {
+                    if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
+                        // SAFETY: the site's code is its live function's.
+                        .filter(|&(_, c, effect)| {
+                            CALLING_EFFECTS || !effect || !code_recurses(unsafe { &*c })
+                        })
+                    {
                         match self.core_leaf_site_call(
                             code,
                             i,
@@ -11008,7 +11487,13 @@ impl Interpreter {
                             .peek_fn(i.cls_raw().attr_version.get())
                             // SAFETY: the slot's function is alive (its class
                             // version matched).
-                            .is_some_and(|fp| fn_is_leaf(unsafe { &*fp })),
+                            .is_some_and(|fp| {
+                                let f = unsafe { &*fp };
+                                fn_is_pure_leaf(f)
+                                    || (fn_is_leaf(f)
+                                        && (CALLING_EFFECTS
+                                            || !code_recurses(unsafe { &*f.code.as_ptr() })))
+                            }),
                         _ => false,
                     };
                 if pure_site {
@@ -11059,7 +11544,7 @@ impl Interpreter {
             || call.op != OpCode::Call
             || call.arg != 1
             || frame.builtins_obj().is_some()
-            || frame.code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+            || frame.code.names.get(name_idx as usize).map(|n| n.as_str()) != Some("len")
         {
             return None;
         }
@@ -11100,20 +11585,16 @@ impl Interpreter {
             ($cache:ident, $frame:expr, $ext:expr) => {
                 *$cache.get_or_insert_with(|| {
                     if $frame.builtins_obj().is_none() {
-                        $ext.and_then(|e| e.stamp_slots.get())
-                            .map_or(&[][..], |s| &s[..])
+                        $ext.map_or(Sites::empty(), |e| e.stamp_sites())
                     } else {
-                        &[][..]
+                        Sites::empty()
                     }
                 })
             };
         }
         macro_rules! mslots {
             ($cache:ident, $ext:expr) => {
-                *$cache.get_or_insert_with(|| {
-                    $ext.and_then(|e| e.method_slots.get())
-                        .map_or(&[][..], |s| &s[..])
-                })
+                *$cache.get_or_insert_with(|| $ext.map_or(Sites::empty(), |e| e.method_sites()))
             };
         }
         'reload: loop {
@@ -11137,14 +11618,26 @@ impl Interpreter {
             // during an activation, and nothing here runs Python code).
             let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
             let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
+            // The code's native form (see `frame_jit`): the native copy of
+            // this loop runs it from every pc the arms below leave it at,
+            // and the arms only run the instructions it returns at. (Tested
+            // before the rest of the prologue, which the other copy derives
+            // again.)
+            #[cfg(feature = "jit")]
+            let native = ext.and_then(|e| e.frame_jit.get(nlocals));
+            #[cfg(feature = "jit")]
+            if NATIVE != native.is_some() {
+                // (The activation is synced at every reload.)
+                return CoreExit::Switch;
+            }
             // (The namespaces are read off the frame at their uses: holding
             // them here costs every switch a spill.)
             // The arms' colder per-activation state (the global and class
             // attribute stamps, the method slots) is derived at its first
             // use: every call, return and helper handoff runs this prologue
             // again, and most activations never read it.
-            let mut cold_stamps: Option<&[StampSlot]> = None;
-            let mut cold_mslots: Option<&[MethodSlot]> = None;
+            let mut cold_stamps: Option<Sites<'_, StampSlot>> = None;
+            let mut cold_mslots: Option<Sites<'_, MethodSlot>> = None;
             //
             // The fused local pairs below, one byte per instruction (empty
             // for code that has none).
@@ -11177,15 +11670,22 @@ impl Interpreter {
                     }
                 };
             }
-            // The code's native form (see `frame_jit`): the native copy of
-            // this loop runs it from every pc the arms below leave it at,
-            // and the arms only run the instructions it returns at.
-            #[cfg(feature = "jit")]
-            let native = ext.and_then(|e| e.frame_jit.get(nlocals));
-            #[cfg(feature = "jit")]
-            if NATIVE != native.is_some() {
-                // (The activation is synced at every reload.)
-                return CoreExit::Switch;
+            // Hand the instruction at `pc` over (see `core_offload_run`'s
+            // modes) without leaving the loop: when the activation goes on
+            // in place, so does the loop, with no reload (see
+            // `core_offload_in_loop`).
+            macro_rules! offload {
+                ($mode:expr) => {{
+                    let mut at = CoreAt { len, pc, last };
+                    // SAFETY: the running activation's state, as held here.
+                    if unsafe { self.core_offload_in_loop::<{ $mode }>(sw, snap_gen, &mut at) } {
+                        len = at.len;
+                        pc = at.pc;
+                        last = at.last;
+                        continue;
+                    }
+                    break Some(CoreExit::Reload);
+                }};
             }
             // The native code writes the stack at fixed offsets: a stack
             // that started small (a materialized frame's) grows first.
@@ -11229,6 +11729,7 @@ impl Interpreter {
                             frame: sw.cur,
                             sw: std::ptr::from_mut(sw),
                             gen_depth: 0,
+                            direct: false,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -11273,7 +11774,8 @@ impl Interpreter {
                         // every pc keeps its own unit, so the pair is fused
                         // here instead — one dispatch, and `x = y` never
                         // touches the stack at all.
-                        match fast_pairs.get(pc).copied().unwrap_or(0) {
+                        let kind = fast_pairs.get(pc).copied().unwrap_or(0);
+                        match kind {
                             1 => {
                                 // SAFETY: a pair kind is only recorded where
                                 // `pc + 1` names an instruction.
@@ -11288,6 +11790,10 @@ impl Interpreter {
                                             // The scalar shapes copy inline, as
                                             // the single-load arm does.
                                             let ca = match a {
+                                                s @ (Object::Int(_)
+                                                | Object::Float(_)
+                                                | Object::Bool(_)
+                                                | Object::None) => scalar_copy(s),
                                                 Object::Unbound => break None,
                                                 other => clone_hot(other),
                                             };
@@ -11346,7 +11852,7 @@ impl Interpreter {
                                 // pair kind is only recorded where the branch
                                 // instruction exists.
                                 let v = unsafe { &*lbase.add(i) };
-                                let jump_pc = pc + 1 + usize::from(fast_pairs[pc] == 4);
+                                let jump_pc = pc + 1 + usize::from(kind == 4);
                                 let jump = unsafe { *instrs.add(jump_pc) };
                                 let taken = match (jump.op, v) {
                                     (_, Object::Unbound) => None,
@@ -11396,111 +11902,104 @@ impl Interpreter {
                                 | Object::Bool(_)
                                 | Object::None) => scalar_copy(s),
                                 Object::Unbound => break None,
-                                other => {
-                                    // `x.attr` on a local receiver: read straight
-                                    // off the local (no receiver clone pushed and
-                                    // released); a miss loads the receiver and
-                                    // leaves `LOAD_ATTR` to its own arm.
-                                    // `x.m(...)` of a leaf or native method on the
-                                    // borrowed local (see `core_local_method`).
-                                    if pc + 1 < ninstrs
-                                        && len < cap
-                                        && (*instrs.add(pc + 1)).op == OpCode::LoadMethodAttr
-                                    {
-                                        if let Some((r, call_pc)) = self.core_local_method(
-                                            code,
-                                            ext,
-                                            other,
-                                            pc,
-                                            lbase,
-                                            nlocals,
-                                            consts,
-                                            sw.depth_cell,
-                                        ) {
-                                            last = call_pc;
-                                            pc = call_pc + 1;
-                                            match r {
-                                                Ok(v) => {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    break Some(CoreExit::Stop(LeafStop::Raised(
-                                                        e,
-                                                    )));
-                                                }
+                                // A plain load (kind 0) of a heap value is a
+                                // clone; the kinds past the pairs fuse the
+                                // instruction after it (see `code_fast_pairs`).
+                                other if kind < FAST_METHOD => clone_hot(other),
+                                // `x.m(...)` of a leaf or native method on the
+                                // borrowed local (see `core_local_method`).
+                                other if kind == FAST_METHOD => {
+                                    if let Some((r, call_pc)) = self.core_local_method::<true>(
+                                        code,
+                                        ext,
+                                        other,
+                                        pc,
+                                        lbase,
+                                        nlocals,
+                                        consts,
+                                        sw.depth_cell,
+                                    ) {
+                                        last = call_pc;
+                                        pc = call_pc + 1;
+                                        match r {
+                                            Ok(v) => {
+                                                base.add(len).write(v);
+                                                len += 1;
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                break Some(CoreExit::Stop(LeafStop::Raised(e)));
                                             }
                                         }
                                     }
-                                    if matches!(other, Object::Instance(_) | Object::Module(_))
-                                        && pc + 1 < ninstrs
-                                    {
-                                        let next = *instrs.add(pc + 1);
-                                        if next.op == OpCode::LoadAttr {
-                                            if code
-                                                .instructions
-                                                .get(pc + 2)
-                                                .is_some_and(|ins| ins.op == OpCode::LoadAttr)
-                                            {
-                                                if let Some((v, end)) =
-                                                    Self::core_local_attr_chain(code, other, pc + 1)
-                                                {
-                                                    base.add(len).write(v);
-                                                    len += 1;
-                                                    last = end;
-                                                    pc = end + 1;
-                                                    continue;
-                                                }
-                                            } else if let (Some(ext), Object::Instance(inst)) =
-                                                (ext, other)
-                                            {
-                                                // The site's field shortcut, in line (the
-                                                // common monomorphic read).
-                                                if let Some(v) = field_slot_hit(ext, pc + 1, inst) {
-                                                    base.add(len).write(clone_hot(v));
-                                                    len += 1;
-                                                    last = pc + 1;
-                                                    pc += 2;
-                                                    continue;
-                                                }
-                                            }
-                                            if let Some(v) = Self::core_local_attr(
-                                                ext,
-                                                code,
-                                                other,
-                                                pc + 1,
-                                                next.arg,
-                                            ) {
-                                                base.add(len).write(v);
+                                    clone_hot(other)
+                                }
+                                // `x.attr` on a local receiver: read straight off
+                                // the local (no receiver clone pushed and
+                                // released); a miss loads the receiver and leaves
+                                // `LOAD_ATTR` to its own arm.
+                                other @ (Object::Instance(_) | Object::Module(_)) => {
+                                    // SAFETY: an attribute kind is only recorded
+                                    // where `pc + 1` names an instruction.
+                                    let next = *instrs.add(pc + 1);
+                                    if kind == FAST_ATTR_CHAIN {
+                                        if let Some((v, end)) =
+                                            Self::core_local_attr_chain(code, other, pc + 1)
+                                        {
+                                            base.add(len).write(v);
+                                            len += 1;
+                                            last = end;
+                                            pc = end + 1;
+                                            continue;
+                                        }
+                                    } else if kind == FAST_ATTR {
+                                        // The site's field shortcut, in line (the
+                                        // common monomorphic read).
+                                        if let (Some(ext), Object::Instance(inst)) = (ext, other) {
+                                            if let Some(v) = field_slot_hit(ext, pc + 1, inst) {
+                                                base.add(len).write(clone_hot(v));
                                                 len += 1;
                                                 last = pc + 1;
                                                 pc += 2;
                                                 continue;
                                             }
                                         }
-                                        // `x.attr = v` on a local receiver:
-                                        // store straight into it, so the
-                                        // receiver is never pushed, cloned and
-                                        // dropped (a drop the collector grades).
-                                        if next.op == OpCode::StoreAttr
-                                            && len > 0
-                                            && Self::core_store_local_attr(
-                                                code,
-                                                other,
-                                                pc + 1,
-                                                next.arg,
-                                                &*base.add(len - 1),
-                                            )
-                                        {
-                                            len -= 1;
+                                    }
+                                    if kind != FAST_STORE_ATTR {
+                                        if let Some(v) = Self::core_local_attr(
+                                            ext,
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            next.arg,
+                                        ) {
+                                            base.add(len).write(v);
+                                            len += 1;
                                             last = pc + 1;
                                             pc += 2;
                                             continue;
                                         }
+                                    } else if len > 0
+                                        // `x.attr = v` on a local receiver: store
+                                        // straight into it, so the receiver is
+                                        // never pushed, cloned and dropped (a
+                                        // drop the collector grades).
+                                        && Self::core_store_local_attr(
+                                            code,
+                                            other,
+                                            pc + 1,
+                                            next.arg,
+                                            &*base.add(len - 1),
+                                        )
+                                    {
+                                        len -= 1;
+                                        last = pc + 1;
+                                        pc += 2;
+                                        continue;
                                     }
                                     clone_hot(other)
                                 }
+                                other => clone_hot(other),
                             };
                             base.add(len).write(c);
                         }
@@ -11574,12 +12073,48 @@ impl Interpreter {
                                     break None;
                                 }
                                 len -= 1;
-                                self.release(std::mem::replace(&mut *slot, base.add(len).read()));
+                                self.release_hot(std::mem::replace(
+                                    &mut *slot,
+                                    base.add(len).read(),
+                                ));
                                 last = pc;
                                 pc += 1;
                                 after_release!();
                                 continue;
                             }
+                        }
+                        last = pc;
+                        pc += 1;
+                    }
+                    // `del x` of a bound plain local (an `except ... as e:`
+                    // clause's cleanup, after its `e = None`), as the full
+                    // arm runs it: an unbound local raises there, and a slot
+                    // shared with a cell is the full handler's.
+                    OpCode::DeleteFast => {
+                        let i = ins.arg as usize;
+                        if i >= nlocals
+                            || (!code.cellvars.is_empty()
+                                && Self::shared_cell_index(code, i).is_some())
+                        {
+                            break None;
+                        }
+                        // SAFETY: `i < nlocals`.
+                        unsafe {
+                            let slot = lbase.add(i);
+                            if matches!(*slot, Object::Unbound) {
+                                break None;
+                            }
+                            if !scalar(&*slot) {
+                                if !Self::core_droppable(&*slot) {
+                                    break None;
+                                }
+                                self.release_hot(std::mem::replace(&mut *slot, Object::Unbound));
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
+                            slot.write(Object::Unbound);
                         }
                         last = pc;
                         pc += 1;
@@ -11731,6 +12266,35 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // `not x`, `-x` and `~x` of a scalar, replaced in place
+                    // (nothing to release); any other shape is the full
+                    // leaf arm's.
+                    OpCode::UnaryOp => {
+                        if len == 0 {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`.
+                        let top = unsafe { base.add(len - 1) };
+                        // SAFETY: as in the full handler (the compiler only
+                        // emits valid kinds).
+                        let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                        // SAFETY: as above.
+                        let r = match (unsafe { &*top }, kind) {
+                            (Object::Bool(b), UnaryKind::Not) => bool_hot(!*b),
+                            (Object::Int(i), UnaryKind::Not) => bool_hot(*i == 0),
+                            (Object::None, UnaryKind::Not) => bool_hot(true),
+                            (Object::Int(i), UnaryKind::Neg) => match i.checked_neg() {
+                                Some(r) => int_hot(r),
+                                None => break None,
+                            },
+                            (Object::Int(i), UnaryKind::Invert) => int_hot(!*i),
+                            _ => break None,
+                        };
+                        // SAFETY: a scalar operand is overwritten in place.
+                        unsafe { top.write(r) };
+                        last = pc;
+                        pc += 1;
+                    }
                     OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => {
                         if len == 0 {
                             break None;
@@ -11766,7 +12330,13 @@ impl Interpreter {
                         // next instruction stores it back): the local lets go of
                         // the string, which then grows in place when nothing else
                         // holds it (CPython's `BINARY_OP_INPLACE_ADD_UNICODE`).
-                        if kind == BinOpKind::Add && pc + 1 < ninstrs {
+                        // (The left operand's tag first: a numeric add skips
+                        // the rest.)
+                        // SAFETY: `len >= 2`.
+                        if kind == BinOpKind::Add
+                            && matches!(unsafe { &*base.add(len - 2) }, Object::Str(_))
+                            && pc + 1 < ninstrs
+                        {
                             // SAFETY: `pc + 1 < ninstrs`.
                             let next = unsafe { *instrs.add(pc + 1) };
                             let li = next.arg as usize;
@@ -12266,6 +12836,26 @@ impl Interpreter {
                             CompareKind::Gt => ord.is_gt(),
                             CompareKind::GtE => ord.is_ge(),
                         };
+                        // A branch on the result (`if a < b:`) runs with the
+                        // compare: the bool is never pushed. (A compare can
+                        // fall through, so it never ends the code.)
+                        // SAFETY: `pc + 1 < ninstrs` (see `code_dispatch_len`).
+                        let next = unsafe { *instrs.add(pc + 1) };
+                        if matches!(next.op, OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue) {
+                            // SAFETY: both operands are scalars (no drop owed).
+                            len -= 2;
+                            last = pc + 1;
+                            pc += 2;
+                            if r == (next.op == OpCode::PopJumpIfTrue) {
+                                pc += next.arg as usize;
+                            } else if
+                            // SAFETY: a branch never ends the code (see
+                            // `code_dispatch_len`).
+                            unsafe { (*instrs.add(pc)).op } == OpCode::NotTaken {
+                                pc += 1;
+                            }
+                            continue;
+                        }
                         // SAFETY: both operands are scalars (no drop owed);
                         // the result takes the lower one's slot.
                         len -= 1;
@@ -12330,7 +12920,7 @@ impl Interpreter {
                     OpCode::JumpBackward => {
                         // The back edge is the burst's eval-breaker (see
                         // `leaf_burst_slow`).
-                        if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                        if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
                             break Some(CoreExit::Stop(LeafStop::Breaker));
                         }
                         #[cfg(feature = "jit")]
@@ -12368,7 +12958,62 @@ impl Interpreter {
                                 Object::Generator(_) | Object::Coroutine(_)
                             )
                         {
+                            // `await fut` of a native asyncio future: its
+                            // iterator's step, the sent value replaced by
+                            // what it yields, or by the result as the
+                            // `SEND` exits (see `future_iter_send`).
+                            // SAFETY: `len >= 2` (checked first).
+                            let step = (len >= 2 && ins.arg & GEN_SEND == 0)
+                                .then(|| unsafe { &*base.add(len - 2) })
+                                .and_then(crate::stdlib::asyncio_mod::future_iter_send);
+                            if let Some(step) = step {
+                                use crate::stdlib::asyncio_mod::FutureIterStep;
+                                let (v, exit) = match step {
+                                    FutureIterStep::Yield(v) => (v, false),
+                                    FutureIterStep::Return(v) => (v, true),
+                                };
+                                // SAFETY: `len >= 2`: the sent value's slot.
+                                unsafe { drop_hot(std::mem::replace(&mut *base.add(len - 1), v)) };
+                                last = pc;
+                                pc += 1;
+                                if exit {
+                                    pc += ins.arg as usize;
+                                }
+                                after_release!();
+                                continue;
+                            }
                             break Some(CoreExit::Stop(LeafStop::Step));
+                        }
+                        // A simple generator steps to its next yield in
+                        // place, as a `FOR_ITER` over it does (see
+                        // `gen_fast`): what it yields takes the sent `None`'s
+                        // slot, or its return value does as the `SEND` exits.
+                        // SAFETY: `len >= 2` (checked above).
+                        if let (Object::Generator(g), Object::None, 0) = unsafe {
+                            (&*base.add(len - 2), &*base.add(len - 1), ins.arg & GEN_SEND)
+                        } {
+                            let (v, exit) = match gen_fast::may_step(g)
+                                .then(|| self.gen_fast_next(g, snap_gen, 0, pending_work))
+                            {
+                                None => (None, false),
+                                Some(gen_fast::GenNext::Yielded(v)) => (Some(v), false),
+                                Some(gen_fast::GenNext::Exhausted(v)) => (Some(v), true),
+                                Some(gen_fast::GenNext::Declined | gen_fast::GenNext::Partial) => {
+                                    (None, false)
+                                }
+                            };
+                            if let Some(v) = v {
+                                // SAFETY: the sent `None`'s slot (no drop
+                                // glue owed).
+                                unsafe { base.add(len - 1).write(v) };
+                                last = pc;
+                                pc += 1;
+                                if exit {
+                                    pc += ins.arg as usize;
+                                }
+                                after_release!();
+                                continue;
+                            }
                         }
                         // SAFETY: `len <= cap`, every slot initialized.
                         unsafe { frame.stack.set_len(len) };
@@ -13101,25 +13746,44 @@ impl Interpreter {
                             // `CALL`'s does (see `core_call_kw`); a common
                             // builtin function (`sorted(xs, key=f)`) runs in
                             // the builtin lane.
-                            let builtin = match &ops[0] {
-                                Object::Function(_) => false,
+                            // (0: a Python function, 1: a builtin, 2: a
+                            // plain class, constructed in place.)
+                            let kind = match &ops[0] {
+                                Object::Function(_) => 0,
                                 Object::Builtin(b)
                                     if !b.binds_instance
                                         && matches!(&ops[1], Object::Unbound)
                                         && builtin_fn_lane_ok(b.name) =>
                                 {
-                                    true
+                                    1
                                 }
+                                Object::Type(t) if !t.flags.is_builtin => 2,
                                 _ => break None,
                             };
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
-                            let ran = if builtin {
-                                self.core_builtin_kw_lane(sw, pc)
-                            } else {
-                                self.core_call_kw(sw, pc) || self.core_call_lane(sw)
+                            let ran = match kind {
+                                1 => self.core_builtin_kw_lane(sw, pc),
+                                // A metaclass's own `__call__` takes the
+                                // call as its method (see `core_new`).
+                                // SAFETY: the running activation, synced.
+                                2 if Self::unpack_meta_call(
+                                    unsafe { &mut *sw.cur },
+                                    argc + kwc + 1,
+                                ) =>
+                                {
+                                    self.core_call_kw(sw, pc) || self.core_call_lane(sw)
+                                }
+                                2 => {
+                                    let new = self.core_new_kw(sw, pc, snap_gen);
+                                    if new {
+                                        burst_stats::note_call(burst_stats::CALL_NEW);
+                                    }
+                                    new || self.core_call_lane(sw)
+                                }
+                                _ => self.core_call_kw(sw, pc) || self.core_call_lane(sw),
                             };
                             if !ran && sw.pending.is_none() {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
@@ -13129,14 +13793,14 @@ impl Interpreter {
                         // SAFETY: every operand was checked to leave by a plain
                         // decrement; the result takes the callee's slot.
                         unsafe {
-                            for k in start..len {
-                                drop_hot(base.add(k).read());
-                            }
+                            release_run(base.add(start), len - start);
                             base.add(start).write(r);
                         }
                         len = start + 1;
                         last = pc;
                         pc += 1;
+                        // (An argument the call held last died.)
+                        after_release!();
                     }
                     OpCode::Call => {
                         let argc = ins.arg as usize;
@@ -13197,9 +13861,7 @@ impl Interpreter {
                                             // by plain decrements; the result
                                             // takes the callee's slot.
                                             unsafe {
-                                                for k in callee_at..len {
-                                                    drop_hot(base.add(k).read());
-                                                }
+                                                release_run(base.add(callee_at), len - callee_at);
                                                 base.add(callee_at).write(v);
                                             }
                                             len = callee_at + 1;
@@ -13210,9 +13872,7 @@ impl Interpreter {
                                         Some(Err(e)) => {
                                             // SAFETY: as above.
                                             unsafe {
-                                                for k in callee_at..len {
-                                                    drop_hot(base.add(k).read());
-                                                }
+                                                release_run(base.add(callee_at), len - callee_at);
                                             }
                                             len = callee_at;
                                             pc += 1;
@@ -13236,12 +13896,12 @@ impl Interpreter {
                             .flatten()
                         {
                             let callee_at = len - argc - 2;
+                            // SAFETY: as above: the callee.
+                            note_type_site(ext, pc, unsafe { &*base.add(callee_at) });
                             // SAFETY: every operand was checked droppable;
                             // the result takes the callee's slot.
                             unsafe {
-                                for k in callee_at..len {
-                                    drop_hot(base.add(k).read());
-                                }
+                                release_run(base.add(callee_at), len - callee_at);
                                 base.add(callee_at).write(v);
                             }
                             len = callee_at + 1;
@@ -13273,9 +13933,7 @@ impl Interpreter {
                                         // the step) leave by plain decrements;
                                         // the value takes the callee's slot.
                                         unsafe {
-                                            for k in len - 3..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(len - 3), 3);
                                             base.add(len - 3).write(v);
                                         }
                                         len -= 2;
@@ -13288,9 +13946,7 @@ impl Interpreter {
                                     gen_fast::GenNext::Exhausted(v) => {
                                         // SAFETY: as above.
                                         unsafe {
-                                            for k in len - 3..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(len - 3), 3);
                                         }
                                         len -= 3;
                                         pc += 1;
@@ -13315,18 +13971,35 @@ impl Interpreter {
                         // SAFETY: `len >= argc + 2 == 3`.
                         if argc == 1
                             && !plain_fn
-                            && matches!(
-                                unsafe { (&*base.add(len - 3), &*base.add(len - 2)) },
-                                (Object::BoundMethod(bm), Object::Unbound)
-                                    if matches!(&bm.function, Object::Builtin(b)
-                                        if matches!(b.name, ".gen_send" | ".cor_send"))
-                            )
+                            && Self::gen_send_call(unsafe { &*base.add(len - 3) }, unsafe {
+                                &*base.add(len - 2)
+                            })
                         {
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
                             *last_pc = last;
                             if !self.core_gen_resume(sw, pc, InlineResume::SendCall) {
+                                sw.pending = Some(CoreExit::Stop(LeafStop::Step));
+                            }
+                            break Some(CoreExit::Reload);
+                        }
+                        // `next(gen, default)`: as `next(gen)`, with the
+                        // default the result of an exhausted generator.
+                        // SAFETY: `len >= argc + 2 == 4`.
+                        if argc == 2
+                            && !plain_fn
+                            && matches!(
+                                unsafe { (&*base.add(len - 4), &*base.add(len - 3), &*base.add(len - 2)) },
+                                (Object::Builtin(b), Object::Unbound, Object::Generator(_))
+                                    if Rc::as_ptr(b) as usize == self.leaf_fns().next_ptr
+                            )
+                        {
+                            // SAFETY: `len <= cap`, every slot initialized.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.pc = pc as u32;
+                            *last_pc = last;
+                            if !self.core_gen_resume(sw, pc, InlineResume::NextDefault) {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
@@ -13357,14 +14030,14 @@ impl Interpreter {
                                     // by a plain decrement; the result takes the
                                     // callee's slot.
                                     unsafe {
-                                        for k in start..len {
-                                            drop_hot(base.add(k).read());
-                                        }
+                                        release_run(base.add(start), len - start);
                                         base.add(start).write(r);
                                     }
                                     len = start + 1;
                                     last = pc;
                                     pc += 1;
+                                    // (An argument the call held last died.)
+                                    after_release!();
                                     continue;
                                 }
                             }
@@ -13387,14 +14060,13 @@ impl Interpreter {
                                 // plain decrement; the result takes the callee's
                                 // slot.
                                 unsafe {
-                                    for k in start..len {
-                                        drop_hot(base.add(k).read());
-                                    }
+                                    release_run(base.add(start), len - start);
                                     base.add(start).write(r);
                                 }
                                 len = start + 1;
                                 last = pc;
                                 pc += 1;
+                                after_release!();
                                 continue;
                             }
                         }
@@ -13404,7 +14076,27 @@ impl Interpreter {
                             frame.pc = pc as u32;
                             *last_pc = last;
                             let switched = if python == 1 {
-                                self.core_call(sw, pc) || self.core_gen_call(sw, pc)
+                                if self.core_call(sw, pc) {
+                                    true
+                                } else if self.core_gen_call(sw, pc) {
+                                    // The generator, made in place: no switch,
+                                    // so the loop goes on (unless a release
+                                    // queued a finalizer, or an `await`
+                                    // started the coroutine).
+                                    if sw.pending.is_none()
+                                        && std::ptr::eq(sw.cur.cast_const(), &raw const *frame)
+                                    {
+                                        // SAFETY: the running activation (its
+                                        // stack only shrank: no reallocation).
+                                        len = unsafe { (*sw.cur).stack.len() };
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
                             } else {
                                 let new = self.core_new(sw, pc, snap_gen);
                                 if new {
@@ -13479,15 +14171,15 @@ impl Interpreter {
                                 // SAFETY: `len >= argc + 2`: the self slot.
                                 let recv = unsafe { &*base.add(len - argc - 1) };
                                 let Object::List(l) = recv else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 if !Self::core_droppable(recv) {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 }
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 let result = match (kind, argc) {
                                     (Some(LeafKind::ListAppend), 1) => {
@@ -13500,9 +14192,9 @@ impl Interpreter {
                                         Some(v) => v,
                                         // `pop from empty list` raises: the
                                         // helper's path.
-                                        None => break Some(CoreExit::Helper),
+                                        None => offload!(OFFLOAD_HELPER),
                                     },
-                                    _ => break Some(CoreExit::Helper),
+                                    _ => offload!(OFFLOAD_HELPER),
                                 };
                                 // SAFETY: the list (droppable) and the builtin
                                 // (count above one) leave by plain decrements;
@@ -13515,6 +14207,7 @@ impl Interpreter {
                                 len -= 1;
                                 last = pc;
                                 pc += 1;
+                                after_release!();
                             }
                             // `append(x)` of a local `append = lst.append` on an
                             // exact list (the site's leaf kind, likewise): the
@@ -13530,12 +14223,12 @@ impl Interpreter {
                                         == Some(LeafKind::ListAppend)) =>
                             {
                                 let Object::List(l) = &bm.receiver else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: nothing below runs code while the
                                 // items are borrowed (see `GilCell::peek_mut`).
                                 let Some(items) = (unsafe { l.peek_mut() }) else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: the operand moves into the list; the
                                 // empty self slot and the bound method (held
@@ -13578,8 +14271,8 @@ impl Interpreter {
                                 let ops = unsafe {
                                     std::slice::from_raw_parts(base.add(first), len - first)
                                 };
-                                if !ops.iter().all(Self::core_droppable) {
-                                    break Some(CoreExit::Helper);
+                                if !Self::core_all_droppable(ops) {
+                                    offload!(OFFLOAD_HELPER);
                                 }
                                 let r = match kind {
                                     Some(LeafKind::Fast(f)) => f(ops),
@@ -13594,30 +14287,27 @@ impl Interpreter {
                                 };
                                 match r {
                                     // A fast half declined, untouched.
-                                    None => break Some(CoreExit::Helper),
+                                    None => offload!(OFFLOAD_HELPER),
                                     Some(Ok(v)) => {
                                         // SAFETY: every operand (checked) and
                                         // the builtin (count above one) leave
                                         // by plain decrements; the result takes
                                         // the callee's slot.
                                         unsafe {
-                                            for k in callee_at..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(callee_at), len - callee_at);
                                             base.add(callee_at).write(v);
                                         }
                                         len = callee_at + 1;
                                         last = pc;
                                         pc += 1;
+                                        after_release!();
                                     }
                                     // As the helper's raise: the operands drop
                                     // wholesale and the pc moves past the call.
                                     Some(Err(e)) => {
                                         // SAFETY: as above.
                                         unsafe {
-                                            for k in callee_at..len {
-                                                drop_hot(base.add(k).read());
-                                            }
+                                            release_run(base.add(callee_at), len - callee_at);
                                         }
                                         len = callee_at;
                                         pc += 1;
@@ -13641,7 +14331,7 @@ impl Interpreter {
                                     if matches!(&bm.function, Object::Builtin(b)
                                         if slot.get_leaf(b).is_some())
                                     {
-                                        break Some(CoreExit::Helper);
+                                        offload!(OFFLOAD_HELPER);
                                     }
                                 }
                                 break None;
@@ -13649,11 +14339,11 @@ impl Interpreter {
                             // A leaf builtin or directly constructible type, or
                             // a bound builtin method held in a local (`append =
                             // y.append`): out of line.
-                            Object::Builtin(_) | Object::Type(_) => break Some(CoreExit::Helper),
+                            Object::Builtin(_) | Object::Type(_) => offload!(OFFLOAD_HELPER),
                             Object::BoundMethod(bm)
                                 if matches!(&bm.function, Object::Builtin(_)) =>
                             {
-                                break Some(CoreExit::Helper)
+                                offload!(OFFLOAD_HELPER)
                             }
                             _ => break None,
                         }
@@ -13663,7 +14353,7 @@ impl Interpreter {
                     OpCode::LoadGlobal => {
                         use weavepy_compiler::InlineCache as IC;
                         let Some(slot) = stamps!(cold_stamps, frame, ext).get(pc) else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if len == cap {
                             break None;
@@ -13674,91 +14364,113 @@ impl Interpreter {
                         let (gdict, bdict) = (frame.globals.as_ptr(), frame.builtins.as_ptr());
                         let gid = specialize::rc_id(&frame.globals);
                         let g_stamp = unsafe { (*gdict).mutation_stamp() };
-                        let hit = match code.caches.get(pc as u32) {
-                            IC::LoadGlobalModule {
-                                globals_id,
-                                key_idx,
-                            } if globals_id == gid && slot.get() == [gid, g_stamp, 0] => unsafe {
-                                (*gdict).get_index(key_idx as usize)
-                            },
-                            IC::LoadGlobalBuiltin {
-                                builtins_id,
-                                key_idx,
-                            } if builtins_id == specialize::rc_id(&frame.builtins)
-                                && !self.globals_missing_any.get()
-                                && slot.get()
-                                    == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
-                            {
-                                let hit = unsafe { (*bdict).get_index(key_idx as usize) };
-                                // `len(local)`: the length straight off the local.
-                                if let Some((_, Object::Builtin(f))) = hit {
-                                    if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
-                                        && pc + 3 < ninstrs
+                        let stamp = slot.get();
+                        // The value the site last read, in place while the
+                        // stamp holds (see `StampSlot::value`); else the
+                        // inline cache's entry under the stamp, recorded.
+                        let held = slot.value();
+                        let (v, builtin): (&Object, bool) = if held != 0
+                            && stamp[0] == gid
+                            && stamp[1] == g_stamp
+                            && if held & 1 == 0 {
+                                stamp[2] == 0
+                            } else {
+                                !self.globals_missing_any.get()
+                                    && stamp[2] == unsafe { (*bdict).mutation_stamp() }
+                            } {
+                            // SAFETY: the dicts are as they were when the
+                            // value was read (see `StampSlot::value`).
+                            (unsafe { &*((held & !1) as *const Object) }, held & 1 != 0)
+                        } else {
+                            let (hit, builtin) = match code.caches.get(pc as u32) {
+                                IC::LoadGlobalModule {
+                                    globals_id,
+                                    key_idx,
+                                } if globals_id == gid && stamp == [gid, g_stamp, 0] => {
+                                    (unsafe { (*gdict).get_index(key_idx as usize) }, false)
+                                }
+                                IC::LoadGlobalBuiltin {
+                                    builtins_id,
+                                    key_idx,
+                                } if builtins_id == specialize::rc_id(&frame.builtins)
+                                    && !self.globals_missing_any.get()
+                                    && stamp
+                                        == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
+                                {
+                                    (unsafe { (*bdict).get_index(key_idx as usize) }, true)
+                                }
+                                _ => offload!(OFFLOAD_HELPER),
+                            };
+                            let Some((_, v)) = hit else {
+                                offload!(OFFLOAD_HELPER);
+                            };
+                            slot.set_value(v, builtin);
+                            (v, builtin)
+                        };
+                        // `len(local)`: the length straight off the local.
+                        if builtin {
+                            if let Object::Builtin(f) = v {
+                                if Rc::as_ptr(f) as usize == self.leaf_fns().len_ptr
+                                    && pc + 3 < ninstrs
+                                {
+                                    // SAFETY: `pc + 3 < ninstrs`.
+                                    let (null, load, call) = unsafe {
+                                        (
+                                            *instrs.add(pc + 1),
+                                            *instrs.add(pc + 2),
+                                            *instrs.add(pc + 3),
+                                        )
+                                    };
+                                    if null.op == OpCode::PushNull
+                                        && load.op == OpCode::LoadFast
+                                        && call.op == OpCode::Call
+                                        && call.arg == 1
+                                        && (load.arg as usize) < nlocals
                                     {
-                                        // SAFETY: `pc + 3 < ninstrs`.
-                                        let (null, load, call) = unsafe {
-                                            (
-                                                *instrs.add(pc + 1),
-                                                *instrs.add(pc + 2),
-                                                *instrs.add(pc + 3),
-                                            )
-                                        };
-                                        if null.op == OpCode::PushNull
-                                            && load.op == OpCode::LoadFast
-                                            && call.op == OpCode::Call
-                                            && call.arg == 1
-                                            && (load.arg as usize) < nlocals
-                                        {
-                                            // SAFETY: `load.arg < nlocals`.
-                                            let n = match unsafe { &*lbase.add(load.arg as usize) }
-                                            {
-                                                // SAFETY: a read between two
-                                                // instructions.
-                                                Object::List(l) => {
-                                                    unsafe { l.peek() }.map(Vec::len)
+                                        // SAFETY: `load.arg < nlocals`.
+                                        let n = match unsafe { &*lbase.add(load.arg as usize) } {
+                                            // SAFETY: a read between two
+                                            // instructions.
+                                            Object::List(l) => unsafe { l.peek() }.map(Vec::len),
+                                            Object::Tuple(t) => Some(t.len()),
+                                            Object::Str(s) => Some(crate::object::str_char_len(s)),
+                                            // SAFETY: as above.
+                                            Object::Dict(d) => unsafe { d.peek() }.map(|d| d.len()),
+                                            // A native `__len__` (a deque's).
+                                            v @ Object::Instance(_) => {
+                                                match self.leaf_instance_len(v) {
+                                                    Some(Object::Int(n)) => usize::try_from(n).ok(),
+                                                    _ => None,
                                                 }
-                                                Object::Tuple(t) => Some(t.len()),
-                                                Object::Str(s) => {
-                                                    Some(crate::object::str_char_len(s))
-                                                }
-                                                // SAFETY: as above.
-                                                Object::Dict(d) => {
-                                                    unsafe { d.peek() }.map(|d| d.len())
-                                                }
-                                                // A native `__len__` (a deque's).
-                                                v @ Object::Instance(_) => {
-                                                    match self.leaf_instance_len(v) {
-                                                        Some(Object::Int(n)) => {
-                                                            usize::try_from(n).ok()
-                                                        }
-                                                        _ => None,
-                                                    }
-                                                }
-                                                _ => None,
-                                            };
-                                            if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
-                                                // SAFETY: `len < cap`.
-                                                unsafe { base.add(len).write(int_hot(n)) };
-                                                len += 1;
-                                                last = pc + 3;
-                                                pc += 4;
-                                                continue;
                                             }
+                                            _ => None,
+                                        };
+                                        if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                                            // SAFETY: `len < cap`.
+                                            unsafe { base.add(len).write(int_hot(n)) };
+                                            len += 1;
+                                            last = pc + 3;
+                                            pc += 4;
+                                            continue;
                                         }
                                     }
                                 }
-                                hit
                             }
-                            _ => break Some(CoreExit::Helper),
-                        };
-                        let Some((_, v)) = hit else {
-                            break Some(CoreExit::Helper);
-                        };
+                        }
                         let v = match v {
+                            // (Written here: a scalar copy that joins the
+                            // other arms' values is split into field moves.)
                             s @ (Object::Int(_)
                             | Object::Float(_)
                             | Object::Bool(_)
-                            | Object::None) => scalar_copy(s),
+                            | Object::None) => {
+                                // SAFETY: `len < cap`.
+                                unsafe { base.add(len).write(scalar_copy(s)) };
+                                len += 1;
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             // `f(...)` of a pure leaf global function with
                             // simple arguments (see `core_pure_global_call`).
                             Object::Function(f)
@@ -13864,14 +14576,14 @@ impl Interpreter {
                             break None;
                         }
                         let Some(cell) = frame.cells.get(ins.arg as usize) else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         // SAFETY: a read between two instructions.
                         let Some(v) = (unsafe { cell.peek() }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if matches!(v, Object::Unbound) {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         let c = Self::clone_operand(v);
                         // SAFETY: `len < cap`.
@@ -13890,7 +14602,7 @@ impl Interpreter {
                         // loop's initialized stack.
                         match unsafe { Self::core_super_attr(code, ins, pc, base, len) } {
                             Some(n) => len = n,
-                            None => break Some(CoreExit::Helper),
+                            None => offload!(OFFLOAD_HELPER),
                         }
                         last = pc;
                         pc += 1;
@@ -13902,12 +14614,12 @@ impl Interpreter {
                     // the site.
                     OpCode::LoadSpecial => {
                         if len == 0 || len == cap {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
                         let Object::Instance(inst) = (unsafe { &*top }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let ver = inst.cls_raw().attr_version.get();
                         let ms = mslots!(cold_mslots, ext).get(pc);
@@ -13916,7 +14628,7 @@ impl Interpreter {
                                 .map(Object::Function)
                                 .or_else(|| ms.get_inst_builtin(ver).map(Object::Builtin))
                         }) else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         // SAFETY: `len < cap`; the instance moves up into
                         // the self slot.
@@ -13935,7 +14647,7 @@ impl Interpreter {
                     // a class receiver leaves an empty self slot.
                     OpCode::LoadMethodAttr => {
                         if len == 0 || len == cap {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -13955,7 +14667,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // `module.func(...)`: the attribute off the site's
                         // cached index (no method binds), with an empty self
@@ -13963,7 +14675,7 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Module(m) = unsafe { &*top } {
                             let Some(v) = Self::core_module_attr(code, m, pc, ins.arg) else {
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             };
                             // SAFETY: `len < cap`: `top` and the slot above.
                             unsafe {
@@ -13983,18 +14695,18 @@ impl Interpreter {
                         // SAFETY: as above.
                         if let Object::Instance(inst) = unsafe { &*top } {
                             if !Self::default_getattribute(inst.cls_raw()) {
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
                             if inst_may_shadow(inst, code, ins.arg) {
                                 // SAFETY: `len < cap`: `top` and the slot
                                 // above it.
-                                if unsafe { Self::core_value_method(code, ins.arg, top) } {
+                                if unsafe { Self::core_value_method(code, ins.arg, pc, top) } {
                                     len += 1;
                                     last = pc;
                                     pc += 1;
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
@@ -14009,7 +14721,7 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let f = match unsafe { &*top } {
                             Object::Instance(inst) => {
@@ -14055,7 +14767,7 @@ impl Interpreter {
                                                 pc += 1;
                                                 continue;
                                             }
-                                            None => break Some(CoreExit::Helper),
+                                            None => offload!(OFFLOAD_HELPER),
                                         },
                                     },
                                 };
@@ -14075,7 +14787,7 @@ impl Interpreter {
                             Object::Type(cls) if Rc::strong_count(cls) > 1 => {
                                 match ms.get_held_unbound(cls.attr_version.get()) {
                                     Some(f) => f,
-                                    None => break Some(CoreExit::Helper),
+                                    None => offload!(OFFLOAD_HELPER),
                                 }
                             }
                             // A builtin receiver's site-cached method (the
@@ -14085,7 +14797,7 @@ impl Interpreter {
                                 let Some(b) =
                                     builtin_recv_tag(recv).and_then(|tag| ms.get_builtin(tag))
                                 else {
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 };
                                 // SAFETY: `len < cap`; the receiver moves up.
                                 unsafe {
@@ -14116,7 +14828,7 @@ impl Interpreter {
                     OpCode::LoadAttr => {
                         use weavepy_compiler::InlineCache as IC;
                         if len == 0 {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14147,7 +14859,7 @@ impl Interpreter {
                                             pc += 1;
                                             continue;
                                         }
-                                        break Some(CoreExit::Helper);
+                                        offload!(OFFLOAD_HELPER);
                                     }
                                 }
                             }
@@ -14162,7 +14874,7 @@ impl Interpreter {
                                         pc += 1;
                                         continue;
                                     }
-                                    _ => break Some(CoreExit::Helper),
+                                    _ => offload!(OFFLOAD_HELPER),
                                 }
                             }
                             // A function's stored attribute (`wrapper.calls`).
@@ -14174,20 +14886,21 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
                             // A builtin container's method read as a value
                             // (`append = y.append`), a frame's or code
                             // object's field (the helper's plain values).
                             _ => {
                                 // SAFETY: `top` is the receiver's slot.
-                                if unsafe { self.core_plain_attr(code, ins.arg, top) } {
+                                let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+                                if unsafe { self.core_plain_attr(code, ins.arg, top, running) } {
                                     last = pc;
                                     pc += 1;
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
                         };
                         // A natively served instance's public field (see
@@ -14202,7 +14915,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                _ => break Some(CoreExit::Helper),
+                                _ => offload!(OFFLOAD_HELPER),
                             }
                         }
                         // SAFETY: a read between two instructions (see
@@ -14230,7 +14943,7 @@ impl Interpreter {
                                     pc += 1;
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
                         };
                         let cls = inst.cls_raw();
@@ -14238,19 +14951,19 @@ impl Interpreter {
                             || cls.native_kind.get() != 0
                             || !Self::core_droppable(unsafe { &*top })
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: a read between two instructions (see
                         // `GilCell::peek`).
                         let Some((k, v)) = (unsafe { inst.attr_peek_index(key_idx as usize) })
                         else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         if !slot_name_matches(code, ins.arg, k) {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         if let Some(e) = ext {
-                            field_slot_note(e, ninstrs, pc, inst, key_idx);
+                            field_slot_note(e, code, pc, inst, key_idx);
                         }
                         let v = Self::clone_operand(v);
                         // SAFETY: the receiver (droppable) is replaced in place.
@@ -14262,7 +14975,7 @@ impl Interpreter {
                     // droppable one (the helper's `leaf_store_attr` first case).
                     OpCode::StoreAttr => {
                         if len < 2 {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len >= 2`.
                         let (recv, val) = unsafe { (&*base.add(len - 1), &*base.add(len - 2)) };
@@ -14281,14 +14994,29 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                break Some(CoreExit::Helper);
+                                offload!(OFFLOAD_HELPER);
                             }
-                            _ => break Some(CoreExit::Helper),
+                            // A plain class's own attribute (`Cls.count = n`).
+                            Object::Type(_) => {
+                                // SAFETY: `len >= 2`: the receiver over the
+                                // value.
+                                if unsafe {
+                                    Self::core_class_store(code, ins.arg, base.add(len - 1))
+                                } {
+                                    len -= 2;
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                offload!(OFFLOAD_HELPER);
+                            }
+                            _ => offload!(OFFLOAD_HELPER),
                         };
                         if !Self::core_droppable(recv)
                             || !Self::core_store_attr(code, inst, pc, ins.arg, val)
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: the value moved into the dict (its slot is a
                         // stand-in now) and the receiver leaves the stack by a
@@ -14332,7 +15060,7 @@ impl Interpreter {
                                 _ => false,
                             };
                         if !ok {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         last = pc;
                         pc += 1;
@@ -14345,7 +15073,7 @@ impl Interpreter {
                         let fresh = len > 0
                             && match unsafe { &*base.add(len - 1) } {
                                 // SAFETY: a read between instructions.
-                                Object::Coroutine(g) => unsafe { g.state.peek() }
+                                Object::Coroutine(g) => unsafe { g.state().peek() }
                                     .is_some_and(|s| matches!(s, GeneratorState::Created(_))),
                                 // A `types.coroutine` generator is its own.
                                 Object::Generator(g) => {
@@ -14376,7 +15104,7 @@ impl Interpreter {
                                             continue;
                                         }
                                     }
-                                    break Some(CoreExit::Helper);
+                                    offload!(OFFLOAD_HELPER);
                                 }
                             }
                             break Some(CoreExit::Stop(LeafStop::Step));
@@ -14459,9 +15187,7 @@ impl Interpreter {
                         // SAFETY: the parts leave the stack (a string's release
                         // runs nothing); the join takes the first slot.
                         unsafe {
-                            for k in len - n..len {
-                                drop_hot(base.add(k).read());
-                            }
+                            release_run(base.add(len - n), n);
                             base.add(len - n).write(joined);
                         }
                         len = len - n + 1;
@@ -14514,10 +15240,23 @@ impl Interpreter {
                     // leaf arms' shapes, which the full handlers' match).
                     // An `except` clause's entry, test and exit (see
                     // `core_exc_op`).
+                    // `del obj.attr` of a plain instance's own attribute (see
+                    // `core_delete_attr`); anything else is the full arm's.
+                    OpCode::DeleteAttr => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack.
+                        match unsafe { self.core_delete_attr(code, ins, pc, base, len) } {
+                            Some(n) => len = n,
+                            None => break None,
+                        }
+                        last = pc;
+                        pc += 1;
+                        after_release!();
+                    }
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
-                        match unsafe { self.core_exc_op(&mut frame.exc, ins, base, len, cap) } {
+                        match unsafe { self.core_exc_op(ins, base, len, cap) } {
                             Some(n) => len = n,
                             None => break None,
                         }
@@ -14549,7 +15288,7 @@ impl Interpreter {
                     // arm), when the iterable leaves by a plain decrement.
                     OpCode::GetIter => {
                         if len == 0 {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         // SAFETY: `len > 0`.
                         let top = unsafe { base.add(len - 1) };
@@ -14575,10 +15314,10 @@ impl Interpreter {
                                 | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         }
                         let Ok(it) = v.make_iter() else {
-                            break Some(CoreExit::Helper);
+                            offload!(OFFLOAD_HELPER);
                         };
                         let it = Object::Iter(Rc::new(RefCell::new(it)));
                         // SAFETY: the iterable (droppable) is replaced in place.
@@ -14594,7 +15333,7 @@ impl Interpreter {
                     op if !SLOW_LEAF_OPS[op as u8 as usize] => {
                         break Some(CoreExit::Stop(LeafStop::Step))
                     }
-                    _ => break None,
+                    _ => offload!(OFFLOAD_ARMS),
                 }
             };
             if matches!(stop, Some(CoreExit::Reload)) {
@@ -14608,6 +15347,33 @@ impl Interpreter {
             *last_pc = last;
             return stop.unwrap_or(CoreExit::Slow);
         }
+    }
+
+    /// [`Self::core_pending_enter`] with its commonest case in line: the
+    /// caller an inline activation other than the burst's entry, with no
+    /// shell yet (the call paths' callers).
+    #[inline(always)]
+    fn core_pending_enter_fast(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<usize> {
+        // SAFETY: as `core_pending_enter`.
+        unsafe {
+            let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
+            let depth = inl.len();
+            if depth != 0 && (depth != sw.entry_depth || sw.entry_dead) {
+                let caller: &mut InlineAct = &mut inl[depth - 1];
+                if caller.act.shell.is_none() {
+                    caller.act.frame = std::ptr::from_mut(frame);
+                    let addr = std::ptr::from_mut::<LeanAct>(&mut caller.act) as usize;
+                    push_fast(&mut self.lean_pending, addr);
+                    return Some(addr);
+                }
+            }
+        }
+        self.core_pending_enter(sw, frame, pc)
     }
 
     /// Put `sw`'s running activation, `frame` (synced, suspended at the
@@ -14739,8 +15505,8 @@ impl Interpreter {
     /// body must be reached through [`Self::call`]'s interpreter-aware
     /// dispatch. A method must be bound to its exact builtin receiver; a
     /// function must be one of the common builtins that never look at the
-    /// calling frame (`locals()`, `sys._getframe()` and the like keep the
-    /// full handler, which makes the frame stack whole first).
+    /// calling frame, or make the frame stack whole themselves (`locals()`
+    /// and the like keep the full handler, which makes it whole first).
     fn builtin_lane(
         &self,
         b: &Rc<crate::object::BuiltinFn>,
@@ -14761,9 +15527,20 @@ impl Interpreter {
                 }
                 // `super().__init__(...)` in an exception class's own
                 // `__init__`: `BaseException.__init__` on the instance,
-                // through the full handler's dispatch.
-                if exception_init_call(b, recv) {
+                // through the full handler's dispatch; likewise
+                // `x.__reduce_ex__(4)` of a plain instance (`copy`,
+                // `pickle`), which may run `copyreg` code.
+                if exception_init_call(b, recv)
+                    || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                        && matches!(recv, Object::Instance(_)))
+                {
                     return Some(true);
+                }
+                // `super().__init__(...)` reaching `object.__init__` (or
+                // another native `__init__`) on a plain instance: the
+                // dispatch's only `__init__` case is a dict payload's.
+                if native_init_call(b, recv) {
+                    return Some(false);
                 }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
@@ -14777,120 +15554,39 @@ impl Interpreter {
     /// The core loop's `CALL` at `pc` of a non-leaf builtin the site settled
     /// on (see [`Self::builtin_lane`]), in `sw`'s synced running activation:
     /// a builtin type's method on its exact receiver, as `(method, receiver)`
-    /// or as a bound method with an empty self slot, or a builtin function.
-    /// The body runs directly, or with `via_call` through [`Self::call`], as
-    /// the full handler's dispatch ends up running it, without that
-    /// handler's chain of special cases. The body may run Python code (an
-    /// element's `__eq__`, a key function), so the operands leave the stack
-    /// first, the activation waits on the pending list meanwhile, and the
-    /// core loop reloads after. `false` touches nothing.
+    /// or as a bound method with an empty self slot, or a builtin function,
+    /// run by [`Self::core_native_body`]. The core loop reloads after.
+    /// `false` touches nothing.
     #[inline(never)]
     fn core_builtin_lane(&mut self, sw: &mut CoreSwitch, pc: usize, via_call: bool) -> bool {
-        const MAX_ARGS: usize = 8;
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
         let Some(ins) = frame.code.instructions.get(pc) else {
             return false;
         };
-        let argc = ins.arg as usize;
-        let n = frame.stack.len();
-        let Some(callee_at) = n.checked_sub(argc + 2) else {
+        let Some(callee_at) = frame.stack.len().checked_sub(ins.arg as usize + 2) else {
             return false;
         };
-        let (b, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
-            (Object::Builtin(b), Object::Unbound) => (b, None),
-            (Object::Builtin(b), recv) => (b, Some(recv)),
-            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
-                match &bm.function {
-                    Object::Builtin(b) => (b, Some(&bm.receiver)),
-                    _ => return false,
+        let b: *const crate::object::BuiltinFn =
+            match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
+                (Object::Builtin(b), Object::Unbound) if !b.binds_instance => Rc::as_ptr(b),
+                (Object::Builtin(b), recv) if lane_recv_ok(b, recv, via_call) => Rc::as_ptr(b),
+                (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                    match &bm.function {
+                        Object::Builtin(b) if lane_recv_ok(b, &bm.receiver, via_call) => {
+                            Rc::as_ptr(b)
+                        }
+                        _ => return false,
+                    }
                 }
-            }
-            _ => return false,
-        };
-        let ok = argc < MAX_ARGS
-            && match receiver {
-                Some(recv) => {
-                    b.binds_instance
-                        && (!via_call
-                            || builtins::method_memo_tag(recv).is_some()
-                            || exception_init_call(b, recv)
-                            || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
-                                && matches!(recv, Object::Instance(_))))
-                }
-                None => !b.binds_instance,
+                _ => return false,
             };
-        if !ok {
-            return false;
-        }
-        let (b, receiver) = (b.clone(), receiver.cloned());
-        // Committed. The receiver and the arguments move into `buf`; the
-        // self slot and the callable leave the stack.
-        let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX_ARGS + 1];
-        let first = usize::from(receiver.is_some());
-        if let Some(receiver) = receiver {
-            buf[0].write(receiver);
-        }
-        // SAFETY: the `argc` operands above the self slot move into `buf`
-        // (`argc < MAX_ARGS`) and the stack forgets them.
-        unsafe {
-            let src = frame.stack.as_ptr().add(callee_at + 2);
-            for k in 0..argc {
-                buf[first + k].write(src.add(k).read());
-            }
-            frame.stack.set_len(callee_at + 2);
-        }
-        let self_slot = frame.stack.pop();
-        let callable = frame.stack.pop();
-        frame.pc = pc as u32 + 1;
-        // SAFETY: the first `first + argc` entries were written above.
-        let ops = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<Object>(), first + argc)
-        };
-        // The body may run Python code that looks up the stack.
-        let pending = self.core_pending_enter(sw, frame, pc);
-        let result = if via_call {
-            let globals = frame.globals.clone();
-            self.call(&Object::Builtin(b.clone()), ops, &[], &globals)
-        } else {
-            match b.call_kw.as_ref() {
-                Some(call_kw) => call_kw(ops, &[]),
-                None => (b.call)(ops),
-            }
-        };
-        self.core_pending_exit(sw, pending);
-        // The operands drop as the full handler's do, after the call.
-        // SAFETY: each initialized entry drops exactly once; `buf` itself
-        // has no drop glue.
-        unsafe { std::ptr::drop_in_place(ops) };
-        for o in [callable, self_slot].into_iter().flatten() {
-            // A scalar or a shared builtin leaves by a plain drop; anything
-            // else as the full handler releases it.
-            if matches!(
-                o,
-                Object::Int(_)
-                    | Object::Float(_)
-                    | Object::Bool(_)
-                    | Object::None
-                    | Object::Unbound
-                    | Object::Builtin(_)
-            ) {
-                drop(o);
-            } else {
-                self.release(o);
-            }
-        }
-        drop(b);
-        match result {
-            Ok(v) => {
-                // SAFETY: as above (the body ran nested activations of its
-                // own, never this one).
-                unsafe { (*sw.cur).stack.push(v) };
-                // SAFETY: the running activation's last-pc slot.
-                unsafe { *sw.last = pc };
-            }
-            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        // SAFETY: the activation is synced, and the shape was checked.
+        match unsafe { self.core_native_body(sw, frame, pc, callee_at, b, via_call) } {
+            // SAFETY: the running activation's last-pc slot.
+            None => unsafe { *sw.last = pc },
+            Some(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
         }
         // A finalizer queued by a dying operand runs before the next
         // instruction, as after the full handler's call.
@@ -14899,6 +15595,88 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// The body of the non-leaf builtin `b` for the `CALL` at `pc` of `sw`'s
+    /// running activation `frame` (synced, its operands from `start` to the
+    /// top of its stack): `b` is the callee itself (a method with its
+    /// receiver in the self slot, or a function with the slot empty) or a
+    /// bound method's function, whose receiver fills the empty self slot
+    /// here. The body runs directly, or with `via_call` through
+    /// [`Self::call`], as the full handler's dispatch ends up running it,
+    /// on the operands where they are (as a vectorcall reads them, the
+    /// stack holding them), with the activation waiting on the pending
+    /// list: the body may run Python code (an element's `__eq__`, a key
+    /// function). Then the operands leave as the full handler's do, the
+    /// arguments first, then the receiver and the callable, and the result
+    /// takes the callee's slot: `None`, the stack ending past it, or the
+    /// error raised, the stack ending at `start`.
+    ///
+    /// # Safety
+    ///
+    /// `frame` is `sw`'s synced running activation, unborrowed elsewhere;
+    /// the callee at `start` is `b` (or a bound method of it) in a shape
+    /// [`Self::core_builtin_lane`] admits.
+    #[inline(never)]
+    pub(crate) unsafe fn core_native_body(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+        start: usize,
+        b: *const crate::object::BuiltinFn,
+        via_call: bool,
+    ) -> Option<RuntimeError> {
+        let len = frame.stack.len();
+        // SAFETY: the caller's contract: `start + 2 <= len`; the stack
+        // isn't resized while the body runs (nested code runs activations
+        // of its own).
+        unsafe {
+            let base = frame.stack.as_mut_ptr();
+            if matches!(&*base.add(start + 1), Object::Unbound) {
+                if let Object::BoundMethod(bm) = &*base.add(start) {
+                    // (The empty self slot needs no release.)
+                    base.add(start + 1).write(bm.receiver.clone());
+                }
+            }
+            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                start + 2
+            } else {
+                start + 1
+            };
+            frame.pc = pc as u32 + 1;
+            // The body may run Python code that looks up the stack.
+            let pending = self.core_pending_enter_fast(sw, frame, pc);
+            let args = std::slice::from_raw_parts(base.add(first), len - first);
+            let result = if via_call {
+                let globals = frame.globals.clone();
+                match &*base.add(start) {
+                    callable @ Object::Builtin(_) => self.call(callable, args, &[], &globals),
+                    callable => self.call(&bm_builtin(callable), args, &[], &globals),
+                }
+            } else {
+                let b = &*b;
+                match b.call_kw.as_ref() {
+                    Some(call_kw) => call_kw(args, &[]),
+                    None => (b.call)(args),
+                }
+            };
+            self.core_pending_exit(sw, pending);
+            // The operands leave the stack, then are released: the
+            // arguments, the receiver, the callable.
+            frame.stack.set_len(start);
+            release_operands(self, base.add(start + 2), len - start - 2);
+            release_operands(self, base.add(start + 1), 1);
+            release_operands(self, base.add(start), 1);
+            match result {
+                Ok(v) => {
+                    base.add(start).write(v);
+                    frame.stack.set_len(start + 1);
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        }
     }
 
     /// A `BINARY_OP` or `COMPARE_OP` at `sw`'s running activation's `pc`
@@ -15044,6 +15822,11 @@ impl Interpreter {
         if len < 5 {
             return false;
         }
+        if self.core_with_exit_inline(sw, pc) {
+            return true;
+        }
+        // SAFETY: as above (nothing was touched).
+        let frame = unsafe { &mut *sw.cur };
         // [exit_func, exit_self, lasti, prev, exc], as the full handler.
         let exc = frame.stack[len - 1].clone();
         let exit_self = frame.stack[len - 4].clone();
@@ -15077,6 +15860,82 @@ impl Interpreter {
         if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
+        true
+    }
+
+    /// [`Self::core_with_exit_lane`] for an exit method that is a plain
+    /// Python function of the manager (`LOAD_SPECIAL` left the function
+    /// under its instance): the call `exit(self, type, exc, tb)` runs as an
+    /// inline activation switched to here, as a `CALL 3` of the same
+    /// operands would, instead of nested through [`Self::call`]. Its
+    /// return lands on the stack past the `WITH_EXCEPT_START`; a raise
+    /// propagates from it as from a call there. `false` touches nothing.
+    #[inline(never)]
+    fn core_with_exit_inline(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let code = {
+            // SAFETY: see `CoreSwitch`: the running activation is synced
+            // and unborrowed here.
+            let frame = unsafe { &*sw.cur };
+            let len = frame.stack.len();
+            // [exit_func, exit_self, lasti, prev, exc], as the full handler.
+            let (Object::Function(f), exit_self, Object::Instance(_)) = (
+                &frame.stack[len - 5],
+                &frame.stack[len - 4],
+                &frame.stack[len - 1],
+            ) else {
+                return false;
+            };
+            // A pure leaf is evaluated in place through `call` (see
+            // `call_pure_leaf`), cheaper than any activation.
+            if matches!(exit_self, Object::Unbound) || fn_is_pure_leaf(f) {
+                return false;
+            }
+            match Self::lean_call_shape_cells(f, 4, true) {
+                Some(shape) => shape,
+                None => return false,
+            }
+        };
+        let (code, missing) = code;
+        // Past the recursion limit the nested call raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return false;
+        };
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`): the running
+        // activation is the innermost; its handles are live and unborrowed.
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let (frame, shell) = (&mut *frame, &mut *shell.cast::<QuietShell<'_>>());
+            let len = frame.stack.len();
+            let Object::Instance(inst) = &frame.stack[len - 1] else {
+                unreachable!("checked above")
+            };
+            let ty = Object::Type(inst.cls());
+            let tb = inst.slot_get("__traceback__").unwrap_or(Object::None);
+            let exc = frame.stack[len - 1].clone();
+            let exit_self = frame.stack[len - 4].clone();
+            let exit_func = frame.stack[len - 5].clone();
+            // Committed: the call's operands, as a `CALL 3` sees them.
+            frame.stack.extend([exit_func, exit_self, ty, exc, tb]);
+            let n = frame.stack.len();
+            let act = self.inline_slot();
+            // SAFETY: a parked slot's locals storage is its own, and empty.
+            let locals = &mut *act.frame.locals.as_ptr();
+            let callable = Self::lean_call_fill(frame, &code, true, n - 4, n - 5, missing, locals);
+            frame.pc = pc as u32 + 1;
+            self.inline_bind(frame, shell, pc, act, code, callable, guard)
+        };
+        let mut act = act;
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
     }
 
@@ -15179,7 +16038,13 @@ impl Interpreter {
         let Some(slot) = code_call_slot(&frame.code, pc) else {
             return false;
         };
-        if slot.hit(fp, Rc::as_ptr(code_rc)) != Some((0, has_self))
+        let Some((missing, true)) = slot
+            .hit(fp, Rc::as_ptr(code_rc))
+            .map(|(missing, s)| (missing as usize, s == has_self))
+        else {
+            return false;
+        };
+        if (missing > 0 && !Self::defaults_cover(f, missing))
             || !code_rc.cellvars.is_empty()
             || !code_rc.freevars.is_empty()
             || !f.closure.is_empty()
@@ -15197,32 +16062,60 @@ impl Interpreter {
             return false;
         };
         // SAFETY: as above; the checks above hold.
-        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, fp, act, guard) };
+        unsafe {
+            self.core_bind_plain::<false>(
+                sw,
+                pc,
+                callee_slot,
+                has_self,
+                missing,
+                false,
+                fp,
+                act,
+                guard,
+                false,
+            )
+        };
         true
     }
 
-    /// The committed half of [`Self::core_call_plain`]: the arguments of
+    /// Whether `f`'s compiled positional defaults (`__defaults__` never
+    /// rebound) cover the last `missing` parameters.
+    #[inline]
+    fn defaults_cover(f: &PyFunction, missing: usize) -> bool {
+        f.defaults.len() >= missing && !f.defaults_maybe_overridden()
+    }
+
+    /// The committed half of [`Self::core_call_plain`] (`held`: the slot
+    /// is a direct call site's warm one, holding the callee's code): the
+    /// arguments of
     /// the `CALL` at `pc` of `sw`'s running activation (the callable at
     /// `callee_slot`, its self slot filled when `has_self`) move into the
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
     /// `fp` (with exactly its arity) under the recursion `guard`, is
-    /// pushed and made the running activation.
+    /// pushed and made the running activation. The last `missing`
+    /// parameters take `fp`'s positional defaults. `DIRECT` marks the
+    /// activation a direct call's (see `frame_jit::direct_call`).
     ///
     /// # Safety
     ///
     /// The running activation is synced and unborrowed, and the call's
-    /// shape is one `core_call_plain` admits.
+    /// shape is one `core_call_plain` admits (the defaults cover
+    /// `missing`, see [`Self::defaults_cover`]).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn core_bind_plain(
+    unsafe fn core_bind_plain<const DIRECT: bool>(
         &mut self,
         sw: &mut CoreSwitch,
         pc: usize,
         callee_slot: usize,
         has_self: bool,
+        missing: usize,
+        cells: bool,
         fp: *const crate::object::PyFunction,
-        mut act: Box<InlineAct>,
+        act: Box<InlineAct>,
         guard: crate::recursion::Guard,
+        held: bool,
     ) -> *mut Frame {
         // SAFETY: the caller's contract.
         let frame = unsafe { &mut *sw.cur };
@@ -15232,8 +16125,7 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*(*fp).code.as_ptr() };
         // Committed. The arguments move into the slot's (empty, sole-owned)
         // locals; the callable and the empty self slot leave the stack.
-        let code = code_rc.clone();
-        let nlocals = code.varnames.len();
+        let nlocals = code_rc.varnames.len();
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { &mut *act.frame.locals.as_ptr() };
         let first = if has_self {
@@ -15242,28 +16134,130 @@ impl Interpreter {
             callee_slot + 2
         };
         let nargs = n - first;
-        locals.reserve(nlocals.max(nargs));
+        let total = nlocals.max(nargs + missing);
+        if locals.capacity() < total {
+            locals.reserve(total);
+        }
         // SAFETY: the `nargs` operands above `first` move into the locals
-        // (reserved above) and the stack forgets them; the callable moves
-        // out of its slot, and an empty self slot owns nothing.
+        // (reserved above) and the stack forgets them, the defaults follow
+        // as copies, and the other locals start unbound, in one pass; the
+        // callable moves out of its slot, and an empty self slot owns
+        // nothing.
         let callable = unsafe {
             let (src, dst) = (frame.stack.as_ptr().add(first), locals.as_mut_ptr());
-            for k in 0..nargs {
-                dst.add(k).write(src.add(k).read());
+            move_objects(src, dst, nargs);
+            let mut k = nargs;
+            if missing > 0 {
+                let defaults = &(*fp).defaults;
+                for d in &defaults[defaults.len() - missing..] {
+                    dst.add(k).write(clone_hot(d));
+                    k += 1;
+                }
             }
-            locals.set_len(nargs);
+            fill_unbound_raw(dst.add(k), total - k);
+            locals.set_len(total);
             let callable = frame.stack.as_ptr().add(callee_slot).read();
             frame.stack.set_len(callee_slot);
             callable
         };
-        fill_unbound(locals, nlocals);
+        // SAFETY: as above.
+        unsafe {
+            self.core_bind_act::<DIRECT>(
+                sw, frame, pc, fp, code_rc, act, guard, held, cells, callable,
+            )
+        }
+    }
+
+    /// [`Self::core_bind_plain`] for the `CALL_KW` at `pc` of `sw`'s
+    /// running activation (a direct call's, see `frame_jit::h_call_kw`):
+    /// the site's verified `CallPyKwNames` permutation `perm` places the
+    /// `kwc` keyword values, the `argc` positionals (after the receiver
+    /// when `has_self`) take the first slots, and the parameters `covered`
+    /// doesn't name take their defaults (see `kw_names_fill_locals`).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s, with the names tuple on the stack's
+    /// top and a callee with no cells and no `**kwargs`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn core_bind_kw_direct(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        has_self: bool,
+        fp: *const crate::object::PyFunction,
+        (perm, covered, kwc, argc): (u32, u32, usize, usize),
+        act: Box<InlineAct>,
+        guard: crate::recursion::Guard,
+    ) -> *mut Frame {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let frame = &mut *sw.cur;
+            let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
+            // A parked slot's locals storage is its own, and empty.
+            let locals = &mut *act.frame.locals.as_ptr();
+            let names = frame.stack.pop().expect("the names tuple");
+            let items: &[Object] = match &names {
+                Object::Tuple(t) => t,
+                _ => &[],
+            };
+            Self::kw_names_fill_locals(
+                locals,
+                &mut frame.stack,
+                items,
+                &*fp,
+                code_rc,
+                perm,
+                covered,
+                kwc,
+                argc + usize::from(has_self),
+            );
+            drop_hot(names);
+            if !has_self {
+                // The empty self slot owns nothing.
+                let n = frame.stack.len();
+                frame.stack.set_len(n - 1);
+            }
+            let callable = frame.stack.pop().expect("the callee");
+            self.core_bind_act::<true>(
+                sw, frame, pc, fp, code_rc, act, guard, false, false, callable,
+            )
+        }
+    }
+
+    /// The common half of [`Self::core_bind_plain`] and
+    /// [`Self::core_bind_kw_direct`]: `act`, its locals filled and
+    /// `callable` off the caller's stack, bound to `fp` and pushed as the
+    /// running activation, the caller (`frame`) waiting past its call.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_bind_act<const DIRECT: bool>(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+        fp: *const crate::object::PyFunction,
+        code_rc: &Rc<CodeObject>,
+        mut act: Box<InlineAct>,
+        guard: crate::recursion::Guard,
+        held: bool,
+        cells: bool,
+        callable: Object,
+    ) -> *mut Frame {
         frame.pc = pc as u32 + 1;
         // SAFETY: the slot is parked (see `inline_bind_cells`): its handles
         // are stale copies, overwritten without a drop. `fp` stays alive
         // while the slot holds `callable`.
         unsafe {
             let fr: &mut Frame = &mut act.frame;
-            std::ptr::write(&raw mut fr.code, code);
+            // (A warm slot, `held`, holds this code already.)
+            if !held {
+                std::ptr::write(&raw mut fr.code, code_rc.clone());
+            }
             std::ptr::write(
                 &raw mut fr.cells,
                 borrowed_rc(crate::object::empty_cells_ref()),
@@ -15271,12 +16265,16 @@ impl Interpreter {
             std::ptr::write(&raw mut fr.globals, borrowed_rc(&(*fp).globals));
             std::ptr::write(&raw mut fr.builtins, borrowed_rc(&(*fp).builtins));
             std::ptr::write(&raw mut act.callable, callable);
+            if cells {
+                Self::bind_call_cells(&mut act, &*fp);
+            }
         }
         act.frame.pc = 0;
         act.parked = false;
+        act.direct = DIRECT;
         act.call_pc = pc;
         // The caller waits on the pending list (see `lean_pending_enter`).
-        act.caller_pending = self.core_pending_enter(sw, frame, pc);
+        act.caller_pending = self.core_pending_enter_fast(sw, frame, pc);
         act.exc_depth = self.exc_info_len();
         act.guard = Some(guard);
         // As `inline_bind_cells`: a hot body is compiled once, so native
@@ -15299,6 +16297,33 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         callee
+    }
+
+    /// [`Self::core_bind_plain`]'s cells for a callee with cell or free
+    /// variables (a direct call's, see `frame_jit::direct_body`): fresh
+    /// cells of its own (its parameters that are cells move into them, as
+    /// `inline_bind` binds them), or its closure's lean cells, which `f`
+    /// holds (see `PyFunction::lean_cells_ref`).
+    ///
+    /// # Safety
+    ///
+    /// `act` is freshly bound to `f` (its locals filled, its cells handle
+    /// a stale copy, overwritten without a drop).
+    #[cold]
+    #[inline(never)]
+    unsafe fn bind_call_cells(act: &mut InlineAct, f: &PyFunction) {
+        // SAFETY: the caller's contract; the code outlives the binding.
+        unsafe {
+            let code: &CodeObject = &*Rc::as_ptr(&act.frame.code);
+            if code.cellvars.is_empty() {
+                let cells = f.lean_cells_ref(code).expect("checked by the call");
+                std::ptr::write(&raw mut act.frame.cells, borrowed_rc(cells));
+            } else {
+                let cells = fresh_cells(f, code, &mut *act.frame.locals.as_ptr());
+                std::ptr::write(&raw mut act.frame.cells, cells);
+                act.owns_cells = true;
+            }
+        }
     }
 
     /// A bound method over a plain function with an empty self slot,
@@ -15476,6 +16501,34 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_getitem`] for a `STORE_SUBSCR` the instance's Python
+    /// `__setitem__` serves ([`Self::try_inline_setitem`]). `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_setitem(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_setitem(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
     /// The core loop's `CALL` at `pc` of a registered leaf builtin whose
     /// leaf half declined the operands (`len(obj)` of an instance with a
     /// Python `__len__`, say): the call runs through [`Self::call`] in
@@ -15483,8 +16536,9 @@ impl Interpreter {
     /// nothing.
     #[inline(never)]
     /// The `CALL` at the running activation's pc of an exact builtin
-    /// container type over one positional argument (`set(genexpr)`,
-    /// `list(xs)`), through the ordinary call with the caller published
+    /// container type (or `weakref.ref`, or `types.MappingProxyType`) over
+    /// one positional argument (`set(genexpr)`, `list(xs)`), through the
+    /// ordinary call with the caller published
     /// (consuming the argument may run Python code), as the builtin lane
     /// runs a builtin function. `false` touches nothing.
     fn core_type_lane(&mut self, sw: &mut CoreSwitch) -> bool {
@@ -15511,6 +16565,9 @@ impl Interpreter {
         if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_]
             .iter()
             .any(|t| Rc::ptr_eq(t, ty))
+            // (`weakref.ref(obj)` and `types.MappingProxyType(mapping)`,
+            // as `inspect` makes them, read no frame either.)
+            && !(ty.flags.is_builtin && matches!(ty.name.as_str(), "ReferenceType" | "mappingproxy"))
         {
             return false;
         }
@@ -15549,7 +16606,8 @@ impl Interpreter {
     /// `CALL_KW` or `CALL_FUNCTION_EX` (an exact tuple, and no `**` or an
     /// exact dict of `str` keys) at the running activation's pc, of a
     /// class or a Python function the inline paths declined (a class with
-    /// its own `__new__`, a callee binding `*args`): the call runs through
+    /// its own `__new__`, a callee binding `*args`), or of a builtin the
+    /// builtin lane takes, spread without keywords: the call runs through
     /// the ordinary protocol with this activation published, as the
     /// builtin lane runs a builtin. Zero-argument `super` (which reads its
     /// caller's frame) stays the full handler's. `false` touches nothing.
@@ -15583,11 +16641,26 @@ impl Interpreter {
             }
             _ => return false,
         };
+        // (A builtin the `CALL` arm's builtin lane takes, spread from a
+        // tuple without keywords: `callback(*args, **kwds)` of a bound
+        // `list.clear`.)
+        let mut builtin = false;
         let ok = match &frame.stack[callee_at] {
             Object::Type(t) => !Rc::ptr_eq(t, &builtin_types().super_),
             Object::Function(_) => true,
-            Object::BoundMethod(bm) => {
-                !bm.redispatch_descriptor && matches!(bm.function, Object::Function(_))
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(_) => true,
+                Object::Builtin(b) if ins.op == OpCode::CallEx => {
+                    builtin = true;
+                    matches!(frame.stack[callee_at + 1], Object::Unbound)
+                        && self.builtin_lane(b, Some(&bm.receiver)).is_some()
+                }
+                _ => false,
+            },
+            Object::Builtin(b) if ins.op == OpCode::CallEx => {
+                builtin = true;
+                matches!(frame.stack[callee_at + 1], Object::Unbound)
+                    && self.builtin_lane(b, None).is_some()
             }
             _ => false,
         };
@@ -15596,7 +16669,10 @@ impl Interpreter {
         }
         let ops = &frame.stack[callee_at..];
         let mut args: Vec<Object> = Vec::new();
-        let mut kwargs: Vec<(String, Object)> = Vec::new();
+        // The keywords' names are the call's own `str` objects (the site's
+        // names tuple, the `**` mapping's keys).
+        let mut kwnames: Vec<Object> = Vec::new();
+        let mut kwvals: Vec<Object> = Vec::new();
         if !matches!(ops[1], Object::Unbound) {
             args.push(ops[1].clone());
         }
@@ -15608,10 +16684,11 @@ impl Interpreter {
             let npos = values.len() - names.len();
             args.extend(values[..npos].iter().cloned());
             for (name, v) in names.iter().zip(&values[npos..]) {
-                let Object::Str(name) = name else {
+                if !matches!(name, Object::Str(_)) {
                     return false;
-                };
-                kwargs.push((name.to_string(), v.clone()));
+                }
+                kwnames.push(name.clone());
+                kwvals.push(v.clone());
             }
         } else {
             let Object::Tuple(items) = &ops[2] else {
@@ -15625,13 +16702,26 @@ impl Interpreter {
                         return false;
                     };
                     for (k, v) in d.iter() {
-                        let Object::Str(name) = &k.0 else {
+                        if !matches!(k.0, Object::Str(_)) {
                             return false;
-                        };
-                        kwargs.push((name.to_string(), v.clone()));
+                        }
+                        kwnames.push(k.0.clone());
+                        kwvals.push(v.clone());
                     }
                 }
                 _ => return false,
+            }
+        }
+        if builtin && !kwnames.is_empty() {
+            return false;
+        }
+        // A keyword call of a plain function decides the site's
+        // `CallPyKwNames` specialization here, as the full handler does:
+        // the core loop takes every execution of the site, so without it
+        // the in-place and inline keyword calls would never apply.
+        if ins.op == OpCode::CallKw {
+            if let Object::Function(f) = &frame.stack[callee_at] {
+                Self::core_specialize_call_kw(&frame.code, pc, f, args.len(), &kwnames);
             }
         }
         // Committed: the operands leave the stack.
@@ -15640,10 +16730,34 @@ impl Interpreter {
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        let result = self.call(&callee, &args, &kwargs, &globals);
+        // A Python function binds its keywords by name objects; anything
+        // else takes them as strings.
+        let target = match &callee {
+            Object::Function(f) if !kwnames.is_empty() => Some((f.clone(), None)),
+            Object::BoundMethod(bm) if !kwnames.is_empty() => match &bm.function {
+                Object::Function(f) => Some((f.clone(), Some(bm.receiver.clone()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        let result = match target {
+            Some((f, receiver)) => {
+                if let Some(r) = receiver {
+                    args.insert(0, r);
+                }
+                self.call_python_kw_names(&f, args, &kwnames, kwvals)
+            }
+            None => {
+                let kwargs: Vec<(String, Object)> =
+                    kwnames.iter().map(Object::to_str).zip(kwvals).collect();
+                let r = self.call(&callee, &args, &kwargs, &globals);
+                drop(args);
+                drop(kwargs);
+                r
+            }
+        };
         self.core_pending_exit(sw, pending);
-        drop(args);
-        drop(kwargs);
+        drop(kwnames);
         drop(callee);
         for o in operands {
             self.release(o);
@@ -15660,6 +16774,69 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// The `CALL_KW` handler's specialization step for the site at `pc` of
+    /// `code`, calling the plain function `f` with `eff_argc` positionals
+    /// (a receiver included) and the keyword `names`: an empty site
+    /// decides, a cooling one counts down, and a specialized one that no
+    /// longer binds this call cools down.
+    #[cold]
+    #[inline(never)]
+    fn core_specialize_call_kw(
+        code: &CodeObject,
+        pc: usize,
+        f: &Rc<PyFunction>,
+        eff_argc: usize,
+        names: &[Object],
+    ) {
+        use weavepy_compiler::InlineCache as IC;
+        let kw_op = OpCode::CallKw as u8;
+        if crate::trace::any_observers_active()
+            && crate::trace::monitoring_union_mask_cached()
+                & crate::trace::event_mask(crate::trace::EVENT_CALL)
+                != 0
+        {
+            return;
+        }
+        let at = pc as u32;
+        match code.caches.get(at) {
+            IC::Empty => {
+                specialize::record_specialize_attempt(kw_op);
+                let decision = specialize::attempt_specialize_call_kw_names(f, eff_argc, names);
+                code.caches.set(at, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(kw_op);
+                } else {
+                    specialize::record_specialize_success(kw_op);
+                }
+            }
+            IC::Cooldown(n) => {
+                code.caches.set(
+                    at,
+                    if n > 0 {
+                        IC::Cooldown(n - 1)
+                    } else {
+                        IC::Empty
+                    },
+                );
+            }
+            IC::CallPyKwNames {
+                func_id,
+                perm,
+                argc,
+                kwc,
+            } => {
+                let binds = argc as usize == eff_argc
+                    && kwc as usize == names.len()
+                    && Self::kw_names_bind_check(f, func_id, perm, names, eff_argc).is_some();
+                if !binds {
+                    specialize::record_miss(kw_op);
+                    code.caches.set(at, IC::Cooldown(COOLDOWN));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `FOR_ITER` at the running activation's pc over a native adapter
@@ -16384,7 +17561,48 @@ impl Interpreter {
         else {
             return false;
         };
+        // A class whose metaclass replaces `__call__` with a plain Python
+        // function (`EnumType`): the call is that function's, with the
+        // class as its receiver.
+        // SAFETY: see `CoreSwitch`.
+        if Self::unpack_meta_call(unsafe { &mut *sw.cur }, argc) {
+            return self.core_call(sw, pc);
+        }
         self.core_new_n(sw, pc, argc, snap_gen)
+    }
+
+    /// Turn the operands of a call of a class (`argc` positionals, no
+    /// receiver) whose metaclass's `__call__` resolves to a plain Python
+    /// function into that function's call with the class as its receiver,
+    /// as `type(cls).__call__(cls, ...)` binds it (the generic call's
+    /// `bind_method`). `false` touches nothing.
+    fn unpack_meta_call(frame: &mut Frame, argc: usize) -> bool {
+        let n = frame.stack.len();
+        let Some(self_slot) = n.checked_sub(argc + 1) else {
+            return false;
+        };
+        let Some(callee_slot) = self_slot.checked_sub(1) else {
+            return false;
+        };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        if !matches!(frame.stack[self_slot], Object::Unbound) || Self::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        let Some(meta) = ty.metaclass.borrow().clone() else {
+            return false;
+        };
+        if meta.flags.is_builtin || meta.c_ext_ptr.get() != 0 {
+            return false;
+        }
+        let Some(call @ Object::Function(_)) = meta.lookup("__call__") else {
+            return false;
+        };
+        let cls = std::mem::replace(&mut frame.stack[callee_slot], call);
+        frame.stack[self_slot] = cls;
+        true
     }
 
     /// `cls(*args)` (the `CALL_FUNCTION_EX` at `pc` of `sw`'s synced
@@ -16434,6 +17652,135 @@ impl Interpreter {
         false
     }
 
+    /// `cls(..., name=value)` (the `CALL_KW` at `pc` of `sw`'s synced
+    /// running activation) of a plain class whose `__init__` a lean
+    /// activation can run: the arguments bind by name as the generic
+    /// binder would (see [`Self::lean_bind_keywords`]), and the `__init__`
+    /// activation runs inline as [`Self::core_new_n`]'s does. `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_new_kw(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        if !self.inline_calls_ok()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || self.lean_snapshot() != Some(snap_gen)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
+            return false;
+        };
+        let len = frame.stack.len();
+        let Some(Object::Tuple(names)) = frame.stack.last() else {
+            return false;
+        };
+        let kwc = names.len();
+        // Stack: class, self-or-null, positionals, keyword values, names.
+        let Some(callee_slot) = len.checked_sub(kwc + argc + 3) else {
+            return false;
+        };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
+        if !matches!(frame.stack[callee_slot + 1], Object::Unbound)
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || !Self::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        let ty = ty.clone();
+        let plan = self.instance_plan(&ty);
+        if plan.seeds_exception_args {
+            return false;
+        }
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only the pointer is compared.
+        if !std::ptr::eq(
+            unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+            Rc::as_ptr(code),
+        ) || !Self::lean_code_ok(code)
+            // The instance binds to the first positional parameter.
+            || code.arg_count == 0
+            || (init.defaults_maybe_overridden()
+                && (init.slot("__defaults__").is_some() || init.slot("__kwdefaults__").is_some()))
+        {
+            return false;
+        }
+        let Some(cells) = init.lean_cells_ref(code) else {
+            return false;
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        // (The instance isn't made until the binding holds: `None` keeps
+        // its parameter's place.)
+        let receiver = Object::None;
+        let values = &frame.stack[len - 1 - kwc..len - 1];
+        let bound = Self::lean_bind_keywords(
+            init,
+            code,
+            std::iter::once(&receiver).chain(&frame.stack[callee_slot + 2..len - 1 - kwc]),
+            names.iter().zip(values),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed.
+        let (init, code) = (init.clone(), code.clone());
+        let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
+        drop(plan);
+        locals[0] = inst.clone();
+        if tracked && gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+        }
+        // SAFETY: as above (finalizers ran against the synced frame).
+        let frame = unsafe { &mut *sw.cur };
+        // The operands leave the stack, as the full call handler releases
+        // them once the parameters are bound.
+        self.release_call_operands(&mut frame.stack, callee_slot);
+        drop(ty);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`.
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
     /// [`Self::core_new`] of the class `argc` positional arguments below
     /// the top of the stack, called by the instruction at `pc`.
     fn core_new_n(&mut self, sw: &mut CoreSwitch, pc: usize, argc: usize, snap_gen: u64) -> bool {
@@ -16467,6 +17814,80 @@ impl Interpreter {
         {
             return false;
         }
+        // `C()` of a class whose memoized plan is the bare allocation: the
+        // class moves off the stack (the self slot owns nothing) and the
+        // instance takes its place.
+        if argc == 0
+            && ty.native_kind.get() == 0
+            // SAFETY: a guard-free read of the memoized plan; nothing runs
+            // before its last use.
+            && unsafe { ty.instance_plan.peek() }
+                .and_then(Option::as_ref)
+                .is_some_and(|(v, plan)| *v == ty.attr_version.get() && plan.bare_alloc)
+        {
+            // SAFETY: the class's slot is initialized and leaves the stack
+            // with the (`Unbound`) self slot, which has no drop glue.
+            let ty = unsafe {
+                let ty = frame.stack.as_ptr().add(callee_slot).read();
+                frame.stack.set_len(callee_slot);
+                ty
+            };
+            let Object::Type(cls) = &ty else {
+                unreachable!("checked above")
+            };
+            let (inst, tracked) = self.alloc_plain_instance_obj(cls);
+            frame.stack.push(inst);
+            frame.pc = pc as u32 + 1;
+            drop(ty);
+            if tracked && gc_trace::maybe_auto_collect() {
+                self.run_pending_finalizers();
+            }
+            return true;
+        }
+        // A class whose construction its plan proved to be a store-only
+        // `__init__`'s stores (see `core_store_init`).
+        // SAFETY: as above.
+        let proven = unsafe { ty.instance_plan.peek() }
+            .and_then(Option::as_ref)
+            .filter(|(v, plan)| {
+                *v == ty.attr_version.get()
+                    && plan.store_init.load(std::sync::atomic::Ordering::Relaxed) == 1
+            })
+            .and_then(|(_, plan)| {
+                let (init, code) = plan.lean_init.as_ref()?;
+                // SAFETY: GIL-serialized raw read of the function's code
+                // cell; only the pointer is compared.
+                let same = std::ptr::eq(
+                    unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+                    Rc::as_ptr(code),
+                );
+                let missing = Self::missing_defaults(init, code, argc + 1).filter(|_| same)?;
+                Some((ty.clone(), plan.clone(), missing))
+            });
+        if let Some((ty, plan, missing)) = proven {
+            let (init, code) = plan.lean_init.as_ref().expect("checked above");
+            if self.core_store_init(
+                frame,
+                &ty,
+                &plan,
+                init,
+                code,
+                false,
+                argc,
+                missing,
+                self_slot,
+                callee_slot,
+                sw.depth_cell,
+            ) {
+                frame.pc = pc as u32 + 1;
+                return true;
+            }
+        }
+        // SAFETY: as above.
+        let frame = unsafe { &mut *sw.cur };
+        let Object::Type(ty) = &frame.stack[callee_slot] else {
+            return false;
+        };
         let ty = ty.clone();
         let plan = self.instance_plan(&ty);
         // A named tuple: the tuple of the arguments is the whole call (see
@@ -16511,19 +17932,7 @@ impl Interpreter {
             }
             // `C()` for a class with the default `__new__` and
             // `object.__init__`: the allocation is the whole call.
-            if argc == 0
-                && plan.is_object_new
-                && plan.init_from_object
-                && plan.user_new.is_none()
-                && plan.abstract_error.is_none()
-                && !plan.seeds_exception_args
-                && matches!(plan.native, crate::types::NativeKind::Plain)
-                && ty.native_kind.get() == 0
-            {
-                let bt = builtin_types();
-                if ty.is_subclass_of(&bt.module_) || ty.is_subclass_of(&bt.generic_alias_) {
-                    return false;
-                }
+            if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
                 let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
                 frame.stack.truncate(callee_slot);
                 frame.stack.push(inst);
@@ -16549,6 +17958,27 @@ impl Interpreter {
         let Some(missing) = Self::lean_init_missing(init, code, argc + 1) else {
             return false;
         };
+        // A store-only `__init__`: the stores themselves, as its sites
+        // last proved them.
+        if matches!(plan.native, crate::types::NativeKind::Plain)
+            && !plan.seeds_exception_args
+            && self.core_store_init(
+                frame,
+                &ty,
+                &plan,
+                init,
+                code,
+                true,
+                argc,
+                missing,
+                self_slot,
+                callee_slot,
+                sw.depth_cell,
+            )
+        {
+            frame.pc = pc as u32 + 1;
+            return true;
+        }
         // A leaf `__init__` (plain stores of its arguments into `self`)
         // runs frameless, as a leaf method call does (a plain instance
         // only).
@@ -16641,6 +18071,263 @@ impl Interpreter {
     /// unused instance was never seen).
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
+    /// [`Self::core_new`] for a store-only `__init__` (see
+    /// [`code_store_init`]): a fresh instance takes the arguments (or
+    /// constants) straight into its split values, in the order the
+    /// class's shared names hold them, when every store's site last
+    /// stored there for the class's current version (which proves the
+    /// store a plain `__dict__` one, see `core_store_new_attr`). The
+    /// arguments the stores don't take are released. `false` touches
+    /// nothing.
+    ///
+    /// With `prove`, the stores prove (or disprove) the shape, which the
+    /// class's `plan` records; without, the plan proved it. A laid-out
+    /// class's member positions are proved once per plan.
+    #[allow(clippy::too_many_arguments)]
+    fn core_store_init(
+        &self,
+        frame: &mut Frame,
+        ty: &Rc<TypeObject>,
+        plan: &crate::types::InstancePlan,
+        init: &Rc<crate::object::PyFunction>,
+        code: &Rc<CodeObject>,
+        prove: bool,
+        argc: usize,
+        missing: usize,
+        self_slot: usize,
+        callee_slot: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> bool {
+        let Some(shape) = code_store_init(code) else {
+            return false;
+        };
+        let Some(slots) = code_vm_ext(code)
+            .filter(|e| e.field_slots.is_allocated())
+            .map(|e| e.field_slots.view())
+        else {
+            return false;
+        };
+        let ver = ty.attr_version.get();
+        if argc + 1 + missing != code.arg_count as usize
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || ty.instances_need_finalize()
+            || crate::capi_watchers::dicts_active()
+            || crate::gil::free_threading_enabled()
+            // The ordinary call's `RecursionError` check.
+            // SAFETY: this thread's own depth cell.
+            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        // A class that lays its `__slots__` members out: each store's site
+        // must have last stored a distinct member of this class version's
+        // instances (sites another version recorded say nothing), whose
+        // layout positions the stores then fill. A site that recorded
+        // anything else for this version never will.
+        let proving = prove.then_some(&plan.store_init);
+        let laid_out = ty.slot_layout.get().and_then(Option::as_ref);
+        let mut members = [0u8; crate::inst_dict::SHARED_KEYS_CAP];
+        let n = shape.stores.len();
+        if let (Some(_), Some(proved)) = (laid_out, plan.slot_members.get()) {
+            members[..n].copy_from_slice(proved);
+        } else if laid_out.is_some() {
+            let mut seen = 0u64;
+            for (k, &(pc, _)) in shape.stores.iter().enumerate() {
+                match slots.get(pc as usize).map(FieldSlot::get) {
+                    Some((v, idx))
+                        if v == ver
+                            && idx & SLOT_FIELD != 0
+                            && (idx & !SLOT_FIELD) < 64
+                            && seen & (1 << (idx & !SLOT_FIELD)) == 0 =>
+                    {
+                        let i = idx & !SLOT_FIELD;
+                        seen |= 1 << i;
+                        members[k] = i as u8;
+                    }
+                    Some((v, _)) if v == ver => {
+                        if let Some(proving) = proving {
+                            proving.store(2, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+            // (The positions hold for this class version: its plan's.)
+            let _ = plan.slot_members.set(members[..n].into());
+        } else if let Some(proving) = proving {
+            // Every store's site must have last stored the next position
+            // of this class version's instances. A site proven for another
+            // position never will be; one that hasn't stored for this
+            // version yet may still.
+            for (k, &(pc, _)) in shape.stores.iter().enumerate() {
+                match slots.get(pc as usize).map(FieldSlot::get) {
+                    Some((v, idx)) if v == ver && idx == k as u32 => {}
+                    Some((v, _)) if v == ver => {
+                        proving.store(2, std::sync::atomic::Ordering::Relaxed);
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        let consts = code_vm_ext(code).map_or(&[][..], |e| &e.objects[..]);
+        if shape
+            .stores
+            .iter()
+            .any(|&(_, src)| matches!(src, StoreSrc::Const(c) if c as usize >= consts.len()))
+        {
+            return false;
+        }
+        let keys = match laid_out {
+            Some(_) => None,
+            None => match ty.shared_keys.get() {
+                Some(keys) if keys.len() >= shape.stores.len() => Some(keys),
+                _ => return false,
+            },
+        };
+        // Committed.
+        let (inst, _) = self.alloc_plain_instance_obj(ty);
+        let Object::Instance(i) = &inst else {
+            unreachable!("a plain class's instance")
+        };
+        if let Some(keys) = keys {
+            // SAFETY: the instance is fresh and unshared.
+            if let Some(split) = unsafe { i.dict.split_cell().peek_mut() } {
+                split.reserve_for(|| ty.shared_keys.share(), keys.len());
+            }
+        }
+        // The parameters: the instance, the arguments (moved out of the
+        // stack on their last use), then the defaults.
+        let args = self_slot + 1;
+        let mut left = [0u8; 8];
+        left[..shape.uses.len()].copy_from_slice(&shape.uses);
+        let defaults = &init.defaults[init.defaults.len() - missing..];
+        // A split instance's values, all computed, go down in one pass.
+        let mut split_vals = [const { std::mem::MaybeUninit::<Object>::uninit() };
+            crate::inst_dict::SHARED_KEYS_CAP];
+        for (k, &(_, src)) in shape.stores.iter().enumerate() {
+            let value = match src {
+                StoreSrc::Param(0) => inst.clone(),
+                StoreSrc::Param(j) => {
+                    let j = j as usize;
+                    left[j] -= 1;
+                    if j <= argc {
+                        let slot = &mut frame.stack[args + j - 1];
+                        if left[j] == 0 {
+                            std::mem::replace(slot, Object::Unbound)
+                        } else {
+                            slot.clone()
+                        }
+                    } else {
+                        defaults[j - argc - 1].clone()
+                    }
+                }
+                StoreSrc::Const(c) => consts[c as usize].clone(),
+                StoreSrc::Int(n) => Object::Int(n),
+            };
+            split_vals[k].write(value);
+        }
+        if let Some(layout) = laid_out {
+            // SAFETY: the first `n` entries were written above; each is
+            // read exactly once, below.
+            let vals = unsafe {
+                std::slice::from_raw_parts_mut(split_vals.as_mut_ptr().cast::<Object>(), n)
+            };
+            // The write barrier once (`note_slot_store`'s), then each value
+            // into its member's place through one borrow.
+            if !vals.iter().all(Object::is_gc_atomic) {
+                i.ensure_gc_tracked();
+            }
+            // SAFETY: the instance is fresh and unshared; its slots were
+            // laid out over its class's layout at allocation.
+            match unsafe { i.slots.peek_mut() }.and_then(|s| s.values_for_layout_mut(layout)) {
+                Some(places) if members[..n].iter().all(|&m| usize::from(m) < places.len()) => {
+                    for (v, &m) in vals[..n].iter().zip(&members[..n]) {
+                        // SAFETY: as above.
+                        let value = unsafe { std::ptr::read(v) };
+                        drop(std::mem::replace(&mut places[usize::from(m)], value));
+                    }
+                }
+                _ => {
+                    // (Unreachable for a fresh instance; the plain stores
+                    // keep it correct regardless.)
+                    for (v, store) in vals[..n].iter().zip(&shape.stores[..n]) {
+                        // SAFETY: as above.
+                        let value = unsafe { std::ptr::read(v) };
+                        let at = code.instructions[store.0 as usize].arg;
+                        if let Some(name) = code.names.get(at as usize) {
+                            i.slot_set(name, value);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(keys) = keys {
+            // SAFETY: the first `n` entries were written above; each is
+            // read exactly once, by the fill or by the stores after it.
+            let vals = unsafe {
+                std::slice::from_raw_parts_mut(split_vals.as_mut_ptr().cast::<Object>(), n)
+            };
+            // The write barrier, once, before the values are viewed.
+            if i.deferred.get() && !vals.iter().all(Object::is_gc_atomic) {
+                i.ensure_gc_tracked();
+            }
+            // (A recycled instance may carry a published, empty `__dict__`,
+            // which then holds its attributes instead.)
+            // SAFETY: the instance is fresh and unshared.
+            let filled = i.c_body.get() == 0
+                && !crate::gil::free_threading_enabled()
+                && unsafe { i.dict.split_peek_mut() }.is_some_and(|split| {
+                    let at = vals.as_ptr();
+                    // SAFETY: as above.
+                    split.fill_fresh(
+                        keys,
+                        || ty.shared_keys.share(),
+                        n,
+                        |k| unsafe { at.add(k).read() },
+                    )
+                });
+            if !filled {
+                for (k, v) in vals[..n].iter().enumerate() {
+                    // SAFETY: as above.
+                    let value = unsafe { std::ptr::read(v) };
+                    // SAFETY: a store with nothing else running; the
+                    // positions are the instance's next ones (proved above).
+                    if let Err(value) = unsafe { i.split_append(k, value) } {
+                        // (Unreachable for a fresh instance over its class's
+                        // names; the plain store keeps it correct regardless.)
+                        let at = code.instructions[shape.stores[k].0 as usize].arg;
+                        if let Some(name) = code_name_obj(code, at) {
+                            i.dict_shared()
+                                .borrow_mut()
+                                .insert(DictKey(name.clone()), value);
+                        }
+                    }
+                }
+            }
+        }
+        // The class, the self slot and the arguments the stores left.
+        // SAFETY: the operands leave the stack, each released once.
+        unsafe {
+            let base = frame.stack.as_ptr();
+            let n = frame.stack.len();
+            frame.stack.set_len(callee_slot);
+            for k in callee_slot..n {
+                let o = base.add(k).read();
+                if !matches!(o, Object::Unbound) {
+                    self.release(o);
+                }
+            }
+        }
+        frame.stack.push(inst);
+        if let Some(proving) = proving {
+            proving.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
+
     fn core_leaf_init(
         &self,
         frame: &mut Frame,
@@ -16669,10 +18356,7 @@ impl Interpreter {
         }
         // The arguments leave by plain decrements (whatever `__init__`
         // stored holds its own reference).
-        if !frame.stack[self_slot + 1..]
-            .iter()
-            .all(Self::core_droppable)
-        {
+        if !Self::core_all_droppable(&frame.stack[self_slot + 1..]) {
             return false;
         }
         let (inst, _) = self.alloc_plain_instance_obj(ty);
@@ -16801,9 +18485,8 @@ impl Interpreter {
     }
 
     /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
-    /// `POP_EXCEPT` (`ins`) of a frame (its handler state `exc`) over the
-    /// `len` stack slots at `base`
-    /// (room to `cap`), as the full handlers run their common shapes: an
+    /// `POP_EXCEPT` (`ins`) over the `len` stack slots at `base` (room to
+    /// `cap`), as the full handlers run their common shapes: an
     /// exception instance on entry, class operands that are
     /// `BaseException` subclasses. Returns the new stack length, or
     /// `None`, having touched nothing. A `POP_EXCEPT`'s releases may queue
@@ -16816,7 +18499,6 @@ impl Interpreter {
     #[inline(never)]
     unsafe fn core_exc_op(
         &mut self,
-        exc: &mut Option<Box<FrameExc>>,
         ins: weavepy_compiler::Instruction,
         base: *mut Object,
         len: usize,
@@ -16833,11 +18515,12 @@ impl Interpreter {
                 }
                 // SAFETY: as above.
                 let instance = unsafe { &*base.add(len - 1) }.clone();
-                let prev = self
-                    .exc_info_stack
-                    .borrow()
-                    .last()
-                    .map_or(Object::None, |pe| pe.instance.clone());
+                let prev = {
+                    let mut handled = self.exc_info_stack.borrow_mut();
+                    let prev = handled.last().cloned().unwrap_or(Object::None);
+                    handled.push(instance);
+                    prev
+                };
                 // SAFETY: the exception moves up one slot and the previous
                 // one takes its place (`len < cap`).
                 unsafe {
@@ -16845,11 +18528,6 @@ impl Interpreter {
                     base.add(len - 1).write(prev);
                     base.add(len).write(top);
                 }
-                let pe = PyException::new(instance);
-                exc.get_or_insert_with(Box::default)
-                    .handlers
-                    .push((ins.arg, pe.clone()));
-                self.exc_info_stack.borrow_mut().push(pe);
                 Some(len + 1)
             }
             OpCode::CheckExcMatch => {
@@ -16873,20 +18551,88 @@ impl Interpreter {
                 }
                 // SAFETY: the slot at `len - 1` is initialized.
                 let prev = unsafe { base.add(len - 1).read() };
-                let popped = exc.as_mut().and_then(|e| e.handlers.pop());
                 let top = self.exc_info_stack.borrow_mut().pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
-                self.recheck_frame_observed = true;
-                drop(top);
-                if let Some((_, pe)) = popped {
-                    self.release(pe.instance);
+                if let Some(top) = top {
+                    self.release(top);
                 }
                 self.release(prev);
                 Some(len - 1)
             }
             _ => None,
         }
+    }
+
+    /// `del obj.attr` (`DELETE_ATTR` `ins` of `code`) of the instance atop
+    /// the `len` stack slots at `base`, as the full leaf arm runs it: an
+    /// ordinary instance's own attribute, by the default `__delattr__`,
+    /// with no class attribute of that name. The value and the instance
+    /// leave as the full arm releases them (which may queue a finalizer:
+    /// the caller checks). Returns the new stack length, or `None`, having
+    /// touched nothing (a missing attribute raises through the full arm).
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries.
+    #[inline(never)]
+    unsafe fn core_delete_attr(
+        &mut self,
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        let Object::Instance(inst) = (unsafe { &*base.add(len - 1) }) else {
+            return None;
+        };
+        let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        // (The full arm's conditions; see there.)
+        if inst.native.get().is_some() || crate::capi_watchers::dicts_active() {
+            return None;
+        }
+        // The rest depend on the name and the class alone, settled once
+        // per class version at the site (versions are process-unique).
+        let ver = cls.attr_version.get();
+        let stamp = code_stamp_slot(code, pc as u32);
+        if !stamp.is_some_and(|s| s.get() == [ver, DELETE_OWN_ATTR, 0]) {
+            if key.starts_with("__")
+                || &**key == "_CHUNK_SIZE"
+                || cls.flags.is_exception
+                || cls.forbids_dict
+                || !Self::default_delattr(cls)
+                || !matches!(
+                    Self::leaf_class_attr(code, cls, ins.arg),
+                    Some(LeafAttr::InstanceOnly)
+                )
+            {
+                return None;
+            }
+            if let Some(s) = stamp {
+                s.set([ver, DELETE_OWN_ATTR, 0]);
+            }
+        }
+        let removed = match inst.split_remove(key) {
+            Some(removed) => removed?,
+            None => inst
+                .dict_cell()
+                .borrow_mut()
+                .shift_remove(&DictKey(Object::Str(key.clone())))?,
+        };
+        // SAFETY: the instance leaves its slot.
+        let owner = unsafe { base.add(len - 1).read() };
+        // Released at once, as CPython's decref is.
+        self.release(removed);
+        self.release(owner);
+        Some(len - 1)
     }
 
     /// Zero-argument `super().name` (`LOAD_SUPER_ATTR` `ins` at `pc` over
@@ -16906,7 +18652,8 @@ impl Interpreter {
         base: *mut Object,
         len: usize,
     ) -> Option<usize> {
-        if ins.arg & 2 != 0 || len < 3 {
+        // (Either form; see `load_super_attr_direct`.)
+        if len < 3 {
             return None;
         }
         // SAFETY: `len >= 3`.
@@ -16974,12 +18721,25 @@ impl Interpreter {
                 // grades its own release.)
                 if !matches!(
                     c,
-                    Object::List(_) | Object::Tuple(_) | Object::Dict(_) | Object::Str(_)
+                    Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Dict(_)
+                        | Object::Str(_)
+                        | Object::MappingProxy(_)
                 ) || !Self::core_droppable(c)
                 {
                     return None;
                 }
                 let r = match (c, k) {
+                    // A class's `__dict__` view (`type.__dict__['__mro__']`,
+                    // as `inspect` reads it): a present key's value (a miss
+                    // raises on the full path).
+                    (Object::MappingProxy(d), Object::Str(_)) => {
+                        let probe = crate::object::LeafProbe::new(k)?;
+                        // SAFETY: as for a dict below.
+                        let d = unsafe { d.peek() }?;
+                        clone_hot(d.get_hot(&probe)?)
+                    }
                     (Object::List(xs), Object::Int(i)) => {
                         // SAFETY: a read between two instructions.
                         let xs = unsafe { xs.peek() }?;
@@ -17005,7 +18765,7 @@ impl Interpreter {
                         // SAFETY: a read between two instructions (the
                         // probe runs no code).
                         let d = unsafe { d.peek() }?;
-                        clone_hot(d.get(&probe)?)
+                        clone_hot(d.get_hot(&probe)?)
                     }
                     // A string's code point (`str_char_at` byte-indexes an
                     // ASCII string and walks any other from its cursor).
@@ -17117,8 +18877,9 @@ impl Interpreter {
                         // SAFETY: as above (the probe and the insert run
                         // no code).
                         let d = unsafe { cell.peek_mut() }?;
-                        let (old, changed) = match d.get_mut(&probe) {
-                            Some(slot) => {
+                        let (old, changed) = match d.probe_entry(&probe) {
+                            crate::dictmap::ProbeEntry::Occupied(e) => {
+                                let slot = e.into_mut();
                                 if !displaced_ok(slot) {
                                     return None;
                                 }
@@ -17128,12 +18889,12 @@ impl Interpreter {
                                 let changed = !old.is_same(slot);
                                 (old, changed)
                             }
-                            None => {
+                            crate::dictmap::ProbeEntry::Vacant(e) => {
                                 if !probe.miss_is_exact() {
                                     return None;
                                 }
                                 // SAFETY: as above.
-                                d.insert(DictKey(clone_hot(k)), unsafe {
+                                e.insert(DictKey(clone_hot(k)), unsafe {
                                     base.add(len - 3).read()
                                 });
                                 (Object::None, true)
@@ -17421,8 +19182,9 @@ impl Interpreter {
                         // SAFETY: as above.
                         let d = unsafe { cell.peek_mut() }?;
                         let (k, v) = (base.wrapping_add(len - 2), base.wrapping_add(len - 1));
-                        match d.get_mut(&probe) {
-                            Some(slot) => {
+                        match d.probe_entry(&probe) {
+                            crate::dictmap::ProbeEntry::Occupied(e) => {
+                                let slot = e.into_mut();
                                 if !Self::core_droppable(slot) || !Self::core_droppable(key) {
                                     return None;
                                 }
@@ -17434,11 +19196,11 @@ impl Interpreter {
                                     drop_hot(k.read());
                                 }
                             }
-                            None if probe.miss_is_exact() => {
+                            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
                                 // SAFETY: as above.
-                                unsafe { d.insert(DictKey(k.read()), v.read()) };
+                                unsafe { e.insert(DictKey(k.read()), v.read()) };
                             }
-                            None => return None,
+                            crate::dictmap::ProbeEntry::Vacant(_) => return None,
                         }
                     }
                     _ => return None,
@@ -17595,20 +19357,37 @@ impl Interpreter {
     ///
     /// `top` is the core loop's top stack slot (an instance), and the slot
     /// above it is free.
+    ///
+    /// The site at `pc` remembers the value's split position for the
+    /// receiver's class (see [`FieldSlot`]), as an instance-field
+    /// `LOAD_ATTR` does, so later loads skip the resolution.
     #[inline(never)]
     pub(crate) unsafe fn core_value_method(
         code: &CodeObject,
         name_idx: u32,
+        pc: usize,
         top: *mut Object,
     ) -> bool {
         // SAFETY: the caller's contract.
         let Object::Instance(inst) = (unsafe { &*top }) else {
             return false;
         };
-        let Some((LeafAttr::Value(v), _)) =
-            Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)
-        else {
-            return false;
+        let ext = code_vm_ext(code);
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let held = ext.and_then(|e| unsafe { field_slot_hit(e, pc, inst) });
+        let v = match held {
+            Some(v) => Self::clone_operand(v),
+            None => {
+                let Some((LeafAttr::Value(v), ix)) =
+                    Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)
+                else {
+                    return false;
+                };
+                if let (Some(ext), Some(ix), None) = (ext, ix, inst.dict.published()) {
+                    field_slot_note(ext, code, pc, inst, ix);
+                }
+                v
+            }
         };
         // SAFETY: as above.
         if !Self::core_droppable(unsafe { &*top }) {
@@ -17756,13 +19535,19 @@ impl Interpreter {
     ///
     /// `top` is the core loop's top stack slot.
     #[inline(never)]
-    unsafe fn core_plain_attr(&self, code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+    unsafe fn core_plain_attr(
+        &self,
+        code: &CodeObject,
+        name_idx: u32,
+        top: *mut Object,
+        running: (*const (), u32),
+    ) -> bool {
         // SAFETY: the caller's contract.
         let recv = unsafe { &*top };
         if !Self::core_droppable(recv) {
             return false;
         }
-        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx) else {
+        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx, Some(running)) else {
             return false;
         };
         // SAFETY: the receiver (droppable) is replaced in place.
@@ -17890,7 +19675,18 @@ impl Interpreter {
         let Object::Function(f) = (unsafe { &*top }) else {
             return false;
         };
-        let Some(v) = Self::leaf_function_read(code, f, name_idx) else {
+        // A plain name (no `function` descriptor is one) is the
+        // `__dict__` entry, probed with the name's interned bytes and
+        // stored hash; anything else, or a cell in use, takes the full read.
+        let plain = code_name_key(code, name_idx)
+            .filter(|key| !key.s.starts_with("__") && !crate::object::exotic_str_keys_possible())
+            .and_then(|key| {
+                // SAFETY: reads between two instructions, running no code;
+                // the views end with the value's clone.
+                let attrs = unsafe { f.attrs.peek() }?.as_ref()?;
+                unsafe { attrs.peek() }?.get(&key).map(Self::clone_operand)
+            });
+        let Some(v) = plain.or_else(|| Self::leaf_function_read(code, f, name_idx)) else {
             return false;
         };
         // SAFETY: as above; the function is held by the variable it was
@@ -17923,13 +19719,25 @@ impl Interpreter {
         {
             return false;
         }
-        let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
+        let (Some(name @ Object::Str(n)), Some(key)) =
+            (code_name_obj(code, name_idx), code_name_key(code, name_idx))
+        else {
             return false;
         };
         if n.starts_with("__") {
             return false;
         }
-        let dict = f.attrs();
+        // The existing dictionary in place (no code runs while it is
+        // read), else a new one.
+        let made;
+        // SAFETY: a read of the cell that holds the dictionary.
+        let dict = match unsafe { f.attrs.peek() } {
+            Some(Some(d)) => d,
+            _ => {
+                made = f.attrs();
+                &made
+            }
+        };
         let old = {
             let Ok(mut d) = dict.try_borrow_mut() else {
                 return false;
@@ -17937,7 +19745,8 @@ impl Interpreter {
             // SAFETY: the value moves into the dictionary; its slot is
             // forgotten below.
             let value = unsafe { std::ptr::read(value) };
-            match d.get_mut(&crate::object::StrKey(n)) {
+            // (Probed with the name's interned bytes and stored hash.)
+            match d.get_mut(&key) {
                 Some(slot) => Some(std::mem::replace(slot, value)),
                 None => {
                     d.insert(DictKey(name.clone()), value);
@@ -17953,14 +19762,71 @@ impl Interpreter {
         true
     }
 
+    /// `C.name = v` with the class at `recv` and the value below it: a
+    /// non-dunder name written to a heap class's own dict under `type`'s
+    /// default `__setattr__` (the plain end of [`Self::set_type_attr_direct`];
+    /// a custom metaclass or a type watcher keeps the full path), the
+    /// class's version advanced, both operands leaving the stack. `false`
+    /// touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `recv` is the core loop's top stack slot, the value the one below.
+    #[inline(never)]
+    unsafe fn core_class_store(code: &CodeObject, name_idx: u32, recv: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        let (Object::Type(cls), value) = (unsafe { &*recv }, unsafe { &*recv.sub(1) }) else {
+            return false;
+        };
+        if crate::capi_watchers::types_active()
+            || !Self::core_drops_plain()
+            || !Self::core_droppable(unsafe { &*recv })
+            || cls.flags.is_builtin
+            || cls.immutable.get()
+            || cls.c_ext_ptr.get() != 0
+            || !Self::plain_metaclass(cls)
+        {
+            return false;
+        }
+        let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        if n.starts_with("__") {
+            return false;
+        }
+        let old = {
+            let Ok(mut d) = cls.dict.try_borrow_mut() else {
+                return false;
+            };
+            match d.get_mut(&crate::object::StrKey(n)) {
+                // (The value it replaces leaves by a plain decrement.)
+                Some(slot) if !Self::core_droppable(slot) => return false,
+                // SAFETY: the value moves into the dictionary; its slot is
+                // forgotten below.
+                Some(slot) => Some(std::mem::replace(slot, unsafe { std::ptr::read(value) })),
+                None => {
+                    // SAFETY: as above.
+                    d.insert(DictKey(name.clone()), unsafe { std::ptr::read(value) });
+                    None
+                }
+            }
+        };
+        cls.bump_attr_version();
+        // SAFETY: the class leaves by a plain decrement (checked droppable);
+        // the value's slot moved out above.
+        unsafe { drop_hot(recv.read()) };
+        drop(old);
+        true
+    }
+
     /// Whether a release reports to nothing (no dict or function watcher,
     /// no reference tracing), so a droppable value leaves by a plain
     /// decrement (see [`Self::core_droppable`]).
     #[inline(always)]
-    fn core_drops_plain() -> bool {
-        !crate::capi_watchers::dicts_active()
-            && !crate::capi_watchers::funcs_active()
-            && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+    pub(crate) fn core_drops_plain() -> bool {
+        // (The dict and function watchers' and the reftrace printer's
+        // flags, tested with one load.)
+        crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES == 0
     }
 
     /// [`Self::core_droppable`] for every one of `ops`, with the global
@@ -18001,7 +19867,13 @@ impl Interpreter {
                 return crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
                     .map(|b| Ok(Object::Bool(b)));
             }
-            return ic.is_subclass_of(cls).then_some(Ok(Object::Bool(true)));
+            if ic.is_subclass_of(cls) {
+                return Some(Ok(Object::Bool(true)));
+            }
+            // A miss is final when `__class__` can't answer otherwise (and
+            // the class isn't `os.PathLike`, whose check is structural).
+            return (ic.class_attr_is_plain() && !crate::stdlib::os::is_path_like(cls))
+                .then_some(Ok(Object::Bool(false)));
         }
         // One class, or a flat tuple of them (`isinstance(x, (str, int))`
         // asks each in turn).
@@ -18401,9 +20273,7 @@ impl Interpreter {
             return None;
         }
         let fast = code_vm_ext(code)?
-            .method_slots
-            .get()?
-            .get(pc)?
+            .method_slot(pc)?
             .get_native_subscript(cls.attr_version.get(), leaf_builtins::generation())?;
         #[cfg(test)]
         NATIVE_SUBSCRIPT_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -18425,7 +20295,7 @@ impl Interpreter {
         recv: &Object,
         attr_pc: usize,
         name_idx: u32,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -18493,7 +20363,7 @@ impl Interpreter {
         code: &CodeObject,
         recv: &Object,
         attr_pc: usize,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -18593,7 +20463,7 @@ impl Interpreter {
         recv: &Object,
         attr_pc: usize,
         name_idx: u32,
-        mslots: &[MethodSlot],
+        mslots: Sites<'_, MethodSlot>,
         lbase: *const Object,
         nlocals: usize,
         consts: &[Object],
@@ -18639,14 +20509,15 @@ impl Interpreter {
         let callee: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let ver = cls.attr_version.get();
         if nargs + 1 == callee.arg_count as usize {
-            let held = mslots[attr_pc]
+            let held = mslots
+                .get(attr_pc)?
                 .get_held(ver)
                 .filter(|h| std::ptr::eq(Rc::as_ptr(h), fp));
             if let (Some(ext), Some(held)) = (code_vm_ext(code), held) {
                 let func = Rc::downgrade(&held);
                 leaf_site_set(
                     ext,
-                    code.instructions.len(),
+                    code,
                     attr_pc,
                     Some(LeafSiteData {
                         ver,
@@ -18720,7 +20591,7 @@ impl Interpreter {
         let r = self.pure_leaf_call(code_rc, f, &args[..total], effect, depth);
         let Some(v) = r else {
             if let Some(ext) = code_vm_ext(code) {
-                leaf_site_set(ext, code.instructions.len(), attr_pc, None);
+                leaf_site_set(ext, code, attr_pc, None);
             }
             return SiteCall::Missed;
         };
@@ -18853,7 +20724,7 @@ impl Interpreter {
                                 let id = Rc::as_ptr(instance) as usize as u64;
                                 eprintln!("First predicate instance drop miss: owners={}, deferred={}, maybe_tracked={}, tracked={}, weakrefs={}",
                                     Rc::strong_count(instance), instance.is_gc_deferred(),
-                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(id),
+                                    gc_trace::maybe_tracked(id), gc_trace::is_tracked(operand),
                                     crate::weakref_registry::may_have_weakrefs(id));
                             }
                         }
@@ -18864,10 +20735,7 @@ impl Interpreter {
                 }
             }
         }
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         #[cfg(test)]
@@ -18891,6 +20759,60 @@ impl Interpreter {
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
         self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+    }
+
+    /// [`Self::core_pure_call`] for a `CALL` site of the frame JIT that
+    /// cached its leaf callee (see `frame_jit::leaf_site_call`): the site
+    /// settled the callee's shape (positional parameters only, at most
+    /// eight, the last `missing` of them from the defaults), so only the
+    /// checks that can change from call to call remain.
+    pub(crate) fn site_leaf_eval(
+        &self,
+        ops: &[Object],
+        missing: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        let Object::Function(f) = ops.first()? else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell (see
+        // `PyFunction::code`), while the caller's stack keeps the function
+        // alive.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let pure = code_is_pure_leaf(code_rc);
+        let effect = !pure && code_is_effect_leaf(code_rc);
+        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+            return None;
+        }
+        if missing > 0
+            && (f.defaults.len() < missing
+                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
+        {
+            return None;
+        }
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        if depth >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        let first = if matches!(ops[1], Object::Unbound) {
+            2
+        } else {
+            1
+        };
+        let nargs = ops.len() - first;
+        let mut args: [*const Object; 8] = [std::ptr::null(); 8];
+        for (k, o) in ops[first..].iter().enumerate() {
+            args[k] = o;
+        }
+        for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
+            args[nargs + k] = o;
+        }
+        self.pure_leaf_call(code_rc, f, &args[..nargs + missing], effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -18938,10 +20860,7 @@ impl Interpreter {
         if unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit() {
             return None;
         }
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         // Its keyword-only parameters follow the positional ones, then its
@@ -19026,7 +20945,7 @@ impl Interpreter {
             || ck as usize != kwc
             || vals.len() != eff_argc + kwc
             || !fn_is_pure_leaf(f)
-            || !vals.iter().all(Self::core_droppable)
+            || !Self::core_all_droppable(vals)
         {
             return None;
         }
@@ -19140,6 +21059,13 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         // SAFETY: forwarded contract.
         if let Some(v) = unsafe { field_slot_hit(ext, cache_pc as usize, inst) } {
+            #[cfg(test)]
+            if ext
+                .field_slot(cache_pc as usize)
+                .is_some_and(|s| s.get().1 & SLOT_FIELD != 0)
+            {
+                note_pure_slot_field_read(code);
+            }
             return Some(v);
         }
         let names: &[Object] = &ext.name_objs;
@@ -19158,13 +21084,7 @@ impl Interpreter {
             if !slot_name_matches_in(names, code, name_idx, key) {
                 return None;
             }
-            field_slot_note(
-                ext,
-                code.instructions.len(),
-                cache_pc as usize,
-                inst,
-                key_idx,
-            );
+            field_slot_note(ext, code, cache_pc as usize, inst, key_idx);
             Some(value)
         } else {
             // SAFETY: the same rooted read as the dictionary path.
@@ -19173,21 +21093,13 @@ impl Interpreter {
                 .get_index(key_idx as usize)
                 .filter(|(key, _)| slot_name_matches_in(names, code, name_idx, key))
                 .map(|(_, value)| value);
+            if indexed.is_some() {
+                slot_field_note(code, ext, cache_pc as usize, inst, key_idx, name_idx);
+            }
             // Slot order can vary by instance or after deletion.
             let value = indexed.or_else(|| slots.get(code.names.get(name_idx as usize)?))?;
             #[cfg(test)]
-            PURE_SLOT_FIELD_READS.with(|hits| {
-                let mut counts = hits.get();
-                let shape = code_vm_ext(code)
-                    .map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
-                let index = match shape {
-                    Some(6) => 0,
-                    Some(7) => 1,
-                    _ => 2,
-                };
-                counts[index] += 1;
-                hits.set(counts);
-            });
+            note_pure_slot_field_read(code);
             Some(value)
         }
     }
@@ -19220,8 +21132,9 @@ impl Interpreter {
 
     /// [`Self::pure_leaf_eval`] (with `effect`, of an effect leaf) at
     /// recursion depth `depth`: a warm callee's compiled plan is entered
-    /// directly (see [`Self::leaf_site_native`]).
-    #[inline(always)]
+    /// directly (see [`Self::leaf_site_native`]). The one copy every
+    /// frameless call path shares: its extension is looked up once.
+    #[inline(never)]
     fn pure_leaf_call(
         &self,
         code: &CodeObject,
@@ -19236,7 +21149,26 @@ impl Interpreter {
         if bails >= LEAF_BAIL_LIMIT && bails > done {
             return None;
         }
-        let r = self.pure_leaf_call_inner(code, f, args, effect, depth);
+        let r = 'eval: {
+            // (The tiny shapes `leaf_eval` answers itself skip the probe.)
+            #[cfg(feature = "jit")]
+            if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                let fast = if effect {
+                    self.leaf_site_native::<true>(code, ext, f, args, depth)
+                } else {
+                    self.leaf_site_native::<false>(code, ext, f, args, depth)
+                };
+                if let Some(r) = fast {
+                    break 'eval r;
+                }
+            }
+            let _ = depth;
+            if effect {
+                self.pure_leaf_eval::<false, true>(code, f, args)
+            } else {
+                self.pure_leaf_eval::<false, false>(code, f, args)
+            }
+        };
         // (Each half stops counting when full: the counts only steer the
         // decision above.)
         let bump = if r.is_some() { 1 } else { 1 << 32 };
@@ -19245,36 +21177,6 @@ impl Interpreter {
                 .store(tries + bump, std::sync::atomic::Ordering::Relaxed);
         }
         r
-    }
-
-    fn pure_leaf_call_inner(
-        &self,
-        code: &CodeObject,
-        f: &crate::object::PyFunction,
-        args: &[*const Object],
-        effect: bool,
-        depth: usize,
-    ) -> Option<Object> {
-        // (The tiny shapes `leaf_eval` answers itself skip the probe.)
-        #[cfg(feature = "jit")]
-        if code_vm_ext(code)
-            .is_some_and(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3)
-        {
-            let fast = if effect {
-                self.leaf_site_native::<true>(code, f, args, depth)
-            } else {
-                self.leaf_site_native::<false>(code, f, args, depth)
-            };
-            if let Some(r) = fast {
-                return r;
-            }
-        }
-        let _ = depth;
-        if effect {
-            self.pure_leaf_eval::<false, true>(code, f, args)
-        } else {
-            self.pure_leaf_eval::<false, false>(code, f, args)
-        }
     }
 
     /// [`Self::pure_leaf_eval`] for a constructor's leaf `__init__` on the
@@ -19526,7 +21428,18 @@ impl Interpreter {
                     }
                 }
             },
-            _ => {
+            // A generator suspended in a `yield from` collapses its chain
+            // as a `SEND` to it would (see `Self::core_iter_collapse`).
+            InlineResume::ForIter
+            | InlineResume::NextCall
+            | InlineResume::NextDefault
+            | InlineResume::SendCall => {
+                // SAFETY: see `CoreSwitch`: the running activation is synced.
+                if Self::iter_may_collapse(unsafe { &*sw.cur }, mode)
+                    && self.core_iter_collapse(sw, pc, mode) == SendHop::Collapsed
+                {
+                    return true;
+                }
                 if !self.core_gen_resume_one(sw, pc, mode) {
                     return false;
                 }
@@ -19555,6 +21468,128 @@ impl Interpreter {
         true
     }
 
+    /// Whether the generator a `FOR_ITER`, `next()` or `send(None)` call
+    /// (`mode`) atop `frame`'s stack resumes is a collapsed chain's level
+    /// or suspended in a `yield from` (see [`Self::core_iter_collapse`]):
+    /// a cheap first look, so most generators skip that call.
+    #[inline(always)]
+    fn iter_may_collapse(frame: &Frame, mode: InlineResume) -> bool {
+        let Some(g) = Self::resumed_gen(frame, mode) else {
+            return false;
+        };
+        if g.chain.get() != 0 {
+            return true;
+        }
+        // SAFETY: a read between instructions; the view ends here.
+        match unsafe { g.state_raw().peek() } {
+            Some(GeneratorState::Suspended(gf)) => {
+                yield_from_resend(&gf.code.instructions, gf.pc as usize).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// [`Self::core_gen_resume`]'s `FOR_ITER` or `next()` (`mode`) at `pc`
+    /// of a generator suspended in a `yield from`: the generator becomes
+    /// the outermost level of a collapsed chain, as the delegate of a
+    /// `SEND` does (see [`Self::core_send_collapse`]), or resumes its
+    /// parked one. Anything else is declined, touching nothing.
+    #[inline(never)]
+    fn core_iter_collapse(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+    ) -> SendHop {
+        // SAFETY: see `CoreSwitch`: the running activation is synced, the
+        // generator where `mode` puts it (checked by the caller).
+        let frame = unsafe { &*sw.cur };
+        let Some(g) = Self::resumed_gen(frame, mode) else {
+            return SendHop::Declined;
+        };
+        if g.chain.get() != 0 {
+            return match Self::parked_head(g) {
+                Some(addr) => self.core_send_unpark(sw, pc, mode, addr),
+                None => SendHop::Declined,
+            };
+        }
+        let Some(gf) = Self::collapse_frame(g) else {
+            return SendHop::Declined;
+        };
+        // SAFETY: suspended (checked): a read between instructions.
+        let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
+            return SendHop::Declined;
+        };
+        // A simple delegate takes a fast step (see `Self::delegate_step`).
+        if gen_fast::may_step(next) {
+            let next: *const Rc<PyGenerator> = next;
+            // SAFETY: `next` lives on `g`'s stack, which the step leaves.
+            if let Some(hop) = self.delegate_step(sw, pc, mode, gf, unsafe { &*next }, next_send) {
+                return hop;
+            }
+        }
+        // Its delegate heads a parked chain: the generator joins it.
+        if let Some(addr) = Self::parked_head(next) {
+            // SAFETY: `g` is suspended in a `yield from` of the chain's
+            // outermost level (checked).
+            unsafe { Self::collapse_prepend(addr, Rc::as_ptr(g), gf, next_send) };
+            return self.core_send_unpark(sw, pc, mode, addr);
+        }
+        let Some(next_frame) = Self::collapse_frame(next) else {
+            return SendHop::Declined;
+        };
+        let next: *const Rc<PyGenerator> = next;
+        // SAFETY: `next` lives on `g`'s stack, which nothing changes before
+        // the walk reads it.
+        if self.core_send_collapse(
+            sw,
+            pc,
+            mode,
+            Rc::as_ptr(g),
+            gf,
+            unsafe { &*next },
+            next_send,
+            next_frame,
+        ) {
+            SendHop::Collapsed
+        } else {
+            SendHop::Declined
+        }
+    }
+
+    /// The generator a `FOR_ITER`, `next()` or `send(None)` call (`mode`)
+    /// atop `frame`'s stack resumes, if a collapsed chain may take it.
+    #[inline(always)]
+    fn resumed_gen(frame: &Frame, mode: InlineResume) -> Option<&Rc<PyGenerator>> {
+        let stack = &frame.stack;
+        let n = stack.len();
+        match mode {
+            InlineResume::ForIter | InlineResume::NextCall => match stack.last()? {
+                Object::Generator(g) => Some(g),
+                _ => None,
+            },
+            InlineResume::NextDefault => match stack.get(n.checked_sub(2)?)? {
+                Object::Generator(g) => Some(g),
+                _ => None,
+            },
+            // `gen.send(None)` / `coro.send(None)` (see `try_inline_gen`).
+            InlineResume::SendCall => {
+                if !matches!(stack.last()?, Object::None) {
+                    return None;
+                }
+                match (stack.get(n.checked_sub(3)?)?, &stack[n - 2]) {
+                    (Object::BoundMethod(bm), Object::Unbound) => match &bm.receiver {
+                        Object::Generator(g) | Object::Coroutine(g) => Some(g),
+                        _ => None,
+                    },
+                    (_, Object::Generator(g) | Object::Coroutine(g)) => Some(g),
+                    _ => None,
+                }
+            }
+            InlineResume::Send => None,
+        }
+    }
+
     /// One level of [`Self::core_gen_resume`]'s `yield from` chain: the
     /// running generator activation's `SEND` at `send_pc` to the suspended
     /// generator under its sent value, as [`Self::try_inline_gen`] resumes
@@ -19576,10 +21611,15 @@ impl Interpreter {
         let sent_none = matches!(frame.stack[n - 1], Object::None);
         // SAFETY: nothing below reaches the cell again until `state`'s last
         // use (`peek_mut` rejects a live guard or shared cells).
-        let Some(state) = (unsafe { g.state.peek_mut() }) else {
+        let Some(state) = (unsafe { g.state_raw().peek_mut() }) else {
             return SendHop::Declined;
         };
         let GeneratorState::Suspended(boxed) = &*state else {
+            // The outermost level of a parked chain: its innermost
+            // generator resumes directly (anything else settles it).
+            if let (true, Some(addr)) = (sent_none, Self::parked_head(g)) {
+                return self.core_send_unpark(sw, send_pc, InlineResume::Send, addr);
+            }
             return SendHop::Declined;
         };
         let gf: &Frame = boxed;
@@ -19603,11 +21643,50 @@ impl Interpreter {
         if sent_none && !gf.sent_consumed && g.kind != crate::object::CoroutineKind::AsyncGenerator
         {
             if let Some((next, next_send)) = Self::collapse_next(gf) {
+                // A simple delegate of its own takes a fast step (see
+                // `Self::delegate_step`).
+                if gen_fast::may_step(next) {
+                    let (next, gf): (*const Rc<PyGenerator>, *mut Frame) =
+                        (next, std::ptr::from_ref(gf).cast_mut());
+                    // SAFETY: `next` lives on the delegate's stack, which the
+                    // step leaves; nothing else reaches its state meanwhile.
+                    if let Some(hop) = self.delegate_step(
+                        sw,
+                        send_pc,
+                        InlineResume::Send,
+                        gf,
+                        unsafe { &*next },
+                        next_send,
+                    ) {
+                        return hop;
+                    }
+                }
+                // Its delegate heads a parked chain: the delegate joins it.
+                if let Some(addr) = Self::parked_head(next) {
+                    // SAFETY: `g` is suspended in a `yield from` of the
+                    // chain's outermost level (checked above).
+                    unsafe {
+                        Self::collapse_prepend(
+                            addr,
+                            Rc::as_ptr(g),
+                            std::ptr::from_ref(gf).cast_mut(),
+                            next_send,
+                        );
+                    }
+                    return self.core_send_unpark(sw, send_pc, InlineResume::Send, addr);
+                }
                 if let Some(next_frame) = Self::collapse_frame(next) {
                     let (g, gf) = (Rc::as_ptr(g), std::ptr::from_ref(gf).cast_mut());
-                    return if self
-                        .core_send_collapse(sw, send_pc, g, gf, next, next_send, next_frame)
-                    {
+                    return if self.core_send_collapse(
+                        sw,
+                        send_pc,
+                        InlineResume::Send,
+                        g,
+                        gf,
+                        next,
+                        next_send,
+                        next_frame,
+                    ) {
                         SendHop::Collapsed
                     } else {
                         SendHop::Declined
@@ -19666,6 +21745,59 @@ impl Interpreter {
         SendHop::Hopped
     }
 
+    /// The address of the parked chain `g` is the outermost level of (see
+    /// [`ChainRec`]), if any.
+    #[inline(always)]
+    fn parked_head(g: &PyGenerator) -> Option<usize> {
+        let addr = g.chain.get();
+        if addr == 0 {
+            return None;
+        }
+        // SAFETY: a level's record is alive (see `ChainRec`).
+        let rec = unsafe { &*(addr as *const ChainRec) };
+        (rec.parked && std::ptr::eq(rec.levels[0].gen, g)).then_some(addr)
+    }
+
+    /// Make `g` (frame `gf`, suspended in the `yield from` at `level_send`
+    /// of the outermost level of the parked chain at `addr`) the chain's
+    /// new outermost level, delegating just past its `SEND`.
+    ///
+    /// # Safety
+    ///
+    /// As described: `g` is alive, qualified as a level (see
+    /// [`Self::collapse_frame`]), and nothing borrows its state.
+    #[cold]
+    #[inline(never)]
+    unsafe fn collapse_prepend(
+        addr: usize,
+        g: *const PyGenerator,
+        gf: *mut Frame,
+        level_send: usize,
+    ) {
+        // SAFETY: the caller's contract; a parked record owns itself.
+        unsafe {
+            let rec = &mut *(addr as *mut ChainRec);
+            let st = (*g).state_raw().as_ptr();
+            let GeneratorState::Suspended(boxed) = std::ptr::read(st) else {
+                unreachable!("checked by the caller");
+            };
+            std::ptr::write(st, GeneratorState::Delegating(boxed));
+            (*g).chain.set(addr);
+            (*gf).pc = level_send as u32 + 1;
+            rec.levels.insert(
+                0,
+                Delegate {
+                    gen: g,
+                    act: LeanAct {
+                        frame: gf,
+                        shell: None,
+                    },
+                    send_pc: level_send,
+                },
+            );
+        }
+    }
+
     /// `g` as a collapsed chain's level or innermost generator (see
     /// [`Self::core_send_collapse`]): suspended, with nothing a lean resume
     /// declines (the checks of [`Self::core_send_hop`]). Its frame, or
@@ -19683,7 +21815,7 @@ impl Interpreter {
             return None;
         }
         // SAFETY: a read between instructions; the view ends here.
-        let GeneratorState::Suspended(boxed) = (unsafe { g.state.peek_mut() })? else {
+        let GeneratorState::Suspended(boxed) = (unsafe { g.state_raw().peek_mut() })? else {
             return None;
         };
         let gf: &mut Frame = boxed;
@@ -19731,6 +21863,25 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::collapse_next`], skipping the instruction checks for a
+    /// frame at the code and pc `memo` holds (and recording them there).
+    #[inline(always)]
+    fn collapse_next_memo<'f>(
+        frame: &'f Frame,
+        memo: &mut (*const CodeObject, u32, usize),
+    ) -> Option<(&'f Rc<PyGenerator>, usize)> {
+        let code = Rc::as_ptr(&frame.code);
+        if code == memo.0 && frame.pc == memo.1 {
+            return match frame.stack.last() {
+                Some(Object::Generator(g) | Object::Coroutine(g)) => Some((g, memo.2)),
+                _ => None,
+            };
+        }
+        let found = Self::collapse_next(frame)?;
+        *memo = (code, frame.pc, found.1);
+        Some(found)
+    }
+
     /// The `SEND` of `None` at `send_pc` of `sw`'s (synced) running
     /// activation to `first` (frame `first_frame`, both checked by
     /// [`Self::core_send_hop`]), a generator itself suspended in a
@@ -19741,42 +21892,303 @@ impl Interpreter {
     /// parked in their own `SEND`s, marked executing
     /// ([`GeneratorState::Delegating`]), and wait on the pending list, so
     /// a flush puts them on the spine. A yield comes straight back to
-    /// this `SEND` ([`Self::core_uncollapse`] puts the levels back as
-    /// running them would have left them); a return or a raise resumes
-    /// only the innermost level ([`Self::collapse_expand_one`]). `false`
-    /// touches nothing.
+    /// this `SEND` and parks the chain ([`Self::collapse_park`]); a
+    /// return or a raise resumes only the innermost level
+    /// ([`Self::collapse_expand_one`]). `false` touches nothing.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn core_send_collapse(
         &mut self,
         sw: &mut CoreSwitch,
         send_pc: usize,
+        mode: InlineResume,
         first: *const PyGenerator,
         first_frame: *mut Frame,
-        mut inner: &Rc<PyGenerator>,
+        inner: &Rc<PyGenerator>,
+        level_send: usize,
+        inner_frame: *mut Frame,
+    ) -> bool {
+        let mut rec = self.chain_rec();
+        // SAFETY: `first` is suspended in a `yield from` of `inner`, both
+        // qualified by the caller.
+        let (inner, inner_frame) = unsafe {
+            Self::collapse_walk(
+                &mut rec,
+                first,
+                first_frame,
+                Rc::as_ptr(inner),
+                level_send,
+                inner_frame,
+            )
+        };
+        let (inner, inner_frame) = match self.chain_step(sw, send_pc, mode, &mut rec) {
+            ChainStep::No => (inner, inner_frame),
+            ChainStep::Inner(inner, inner_frame) => (inner, inner_frame),
+            ChainStep::Delivered => {
+                self.chain_repark(rec);
+                return true;
+            }
+            ChainStep::Resume => {
+                self.chain_recycle(rec);
+                return false;
+            }
+        };
+        match self.collapse_commit(sw, send_pc, mode, rec, inner, inner_frame) {
+            Ok(()) => true,
+            Err(mut rec) => {
+                for level in rec.levels.drain(..).rev() {
+                    // SAFETY: delegating since the walk.
+                    unsafe { level.suspend() };
+                }
+                self.chain_recycle(rec);
+                false
+            }
+        }
+    }
+
+    /// The innermost generator of the collapsed chain `rec` (taken to run
+    /// for the consumer's `mode` at `pc`, see [`Self::collapse_commit`])
+    /// by fast step (see `gen_fast`) instead of as an activation: a yield
+    /// passes every level by, leaving each where it was, so it goes to
+    /// the consumer directly ([`ChainStep::Delivered`]); a return resumes
+    /// the innermost level in its `SEND`'s exit with the value
+    /// ([`ChainStep::Inner`], or [`ChainStep::Resume`] when that level is
+    /// the chain's only one, for the consumer to resume as usual).
+    #[inline(always)]
+    fn chain_step(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        rec: &mut ChainRec,
+    ) -> ChainStep {
+        let last = rec.levels.last().expect("a collapsed chain");
+        // SAFETY: the innermost level is alive and delegating: its frame
+        // sits in its `SEND`, its delegate on top.
+        match (unsafe { &*last.act.frame }).stack.last() {
+            Some(Object::Generator(inner)) if gen_fast::may_step(inner) => {
+                let inner: *const Rc<PyGenerator> = inner;
+                self.chain_step_run(sw, pc, mode, rec, inner)
+            }
+            _ => ChainStep::No,
+        }
+    }
+
+    /// [`Self::chain_step`] for an innermost generator `inner` a fast step
+    /// may run.
+    #[inline(never)]
+    fn chain_step_run(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        rec: &mut ChainRec,
+        inner: *const Rc<PyGenerator>,
+    ) -> ChainStep {
+        // (Its levels count against the recursion limit, as when resumed.)
+        // SAFETY: the running thread's own cell.
+        if unsafe { (*sw.depth_cell).get() } + rec.levels.len() + 2
+            >= crate::recursion::recursion_limit()
+        {
+            return ChainStep::No;
+        }
+        // SAFETY: held by the innermost level's stack, which nothing below
+        // changes before the step ends.
+        let inner = unsafe { &*inner };
+        match self.gen_fast_next(inner, sw.snap_gen, 0, sw.maybe_dead) {
+            gen_fast::GenNext::Yielded(v) => {
+                // The outermost level goes once the chain parks.
+                rec.hold = self.step_deliver(sw, pc, mode, v);
+                ChainStep::Delivered
+            }
+            gen_fast::GenNext::Exhausted(v) => {
+                // The innermost level's `SEND` exits with the return value,
+                // the level suspended there having taken it.
+                let level = rec.levels.pop().expect("a collapsed chain");
+                // SAFETY: alive and delegating (see `Delegate`); its frame
+                // just past its `SEND`, its delegate on top.
+                unsafe {
+                    level.suspend();
+                    let frame = &mut *level.act.frame;
+                    let jump = frame.code.instructions[level.send_pc].arg;
+                    frame.pc = level.send_pc as u32 + 1 + jump;
+                    frame.stack.push(v);
+                    frame.sent_consumed = true;
+                }
+                if rec.levels.is_empty() {
+                    ChainStep::Resume
+                } else {
+                    ChainStep::Inner(level.gen, level.act.frame)
+                }
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => ChainStep::No,
+        }
+    }
+
+    /// The value `v` a fast step of the generator the consumer's `mode`
+    /// at `pc` resumes (or of that generator's delegate) yielded, as the
+    /// consumer's result: its operands leave as the instruction's own
+    /// resume takes them, and the generator a `next()` or `send()` call
+    /// held is returned, for the caller to release once the chain is
+    /// settled.
+    fn step_deliver(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        v: Object,
+    ) -> Option<Rc<PyGenerator>> {
+        // SAFETY: see `CoreSwitch`: the consumer is the running activation,
+        // synced, its operands as `mode` has them.
+        let frame = unsafe { &mut *sw.cur };
+        let mut held = None;
+        match mode {
+            InlineResume::Send => {
+                // The value takes the sent `None`'s place.
+                if let Some(top) = frame.stack.last_mut() {
+                    drop(std::mem::replace(top, v));
+                }
+            }
+            InlineResume::ForIter => frame.stack.push(v),
+            InlineResume::NextCall | InlineResume::NextDefault => {
+                if mode == InlineResume::NextDefault {
+                    drop(frame.stack.pop());
+                }
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                if let Some(Object::Generator(g)) = g {
+                    held = Some(g);
+                }
+                drop((a, b));
+                frame.stack.push(v);
+            }
+            InlineResume::SendCall => {
+                held = Self::send_call_pop(frame);
+                frame.stack.push(v);
+            }
+        }
+        frame.pc = pc as u32 + 1;
+        // SAFETY: as above.
+        unsafe { *sw.last = pc };
+        // Anything the step released may have queued a finalizer, run
+        // before the consumer's next instruction.
+        // SAFETY: the running thread's own flag.
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        held
+    }
+
+    /// The resume (the consumer's `mode` at `pc`) of a generator (frame
+    /// `gf`) suspended in the `yield from` at `send_pc` of `inner`, a
+    /// simple generator, by `inner`'s fast step (see `gen_fast`): a yield
+    /// passes the generator by, leaving it where it was, and goes to the
+    /// consumer directly (`Collapsed`); a return lands in the generator's
+    /// `SEND` exit, which it takes as its sent value, for the consumer to
+    /// resume it as usual (`Declined`). `None` when the step declined.
+    #[inline(never)]
+    fn delegate_step(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        gf: *mut Frame,
+        inner: &Rc<PyGenerator>,
+        send_pc: usize,
+    ) -> Option<SendHop> {
+        // (The generator counts against the recursion limit, as resumed.)
+        // SAFETY: the running thread's own cell.
+        if unsafe { (*sw.depth_cell).get() } + 3 >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        match self.gen_fast_next(inner, sw.snap_gen, 0, sw.maybe_dead) {
+            gen_fast::GenNext::Yielded(v) => {
+                drop(self.step_deliver(sw, pc, mode, v));
+                Some(SendHop::Collapsed)
+            }
+            gen_fast::GenNext::Exhausted(v) => {
+                // SAFETY: the generator is suspended (checked by the
+                // caller), its frame at the `RESUME` after the yield.
+                unsafe {
+                    let frame = &mut *gf;
+                    let jump = frame.code.instructions[send_pc].arg;
+                    frame.pc = send_pc as u32 + 1 + jump;
+                    frame.stack.push(v);
+                    frame.sent_consumed = true;
+                }
+                Some(SendHop::Declined)
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
+    }
+
+    /// A `send(None)` call's operands (see [`Self::resumed_gen`]) off
+    /// `frame`'s stack: the generator it resumes, which the caller keeps.
+    fn send_call_pop(frame: &mut Frame) -> Option<Rc<PyGenerator>> {
+        let (v, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+        let g = match (&a, &b) {
+            (Some(Object::BoundMethod(bm)), _) => match &bm.receiver {
+                Object::Generator(g) | Object::Coroutine(g) => Some(g.clone()),
+                _ => None,
+            },
+            (_, Some(Object::Generator(g) | Object::Coroutine(g))) => Some(g.clone()),
+            _ => None,
+        };
+        drop((v, b, a));
+        g
+    }
+
+    /// Park `rec` again (see [`ChainRec`]) after its innermost generator's
+    /// yield went to the consumer directly ([`Self::chain_step`]).
+    fn chain_repark(&mut self, mut rec: Box<ChainRec>) {
+        rec.parked = true;
+        let hold = rec.hold.take();
+        let _ = Box::into_raw(rec);
+        // (Last: its release may settle the chain.)
+        drop(hold);
+    }
+
+    /// Add `g` (frame `gf`, suspended in the `yield from` at `level_send`
+    /// of `inner`, which `inner_frame` qualifies) to `rec` as its
+    /// innermost level, and every generator below it that qualifies in
+    /// turn, each made delegating just past its `SEND`
+    /// ([`Delegate::suspend`] undoes it). Returns the chain's innermost
+    /// generator, suspended, and its frame.
+    ///
+    /// # Safety
+    ///
+    /// As described: `g` and `inner` are alive (`inner` held by `g`'s
+    /// stack) and suspended, with no borrow of their state live.
+    #[inline(always)]
+    unsafe fn collapse_walk(
+        rec: &mut ChainRec,
+        mut g: *const PyGenerator,
+        mut gf: *mut Frame,
+        mut inner: *const PyGenerator,
         mut level_send: usize,
         mut inner_frame: *mut Frame,
-    ) -> bool {
-        let mut act = self.inline_slot();
-        debug_assert!(act.delegates.is_empty());
-        let (mut g, mut gf) = (first, first_frame);
+    ) -> (*const PyGenerator, *mut Frame) {
+        let addr = std::ptr::from_mut(rec) as usize;
         // The code objects whose lean resume a level already vouched for
         // (a recursive generator's levels share one).
         let mut code_ok: *const CodeObject = std::ptr::null();
+        // The last level's code, pc and `SEND` (a recursive generator's
+        // levels mostly share all three).
+        let mut resend: (*const CodeObject, u32, usize) = (std::ptr::null(), u32::MAX, 0);
         loop {
-            // The level delegates from here (`Delegate::suspend` undoes it).
             // SAFETY: each level is alive (its holder is the level above,
             // or the running activation) and suspended (checked), with no
             // borrow of its state live; the box moves between variants
             // without drop glue.
             unsafe {
-                let st = (*g).state.as_ptr();
+                let st = (*g).state_raw().as_ptr();
                 let GeneratorState::Suspended(boxed) = std::ptr::read(st) else {
                     unreachable!("checked by `collapse_frame`");
                 };
                 std::ptr::write(st, GeneratorState::Delegating(boxed));
+                (*g).chain.set(addr);
+                (*gf).pc = level_send as u32 + 1;
             }
-            act.delegates.push(Delegate {
+            rec.levels.push(Delegate {
                 gen: g,
                 act: LeanAct {
                     frame: gf,
@@ -19784,21 +22196,40 @@ impl Interpreter {
                 },
                 send_pc: level_send,
             });
-            g = Rc::as_ptr(inner);
+            g = inner;
             gf = inner_frame;
             // SAFETY: as above.
-            let Some((next, next_send)) = Self::collapse_next(unsafe { &*gf }) else {
+            let Some((next, next_send)) = Self::collapse_next_memo(unsafe { &*gf }, &mut resend)
+            else {
                 break;
             };
             let Some(next_frame) = Self::collapse_frame_with(next, &mut code_ok) else {
                 break;
             };
-            inner = next;
+            inner = Rc::as_ptr(next);
             level_send = next_send;
             inner_frame = next_frame;
         }
+        (g, gf)
+    }
+
+    /// Run `inner` (frame `inner_frame`, suspended and qualified), the
+    /// innermost generator of the chain whose delegating levels `rec`
+    /// holds, for the running activation's resume of the outermost level
+    /// at `pc`: a `SEND` of `None` (see [`Self::core_send_collapse`]), a
+    /// `FOR_ITER` or a `next()` (`mode`, as [`Self::try_inline_gen`]
+    /// takes them). Past the recursion limit, `rec` comes back untouched.
+    fn collapse_commit(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        mut rec: Box<ChainRec>,
+        inner: *const PyGenerator,
+        inner_frame: *mut Frame,
+    ) -> Result<(), Box<ChainRec>> {
         // Each level counts against the recursion limit, as when resumed.
-        let levels = act.delegates.len();
+        let levels = rec.levels.len();
         let guard = if crate::recursion::enter_n(sw.depth_cell, levels) {
             match crate::recursion::enter_with(sw.depth_cell) {
                 crate::recursion::Enter::Ok(guard) => Some(guard),
@@ -19811,39 +22242,72 @@ impl Interpreter {
             None
         };
         let Some(guard) = guard else {
-            for level in act.delegates.drain(..) {
-                // SAFETY: delegating since above.
-                unsafe { level.suspend() };
-            }
-            if self.inline_pool.len() < INLINE_POOL_CAP {
-                self.inline_pool.push(act);
-            }
-            return false;
+            return Err(rec);
         };
-        // Committed: each level is just past its `SEND`.
-        for level in &act.delegates {
-            // SAFETY: the level's frame, in its generator's box.
-            unsafe { (*level.act.frame).pc = level.send_pc as u32 + 1 };
-        }
-        let inner = inner.clone();
+        // Committed.
+        // SAFETY: alive (held by the innermost level's stack).
+        let inner = unsafe {
+            Rc::increment_strong_count(inner);
+            Rc::from_raw(inner)
+        };
         // SAFETY: suspended (checked), no borrow of its state live.
         let GeneratorState::Suspended(mut boxed) = std::mem::replace(
-            unsafe { &mut *inner.state.as_ptr() },
+            unsafe { &mut *inner.state_raw().as_ptr() },
             GeneratorState::Running,
         ) else {
             unreachable!("checked by `collapse_frame`");
         };
+        debug_assert!(std::ptr::eq::<Frame>(&raw const *boxed, inner_frame));
         boxed.gen_first_resume = false;
+        // (A step that stopped partway, or the innermost level's delegate's
+        // return delivered by one, already gave it its value.)
+        let sent_consumed = std::mem::take(&mut boxed.sent_consumed);
         // SAFETY: see `CoreSwitch`: the running activation is synced, its
-        // stack `[.., first, None]` (checked by `core_send_hop`).
+        // stack as `mode` has it (checked by the caller).
         let frame = unsafe { &mut *sw.cur };
-        let jump = frame.code.instructions[send_pc].arg;
-        // The sent `None` goes in.
-        frame.stack.pop();
-        boxed.stack.push(Object::None);
-        frame.pc = send_pc as u32 + 1;
+        // The consumer's operands leave as `inline_gen_commit` takes them;
+        // the outermost level's activation keeps a `next()`'s generator.
+        let arg = match mode {
+            InlineResume::Send => {
+                // The sent `None`.
+                frame.stack.pop();
+                frame.code.instructions[pc].arg | GEN_SEND
+            }
+            InlineResume::ForIter => frame.code.instructions[pc].arg,
+            InlineResume::NextCall => {
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                let Some(Object::Generator(g)) = g else {
+                    unreachable!("checked by `core_iter_collapse`");
+                };
+                rec.hold = Some(g);
+                drop((a, b));
+                GEN_NEXT_CALL
+            }
+            InlineResume::NextDefault => {
+                let default = frame.stack.pop().expect("checked above");
+                let (g, b, a) = (frame.stack.pop(), frame.stack.pop(), frame.stack.pop());
+                let Some(Object::Generator(g)) = g else {
+                    unreachable!("checked by `core_iter_collapse`");
+                };
+                rec.hold = Some(g);
+                frame.stack.push(default);
+                drop((a, b));
+                GEN_NEXT_DEFAULT
+            }
+            InlineResume::SendCall => {
+                rec.hold = Self::send_call_pop(frame);
+                GEN_NEXT_CALL
+            }
+        };
+        // The resume's `None` goes in.
+        if !sent_consumed {
+            boxed.stack.push(Object::None);
+        }
+        frame.pc = pc as u32 + 1;
         let gen_frame: *mut Frame = &raw mut *boxed;
+        let mut act = self.inline_slot();
         debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        debug_assert!(act.chain.is_none());
         // SAFETY: a pooled slot holds none of these (see `try_inline_gen`).
         unsafe {
             std::ptr::write(&raw mut act.gen, Some(inner));
@@ -19851,54 +22315,184 @@ impl Interpreter {
             std::ptr::write(&raw mut act.guard, Some(guard));
         }
         act.gen_frame = gen_frame;
-        act.exhaust_arg = jump | GEN_SEND;
+        act.exhaust_arg = arg;
         act.act.frame = gen_frame;
-        act.call_pc = send_pc;
-        act.caller_pending = self.core_pending_enter(sw, frame, send_pc);
+        act.call_pc = pc;
+        act.caller_pending = self.core_pending_enter(sw, frame, pc);
         act.exc_depth = self.exc_info_len();
         // The levels wait on the pending list, outermost first, as each
         // would while the next one ran (the buffer stays put from here).
-        for level in &mut act.delegates {
-            self.lean_pending.push(&raw mut level.act as usize);
+        rec.pend_at = self.lean_pending.len();
+        self.lean_pending.reserve(levels);
+        // SAFETY: reserved: each entry is written in place, and the length
+        // covers them once all are.
+        unsafe {
+            let base = self.lean_pending.as_mut_ptr().add(rec.pend_at);
+            for (k, level) in rec.levels.iter_mut().enumerate() {
+                base.add(k).write(&raw mut level.act as usize);
+            }
+            self.lean_pending.set_len(rec.pend_at + levels);
         }
+        act.chain = Some(rec);
         // SAFETY: see `CoreSwitch`.
         unsafe { push_fast(&mut *sw.inl, act) };
         sw.cur = gen_frame;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
-        true
+        Ok(())
+    }
+
+    /// The `SEND` of `None` (or the `FOR_ITER` or `next()`, `mode`) at
+    /// `pc` of `sw`'s (synced) running activation to the outermost level
+    /// of the parked chain whose record is at `addr` (see [`ChainRec`]):
+    /// its innermost generator resumes directly, as
+    /// [`Self::core_send_collapse`] resumes it, with any generators that
+    /// innermost one has since started delegating to added as levels.
+    /// Anything that doesn't qualify leaves the chain parked (the
+    /// instruction's full handler settles it).
+    #[inline(never)]
+    fn core_send_unpark(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        mode: InlineResume,
+        addr: usize,
+    ) -> SendHop {
+        // SAFETY: a parked record owns itself (see `ChainRec`); taken
+        // here, put back below unless the chain runs.
+        let mut rec = unsafe { Box::from_raw(addr as *mut ChainRec) };
+        rec.parked = false;
+        let repark = |mut rec: Box<ChainRec>| {
+            rec.parked = true;
+            let _ = Box::into_raw(rec);
+            SendHop::Declined
+        };
+        let last = rec.levels.last().expect("a collapsed chain");
+        // SAFETY: the innermost level is alive and parked: its frame sits
+        // in its `SEND`, its delegate on top (held there until it runs).
+        let inner: &Rc<PyGenerator> = match unsafe { &*last.act.frame }.stack.last() {
+            Some(Object::Generator(g) | Object::Coroutine(g)) => unsafe { &*std::ptr::from_ref(g) },
+            _ => return repark(rec),
+        };
+        // A simple innermost generator takes a fast step first.
+        let stepped = if gen_fast::steps_body(inner) {
+            match self.chain_step_run(sw, pc, mode, &mut rec, inner) {
+                ChainStep::No => None,
+                ChainStep::Inner(inner, inner_frame) => Some((inner, inner_frame)),
+                ChainStep::Delivered => {
+                    self.chain_repark(rec);
+                    return SendHop::Collapsed;
+                }
+                ChainStep::Resume => {
+                    self.chain_recycle(rec);
+                    return SendHop::Declined;
+                }
+            }
+        } else {
+            None
+        };
+        let base = rec.levels.len();
+        let (inner, inner_frame) = match stepped {
+            // The innermost level took its delegate's return value.
+            Some(stepped) => stepped,
+            None => {
+                let (inner, inner_frame) = match Self::collapse_frame(inner) {
+                    Some(frame) => (Rc::as_ptr(inner), frame),
+                    None => return repark(rec),
+                };
+                // The innermost generator may since have started delegating
+                // (a `yield from` of a fresh generator): its own chain joins.
+                // SAFETY: as `core_send_collapse` (the innermost generator
+                // was just qualified, and with it the generator it
+                // delegates to).
+                match Self::collapse_next(unsafe { &*inner_frame }) {
+                    Some((next, next_send)) => match Self::collapse_frame(next) {
+                        Some(next_frame) => unsafe {
+                            Self::collapse_walk(
+                                &mut rec,
+                                inner,
+                                inner_frame,
+                                Rc::as_ptr(next),
+                                next_send,
+                                next_frame,
+                            )
+                        },
+                        None => (inner, inner_frame),
+                    },
+                    None => (inner, inner_frame),
+                }
+            }
+        };
+        match self.collapse_commit(sw, pc, mode, rec, inner, inner_frame) {
+            Ok(()) => SendHop::Collapsed,
+            Err(mut rec) => {
+                for level in rec.levels.drain(base..).rev() {
+                    // SAFETY: delegating since the walk.
+                    unsafe { level.suspend() };
+                }
+                repark(rec)
+            }
+        }
     }
 
     /// A collapsed chain's innermost generator yielded (`done`, its
-    /// finished activation, still holds the levels; the value goes to the
-    /// consumer): put the levels back as running them would have left
-    /// them, each suspended at its `yield from`. Only for levels without
-    /// a shell (see [`Self::collapse_expand_one`] otherwise).
+    /// finished activation, holds the levels, none flushed; the value
+    /// goes to the consumer): the chain parks (see [`ChainRec`]), its
+    /// levels still delegating, off the pending list and the recursion
+    /// depth.
     #[inline]
-    fn core_uncollapse(&mut self, done: &mut InlineAct) {
-        let levels = done.delegates.len();
-        debug_assert!(done.delegates.iter().all(|l| l.act.shell.is_none()));
-        // Still pending means nothing flushed (a flush drains the list).
-        if let Some(innermost) = done.delegates.last_mut() {
-            let addr = &raw mut innermost.act as usize;
-            if self.lean_pending.last() == Some(&addr) {
-                let len = self.lean_pending.len();
-                self.lean_pending.truncate(len - levels);
-            }
-        }
-        for level in done.delegates.drain(..).rev() {
-            // SAFETY: the levels are alive and delegating (see
-            // `Delegate::gen`); nothing borrows their state here.
-            unsafe { level.suspend() };
-        }
-        crate::recursion::leave_n(crate::recursion::depth_cell(), levels);
+    fn collapse_park(&mut self, done: &mut InlineAct) {
+        let mut rec = done.chain.take().expect("a collapsed chain");
+        debug_assert!(rec.levels.iter().all(|l| l.act.shell.is_none()));
+        debug_assert_eq!(self.lean_pending.len(), rec.pend_at + rec.levels.len());
+        self.lean_pending.truncate(rec.pend_at);
+        crate::recursion::leave_n(crate::recursion::depth_cell(), rec.levels.len());
+        rec.parked = true;
+        let hold = rec.hold.take();
+        let _ = Box::into_raw(rec);
+        // (Last: its release may settle the chain.)
+        drop(hold);
     }
 
-    /// Whether any level of `act`'s collapsed chain has a shell (a flush
-    /// put the levels on the spine).
+    /// An empty [`ChainRec`], from the pool or fresh (boxed: see
+    /// [`Self::chain_pool`]).
     #[inline]
-    fn collapse_flushed(act: &InlineAct) -> bool {
-        act.delegates.iter().any(|l| l.act.shell.is_some())
+    #[allow(clippy::unnecessary_box_returns)]
+    fn chain_rec(&mut self) -> Box<ChainRec> {
+        self.chain_pool.pop().unwrap_or_else(|| {
+            Box::new(ChainRec {
+                levels: Vec::new(),
+                parked: false,
+                pend_at: 0,
+                hold: None,
+            })
+        })
+    }
+
+    /// Return an emptied [`ChainRec`] to the pool.
+    #[inline]
+    fn chain_recycle(&mut self, mut rec: Box<ChainRec>) {
+        debug_assert!(rec.levels.is_empty());
+        rec.parked = false;
+        drop(rec.hold.take());
+        if self.chain_pool.len() < 16 {
+            self.chain_pool.push(rec);
+        }
+    }
+
+    /// Whether a flush may have put the levels of `act`'s collapsed chain
+    /// on the spine (given them shells). Unflushed, the levels' entries
+    /// are still the pending list's newest ones where the chain put them
+    /// (a flush drains entries oldest first, and only the chain pushes
+    /// these).
+    #[inline]
+    fn collapse_flushed(&self, act: &InlineAct) -> bool {
+        let Some(rec) = &act.chain else {
+            return false;
+        };
+        let first = std::ptr::from_ref(&rec.levels[0].act) as usize;
+        self.lean_pending.len() != rec.pend_at + rec.levels.len()
+            || self.lean_pending.get(rec.pend_at) != Some(&first)
     }
 
     /// Resume the innermost level of `done`'s collapsed chain for real:
@@ -19908,12 +22502,15 @@ impl Interpreter {
     /// to), and the returned activation runs the level, taking over the
     /// consumer-facing fields and the rest of the chain.
     fn collapse_expand_one(&mut self, done: &mut InlineAct) -> Box<InlineAct> {
-        let addr = done
-            .delegates
+        let rec = done.chain.as_mut().expect("a collapsed chain");
+        let addr = rec
+            .levels
             .last_mut()
             .map(|l| &raw mut l.act as usize)
             .expect("a collapsed chain");
-        let level = done.delegates.pop().expect("a collapsed chain");
+        let level = rec.levels.pop().expect("a collapsed chain");
+        // SAFETY: alive, see `Delegate::gen`; it runs for real from here.
+        unsafe { (*level.gen).chain.set(0) };
         // The level's pending entry was the innermost generator's caller
         // entry (the delegate's `lean_pending_exit` takes it).
         let level_pending = (level.act.shell.is_none()).then_some(addr);
@@ -19925,13 +22522,14 @@ impl Interpreter {
             Rc::from_raw(level.gen)
         };
         // SAFETY: delegating (see `Delegate`); nothing borrows the state.
-        let GeneratorState::Delegating(boxed) =
-            std::mem::replace(unsafe { &mut *gen.state.as_ptr() }, GeneratorState::Running)
-        else {
+        let GeneratorState::Delegating(boxed) = std::mem::replace(
+            unsafe { &mut *gen.state_raw().as_ptr() },
+            GeneratorState::Running,
+        ) else {
             unreachable!("a collapsed level is delegating");
         };
         let mut act = self.inline_slot();
-        debug_assert!(act.delegates.is_empty());
+        debug_assert!(act.chain.is_none());
         let gen_frame = level.act.frame;
         // SAFETY: a pooled slot holds none of these (see `try_inline_gen`);
         // the level's recursion depth was entered by the collapse.
@@ -19952,7 +22550,11 @@ impl Interpreter {
         act.exhaust_arg = done.exhaust_arg;
         act.caller_pending = done.caller_pending.take();
         act.exc_depth = done.exc_depth;
-        std::mem::swap(&mut act.delegates, &mut done.delegates);
+        // The rest of the chain (if any) stays collapsed under the level.
+        match done.chain.take() {
+            Some(rec) if rec.levels.is_empty() => self.chain_recycle(rec),
+            rest => act.chain = rest,
+        }
         // SAFETY: the level's frame, just past its `SEND`.
         let jump = unsafe { &*gen_frame }.code.instructions[level.send_pc].arg;
         done.call_pc = level.send_pc;
@@ -20026,8 +22628,8 @@ impl Interpreter {
                 .shell
                 .as_deref()
                 .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
-            || Self::collapse_flushed(top)
-            || self.gil_countdown <= 2
+            || self.collapse_flushed(top)
+            || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20061,12 +22663,13 @@ impl Interpreter {
             done.gen_frame = std::ptr::null_mut();
             Self::park_suspended_boxed(&gen, boxed);
             drop(gen);
-            // A collapsed chain's levels suspend again in their `yield
-            // from`s, the value passing them by.
-            if !done.delegates.is_empty() {
-                self.core_uncollapse(&mut done);
+            // A collapsed chain's levels stay collapsed, the value passing
+            // them by (see `Self::collapse_park`).
+            if done.chain.is_some() {
+                self.collapse_park(&mut done);
             }
             let call_pc = done.call_pc;
+            let next_default = done.exhaust_arg == GEN_NEXT_DEFAULT;
             self.lean_pending_exit(done.caller_pending);
             // SAFETY: the shell was taken above: no drop glue owed.
             unsafe { std::ptr::write(&raw mut done.act.shell, None) };
@@ -20078,6 +22681,11 @@ impl Interpreter {
             let mut tmp = None;
             // SAFETY: the consumer is the innermost remaining activation.
             let (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
+            // `next(gen, default)`: the value takes the default's place.
+            if next_default {
+                // SAFETY: as above.
+                drop(unsafe { (*cframe).stack.pop() });
+            }
             sw.cur = cframe;
             sw.last = if clast == &raw mut sw.scratch {
                 sw.scratch = usize::MAX;
@@ -20100,7 +22708,7 @@ impl Interpreter {
                             .shell
                             .as_deref()
                             .is_none_or(|s| self.shell_pops_quietly(s, t.exc_depth))
-                        && !Self::collapse_flushed(t)
+                        && !self.collapse_flushed(t)
                 })
                 && unsafe { &*cframe }
                     .code
@@ -20114,7 +22722,7 @@ impl Interpreter {
             }
             // SAFETY: as above.
             unsafe { push_fast(&mut (*cframe).stack, v) };
-            if self.gil_countdown <= 2 {
+            if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
             }
@@ -20150,11 +22758,9 @@ impl Interpreter {
         let Some(top) = inl.last_mut() else {
             return false;
         };
-        // A shell (the general epilogue's), or `next(gen)`'s exhaustion
-        // (a `StopIteration`), finishes through `quiet_run`.
+        // A shell (the general epilogue's) finishes through `quiet_run`.
         if top.act.shell.is_some()
-            || top.exhaust_arg == GEN_NEXT_CALL
-            || self.gil_countdown <= 2
+            || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20173,14 +22779,14 @@ impl Interpreter {
         let gen = done.gen.take().expect("a generator activation");
         let mut boxed = done.gen_box.take().expect("a generator activation");
         done.gen_frame = std::ptr::null_mut();
-        *gen.state.borrow_mut() = GeneratorState::Finished;
+        Self::finish_running_gen(&gen);
         self.recycle_frame_allocs(&mut boxed);
         Self::release_finished_gen(&gen);
-        drop(boxed);
+        self.recycle_gen_box(boxed);
         drop(gen);
         // A collapsed chain's innermost level takes the return value: it
         // resumes in its `SEND`, the rest of the chain still collapsed.
-        if !done.delegates.is_empty() {
+        if done.chain.is_some() {
             let level = self.collapse_expand_one(&mut done);
             push_fast(inl, level);
         }
@@ -20197,7 +22803,17 @@ impl Interpreter {
         let (cframe, clast, cshell) = unsafe { sw.activation(inl.len(), &mut tmp) };
         // SAFETY: as above.
         let consumer = unsafe { &mut *cframe };
-        if arg & GEN_SEND != 0 {
+        let mut raised = None;
+        if arg == GEN_NEXT_CALL {
+            // `next(gen)` or `gen.send(v)`: `StopIteration(value)`, raised
+            // at the call (the consumer's `pc` is past it), as
+            // `inline_gen_deliver` raises it.
+            raised = Some(crate::error::stop_iteration_with(v));
+        } else if arg == GEN_NEXT_DEFAULT {
+            // `next(gen, default)`: the default (atop the consumer's stack)
+            // is the result.
+            drop(v);
+        } else if arg & GEN_SEND != 0 {
             // `SEND`: the return value is the `yield from`/`await` result;
             // the sub-generator stays for `END_SEND`.
             consumer.stack.push(v);
@@ -20217,10 +22833,15 @@ impl Interpreter {
         } else {
             clast
         };
+        // The raise protocol of a call that raised (the leaf raise shape).
+        if let Some(e) = raised {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+            return true;
+        }
         // The consumer's `QuietEntry::Returned` protocol (`quiet_frame`).
         // SAFETY: as above.
         unsafe { *sw.last = call_pc };
-        if self.gil_countdown <= 2 {
+        if self.countdown_out(2) {
             sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
             return true;
         }
@@ -20262,13 +22883,12 @@ impl Interpreter {
         }
         // An activation whose shell the full epilogue would act on
         // finishes through `quiet_run`; so does a return into a caller
-        // whose protocol would yield straight away.
-        if top
-            .act
-            .shell
-            .as_deref()
-            .is_some_and(|s| !self.shell_pops_quietly(s, top.exc_depth))
-            || self.gil_countdown <= 2
+        // whose protocol would yield straight away. (A frame object alone
+        // settles in `retire_quiet_shell` while nothing observes returns.)
+        if top.act.shell.as_deref().is_some_and(|s| {
+            !self.shell_pops_quietly(s, top.exc_depth)
+                && (self.exc_info_len() > top.exc_depth || crate::trace::any_observers_active())
+        }) || self.countdown_out(2)
             || crate::hot_gates::loop_gen() != snap_gen
         {
             return false;
@@ -20303,7 +22923,14 @@ impl Interpreter {
             && Rc::strong_count(&frame.locals) == 1;
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
-        if clean && done.init_inst.is_none() && done.binop.is_none() && !done.discard {
+        if clean
+            && (done.init_inst.is_none() || matches!(v, Object::None))
+            && done.binop.is_none()
+            && !done.discard
+        {
+            // A constructor's `__init__` returned `None`: the caller takes
+            // the instance (`inline_deliver`'s epilogue).
+            let v = done.init_inst.take().unwrap_or(v);
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -20343,7 +22970,7 @@ impl Interpreter {
             // below.
             // SAFETY: as above.
             unsafe { *sw.last = call_pc };
-            if self.gil_countdown <= 2 {
+            if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
             }
@@ -20397,7 +23024,7 @@ impl Interpreter {
                 // SAFETY: as above.
                 unsafe { *sw.last = cur_pc };
                 // The caller's `Returned` entry protocol (`quiet_frame`).
-                if self.gil_countdown <= 2 {
+                if self.countdown_out(2) {
                     sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                     return true;
                 }
@@ -20452,7 +23079,9 @@ impl Interpreter {
         // `y.append` (a builtin container's method read as a value) and
         // `obj.__dict__`: sites the full handler never specializes.
         if ins.op == OpCode::LoadAttr {
-            if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg) {
+            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+            if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg, Some(running))
+            {
                 if let Some(top) = stack.last_mut() {
                     drop(std::mem::replace(top, v));
                 }
@@ -20686,32 +23315,12 @@ impl Interpreter {
         code: &CodeObject,
         recv: Option<&Object>,
         name_idx: u32,
+        running: Option<(*const (), u32)>,
     ) -> Option<Object> {
         let recv = recv?;
         let name = code.names.get(name_idx as usize)?.as_str();
         match recv {
-            // A code object's fields and a frame's plain ones (neither type
-            // can be subclassed, and no getter here runs Python); the full
-            // path keeps the deprecated `co_lnotab`, a generator frame's
-            // re-derived `f_back`, and a line-0 `f_lineno`.
-            Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
-            Object::Frame(fr) => match name {
-                "f_code" => Some(Object::Code(fr.code.clone())),
-                "f_globals" => Some(Object::Dict(fr.globals.clone())),
-                "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
-                "f_lineno" => match fr.current_lineno() {
-                    0 => None,
-                    line => Some(Object::Int(i64::from(line))),
-                },
-                "f_back"
-                    if !(fr.code.is_generator
-                        || fr.code.is_coroutine
-                        || fr.code.is_async_generator) =>
-                {
-                    Some(fr.back_frame().map_or(Object::None, Object::Frame))
-                }
-                _ => None,
-            },
+            Object::Code(_) | Object::Frame(_) => Self::frame_plain_attr(recv, name, running),
             // `x.__class__` of a builtin value: its exact type (no instance
             // or class can override it there).
             Object::Generator(_)
@@ -20732,6 +23341,64 @@ impl Interpreter {
             {
                 Some(Object::Type(crate::builtins::class_of(recv)))
             }
+            _ => self.leaf_plain_attr_value_rest(recv, name),
+        }
+    }
+
+    /// A code object's fields and a frame's plain ones (neither type can
+    /// be subclassed, and no getter here runs Python); the full path keeps
+    /// the deprecated `co_lnotab`, a generator frame's re-derived
+    /// `f_back`, and a line-0 `f_lineno`. A live frame's line is its
+    /// shell's `lasti` (see `PyFrame::live`), which is current unless its
+    /// activation is the one running: `running` names the running
+    /// activation (its locals' storage, which its frame object's mirror
+    /// shares) and the instruction it is at, if the caller knows them.
+    #[inline]
+    fn frame_plain_attr(
+        recv: &Object,
+        name: &str,
+        running: Option<(*const (), u32)>,
+    ) -> Option<Object> {
+        match recv {
+            Object::Code(c) if name != "co_lnotab" => crate::builtins::code_synthetic_attr(c, name),
+            Object::Frame(fr) => match name {
+                "f_code" => Some(Object::Code(fr.code.clone())),
+                "f_globals" => Some(Object::Dict(fr.globals.clone())),
+                "f_builtins" => Some(Object::Dict(fr.builtins.clone())),
+                "f_lineno" => {
+                    if !fr.live.load(std::sync::atomic::Ordering::Relaxed).is_null() {
+                        let (locals, pc) = running?;
+                        let own = fr
+                            .locals_mirror
+                            .try_borrow()
+                            .ok()?
+                            .as_ref()
+                            .is_some_and(|m| std::ptr::eq(Rc::as_ptr(m).cast::<()>(), locals));
+                        if own {
+                            fr.set_lasti(pc);
+                        }
+                    }
+                    match fr.current_lineno() {
+                        0 => None,
+                        line => Some(Object::Int(i64::from(line))),
+                    }
+                }
+                "f_back"
+                    if !(fr.code.is_generator
+                        || fr.code.is_coroutine
+                        || fr.code.is_async_generator) =>
+                {
+                    Some(fr.back_frame().map_or(Object::None, Object::Frame))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The rest of [`Self::leaf_plain_attr_value`]'s shapes.
+    fn leaf_plain_attr_value_rest(&self, recv: &Object, name: &str) -> Option<Object> {
+        match recv {
             Object::List(_)
             | Object::Dict(_)
             | Object::Set(_)
@@ -20792,7 +23459,21 @@ impl Interpreter {
         let Some(name @ Object::Str(n)) = code_name_obj(code, ins.arg) else {
             return None;
         };
-        if n.starts_with("__") {
+        // The names the function type (and `object`) define as data
+        // descriptors are the full handler's; any other lands in the
+        // function's `__dict__` (`wrapper.__wrapped__ = f`).
+        if n.starts_with("__")
+            && (crate::object::is_function_slot(n)
+                || matches!(
+                    &**n,
+                    "__code__"
+                        | "__globals__"
+                        | "__closure__"
+                        | "__builtins__"
+                        | "__dict__"
+                        | "__class__"
+                ))
+        {
             return None;
         }
         let n_ = stack.len();
@@ -20978,10 +23659,7 @@ impl Interpreter {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
-            if !ops
-                .iter()
-                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-            {
+            if !Self::core_all_droppable(ops) {
                 return None;
             }
             return if cls.flags.is_builtin {
@@ -20999,10 +23677,7 @@ impl Interpreter {
         } else {
             (&[], &[])
         };
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
@@ -21014,10 +23689,7 @@ impl Interpreter {
     /// for the full handler, which also raises every error.
     #[inline(never)]
     fn core_native_method_kw(ops: &[Object], argc: usize) -> Option<Object> {
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         crate::stdlib::decimal_native::method_kw(ops, argc)
@@ -21067,11 +23739,7 @@ impl Interpreter {
             bound[i] = Some(value);
         }
         let n = bound.iter().take_while(|a| a.is_some()).count();
-        if bound[n..].iter().any(Option::is_some)
-            || !ops
-                .iter()
-                .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if bound[n..].iter().any(Option::is_some) || !Self::core_all_droppable(ops) {
             return None;
         }
         let mut args = Vec::with_capacity(n + 1);
@@ -21096,10 +23764,7 @@ impl Interpreter {
             return None;
         }
         let fast = crate::stdlib::datetime_native::bound_fast(&bm.function, &bm.receiver)?;
-        if !ops
-            .iter()
-            .all(|o| matches!(o, Object::Unbound) || Self::core_droppable(o))
-        {
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         // Bitwise views of the receiver and the arguments, never dropped:
@@ -21138,9 +23803,57 @@ impl Interpreter {
     }
 
     /// A module attribute through the `LOAD_ATTR` site's cached index:
-    /// the value, cloned, or `None` for the helper's full path.
+    /// the value, cloned, or `None` for the helper's full path. A site
+    /// remembers the module dict's stamp and the entry's position once a
+    /// read proves them (see [`MODULE_ENTRY`]), so a warm read is a stamp
+    /// compare and an indexed load (CPython's `LOAD_ATTR_MODULE`).
     #[inline]
     fn core_module_attr(
+        code: &CodeObject,
+        m: &crate::object::PyModule,
+        pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let dict = unsafe { m.dict.peek() }?;
+        if let Some(slot) = code_vm_ext(code).and_then(|ext| ext.stamp_slot(pc)) {
+            let [stamp, tag, idx] = slot.get();
+            if tag == MODULE_ENTRY && stamp == dict.mutation_stamp() {
+                if let Some((_, v)) = dict.get_index(idx as usize) {
+                    return Some(Self::clone_operand(v));
+                }
+            }
+        }
+        Self::core_module_attr_indexed(code, m, pc, name_idx)
+    }
+
+    /// [`Self::core_module_attr`] through the site's inline cache, which
+    /// on a hit also fills the site's [`MODULE_ENTRY`] stamp.
+    #[inline(never)]
+    fn core_module_attr_indexed(
+        code: &CodeObject,
+        m: &crate::object::PyModule,
+        pc: usize,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let v = Self::core_module_attr_cached(code, m, pc, name_idx)?;
+        // SAFETY: as above (the read above ran no code).
+        if let (Some(dict), Some(slot)) =
+            (unsafe { m.dict.peek() }, code_stamp_slot(code, pc as u32))
+        {
+            if let weavepy_compiler::InlineCache::LoadAttrModule { key_idx, .. } =
+                code.caches.get(pc as u32)
+            {
+                slot.set([dict.mutation_stamp(), MODULE_ENTRY, u64::from(key_idx)]);
+            }
+        }
+        Some(v)
+    }
+
+    /// [`Self::core_module_attr_indexed`]'s read of the site's inline
+    /// cache.
+    #[inline]
+    fn core_module_attr_cached(
         code: &CodeObject,
         m: &crate::object::PyModule,
         pc: usize,
@@ -21175,9 +23888,7 @@ impl Interpreter {
         // SAFETY: as above; the shared view above is no longer used.
         if let Some(d) = unsafe { m.dict.peek_mut() } {
             let map: &mut crate::object::DictMap = &mut *d;
-            if let Some((key, _)) =
-                indexmap::map::MutableKeys::get_index_mut2(map, key_idx as usize)
-            {
+            if let Some((key, _)) = map.get_index_mut2(key_idx as usize) {
                 key.0 = Object::Str(name);
             }
         }
@@ -21203,7 +23914,7 @@ impl Interpreter {
             }
             // A scalar class attribute the instance doesn't shadow, or a
             // named tuple field (see `leaf_attr_resolve_site`).
-            if let Some(slot) = ext.stamp_slots.get().and_then(|s| s.get(attr_pc)) {
+            if let Some(slot) = ext.stamp_slot(attr_pc) {
                 if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
                     if !inst_may_shadow(inst, code, name_idx) {
                         return Some(v);
@@ -21228,13 +23939,16 @@ impl Interpreter {
                 return None;
             }
             if let Some(ext) = ext {
-                field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+                field_slot_note(ext, code, attr_pc, inst, key_idx);
             }
             return Some(Self::clone_operand(v));
         }
         // `leaf_fused_local_attr`, over the decoded cache.
         if matches!(cache, IC::Empty) {
-            return None;
+            return match local {
+                Object::Instance(inst) => inst_dict_attr(code, inst, attr_pc, name_idx),
+                _ => None,
+            };
         }
         match local {
             Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
@@ -21299,6 +24013,9 @@ impl Interpreter {
                         .get_index(key_idx as usize)
                         .filter(|(key, _)| slot_name_matches(code, ins.arg, key))
                         .map(|(_, value)| value);
+                    if let (Some(_), Some(ext)) = (indexed, ext) {
+                        slot_field_note(code, ext, pc, inst, key_idx, ins.arg);
+                    }
                     indexed.or_else(|| slots.get(name))
                 }
                 _ => {
@@ -21316,14 +24033,14 @@ impl Interpreter {
                         } if ver == cached => {
                             let hit = indexed(key_idx);
                             if let (Some(_), Some(ext)) = (hit, ext) {
-                                field_slot_note(ext, code.instructions.len(), pc, inst, key_idx);
+                                field_slot_note(ext, code, pc, inst, key_idx);
                             }
                             hit
                         }
                         _ => None,
                     };
                     primary.or_else(|| {
-                        let poly = code_vm_ext(code)?.attr_poly.get()?.get(pc)?;
+                        let poly = code_vm_ext(code)?.attr_poly_slot(pc)?;
                         indexed(poly.index(ver)?)
                     })
                 }
@@ -21379,30 +24096,40 @@ impl Interpreter {
         use weavepy_compiler::InlineCache as IC;
         let cls = inst.cls_raw();
         let ext = code_vm_ext(code);
-        if let Some((ver, idx)) = ext
-            .and_then(|e| e.field_slots.get())
-            .and_then(|slots| slots.get(attr_pc))
-            .map(FieldSlot::get)
-        {
-            if cls.attr_version.get() == ver && !crate::capi_watchers::dicts_active() {
+        if let Some((ver, idx)) = ext.and_then(|e| e.field_slot(attr_pc)).map(FieldSlot::get) {
+            if cls.attr_version.get() != ver {
+                // Another class's (or version's) shortcut: the site's
+                // cache below decides.
+            } else if idx & SLOT_FIELD != 0 {
+                // A laid-out `__slots__` member, set or not: the member
+                // descriptor's store, in place.
                 // SAFETY: a store between two instructions (see `peek_mut`).
-                if let Some(slot) =
-                    unsafe { inst.split_field_mut(idx as usize, value.is_gc_atomic()) }
-                {
-                    if Self::core_droppable(slot) {
-                        // SAFETY: as the indexed store below.
-                        drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
-                        return true;
+                if let Some(slot) = unsafe {
+                    inst.laid_out_slot_mut((idx & !SLOT_FIELD) as usize, value.is_gc_atomic())
+                } {
+                    if !Self::core_droppable(slot) {
+                        return false;
                     }
-                    return false;
+                    // SAFETY: as the indexed store below.
+                    drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
+                    return true;
                 }
-                // The constructor shape: the attribute is the instance's
-                // next one.
-                // SAFETY: as above; the value moves out of the caller's
-                // stack slot, and a declined append hands the bits back.
-                match unsafe { inst.split_append(idx as usize, std::ptr::read(value)) } {
+            } else if !crate::capi_watchers::dicts_active() {
+                // Over the attribute's value, or (the constructor shape) as
+                // the instance's next one.
+                // SAFETY: a store between two instructions (see `peek_mut`);
+                // the value moves out of the caller's stack slot, and a
+                // declined store hands the bits back.
+                match unsafe {
+                    inst.split_store_at(idx as usize, std::ptr::read(value), Self::core_droppable)
+                } {
                     Ok(()) => return true,
-                    Err(v) => std::mem::forget(v),
+                    Err((v, refused)) => {
+                        std::mem::forget(v);
+                        if refused {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -21430,7 +24157,7 @@ impl Interpreter {
                 let old = std::mem::replace(slot, unsafe { std::ptr::read(value) });
                 drop(old);
                 if let Some(ext) = ext {
-                    field_slot_note(ext, code.instructions.len(), attr_pc, inst, key_idx);
+                    field_slot_note(ext, code, attr_pc, inst, key_idx);
                 }
                 true
             }
@@ -21438,7 +24165,7 @@ impl Interpreter {
                 Self::core_store_new_attr(code, inst, cls, attr_pc, name_idx, ver, value)
             }
             IC::StoreAttrSlot { key_idx, ver } if cls.attr_version.get() == ver => {
-                Self::core_store_slot(code, inst, key_idx, name_idx, value)
+                Self::core_store_slot(code, inst, attr_pc, key_idx, name_idx, value)
             }
             _ => false,
         }
@@ -21453,6 +24180,7 @@ impl Interpreter {
     fn core_store_slot(
         code: &CodeObject,
         inst: &PyInstance,
+        attr_pc: usize,
         key_idx: u32,
         name_idx: u32,
         value: &Object,
@@ -21472,6 +24200,10 @@ impl Interpreter {
             let v = unsafe { std::ptr::read(value) };
             inst.note_slot_store(&v);
             drop(std::mem::replace(slot, v));
+            drop(slots);
+            if let Some(ext) = code_vm_ext_existing(code) {
+                slot_field_note(code, ext, attr_pc, inst, key_idx, name_idx);
+            }
             return true;
         }
         match slots.get_index_mut(key_idx as usize) {
@@ -21539,8 +24271,17 @@ impl Interpreter {
         attr_pc: usize,
         cursor: &mut Option<usize>,
     ) -> Option<bool> {
-        let (ver, idx) = ext.field_slots.get()?.get(attr_pc)?.get();
-        if inst.cls_raw().attr_version.get() != ver || crate::capi_watchers::dicts_active() {
+        let (ver, idx) = ext.field_slot(attr_pc)?.get();
+        if inst.cls_raw().attr_version.get() != ver {
+            return None;
+        }
+        if idx & SLOT_FIELD != 0 {
+            // A laid-out member's store, set or not (see `core_store_attr`).
+            // SAFETY: a read with nothing running (the commit's check pass).
+            let slot = unsafe { inst.laid_out_slot_any((idx & !SLOT_FIELD) as usize) }?;
+            return Some(Self::core_droppable(slot));
+        }
+        if crate::capi_watchers::dicts_active() {
             return None;
         }
         // SAFETY: a read with nothing running (the commit's check pass).
@@ -21661,7 +24402,7 @@ impl Interpreter {
                         // SAFETY: a read between two instructions.
                         let pos = unsafe { inst.dict.split_peek() }.and_then(|s| s.position(name));
                         if let Some(pos) = pos.and_then(|p| u32::try_from(p).ok()) {
-                            field_slot_note(ext, code.instructions.len(), attr_pc, inst, pos);
+                            field_slot_note(ext, code, attr_pc, inst, pos);
                         }
                     }
                     return true;
@@ -21749,7 +24490,10 @@ impl Interpreter {
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
         if matches!(code.caches.get(attr_pc as u32), IC::Empty) {
-            return None;
+            return match local {
+                Object::Instance(inst) => inst_dict_attr(code, inst, attr_pc, name_idx),
+                _ => None,
+            };
         }
         match local {
             Object::Instance(i) if i.cls_raw().native_kind.get() == 0 => {}
@@ -21802,7 +24546,7 @@ impl Interpreter {
             return None;
         };
         if Rc::as_ptr(f) as usize != self.leaf_fns().len_ptr
-            || code.names.get(name_idx as usize).map(String::as_str) != Some("len")
+            || code.names.get(name_idx as usize).map(|n| n.as_str()) != Some("len")
         {
             return None;
         }
@@ -21909,7 +24653,6 @@ impl Interpreter {
             globals,
             builtins,
             rare,
-            exc: frame_exc,
             ..
         } = frame;
         let code: &CodeObject = code_rc;
@@ -22339,7 +25082,7 @@ impl Interpreter {
                     // hand-off cadence, every loop-generation input
                     // (signals, async exceptions, observers, pending
                     // finalizers), and tier-2 heat are all polled here.
-                    if self.gil_countdown <= 1 || crate::hot_gates::loop_gen() != snap_gen {
+                    if self.countdown_out(1) || crate::hot_gates::loop_gen() != snap_gen {
                         stop = LeafStop::Breaker;
                         break;
                     }
@@ -22690,10 +25433,15 @@ impl Interpreter {
                     let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
                         break;
                     };
-                    let removed = inst
-                        .dict_cell()
-                        .borrow_mut()
-                        .shift_remove(&DictKey(Object::Str(key.clone())));
+                    // (The split layout deletes in place; see
+                    // `PyInstance::split_remove`.)
+                    let removed = match inst.split_remove(key) {
+                        Some(removed) => removed,
+                        None => inst
+                            .dict_cell()
+                            .borrow_mut()
+                            .shift_remove(&DictKey(Object::Str(key.clone()))),
+                    };
                     // A missing attribute raises through the full path.
                     let Some(removed) = removed else {
                         break;
@@ -22808,14 +25556,16 @@ impl Interpreter {
                                 break;
                             };
                             let value = stack[n - 1].clone();
-                            if let Some(slot) = d.get_mut(&probe) {
-                                drop(std::mem::replace(slot, value));
-                                true
-                            } else if probe.miss_is_exact() {
-                                d.insert(DictKey(key.clone()), value);
-                                true
-                            } else {
-                                false
+                            match d.probe_entry(&probe) {
+                                crate::dictmap::ProbeEntry::Occupied(e) => {
+                                    drop(std::mem::replace(e.into_mut(), value));
+                                    true
+                                }
+                                crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                                    e.insert(DictKey(key.clone()), value);
+                                    true
+                                }
+                                crate::dictmap::ProbeEntry::Vacant(_) => false,
                             }
                         }
                         _ => false,
@@ -23196,19 +25946,20 @@ impl Interpreter {
                             let Ok(mut d) = cell.try_borrow_mut() else {
                                 break;
                             };
-                            let (old, changed) = match d.get_mut(&probe) {
-                                Some(slot) => {
+                            let (old, changed) = match d.probe_entry(&probe) {
+                                crate::dictmap::ProbeEntry::Occupied(e) => {
+                                    let slot = e.into_mut();
                                     let v = std::mem::replace(value_slot, Object::Unbound);
                                     let old = std::mem::replace(slot, v);
                                     let changed = !old.is_same(slot);
                                     (old, changed)
                                 }
-                                None => {
+                                crate::dictmap::ProbeEntry::Vacant(e) => {
                                     if !probe.miss_is_exact() {
                                         break;
                                     }
                                     let v = std::mem::replace(value_slot, Object::Unbound);
-                                    d.insert(DictKey(key.clone()), v);
+                                    e.insert(DictKey(key.clone()), v);
                                     (Object::Unbound, true)
                                 }
                             };
@@ -23293,10 +26044,7 @@ impl Interpreter {
                     // pushed in the elided-method shape (function, self)
                     // — the `CALL` folds `self` in — or bound, without the
                     // super proxy the full handler builds. Stack (top-
-                    // down): self, class, global `super`.
-                    if ins.arg & 2 != 0 {
-                        break;
-                    }
+                    // down): self, class, global `super` (either form).
                     let n = stack.len();
                     if n < 3 || !is_super_callable(&stack[n - 3]) {
                         break;
@@ -23705,19 +26453,14 @@ impl Interpreter {
                         break;
                     }
                     let exc = stack.pop().expect("checked above");
-                    let prev = self
-                        .exc_info_stack
-                        .borrow()
-                        .last()
-                        .map_or(Object::None, |pe| pe.instance.clone());
+                    let prev = {
+                        let mut handled = self.exc_info_stack.borrow_mut();
+                        let prev = handled.last().cloned().unwrap_or(Object::None);
+                        handled.push(exc.clone());
+                        prev
+                    };
                     stack.push(prev);
-                    stack.push(exc.clone());
-                    let pe = PyException::new(exc);
-                    frame_exc
-                        .get_or_insert_with(Box::default)
-                        .handlers
-                        .push((ins.arg, pe.clone()));
-                    self.exc_info_stack.borrow_mut().push(pe);
+                    stack.push(exc);
                     last = pc;
                     pc += 1;
                 }
@@ -23736,16 +26479,13 @@ impl Interpreter {
                 }
                 OpCode::PopExcept => {
                     let Some(prev) = stack.pop() else { break };
-                    let popped = frame_exc.as_mut().and_then(|e| e.handlers.pop());
                     let top = self.exc_info_stack.borrow_mut().pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
-                    self.recheck_frame_observed = true;
                     last = pc;
                     pc += 1;
-                    drop(top);
-                    if let Some((_, pe)) = popped {
-                        self.release(pe.instance);
+                    if let Some(top) = top {
+                        self.release(top);
                     }
                     self.release(prev);
                 }
@@ -23806,7 +26546,10 @@ impl Interpreter {
     /// hands the instruction to the full handler (which restarts the scan:
     /// nothing observable happened here).
     fn leaf_contains(container: &Object, item: &Object) -> Option<bool> {
-        let member = Self::leaf_member_eq;
+        if let Some(found) = Self::leaf_contains_table(container, item) {
+            return Some(found);
+        }
+        let member = Self::leaf_contains_eq;
         match container {
             Object::List(l) => {
                 // SAFETY: a read between two instructions (the member test
@@ -23866,8 +26609,51 @@ impl Interpreter {
                 }
                 found.ok().flatten()
             }
+            // A class's `__dict__` view (`'__dict__' in type.__dict__`, as
+            // `inspect` asks) tests the class dict it wraps.
+            Object::MappingProxy(d) => Self::leaf_contains(&Object::Dict(d.clone()), item),
             _ => None,
         }
+    }
+
+    /// [`Self::leaf_contains`]'s commonest tests, small enough to inline
+    /// into the frame JIT's helper: a `str`, machine `int` or plain class
+    /// in a set or dict (`cls in _atomic_types`), probed in line. `None`
+    /// for anything else, or a miss a key of another kind might explain.
+    #[inline(always)]
+    pub(crate) fn leaf_contains_table(container: &Object, item: &Object) -> Option<bool> {
+        // A `str`, machine `int` or plain class in a set or dict, the
+        // commonest tests (`cls in _atomic_types`), probed in line.
+        if let (
+            Object::Set(_) | Object::FrozenSet(_) | Object::Dict(_),
+            Object::Str(_) | Object::Int(_) | Object::Type(_),
+        ) = (container, item)
+        {
+            let probe = match item {
+                Object::Type(t) => crate::object::type_hash_is_identity(t)
+                    .then(|| crate::object::LeafProbe::identity_type(item)),
+                _ => crate::object::LeafProbe::new(item),
+            };
+            if let Some(probe) = probe {
+                let found = match container {
+                    // SAFETY: a read between two instructions (the probe
+                    // runs no code).
+                    Object::Set(st) => unsafe { st.peek() }.map(|m| m.contains_hot(&probe)),
+                    Object::FrozenSet(fs) => Some(fs.contains_hot(&probe)),
+                    // SAFETY: as above.
+                    Object::Dict(d) => {
+                        unsafe { d.peek() }.map(|m| m.get_index_hot(&probe).is_some())
+                    }
+                    _ => None,
+                };
+                if let Some(found) = found {
+                    if found || probe.miss_is_exact() {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Whether hashing `item` runs no Python code: a native scalar, a
@@ -23926,6 +26712,68 @@ impl Interpreter {
             return Some(false);
         }
         None
+    }
+
+    /// [`Self::leaf_member_eq`] for a membership test (`in`), which settles
+    /// a few more pairs itself rather than through a native comparison.
+    fn leaf_contains_eq(x: &Object, item: &Object) -> Option<bool> {
+        if let Some(eq) = Self::leaf_member_eq(x, item) {
+            return Some(eq);
+        }
+        let scalar = |o: &Object| {
+            matches!(
+                o,
+                Object::None
+                    | Object::Bool(_)
+                    | Object::Int(_)
+                    | Object::Float(_)
+                    | Object::Str(_)
+                    | Object::Bytes(_)
+            )
+        };
+        // An `int` subclass's instance under `int`'s own `__eq__` (an
+        // `IntEnum` or `IntFlag` member) equals what its value equals.
+        if let (Some(a), Some(b)) = (Self::int_eq_value(x), Self::int_eq_value(item)) {
+            return Some(a == b);
+        }
+        // A function, or a class under `type`'s own `__eq__`, equals
+        // nothing but itself, against anything whose `__eq__` doesn't
+        // know it either.
+        let identity = |o: &Object| match o {
+            Object::Function(_) => true,
+            Object::Type(t) => Self::plain_metaclass(t),
+            _ => false,
+        };
+        // (A builtin function's `__eq__` knows only builtin functions.)
+        let default_eq = |o: &Object| {
+            identity(o)
+                || scalar(o)
+                || matches!(o, Object::Builtin(_))
+                || (matches!(o, Object::Instance(i) if i.native.get().is_none())
+                    && !crate::object::instance_has_custom_eq(o))
+        };
+        if (identity(x) && default_eq(item)) || (identity(item) && default_eq(x)) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// The value `o` compares as under `int.__eq__`: a machine `int` or
+    /// `bool`, or an instance of an `int` subclass whose `__eq__` is
+    /// `int`'s own, over a machine `int`.
+    fn int_eq_value(o: &Object) -> Option<i64> {
+        match o {
+            Object::Int(i) => Some(*i),
+            Object::Bool(b) => Some(i64::from(*b)),
+            Object::Instance(inst) => {
+                let Some(Object::Int(i)) = inst.native.get() else {
+                    return None;
+                };
+                let eq = inst.cls_raw().dunder(crate::types::Dunder::Eq);
+                (eq.builtin_owner() && !eq.object_owner()).then_some(*i)
+            }
+            _ => None,
+        }
     }
 
     /// `len(v)` for an instance whose class serves `__len__` with a
@@ -24418,8 +27266,7 @@ impl Interpreter {
         // Inspect an existing table first. A Python-defined subscript
         // must not allocate a native cache or pay the temporary probe.
         let cached = code_vm_ext(code)
-            .and_then(|ext| ext.method_slots.get())
-            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|ext| ext.method_slot(cache_pc as usize))
             .and_then(|slot| slot.get_native_subscript(version, generation));
         let fast = match cached {
             Some(fast) => {
@@ -24485,8 +27332,7 @@ impl Interpreter {
         let version = cls.attr_version.get();
         let generation = leaf_builtins::generation();
         let cached = code_vm_ext(code)
-            .and_then(|ext| ext.method_slots.get())
-            .and_then(|slots| slots.get(cache_pc as usize))
+            .and_then(|ext| ext.method_slot(cache_pc as usize))
             .and_then(|slot| slot.get_native_subscript(version, generation));
         if cached.is_some() {
             return cached;
@@ -24683,6 +27529,7 @@ impl Interpreter {
                     ("any", LeafKind::Fast(crate::seqiter::any_fast)),
                     ("all", LeafKind::Fast(crate::seqiter::all_fast)),
                     ("abs", LeafKind::Fast(crate::seqiter::abs_fast)),
+                    ("hash", LeafKind::Fast(crate::seqiter::hash_fast)),
                     ("ord", LeafKind::Fast(crate::seqiter::ord_fast)),
                     ("chr", LeafKind::Fast(crate::seqiter::chr_fast)),
                     ("divmod", LeafKind::Fast(crate::seqiter::divmod_fast)),
@@ -24707,6 +27554,7 @@ impl Interpreter {
                         ("__len__", LeafKind::Len),
                         ("append", LeafKind::ListAppend),
                         ("pop", LeafKind::ListPop),
+                        ("extend", LeafKind::ListExtend),
                         ("insert", LeafKind::ListInsert),
                         ("reverse", LeafKind::ListReverse),
                         ("copy", LeafKind::ListCopy),
@@ -25249,25 +28097,62 @@ impl Interpreter {
     /// the default. `None` for anything else (descriptors, dunders, a
     /// missing attribute's `AttributeError`), which the full call handles.
     fn leaf_getattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-        let (recv, Object::Str(name_obj)) = (args.first()?, args.get(1)?) else {
+        if args.len() > 3 {
+            return None;
+        }
+        Self::leaf_getattr_parts(args.first()?, args.get(1)?, args.get(2), false).map(Ok)
+    }
+
+    /// [`Self::leaf_getattr`] on its parts, `default` the third argument's
+    /// value if any. With `probe` (`hasattr`), the value found matters
+    /// only as present: a method found to bind is answered with `True`
+    /// instead of a bound method, and a built-in kind's method (see
+    /// [`builtins::lookup_method`]) is found without binding it.
+    fn leaf_getattr_parts(
+        recv: &Object,
+        name_arg: &Object,
+        default: Option<&Object>,
+        probe: bool,
+    ) -> Option<Object> {
+        let Object::Str(name_obj) = name_arg else {
             return None;
         };
         let name: &str = name_obj;
-        if args.len() > 3 || crate::object::exotic_str_keys_possible() {
+        if crate::object::exotic_str_keys_possible() {
             return None;
         }
         let inst = match recv {
             Object::Instance(inst) => inst,
             // A function's stored attribute (`__doc__` once read,
             // `__wrapped__`).
-            Object::Function(f) => return function_stored_attr(f, name_obj).map(Ok),
+            Object::Function(f) => return function_stored_attr(f, name_obj),
+            // A plain module's global (`hasattr(os, 'getpid')`): its
+            // dictionary's value (`ModuleType`'s descriptors are dunders;
+            // a missing name may reach a module `__getattr__`).
+            Object::Module(m)
+                if !name.starts_with("__") && !crate::object::module_classes_possible() =>
+            {
+                return m.dict.borrow().get(&crate::object::StrKey(name)).cloned();
+            }
+            // A built-in kind's method (`hasattr(stream, "write")`): its
+            // lookup runs no code, and a found method means the attribute
+            // is there.
+            _ if probe
+                && !name.starts_with('_')
+                && builtins::method_memo_tag(recv).is_some()
+                && builtins::lookup_method(recv, name).is_some() =>
+            {
+                return Some(Object::Bool(true));
+            }
             _ => return None,
         };
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
         // default.
         if name.starts_with("__") {
-            return (args.len() == 3 && attr_certainly_missing(&args[0], name))
-                .then(|| Ok(args[2].clone()));
+            if let Some(d) = default.filter(|_| attr_certainly_missing(recv, name)) {
+                return Some(d.clone());
+            }
+            return Self::leaf_builtin_dunder_attr(inst, recv, name);
         }
         let cls = inst.cls_raw();
         if cls.native_kind.get() != 0
@@ -25295,18 +28180,56 @@ impl Interpreter {
             return None;
         }
         if let Some(v) = inst.attr_get_str(name) {
-            return Some(Ok(v));
+            return Some(v);
         }
-        Some(Ok(match on_class {
+        Some(match on_class {
+            Some(Object::Function(_)) if probe => Object::Bool(true),
             Some(f @ Object::Function(_)) => {
-                Object::BoundMethod(Rc::new(BoundMethod::new(args[0].clone(), f)))
+                Object::BoundMethod(Rc::new(BoundMethod::new(recv.clone(), f)))
             }
             Some(v) => v,
-            None if args.len() == 3 && !cls.dunder(crate::types::Dunder::GetAttr).present() => {
-                args[2].clone()
+            None if default.is_some() && !cls.dunder(crate::types::Dunder::GetAttr).present() => {
+                default?.clone()
             }
             None => return None,
-        }))
+        })
+    }
+
+    /// A dunder a plain instance gets from a builtin method on its class
+    /// (`obj.__reduce_ex__`, which `copy` fetches): what
+    /// `load_attr_instance_default` resolves for it (an instance-dict
+    /// entry, else the method bound to `obj`), or `None` for any shape
+    /// that path treats specially.
+    fn leaf_builtin_dunder_attr(inst: &PyInstance, recv: &Object, name: &str) -> Option<Object> {
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || !Self::default_getattribute(cls)
+            || cls.dunder(crate::types::Dunder::GetAttr).present()
+            || cls.is_super_proxy_type()
+        {
+            return None;
+        }
+        let Some(Object::Builtin(b)) = cls.lookup(name) else {
+            return None;
+        };
+        // (A weak proxy forwards these names to its referent.)
+        if matches!(
+            name,
+            "__reduce_ex__" | "__reduce__" | "__copy__" | "__deepcopy__" | "__getstate__"
+        ) && crate::stdlib::weakref_real::proxy_referent(recv).is_some()
+        {
+            return None;
+        }
+        if let Some(v) = inst.attr_get_str(name) {
+            return Some(v);
+        }
+        Some(if b.binds_instance {
+            Object::BoundMethod(Rc::new(BoundMethod::new(recv.clone(), Object::Builtin(b))))
+        } else {
+            Object::Builtin(b)
+        })
     }
 
     /// `hasattr(obj, name)` decided as [`Self::leaf_getattr`] decides
@@ -25317,11 +28240,9 @@ impl Interpreter {
         let [obj, name] = args else {
             return None;
         };
-        let probe = [obj.clone(), name.clone(), Object::Unbound];
-        match Self::leaf_getattr(&probe)? {
-            Ok(Object::Unbound) => Some(Ok(Object::Bool(false))),
-            Ok(_) => Some(Ok(Object::Bool(true))),
-            Err(_) => None,
+        match Self::leaf_getattr_parts(obj, name, Some(&Object::Unbound), true)? {
+            Object::Unbound => Some(Ok(Object::Bool(false))),
+            _ => Some(Ok(Object::Bool(true))),
         }
     }
 
@@ -25400,6 +28321,13 @@ impl Interpreter {
                 });
             }
             K::ListInsert => args.len() == 3 && matches!(args[0], O::List(_)) && leaf_int(&args[1]),
+            // An exact list's or tuple's items, snapshotted: no iteration
+            // hook runs.
+            K::ListExtend => {
+                args.len() == 2
+                    && matches!(args[0], O::List(_))
+                    && matches!(args[1], O::List(_) | O::Tuple(_))
+            }
             K::ListReverse | K::ListCopy => args.len() == 1 && matches!(args[0], O::List(_)),
             // Admitted when every comparison `list.remove` makes up to its
             // match (or to the end: the ValueError) runs no Python code.
@@ -25690,7 +28618,14 @@ impl Interpreter {
                     .filter(|(key, _)| slot_name_matches(code, name_idx, key))
                     .map(|(_, value)| value);
                 match indexed {
-                    Some(v) => Some(Self::clone_operand(v)),
+                    Some(v) => {
+                        let v = Self::clone_operand(v);
+                        drop(slots);
+                        if let Some(ext) = code_vm_ext_existing(code) {
+                            slot_field_note(code, ext, cache_pc as usize, inst, key_idx, name_idx);
+                        }
+                        Some(v)
+                    }
                     None => slots
                         .get(code.names.get(name_idx as usize)?.as_str())
                         .map(Self::clone_operand),
@@ -25826,10 +28761,7 @@ impl Interpreter {
         receiver: &Object,
         depth: usize,
     ) -> Option<Object> {
-        let slot = code_vm_ext(code)?
-            .method_slots
-            .get()?
-            .get(cache_pc as usize)?;
+        let slot = code_vm_ext(code)?.method_slot(cache_pc as usize)?;
         let cls = inst.cls_raw();
         // SAFETY: GIL-serialized (the caller declines free threading); the
         // getter evaluation runs no Python, so nothing rebinds either.
@@ -25916,6 +28848,9 @@ impl Interpreter {
                 return Some(v);
             }
         }
+        if let Some(v) = inst_dict_attr(code, inst, cache_pc as usize, name_idx) {
+            return Some(v);
+        }
         match Self::leaf_resolve_instance_attr_ix(code, inst, name_idx)? {
             (LeafAttr::Value(v), ix) => {
                 if let Some(ix) = ix {
@@ -25998,9 +28933,12 @@ impl Interpreter {
         // `__getattribute__` (a `super` proxy resolves `__init__` in the
         // MRO *after* its own class), where the class-MRO answer the
         // class cache holds would be wrong. `__new__` keeps its historic
-        // exception.
+        // exception, except through a `super` proxy.
         let name = code.names.get(name_idx as usize)?;
-        if name.len() > 4 && name.starts_with("__") && name != "__new__" {
+        if name.len() > 4
+            && name.starts_with("__")
+            && (name != "__new__" || cls.is_super_proxy_type())
+        {
             return None;
         }
         let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -26269,7 +29207,8 @@ impl Interpreter {
                 .is_some_and(|n| n == "__doc__")
         {
             let plain = |v: Option<&Object>| matches!(v, Some(Object::Str(_) | Object::None));
-            let key = crate::object::StrKey("__doc__");
+            // (The site's name, hashed once.)
+            let key = code_name_key(code, name_idx)?;
             if !Self::plain_metaclass(cls) {
                 // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
                 let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
@@ -26309,17 +29248,31 @@ impl Interpreter {
         }
         // A builtin class's native class method (`int.from_bytes`), bound
         // to the class as `classmethod.__get__` binds it.
-        if cls.flags.is_builtin {
-            let name = code.names.get(name_idx as usize)?;
-            let d = cls.dict.try_borrow().ok()?;
-            if let Some(Object::ClassMethod(cm)) = d.get(&crate::object::StrKey(name)) {
-                let f = cm.func();
-                return matches!(f, Object::Builtin(_)).then(|| {
-                    Object::BoundMethod(Rc::new(BoundMethod::py_method(
-                        Object::Type(cls.clone()),
-                        f,
-                    )))
-                });
+        // (Most names are none: the class remembers which, sparing the
+        // probe's hashing.)
+        let name = code.names.get(name_idx as usize)?;
+        if cls.flags.is_builtin
+            && !cls.memo_verdict(crate::types::Verdict::NoNativeClassMethod, name, || {
+                cls.dict.try_borrow().is_ok_and(|d| {
+                    !matches!(
+                        d.get(&crate::object::StrKey(name)),
+                        Some(Object::ClassMethod(_))
+                    )
+                })
+            })
+        {
+            // (Through the type cache: the class's own entry is the one
+            // its MRO walk finds first.)
+            if let Some((Object::ClassMethod(cm), owner)) = cls.lookup_with_owner(name) {
+                if Rc::ptr_eq(&owner, cls) {
+                    let f = cm.func();
+                    return matches!(f, Object::Builtin(_)).then(|| {
+                        Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                            Object::Type(cls.clone()),
+                            f,
+                        )))
+                    });
+                }
             }
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -26451,10 +29404,24 @@ impl Interpreter {
         let Object::Type(cls) = class_obj else {
             return None;
         };
-        let Object::Instance(inst) = self_obj else {
-            return None;
+        // The receiver's class, whose MRO `super()` walks. A class
+        // receiver that is an instance of `cls` (a metaclass method's
+        // `super().__setattr__(...)`) binds like any instance, through
+        // its metaclass; one that is a subclass of `cls` (a class method,
+        // `__new__`) binds unlike one and stays on the full path.
+        let meta_holder;
+        let recv_cls: &TypeObject = match self_obj {
+            Object::Instance(inst) => inst.cls_raw(),
+            Object::Type(k) => {
+                if k.is_subclass_of(cls) {
+                    return None;
+                }
+                // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+                meta_holder = unsafe { (*k.metaclass.as_ptr()).clone() }?;
+                &meta_holder
+            }
+            _ => return None,
         };
-        let recv_cls = inst.cls_raw();
         let ver = recv_cls.attr_version.get();
         let cls_id = Rc::as_ptr(cls) as usize as u64;
         let slot = code_method_slot(code, cache_pc);
@@ -26475,9 +29442,14 @@ impl Interpreter {
             _ => {}
         }
         let name = code.names.get(name_idx as usize)?;
-        if name.starts_with("__") && name != "__init__" {
+        // `super().__class__` is the proxy's own attribute.
+        if name == "__class__" {
             return None;
         }
+        // A built-in class can serve a dunder from outside its dict (a
+        // slot wrapper the full lookup synthesizes): a dunder's walk may
+        // not pass one by.
+        let dunder = name.starts_with("__") && name != "__init__";
         // (The receiver's metaclass takes no part: `super()` reads the
         // dicts along its stored MRO, which a custom `mro()` produced.)
         let mro = recv_cls.mro.try_borrow().ok()?;
@@ -26490,8 +29462,15 @@ impl Interpreter {
             }
             let d = owner.dict.try_borrow().ok()?;
             if let Some(v) = d.get(&key) {
+                // (An introspection-only entry is invisible to dispatch.)
+                if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                    return None;
+                }
                 found = Some(v.clone());
                 break;
+            }
+            if dunder && owner.flags.is_builtin {
+                return None;
             }
         }
         match found? {
@@ -26658,22 +29637,27 @@ impl Interpreter {
                     // establishes, read from the class's own caches).
                     _ => {
                         let cls = inst.cls_raw();
-                        if !Self::default_getattribute(cls)
-                            || cls.flags.is_builtin
-                            || !cls.setattr_is_default()
-                            || cls.forbids_dict
-                            || crate::object::exotic_str_keys_possible()
-                            || (name.starts_with("__") && name != "__doc__")
-                            // An exception's `args` is a `BaseException`
-                            // descriptor.
-                            || (name == "args"
-                                && cls.is_subclass_of(&builtin_types().base_exception))
+                        if crate::object::exotic_str_keys_possible()
                             || inst.c_body.get() != 0
-                            || !matches!(
-                                cls.lookup(name),
-                                None | Some(Object::Function(_) | Object::Str(_) | Object::None)
-                            )
                             || crate::capi_watchers::dicts_active()
+                            // (The class's part, settled per class version.)
+                            || !cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
+                                Self::default_getattribute(cls)
+                                    && !cls.flags.is_builtin
+                                    && cls.setattr_is_default()
+                                    && !cls.forbids_dict
+                                    && !(name.starts_with("__") && name != "__doc__")
+                                    // An exception's `args` is a
+                                    // `BaseException` descriptor.
+                                    && !(name == "args"
+                                        && cls.is_subclass_of(&builtin_types().base_exception))
+                                    && matches!(
+                                        cls.lookup(name),
+                                        None | Some(
+                                            Object::Function(_) | Object::Str(_) | Object::None
+                                        )
+                                    )
+                            })
                         {
                             return None;
                         }
@@ -29686,12 +32670,13 @@ impl Interpreter {
                         // (`sys.exc_info()`), not frame-local: a helper
                         // called from inside an `except:` block can
                         // re-raise the caller's exception.
-                        let mut top = self
+                        let top = self
                             .exc_info_stack
                             .borrow()
                             .last()
                             .cloned()
                             .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
+                        let mut top = PyException::new(top);
                         top.suppress_tb_once = true;
                         top.context_settled = true;
                         return Err(RuntimeError::PyException(top));
@@ -29844,12 +32829,8 @@ impl Interpreter {
                 // `raise`'s `__context__` see the match, not the whole
                 // group, with no per-clause PUSH_EXC_INFO on the wire.
                 if !matches!(matched, Object::None) {
-                    let pe = PyException::new(matched.clone());
                     if let Some(top) = self.exc_info_stack.borrow_mut().last_mut() {
-                        *top = pe.clone();
-                    }
-                    if let Some(top) = frame.exc.as_mut().and_then(|e| e.handlers.last_mut()) {
-                        top.1 = pe;
+                        *top = matched.clone();
                     }
                 }
                 frame.push(rest);
@@ -29867,22 +32848,12 @@ impl Interpreter {
                     .exc_info_stack
                     .borrow()
                     .last()
-                    .map(|pe| pe.instance.clone())
+                    .cloned()
                     .unwrap_or(Object::None);
                 frame.push(prev);
                 frame.push(exc.clone());
                 if let Object::Instance(_) = &exc {
-                    let pe = PyException::new(exc);
-                    // `ins.arg` is the pc just past this handler body
-                    // (back-patched by the compiler). Tag the entry so
-                    // the unwinder can drop it when an exception escapes
-                    // the handler to an enclosing `try`. A 0 arg means
-                    // the code carries no tag (e.g. older marshalled
-                    // bytecode); leave it untagged and let frame-exit
-                    // reconciliation handle any residue.
-                    let body_end = ins.arg;
-                    frame.exc_mut().handlers.push((body_end, pe.clone()));
-                    self.exc_info_stack.borrow_mut().push(pe);
+                    self.exc_info_stack.borrow_mut().push(exc);
                 }
             }
             OpCode::PopExcept => {
@@ -29892,15 +32863,13 @@ impl Interpreter {
                 // `sys.exc_info()` restore, so the value itself is
                 // discarded).
                 let _prev = frame.pop()?;
-                let popped = frame.exc_handlers_pop();
-                drop(self.exc_info_stack.borrow_mut().pop());
+                let popped = self.exc_info_stack.borrow_mut().pop();
                 // CPython clears the just-handled exception at the end of an
                 // `except` block (the implicit `del` of the bound name plus
                 // the per-frame exc-state pop): it dies here unless something
                 // else holds it.
-                self.recheck_frame_observed = true;
-                if let Some((_, pe)) = popped {
-                    self.release(pe.instance);
+                if let Some(popped) = popped {
+                    self.release(popped);
                 }
             }
             OpCode::PrepReraiseStar => {
@@ -29973,7 +32942,7 @@ impl Interpreter {
                             .lasti
                             .store(orig, std::sync::atomic::Ordering::Relaxed);
                         if let Some(py_frame) = shell.materialized.borrow().as_ref() {
-                            py_frame.lasti.set(orig);
+                            py_frame.set_lasti(orig);
                         }
                     }
                 }
@@ -30349,7 +33318,7 @@ impl Interpreter {
                         // Keep the in-flight traceback so the RuntimeError
                         // points at the offending frame; chain the original
                         // as cause + context (PEP 479 wording).
-                        new_exc.traceback = orig.traceback.clone();
+                        new_exc.traced = orig.traced;
                         new_exc.cause = Some(Box::new(orig.clone()));
                         new_exc.context = Some(Box::new(orig));
                         new_exc.context_settled = true;
@@ -30738,7 +33707,7 @@ impl Interpreter {
         let fresh = !exc.context_settled
             && exc.context.is_none()
             && exc.cause.is_none()
-            && exc.traceback.is_empty()
+            && !exc.traced
             && !exc.suppress_tb_once;
         // Nothing is being handled: there is no context to chain (the
         // decision `attach_implicit_context` would settle the same way),
@@ -30752,7 +33721,7 @@ impl Interpreter {
             if exc.context.is_some() {
                 Self::sync_exc_attrs(exc);
             }
-        } else if exc.traceback.is_empty() && (exc.cause.is_some() || exc.context.is_some()) {
+        } else if !exc.traced && (exc.cause.is_some() || exc.context.is_some()) {
             // A fresh Rust-raised error that already carries an
             // explicit `cause`/`context` (e.g. `_io` chaining a
             // misbehaving raw `readinto`'s `TypeError` into an
@@ -30797,6 +33766,44 @@ impl Interpreter {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether a quiet loop's return from an activation with `shell` may
+    /// skip the general loop: nothing the full epilogue acts on (no frame
+    /// object, no handled-exception entries left above `exc_depth`), or
+    /// no observer for its `'return'` events (the epilogue's object
+    /// settling and stack reconciling then run here, see
+    /// [`Self::finish_quiet_return`]). A `sys._getframe` handle, or a
+    /// frame object some traceback entry built, no longer sends the
+    /// return through the general loop.
+    #[inline]
+    fn return_settles_quietly(&self, shell: &crate::object::FrameShell, exc_depth: usize) -> bool {
+        (!shell
+            .has_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.exc_info_len() <= exc_depth)
+            || !crate::trace::any_observers_active()
+    }
+
+    /// `run_activation`'s epilogue for a normal return of an ordinary
+    /// activation that [`Self::return_settles_quietly`] accepted: pop its
+    /// shell, settle its frame object, drop the handled-exception entries
+    /// it left, park the shell.
+    #[inline(never)]
+    fn finish_quiet_return(
+        &mut self,
+        frame: &Frame,
+        shell: Rc<crate::object::FrameShell>,
+        exc_depth: usize,
+    ) {
+        self.pop_frame_shell();
+        // A lazy traceback entry still holding the shell had its frame
+        // object built by the pop.
+        Self::settle_exited_frame_object(&shell, frame, true);
+        if self.exc_info_len() > exc_depth {
+            self.exc_info_stack.borrow_mut().truncate(exc_depth);
+        }
+        self.recycle_frame_shell(shell);
     }
 
     /// The general loop's unwind of an inline activation that `exc`
@@ -30847,12 +33854,10 @@ impl Interpreter {
         frame: &Frame,
         cur_pc: usize,
     ) {
-        if shell.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            // See `sync_lazy_tb_lasti`.
-            shell
-                .lasti
-                .store(cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
-        }
+        // See `sync_lazy_tb_lasti`.
+        shell
+            .lasti
+            .store(cur_pc as u32, std::sync::atomic::Ordering::Relaxed);
         self.pop_frame_shell();
         Self::settle_exited_frame_object(&shell, frame, true);
         self.recycle_frame_shell(shell);
@@ -30969,15 +33974,10 @@ impl Interpreter {
     }
 
     /// Push one frame's worth of `tb_*` info onto the exception's
-    /// traceback chain — both the legacy `Vec<TracebackEntry>` (used
-    /// for the cheap `RuntimeError` Display impl) and the new
-    /// `PyTraceback` chain stored on the instance dict so Python code
-    /// can walk `exc.__traceback__`.
+    /// traceback: the `PyTraceback` chain stored on the instance so
+    /// Python code can walk `exc.__traceback__`.
     fn append_traceback(&self, exc: &mut PyException, frame: &mut Frame, lasti: u32, lineno: u32) {
-        exc.push_traceback(TracebackEntry {
-            code: frame.code.clone(),
-            lineno,
-        });
+        exc.traced = true;
         // The Python-visible frame for this entry must be *this* frame's
         // snapshot. Generator-family frames cache theirs (stable identity
         // across resumes) but are not necessarily on `frame_stack` when an
@@ -31034,7 +34034,7 @@ impl Interpreter {
                                 // Cache it on generator-family frames so
                                 // `gi_frame` keeps a stable identity.
                                 let py = self.build_py_frame(frame, None);
-                                py.lasti.set(lasti);
+                                py.set_lasti(lasti);
                                 if frame.code.is_generator
                                     || frame.code.is_coroutine
                                     || frame.code.is_async_generator
@@ -31059,12 +34059,17 @@ impl Interpreter {
             let new_tb = Object::Traceback(new_tb);
             inst.note_slot_store(&new_tb);
             let mut slots = inst.slots.borrow_mut();
-            match slots.get_mut("__traceback__") {
+            match slots.exc_tail_place(crate::types::ExcTail::Traceback) {
                 Some(slot) => {
                     let prev = std::mem::replace(slot, new_tb);
-                    if let (Object::Traceback(prev_tb), Object::Traceback(head)) = (&prev, &*slot) {
-                        *head.next.borrow_mut() = Some(prev_tb.clone());
-                    }
+                    // The chain so far moves under the new head.
+                    let prev = match (prev, &*slot) {
+                        (Object::Traceback(prev_tb), Object::Traceback(head)) => {
+                            *head.next.borrow_mut() = Some(prev_tb);
+                            None
+                        }
+                        (prev, _) => Some(prev),
+                    };
                     drop(slots);
                     drop(prev);
                 }
@@ -31104,7 +34109,7 @@ impl Interpreter {
         let new_tb = Rc::new(PyTraceback::new(
             py_frame.clone(),
             py_frame.last_line.get().unwrap_or(1),
-            py_frame.lasti.get(),
+            py_frame.lasti_now(),
             None,
         ));
         inst.slot_set("__traceback__", Object::Traceback(new_tb));
@@ -31129,7 +34134,7 @@ impl Interpreter {
         let Some(ctx) = stack.last() else {
             return;
         };
-        let Object::Instance(ctx_inst) = &ctx.instance else {
+        let Object::Instance(ctx_inst) = ctx else {
             return;
         };
         let Object::Instance(exc_inst) = &exc.instance else {
@@ -31146,7 +34151,7 @@ impl Interpreter {
         // first so traceback walkers can't loop. CPython does the same
         // before assigning the new `__context__`.
         Self::break_implicit_context_cycle(ctx_inst, exc_inst);
-        exc.context = Some(Box::new(ctx.clone()));
+        exc.context = Some(Box::new(PyException::new(ctx.clone())));
     }
 
     /// Chain an exception injected by `gen.throw()` to whatever the
@@ -31160,7 +34165,7 @@ impl Interpreter {
         let Some(active) = frame.saved_exc_info_last() else {
             return;
         };
-        let Object::Instance(active_inst) = &active.instance else {
+        let Object::Instance(active_inst) = active else {
             return;
         };
         let Object::Instance(exc_inst) = &exc.instance else {
@@ -31170,7 +34175,7 @@ impl Interpreter {
             return;
         }
         Self::break_implicit_context_cycle(active_inst, exc_inst);
-        exc.context = Some(Box::new(active.clone()));
+        exc.context = Some(Box::new(PyException::new(active.clone())));
         // Mirror onto the instance dict so Python's `e.__context__` sees
         // it (the throw path doesn't go through `RAISE_VARARGS`, which is
         // where `sync_exc_attrs` normally runs).
@@ -31226,14 +34231,15 @@ impl Interpreter {
     /// `False`), so only real values need storing.
     fn sync_exc_attrs(exc: &PyException) {
         if let Object::Instance(inst) = &exc.instance {
+            use crate::types::ExcTail;
             if let Some(cause) = exc.cause.as_ref() {
-                inst.slot_set("__cause__", cause.instance.clone());
+                drop(inst.exc_tail_set(ExcTail::Cause, cause.instance.clone()));
                 // Explicit cause suppresses __context__ rendering by
                 // default; user code can still set __suppress_context__.
-                inst.slot_set("__suppress_context__", Object::Bool(true));
+                drop(inst.exc_tail_set(ExcTail::SuppressContext, Object::Bool(true)));
             }
             if let Some(context) = exc.context.as_ref() {
-                inst.slot_set("__context__", context.instance.clone());
+                drop(inst.exc_tail_set(ExcTail::Context, context.instance.clone()));
             }
         }
     }
@@ -31323,8 +34329,17 @@ impl Interpreter {
             if matches!(c, Object::None) {
                 pe.cause = None;
                 if let Object::Instance(ref inst_rc) = pe.instance {
-                    inst_rc.slot_set("__cause__", Object::None);
-                    inst_rc.slot_set("__suppress_context__", Object::Bool(true));
+                    use crate::types::ExcTail;
+                    // An unset `__cause__` already reads None (a re-raised
+                    // instance's earlier cause is cleared).
+                    let earlier = inst_rc
+                        .slots
+                        .borrow_mut()
+                        .exc_tail_place(ExcTail::Cause)
+                        .filter(|cause| !matches!(cause, Object::Unbound))
+                        .map(|cause| std::mem::replace(cause, Object::None));
+                    drop(earlier);
+                    drop(inst_rc.exc_tail_set(ExcTail::SuppressContext, Object::Bool(true)));
                 }
             } else {
                 let cpe = Self::normalize_exception(c, None)?;
@@ -31423,10 +34438,19 @@ impl Interpreter {
 
     // ---------- helpers ----------
 
+    /// [`Self::name_at`] without the copy, for a caller that keeps the
+    /// code alive across the use.
+    fn name_ref(code: &CodeObject, arg: u32) -> Result<&str, RuntimeError> {
+        code.names
+            .get(arg as usize)
+            .map(|n| n.as_str())
+            .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))
+    }
+
     fn name_at(&self, code: &CodeObject, arg: u32) -> Result<String, RuntimeError> {
         code.names
             .get(arg as usize)
-            .cloned()
+            .map(|n| n.to_string())
             .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))
     }
 
@@ -31624,6 +34648,18 @@ impl Interpreter {
     /// The dict-subclass instance registered (by `exec`/`eval`) as the
     /// owner of `globals`, if any.
     fn globals_missing_owner(&self, globals: &Rc<RefCell<DictData>>) -> Option<Object> {
+        // While the gate is up every builtin `LOAD_GLOBAL` asks here, and
+        // a program that runs no finalizers may never drain them to notice
+        // the last owner die: every so often, have the next safe point
+        // drain and prune (see `prune_globals_missing_hooks_sometimes`).
+        let n = self.globals_missing_asks.get();
+        if n >= 1024 {
+            self.globals_missing_asks.set(0);
+            self.globals_missing_prune_in.set(0);
+            gc_trace::mark_maybe_dead();
+        } else {
+            self.globals_missing_asks.set(n + 1);
+        }
         let hooks = self.globals_missing_hooks.borrow();
         if hooks.is_empty() {
             return None;
@@ -31702,10 +34738,41 @@ impl Interpreter {
             // the dict, and this table's for the instance.
             Rc::strong_count(d) > 1 || Rc::strong_count(inst) > 1
         });
+        // With no owner left, builtin lookups take their fast paths again
+        // (a `@dataclass` whose annotations needed `annotationlib`'s
+        // `_StringifierDict` set the gate for good otherwise).
+        self.globals_missing_any.set(!hooks.is_empty());
+    }
+
+    /// [`Self::prune_globals_missing_hooks`] every 64th finalizer drain
+    /// while the gate is set: owners die when the `exec`/`eval` or
+    /// function that used them is done, with nothing to notice.
+    #[cold]
+    #[inline(never)]
+    fn prune_globals_missing_hooks_sometimes(&self) {
+        let n = self.globals_missing_prune_in.get();
+        if n > 0 {
+            self.globals_missing_prune_in.set(n - 1);
+            return;
+        }
+        self.globals_missing_prune_in.set(63);
+        self.prune_globals_missing_hooks();
     }
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         let result = self.load_attr_inner(obj, name);
+        self.load_attr_finish(obj, name, result)
+    }
+
+    /// The end of [`Self::load_attr`] for the per-variant lookup's
+    /// `result`: the slot-wrapper rescue, and an `AttributeError`'s
+    /// `name`/`obj` context.
+    fn load_attr_finish(
+        &mut self,
+        obj: &Object,
+        name: &str,
+        result: Result<Object, RuntimeError>,
+    ) -> Result<Object, RuntimeError> {
         // CPython's `object.__getattribute__` final step: after the
         // per-variant lookup misses, resolve the name through
         // `type(obj)`'s MRO slot-wrapper table and bind it
@@ -31782,6 +34849,9 @@ impl Interpreter {
             if self.is_attribute_error(err) {
                 if let RuntimeError::PyException(pe) = err {
                     if let Object::Instance(inst) = &pe.instance {
+                        if attr_error_context_laid_out(inst, obj, name) {
+                            return result;
+                        }
                         let need = matches!(
                             crate::builtin_types::exc_attr(inst, "name"),
                             None | Some(Object::None)
@@ -31870,7 +34940,7 @@ impl Interpreter {
                         // Currently executing (illegal to re-enter)?
                         "running" => {
                             return Ok(Object::Bool(matches!(
-                                &*g.state.borrow(),
+                                &*g.state().borrow(),
                                 GeneratorState::Running | GeneratorState::Delegating(_)
                             )))
                         }
@@ -31879,14 +34949,14 @@ impl Interpreter {
                         "frame" => {
                             // A collapsed chain's generator gets its spine
                             // entry first, as an executing frame has one.
-                            if matches!(&*g.state.borrow(), GeneratorState::Delegating(_)) {
+                            if matches!(&*g.state().borrow(), GeneratorState::Delegating(_)) {
                                 self.flush_pending_callers();
                             }
                             return Ok(self.gen_py_frame(g));
                         }
                         "suspended" => {
                             return Ok(Object::Bool(matches!(
-                                &*g.state.borrow(),
+                                &*g.state().borrow(),
                                 GeneratorState::Suspended(_)
                             )))
                         }
@@ -32613,7 +35683,7 @@ impl Interpreter {
                     // lineno_matches_lasti at the exec 'call' event).
                     let line = fr.current_lineno();
                     if line == 0 {
-                        let at_module_resume = fr.lasti.get() == 0
+                        let at_module_resume = fr.lasti_now() == 0
                             && fr.code.name == "<module>"
                             && fr.code.instructions.first().map(|x| x.op)
                                 == Some(weavepy_compiler::bytecode::OpCode::Resume);
@@ -32633,7 +35703,7 @@ impl Interpreter {
                     }
                 }
                 "f_lasti" => Ok(Object::Int(i64::from(
-                    fr.code.cpython_lasti(fr.lasti.get()),
+                    fr.code.cpython_lasti(fr.lasti_now()),
                 ))),
                 "f_back" => {
                     // A generator-family frame drops its resumer link when
@@ -33566,6 +36636,17 @@ impl Interpreter {
                 Rc::strong_count(inst),
             );
         }
+        // `inst.__class__` (`_abc_instancecheck`, `isinstance` misses,
+        // `copy`): `object`'s descriptor answering the class, when nothing
+        // on the MRO overrides `__class__` or `__getattribute__` (a
+        // builtin class's instances, weak proxies among them, keep the
+        // full lookup).
+        if name == "__class__" && inst.c_body.get() == 0 {
+            let cls = inst.cls();
+            if !cls.flags.is_builtin && cls.class_attr_is_plain() {
+                return Ok(Object::Type(cls));
+            }
+        }
         let result = if let Some(getattribute) = self.user_getattribute(&inst.cls()) {
             // `dispatch` (not `new`): a `__getattribute__` that is itself a
             // descriptor (`__getattribute__ = SomeDescriptor()`) must have
@@ -33582,29 +36663,54 @@ impl Interpreter {
                 &self.builtins.clone(),
             )
         } else {
+            // The default lookup would only raise for the hook to catch:
+            // call the hook without building that `AttributeError` (CPython's
+            // `slot_tp_getattr_hook` suppresses it the same way).
+            let hook = inst.cls().dunder(crate::types::Dunder::GetAttr).present();
+            if hook && default_lookup_misses(instance_obj, name, true) {
+                if let Some(getattr) = inst.cls().lookup("__getattr__") {
+                    return self.call_getattr_hook(instance_obj, getattr, name);
+                }
+            }
             self.load_attr_instance_default(inst, instance_obj, name)
         };
         match result {
             Err(e) if self.is_attribute_error(&e) => {
-                if let Some(getattr) = inst.cls().lookup("__getattr__") {
-                    // `dispatch` so a descriptor `__getattr__` also honours
-                    // its `__get__` (test_descr test_getattr_hooks).
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                        instance_obj.clone(),
-                        getattr,
-                    )));
-                    self.call(
-                        &bound,
-                        &[Object::from_str(name)],
-                        &[],
-                        &self.builtins.clone(),
-                    )
-                } else {
-                    Err(e)
+                // (The memoized answer first: most classes have no hook.)
+                let cls = inst.cls();
+                let hook = cls.dunder(crate::types::Dunder::GetAttr).present();
+                match hook.then(|| cls.lookup("__getattr__")).flatten() {
+                    Some(getattr) => self.call_getattr_hook(instance_obj, getattr, name),
+                    None => Err(e),
                 }
             }
             other => other,
         }
+    }
+
+    /// `type(obj).__getattr__(obj, name)`, the hook `getattr` resolved.
+    fn call_getattr_hook(
+        &mut self,
+        instance_obj: &Object,
+        getattr: Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        // A plain function binds the instance as its first argument.
+        if let Object::Function(f) = &getattr {
+            return self.call_python(f, &[instance_obj.clone(), Object::from_str(name)], &[]);
+        }
+        // `dispatch` so a descriptor `__getattr__` also honours its
+        // `__get__` (test_descr test_getattr_hooks).
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
+            instance_obj.clone(),
+            getattr,
+        )));
+        self.call(
+            &bound,
+            &[Object::from_str(name)],
+            &[],
+            &self.builtins.clone(),
+        )
     }
 
     /// A user-defined `__getattribute__` override, if any. Returns `None`
@@ -33737,7 +36843,10 @@ impl Interpreter {
         frame: &mut Frame,
         arg: u32,
     ) -> Result<Option<Object>, RuntimeError> {
-        if arg & 2 != 0 || crate::trace::any_observers_active() {
+        // (Both forms: the explicit `super(C, obj)` puts its arguments
+        // where the implicit one puts the `__class__` cell and the first
+        // argument, and CPython specializes either.)
+        if crate::trace::any_observers_active() {
             return Ok(None);
         }
         let n = frame.stack.len();
@@ -34840,13 +37949,19 @@ impl Interpreter {
                         None if slot.default.is_some() => Ok(slot.default.clone().unwrap()),
                         // CPython's member descriptor reports the
                         // owning type's *fully qualified* name here
-                        // (e.g. `pkg.mod.Cls`), unlike the generic
-                        // "has no attribute" path which uses `tp_name`.
-                        None => Err(attribute_error(format!(
-                            "'{}' object has no attribute '{}'",
-                            inst.cls().qualified_display_name(),
-                            slot.name
-                        ))),
+                        // (`%T`: e.g. `pkg.mod.Cls`, but `Cls` in
+                        // `__main__`), unlike the generic "has no
+                        // attribute" path which uses `tp_name`.
+                        None => {
+                            let ty = inst.cls().fully_qualified_name();
+                            let mut msg = String::with_capacity(ty.len() + slot.name.len() + 30);
+                            msg.push('\'');
+                            msg.push_str(&ty);
+                            msg.push_str("' object has no attribute '");
+                            msg.push_str(&slot.name);
+                            msg.push('\'');
+                            Err(attribute_error(msg))
+                        }
                     }
                 }
                 _ => Err(type_error("slot descriptor requires an instance")),
@@ -37165,7 +40280,7 @@ impl Interpreter {
                     None => Ok(default.expect("checked above")),
                 }
             }
-            Object::Generator(g) => self.generator_send(g, Object::None),
+            Object::Generator(g) => self.generator_next_raw(g, false),
             Object::Coroutine(_) => match self.gen_method_send(it, Object::None) {
                 Ok(v) => Ok(v),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
@@ -37558,7 +40673,7 @@ impl Interpreter {
                 let mut out = Vec::new();
                 if !self.seq_drain(l, &mut out, globals)? {
                     loop {
-                        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+                        if let Some(r) = self.lazy_core_next(l) {
                             match r {
                                 Some(x) => out.push(x),
                                 None => break,
@@ -37708,7 +40823,13 @@ impl Interpreter {
         // instead of materializing the whole sequence first; CPython's
         // `builtin_sum_impl` is exactly this drive loop.
         let mut total = SumState::new(acc);
-        if let Object::Generator(g) = &args[0] {
+        // (An iterable whose `__iter__` is a generator function, as a tree
+        // walked by `yield from`, drains the same way.)
+        let iter = match &args[0] {
+            Object::Generator(_) => args[0].clone(),
+            other => self.make_iter(other, globals)?,
+        };
+        if let Object::Generator(g) = &iter {
             loop {
                 // A lean resume folds scalar yields straight into `total`
                 // (see `Interpreter::sum_fold`); it returns at the first
@@ -37723,7 +40844,6 @@ impl Interpreter {
         }
         // Stream the live iterator. Addition can mutate the source or
         // raise, so don't consume later elements or request a length hint.
-        let iter = self.make_iter(&args[0], globals)?;
         while let Some(x) = self.iter_next(&iter, globals)? {
             total.add(self, x)?;
         }
@@ -38011,8 +41131,12 @@ impl Interpreter {
         }
         // Only `Instance`s can carry a custom `__class__`; for every other
         // object the real type *is* `__class__`, so skip the (observable)
-        // attribute access on the negative path.
-        if let Object::Instance(_) = obj {
+        // attribute access on the negative path. So is it for an instance
+        // whose class overrides neither `__class__` nor `__getattribute__`.
+        if let Object::Instance(inst) = obj {
+            if inst.cls().class_attr_is_plain() {
+                return Ok(Object::Bool(false));
+            }
             match self.load_attr(obj, "__class__") {
                 Ok(Object::Type(c)) => {
                     if !Rc::ptr_eq(&c, &real) && c.is_subclass_of(cls) {
@@ -38510,7 +41634,7 @@ impl Interpreter {
         args: &[Object],
         _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let name = match attr_name_arg(args.get(1)) {
+        let name = match attr_name_cow(args.get(1)) {
             Some(n) => n,
             None => {
                 return Err(type_error(format!(
@@ -38532,12 +41656,26 @@ impl Interpreter {
                 ))),
             };
         }
-        if args.len() >= 3 && attr_certainly_missing(&args[0], &name) {
+        if args.len() < 3 {
+            return self.load_attr(&args[0], &name);
+        }
+        if attr_certainly_missing(&args[0], &name) {
             return Ok(args[2].clone());
+        }
+        let value_class = builtin_value_class(&args[0]);
+        if let Some(c) = &value_class {
+            if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
+                return Ok(args[2].clone());
+            }
         }
         match self.load_attr(&args[0], &name) {
             Ok(v) => Ok(v),
-            Err(e) if args.len() >= 3 && self.is_attribute_error(&e) => Ok(args[2].clone()),
+            Err(e) if self.is_attribute_error(&e) => {
+                if let Some(c) = value_class {
+                    c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
+                }
+                Ok(args[2].clone())
+            }
             Err(e) => Err(e),
         }
     }
@@ -38551,7 +41689,7 @@ impl Interpreter {
         args: &[Object],
         _globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let name = match attr_name_arg(args.get(1)) {
+        let name = match attr_name_cow(args.get(1)) {
             Some(n) => n,
             None => {
                 return Err(type_error(format!(
@@ -38568,22 +41706,32 @@ impl Interpreter {
         if attr_certainly_missing(&args[0], &name) {
             return Ok(Object::Bool(false));
         }
-        let immutable_type = match &args[0] {
-            Object::Type(t) if t.flags.is_builtin && !crate::stdlib::os::is_struct_seq_type(t) => {
-                Some(t)
-            }
+        // A builtin class's miss, remembered per class version (a
+        // struct-sequence class, whose attributes can be set, moves its
+        // version when they are).
+        let builtin_type = match &args[0] {
+            Object::Type(t) if t.flags.is_builtin => Some(t),
             _ => None,
         };
-        if let Some(t) = immutable_type {
-            if builtin_type_misses::contains(t, &name) {
+        if let Some(t) = builtin_type {
+            if t.verdict_cached(crate::types::Verdict::TypeAttrMissing, &name) == Some(true) {
+                return Ok(Object::Bool(false));
+            }
+        }
+        let value_class = builtin_value_class(&args[0]);
+        if let Some(c) = &value_class {
+            if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
                 return Ok(Object::Bool(false));
             }
         }
         match self.load_attr(&args[0], &name) {
             Ok(_) => Ok(Object::Bool(true)),
             Err(e) if self.is_attribute_error(&e) => {
-                if let Some(t) = immutable_type {
-                    builtin_type_misses::insert(t, &name);
+                if let Some(t) = builtin_type {
+                    t.verdict_record(crate::types::Verdict::TypeAttrMissing, &name, true);
+                }
+                if let Some(c) = value_class {
+                    c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
                 }
                 Ok(Object::Bool(false))
             }
@@ -40348,7 +43496,7 @@ impl Interpreter {
                 // CPython GET_AWAITABLE: a coroutine that is suspended
                 // inside its own `await` (it has a yield-from
                 // sub-iterator) cannot gain a second awaiter.
-                let busy = matches!(&*g.state.borrow(), GeneratorState::Suspended(frame)
+                let busy = matches!(&*g.state().borrow(), GeneratorState::Suspended(frame)
                     if detect_yield_from_subiter(frame).is_some());
                 if busy {
                     return Err(crate::error::runtime_error(
@@ -40402,7 +43550,7 @@ impl Interpreter {
                         let RuntimeError::PyException(mut outer) = not_awaitable(&value) else {
                             unreachable!("not_awaitable builds a PyException");
                         };
-                        outer.traceback = inner.traceback.clone();
+                        outer.traced = inner.traced;
                         outer.cause = Some(Box::new(inner.clone()));
                         outer.context = Some(Box::new(inner));
                         Self::sync_exc_attrs(&outer);
@@ -40504,7 +43652,7 @@ impl Interpreter {
         match iter {
             Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
-            Object::Generator(g) => match self.generator_send(g, Object::None) {
+            Object::Generator(g) => match self.generator_next_raw(g, false) {
                 Ok(v) => Ok(Some(v)),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                     Ok(None)
@@ -40631,15 +43779,30 @@ impl Interpreter {
     /// Runs at the interpreter level because the wrapped source can be
     /// any VM iterable (generator, user `__next__`, native iterator) —
     /// and, like CPython's C itertools, stepping adds no Python frame.
+    /// A `StopIteration` that a callback raises ends the iteration, as a C
+    /// iterator's `tp_iternext` leaving it set does for its consumer
+    /// (`for x in map(f, xs)` stops where `f` raises it).
     fn lazy_iter_next(
         &mut self,
         l: &Rc<crate::object::PyLazyIter>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        match self.lazy_iter_step(l, globals) {
+            Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+            r => r,
+        }
+    }
+
+    /// [`Self::lazy_iter_next`]'s step.
+    fn lazy_iter_step(
+        &mut self,
+        l: &Rc<crate::object::PyLazyIter>,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
         use crate::object::LazyIterKind;
-        // Steps that run no code first (pure state machines, and native
-        // sources with an item ready), under one borrow.
-        if let Some(r) = crate::seqiter::lazy_pure_next(l) {
+        // Steps that run no code first (pure state machines, native
+        // sources with an item ready, pure callbacks), under one borrow.
+        if let Some(r) = self.lazy_core_next(l) {
             return Ok(r);
         }
         // The builtin `map`/`filter`/`zip`/`enumerate` adapters.
@@ -41536,10 +44699,10 @@ impl Interpreter {
         // now (e.g. `await anext(me)` from inside the body) both count
         // as "already running" in CPython's `ag_running_async` sense.
         let mid_await = matches!(
-            &*g.state.borrow(),
+            &*g.state().borrow(),
             GeneratorState::Suspended(frame) if !frame.agen_yielded_value
         ) || matches!(
-            &*g.state.borrow(),
+            &*g.state().borrow(),
             GeneratorState::Running | GeneratorState::Delegating(_)
         );
         if !mid_await {
@@ -41665,7 +44828,7 @@ impl Interpreter {
     /// "completes with value" behavior) when the frame can't be inspected
     /// (e.g. the generator already finished).
     fn agen_yielded_a_value(g: &Rc<PyGenerator>) -> bool {
-        match &*g.state.borrow() {
+        match &*g.state().borrow() {
             GeneratorState::Suspended(frame) => frame.agen_yielded_value,
             _ => true,
         }
@@ -41817,7 +44980,7 @@ impl Interpreter {
         let mut new_exc = PyException::new(rt_inst);
         // Keep the in-flight traceback so the RuntimeError points at the
         // offending frame; chain the original as cause + context.
-        new_exc.traceback = exc.traceback.clone();
+        new_exc.traced = exc.traced;
         new_exc.cause = Some(Box::new(exc.clone()));
         new_exc.context = Some(Box::new(exc));
         Self::sync_exc_attrs(&new_exc);
@@ -41840,11 +45003,11 @@ impl Interpreter {
         gen: &Rc<PyGenerator>,
         mut exc: PyException,
     ) -> Result<Object, RuntimeError> {
-        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let prev_state = std::mem::replace(&mut *gen.state().borrow_mut(), GeneratorState::Running);
         let mut frame = match prev_state {
             GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => *boxed,
             GeneratorState::Finished => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 // bpo-25887: throwing into an exhausted coroutine is a
                 // RuntimeError (matching `send`), except for the
                 // GeneratorExit that `close()` injects.
@@ -41864,7 +45027,7 @@ impl Interpreter {
                 )));
             }
             delegating @ GeneratorState::Delegating(_) => {
-                *gen.state.borrow_mut() = delegating;
+                *gen.state().borrow_mut() = delegating;
                 return Err(value_error(format!(
                     "{} already executing",
                     gen.kind.word()
@@ -41912,7 +45075,7 @@ impl Interpreter {
                         self.resume_outer_with_exc(gen, frame, close_exc)
                     }
                     Err(err) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         self.recycle_frame_allocs(&mut frame);
                         Err(err)
                     }
@@ -41958,18 +45121,18 @@ impl Interpreter {
                             Ok(v)
                         }
                         Ok(FrameOutcome::Returned(v)) => {
-                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            *gen.state().borrow_mut() = GeneratorState::Finished;
                             self.recycle_frame_allocs(&mut frame);
                             Err(stop_iteration_with(v))
                         }
                         Ok(FrameOutcome::StartGenerator) => {
-                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            *gen.state().borrow_mut() = GeneratorState::Finished;
                             Err(RuntimeError::Internal(
                                 "RETURN_GENERATOR inside generator_throw".to_owned(),
                             ))
                         }
                         Err(err) => {
-                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            *gen.state().borrow_mut() = GeneratorState::Finished;
                             let escaped = self.pep479_escape(gen, err);
                             self.recycle_frame_allocs(&mut frame);
                             Err(escaped)
@@ -41987,7 +45150,7 @@ impl Interpreter {
                     return self.resume_outer_with_exc(gen, frame, inner_exc);
                 }
                 Err(err) => {
-                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    *gen.state().borrow_mut() = GeneratorState::Finished;
                     self.recycle_frame_allocs(&mut frame);
                     return Err(err);
                 }
@@ -42010,7 +45173,7 @@ impl Interpreter {
                 frame.py_frame = Some(py.clone());
                 py
             });
-            py.lasti.set(frame.pc);
+            py.set_lasti(frame.pc);
             let line = frame
                 .code
                 .linetable
@@ -42027,7 +45190,7 @@ impl Interpreter {
                 .and_then(|()| self.fire_exception_event(&py, &exc, true));
             self.pop_frame_shell();
             if let Err(err) = hook_result {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 return Err(err);
             }
             frame.suppress_call_event = true;
@@ -42054,7 +45217,7 @@ impl Interpreter {
                 // raise/handled pairing).
                 if let Some(inst) = handled_arg {
                     if let Err(err) = self.fire_gen_handled_event(&mut frame, inst) {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         return Err(err);
                     }
                 }
@@ -42064,18 +45227,18 @@ impl Interpreter {
                         Ok(v)
                     }
                     Ok(FrameOutcome::Returned(v)) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         self.recycle_frame_allocs(&mut frame);
                         Err(stop_iteration_with(v))
                     }
                     Ok(FrameOutcome::StartGenerator) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         Err(RuntimeError::Internal(
                             "RETURN_GENERATOR inside generator_throw".to_owned(),
                         ))
                     }
                     Err(err) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         let escaped = self.pep479_escape(gen, err);
                         self.recycle_frame_allocs(&mut frame);
                         Err(escaped)
@@ -42090,7 +45253,7 @@ impl Interpreter {
                 // `None` to both settrace and setprofile) must fire now —
                 // `gen_close` on a bare genexpr is exactly this path
                 // (test_cprofile.test_throw).
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 if crate::trace::any_observers_active() {
                     let py = frame.py_frame.clone().unwrap_or_else(|| {
                         let py = self.build_py_frame(&frame, None);
@@ -42149,7 +45312,7 @@ impl Interpreter {
     /// closes this way on the spot instead of queueing its finalizer.
     pub(crate) fn gen_close_quiet_detached(g: &PyGenerator) -> Option<Box<Frame>> {
         const RESUME_DEPTH1_MASK: u32 = 4;
-        let Ok(mut state) = g.state.try_borrow_mut() else {
+        let Ok(mut state) = g.state().try_borrow_mut() else {
             return None;
         };
         let (created, boxed) = match &mut *state {
@@ -42250,7 +45413,7 @@ impl Interpreter {
                 // a traceback pointing at the generator's frame (the
                 // unraisable hook asserts `exc_traceback is not None`).
                 let frame_obj = self.gen_py_frame(&g);
-                *g.state.borrow_mut() = GeneratorState::Finished;
+                *g.state().borrow_mut() = GeneratorState::Finished;
                 let err =
                     crate::error::runtime_error(format!("{} ignored GeneratorExit", g.kind.word()));
                 if let RuntimeError::PyException(pyexc) = &err {
@@ -42260,7 +45423,7 @@ impl Interpreter {
                         let tb = Rc::new(PyTraceback::new(
                             pf.clone(),
                             pf.last_line.get().unwrap_or(1),
-                            pf.lasti.get(),
+                            pf.lasti_now(),
                             None,
                         ));
                         inst.slot_set("__traceback__", Object::Traceback(tb));
@@ -42273,7 +45436,7 @@ impl Interpreter {
                     || exc.type_name() == "StopIteration"
                     || exc.type_name() == "StopAsyncIteration" =>
             {
-                *g.state.borrow_mut() = GeneratorState::Finished;
+                *g.state().borrow_mut() = GeneratorState::Finished;
                 // Python 3.13 (gh-104770): if the generator catches
                 // `GeneratorExit` and then *returns* a value, `close()`
                 // returns it. The return surfaces as `StopIteration(value)`;
@@ -42288,7 +45451,7 @@ impl Interpreter {
                 Ok(Object::None)
             }
             Err(err) => {
-                *g.state.borrow_mut() = GeneratorState::Finished;
+                *g.state().borrow_mut() = GeneratorState::Finished;
                 Err(err)
             }
         }
@@ -42387,7 +45550,7 @@ impl Interpreter {
             frame.py_frame = Some(py.clone());
             py
         });
-        py.lasti.set(frame.pc);
+        py.set_lasti(frame.pc);
         py.set_back(self.materialize_top_py_frame());
         self.push_materialized_frame(&py);
         let hook_result =
@@ -42419,7 +45582,7 @@ impl Interpreter {
                 // (CPython's exception_unwind → monitor_handled).
                 if let Some(inst) = handled_arg {
                     if let Err(err) = self.fire_gen_handled_event(&mut frame, inst) {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         return Err(err);
                     }
                 }
@@ -42429,18 +45592,18 @@ impl Interpreter {
                         Ok(v)
                     }
                     Ok(FrameOutcome::Returned(v)) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         self.recycle_frame_allocs(&mut frame);
                         Err(stop_iteration_with(v))
                     }
                     Ok(FrameOutcome::StartGenerator) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         Err(RuntimeError::Internal(
                             "RETURN_GENERATOR inside resume_outer_with_exc".to_owned(),
                         ))
                     }
                     Err(err) => {
-                        *gen.state.borrow_mut() = GeneratorState::Finished;
+                        *gen.state().borrow_mut() = GeneratorState::Finished;
                         let escaped = self.pep479_escape(gen, err);
                         self.recycle_frame_allocs(&mut frame);
                         Err(escaped)
@@ -42449,7 +45612,7 @@ impl Interpreter {
             }
             Ok(None) => unreachable!(),
             Err(err) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 self.recycle_frame_allocs(&mut frame);
                 Err(escaped)
@@ -42511,7 +45674,7 @@ impl Interpreter {
         };
         {
             let dict = d.borrow();
-            let cell_names: Vec<&String> = frame
+            let cell_names: Vec<&weavepy_compiler::Name> = frame
                 .code
                 .cellvars
                 .iter()
@@ -42564,6 +45727,53 @@ impl Interpreter {
     /// on the frame or its cached shell), it suspended outside any
     /// handler (no detached exception state to restore), and its code
     /// is the interpreter's — else `None` and the general path runs.
+    /// `next(gen)` from native code (`next()` outside the core loop, a
+    /// native iterator's step over a generator): a simple body steps to
+    /// its next yield in place, as a `FOR_ITER` over it does (see
+    /// `gen_fast`), and anything else resumes through
+    /// [`Self::generator_send`]. With `raw`, as [`Self::generator_resume`]
+    /// reports a return. (`gen.send(None)` keeps its activation: a body
+    /// tier 2 parks natively resumes there.)
+    fn generator_next_raw(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        raw: bool,
+    ) -> Result<Object, RuntimeError> {
+        if gen.kind == crate::object::CoroutineKind::Generator {
+            if let Some(r) = self.generator_next_fast(gen, raw) {
+                return r;
+            }
+        }
+        if raw {
+            GEN_RAW_RETURN.with(|r| r.set(true));
+        }
+        self.generator_send_fold(gen, Object::None, None)
+    }
+
+    /// [`Self::generator_next_raw`]'s fast step, on the lean resume's
+    /// terms: `None` when the generator or its body declines, with nothing
+    /// run (or the body stopped partway, parked for the general resume to
+    /// go on with).
+    #[inline]
+    fn generator_next_fast(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        raw_return: bool,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let snap_gen = self.lean_snapshot()?;
+        if self.dbg_sample
+            || crate::trace::eval_frame_record_active()
+            || crate::stdlib::greenlet_native::on_greenlet_stack()
+        {
+            return None;
+        }
+        match self.gen_fast_next(gen, snap_gen, 0, crate::gc_trace::maybe_dead_flag()) {
+            gen_fast::GenNext::Yielded(v) => Some(Ok(v)),
+            gen_fast::GenNext::Exhausted(v) => Some(Self::generator_returned(v, raw_return)),
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
+    }
+
     fn generator_send_lean(
         &mut self,
         gen: &Rc<PyGenerator>,
@@ -42582,7 +45792,7 @@ impl Interpreter {
         // (only a `None` may be sent into it; the general path raises).
         // Validate and take the frame under one borrow. No Python runs
         // while it is held; release it before resuming the activation.
-        let mut state = gen.state.try_borrow_mut().ok()?;
+        let mut state = gen.state().try_borrow_mut().ok()?;
         let first_resume;
         {
             let boxed = match &*state {
@@ -42646,7 +45856,7 @@ impl Interpreter {
             // single send would then finish the whole generator on the
             // slow path. Service the breaker here (as the quiet loop's
             // checkpoint does) and keep stepping.
-            while fast.is_none()
+            while matches!(fast, gen_fast::GenStep::Bail)
                 && self.gil_countdown <= 1
                 && crate::hot_gates::loop_gen() == snap_gen
                 && !frame.sent_consumed
@@ -42658,8 +45868,10 @@ impl Interpreter {
                 }
                 fast = self.gen_fast_run(frame, snap_gen, fold);
             }
-            if let Some(v) = fast {
+            if let gen_fast::GenStep::Yielded(v) = fast {
                 Ok(FrameOutcome::Yielded(v))
+            } else if let gen_fast::GenStep::Returned(v) = fast {
+                Ok(FrameOutcome::Returned(v))
             } else {
                 // The draining consumer's sink, folded at this frame's yields.
                 let prev_fold = std::mem::replace(
@@ -42726,20 +45938,21 @@ impl Interpreter {
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Self::finish_running_gen(gen);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
                 Self::release_finished_gen(gen);
+                self.recycle_gen_box(boxed);
                 Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 Err(RuntimeError::Internal(
                     "RETURN_GENERATOR in already-running generator".to_owned(),
                 ))
             }
             Err(err) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
@@ -42760,20 +45973,47 @@ impl Interpreter {
         if gen.kind == crate::object::CoroutineKind::AsyncGenerator {
             return;
         }
-        // A generator still in the collector's young set has no index
+        // A generator still in the collector's young set has no registry
         // entry to remove (the set drops it once it's dead).
-        if !gen.gc_registered.get() {
+        if !gen.gc_slot.is_registered() {
             return;
         }
         let id = Rc::as_ptr(gen) as usize as u64;
         if crate::weakref_registry::count_for(id) > 0 {
             return;
         }
-        gen.gc_registered.set(false);
-        gc_trace::untrack_registered_id(id);
+        gc_trace::untrack_generator(gen);
+    }
+
+    /// Mark `gen`, running (its frame out of its state), finished.
+    #[inline]
+    fn finish_running_gen(gen: &Rc<PyGenerator>) {
+        // SAFETY: the store runs no code (the displaced state is `Running`,
+        // which owns nothing) and no guard is live on the cell (`peek_mut`
+        // checks).
+        match unsafe { gen.state().peek_mut() } {
+            Some(state) if matches!(state, GeneratorState::Running) => unsafe {
+                std::ptr::write(state, GeneratorState::Finished);
+            },
+            Some(state) => *state = GeneratorState::Finished,
+            None => *gen.state().borrow_mut() = GeneratorState::Finished,
+        }
+    }
+
+    /// Hand a coroutine whose tracking was deferred (see
+    /// [`PyGenerator::track_deferred`]) to the collector.
+    #[cold]
+    #[inline(never)]
+    fn track_deferred_gen(gen: &Rc<PyGenerator>) {
+        gen.track_deferred.set(false);
+        gc_trace::track_generator(&Object::Coroutine(gen.clone()));
     }
 
     fn park_suspended_boxed(gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
+        // Suspended, it can close a cycle the collector must see.
+        if gen.track_deferred.get() {
+            Self::track_deferred_gen(gen);
+        }
         if let Some(py) = &boxed.py_frame {
             if py.gen_owner.borrow().is_none() {
                 *py.gen_owner.borrow_mut() = Some(Rc::downgrade(gen));
@@ -42782,14 +46022,14 @@ impl Interpreter {
         // SAFETY: the store runs no code (the displaced state is
         // `Running`, which owns nothing) and no guard is live on the cell
         // (`peek_mut` checks).
-        match unsafe { gen.state.peek_mut() } {
+        match unsafe { gen.state().peek_mut() } {
             // `Running` owns nothing: no drop glue for the displaced state.
             // SAFETY: as above.
             Some(state) if matches!(state, GeneratorState::Running) => unsafe {
                 std::ptr::write(state, GeneratorState::Suspended(boxed));
             },
             Some(state) => *state = GeneratorState::Suspended(boxed),
-            None => *gen.state.borrow_mut() = GeneratorState::Suspended(boxed),
+            None => *gen.state().borrow_mut() = GeneratorState::Suspended(boxed),
         }
     }
 
@@ -42836,10 +46076,15 @@ impl Interpreter {
         fire: bool,
     ) -> Result<Option<Object>, RuntimeError> {
         let raw = !crate::trace::any_observers_active();
-        if raw {
-            GEN_RAW_RETURN.with(|r| r.set(true));
-        }
-        match self.generator_send_fold(g, Object::None, fold) {
+        let result = if fold.is_none() {
+            self.generator_next_raw(g, raw)
+        } else {
+            if raw {
+                GEN_RAW_RETURN.with(|r| r.set(true));
+            }
+            self.generator_send_fold(g, Object::None, fold)
+        };
+        match result {
             Ok(Object::Unbound) if raw => {
                 drop(GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()));
                 Ok(None)
@@ -42885,12 +46130,12 @@ impl Interpreter {
         // Take the boxed frame; it is run *in place* (RFC 0069 WS4) so
         // the yield round-trip neither reallocates the box nor moves
         // the frame through the stack.
-        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let prev_state = std::mem::replace(&mut *gen.state().borrow_mut(), GeneratorState::Running);
         let (mut boxed, first_resume) = match prev_state {
             GeneratorState::Created(boxed) => (boxed, true),
             GeneratorState::Suspended(boxed) => (boxed, false),
             GeneratorState::Finished => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 // bpo-25887: re-awaiting a completed coroutine is an
                 // error, not a silent StopIteration.
                 if matches!(gen.kind, crate::object::CoroutineKind::Coroutine) {
@@ -42907,7 +46152,7 @@ impl Interpreter {
                 )));
             }
             delegating @ GeneratorState::Delegating(_) => {
-                *gen.state.borrow_mut() = delegating;
+                *gen.state().borrow_mut() = delegating;
                 return Err(value_error(format!(
                     "{} already executing",
                     gen.kind.word()
@@ -42981,7 +46226,7 @@ impl Interpreter {
                 // dance unwraps to `None` rather than to the empty
                 // string we get from `from_builtin("StopIteration",
                 // "")`.
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 let frame: &mut Frame = &mut boxed;
                 // RFC 0059 WS4: the exhausted frame's storage is dead —
                 // donate it back to the frame pools.
@@ -42990,13 +46235,13 @@ impl Interpreter {
                 Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 Err(RuntimeError::Internal(
                     "RETURN_GENERATOR in already-running generator".to_owned(),
                 ))
             }
             Err(err) => {
-                *gen.state.borrow_mut() = GeneratorState::Finished;
+                *gen.state().borrow_mut() = GeneratorState::Finished;
                 let escaped = self.pep479_escape(gen, err);
                 let frame: &mut Frame = &mut boxed;
                 self.recycle_frame_allocs(frame);
@@ -43852,6 +47097,11 @@ impl Interpreter {
         b: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Object::Str(t) = a {
+            if let Some(out) = percent_render_plain_value(t, b) {
+                return Ok(Object::from_str(out));
+            }
+        }
         if a.is_str() {
             // Surrogate-aware printf: a `WStr` template (and any `WStr`
             // argument resolved via `%s`) bridges its lone surrogates into
@@ -44025,6 +47275,23 @@ impl Interpreter {
         }
     }
 
+    /// `type(x).<op's dunder>` for an instance `x` when it is a plain
+    /// Python function, from the class's cache (see
+    /// [`Self::instance_dunder_function`]): called with `x` first, it is
+    /// what [`Self::cmp_method`] binds.
+    fn cmp_function(x: &Object, op: CompareKind) -> Option<Rc<PyFunction>> {
+        /// Class cache keys per comparison dunder.
+        static CMP_KEYS: [u8; 8] = [0; 8];
+        let Object::Instance(inst) = x else {
+            return None;
+        };
+        Self::instance_dunder_function(
+            inst,
+            std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
+            cmp_dunder(op).0,
+        )
+    }
+
     /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].
     /// Used everywhere a comparison feeds control flow or a native algorithm
     /// (`min`/`max`, `in`, sort merges, the `==` sentinel probes).
@@ -44162,14 +47429,7 @@ impl Interpreter {
             if std::ptr::eq(ia.cls_raw(), ib.cls_raw())
                 || !ib.cls_raw().is_subclass_of(ia.cls_raw())
             {
-                /// Class cache keys per comparison (see
-                /// `instance_dunder_function`).
-                static CMP_KEYS: [u8; 8] = [0; 8];
-                if let Some(f) = Self::instance_dunder_function(
-                    ia,
-                    std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
-                    cmp_dunder(op).0,
-                ) {
+                if let Some(f) = Self::cmp_function(a, op) {
                     let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
                     if !r.is_same(&crate::vm_singletons::not_implemented()) {
                         return Ok(r);
@@ -44288,9 +47548,12 @@ impl Interpreter {
         // interface's richer `__eq__` first (test_ipaddress), and
         // `addr < intf` must run the interface's total_ordering
         // `__gt__` first.
+        // (A plain function on an instance's class, from the class's
+        // cache, is called directly below, as `cmp_method` would bind it.)
+        let b_function = Self::cmp_function(b, cmp_swapped(op));
         let reflected_first = !Rc::ptr_eq(&cls_b, &cls_a)
             && cls_b.is_subclass_of(&cls_a)
-            && (cls_b.lookup(swapped).is_some() || b_foreign);
+            && (b_function.is_some() || b_foreign || cls_b.lookup(swapped).is_some());
         let mut tried_reflected = false;
         // Track whether each operand's *own* `__ne__` slot actually ran.
         // `object.__ne__` (installed on every class) already derives from the
@@ -44310,7 +47573,13 @@ impl Interpreter {
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(method) = self.cmp_method(b, swapped, globals) {
+            if let Some(f) = b_function.clone() {
+                b_slot_ran = true;
+                let r = self.call_dunder_function(f, &[b.clone(), a.clone()])?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+            } else if let Some(method) = self.cmp_method(b, swapped, globals) {
                 b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
@@ -44329,6 +47598,12 @@ impl Interpreter {
         }
         if forward_ran {
             a_slot_ran = true;
+        } else if let Some(f) = Self::cmp_function(a, op) {
+            a_slot_ran = true;
+            let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
+            if !r.is_same(&not_impl) {
+                return Ok(r);
+            }
         } else if let Some(method) = self.cmp_method(a, dunder, globals) {
             a_slot_ran = true;
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
@@ -44346,7 +47621,13 @@ impl Interpreter {
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(method) = self.cmp_method(b, swapped, globals) {
+            if let Some(f) = b_function {
+                b_slot_ran = true;
+                let r = self.call_dunder_function(f, &[b.clone(), a.clone()])?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+            } else if let Some(method) = self.cmp_method(b, swapped, globals) {
                 b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
@@ -45184,7 +48465,7 @@ impl Interpreter {
                 if let Some((k, v)) = g.get_index(key_idx as usize) {
                     // Verify the key at the cached slot still matches the
                     // expected name. `del` of an earlier global shift-removes
-                    // an IndexMap entry, renumbering every later slot without
+                    // a table entry, renumbering every later slot without
                     // changing the dict's Rc identity — so the cached index
                     // would otherwise alias a *different* global's value.
                     if let Object::Str(s) = &k.0 {
@@ -45222,7 +48503,7 @@ impl Interpreter {
                     .code
                     .names
                     .get(name_idx as usize)
-                    .map(String::as_str)
+                    .map(|n| n.as_str())
                     .ok_or_else(|| RuntimeError::Internal("bad name index".to_owned()))?;
                 if frame
                     .globals
@@ -45437,21 +48718,72 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
+        // A site cooling down after a failed load (an odd count; see
+        // `specialized_load_attr`'s `Cooldown` arm) asks whether the
+        // attribute is certainly missing, ahead of the getter lanes.
+        let failing = failing_attr_site(&frame.code, pc);
         // A property's or a Python data descriptor's getter runs as an
         // inline activation, as the core loop's own arm runs it.
         if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && !frame_field
+            && !failing
             && (self.core_property(sw) || self.core_getitem(sw, true))
         {
             return Ok(());
         }
         // SAFETY: as above (both declined untouched).
         let frame = unsafe { &mut *sw.cur };
-        let arg = frame.code.instructions[pc].arg;
+        let ins = frame.code.instructions[pc];
+        // A frame's or code object's plain field.
+        if frame_field {
+            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+            let v = match (frame.stack.last(), frame.code.names.get(ins.arg as usize)) {
+                (Some(recv), Some(name)) => Self::frame_plain_attr(recv, name, Some(running)),
+                _ => None,
+            };
+            if let Some(v) = v {
+                frame.pc = pc as u32 + 1;
+                if let Some(top) = frame.stack.last_mut() {
+                    let recv = std::mem::replace(top, v);
+                    self.release(recv);
+                }
+                return Ok(());
+            }
+        }
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        let r = self.load_attr_step(frame, pc as u32, arg);
+        let r = match ins.op {
+            OpCode::LoadAttr if failing => match self.load_attr_certain_miss(frame, ins.arg) {
+                Some(err) => Err(err),
+                None => self.load_attr_step(frame, pc as u32, ins.arg),
+            },
+            _ => self.load_attr_step(frame, pc as u32, ins.arg),
+        };
         self.core_pending_exit(sw, pending);
         r
+    }
+
+    /// A `LOAD_ATTR` (name `name_idx`) of a plain instance that has no
+    /// such attribute anywhere ([`attr_certainly_missing`]): the receiver
+    /// leaves the stack, released as the full load releases it, and the
+    /// `AttributeError` the default lookup ends with comes back without
+    /// its resolution passes. `None` touches nothing.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn load_attr_certain_miss(&mut self, frame: &mut Frame, name_idx: u32) -> Option<RuntimeError> {
+        let recv @ Object::Instance(_) = frame.stack.last()? else {
+            return None;
+        };
+        let name = frame.code.names.get(name_idx as usize)?;
+        if !attr_certainly_missing(recv, name) {
+            return None;
+        }
+        let recv = frame.stack.pop()?;
+        let err = crate::error::attribute_error_named(&recv, name);
+        self.release(recv);
+        Some(err)
     }
 
     fn specialized_load_attr(
@@ -45525,7 +48857,7 @@ impl Interpreter {
                         // genuine `__slots__` member descriptor for this
                         // name) and the version guard covers class-dict /
                         // MRO changes since.
-                        let name = frame.code.names.get(name_idx as usize).map(String::as_str);
+                        let name = frame.code.names.get(name_idx as usize).map(|n| n.as_str());
                         if let Some(name) = name {
                             let hit = {
                                 let slots = inst.slots.borrow();
@@ -45542,9 +48874,19 @@ impl Interpreter {
                                 specialize::record_hit(op_idx);
                                 return Ok(v);
                             }
+                            // Unset slot: the member descriptor raises its
+                            // `AttributeError`, as the default lookup's data
+                            // descriptor step would (the guard rules out a
+                            // `__getattr__` hook), and the site stays as it is
+                            // (CPython's `LOAD_ATTR_SLOT` deopts for this
+                            // execution only).
+                            let cls = inst.cls();
+                            if let Some(sd @ Object::SlotDescriptor(_)) = cls.lookup(name) {
+                                let owner = Object::Type(cls);
+                                let result = self.descriptor_get(&sd, &receiver, &owner);
+                                return self.load_attr_finish(&receiver, name, result);
+                            }
                         }
-                        // Unset slot: the slow path raises the faithful
-                        // AttributeError.
                     }
                 }
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
@@ -45663,9 +49005,9 @@ impl Interpreter {
                 self.deopt_load_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
-                let name = self.name_at(&frame.code, name_idx)?;
+                let name = Self::name_ref(&frame.code, name_idx)?;
                 let obj = receiver;
-                let result = self.load_attr(&obj, &name);
+                let result = self.load_attr(&obj, name);
                 // Specialize *after* the generic lookup. The decision's
                 // dict-index probe hashes `name` into the instance dict and
                 // can run a hostile key's `__eq__` (test_descr
@@ -45673,10 +49015,16 @@ impl Interpreter {
                 // descriptor from one); that side effect must not run ahead
                 // of the lookup it's meant to accelerate.
                 specialize::record_specialize_attempt(op_idx);
+                // A site cools down two steps at a time from an odd count
+                // when its load failed, an even one otherwise (see the
+                // `Cooldown` arm).
                 let decision = if result.is_ok() {
-                    specialize::attempt_specialize_load_attr(&obj, &name)
+                    match specialize::attempt_specialize_load_attr(&obj, name) {
+                        IC::Cooldown(n) => IC::Cooldown(n.saturating_mul(2) & !1),
+                        decision => decision,
+                    }
                 } else {
-                    IC::Cooldown(COOLDOWN)
+                    IC::Cooldown(2 * COOLDOWN + 1)
                 };
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
@@ -45687,18 +49035,29 @@ impl Interpreter {
                 result
             }
             IC::Cooldown(n) => {
-                let next = if n > 0 {
-                    IC::Cooldown(n - 1)
+                let next = if n >= 2 {
+                    IC::Cooldown(n - 2)
                 } else {
                     IC::Empty
                 };
                 frame.code.caches.set(cache_pc, next);
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&receiver, &name)
+                // A site cooling down after a failed load (an odd count; `try:
+                // o.x except AttributeError:`): an attribute certainly missing
+                // raises the `AttributeError` the default lookup ends with,
+                // without its resolution passes.
+                if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
+                    if attr_certainly_missing(&receiver, name) {
+                        let err = crate::error::attribute_error_named(&receiver, name);
+                        self.release(receiver);
+                        return Err(err);
+                    }
+                }
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.load_attr(&receiver, name)
             }
             _ => {
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.load_attr(&receiver, &name)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.load_attr(&receiver, name)
             }
         }
     }
@@ -45715,12 +49074,13 @@ impl Interpreter {
         receiver: Object,
     ) -> Result<Object, RuntimeError> {
         specialize::record_miss(OpCode::LoadAttr as u8);
-        frame
-            .code
-            .caches
-            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
-        let name = self.name_at(&frame.code, name_idx)?;
-        self.load_attr(&receiver, &name)
+        // (An even count: see `specialized_load_attr`'s `Cooldown` arm.)
+        frame.code.caches.set(
+            cache_pc,
+            weavepy_compiler::InlineCache::Cooldown(2 * COOLDOWN),
+        );
+        let name = Self::name_ref(&frame.code, name_idx)?;
+        self.load_attr(&receiver, name)
     }
 
     /// Specialized `STORE_ATTR`. Stack discipline matches the
@@ -45978,9 +49338,10 @@ impl Interpreter {
                 self.deopt_store_attr_taken(frame, cache_pc, name_idx, receiver)
             }
             IC::Empty => {
-                let name = self.name_at(&frame.code, name_idx)?;
+                let code = frame.code.clone();
+                let name = Self::name_ref(&code, name_idx)?;
                 specialize::record_specialize_attempt(op_idx);
-                let decision = specialize::attempt_specialize_store_attr(&receiver, &name);
+                let decision = specialize::attempt_specialize_store_attr(&receiver, name);
                 frame.code.caches.set(cache_pc, decision);
                 if matches!(decision, IC::Cooldown(_)) {
                     specialize::record_specialize_skip(op_idx);
@@ -45988,7 +49349,7 @@ impl Interpreter {
                     specialize::record_specialize_success(op_idx);
                 }
                 let val = frame.pop()?;
-                self.store_attr(&receiver, &name, val)
+                self.store_attr(&receiver, name, val)
             }
             IC::Cooldown(n) => {
                 let next = if n > 0 {
@@ -45998,13 +49359,13 @@ impl Interpreter {
                 };
                 frame.code.caches.set(cache_pc, next);
                 let val = frame.pop()?;
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&receiver, &name, val)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.store_attr(&receiver, name, val)
             }
             _ => {
                 let val = frame.pop()?;
-                let name = self.name_at(&frame.code, name_idx)?;
-                self.store_attr(&receiver, &name, val)
+                let name = Self::name_ref(&frame.code, name_idx)?;
+                self.store_attr(&receiver, name, val)
             }
         }
     }
@@ -46025,8 +49386,8 @@ impl Interpreter {
             .caches
             .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
         let val = frame.pop()?;
-        let name = self.name_at(&frame.code, name_idx)?;
-        self.store_attr(&receiver, &name, val)
+        let name = Self::name_ref(&frame.code, name_idx)?;
+        self.store_attr(&receiver, name, val)
     }
 
     /// Specialized `FOR_ITER`. Returns `Ok(true)` when the fast
@@ -46687,6 +50048,7 @@ impl Interpreter {
                 )));
             };
             *ty.qualname.borrow_mut() = Some(s.to_string());
+            ty.forget_display_names();
             return Ok(());
         }
         // The `type.__dict__` / `type.__mro__` getsets have no setter in
@@ -47127,6 +50489,7 @@ impl Interpreter {
                         // was made from.
                         f.slots();
                         *f.code.borrow_mut() = c;
+                        f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {
                             crate::capi_watchers::func_event("MODIFY_CODE", obj, &new_code);
@@ -48304,10 +51667,15 @@ impl Interpreter {
                 _ => {}
             }
         }
-        let removed = inst
-            .dict_cell()
-            .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(name)));
+        // The split layout deletes in place (see `PyInstance::split_remove`);
+        // a real dictionary is watchable.
+        let removed = match inst.split_remove(name) {
+            Some(removed) => removed,
+            None => inst
+                .dict_cell()
+                .borrow_mut()
+                .shift_remove(&DictKey(Object::from_str(name))),
+        };
         // Watched instance `__dict__` observes attribute deletion as
         // PyDict_EVENT_DELETED (test_watchers test_object_dict).
         if removed.is_some() && crate::capi_watchers::dicts_active() {
@@ -49399,10 +52767,13 @@ impl Interpreter {
                         })?;
                         let rest: &[Object] = if args.is_empty() { &[] } else { &args[1..] };
                         return match b.name {
-                            ".u.gen_send" | ".u.cor_send" => self.gen_method_send(
-                                &receiver,
-                                rest.first().cloned().unwrap_or(Object::None),
-                            ),
+                            ".u.gen_send" | ".u.cor_send" => {
+                                gen_send_arity(&receiver, rest.len())?;
+                                self.gen_method_send(
+                                    &receiver,
+                                    rest.first().cloned().unwrap_or(Object::None),
+                                )
+                            }
                             ".u.gen_throw" | ".u.cor_throw" => {
                                 self.gen_method_throw(&receiver, rest)
                             }
@@ -50628,6 +53999,7 @@ impl Interpreter {
                             return Err(type_error("__subclasses__() requires a type receiver"));
                         }
                         ".gen_send" | ".cor_send" => {
+                            gen_send_arity(&bm.receiver, args.len())?;
                             let value = args.first().cloned().unwrap_or(Object::None);
                             return self.gen_method_send(&bm.receiver, value);
                         }
@@ -51047,6 +54419,11 @@ impl Interpreter {
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
         if let ([arg], []) = (args, kwargs) {
+            // `type(x)`: the class itself (`b_type`), without the
+            // constructor dispatch `instantiate` runs first.
+            if Rc::ptr_eq(ty, &builtin_types().type_) {
+                return Ok(Object::Type(builtins::class_of(arg)));
+            }
             if let Some(r) = self.container_ctor1(ty, arg) {
                 return r;
             }
@@ -51296,7 +54673,7 @@ impl Interpreter {
         };
         let name = match args.get(2) {
             Some(Object::Str(s)) => s.to_string(),
-            Some(Object::None) | None => code.name.clone(),
+            Some(Object::None) | None => code.name.to_string(),
             Some(other) => {
                 return Err(type_error(format!(
                     "function() argument 'name' must be str or None, not {}",
@@ -51360,7 +54737,7 @@ impl Interpreter {
                 .unwrap_or_else(|| self.builtins.clone()),
         };
         Ok(Object::Function(Rc::new(crate::object::PyFunction {
-            name,
+            name: name.into(),
             code: RefCell::new(code),
             globals,
             builtins,
@@ -51372,6 +54749,8 @@ impl Interpreter {
             slot_seed: RefCell::new(None),
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
+            names_kept: crate::sync::Cell::new(0),
+            gc_slot: crate::gc_trace::GcSlot::new(),
         })))
     }
 
@@ -53572,7 +56951,19 @@ impl Interpreter {
     /// class's `__init__` never calls `super().__init__`.
     fn seed_exception_args(inst: &Object, args: impl Iterator<Item = Object>) {
         if let Object::Instance(i) = inst {
-            i.slot_set("args", Object::new_tuple(args.collect()));
+            let args = Object::new_tuple(args.collect());
+            if i.slots.borrow().is_empty_default() {
+                // Laid out as a built-in construction's (see
+                // `SlotStorage::exception`), so a raise fills its slots in
+                // place. As there, only a non-atomic argument can close a
+                // cycle through the instance.
+                if matches!(&args, Object::Tuple(t) if t.iter().any(|x| !gc_trace::is_atomic(x))) {
+                    i.ensure_gc_tracked();
+                }
+                *i.slots.borrow_mut() = crate::types::SlotStorage::exception(args, []);
+            } else {
+                i.slot_set("args", args);
+            }
         }
     }
 
@@ -53861,6 +57252,15 @@ impl Interpreter {
                 _ => false,
             };
 
+        let bare_alloc = is_object_new
+            && init_from_object
+            && user_new.is_none()
+            && abstract_error.is_none()
+            && !seeds_exception_args
+            && matches!(native, NativeKind::Plain)
+            && !cls.is_subclass_of(&bt.module_)
+            && !cls.is_subclass_of(&bt.generic_alias_);
+
         crate::types::InstancePlan {
             abstract_error,
             user_new,
@@ -53873,6 +57273,9 @@ impl Interpreter {
             only_object_init,
             lean_init,
             tuple_new,
+            bare_alloc,
+            store_init: std::sync::atomic::AtomicU8::new(0),
+            slot_members: std::sync::OnceLock::new(),
         }
     }
 
@@ -54740,9 +58143,7 @@ impl Interpreter {
             let inst = PyInstance::new(cls);
             let args_tuple = Object::new_tuple(args.to_vec());
             inst.note_slot_store(&args_tuple);
-            let mut entries = Vec::with_capacity(4);
-            entries.push((crate::types::slot_key("args"), args_tuple));
-            *inst.slots.borrow_mut() = crate::types::SlotStorage::from_entries(entries);
+            *inst.slots.borrow_mut() = crate::types::SlotStorage::exception(args_tuple, []);
             let obj = Object::Instance(Rc::new(inst));
             // See the GC note at the end.
             if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
@@ -54770,13 +58171,27 @@ impl Interpreter {
         };
         // (No `message` mirror: CPython has none, and `str()` and the Rust
         // display derive the text from `args`.)
-        inst.slot_set("args", args_tuple);
         // PEP 380: `StopIteration.value` is the first constructor arg
         // (or None). Generator `return` goes through
         // `stop_iteration_with`, but user code constructs
         // `StopIteration(x)` directly and reads `.value` too.
-        if is_stop_iteration {
-            inst.slot_set("value", args.first().cloned().unwrap_or(Object::None));
+        let value = is_stop_iteration.then(|| args.first().cloned().unwrap_or(Object::None));
+        if inst.slots.borrow().is_empty_default() {
+            // Laid out as the common case's (see `SlotStorage::exception`).
+            inst.note_slot_store(&args_tuple);
+            let slots = match value {
+                Some(value) => {
+                    inst.note_slot_store(&value);
+                    crate::types::SlotStorage::exception(args_tuple, [("value", value)])
+                }
+                None => crate::types::SlotStorage::exception(args_tuple, []),
+            };
+            *inst.slots.borrow_mut() = slots;
+        } else {
+            inst.slot_set("args", args_tuple);
+            if let Some(value) = value {
+                inst.slot_set("value", value);
+            }
         }
         // `SystemExit.code`: None for no args, the lone argument for
         // one, the whole tuple otherwise (CPython `SystemExit_init`).
@@ -54953,11 +58368,24 @@ impl Interpreter {
     /// call to the full machinery, nothing having happened.
     #[inline]
     fn call_pure_leaf(&self, f: &PyFunction, args: &[Object]) -> Option<Object> {
+        self.call_pure_leaf_with(f, None, args)
+    }
+
+    /// [`Self::call_pure_leaf`] with `recv`, when given, as the first
+    /// argument (a bound method's receiver).
+    #[inline]
+    pub(crate) fn call_pure_leaf_with(
+        &self,
+        f: &PyFunction,
+        recv: Option<&Object>,
+        args: &[Object],
+    ) -> Option<Object> {
         const MAX_ARGS: usize = 6;
         // SAFETY: a function's code is only replaced under the GIL, and
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
-        if args.len() > MAX_ARGS
+        let n = args.len() + usize::from(recv.is_some());
+        if n > MAX_ARGS
             || !code_is_pure_leaf(code)
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
@@ -54967,10 +58395,10 @@ impl Interpreter {
             return None;
         }
         let mut ptrs = [std::ptr::null::<Object>(); MAX_ARGS];
-        for (p, a) in ptrs.iter_mut().zip(args) {
+        for (p, a) in ptrs.iter_mut().zip(recv.into_iter().chain(args)) {
             *p = a;
         }
-        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..args.len()])
+        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..n])
     }
 
     /// The full argument binder for [`Self::call_python_owned`]: CPython's
@@ -55296,7 +58724,7 @@ impl Interpreter {
             f.slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| code.qualname.clone())
+                .unwrap_or_else(|| code.qualname.to_string())
         };
         if !missing_positional.is_empty() {
             return Err(type_error(format_missing_arguments(
@@ -55318,7 +58746,7 @@ impl Interpreter {
                 .slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| code.qualname.clone());
+                .unwrap_or_else(|| code.qualname.to_string());
             return Err(type_error(format_missing_arguments(
                 &error_name,
                 "keyword-only",
@@ -55420,6 +58848,72 @@ impl Interpreter {
                 },
             )?
         };
+        self.call_python_bound(f, code, positional)
+    }
+
+    /// A keyword call of `f`: the positional `args`, then `kwvals` named by
+    /// `names` (the call site's `str` objects, one per value). Bound by the
+    /// `CALL_KW` specialization's permutation ([`specialize::kw_perm`],
+    /// computed for this call: no `String` per keyword) through
+    /// [`Self::kw_names_fill_locals`] when the shape has one; anything else,
+    /// its errors included, through the full binder.
+    fn call_python_kw_names(
+        &mut self,
+        f: &Rc<PyFunction>,
+        args: Vec<Object>,
+        names: &[Object],
+        kwvals: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        let code = f.code();
+        let strs = || {
+            names.iter().map(|n| match n {
+                Object::Str(s) => &**s,
+                _ => "",
+            })
+        };
+        let plan = if self.pending_raw_kwargs.borrow().is_none()
+            && names.iter().all(|n| matches!(n, Object::Str(_)))
+        {
+            specialize::kw_perm(f, &code, args.len(), strs())
+        } else {
+            None
+        };
+        if let Some((perm, covered)) = plan {
+            let (eff_argc, kwc) = (args.len(), kwvals.len());
+            let mut stack: Vec<Object> = self.pooled_scratch();
+            stack.extend(args);
+            stack.extend(kwvals);
+            let mut positional: Vec<Object> = self.pooled_scratch();
+            Self::kw_names_fill_locals(
+                &mut positional,
+                &mut stack,
+                names,
+                f,
+                &code,
+                perm,
+                covered,
+                kwc,
+                eff_argc,
+            );
+            self.recycle_scratch(stack);
+            return self.call_python_bound(f, code, positional);
+        }
+        let kwargs = names
+            .iter()
+            .zip(kwvals)
+            .map(|(n, v)| (n.to_str(), v))
+            .collect();
+        self.call_python_owned(f, args, kwargs)
+    }
+
+    /// Run `f` (whose code is `code`) on its bound fast locals
+    /// `positional` (see [`Self::call_python_owned`]).
+    fn call_python_bound(
+        &mut self,
+        f: &Rc<PyFunction>,
+        code: Rc<CodeObject>,
+        positional: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
         // Keep native eligibility outside the argument binder so its layout
         // values need not stay live across keyword and default processing.
         #[cfg(feature = "jit")]
@@ -55497,7 +58991,7 @@ impl Interpreter {
             };
             match bootstrap {
                 FrameOutcome::StartGenerator => {
-                    let obj = Self::wrap_started_generator(f, &code, frame);
+                    let obj = Self::wrap_started_generator(f, &code, self.box_gen_frame(frame));
                     if let Some(origin) = cr_origin {
                         if let Object::Coroutine(gen) = &obj {
                             gen.set_origin(origin);
@@ -55526,14 +59020,24 @@ impl Interpreter {
     /// inherits it so a *running* generator's `gi_frame` can be found
     /// without eager `PyFrame` construction.
     fn set_frame_gen_owner(gen: &Rc<PyGenerator>) {
-        if let GeneratorState::Created(boxed) = &mut *gen.state.borrow_mut() {
+        if let GeneratorState::Created(boxed) = &mut *gen.state().borrow_mut() {
             boxed.gen_owner = Some(Rc::downgrade(gen));
         }
     }
 
     /// Wrap `frame`, `f`'s generator-family body just past
     /// `RETURN_GENERATOR`, in its generator object (tracked).
-    fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Frame) -> Object {
+    fn wrap_started_generator(f: &PyFunction, code: &CodeObject, frame: Box<Frame>) -> Object {
+        let obj = Self::make_started_generator(f, code, frame);
+        // RFC 0024: generator frames can participate in reference cycles
+        // (a local that holds the generator itself), so track them like
+        // instances.
+        gc_trace::track_generator(&obj);
+        obj
+    }
+
+    /// [`Self::wrap_started_generator`] without tracking the generator.
+    fn make_started_generator(f: &PyFunction, code: &CodeObject, frame: Box<Frame>) -> Object {
         let kind = if code.is_coroutine {
             crate::object::CoroutineKind::Coroutine
         } else if code.is_async_generator {
@@ -55544,34 +59048,46 @@ impl Interpreter {
         // CPython snapshots the *function's* current `__name__` and
         // `__qualname__` (which user code may have reassigned) into
         // `gi_name`/`gi_qualname` at call time, sharing the objects.
+        // A generator-family body's activations never start at pc 0, where
+        // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
+        // the creation of one that awaits or delegates counts instead (its
+        // `SEND`s run natively; a plain generator's body still warms by
+        // its loops and fast steps, which pays off more reliably).
+        #[cfg(feature = "jit")]
+        if let Some(ext) = code_vm_ext(code) {
+            let start = ext.gen_start.load(std::sync::atomic::Ordering::Relaxed);
+            if code.is_coroutine || (start != u32::MAX && start & GEN_DELEGATES != 0) {
+                ext.frame_jit
+                    .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
+            }
+        }
         let gen_code = Object::Code(frame.code.clone());
-        let gen = if f.names_seeded() {
-            // The code's names, which the generator reads by default.
-            PyGenerator::new(kind, gen_code, Box::new(frame))
-        } else {
-            let (name, qualname) = f.name_objects();
-            PyGenerator::with_names(
-                name.unwrap_or_else(|| Object::from_str(f.name.clone())),
-                qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
-                kind,
-                gen_code,
-                Box::new(frame),
-            )
-        };
-        let gen = Rc::new(gen);
-        Self::set_frame_gen_owner(&gen);
-        let obj = if code.is_coroutine {
+        let mut frame = frame;
+        // The frame's weak backlink (see `set_frame_gen_owner`), stamped as
+        // the generator is made.
+        let gen = Rc::new_cyclic(|owner| {
+            frame.gen_owner = Some(owner.clone());
+            if f.code_names_kept(|| code_gen_names(code)) {
+                // The code's names, which the generator reads by default.
+                PyGenerator::new(kind, gen_code, frame)
+            } else {
+                let (name, qualname) = f.name_objects();
+                PyGenerator::with_names(
+                    name.unwrap_or_else(|| Object::from_str(f.name.clone())),
+                    qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+                    kind,
+                    gen_code,
+                    frame,
+                )
+            }
+        });
+        if code.is_coroutine {
             Object::Coroutine(gen)
         } else if code.is_async_generator {
             Object::AsyncGenerator(gen)
         } else {
             Object::Generator(gen)
-        };
-        // RFC 0024: generator frames can participate in reference cycles
-        // (a local that holds the generator itself), so track them like
-        // instances.
-        gc_trace::track(&obj);
-        obj
+        }
     }
 
     /// `iter(obj)` (`name` `__iter__`) or `obj.__await__()` for an
@@ -55594,7 +59110,33 @@ impl Interpreter {
         if !code.is_generator {
             return None;
         }
-        self.start_generator_fast(&f, &code, vec![v.clone()])
+        let start = self.generator_start(&f, &code, 1)?;
+        // A body without cells of its own: `self` goes straight into the
+        // locals, as `core_gen_call` passes a call's arguments.
+        if let Some(cells) = f.lean_cells_ref(&code) {
+            let nlocals = code.varnames.len();
+            let locals = self.pooled_locals_empty(nlocals);
+            {
+                // SAFETY: sole owner (see `pooled_locals_empty`).
+                let l = unsafe { &mut *locals.as_ptr() };
+                l.push(v.clone());
+                let missing = (code.arg_count as usize).saturating_sub(1);
+                if missing > 0 {
+                    l.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+                }
+                l.resize(nlocals, Object::Unbound);
+            }
+            let mut frame = Self::gen_frame_lean(&f, code.clone(), locals, cells.clone(), start);
+            frame.stack = self.pooled_stack();
+            return Some(Self::wrap_started_generator(
+                &f,
+                &code,
+                self.box_gen_frame(frame),
+            ));
+        }
+        let mut positional = self.pooled_scratch();
+        positional.push(v.clone());
+        Some(self.start_generator_at(&f, &code, positional, start))
     }
 
     /// The generator-family object a call of `f` (its code `code`) with
@@ -55619,12 +59161,14 @@ impl Interpreter {
     /// call of `f` (its code `code`) with `given` positional arguments:
     /// the `RETURN_GENERATOR` it starts past, if so.
     fn generator_start(&self, f: &PyFunction, code: &CodeObject, given: usize) -> Option<usize> {
+        let ext = code_vm_ext(code)?;
+        let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext)?,
+            u32::MAX => return None,
+            at => (at & !GEN_DELEGATES) as usize - 1,
+        };
         let nargs = code.arg_count as usize;
-        if !(code.is_generator || code.is_coroutine || code.is_async_generator)
-            || code.kwonly_count != 0
-            || code.has_varargs
-            || code.has_varkeywords
-            || given > nargs
+        if given > nargs
             || (code.is_coroutine && crate::stdlib::sys::coroutine_origin_tracking_depth() > 0)
             || crate::trace::eval_frame_record_active()
             || crate::trace::any_observers_active()
@@ -55636,11 +59180,33 @@ impl Interpreter {
         if missing > 0 && (missing > f.defaults.len() || f.defaults_maybe_overridden()) {
             return None;
         }
+        Some(start)
+    }
+
+    /// [`Self::generator_start`]'s verdict on `code`'s shape and prologue,
+    /// remembered in its extension table: a generator-family body with
+    /// positional parameters only, and the `RETURN_GENERATOR` it starts
+    /// past.
+    #[cold]
+    #[inline(never)]
+    fn generator_start_scan(code: &CodeObject, ext: &CodeConstObjects) -> Option<usize> {
+        let shaped = (code.is_generator || code.is_coroutine || code.is_async_generator)
+            && code.kwonly_count == 0
+            && !code.has_varargs
+            && !code.has_varkeywords;
         let start = code
             .instructions
             .iter()
-            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))?;
-        (code.instructions[start].op == OpCode::ReturnGenerator).then_some(start)
+            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
+            .filter(|&start| shaped && code.instructions[start].op == OpCode::ReturnGenerator);
+        let delegates = code.instructions.iter().any(|i| i.op == OpCode::Send);
+        ext.gen_start.store(
+            start.map_or(u32::MAX, |at| {
+                (at as u32 + 1) | if delegates { GEN_DELEGATES } else { 0 }
+            }),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        start
     }
 
     /// [`Self::start_generator_fast`] once [`Self::generator_start`] has
@@ -55656,15 +59222,78 @@ impl Interpreter {
         if missing > 0 {
             positional.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
-        let mut frame = self.make_frame(
-            code.clone(),
-            positional,
-            f.closure.clone(),
-            f.globals.clone(),
-            Some(f.builtins.clone()),
-        );
-        frame.pc = start as u32 + 1;
-        Self::wrap_started_generator(f, code, frame)
+        let frame = match f.lean_cells_ref(code) {
+            // No cells of its own: the function's (see `core_gen_call`).
+            Some(cells) => {
+                let locals = self.pooled_locals_from_args(&mut positional, code.varnames.len());
+                self.recycle_scratch(positional);
+                let mut frame = Self::gen_frame_lean(f, code.clone(), locals, cells.clone(), start);
+                frame.stack = self.pooled_stack();
+                frame
+            }
+            None => {
+                let mut frame = self.make_frame(
+                    code.clone(),
+                    positional,
+                    f.closure.clone(),
+                    f.globals.clone(),
+                    Some(f.builtins.clone()),
+                );
+                frame.pc = start as u32 + 1;
+                frame
+            }
+        };
+        Self::wrap_started_generator(f, code, self.box_gen_frame(frame))
+    }
+
+    /// The frame of a generator-family call of `f` (its code `code`, which
+    /// defines no cells of its own) with its `locals` filled and `cells`
+    /// the function's, just past the `RETURN_GENERATOR` at `start`.
+    #[inline]
+    fn gen_frame_lean(
+        f: &PyFunction,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        start: usize,
+    ) -> Frame {
+        Frame {
+            code,
+            locals,
+            cells,
+            stack: Vec::new(),
+            globals: f.globals.clone(),
+            builtins: f.builtins.clone(),
+            rare: None,
+            exc: None,
+            agen_yielded_value: true,
+            pc: start as u32 + 1,
+            py_frame: None,
+            gen_owner: None,
+            suppress_call_event: false,
+            gen_first_resume: false,
+            sent_consumed: false,
+            shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
+        }
+    }
+
+    /// Whether a `CALL` of one argument with `callee` and `slot` below it
+    /// is `gen.send(v)` or `coro.send(v)`: the bound method with an empty
+    /// self slot, or the method form `gen.send` loads (see
+    /// `core_gen_method`).
+    #[inline(always)]
+    pub(crate) fn gen_send_call(callee: &Object, slot: &Object) -> bool {
+        match (callee, slot) {
+            (Object::BoundMethod(bm), Object::Unbound) => {
+                matches!(&bm.function, Object::Builtin(b) if matches!(b.name, ".gen_send" | ".cor_send"))
+            }
+            (Object::Builtin(b), Object::Generator(_) | Object::Coroutine(_)) => {
+                matches!(b.name, ".u.gen_send" | ".u.cor_send")
+            }
+            _ => false,
+        }
     }
 
     /// The core loop's `CALL` at `pc` of a generator function (a plain
@@ -55694,44 +59323,185 @@ impl Interpreter {
             }
             _ => return false,
         };
-        let code = f.code();
-        let Some(start) = self.generator_start(f, &code, argc + usize::from(receiver.is_some()))
+        // SAFETY: GIL-serialized raw read of the function's code cell (the
+        // callee on the stack holds the function).
+        let code_ref: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        let Some(start) = self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))
         else {
             return false;
         };
+        let code = code_ref.clone();
+        // A body without cells of its own shares the function's (see
+        // `PyFunction::lean_cells`), and its frame is built right here.
+        let cells = f.lean_cells_ref(&code).cloned();
         // Committed: the arguments move into the generator's frame, and
         // the callee and its self slot leave the stack (one that dies
         // queues its finalizer, which runs before the next instruction).
-        let mut positional = self.pooled_scratch();
-        let mut ops = frame.stack.drain(callee_at..);
-        let callee = ops.next().expect("checked above");
-        let slot = ops.next().expect("checked above");
-        let callee_receiver = match &callee {
-            Object::BoundMethod(bm) => Some(bm.receiver.clone()),
-            _ => None,
+        // The operands are moved out whole: the stack forgets them first
+        // (nothing touches it until they're all moved).
+        let nargs = argc;
+        let base = frame.stack.as_mut_ptr();
+        // SAFETY: `callee_at + 2 + nargs` is the stack's length.
+        let (callee, slot, args) = unsafe {
+            frame.stack.set_len(callee_at);
+            (
+                base.add(callee_at).read(),
+                base.add(callee_at + 1).read(),
+                base.add(callee_at + 2),
+            )
         };
-        positional.extend(callee_receiver);
-        positional.extend((!matches!(slot, Object::Unbound)).then_some(slot));
-        positional.extend(ops);
-        let gen = match &callee {
-            Object::Function(f) => self.start_generator_at(f, &code, positional, start),
-            Object::BoundMethod(bm) => {
-                let Object::Function(f) = &bm.function else {
-                    unreachable!("checked above");
-                };
-                self.start_generator_at(f, &code, positional, start)
-            }
+        let (f, callee_receiver) = match &callee {
+            Object::Function(f) => (f, None),
+            Object::BoundMethod(bm) => match &bm.function {
+                Object::Function(f) => (f, Some(bm.receiver.clone())),
+                _ => unreachable!("checked above"),
+            },
             _ => unreachable!("checked above"),
         };
-        self.release(callee);
+        // Move the arguments onto the end of `v`.
+        // SAFETY: `args` holds `nargs` initialized values the stack forgot.
+        let take_args = |v: &mut Vec<Object>| unsafe {
+            v.reserve(nargs);
+            std::ptr::copy_nonoverlapping(args, v.as_mut_ptr().add(v.len()), nargs);
+            v.set_len(v.len() + nargs);
+        };
+        // `await f(...)`: the coroutine starts as it is made (see below).
+        let await_send = if code.is_coroutine && self.inline_calls_ok() {
+            await_send_after(&frame.code, pc)
+        } else {
+            None
+        };
+        let gen = if let Some(cells) = cells {
+            // The arguments move straight into the locals (no staging).
+            let nlocals = code.varnames.len();
+            let locals = self.pooled_locals_empty(nlocals);
+            {
+                // SAFETY: sole owner (see `pooled_locals_empty`).
+                let v = unsafe { &mut *locals.as_ptr() };
+                v.extend(callee_receiver);
+                if !matches!(slot, Object::Unbound) {
+                    v.push(slot);
+                }
+                take_args(v);
+                let missing = (code.arg_count as usize).saturating_sub(v.len());
+                if missing > 0 {
+                    v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+                }
+                v.resize(nlocals, Object::Unbound);
+            }
+            let mut gen_frame = Self::gen_frame_lean(f, code, locals, cells, start);
+            gen_frame.stack = self.pooled_stack();
+            let code = Rc::clone(&gen_frame.code);
+            let boxed = self.box_gen_frame(gen_frame);
+            if await_send.is_some() {
+                // Tracked if it suspends (see `PyGenerator::track_deferred`),
+                // or below if it doesn't start.
+                let obj = Self::make_started_generator(f, &code, boxed);
+                if let Object::Coroutine(g) = &obj {
+                    g.track_deferred.set(true);
+                }
+                obj
+            } else {
+                Self::wrap_started_generator(f, &code, boxed)
+            }
+        } else {
+            let mut positional = self.pooled_scratch();
+            positional.extend(callee_receiver);
+            if !matches!(slot, Object::Unbound) {
+                positional.push(slot);
+            }
+            take_args(&mut positional);
+            self.start_generator_at(f, &code, positional, start)
+        };
+        match callee {
+            // A function something else still holds (its module, its
+            // class) can't die here: a plain decrement.
+            Object::Function(f) if Rc::strong_count(&f) > 1 => drop(f),
+            callee => self.release(callee),
+        }
+        let deferred = matches!(&gen, Object::Coroutine(g) if g.track_deferred.get());
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
         // SAFETY: the running activation's last-pc slot.
         unsafe { *sw.last = pc };
+        // `await f(...)`: the coroutine starts at once, as the `SEND` after
+        // its `GET_AWAITABLE` (which passes a fresh coroutine through) would
+        // start it with the `None` sent. The caller rests at the `SEND`,
+        // where the coroutine's return lands; the caller of this function
+        // finds the switch in `sw`.
+        let caller: *mut Frame = frame;
         // SAFETY: the running thread's own flag (see `quiet_run`).
-        if unsafe { (*sw.maybe_dead).get() } {
+        let started = if unsafe { (*sw.maybe_dead).get() } {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            false
+        } else if let Some(send_pc) = await_send {
+            // SAFETY: as above (the `LOAD_CONST` before the `SEND`).
+            unsafe { *sw.last = send_pc - 1 };
+            let started = self.core_await_enter(sw, send_pc);
+            if !started {
+                // SAFETY: as above.
+                unsafe { *sw.last = pc };
+            }
+            started
+        } else {
+            false
+        };
+        if deferred && !started {
+            // SAFETY: as above.
+            if let Some(obj @ Object::Coroutine(g)) = unsafe { (*caller).stack.last() } {
+                g.track_deferred.set(false);
+                gc_trace::track_generator(obj);
+            }
         }
+        true
+    }
+
+    /// The `await` (its `SEND` at `send_pc`) of the coroutine atop `sw`'s
+    /// running activation, which the activation's call just made: started
+    /// at once as the `SEND` would start it (`try_inline_gen`'s `Send`
+    /// resume, whose checks a fresh coroutine passes but for its code's),
+    /// the caller resting past the `SEND`. `false` touches nothing.
+    fn core_await_enter(&mut self, sw: &mut CoreSwitch, send_pc: usize) -> bool {
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_gen_resume_one`).
+        let (frame, shell) = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            (&mut *frame, &mut *shell.cast::<QuietShell<'_>>())
+        };
+        let Some(Object::Coroutine(g)) = frame.stack.last() else {
+            return false;
+        };
+        let g = g.clone();
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *g.state().as_ptr() };
+        if !matches!(state, GeneratorState::Created(boxed) if Self::lean_gen_code_ok(&boxed.code)) {
+            return false;
+        }
+        // Past the recursion limit the `SEND` raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
+            return false;
+        };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("checked above");
+        };
+        let jump = frame.code.instructions[send_pc].arg;
+        let act = self.inline_gen_commit(
+            frame,
+            shell,
+            send_pc,
+            InlineResume::Send,
+            jump | GEN_SEND,
+            (g, boxed, true, Object::None),
+            guard,
+        );
+        let gen_frame = act.gen_frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = gen_frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
         true
     }
 
@@ -57172,6 +60942,15 @@ impl Interpreter {
     /// Import `module` and fetch one of its top-level attributes by name.
     /// Returns `None` if the module can't be imported or lacks the name.
     pub(crate) fn module_attr(&mut self, module: &str, attr: &str) -> Option<Object> {
+        // An imported top-level module that no thread is initializing: its
+        // attribute straight off the `sys.modules` entry (what `load_one`
+        // returns for it), without the dotted walk's bookkeeping.
+        // `object.__reduce_ex__` reads `copyreg.__newobj__` this way.
+        if !module.contains('.') && self.cache.initializing_holder(module).is_none() {
+            if let Some(Object::Module(m)) = self.cache.get(module) {
+                return m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
+            }
+        }
         let m = self.import_path(module).ok()?;
         if let Object::Module(m) = m {
             return m.dict.borrow().get(&crate::object::StrKey(attr)).cloned();
@@ -57470,6 +61249,10 @@ impl Interpreter {
         &mut self,
         recv: &Object,
     ) -> Result<Option<Object>, RuntimeError> {
+        // (No class of these is subclassable: an instance is none of them.)
+        if matches!(recv, Object::Instance(_)) {
+            return Ok(None);
+        }
         let ty_name = crate::builtins::class_of(recv).name.clone();
         if !matches!(
             ty_name.as_str(),
@@ -57608,30 +61391,39 @@ impl Interpreter {
             return None;
         }
         let cls = inst.cls();
-        let slots_key = crate::object::StrKey("__slots__");
-        if cls
-            .mro
-            .borrow()
-            .iter()
-            .any(|c| c.dict.borrow().get(&slots_key).is_some())
-        {
+        // (A pure function of the class's attributes: memoized.)
+        let plain = cls.memo_verdict(crate::types::Verdict::PlainNewobj, "", || {
+            let slots_key = crate::object::StrKey("__slots__");
+            if cls
+                .mro
+                .borrow()
+                .iter()
+                .any(|c| c.dict.borrow().get(&slots_key).is_some())
+            {
+                return false;
+            }
+            if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some() {
+                return false;
+            }
+            let Some(default_getstate) = builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("__getstate__"))
+                .cloned()
+            else {
+                return false;
+            };
+            // (The class lookup skips `object`'s own entry: none found is
+            // the default too.)
+            match (cls.lookup("__getstate__"), &default_getstate) {
+                (None, _) => true,
+                (Some(Object::Builtin(a)), Object::Builtin(b)) => Rc::ptr_eq(&a, b),
+                _ => false,
+            }
+        });
+        if !plain {
             return None;
-        }
-        if cls.lookup("__getnewargs_ex__").is_some() || cls.lookup("__getnewargs__").is_some() {
-            return None;
-        }
-        let default_getstate = builtin_types()
-            .object_
-            .dict
-            .borrow()
-            .get(&crate::object::StrKey("__getstate__"))
-            .cloned()?;
-        // (The class lookup skips `object`'s own entry: none found is the
-        // default too.)
-        match (cls.lookup("__getstate__"), &default_getstate) {
-            (None, _) => {}
-            (Some(Object::Builtin(a)), Object::Builtin(b)) if Rc::ptr_eq(&a, b) => {}
-            _ => return None,
         }
         let newobj = self.module_attr("copyreg", "__newobj__")?;
         let dict = inst.dict_shared();
@@ -60165,11 +63957,15 @@ impl Interpreter {
         {
             frozen_code_cache::insert(full, &code);
             // RFC 0059 WS5a — persist for future processes as well.
-            // `-B`/`PYTHONDONTWRITEBYTECODE` suppresses the write like
-            // any other bytecode artifact (reads stay enabled).
-            if !self.bytecode_writes_disabled() {
-                frozen_code_cache::write_disk(full, source, &code);
-            }
+            // `-B`/`PYTHONDONTWRITEBYTECODE` doesn't suppress the write:
+            // it governs `.pyc` files beside source files, and CPython
+            // ships its standard library already compiled, so this cache
+            // (in the user's cache directory, keyed by the binary's
+            // format) is the counterpart of that installed bytecode.
+            // Without it, every process under `-B` compiled each stdlib
+            // module it imported (`import asyncio`: about 5x the
+            // instructions). `WEAVEPY_FROZEN_CACHE=0` turns it off.
+            frozen_code_cache::write_disk(full, source, &code);
         }
         self.run_frozen_compiled(full, code, is_package, filename)
     }
@@ -63668,6 +67464,8 @@ enum LeafKind {
     GetAttr,
     ListAppend,
     ListPop,
+    /// `list.extend` of an exact list or tuple.
+    ListExtend,
     ListInsert,
     ListReverse,
     ListCopy,
@@ -63720,6 +67518,7 @@ impl LeafKind {
                 | Self::SetAdd
                 | Self::ListAppend
                 | Self::ListPop
+                | Self::ListExtend
                 | Self::ListInsert
                 | Self::ListReverse
                 | Self::ListCopy
@@ -63991,11 +67790,65 @@ struct InlineAct {
     discard: bool,
     /// A collapsed `yield from` chain (see
     /// `Interpreter::core_send_collapse`): the generators between the
-    /// consumer and the one this activation runs, outermost first. The
-    /// activation's consumer-facing fields (`call_pc`, `exhaust_arg`,
-    /// `caller_pending`) are the consumer's. Empty otherwise; a pooled
-    /// slot keeps the buffer.
-    delegates: Vec<Delegate>,
+    /// consumer and the one this activation runs, outermost first (never
+    /// none). The activation's consumer-facing fields (`call_pc`,
+    /// `exhaust_arg`, `caller_pending`) are the consumer's.
+    chain: Option<Box<ChainRec>>,
+}
+
+/// The levels of a collapsed `yield from` chain (see
+/// `Interpreter::core_send_collapse`), outermost first, each in
+/// [`GeneratorState::Delegating`] with the record's address in its
+/// [`PyGenerator::chain`]. While the chain runs, the activation of its
+/// innermost generator owns the record ([`InlineAct::chain`]). When that
+/// generator yields, the chain parks (`Interpreter::collapse_park`): the
+/// record owns itself and the levels stay delegating, as if each had
+/// passed the value up and resumed straight back into its `SEND`. The
+/// next `SEND` of `None` to the outermost level resumes the innermost
+/// generator directly (`Interpreter::core_send_unpark`); anything else
+/// that reaches a level's state first settles the chain
+/// ([`settle_parked_chain`]), suspending each level in its `yield from`.
+struct ChainRec {
+    levels: Vec<Delegate>,
+    /// Parked (see above), or owned by a running activation.
+    parked: bool,
+    /// Where the levels' entries start on the pending list while the
+    /// chain runs unflushed (see `Interpreter::collapse_flushed`).
+    pend_at: usize,
+    /// The outermost level, while the chain runs for a `next()` call
+    /// (whose operands held it); otherwise its holder is the consumer's
+    /// stack, or (parked) whoever holds it.
+    hold: Option<Rc<PyGenerator>>,
+}
+
+// SAFETY: a record moves between threads with its generators, under the
+// GIL; a pooled one is empty.
+unsafe impl Send for ChainRec {}
+
+/// Settle the parked chain whose record is at `addr` (see [`ChainRec`]):
+/// each level suspends in its `yield from`, as resuming the chain level
+/// by level leaves it. A running chain's record is left alone (its
+/// levels are executing).
+#[cold]
+#[inline(never)]
+pub(crate) fn settle_parked_chain(addr: usize) {
+    // SAFETY: a level's `chain` names a live record: whoever ends the
+    // record clears it on every level first.
+    unsafe {
+        let rec = addr as *mut ChainRec;
+        if !(*rec).parked {
+            return;
+        }
+        let rec = Box::from_raw(rec);
+        // (Innermost first: a level's state is only read through the
+        // level above, which is still delegating meanwhile.)
+        for level in rec.levels.iter().rev() {
+            // The levels are alive (each held by the one above, the
+            // outermost by its owners) and parked: nothing borrows their
+            // state.
+            level.suspend();
+        }
+    }
 }
 
 /// One suspended level of a collapsed `yield from` chain (see
@@ -64015,19 +67868,22 @@ struct Delegate {
 }
 
 impl Delegate {
-    /// Put the level's generator back in `Suspended`, at its `RESUME`.
+    /// Put the level's generator back in `Suspended`, at its `RESUME`,
+    /// out of its chain.
     ///
     /// # Safety
     ///
     /// The generator is alive and in `Delegating`, with no borrow of its
     /// state live.
     unsafe fn suspend(&self) {
+        // SAFETY: alive (the caller's contract).
+        unsafe { (*self.gen).chain.set(0) };
         // SAFETY: the frame lives in the generator's box (see above).
         unsafe { (*self.act.frame).pc = self.send_pc as u32 + 2 };
         // SAFETY: the caller's contract; the box moves between variants
         // without drop glue.
         unsafe {
-            let st = (*self.gen).state.as_ptr();
+            let st = (*self.gen).state_raw().as_ptr();
             let GeneratorState::Delegating(boxed) = std::ptr::read(st) else {
                 unreachable!("a collapsed level is delegating");
             };
@@ -64081,7 +67937,7 @@ impl InlineAct {
             direct: false,
             binop: None,
             discard: false,
-            delegates: Vec::new(),
+            chain: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -64099,10 +67955,12 @@ unsafe impl Send for InlineAct {}
 impl Drop for InlineAct {
     fn drop(&mut self) {
         // An activation torn down mid-chain leaves its levels suspended.
-        for level in self.delegates.drain(..).rev() {
-            // SAFETY: the levels are alive (see `Delegate::gen`) and
-            // delegating; nothing borrows their state during a drop.
-            unsafe { level.suspend() };
+        if let Some(rec) = self.chain.take() {
+            for level in rec.levels.iter().rev() {
+                // SAFETY: the levels are alive (see `Delegate::gen`) and
+                // delegating; nothing borrows their state during a drop.
+                unsafe { level.suspend() };
+            }
         }
         if self.owns_cells {
             // SAFETY: owned cells are released once (the frame's own drop
@@ -64157,7 +68015,28 @@ const GEN_NEXT_CALL: u32 = u32::MAX;
 /// Set in [`InlineAct::exhaust_arg`] (with the `SEND`'s jump below it) for
 /// a sub-generator resumed by `yield from` or `await`: exhaustion leaves
 /// its return value on the delegator's stack and takes the jump.
-const GEN_SEND: u32 = 1 << 31;
+pub(crate) const GEN_SEND: u32 = 1 << 31;
+
+/// [`InlineAct::exhaust_arg`] of a generator resumed by `next(gen,
+/// default)`: the default waits atop the caller's stack, replaced by a
+/// yielded value, or left as the call's result when the generator
+/// finishes. (Checked before [`GEN_SEND`], whose bit it has.)
+const GEN_NEXT_DEFAULT: u32 = u32::MAX - 1;
+
+/// How [`Interpreter::chain_step`] went.
+enum ChainStep {
+    /// Nothing happened.
+    No,
+    /// The innermost generator yielded, its value delivered to the
+    /// consumer: the chain parks again.
+    Delivered,
+    /// The innermost generator returned into the innermost level, now the
+    /// chain's innermost generator (its frame), to run.
+    Inner(*const PyGenerator, *mut Frame),
+    /// The innermost generator returned into the chain's only level, out
+    /// of the chain: the consumer resumes it as usual.
+    Resume,
+}
 
 /// How [`Interpreter::core_send_hop`] went.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64179,6 +68058,10 @@ enum InlineResume {
     ForIter,
     /// A `CALL` of builtin `next` on the generator at the top of the stack.
     NextCall,
+    /// A `CALL` of builtin `next` on a generator with a default (the top
+    /// of the stack): as [`Self::NextCall`], but exhaustion gives the
+    /// default.
+    NextDefault,
     /// `SEND` of the value at the top of the stack to the generator or
     /// coroutine below it (`yield from`, `await`).
     Send,
@@ -64278,6 +68161,13 @@ struct CoreSwitch {
     /// The observer generation the burst started under (see
     /// [`Interpreter::core_pending_exit`]).
     obs_gen: u64,
+    /// `Interpreter::inline_calls_ok` when the burst started: its inputs
+    /// hold for a burst (a native stack's greenlet, the process's flags)
+    /// or bump the loop generation when they change (the eval-frame
+    /// recorder), which every direct call compares first.
+    calls_ok: bool,
+    /// The loop generation the burst runs under (see `quiet_run`).
+    snap_gen: u64,
 }
 
 impl CoreSwitch {
@@ -64287,6 +68177,8 @@ impl CoreSwitch {
         frame: &mut Frame,
         shell: &mut QuietShell<'_>,
         last: &mut usize,
+        calls_ok: bool,
+        snap_gen: u64,
     ) -> Self {
         let frame: *mut Frame = frame;
         let shell: *mut QuietShell<'static> = std::ptr::from_mut(shell).cast();
@@ -64311,6 +68203,8 @@ impl CoreSwitch {
             maybe_dead: roots.maybe_dead,
             depth_cell: crate::recursion::depth_cell(),
             obs_gen: crate::trace::observer_gen(),
+            calls_ok,
+            snap_gen,
         }
     }
 
@@ -64699,6 +68593,22 @@ fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Opt
     (instrs.get(target)?.op == OpCode::Send).then_some(target)
 }
 
+/// The `SEND` of an `await` of the `CALL` at `pc`'s result: the call is
+/// followed by `GET_AWAITABLE 0; LOAD_CONST None; SEND`.
+#[inline]
+pub(crate) fn await_send_after(code: &CodeObject, pc: usize) -> Option<usize> {
+    let [get, none, send] = code.instructions.get(pc + 1..pc + 4)? else {
+        return None;
+    };
+    (get.op == OpCode::GetAwaitable
+        && get.arg == 0
+        && none.op == OpCode::LoadConst
+        && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
+        && send.op == OpCode::Send
+        && send.arg & GEN_SEND == 0)
+        .then_some(pc + 3)
+}
+
 /// Move the object at `src` to `dst` as one 16-byte copy: a move through
 /// a typed value (`pop` then `push`) splits it at the tag byte, and the
 /// 16-byte reload that follows stalls on store forwarding.
@@ -64756,8 +68666,41 @@ unsafe fn release_locals(locals: &mut Vec<Object>) {
     // SAFETY: the first `n` values are initialized.
     unsafe {
         locals.set_len(0);
+        release_run(base, n);
+    }
+}
+
+/// Release the `n` values from `base` on (each read out once), as
+/// [`drop_hot`] releases one: the bias is tested once for the run, and a
+/// shared owner's decrement reads only the tag and the pointer (a moved
+/// out copy of each value showed in every return's profile).
+///
+/// # Safety
+///
+/// The `n` values are initialized, owned by the caller, and never read
+/// again.
+#[inline(always)]
+pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if !crate::rc::refcounts_biased() {
+            for k in 0..n {
+                drop(base.add(k).read());
+            }
+            return;
+        }
         for k in 0..n {
-            drop_hot(base.add(k).read());
+            let at = base.add(k);
+            if let Some(word) = (*at).strong_word() {
+                // While the bias holds this thread alone updates counts.
+                let w = &*word;
+                let c = w.load(std::sync::atomic::Ordering::Relaxed);
+                if c != 1 {
+                    w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    drop(at.read());
+                }
+            }
         }
     }
 }
@@ -65050,8 +68993,17 @@ mod burst_stats {
     static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
-    #[inline]
+    /// (Every call path counts: off, it's one load in line.)
+    #[inline(always)]
     pub(crate) fn note_call(i: usize) {
+        if ENABLED.load(Ordering::Relaxed) != 0 {
+            note_call_slow(i);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_call_slow(i: usize) {
         if enabled() {
             CALLS[i].fetch_add(1, Ordering::Relaxed);
         }
@@ -65282,6 +69234,60 @@ fn is_object_new(b: &Rc<crate::object::BuiltinFn>) -> bool {
     Rc::as_ptr(b) as usize == want
 }
 
+/// Move `n` objects from `src` to `dst` (non-overlapping): a call's few
+/// arguments in straight-line code, without the unrolled loop's
+/// prologue and remainder.
+///
+/// # Safety
+///
+/// `src` holds `n` initialized objects the caller forgets; `dst` has room
+/// for `n`.
+#[inline(always)]
+unsafe fn move_objects(src: *const Object, dst: *mut Object, n: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match n {
+            0 => {}
+            1 => dst.write(src.read()),
+            2 => {
+                dst.write(src.read());
+                dst.add(1).write(src.add(1).read());
+            }
+            3 => {
+                dst.write(src.read());
+                dst.add(1).write(src.add(1).read());
+                dst.add(2).write(src.add(2).read());
+            }
+            _ => std::ptr::copy_nonoverlapping(src, dst, n),
+        }
+    }
+}
+
+/// Write `n` unbound markers from `dst` (a frame's unset locals).
+///
+/// # Safety
+///
+/// `dst` has room for `n` objects, whose old contents need no drop.
+#[inline(always)]
+unsafe fn fill_unbound_raw(dst: *mut Object, n: usize) {
+    // SAFETY: the caller's contract; `Unbound` owns nothing.
+    unsafe {
+        match n {
+            0 => {}
+            1 => dst.write(Object::Unbound),
+            2 => {
+                dst.write(Object::Unbound);
+                dst.add(1).write(Object::Unbound);
+            }
+            _ => {
+                for k in 0..n {
+                    dst.add(k).write(Object::Unbound);
+                }
+            }
+        }
+    }
+}
+
 /// Extend `v` to `n` slots with `Unbound` (the fresh locals of an
 /// activation), in line: a call's handful of slots isn't worth
 /// `Vec::resize`'s out-of-line loop.
@@ -65345,10 +69351,8 @@ enum DictStep {
 enum CoreExit {
     /// End the burst.
     Stop(LeafStop),
-    /// The instruction at `frame.pc` runs out of line
-    /// (`leaf_core_helper`).
-    Helper,
-    /// The instruction at `frame.pc` needs the full leaf arms.
+    /// The instruction at `frame.pc` needs the full leaf arms (see
+    /// [`Interpreter::core_offload`]).
     Slow,
     /// (Inside [`Interpreter::leaf_core`] only.) An in-loop call or
     /// return synced and moved the running activation: reload.
@@ -65358,6 +69362,21 @@ enum CoreExit {
     /// (see `frame_jit`).
     #[cfg(feature = "jit")]
     Switch,
+}
+
+/// [`Interpreter::core_offload_run`]'s modes: an out-of-line instruction
+/// (the helper, then its lanes), a handoff that may take a lane before the
+/// full leaf arms, and one only the full leaf arms run.
+const OFFLOAD_HELPER: u8 = 0;
+const OFFLOAD_SLOW: u8 = 1;
+const OFFLOAD_ARMS: u8 = 2;
+
+/// The core loop's view of its running activation as it hands an
+/// instruction over in place (see [`Interpreter::core_offload_in_loop`]).
+struct CoreAt {
+    len: usize,
+    pc: usize,
+    last: usize,
 }
 
 /// How [`Interpreter::leaf_core_attr`] ran its instruction.
@@ -65495,6 +69514,7 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::LoadDeref,
         OpCode::BuildList,
         OpCode::ContainsOp,
+        OpCode::UnaryOp,
     ];
     let mut i = 0;
     while i < ops.len() {
@@ -65621,7 +69641,7 @@ pub(crate) fn callable_function_str(callable: &Object) -> Option<String> {
                 .slot("__qualname__")
                 .as_ref()
                 .map(Object::to_str)
-                .unwrap_or_else(|| f.code().qualname.clone());
+                .unwrap_or_else(|| f.code().qualname.to_string());
             let module = f.slot("__module__").as_ref().map(Object::to_str);
             match module {
                 Some(m) if !m.is_empty() && m != "builtins" => Some(format!("{m}.{qual}()")),
@@ -65726,55 +69746,26 @@ thread_local! {
     > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
 }
 
-/// Attribute names a built-in type was found to lack. Built-in types are
-/// immutable, so a miss is permanent, and `hasattr` can answer a repeat
-/// without raising (asyncio's `isfuture` asks
-/// `hasattr(type(coro), '_asyncio_future_blocking')` for every coroutine
-/// it's handed). Their attributes resolve dynamically, so a first miss
-/// must still go through the full lookup. Entries are keyed by address
-/// and hold the type weakly, which keeps the address from being reused.
-mod builtin_type_misses {
-    use std::cell::RefCell;
-
-    use crate::fasthash::{FxHashMap, FxHashSet};
-    use crate::sync::{Rc, Weak};
-    use crate::types::TypeObject;
-
-    /// Past this many names the record starts over (a bound, not a cache
-    /// policy: real programs probe a handful of names).
-    const CAP: usize = 512;
-
-    type Misses = FxHashMap<usize, (Weak<TypeObject>, FxHashSet<Box<str>>)>;
-
-    thread_local! {
-        static MISSES: RefCell<(usize, Misses)> = RefCell::new((0, FxHashMap::default()));
-    }
-
-    pub(super) fn contains(ty: &Rc<TypeObject>, name: &str) -> bool {
-        MISSES.with(|m| {
-            m.borrow()
-                .1
-                .get(&(Rc::as_ptr(ty) as usize))
-                .is_some_and(|(w, names)| w.strong_count() > 0 && names.contains(name))
-        })
-    }
-
-    pub(super) fn insert(ty: &Rc<TypeObject>, name: &str) {
-        MISSES.with(|m| {
-            let mut m = m.borrow_mut();
-            let (count, map) = &mut *m;
-            if *count >= CAP {
-                *count = 0;
-                map.clear();
-            }
-            let entry = map
-                .entry(Rc::as_ptr(ty) as usize)
-                .or_insert_with(|| (Rc::downgrade(ty), FxHashSet::default()));
-            if entry.1.insert(name.into()) {
-                *count += 1;
-            }
-        });
-    }
+/// The built-in class whose attributes are all of `obj`'s: a value of a
+/// built-in type that carries none of its own (no instance dict, no
+/// per-object attribute store), so what `obj.name` resolves to depends on
+/// the class and the name alone. `None` for anything else.
+fn builtin_value_class(obj: &Object) -> Option<Rc<TypeObject>> {
+    matches!(
+        obj,
+        Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+    )
+    .then(|| crate::builtins::class_of(obj))
 }
 
 /// Whether `obj.name` certainly raises `AttributeError` without running
@@ -65783,6 +69774,48 @@ mod builtin_type_misses {
 /// `getattr` default or `hasattr` then needs no exception at all. Dunder
 /// names, which the lookup special-cases, never qualify.
 fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
+    default_lookup_misses(obj, name, false)
+}
+
+/// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
+/// (`exc`) with `.name` and `.obj`, for one built natively, whose storage
+/// lays both fields out (see `error::attribute_error`): stored in place
+/// when neither is set. `true` once settled; `false` leaves the decision
+/// to the general path (any other storage, or attributes in a `__dict__`).
+fn attr_error_context_laid_out(exc: &PyInstance, obj: &Object, name: &str) -> bool {
+    if exc.attr_count() != 0 {
+        return false;
+    }
+    // (Noted before the slots are borrowed: the exception holds `obj`
+    // from here on, or already holds another one.)
+    exc.note_slot_store(obj);
+    let Ok(mut slots) = exc.slots.try_borrow_mut() else {
+        return false;
+    };
+    let Some((name_at, obj_at)) = slots.laid_out_pair_mut("name", "obj") else {
+        return false;
+    };
+    let unset = |v: &Object| matches!(v, Object::Unbound | Object::None);
+    if !(unset(name_at) && unset(obj_at)) {
+        return true;
+    }
+    // (A `str` needs no note.)
+    let name = Object::from_str(name);
+    let old = [
+        std::mem::replace(name_at, name),
+        std::mem::replace(obj_at, obj.clone()),
+    ];
+    drop(slots);
+    drop(old);
+    true
+}
+
+/// Whether the default `object.__getattribute__` lookup of `obj.name`
+/// certainly ends in its `AttributeError` without running any code (see
+/// [`attr_certainly_missing`]), ignoring a `__getattr__` hook on the class
+/// when `hooked` (the caller then calls the hook itself, as CPython's
+/// `slot_tp_getattr_hook` does after a suppressed generic lookup).
+fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
     use crate::types::Dunder;
     let Object::Instance(inst) = obj else {
         return false;
@@ -65792,29 +69825,45 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
         return false;
     }
     let cls = inst.cls();
-    if cls.native_kind.get() != 0
-        || !cls.dunder(Dunder::GetAttribute).object_owner()
-        || cls.dunder(Dunder::GetAttr).present()
-        || cls.lookup(name).is_some()
-    {
+    if cls.native_kind.get() != 0 {
         return false;
     }
-    // A dunder may also come from a builtin base's slot (`__repr__`,
-    // `__reduce_ex__`), or be an instance-level special; one that none
-    // supplies (`__deepcopy__`, which `copy` probes) is missing.
-    if dunder {
-        let special = matches!(
-            name,
-            "__class__" | "__dict__" | "__weakref__" | "__doc__" | "__module__"
-        );
-        let builtin_base = cls
-            .mro
-            .borrow()
-            .iter()
-            .any(|t| t.flags.is_builtin && t.name != "object");
-        if special || builtin_base || builtin_slot_wrapper(&cls, name).is_some() {
+    // (A builtin class's hook, a weak proxy's among them, may stand in for
+    // special cases of the default lookup.)
+    let hook = cls.dunder(Dunder::GetAttr).present();
+    if hook && (!hooked || cls.flags.is_builtin) {
+        return false;
+    }
+    // The class's part of the verdict depends only on its attributes
+    // (memoized until it or a base changes).
+    let class_missing = cls.memo_verdict(crate::types::Verdict::AttrMissing, name, || {
+        if !cls.dunder(Dunder::GetAttribute).object_owner()
+            || cls.is_super_proxy_type()
+            || cls.lookup(name).is_some()
+        {
             return false;
         }
+        // A dunder may also come from a builtin base's slot (`__repr__`,
+        // `__reduce_ex__`), or be an instance-level special; one that none
+        // supplies (`__deepcopy__`, which `copy` probes) is missing.
+        if dunder {
+            let special = matches!(
+                name,
+                "__class__" | "__dict__" | "__weakref__" | "__doc__" | "__module__"
+            );
+            let builtin_base = cls
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| t.flags.is_builtin && t.name != "object");
+            if special || builtin_base || builtin_slot_wrapper(&cls, name).is_some() {
+                return false;
+            }
+        }
+        true
+    });
+    if !class_missing {
+        return false;
     }
     match inst.dict.published() {
         Some(d) => d
@@ -65851,6 +69900,18 @@ pub(crate) fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Ob
             _ => Object::None,
         });
     }
+    // A name no builtin base supplies (the common case: the rescue of every
+    // failed instance lookup asks) is settled once per class version.
+    if ty.memo_verdict(crate::types::Verdict::NoSlotWrapper, name, || {
+        builtin_slot_wrapper_walk(ty, name).is_none()
+    }) {
+        return None;
+    }
+    builtin_slot_wrapper_walk(ty, name)
+}
+
+/// [`builtin_slot_wrapper`]'s walk of `ty`'s builtin bases.
+fn builtin_slot_wrapper_walk(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
     for base in ty.mro.borrow().iter() {
         if !base.flags.is_builtin {
             continue;
@@ -66015,8 +70076,13 @@ pub(crate) fn attr_name_of(o: &Object) -> Option<String> {
     }
 }
 
-fn attr_name_arg(o: Option<&Object>) -> Option<String> {
-    o.and_then(attr_name_of)
+/// A `getattr`/`hasattr` name argument (see [`attr_name_of`]), borrowing a
+/// plain `str`.
+fn attr_name_cow(o: Option<&Object>) -> Option<std::borrow::Cow<'_, str>> {
+    match o? {
+        Object::Str(s) => Some(std::borrow::Cow::Borrowed(&**s)),
+        other => attr_name_of(other).map(std::borrow::Cow::Owned),
+    }
 }
 
 /// `True` when `o` is a `StopAsyncIteration` instance (or one of
@@ -66137,6 +70203,20 @@ unsafe fn core_gen_method(code: &CodeObject, name_idx: u32, top: *mut Object) ->
     else {
         return false;
     };
+    // `gen.send(v)`: the unbound method and the generator as its self (the
+    // `CALL` passes it as the first argument), with no bound method made;
+    // the `CALL` arms resume the generator inline.
+    if name == "send" {
+        // SAFETY: the caller's contract.
+        let coro = matches!(unsafe { &*top }, Object::Coroutine(_));
+        // SAFETY: the generator moves up to the self slot, which is free.
+        unsafe {
+            let gen = top.read();
+            top.write(gen_send_unbound(coro));
+            top.add(1).write(gen);
+        }
+        return true;
+    }
     // SAFETY: the caller's contract.
     let bm = make_gen_method(name, unsafe { &*top });
     // SAFETY: the generator (held by the bound method too) is replaced in
@@ -66146,6 +70226,43 @@ unsafe fn core_gen_method(code: &CodeObject, name_idx: u32, top: *mut Object) ->
         top.add(1).write(Object::Unbound);
     }
     true
+}
+
+/// `send`'s one argument (CPython's `METH_O`): `n` given to `receiver`'s.
+fn gen_send_arity(receiver: &Object, n: usize) -> Result<(), RuntimeError> {
+    if n == 1 {
+        return Ok(());
+    }
+    let kind = match receiver {
+        Object::Coroutine(_) => "coroutine",
+        _ => "generator",
+    };
+    Err(type_error(format!(
+        "{kind}.send() takes exactly one argument ({n} given)"
+    )))
+}
+
+/// The unbound `send` of generators (or coroutines) that a method load of
+/// `gen.send` pushes (see [`core_gen_method`]): the `.u.` sentinel a
+/// type's attribute gives (`type(gen).send`), which `Interpreter::call`
+/// runs with its first argument as the receiver. One per kind, shared.
+fn gen_send_unbound(coro: bool) -> Object {
+    static METHODS: [std::sync::OnceLock<Object>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    METHODS[usize::from(coro)]
+        .get_or_init(|| {
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: if coro { ".u.cor_send" } else { ".u.gen_send" },
+                binds_instance: false,
+                call: Box::new(|_args| {
+                    Err(RuntimeError::Internal(
+                        "unbound generator method must be dispatched via Interpreter::call"
+                            .to_owned(),
+                    ))
+                }),
+                call_kw: None,
+            }))
+        })
+        .clone()
 }
 
 fn make_gen_method(name: &str, receiver: &Object) -> Object {
@@ -67408,6 +71525,11 @@ fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String>
     };
     let bytes = template.as_bytes();
     let map = d.try_borrow().ok()?;
+    // The plain shape (`logging`'s `%(asctime)s %(levelname)s ...`), in
+    // one pass.
+    if let Some(out) = percent_render_plain(template, PercentArgs::Mapping(&map)) {
+        return Some(out);
+    }
     let mut i = 0;
     while let Some(off) = bytes[i..].iter().position(|&b| b == b'%') {
         i += off + 1;
@@ -67450,7 +71572,97 @@ fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String>
     percent_format(template, value).ok()
 }
 
+/// The arguments [`percent_render_plain`] renders from.
+enum PercentArgs<'a> {
+    Positional(&'a [Object]),
+    Mapping(&'a DictData),
+}
+
+/// `template % args` in one pass when every conversion is a plain `%s`,
+/// `%d` or `%i` (no flags, width or precision; a mapping key for a
+/// mapping, none for positional arguments) of an exact `str`, `int`,
+/// `bool` or `None` (`%s` only for `str`, `None`), and every positional
+/// argument is consumed: the text `percent_format_with` renders for that
+/// shape. `None` for anything else (the general path then renders it, or
+/// raises), including a mapping key the dictionary lacks.
+fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String> {
+    use std::fmt::Write as _;
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len() + 32);
+    let (mut i, mut lit, mut next) = (0, 0, 0);
+    while let Some(off) = memchr::memchr(b'%', &bytes[i..]) {
+        let at = i + off;
+        out.push_str(&template[lit..at]);
+        let mut k = at + 1;
+        let v = match (bytes.get(k)?, &args) {
+            (b'%', _) => {
+                out.push('%');
+                i = k + 1;
+                lit = i;
+                continue;
+            }
+            (b'(', PercentArgs::Mapping(map)) => {
+                let close = k + 1 + memchr::memchr(b')', &bytes[k + 1..])?;
+                let key = &template[k + 1..close];
+                if key.contains('(') {
+                    return None;
+                }
+                k = close + 1;
+                map.get(&crate::object::StrKey(key))?
+            }
+            (_, PercentArgs::Positional(items)) => {
+                let v = items.get(next)?;
+                next += 1;
+                v
+            }
+            _ => return None,
+        };
+        match (bytes.get(k)?, v) {
+            (b's', Object::Str(s)) => out.push_str(s),
+            (b's' | b'd' | b'i', Object::Int(n)) => {
+                let _ = write!(out, "{n}");
+            }
+            (b's', Object::Bool(b)) => out.push_str(if *b { "True" } else { "False" }),
+            (b'd' | b'i', Object::Bool(b)) => out.push(if *b { '1' } else { '0' }),
+            (b's', Object::None) => out.push_str("None"),
+            _ => return None,
+        }
+        i = k + 1;
+        lit = i;
+    }
+    if let PercentArgs::Positional(items) = args {
+        if next != items.len() {
+            return None;
+        }
+    }
+    out.push_str(&template[lit..]);
+    Some(out)
+}
+
+/// [`percent_render_plain`] of `template % value` for an argument tuple,
+/// a lone scalar argument or an exact dict.
+fn percent_render_plain_value(template: &str, value: &Object) -> Option<String> {
+    let one;
+    let items: &[Object] = match value {
+        Object::Tuple(items) if !items.is_empty() => items,
+        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None => {
+            one = [value.clone()];
+            &one
+        }
+        Object::Dict(d) => {
+            let map = d.try_borrow().ok()?;
+            return percent_render_plain(template, PercentArgs::Mapping(&map));
+        }
+        _ => return None,
+    };
+    percent_render_plain(template, PercentArgs::Positional(items))
+}
+
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
+    // The plain shape (`"warning number %d of %s" % (i, s)`).
+    if let Some(out) = percent_render_plain_value(template, value) {
+        return Ok(out);
+    }
     let mut noop = |_: &Object, _: char| Ok(None);
     percent_format_with(template, value, PercentMode::Str, &mut noop)
 }
@@ -69196,6 +73408,9 @@ fn format_bigint_hex(b: &num_bigint::BigInt, upper: bool, p: &ParsedSpec) -> Str
 /// rest (`'%.123456f'` matches CPython instead of aborting).
 fn fixed_core(mag: f64, prec: usize) -> String {
     const FIXED_PREC_CAP: usize = 1100;
+    if let Some(s) = fixed_core_word(mag, prec) {
+        return s;
+    }
     if prec <= FIXED_PREC_CAP {
         format!("{mag:.*}", prec)
     } else {
@@ -69204,6 +73419,61 @@ fn fixed_core(mag: f64, prec: usize) -> String {
         s.extend(std::iter::repeat_n('0', prec - cap));
         s
     }
+}
+
+/// [`fixed_core`] in 128-bit integer arithmetic, for the common shapes:
+/// at most 17 fractional digits of a magnitude below 2**63. The float is
+/// `m * 2**e` exactly, so `mag * 10**prec` is `m * 10**prec` shifted by
+/// `e`, rounded half to even on the exact remainder (the correctly
+/// rounded answer the general formatter gives). `None` for any other
+/// magnitude or precision.
+fn fixed_core_word(mag: f64, prec: usize) -> Option<String> {
+    if prec > 17 {
+        return None;
+    }
+    let bits = mag.to_bits();
+    let exp_field = ((bits >> 52) & 0x7ff) as i32;
+    let frac = u128::from(bits & ((1u64 << 52) - 1));
+    let (m, e) = if exp_field == 0 {
+        (frac, -1074)
+    } else {
+        (frac | 1 << 52, exp_field - 1075)
+    };
+    let p10 = 10u128.pow(prec as u32);
+    let scaled = if e >= 0 {
+        // `m << e` stays below 2**63, and times `10**17` below 2**120.
+        if e > 10 {
+            return None;
+        }
+        (m << e) * p10
+    } else if -e > 120 {
+        // Below 2**-68 the scaled value is under one half: it rounds to 0.
+        0
+    } else {
+        let sh = e.unsigned_abs();
+        let num = m * p10;
+        let q = num >> sh;
+        let r = num & ((1u128 << sh) - 1);
+        let half = 1u128 << (sh - 1);
+        q + u128::from(r > half || (r == half && q & 1 == 1))
+    };
+    let digits = scaled.to_string();
+    if prec == 0 {
+        return Some(digits);
+    }
+    let mut out = String::with_capacity(digits.len().max(prec + 1) + 1);
+    if digits.len() <= prec {
+        out.push('0');
+        out.push('.');
+        out.extend(std::iter::repeat_n('0', prec - digits.len()));
+        out.push_str(&digits);
+    } else {
+        let (int, frac) = digits.split_at(digits.len() - prec);
+        out.push_str(int);
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
 }
 
 /// `true` when every decimal digit in `core` is `'0'` (and there is at
@@ -69752,6 +74022,19 @@ fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
     }
 }
 
+/// The comparison whose forward dunder is `op`'s reflected one.
+fn cmp_swapped(op: CompareKind) -> CompareKind {
+    use CompareKind as C;
+    match op {
+        C::Eq => C::Eq,
+        C::NotEq => C::NotEq,
+        C::Lt => C::Gt,
+        C::LtE => C::GtE,
+        C::Gt => C::Lt,
+        C::GtE => C::LtE,
+    }
+}
+
 fn cmp_dunder(op: CompareKind) -> (&'static str, &'static str) {
     use CompareKind as C;
     match op {
@@ -69897,6 +74180,44 @@ fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
     b.name == "__init__" && matches!(recv, Object::Instance(i) if i.cls_raw().flags.is_exception)
 }
 
+/// Whether the core loop's builtin lane may call the method body `b` on
+/// `recv` (see `Interpreter::core_builtin_lane`): a body that binds
+/// instances, and with `via_call` one whose receiver the interpreter's
+/// dispatch knows by name.
+#[inline]
+fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> bool {
+    b.binds_instance
+        // (A site settled on a plain instance's native `__init__` may see
+        // a dict payload later, which the dispatch routes.)
+        && (via_call || b.name != "__init__" || native_init_call(b, recv))
+        && (!via_call
+            || builtins::method_memo_tag(recv).is_some()
+            || exception_init_call(b, recv)
+            || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
+                && matches!(recv, Object::Instance(_))))
+}
+
+/// Whether `b` called on `recv` is a native `__init__` (`object.__init__`,
+/// typically through `super().__init__()`) on a plain instance: no native
+/// payload (a dict's routes through the dispatch) and not an exception
+/// (see [`exception_init_call`]), so its body runs directly.
+fn native_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
+    b.name == "__init__"
+        && b.call_kw.is_none()
+        && matches!(recv, Object::Instance(i) if i.native.get().is_none()
+            && i.c_body.get() == 0
+            && !i.cls_raw().flags.is_exception)
+}
+
+/// The builtin function a bound method of one wraps, as its own callable.
+#[cold]
+fn bm_builtin(callable: &Object) -> Object {
+    match callable {
+        Object::BoundMethod(bm) => bm.function.clone(),
+        other => other.clone(),
+    }
+}
+
 /// Builtin type methods the interpreter dispatches by name (their bodies
 /// iterate or compare through it): the core loop calls one on its exact
 /// builtin receiver through [`Interpreter::call`] (see
@@ -69925,7 +74246,10 @@ fn builtin_method_via_call(name: &str) -> bool {
 /// Builtin functions the core loop may call in place (see
 /// `Interpreter::builtin_lane`): common ones that never look at the
 /// calling frame, so the frame stack needn't be whole while they run.
-/// (Python code they call makes it whole as it needs to.)
+/// (Python code they call makes it whole as it needs to.) The `sys`
+/// frame readers make it whole themselves (`sync_frame_spine`), the
+/// calling activation waiting on the pending list with its `lasti` at the
+/// call.
 fn builtin_fn_lane_ok(name: &str) -> bool {
     matches!(
         name,
@@ -69953,6 +74277,12 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "monotonic_ns" | "heappush" | "heappop" | "heapify" | "heapreplace"
             | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
+            // sys
+            | "_getframe" | "_getframemodulename" | "getrecursionlimit"
+            // warnings (which reads the whole stack, lean activations included)
+            | "warn"
+            // asyncio (`gather` reads the running loop's current task)
+            | "current_task"
     )
 }
 
@@ -70140,21 +74470,25 @@ struct CodeConstObjects {
     /// before falling back to a byte compare, and `STORE_ATTR` inserts
     /// the pooled key without a per-store pool lookup.
     name_objs: Vec<Object>,
+    /// Each instruction's rank among the code's *sites* (see
+    /// [`site_ranks`]), which index the per-site tables below, or
+    /// [`NO_SITE`]; built with the first of those tables.
+    site_ranks: std::sync::OnceLock<std::sync::Arc<[u16]>>,
     /// RFC 0077 WS4: the resolved method per `LoadAttrMethod` site (see
     /// [`MethodSlot`]). Allocated on the first method-shape hit in this
-    /// code object, one slot per instruction so `cache_pc` indexes it.
-    method_slots: std::sync::OnceLock<Box<[MethodSlot]>>,
+    /// code object.
+    method_slots: SiteSlots<MethodSlot>,
     /// The dict stamps a `LOAD_GLOBAL` site last validated against (see
     /// [`StampSlot`]); allocated on the first global hit in this code
-    /// object, one slot per instruction.
-    stamp_slots: std::sync::OnceLock<Box<[StampSlot]>>,
+    /// object.
+    stamp_slots: SiteSlots<StampSlot>,
     /// Polymorphic instance-attribute entries per `LOAD_ATTR` site (see
     /// [`AttrPoly`]); allocated on the first polymorphic resolution in
-    /// this code object, one slot per instruction.
-    attr_poly: std::sync::OnceLock<Box<[AttrPoly]>>,
+    /// this code object.
+    attr_poly: SiteSlots<AttrPoly>,
     /// Inline-call shapes per `CALL` site (see [`CallSlot`]); allocated
     /// on the first inline call in this code object.
-    call_slots: std::sync::OnceLock<Box<[CallSlot]>>,
+    call_slots: SiteSlots<CallSlot>,
     /// Whether this code is a *pure leaf* (see [`code_is_pure_leaf`]):
     /// `0` not yet decided, `1` no, `2` general leaf, `3` argument return,
     /// `4` constant return, `5` small-int return, `6` attribute return,
@@ -70167,17 +74501,24 @@ struct CodeConstObjects {
     leaf_tries: std::sync::atomic::AtomicU64,
     /// Per-instruction fused-pair kinds (see [`code_fast_pairs`]): `1`
     /// at a `LOAD_FAST` whose successor is another `LOAD_FAST`, `2` when
-    /// it is a `STORE_FAST`, `0` everywhere else. CPython's compiler
-    /// fuses exactly these pairs into one instruction and the decoder
-    /// splits them back apart; the core loop reads one byte to run the
-    /// pair as a single dispatch. Empty when the code has no pair.
+    /// it is a `STORE_FAST`, `3` and `4` for a branch on the local, the
+    /// receiver-fused kinds from [`FAST_METHOD`] on, `0` everywhere else.
+    /// CPython's compiler fuses the first pairs into one instruction and
+    /// the decoder splits them back apart; the core loop reads one byte to
+    /// run the pair as a single dispatch. Empty when the code has none.
     fast_pairs: std::sync::OnceLock<Box<[u8]>>,
     /// Whether the code is a generator body fast steps run (see
     /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
     gen_fast: std::sync::atomic::AtomicU8,
+    /// The `RETURN_GENERATOR` a generator-family call of the code starts
+    /// past (see `Interpreter::generator_start`): `0` not yet scanned,
+    /// `u32::MAX` none (the prologue holds something else), else its pc
+    /// plus one, with [`GEN_DELEGATES`] set for a body that awaits or
+    /// delegates (a `SEND`).
+    gen_start: std::sync::atomic::AtomicU32,
     /// Split-layout attribute shortcuts per `LOAD_ATTR` site (see
     /// [`FieldSlot`]); allocated on the first recorded one.
-    field_slots: std::sync::OnceLock<Box<[FieldSlot]>>,
+    field_slots: SiteSlots<FieldSlot>,
     /// The `BINARY_OP` and `COMPARE_OP` sites the core loop has run on a
     /// natively served operand (see `stdlib::datetime_native`), for the
     /// frame compiler to send through its helpers instead of the scalar
@@ -70190,17 +74531,32 @@ struct CodeConstObjects {
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
-    leaf_sites: std::sync::OnceLock<Box<[LeafSite]>>,
+    leaf_sites: SiteSlots<LeafSite>,
     /// A leaf body's translation for the frameless evaluator (see
     /// [`leaf_plan`]), or `None` when the body has none.
     leaf_plan: std::sync::OnceLock<Option<Box<leaf_plan::LeafPlan>>>,
     /// Whether every return is `return None` (see
     /// [`code_returns_only_none`]): `0` not yet decided, `1` no, `2` yes.
     returns_none: std::sync::atomic::AtomicU8,
+    /// The body's store-only `__init__` shape (see [`code_store_init`]),
+    /// or `None` when it isn't one.
+    store_init: std::sync::OnceLock<Option<Box<StoreInit>>>,
+    /// Whether the body may call itself (see [`code_recurses`]): `0` not
+    /// yet decided, `1` no, `2` yes.
+    calls: std::sync::atomic::AtomicU8,
+    /// Per `co_names` entry, its position among the shared names of the
+    /// instances last checked for shadowing it (see [`inst_may_shadow`]).
+    name_memos: std::sync::OnceLock<Box<[crate::inst_dict::NameMemo]>>,
     /// The code's name and qualified name as interned strings: a fresh
     /// generator's `gi_name` and `gi_qualname` while its function's names
     /// are untouched.
     gen_names: std::sync::OnceLock<(Object, Object)>,
+    /// `co_name`, `co_qualname` and `co_filename` as the str objects every
+    /// read returns (CPython stores them; logging reads two per record).
+    ident_strs: std::sync::OnceLock<[Object; 3]>,
+    /// `co_positions()` entries, as a tuple of 4-tuples, and the
+    /// debug-ranges setting they were built under.
+    positions: std::sync::OnceLock<(bool, Object)>,
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
@@ -70212,6 +74568,208 @@ struct CodeConstObjects {
     /// [`code_dispatch_len`]): the instruction count, or `0` when some
     /// path could run off the end.
     dispatch_len: usize,
+}
+
+/// [`CodeConstObjects::gen_start`]'s mark of a body with a `SEND`.
+const GEN_DELEGATES: u32 = 1 << 31;
+
+/// The rank [`site_ranks`] gives an instruction that isn't a site (or one
+/// past the 65,535th): no per-site table has an entry at it.
+const NO_SITE: u16 = u16::MAX;
+
+/// Whether instructions of `op` are *sites*: the instructions whose pcs
+/// the per-site tables of [`CodeConstObjects`] are read and written at.
+/// An access at any other instruction finds no entry, as an unallocated
+/// table does.
+#[inline]
+fn is_site_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::LoadGlobal
+            | OpCode::LoadAttr
+            | OpCode::LoadMethodAttr
+            | OpCode::LoadSuperAttr
+            | OpCode::StoreAttr
+            | OpCode::LoadSpecial
+            | OpCode::BinarySubscr
+            | OpCode::StoreSubscr
+            | OpCode::Call
+            | OpCode::CallSelf
+            | OpCode::CallKw
+            | OpCode::CallEx
+    )
+}
+
+/// Each instruction's rank among `code`'s sites (see [`is_site_op`]), in
+/// order, or [`NO_SITE`].
+///
+/// The per-site tables hold an entry per site rather than per
+/// instruction: most instructions (local and constant loads, stores,
+/// jumps) never read one, and entries tens of bytes each for every
+/// instruction made the warm code of a few imports hold megabytes of
+/// tables.
+fn site_ranks(code: &CodeObject) -> std::sync::Arc<[u16]> {
+    let mut next = 0u16;
+    code.instructions
+        .iter()
+        .map(|i| {
+            if is_site_op(i.op) && next < NO_SITE {
+                next += 1;
+                next - 1
+            } else {
+                NO_SITE
+            }
+        })
+        .collect()
+}
+
+/// A per-site table of [`CodeConstObjects`]: an entry per site (see
+/// [`site_ranks`]), allocated on first use. [`Self::get`] and
+/// [`Self::view`] map an instruction's pc to its entry.
+struct SiteSlots<T>(std::sync::OnceLock<SiteTable<T>>);
+
+/// An allocated [`SiteSlots`]: the code's site ranks (shared by its
+/// tables, and kept here so that a lookup checks one initialization) and
+/// the entries.
+struct SiteTable<T> {
+    ranks: std::sync::Arc<[u16]>,
+    slots: Box<[T]>,
+}
+
+impl<T> SiteSlots<T> {
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    /// Whether the table is allocated.
+    #[inline]
+    fn is_allocated(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// The entry of the instruction at `pc`, if the table is allocated
+    /// and the instruction is a site.
+    #[inline(always)]
+    fn get(&self, pc: usize) -> Option<&T> {
+        let t = self.0.get()?;
+        // (`NO_SITE` is past the end of every table, which has at most
+        // `NO_SITE` entries.)
+        t.slots.get(usize::from(*t.ranks.get(pc)?))
+    }
+
+    /// The pc-indexed view of the table (empty while unallocated).
+    #[inline(always)]
+    fn view(&self) -> Sites<'_, T> {
+        match self.0.get() {
+            Some(t) => Sites {
+                ranks: &t.ranks,
+                slots: &t.slots,
+            },
+            None => Sites::empty(),
+        }
+    }
+}
+
+/// A view of a per-site table that takes instruction pcs (see
+/// [`SiteSlots`]); empty when the table isn't allocated.
+pub(crate) struct Sites<'a, T> {
+    ranks: &'a [u16],
+    slots: &'a [T],
+}
+
+impl<T> Clone for Sites<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Sites<'_, T> {}
+
+impl<'a, T> Sites<'a, T> {
+    /// The view of no table.
+    pub(crate) const fn empty() -> Self {
+        Sites {
+            ranks: &[],
+            slots: &[],
+        }
+    }
+
+    /// The entry of the instruction at `pc`, if it is a site.
+    #[inline(always)]
+    pub(crate) fn get(&self, pc: usize) -> Option<&'a T> {
+        // (`NO_SITE` is past the end of every table, which has at most
+        // `NO_SITE` entries.)
+        self.slots.get(usize::from(*self.ranks.get(pc)?))
+    }
+}
+
+impl CodeConstObjects {
+    /// The view of `table` (one of this object's per-site tables),
+    /// allocated (with an entry per site of `code`, this object's code) if
+    /// it isn't yet.
+    fn alloc_sites<'a, T>(
+        &'a self,
+        code: &CodeObject,
+        table: &'a SiteSlots<T>,
+        empty: impl Fn() -> T,
+    ) -> Sites<'a, T> {
+        table.0.get_or_init(|| {
+            let ranks = self.site_ranks.get_or_init(|| site_ranks(code)).clone();
+            let n = ranks.iter().filter(|&&r| r != NO_SITE).count();
+            SiteTable {
+                ranks,
+                slots: (0..n).map(|_| empty()).collect(),
+            }
+        });
+        table.view()
+    }
+
+    /// The method slot of the instruction at `pc` (see
+    /// [`Self::method_slots`]).
+    #[inline(always)]
+    pub(crate) fn method_slot(&self, pc: usize) -> Option<&MethodSlot> {
+        self.method_slots.get(pc)
+    }
+
+    /// The stamp slot of the instruction at `pc` (see
+    /// [`Self::stamp_slots`]).
+    #[inline(always)]
+    pub(crate) fn stamp_slot(&self, pc: usize) -> Option<&StampSlot> {
+        self.stamp_slots.get(pc)
+    }
+
+    /// The field slot of the instruction at `pc` (see
+    /// [`Self::field_slots`]).
+    #[inline(always)]
+    pub(crate) fn field_slot(&self, pc: usize) -> Option<&FieldSlot> {
+        self.field_slots.get(pc)
+    }
+
+    /// The polymorphic attribute entries of the instruction at `pc` (see
+    /// [`Self::attr_poly`]).
+    #[inline(always)]
+    pub(crate) fn attr_poly_slot(&self, pc: usize) -> Option<&AttrPoly> {
+        self.attr_poly.get(pc)
+    }
+
+    /// The method slots by pc (see [`Self::method_slots`]).
+    #[inline(always)]
+    pub(crate) fn method_sites(&self) -> Sites<'_, MethodSlot> {
+        self.method_slots.view()
+    }
+
+    /// The stamp slots by pc (see [`Self::stamp_slots`]).
+    #[inline(always)]
+    pub(crate) fn stamp_sites(&self) -> Sites<'_, StampSlot> {
+        self.stamp_slots.view()
+    }
+
+    /// The field slots by pc (see [`Self::field_slots`]), allocated if
+    /// they aren't yet; `code` is this object's code.
+    #[cfg(feature = "jit")]
+    pub(crate) fn alloc_field_sites(&self, code: &CodeObject) -> Sites<'_, FieldSlot> {
+        self.alloc_sites(code, &self.field_slots, FieldSlot::empty)
+    }
 }
 
 /// The bound the core loop checks a code object's entry pc against, so it
@@ -70260,10 +74818,10 @@ fn code_dispatch_len(code: &CodeObject) -> usize {
 }
 
 /// Whether `ext`'s code (of `ninstrs` instructions) may allocate its
-/// per-instruction side tables, after one more site execution found one
+/// per-site side tables, after one more site execution found one
 /// unallocated.
 ///
-/// Each table holds an entry per instruction, tens of bytes each, while
+/// Each table holds an entry per site, tens of bytes each, while
 /// most code runs only a few times (a function an import calls once or
 /// twice): allocating the tables at a site's first run cost a small
 /// program's start-up about 1.5 MB. So the tables wait until the code's
@@ -70279,6 +74837,39 @@ fn site_tables_warm(ext: &CodeConstObjects, ninstrs: usize) -> bool {
     let n = ext.cold_sites.load(Relaxed).saturating_add(1);
     ext.cold_sites.store(n, Relaxed);
     n as usize >= ninstrs
+}
+
+/// The entry of `table` (one of `ext`'s per-site tables) for the
+/// instruction at `pc`, allocating the table once `code` (`ext`'s code) is
+/// warm (see [`site_tables_warm`]).
+#[inline(always)]
+fn warm_site<'a, T>(
+    ext: &'a CodeConstObjects,
+    code: &CodeObject,
+    table: &'a SiteSlots<T>,
+    pc: usize,
+    empty: fn() -> T,
+) -> Option<&'a T> {
+    match table.0.get() {
+        Some(t) => t.slots.get(usize::from(*t.ranks.get(pc)?)),
+        None => warm_site_alloc(ext, code, table, pc, empty),
+    }
+}
+
+/// [`warm_site`] for a table not yet allocated.
+#[cold]
+#[inline(never)]
+fn warm_site_alloc<'a, T>(
+    ext: &'a CodeConstObjects,
+    code: &CodeObject,
+    table: &'a SiteSlots<T>,
+    pc: usize,
+    empty: fn() -> T,
+) -> Option<&'a T> {
+    if !site_tables_warm(ext, code.instructions.len()) {
+        return None;
+    }
+    ext.alloc_sites(code, table, empty).get(pc)
 }
 
 /// Let `code`'s side tables be allocated from now on (see
@@ -70431,15 +75022,7 @@ fn builtin_recv_tag(recv: &Object) -> Option<u64> {
 #[inline]
 fn code_call_slot(code: &CodeObject, pc: usize) -> Option<&CallSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.call_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .call_slots
-            .get_or_init(|| (0..n).map(|_| CallSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(pc)
+    warm_site(ext, code, &ext.call_slots, pc, CallSlot::empty)
 }
 
 /// A `LOAD_ATTR` site's polymorphic instance-attribute cache: up to
@@ -70499,15 +75082,13 @@ impl AttrPoly {
 #[inline]
 fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.attr_poly.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .attr_poly
-            .get_or_init(|| (0..n).map(|_| AttrPoly::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(
+        ext,
+        code,
+        &ext.attr_poly,
+        cache_pc as usize,
+        AttrPoly::empty,
+    )
 }
 
 /// The state a `LOAD_GLOBAL` site last proved its cached slot against:
@@ -70515,8 +75096,14 @@ fn code_attr_poly(code: &CodeObject, cache_pc: u32) -> Option<&AttrPoly> {
 /// and (for a builtin hit) the builtins dict's stamp. While all three
 /// match, the dicts are exactly as they were when the site last ran its
 /// full guards, so the cached index can be read straight away.
-#[repr(transparent)]
-struct StampSlot(std::cell::UnsafeCell<[u64; 3]>);
+///
+/// The second field is the address of the value the core loop's
+/// `LOAD_GLOBAL` arm last read under the stamp (with bit 0 set for a
+/// builtin), `0` when none: a dict's stamp moves with every mutation, so
+/// while the stamp holds the value stays where it is (see
+/// [`Self::value`]). Every other write of the stamp clears it.
+#[repr(C)]
+struct StampSlot(std::cell::UnsafeCell<[u64; 3]>, std::cell::Cell<u64>);
 
 // SAFETY: as `MethodSlot`: read and written only from the dispatch loop
 // with the GIL held.
@@ -70525,7 +75112,7 @@ unsafe impl Sync for StampSlot {}
 
 impl StampSlot {
     const fn empty() -> Self {
-        Self(std::cell::UnsafeCell::new([0; 3]))
+        Self(std::cell::UnsafeCell::new([0; 3]), std::cell::Cell::new(0))
     }
 
     #[inline]
@@ -70539,6 +75126,25 @@ impl StampSlot {
         // SAFETY: GIL-serialized; the exclusive reference lives only for
         // the assignment.
         unsafe { *self.0.get() = v };
+        self.1.set(0);
+    }
+
+    /// The value the `LOAD_GLOBAL` site last read under its stamp, as its
+    /// address with bit 0 set for a builtin (`0`: none). It is the value
+    /// while the stamp matches the frame's namespaces: the module dict's,
+    /// and for a builtin also the builtins dict's (stamps are unique to a
+    /// dict and its state).
+    #[inline(always)]
+    fn value(&self) -> u64 {
+        self.1.get()
+    }
+
+    /// Record the value a `LOAD_GLOBAL` read under the stamp just proved
+    /// (see [`Self::value`]).
+    #[inline]
+    fn set_value(&self, v: &Object, builtin: bool) {
+        self.1
+            .set(std::ptr::from_ref(v) as u64 | u64::from(builtin));
     }
 }
 
@@ -70548,7 +75154,10 @@ impl StampSlot {
 /// (see [`field_slot_note`]). The names are append-only and the version
 /// is process-unique, so while both match, the value at that position of
 /// a split instance *is* the attribute: no inline-cache decode and no
-/// name comparison.
+/// name comparison. A position marked [`SLOT_FIELD`] is instead a
+/// `__slots__` member's in its class's slot layout (see
+/// [`slot_field_note`]), which an instance laid out over that layout
+/// keeps there.
 #[repr(transparent)]
 struct FieldSlot(std::cell::UnsafeCell<(u64, u32)>);
 
@@ -70560,7 +75169,7 @@ pub(crate) const FIELD_SLOT_IDX: usize = std::mem::offset_of!((u64, u32), 1);
 /// The [`FieldSlot`] of the attribute site at `pc` of `code`, if the code
 /// has any (native code reads it in line).
 pub(crate) fn code_field_slot(code: &CodeObject, pc: usize) -> Option<*const u8> {
-    let slot = code_vm_ext(code)?.field_slots.get()?.get(pc)?;
+    let slot = code_vm_ext(code)?.field_slot(pc)?;
     Some(std::ptr::from_ref(slot).cast())
 }
 
@@ -70691,7 +75300,7 @@ fn leaf_site_hit(
     pc: usize,
     ver: u64,
 ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
-    let site = ext.leaf_sites.get()?.get(pc)?;
+    let site = ext.leaf_sites.get(pc)?;
     // SAFETY: GIL-serialized; the borrow ends before any refill.
     match unsafe { &*site.0.get() } {
         Some(d) if d.ver == ver && d.func.strong_count() > 0 => {
@@ -70702,27 +75311,140 @@ fn leaf_site_hit(
     }
 }
 
+/// The builtin method a `LOAD_ATTR` (method) site at `attr_pc` cached for
+/// a `list`, `dict`, `set` or `str` receiver, with the receiver's tag (see
+/// [`builtin_recv_tag`]) and the leaf kind its `CALL` at `call_pc`
+/// settled on, for the frame JIT's method kernels.
+#[cfg(feature = "jit")]
+pub(crate) fn builtin_method_site(
+    ext: &CodeConstObjects,
+    attr_pc: usize,
+    call_pc: usize,
+) -> Option<(u64, LeafKind, Rc<crate::object::BuiltinFn>)> {
+    let slots = ext.method_sites();
+    // SAFETY: GIL-serialized; the borrow ends before any refill.
+    let (ver, f) = unsafe { &*slots.get(attr_pc)?.0.get() };
+    let MethodSlotFn::Builtin(b) = f else {
+        return None;
+    };
+    if ver & MethodSlot::BUILTIN_TAG == 0 {
+        return None;
+    }
+    let tag = ver & !MethodSlot::BUILTIN_TAG;
+    if !(1..=4).contains(&tag) {
+        return None;
+    }
+    let kind = slots.get(call_pc)?.get_leaf_ptr(Rc::as_ptr(b))?;
+    Some((tag, kind, b.clone()))
+}
+
+/// The leaf builtin's kind the `CALL` at `pc` last settled on.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKind> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::Leaf(_, kind) => Some(*kind),
+        _ => None,
+    }
+}
+
+/// The builtin the `CALL` at `pc` last settled on: its leaf kind, or
+/// `None` and whether its body runs through `Interpreter::call` for a
+/// builtin whose body the core loop's lane runs (see
+/// [`MethodSlotFn::NativeBody`]).
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_builtin(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::BuiltinFn>, Option<LeafKind>, bool)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::Leaf(f, kind) => Some((f.clone(), Some(*kind), false)),
+        MethodSlotFn::NativeBody(f, via_call) => Some((f.clone(), None, *via_call)),
+        _ => None,
+    }
+}
+
+/// The builtin type's method the method load at `pc` last resolved, and
+/// the receiver variant it was resolved for (see [`builtin_recv_tag`]):
+/// an exact builtin receiver's method never changes, so the variant alone
+/// keys it.
+#[cfg(feature = "jit")]
+pub(crate) fn load_method_builtin(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(u64, Rc<crate::object::BuiltinFn>)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &*slot.0.get() } {
+        (key, MethodSlotFn::Builtin(f)) if key & MethodSlot::BUILTIN_TAG != 0 => {
+            Some((key & !MethodSlot::BUILTIN_TAG, f.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The builtin type the `CALL` at `pc` last constructed in place.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_type(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<Rc<crate::types::TypeObject>> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    match unsafe { &(*slot.0.get()).1 } {
+        MethodSlotFn::BuiltinType(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Note at the `CALL` site at `pc` that its callee, a builtin type, was
+/// constructed in place (see [`MethodSlot::note_builtin_type`]).
+#[inline]
+fn note_type_site(ext: Option<&CodeConstObjects>, pc: usize, callee: &Object) {
+    if let (Some(slot), Object::Type(t)) = (ext.and_then(|e| e.method_slot(pc)), callee) {
+        if t.flags.is_builtin && t.native_kind.get() == 0 {
+            slot.note_builtin_type(t);
+        }
+    }
+}
+
+/// Whether the `CALL` at `pc` last settled on a leaf builtin the core
+/// loop's arm (and the frame JIT's helper) runs in place.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
+    call_site_leaf(ext, pc).is_some_and(LeafKind::runs_in_core)
+}
+
 /// Whether the method call whose `LOAD_ATTR` is at `pc` last resolved to
 /// a callee the core loop runs in place (a builtin, or a leaf function),
 /// without an activation of its own.
 #[cfg(feature = "jit")]
 pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
-    // SAFETY: GIL-serialized; the borrows end before any refill.
+    // (A recursive effect leaf runs as an ordinary call, not in place:
+    // `core_local_method` declines it, so a native method-call helper
+    // there would only cost every call its probes.)
+    // SAFETY: GIL-serialized; the borrows end before any refill; a live
+    // site's code is its live function's.
     let leaf = ext
         .leaf_sites
-        .get()
-        .and_then(|s| s.get(pc))
+        .get(pc)
         .and_then(|s| unsafe { &*s.0.get() }.as_ref())
-        .is_some_and(|site| site.func.strong_count() > 0);
+        .is_some_and(|site| {
+            site.func.strong_count() > 0 && !(site.effect && code_recurses(unsafe { &*site.code }))
+        });
     leaf || ext
-        .method_slots
-        .get()
-        .and_then(|s| s.get(pc))
+        .method_slot(pc)
         .is_some_and(|slot| match unsafe { &(*slot.0.get()).1 } {
             MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
             MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
                 // SAFETY: the function is alive while the upgrade holds it.
-                w.upgrade().is_some_and(|f| fn_is_leaf(&f))
+                w.upgrade().is_some_and(|f| {
+                    fn_is_pure_leaf(&f)
+                        || (fn_is_leaf(&f) && !code_recurses(unsafe { &*f.code.as_ptr() }))
+                })
             }
             _ => false,
         })
@@ -70730,13 +75452,13 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 
 /// Record (or, with `data` `None`, forget) the site at `pc`'s callee.
 #[inline(never)]
-fn leaf_site_set(ext: &CodeConstObjects, ninstrs: usize, pc: usize, data: Option<LeafSiteData>) {
-    if ext.leaf_sites.get().is_none() && (data.is_none() || !site_tables_warm(ext, ninstrs)) {
+fn leaf_site_set(ext: &CodeConstObjects, code: &CodeObject, pc: usize, data: Option<LeafSiteData>) {
+    if !ext.leaf_sites.is_allocated()
+        && (data.is_none() || !site_tables_warm(ext, code.instructions.len()))
+    {
         return;
     }
-    let sites = ext
-        .leaf_sites
-        .get_or_init(|| (0..ninstrs).map(|_| LeafSite::empty()).collect());
+    let sites = ext.alloc_sites(code, &ext.leaf_sites, LeafSite::empty);
     if let Some(site) = sites.get(pc) {
         site.set(data);
     }
@@ -70755,7 +75477,8 @@ enum SiteCall {
 }
 
 /// The attribute `inst` holds for the `LOAD_ATTR` at `pc`, through the
-/// site's [`FieldSlot`] (never recorded for a slot or native class).
+/// site's [`FieldSlot`]: a split field, or a laid-out `__slots__` member
+/// (never recorded for a native class).
 ///
 /// # Safety
 ///
@@ -70767,12 +75490,83 @@ unsafe fn field_slot_hit<'a>(
     pc: usize,
     inst: &'a PyInstance,
 ) -> Option<&'a Object> {
-    let (ver, idx) = ext.field_slots.get()?.get(pc)?.get();
+    let (ver, idx) = ext.field_slot(pc)?.get();
     if inst.cls_raw().attr_version.get() != ver {
         return None;
     }
+    if idx & SLOT_FIELD != 0 {
+        // SAFETY: forwarded contract.
+        return unsafe { inst.laid_out_slot((idx & !SLOT_FIELD) as usize) };
+    }
     // SAFETY: forwarded contract.
     unsafe { inst.split_field(idx as usize) }
+}
+
+/// Count a frameless slot read by the shape of the leaf `code` reading it
+/// (the unit tests' path coverage).
+#[cfg(test)]
+fn note_pure_slot_field_read(code: &CodeObject) {
+    PURE_SLOT_FIELD_READS.with(|hits| {
+        let mut counts = hits.get();
+        let shape =
+            code_vm_ext(code).map(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed));
+        let index = match shape {
+            Some(6) => 0,
+            Some(7) => 1,
+            _ => 2,
+        };
+        counts[index] += 1;
+        hits.set(counts);
+    });
+}
+
+/// A [`FieldSlot`] position naming a `__slots__` member's place in its
+/// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
+/// rather than a split field's: CPython's member descriptor offset. No
+/// split position reaches it (a class shares at most
+/// [`crate::inst_dict::SHARED_KEYS_CAP`] names).
+pub(crate) const SLOT_FIELD: u32 = 1 << 31;
+
+/// Record the [`FieldSlot`] shortcut for the attribute site at `pc` of
+/// `code` (name `co_names[name_idx]`) to the `__slots__` member at
+/// position `idx` of `inst`'s slots, after the site's guarded read or
+/// store of a member (the class passed the site's version check): kept
+/// only when the instance's slots are laid out over its class's own
+/// layout with the name there, where the position names the member for
+/// as long as the class lives.
+#[inline(never)]
+fn slot_field_note(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    pc: usize,
+    inst: &PyInstance,
+    idx: u32,
+    name_idx: u32,
+) {
+    let ninstrs = code.instructions.len();
+    let cls = inst.cls_raw();
+    let Some(layout) = cls.slot_layout.get().and_then(Option::as_ref) else {
+        return;
+    };
+    match layout.get(idx as usize) {
+        Some(key) if slot_name_matches_in(&ext.name_objs, code, name_idx, key) => {}
+        _ => return,
+    }
+    // SAFETY: a read with nothing running (the caller's own guarded
+    // access, whose borrow has ended).
+    if unsafe { inst.slots.peek() }
+        .and_then(|s| s.values_for_layout(layout))
+        .is_none()
+    {
+        return;
+    }
+    if !ext.field_slots.is_allocated() && !site_tables_warm(ext, ninstrs) {
+        return;
+    }
+    let slots = ext.alloc_sites(code, &ext.field_slots, FieldSlot::empty);
+    if let Some(slot) = slots.get(pc) {
+        slot.set((cls.attr_version.get(), idx | SLOT_FIELD));
+    }
 }
 
 /// Record the [`FieldSlot`] shortcut for the `LOAD_ATTR` at `pc`, after
@@ -70780,17 +75574,21 @@ unsafe fn field_slot_hit<'a>(
 /// (whose class passed the site's version check): kept only when that
 /// position is the split layout's, over the class's own names.
 #[inline(never)]
-fn field_slot_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize, inst: &PyInstance, idx: u32) {
+fn field_slot_note(
+    ext: &CodeConstObjects,
+    code: &CodeObject,
+    pc: usize,
+    inst: &PyInstance,
+    idx: u32,
+) {
     // SAFETY: a read with nothing running (the caller's own guarded read).
     if unsafe { inst.split_field(idx as usize) }.is_none() {
         return;
     }
-    if ext.field_slots.get().is_none() && !site_tables_warm(ext, ninstrs) {
+    if !ext.field_slots.is_allocated() && !site_tables_warm(ext, code.instructions.len()) {
         return;
     }
-    let slots = ext
-        .field_slots
-        .get_or_init(|| (0..ninstrs).map(|_| FieldSlot::empty()).collect());
+    let slots = ext.alloc_sites(code, &ext.field_slots, FieldSlot::empty);
     if let Some(slot) = slots.get(pc) {
         slot.set((inst.cls_raw().attr_version.get(), idx));
     }
@@ -70818,10 +75616,7 @@ fn native_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
 /// Whether the `LOAD_ATTR` at `pc` has recorded a split-layout field (see
 /// [`FieldSlot`]).
 pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
-    ext.field_slots
-        .get()
-        .and_then(|s| s.get(pc))
-        .is_some_and(|s| s.get().0 != 0)
+    ext.field_slot(pc).is_some_and(|s| s.get().0 != 0)
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
@@ -70842,10 +75637,7 @@ fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
 /// method slot holds one).
 #[cfg(feature = "jit")]
 pub(crate) fn property_site(ext: &CodeConstObjects, pc: usize) -> bool {
-    ext.method_slots
-        .get()
-        .and_then(|s| s.get(pc))
-        .is_some_and(MethodSlot::holds_getter)
+    ext.method_slot(pc).is_some_and(MethodSlot::holds_getter)
 }
 
 /// Whether the `BINARY_OP` at `pc` has run on an instance operand.
@@ -70863,18 +75655,12 @@ pub(crate) fn native_site(ext: &CodeConstObjects, pc: usize) -> bool {
         .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The bytes compiled code tests before releasing a shared value in line:
+/// The word compiled code tests before releasing a shared value in line:
 /// the reference-count bias's shared flag and every observer
-/// [`Interpreter::core_drops_plain`] consults; all zero for a plain
-/// decrement.
-pub(crate) fn plain_release_flags() -> [*const u8; 4] {
-    let [dicts, funcs] = crate::capi_watchers::release_flags();
-    [
-        crate::sync::rc_shared_flag().as_ptr().cast_const().cast(),
-        dicts,
-        funcs,
-        crate::stdlib::testinternalcapi_mod::reftrace_print_flag(),
-    ]
+/// [`Interpreter::core_drops_plain`] consults, one byte each; zero for a
+/// plain decrement.
+pub(crate) fn plain_release_gate() -> *const u32 {
+    std::ptr::from_ref(&crate::sync::RELEASE_GATES).cast()
 }
 
 /// `v.clone()`, in line (see `Object`'s `Clone`).
@@ -70893,8 +75679,15 @@ fn scalar_copy(v: &Object) -> Object {
         v,
         Object::None | Object::Unbound | Object::Bool(_) | Object::Int(_) | Object::Float(_)
     ));
-    // SAFETY: a scalar owns nothing: its bits are a complete copy.
-    unsafe { std::ptr::read(v) }
+    // SAFETY: a scalar owns nothing: its bits are a complete copy. (Read
+    // as opaque bytes: typed as an `Object` known to be a scalar, the copy
+    // is split into the variants' fields, a byte, a word and padding moved
+    // apart through the stack.)
+    unsafe {
+        std::mem::transmute::<std::mem::MaybeUninit<[u64; 2]>, Object>(std::ptr::read(
+            std::ptr::from_ref(v).cast::<std::mem::MaybeUninit<[u64; 2]>>(),
+        ))
+    }
 }
 
 /// `Object::Int(v)` built as two whole words (see [`clone_hot`]): the
@@ -70950,19 +75743,63 @@ fn drop_hot(v: Object) {
     }
 }
 
+/// Whether a shared value's reference may be released by a plain
+/// decrement: one thread owns every count and no observer wants releases
+/// (one load of [`plain_release_gate`]'s flags; a debug build's counts are
+/// always atomic, as [`crate::rc::try_release_word`]'s are).
+#[inline(always)]
+fn release_gates_clear() -> bool {
+    // SAFETY: the gates are four flags laid out as one `u32`.
+    !cfg!(debug_assertions)
+        && unsafe {
+            (*plain_release_gate().cast::<std::sync::atomic::AtomicU32>())
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        }
+}
+
+/// Release the `n` call operands at `p` (moved out: the caller's stack no
+/// longer counts them) in order, as [`Interpreter::release`] does, with
+/// the commonest cases in line: a scalar, or a shared value's plain
+/// decrement while [`release_gates_clear`] holds. A last owner, or any
+/// release an observer wants, takes the full release.
+///
+/// # Safety
+///
+/// `p` holds `n` initialized values the caller owns and gives up.
+#[inline(always)]
+unsafe fn release_operands(interp: &Interpreter, p: *const Object, n: usize) {
+    let plain = release_gates_clear();
+    for k in 0..n {
+        // SAFETY: the caller's contract: each value owns a reference to its
+        // live allocation, which (with the gates clear) only this thread
+        // counts; the value is read out only for the full release.
+        unsafe {
+            let at = p.add(k);
+            let Some(word) = (*at).strong_word() else {
+                continue;
+            };
+            let c = (*word).load(std::sync::atomic::Ordering::Relaxed);
+            if plain && c > 1 {
+                (*word).store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                interp.release(at.read());
+            }
+        }
+    }
+}
+
 /// The stamp slot for `cache_pc`, allocating the table on first use.
 #[inline]
 fn code_stamp_slot(code: &CodeObject, cache_pc: u32) -> Option<&StampSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.stamp_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .stamp_slots
-            .get_or_init(|| (0..n).map(|_| StampSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(
+        ext,
+        code,
+        &ext.stamp_slots,
+        cache_pc as usize,
+        StampSlot::empty,
+    )
 }
 
 /// Tags of a `LOAD_ATTR` site's class-attribute stamp (`[attr_version,
@@ -70994,6 +75831,80 @@ const TUPLE_FIELD: u64 = 0x5ca1_a770_0000_0005;
 /// layout (see [`Interpreter::core_laid_out_attr`]). A slot member is a
 /// data descriptor, so no instance dictionary shadows it.
 const LAID_OUT_SLOT: u64 = 0x5ca1_a770_0000_0006;
+
+/// A `DELETE_ATTR` site's stamp tag: the class at that version deletes the
+/// site's name from an instance's own dictionary by the default
+/// `__delattr__`, with no class attribute of that name in the way (see
+/// [`Interpreter::core_delete_attr`]).
+const DELETE_OWN_ATTR: u64 = 0x5ca1_a770_0000_0007;
+
+/// Whether the `LOAD_ATTR` at `pc` is cooling down after a failed load
+/// (an odd count; see `Interpreter::specialized_load_attr`'s `Cooldown`
+/// arm): its lanes are skipped for the full handler, whose certainly
+/// missing check raises (`try: o.x except AttributeError:`).
+#[inline(always)]
+pub(crate) fn failing_attr_site(code: &CodeObject, pc: usize) -> bool {
+    matches!(
+        code.caches.get(pc as u32),
+        weavepy_compiler::InlineCache::Cooldown(n) if n & 1 == 1
+    )
+}
+
+/// A `LOAD_ATTR` site's stamp tag for a module attribute: the first word
+/// is the module dict's mutation stamp, the bits the entry's position.
+/// A stamp names one key layout of one dict (values stored in place keep
+/// it), so while it matches, that position holds the site's name.
+const MODULE_ENTRY: u64 = 0x5ca1_a770_0000_0008;
+
+/// A `LOAD_ATTR` site's stamp tag for `inst.__dict__` where the class (at
+/// that version) resolves the name to its own `__dict__` member, a data
+/// descriptor serving the instance dict (CPython's `subtype_dict`).
+const INST_DICT: u64 = 0x5ca1_a770_0000_0009;
+
+/// `inst.__dict__` for the `LOAD_ATTR` site at `pc` (name `name_idx`):
+/// through the site's [`INST_DICT`] stamp, or, for a class that resolves
+/// `__dict__` to its plain dict member under the default attribute
+/// protocol, the instance dict, after which the site remembers the class.
+/// `None` for any other name or shape. Runs no code (the dict may be
+/// created).
+#[inline(always)]
+fn inst_dict_attr(
+    code: &CodeObject,
+    inst: &PyInstance,
+    pc: usize,
+    name_idx: u32,
+) -> Option<Object> {
+    if code.names.get(name_idx as usize)?.as_str() != "__dict__" {
+        return None;
+    }
+    inst_dict_attr_named(code, inst, pc)
+}
+
+/// [`inst_dict_attr`] once the name is `__dict__`.
+#[inline(never)]
+fn inst_dict_attr_named(code: &CodeObject, inst: &PyInstance, pc: usize) -> Option<Object> {
+    if inst.native.get().is_some() || inst.c_body.get() != 0 {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    let ver = cls.attr_version.get();
+    let warm = code_vm_ext(code)
+        .and_then(|ext| ext.stamp_slot(pc))
+        .is_some_and(|slot| slot.get()[..2] == [ver, INST_DICT]);
+    if !warm {
+        if !cls.has_managed_dict()
+            || cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || !Interpreter::default_getattribute(cls)
+            || cls.is_super_proxy_type()
+            || !matches!(cls.lookup("__dict__"), Some(Object::SlotDescriptor(s)) if s.name == "__dict__")
+        {
+            return None;
+        }
+        code_stamp_slot(code, pc as u32)?.set([ver, INST_DICT, 0]);
+    }
+    Some(Object::Dict(inst.dict_shared()))
+}
 
 /// The named tuple field a `LOAD_ATTR` site's stamp remembers for
 /// `inst`'s class at its current version (see [`TUPLE_FIELD`]): the item
@@ -71109,6 +76020,10 @@ enum MethodSlotFn {
         generation: u64,
         fast: leaf_builtins::Fast,
     },
+    /// A `CALL` site's builtin type (`type(x)`, `int(s)`, `list()`), which
+    /// the site constructed in place (see `Interpreter::core_builtin_ctor`).
+    /// Builtin types live as long as the interpreter.
+    BuiltinType(Rc<crate::types::TypeObject>),
     /// A rejected native bound-call body, weakly held so a call site
     /// doesn't extend its lifetime. The key is the registry generation.
     NonLeaf(crate::sync::Weak<crate::object::BoundMethod>),
@@ -71444,6 +76359,22 @@ impl MethodSlot {
         unsafe { *self.0.get() = (0, MethodSlotFn::NativeBody(f.clone(), via_call)) };
     }
 
+    /// Remember that this `CALL` site constructed the builtin type `t` in
+    /// place, unless the site already settled on another callee.
+    #[inline]
+    fn note_builtin_type(&self, t: &Rc<crate::types::TypeObject>) {
+        // SAFETY: as `get`; the shared borrow ends before the write.
+        let vacant = match unsafe { &*self.0.get() } {
+            (_, MethodSlotFn::BuiltinType(c)) => !Rc::ptr_eq(c, t),
+            (0, MethodSlotFn::Py(w)) => w.strong_count() == 0,
+            _ => false,
+        };
+        if vacant {
+            // SAFETY: as `set`.
+            unsafe { *self.0.get() = (0, MethodSlotFn::BuiltinType(t.clone())) };
+        }
+    }
+
     fn is_non_leaf(&self, method: &Rc<crate::object::BoundMethod>) -> bool {
         // SAFETY: GIL-held leaf dispatch, as `get_leaf`. A live Weak keeps
         // the allocation reserved, preventing address-reuse aliasing.
@@ -71600,15 +76531,13 @@ impl MethodSlot {
 #[inline]
 fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
     let ext = code_vm_ext(code)?;
-    let n = code.instructions.len();
-    match ext.method_slots.get() {
-        Some(slots) => slots,
-        None if site_tables_warm(ext, n) => ext
-            .method_slots
-            .get_or_init(|| (0..n).map(|_| MethodSlot::empty()).collect()),
-        None => return None,
-    }
-    .get(cache_pc as usize)
+    warm_site(
+        ext,
+        code,
+        &ext.method_slots,
+        cache_pc as usize,
+        MethodSlot::empty,
+    )
 }
 
 /// The plain function class `cls` (at attribute version `ver`) resolves
@@ -71653,16 +76582,15 @@ pub(crate) fn code_is_pure_leaf_pub(code: &CodeObject) -> bool {
 }
 
 /// The fused-pair kind of every instruction (see
-/// [`CodeConstObjects::fast_pairs`]), built once per code object.
-/// Empty for code with no pair at all — the common shape, whose
-/// `LOAD_FAST` arm then reads nothing.
+/// [`CodeConstObjects::fast_pairs`]), built once per code object: past
+/// the local-to-local pairs, the receiver-fused kinds ([`FAST_METHOD`] and
+/// on), which `LOAD_FAST` reads instead of decoding the next instruction.
+/// Empty for code with none at all, whose `LOAD_FAST` arm then reads
+/// nothing.
 fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> &'a [u8] {
     let Some(ext) = ext else { return &[] };
     ext.fast_pairs.get_or_init(|| {
-        // (`WEAVEPY_NO_PAIRS`, a bisection aid, leaves every table empty.)
-        if crate::hot_gates::env_flags::no_pairs() {
-            return Box::new([]);
-        }
+        let no_pairs = crate::hot_gates::env_flags::no_pairs();
         let ops = &code.instructions;
         let mut any = false;
         let mut kinds = vec![0u8; ops.len()];
@@ -71671,6 +76599,19 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
                 continue;
             }
             let kind = match ops.get(pc + 1).map(|i| i.op) {
+                // The receiver-fused shapes: a method call, an attribute
+                // read (a chain of them) or store on the local.
+                Some(OpCode::LoadMethodAttr) => FAST_METHOD,
+                Some(OpCode::LoadAttr)
+                    if ops.get(pc + 2).map(|i| i.op) == Some(OpCode::LoadAttr) =>
+                {
+                    FAST_ATTR_CHAIN
+                }
+                Some(OpCode::LoadAttr) => FAST_ATTR,
+                Some(OpCode::StoreAttr) => FAST_STORE_ATTR,
+                // (`WEAVEPY_NO_PAIRS`, a bisection aid, leaves out the
+                // local-to-local pairs.)
+                _ if no_pairs => 0,
                 // A second load whose own successor reads an attribute
                 // off it keeps the receiver-fused arm instead.
                 Some(OpCode::LoadFast) => u8::from(!matches!(
@@ -71701,6 +76642,14 @@ fn code_fast_pairs<'a>(code: &CodeObject, ext: Option<&'a CodeConstObjects>) -> 
         }
     })
 }
+
+/// [`code_fast_pairs`]'s receiver-fused kinds: the `LOAD_FAST` is followed
+/// by a `LOAD_METHOD_ATTR`, a `LOAD_ATTR` (followed by another, for the
+/// chain), or a `STORE_ATTR`.
+const FAST_METHOD: u8 = 5;
+const FAST_ATTR: u8 = 6;
+const FAST_ATTR_CHAIN: u8 = 7;
+const FAST_STORE_ATTR: u8 = 8;
 
 /// A leaf's parameter count: its positional parameters, its keyword-only
 /// ones, then its `**kwargs` dictionary when it has one (bound by keyword
@@ -71994,6 +76943,132 @@ fn code_returns_only_none(code: &CodeObject) -> bool {
     yes
 }
 
+/// Whether `code`'s body may call itself: it makes a call, and its names
+/// include its own (`self.find(...)` in a method `find`, or a recursive
+/// function's global). Cached in its extension. Evaluated frameless, a
+/// recursive effect leaf nests its own evaluation at every level, which
+/// costs more than calling it directly (go's `Square.find`); an effect
+/// leaf that calls other code costs less frameless (deltablue's
+/// constraint methods, whose direct calls compiled them to no gain).
+fn code_recurses(code: &CodeObject) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(ext) = code_vm_ext(code) else {
+        return true;
+    };
+    match ext.calls.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let yes = code.names.contains(&code.name)
+        && code
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, OpCode::Call | OpCode::CallKw | OpCode::CallEx));
+    ext.calls.store(if yes { 2 } else { 1 }, Relaxed);
+    yes
+}
+
+/// Where a store-only `__init__`'s stored value comes from.
+#[derive(Clone, Copy)]
+enum StoreSrc {
+    /// The parameter at this position (`0` is the instance itself).
+    Param(u32),
+    /// This constant (an index into the code's constant objects).
+    Const(u32),
+    /// A small int literal.
+    Int(i64),
+}
+
+/// A *store-only* `__init__` (see [`code_store_init`]): its attribute
+/// stores into `self`, in order.
+struct StoreInit {
+    /// Each store's `STORE_ATTR` pc and the value it stores.
+    stores: Box<[(u32, StoreSrc)]>,
+    /// How many stores take each parameter (a parameter's last use moves
+    /// it, any earlier one copies it).
+    uses: Box<[u8]>,
+}
+
+/// The store-only shape of `code`: a body that is nothing but
+/// `self.name = <parameter or constant>` statements followed by
+/// `return None` (`RESUME` aside), as most `__init__`s are. Cached in the
+/// code's extension.
+fn code_store_init(code: &CodeObject) -> Option<&StoreInit> {
+    let ext = code_vm_ext(code)?;
+    ext.store_init
+        .get_or_init(|| store_init_shape(code).map(Box::new))
+        .as_deref()
+}
+
+fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
+    let nparams = code.arg_count as usize;
+    if nparams == 0
+        || nparams > 8
+        || code.is_generator
+        || code.is_coroutine
+        || code.is_async_generator
+        || !code.cellvars.is_empty()
+        || !code.freevars.is_empty()
+        || Interpreter::has_extended_params(code)
+    {
+        return None;
+    }
+    let ins = &code.instructions;
+    let mut stores = Vec::new();
+    let mut uses = vec![0u8; nparams];
+    let mut pc = 0;
+    while pc < ins.len() {
+        let i = ins[pc];
+        match i.op {
+            OpCode::Resume | OpCode::Nop | OpCode::NotTaken => pc += 1,
+            OpCode::LoadConst
+                if matches!(code.constants.get(i.arg as usize), Some(Constant::None))
+                    && ins.get(pc + 1).is_some_and(|n| n.op == OpCode::ReturnValue) =>
+            {
+                // The final `return None`: the shape holds when nothing
+                // else follows it.
+                if pc + 2 != ins.len()
+                    || stores.is_empty()
+                    || stores.len() > crate::inst_dict::SHARED_KEYS_CAP
+                {
+                    return None;
+                }
+                return Some(StoreInit {
+                    stores: stores.into_boxed_slice(),
+                    uses: uses.into_boxed_slice(),
+                });
+            }
+            _ => {
+                let src = match i.op {
+                    OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+                        if (i.arg as usize) < nparams =>
+                    {
+                        uses[i.arg as usize] = uses[i.arg as usize].checked_add(1)?;
+                        StoreSrc::Param(i.arg)
+                    }
+                    OpCode::LoadConst => StoreSrc::Const(i.arg),
+                    OpCode::LoadSmallInt => StoreSrc::Int(i64::from(i.arg)),
+                    _ => return None,
+                };
+                let recv = ins.get(pc + 1)?;
+                let store = ins.get(pc + 2)?;
+                if !matches!(
+                    recv.op,
+                    OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+                ) || recv.arg != 0
+                    || store.op != OpCode::StoreAttr
+                {
+                    return None;
+                }
+                stores.push((u32::try_from(pc + 2).ok()?, src));
+                pc += 3;
+            }
+        }
+    }
+    None
+}
+
 /// Whether `code` is an *effect leaf* (see `code_pure_leaf_decide`),
 /// deciding its leaf verdicts on first use.
 #[inline]
@@ -72112,7 +77187,7 @@ pub(crate) fn code_gen_names(code: &CodeObject) -> (Object, Object) {
 /// outlives its young set, so a long-lived one (a parked coroutine, say)
 /// holds no more than it needs.
 pub(crate) fn compact_generator_frame(gen: &PyGenerator) {
-    let Ok(mut state) = gen.state.try_borrow_mut() else {
+    let Ok(mut state) = gen.state().try_borrow_mut() else {
         return;
     };
     let (GeneratorState::Created(frame) | GeneratorState::Suspended(frame)) = &mut *state else {
@@ -72179,21 +77254,28 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
                 .collect(),
-            method_slots: std::sync::OnceLock::new(),
-            stamp_slots: std::sync::OnceLock::new(),
-            attr_poly: std::sync::OnceLock::new(),
-            call_slots: std::sync::OnceLock::new(),
+            site_ranks: std::sync::OnceLock::new(),
+            method_slots: SiteSlots::new(),
+            stamp_slots: SiteSlots::new(),
+            attr_poly: SiteSlots::new(),
+            call_slots: SiteSlots::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             leaf_tries: std::sync::atomic::AtomicU64::new(0),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
-            field_slots: std::sync::OnceLock::new(),
+            gen_start: std::sync::atomic::AtomicU32::new(0),
+            field_slots: SiteSlots::new(),
             native_sites: std::sync::OnceLock::new(),
             instance_sites: std::sync::OnceLock::new(),
-            leaf_sites: std::sync::OnceLock::new(),
+            leaf_sites: SiteSlots::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
+            store_init: std::sync::OnceLock::new(),
+            calls: std::sync::atomic::AtomicU8::new(0),
+            name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
+            ident_strs: std::sync::OnceLock::new(),
+            positions: std::sync::OnceLock::new(),
             #[cfg(feature = "jit")]
             frame_jit: frame_jit::Slot::default(),
             cold_sites: std::sync::atomic::AtomicU32::new(0),
@@ -72308,7 +77390,7 @@ fn set_function_attribute(func: Object, value: Object, flag: u32) -> Result<Obje
                     let owner_qualname = f
                         .slot("__qualname__")
                         .map(|q| q.to_str())
-                        .unwrap_or_else(|| f.code.borrow().qualname.clone());
+                        .unwrap_or_else(|| f.code.borrow().qualname.to_string());
                     annotate.set_slot(
                         "__qualname__",
                         Object::from_str(format!("{owner_qualname}.__annotate__")),
@@ -72407,10 +77489,14 @@ fn new_function(
     // staticmethod wrappers) return the *same* object, which
     // `assertIs(wrapper.__name__, func.__name__)` in test_decorators
     // relies on.
-    let module = globals
-        .borrow()
-        .get(&DictKey(fn_slot_keys()[1].clone()))
-        .cloned();
+    let module = {
+        let g = globals.borrow();
+        match g.get_index(0) {
+            // A module's namespace starts with its `__name__`.
+            Some((k, v)) if matches!(&k.0, Object::Str(s) if &**s == "__name__") => Some(v.clone()),
+            _ => g.get(&DictKey(fn_slot_keys()[1].clone())).cloned(),
+        }
+    };
     let f = PyFunction {
         name: code.name.clone(),
         code: RefCell::new(code),
@@ -72425,8 +77511,10 @@ fn new_function(
         attrs: RefCell::new(None),
         slots_raw: crate::sync::OnceBox::new(),
         slot_seed: RefCell::new(Some(crate::object::LazySlots(module))),
+        gc_slot: crate::gc_trace::GcSlot::new(),
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
+        names_kept: crate::sync::Cell::new(0),
     };
     if let Some(ann) = annotations {
         f.slots()
@@ -72542,9 +77630,18 @@ fn inst_may_shadow(inst: &PyInstance, code: &CodeObject, name_idx: u32) -> bool 
                 return false;
             }
             let i = name_idx as usize;
-            match code_vm_ext(code).map(|t| (t.name_objs.get(i), t.name_hashes.get(i))) {
+            let ext = code_vm_ext(code);
+            match ext.map(|t| (t.name_objs.get(i), t.name_hashes.get(i))) {
                 Some((Some(Object::Str(n)), Some(&hash))) => {
-                    split.position_hashed(n, hash).is_some()
+                    let memos = ext.expect("matched above").name_memos.get_or_init(|| {
+                        (0..code.names.len())
+                            .map(|_| crate::inst_dict::NameMemo::default())
+                            .collect()
+                    });
+                    match memos.get(i) {
+                        Some(memo) => split.holds_memo(n, hash, memo),
+                        None => split.position_hashed(n, hash).is_some(),
+                    }
                 }
                 _ => code_name_key(code, name_idx)
                     .is_none_or(|k| split.position_hashed(k.s, k.hash).is_some()),
@@ -75233,6 +80330,7 @@ next(gen)
 
     #[test]
     fn sum_streaming_integer_fastpath_preserves_boundaries_and_fallbacks() {
+        let _gil = crate::gil::hold_gil();
         let zero = Object::Int(0);
         for sequence in [
             Object::new_list(vec![Object::Int(i64::MAX), Object::Int(1), Object::Int(-1)]),
@@ -75260,6 +80358,11 @@ next(gen)
 
     fn run(src: &str) -> String {
         let module = parse_module(src).expect("parse");
+        // Tests run in parallel, each with its own interpreter, and share
+        // the process-wide collector: hold the GIL while this thread's
+        // objects are built, read and released (it still passes the GIL
+        // on at the eval loop's hand-off points).
+        let _gil = crate::gil::hold_gil();
         let code = compile_module(&module).expect("compile");
         let mut interp = Interpreter::new();
         let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
@@ -75475,6 +80578,7 @@ assert loop(2000) == 1999000
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
+                let _gil = crate::gil::hold_gil();
                 crate::tier2::force_enable_for_test(4);
                 crate::tier2::note_startup_finished();
                 let mut interp = Interpreter::new();
@@ -75960,7 +81064,7 @@ assert loop(2000) == 1999000
                 "  function owners={}, maybe_tracked={}, tracked={}",
                 Rc::strong_count(function),
                 gc_trace::maybe_tracked(id),
-                gc_trace::is_tracked(id)
+                gc_trace::is_tracked(&Object::Function(function.clone()))
             );
             if *name == "default_predicate" {
                 if let Some(receiver @ Object::Instance(inst)) = function.defaults.first() {
@@ -77176,7 +82280,31 @@ assert loop(2000) == 1999000
         .expect("jit worker thread")
     }
 
+    /// Run `body` for the test `name` (its path in the test binary) in a
+    /// child process of its own: `sys.setrecursionlimit` sets a
+    /// process-wide limit, which a test must not change under the
+    /// interpreters the other tests run on concurrent threads (or have
+    /// changed under it).
+    #[cfg(feature = "jit")]
+    fn with_own_recursion_limit(name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "WEAVEPY_RECURSION_LIMIT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            body();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn recursion-limit test");
+        assert!(
+            status.success(),
+            "isolated recursion-limit test failed: {status}"
+        );
+    }
+
     fn check_cold_instance_dictionaries() {
+        let _gil = crate::gil::hold_gil();
         let source = r"
 import gc
 class Plain:
@@ -77259,6 +82387,49 @@ assert namespace is exported.__dict__
         })
         .join()
         .expect("jit worker thread");
+    }
+
+    /// Building and dropping an interpreter waits for the GIL. Both
+    /// touch objects of the process-wide collector -- construction tracks
+    /// thousands, and the drop releases them -- and a collection on another
+    /// thread reads every tracked object, and the collector's own lists,
+    /// without taking cell borrows. The parallel unit tests, each with its
+    /// own interpreter, corrupted the collector's deferred list and freed
+    /// lists under a collection's mark walk while they did either outside
+    /// the GIL.
+    #[test]
+    fn interpreters_build_and_drop_under_the_gil() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // Hold the GIL for a while and check that `work`, on another
+        // thread, did not finish meanwhile.
+        fn waits_for_the_gil(work: impl FnOnce() + Send + 'static) {
+            let done = Arc::new(AtomicBool::new(false));
+            let gil = crate::gil::hold_gil();
+            let worker = {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    work();
+                    done.store(true, Ordering::Release);
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !done.load(Ordering::Acquire),
+                "the interpreter was built or dropped without the GIL"
+            );
+            drop(gil);
+            worker.join().expect("interpreter thread");
+            assert!(done.load(Ordering::Acquire));
+        }
+        // Warm the process-wide caches, so the timed construction is fast.
+        drop(Interpreter::new());
+        waits_for_the_gil(|| drop(Interpreter::new()));
+        let mut interp = Interpreter::new();
+        let module = parse_module("data = {i: [i] for i in range(100)}\n").expect("parse");
+        let code = compile_module(&module).expect("compile");
+        interp.run_module(&code).expect("run");
+        waits_for_the_gil(move || drop(interp));
     }
 
     #[test]
@@ -80586,6 +85757,14 @@ assert namespace is exported.__dict__
                    sys.setrecursionlimit(limit)\n\
                    print('depth', depth)\n\
                    print(run(c, 3000, rebind, 1000))\n";
+        with_own_recursion_limit(
+            "tests::jit_direct_method_call_guard_changes_match_interpreter",
+            || check_direct_method_call_guard_changes(src),
+        );
+    }
+
+    #[cfg(feature = "jit")]
+    fn check_direct_method_call_guard_changes(src: &str) {
         let (out, compiled, _deopts) = run_jit(src);
         assert!(compiled >= 2, "the method kernels never compiled");
         assert_eq!(out, run(src));
@@ -81947,10 +87126,15 @@ print("native pickle coverage: ok")
                    \x20   return down(n - 1)\n\
                    k = 0\nwhile k < 10:\n    down(5)\n    k = k + 1\n\
                    try:\n    down(100000)\nexcept RecursionError:\n    print('rec ok')\n";
-        let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
-        assert!(calls >= 1, "down never took the native call path");
-        assert_eq!(out, "rec ok\n");
-        assert_eq!(out, run(src));
+        with_own_recursion_limit(
+            "tests::jit_native_recursion_limit_matches_interpreter",
+            || {
+                let (out, calls, _fallbacks, _deopts) = run_jit_native(src);
+                assert!(calls >= 1, "down never took the native call path");
+                assert_eq!(out, "rec ok\n");
+                assert_eq!(out, run(src));
+            },
+        );
     }
 
     #[cfg(feature = "jit")]
@@ -82406,6 +87590,7 @@ print("native pickle coverage: ok")
 
     #[test]
     fn native_leaf_lookup_uses_body_identity() {
+        let _gil = crate::gil::hold_gil();
         let interp = Interpreter::new();
         let receiver = Object::new_list(Vec::new());
         let Object::Builtin(first) = interp.lookup_method(&receiver, "__len__").unwrap() else {
@@ -82427,6 +87612,7 @@ print("native pickle coverage: ok")
 
     #[test]
     fn native_bound_rejection_cache_does_not_own_methods() {
+        let _gil = crate::gil::hold_gil();
         let receiver = Rc::new(RefCell::new(Vec::new()));
         let weak_receiver = Rc::downgrade(&receiver);
         let object = Object::List(receiver);

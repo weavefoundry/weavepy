@@ -1630,7 +1630,7 @@ const EP_ITERFIND: usize = 3;
 /// The closure `f` holds for free variable `name`, when it is a `str`.
 fn closure_str(
     f: &crate::object::PyFunction,
-    freevars: &[String],
+    freevars: &[weavepy_compiler::Name],
     name: &str,
 ) -> Option<SharedStr> {
     let i = freevars.iter().position(|v| v == name)?;
@@ -1741,14 +1741,12 @@ struct PathKey<'a> {
     exotic: std::cell::Cell<bool>,
 }
 
-impl std::hash::Hash for PathKey<'_> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+impl crate::dictmap::Probe for PathKey<'_> {
+    fn probe_hash(&self) -> i64 {
+        self.hash
     }
-}
 
-impl indexmap::Equivalent<DictKey> for PathKey<'_> {
-    fn equivalent(&self, key: &DictKey) -> bool {
+    fn probe_eq(&self, key: &DictKey) -> bool {
         match &key.0 {
             Object::Tuple(t) => {
                 let mut items = t.iter();

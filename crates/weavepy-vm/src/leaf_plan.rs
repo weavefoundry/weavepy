@@ -994,21 +994,20 @@ impl Interpreter {
     /// code, at recursion depth `depth`, once the callee's warm-up is past
     /// (the frameless call bookkeeping is then only the hit count):
     /// `None` when the plan has no native code, or the callee one of the
-    /// tiny shapes `leaf_eval` answers itself; otherwise the result, or
-    /// `None` inside having done nothing observable.
+    /// tiny shapes `leaf_eval` answers itself (the caller checked `ext`,
+    /// `code`'s extension, for those); otherwise the result, or `None`
+    /// inside having done nothing observable.
     #[cfg(feature = "jit")]
-    #[inline]
+    #[inline(always)]
     pub(crate) fn leaf_site_native<const EFFECT: bool>(
         &self,
         code: &CodeObject,
+        ext: &CodeConstObjects,
         f: &crate::object::PyFunction,
         args: &[*const Object],
         depth: usize,
     ) -> Option<Option<Object>> {
-        let ext = crate::code_vm_ext(code)?;
-        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3
-            || code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
-        {
+        if code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP {
             return None;
         }
         let plan = ext.leaf_plan.get()?.as_deref()?;
@@ -1086,7 +1085,7 @@ impl Interpreter {
             }};
         }
         let mut consts: &[V] = &plan.consts;
-        let mut stamps: &[crate::StampSlot] = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+        let mut stamps: crate::Sites<'_, crate::StampSlot> = ext.stamp_sites();
         let mut owned = Owned::new();
         let mut pend = Pending::new();
         let mut ops: &[Op] = &plan.ops;
@@ -1274,7 +1273,7 @@ impl Interpreter {
                         depth += 1;
                         (code, ext, plan, f) = (&**ccode, cext, cplan, callee);
                         consts = &plan.consts;
-                        stamps = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+                        stamps = ext.stamp_sites();
                         ops = &plan.ops;
                         ip = 0;
                         continue;
@@ -1321,7 +1320,7 @@ impl Interpreter {
                         let c = unsafe { &*callers.get_unchecked(depth).as_ptr() };
                         (ip, code, ext, plan, f) = (c.ip, c.code, c.ext, c.plan, c.f);
                         consts = &plan.consts;
-                        stamps = ext.stamp_slots.get().map_or(&[], |s| &s[..]);
+                        stamps = ext.stamp_sites();
                         ops = &plan.ops;
                         // SAFETY: as above.
                         unsafe {
@@ -1559,7 +1558,7 @@ impl Interpreter {
     fn plan_global(
         &self,
         code: &CodeObject,
-        stamps: &[crate::StampSlot],
+        stamps: crate::Sites<'_, crate::StampSlot>,
         f: &crate::object::PyFunction,
         pc: u16,
     ) -> Option<V> {
@@ -1609,7 +1608,7 @@ impl Interpreter {
         &self,
         code: &CodeObject,
         ext: &CodeConstObjects,
-        stamps: &[crate::StampSlot],
+        stamps: crate::Sites<'_, crate::StampSlot>,
         owned: &mut Owned,
         pend: &Pending,
         src: V,
@@ -1704,7 +1703,7 @@ impl Interpreter {
         if (EFFECT && pend.n > 0) || nest >= NEST {
             return None;
         }
-        let slot = ext.method_slots.get()?.get(pc as usize)?;
+        let slot = ext.method_slot(pc as usize)?;
         let cls = inst.cls_raw();
         // SAFETY: GIL-serialized; nothing here runs Python, so nothing
         // rebinds the getter or its code, or changes the class.

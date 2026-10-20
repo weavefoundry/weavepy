@@ -623,7 +623,7 @@ const CACHE_SWEEP_MIN: usize = 1024;
 /// cache that has grown to `sweep_at` entries first drops those of code
 /// objects that have died (see [`JitState::sweep_at`]).
 fn cache_entry<'a>(
-    cache: &'a mut CodeMap<CacheEntry>,
+    cache: &'a mut CodeMap<Box<CacheEntry>>,
     sweep_at: &mut usize,
     code: &Rc<CodeObject>,
 ) -> &'a mut CacheEntry {
@@ -633,7 +633,7 @@ fn cache_entry<'a>(
     }
     cache
         .entry(Rc::as_ptr(code).cast::<CodeObject>())
-        .or_insert_with(|| CacheEntry::new(code))
+        .or_insert_with(|| Box::new(CacheEntry::new(code)))
 }
 
 /// Give up on OSR for a code object after this many failed validations.
@@ -800,7 +800,10 @@ struct JitState {
     threshold: u32,
     range_budget: bool,
     engine: Option<JitEngine>,
-    cache: CodeMap<CacheEntry>,
+    /// Each code object's entry, boxed: every code object that runs gets
+    /// one, and an entry in line made each of the table's buckets (spare
+    /// ones included) as large as an entry.
+    cache: CodeMap<Box<CacheEntry>>,
     /// The cache size at which [`cache_entry`] next sweeps out the
     /// entries of dead code objects (twice the live count the last sweep
     /// left, so sweeping stays amortized constant time per entry).
@@ -823,12 +826,9 @@ struct JitState {
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process, when the first code object is
-/// halfway to its compile threshold. Not at start-up: paging the code
-/// generator in costs a program that never compiles anything about 2 MB
-/// of resident memory (a third of an empty script's over CPython's), and
-/// on the development host it slowed start-up more than it saved a short
-/// hot loop's first compile.
+/// [`prewarm_codegen`]), once per process: when start-up begins with the
+/// JIT on (see [`prewarm_at_startup`]), or failing that when the first
+/// code object is halfway to its compile threshold.
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -841,6 +841,21 @@ fn spawn_codegen_prewarm() {
         if let Ok(mut slot) = PREWARM_THREAD.lock() {
             *slot = Some(handle);
         }
+    }
+}
+
+/// Start the code generator's warm-up as start-up begins, when the JIT may
+/// run. A hot loop gets from its first iterations to its compile in far
+/// less time than the warm-up takes (about 0.7 ms), so a warm-up started
+/// on the way there leaves the first compile paying most of the cold start
+/// on the thread that needs the code: short hot programs ran 6-11% slower
+/// for it. On a background thread during start-up it costs the main thread
+/// nothing; the price is the code generator's pages (about 2 MB resident)
+/// in a process that never compiles, which start-up also paid when it
+/// warmed the code generator itself.
+pub(crate) fn prewarm_at_startup() {
+    if !jit_off_for_process() {
+        spawn_codegen_prewarm();
     }
 }
 
@@ -1067,32 +1082,14 @@ fn import_compilation_budget() -> bool {
 }
 
 /// Mark interpreter start-up finished (see [`STARTUP_DONE`]).
+///
+/// The engine is still built at the first compile, not here: building it
+/// and running a compile through it pages in about 1.4 MB of the code
+/// generator, which a process that never compiles (a short script, most
+/// imports) would carry for nothing, to save the first compile about a
+/// millisecond.
 pub(crate) fn note_startup_finished() {
     STARTUP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-    warm_engine();
-}
-
-/// Build this thread's engine and run one throwaway compile through it
-/// (see [`JitEngine::warm_up`]) as start-up ends, when the JIT is on: the
-/// first hot loop's compile then doesn't pay the code generator's cold
-/// start inside the work it speeds up.
-fn warm_engine() {
-    if jit_off_for_process() {
-        return;
-    }
-    JIT.with(|cell| {
-        let Ok(mut st) = cell.try_borrow_mut() else {
-            return;
-        };
-        if !st.enabled || st.engine.is_some() {
-            return;
-        }
-        st.engine = JitEngine::new();
-        match st.engine.as_mut() {
-            Some(engine) => engine.warm_up(),
-            None => st.enabled = false,
-        }
-    });
 }
 
 /// Whether a code object whose counter reached `counter` against
@@ -1112,6 +1109,39 @@ fn compile_allowed(counter: u32, threshold: u32) -> bool {
 /// compiler, a table builder) mostly runs once per process, and an
 /// attempt costs milliseconds.
 const IMPORT_THRESHOLD_FACTOR: u32 = 64;
+
+/// The work at which the current phase admits compiling code whose
+/// threshold is `threshold` (see [`compile_allowed`]).
+fn admit_at(threshold: u32) -> u32 {
+    if compile_allowed(0, threshold) {
+        threshold
+    } else {
+        threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR)
+    }
+}
+
+/// Bodies longer than this many instructions need proportionally more
+/// work before start-up or an import analyzes them (see
+/// [`import_size_budget`]).
+const IMPORT_LARGE_BODY: usize = 512;
+
+/// The counter a code object needs before tier 2 analyzes it, beyond
+/// [`compile_allowed`]'s, when this phase admits compiles only at
+/// `admit_at` (more than the threshold: start-up or an import). The
+/// analysis of a body costs about its length (`import statistics`, whose
+/// imports compile regular expressions, spent 12 ms and a sixth of its
+/// instructions analyzing `re._parser._parse`'s 1,700 to reject them),
+/// and import-time code mostly runs once per process, so a large body
+/// needs work in proportion to its length; it can still compile at the
+/// ordinary threshold once the imports are done.
+fn import_size_budget(code: &CodeObject, admit_at: u32) -> u32 {
+    let len = code.instructions.len();
+    if compile_allowed(0, 1) || len <= IMPORT_LARGE_BODY {
+        return 0;
+    }
+    let scale = u32::try_from(len / IMPORT_LARGE_BODY + 1).unwrap_or(u32::MAX);
+    admit_at.saturating_mul(scale)
+}
 
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
 /// keeps tier 2's start-up and import budgets.
@@ -1326,11 +1356,21 @@ impl JitState {
                     if entry_pc == 0 {
                         entry.calls = entry.calls.wrapping_add(1);
                     }
-                    if entry.counter == self.threshold / 2 && self.engine.is_none() {
+                    // Halfway to the work this phase admits a compile at
+                    // (start-up and imports need far more first). (The
+                    // phase is read only at the two counts it can be.)
+                    let half = self.threshold / 2;
+                    if (entry.counter == half
+                        || entry.counter
+                            == self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR) / 2)
+                        && entry.counter == admit_at(self.threshold) / 2
+                        && self.engine.is_none()
+                    {
                         spawn_codegen_prewarm();
                     }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
+                        || entry.counter < import_size_budget(code, admit_at(self.threshold))
                     {
                         return None;
                     }
@@ -1359,15 +1399,9 @@ impl JitState {
             long_calls = entry.backedges / calls >= LOOP_CALL_ITERATIONS;
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
-        if self.engine.is_none() {
-            self.engine = JitEngine::new();
-            if self.engine.is_none() {
-                // Host ISA unavailable — disable so we stop retrying.
-                self.enabled = false;
-                return None;
-            }
-        }
-        let engine = self.engine.as_mut()?;
+        // The engine is built once an analysis admits some code (see
+        // `JitEngine::compile_frame_lazily`).
+        let engine = &mut self.engine;
         let VmProbes {
             resolve_obj,
             ret_lane_of,
@@ -1690,7 +1724,8 @@ impl JitState {
             let mut slot_member =
                 |site: &AttrSiteMeta| attr_guard_of(site).is_some_and(|g| g.slot_layout != 0);
             ensure_obj_layout();
-            let r = engine.compile_frame_direct(
+            let r = JitEngine::compile_frame_lazily(
+                engine,
                 code,
                 &mut classify,
                 &mut jit_probes,
@@ -1716,6 +1751,14 @@ impl JitState {
                 first
             }
         };
+        if matches!(
+            res,
+            Err(weavepy_jit::JitVerdict::UnsupportedOpcode(why)) if why == weavepy_jit::NO_HOST_ENGINE
+        ) {
+            // Host ISA unavailable — disable so we stop retrying.
+            self.enabled = false;
+            return None;
+        }
         let (tier, out) = match res {
             Ok(cf) => {
                 self.stats.frames_compiled += 1;
@@ -2303,7 +2346,7 @@ fn ctor_field_plan(icode: &CodeObject) -> Option<Vec<(String, CtorFieldSrc)>> {
                 if recv.op != OpCode::LoadFast || recv.arg != 0 || store.op != OpCode::StoreAttr {
                     return None;
                 }
-                let name = icode.names.get(store.arg as usize)?.clone();
+                let name = icode.names.get(store.arg as usize)?.to_string();
                 match fields.iter_mut().find(|(n, _)| *n == name) {
                     Some(slot) => slot.1 = src,
                     None => fields.push((name, src)),
@@ -2486,7 +2529,10 @@ fn native_method_callable(cf: &CompiledFrame, code: &CodeObject) -> bool {
 }
 
 thread_local! {
-    static JIT: RefCell<JitState> = RefCell::new(JitState::new());
+    /// This thread's compiled code and its tables, which hold functions,
+    /// classes and constants: released under the GIL at thread exit.
+    static JIT: crate::gil::ReleaseUnderGil<RefCell<JitState>> =
+        crate::gil::ReleaseUnderGil::new(RefCell::new(JitState::new()));
 
     /// Memoized callee return typing (RFC 0059 WS3 / RFC 0069 WS1):
     /// `(scalar lane, provably-returns-None)`, keyed by code object
@@ -3165,12 +3211,13 @@ fn attr_chain_step(obj: &Object, name: &str) -> Option<Object> {
 /// residue for locals bound from a live list's elements: the probe
 /// predicts from a representative, and the burned fingerprints
 /// re-validate per access).
-fn walk_attr_path(frame: &super::Frame, slot: u32, path: &[String]) -> Option<Object> {
+fn walk_attr_path<S: AsRef<str>>(frame: &super::Frame, slot: u32, path: &[S]) -> Option<Object> {
     let mut cur = {
         let locals = frame.locals.borrow();
         locals.get(slot as usize)?.clone()
     };
     for name in path {
+        let name = name.as_ref();
         if name == weavepy_jit::ELEM_SENTINEL {
             cur = exemplar_element(&cur)?;
             continue;
@@ -4029,7 +4076,7 @@ fn inline_fields_of(recv: &Object, code: &CodeObject, ver: u64) -> Vec<InlineFie
             _ => continue,
         };
         out.push(InlineField {
-            name: name.clone(),
+            name: name.to_string(),
             lane,
             at,
         });
@@ -4667,6 +4714,10 @@ struct CallCtx {
     /// activation shell the inspection found (a framed activation's are
     /// its frame's own).
     inspected_locals: std::cell::RefCell<Option<Rc<GilRefCell<Vec<Object>>>>>,
+    /// A frameless activation's frame object, made for its activation
+    /// shell while a call ran (`sys._getframe()`): the interpreter
+    /// continuation adopts it (see [`call_with_activation_shell`]).
+    inspected_frame: std::cell::RefCell<Option<Rc<crate::object::PyFrame>>>,
 }
 
 /// A framed native activation running on this thread, registered so
@@ -5862,7 +5913,7 @@ unsafe fn call_py_with_gaps(
         if kwargs.is_empty() && args.len() == j {
             args.push(v);
         } else if let Some(name) = code.varnames.get(j) {
-            kwargs.push((name.clone(), v));
+            kwargs.push((name.to_string(), v));
         }
     }
     let res = call_with_activation_shell(interp, ctx, jf, |i| {
@@ -6287,6 +6338,18 @@ unsafe fn try_native_call(
             }
             child.pins.clear();
             ctx.child = Some(child);
+            // An argument the callee held last died with its pins: the
+            // caller leaves native code after the call, so the queued
+            // finalizer runs before its next instruction, as the
+            // interpreter's own call runs it.
+            if finalizer_queued() {
+                ctx.parked = Some(match expect {
+                    SlotTag::Int | SlotTag::Float | SlotTag::Bool => unpack(bits, expect_tag),
+                    SlotTag::ObjPin if bits != u64::MAX => unpack_pins(bits, expect_tag, &ctx.pins),
+                    _ => Object::None,
+                });
+                return Some(CallStatus::Boxed as i64);
+            }
             jf.ret_bits = bits;
             jf.ret_tag = expect_tag;
             return Some(CallStatus::Ok as i64);
@@ -6463,6 +6526,7 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     })
 }
@@ -6589,6 +6653,19 @@ unsafe fn finish_native_call(
     }
     ctx.child = Some(child);
     ctx.dirty |= child_dirty;
+    // A finalizer the callee's releases queued runs before the caller's
+    // next instruction: the caller leaves native code after the call.
+    if finalizer_queued() {
+        match done {
+            Done::Raised(e) => {
+                ctx.raised = Some(e);
+                return CallStatus::Raised as i64;
+            }
+            Done::Scalar(bits, tag) => ctx.parked = Some(unpack(bits, tag)),
+            Done::Obj(v) => ctx.parked = Some(v),
+        }
+        return CallStatus::Boxed as i64;
+    }
 
     match done {
         Done::Raised(e) => {
@@ -6840,9 +6917,23 @@ fn finish_deopted(
     // An inspected activation's shell holds its locals, plus whatever the
     // inspection wrote (see `sync_native_locals`).
     let inspected = nctx.inspected_locals.borrow_mut().take();
+    // A frame object made for the activation's shell stands for this
+    // frame: the frame runs on in it, on the storage its `f_locals` reads.
+    let adopted = nctx.inspected_frame.borrow_mut().take();
+    let mut shared_locals = None;
     if let Some(shell) = inspected.filter(|_| nctx.introspected.get()) {
-        locals_v.extend(shell.borrow().iter().take(n_real).cloned());
-        locals_v.resize(n_real, Object::Unbound);
+        if adopted.as_ref().is_some_and(|py| {
+            py.locals_mirror
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| Rc::ptr_eq(m, &shell))
+        }) {
+            shell.borrow_mut().resize(n_real, Object::Unbound);
+            shared_locals = Some(shell);
+        } else {
+            locals_v.extend(shell.borrow().iter().take(n_real).cloned());
+            locals_v.resize(n_real, Object::Unbound);
+        }
     } else {
         for slot in 0..n_real {
             match entry.cf.local_types.get(slot).copied().flatten() {
@@ -6855,9 +6946,10 @@ fn finish_deopted(
             }
         }
     }
+    let py_frame = shared_locals.as_ref().and(adopted);
     let mut frame = super::Frame {
         code: code.clone(),
-        locals: Rc::new(GilRefCell::new(locals_v)),
+        locals: shared_locals.unwrap_or_else(|| Rc::new(GilRefCell::new(locals_v))),
         cells: crate::object::empty_cells(),
         stack: Vec::new(),
         globals: func.globals.clone(),
@@ -6866,7 +6958,7 @@ fn finish_deopted(
         exc: None,
         agen_yielded_value: true,
         pc: 0,
-        py_frame: None,
+        py_frame,
         gen_owner: None,
         suppress_call_event: true,
         gen_first_resume: false,
@@ -6930,6 +7022,17 @@ fn call_with_activation_shell<T>(
     f: impl FnOnce(&mut super::Interpreter) -> T,
 ) -> T {
     let Some(code) = &ctx.frameless_code else {
+        // A framed activation's shell is the spine's top while its native
+        // code runs: the call site becomes its `f_lineno`, as the
+        // interpreter's own call would record it.
+        if let Ok(stack) = interp.frame_stack.try_borrow() {
+            if let Some(top) = stack.last() {
+                if std::ptr::eq(Rc::as_ptr(&*top.code), ctx.code_ptr) {
+                    top.lasti
+                        .store(jf.deopt_pc, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         return f(interp);
     };
     let shell_locals = Rc::new(GilRefCell::new(Vec::new()));
@@ -6949,9 +7052,26 @@ fn call_with_activation_shell<T>(
         materialized: GilRefCell::new(None),
         tb_refs: std::sync::atomic::AtomicU32::new(0),
     });
-    interp.frame_stack.borrow_mut().push(shell);
+    interp.frame_stack.borrow_mut().push(shell.clone());
     // Inspection of the shell's frame finds this activation's locals.
-    let out = with_native_frame(&shell_locals, jf, || f(interp));
+    let out = with_native_frame(&shell_locals, jf, || {
+        let out = f(interp);
+        // The call made the activation's frame object (`sys._getframe()`
+        // in a callee, or the native code's own call of it): one object
+        // stands for the activation from now on, so the rest of it runs
+        // in the interpreter (the inspection mark ends the native run
+        // after this call), whose frame adopts the object and these
+        // locals (see `finish_deopted`).
+        // (An inspection of its `f_locals` synced them already, and may
+        // have written them since.)
+        if let Some(py) = shell.materialized.borrow().as_ref() {
+            if !ctx.introspected.get() {
+                sync_native_locals(&shell_locals);
+            }
+            *ctx.inspected_frame.borrow_mut() = Some(py.clone());
+        }
+        out
+    });
     // The general pop: a traceback entry or a callee frame's `f_back` may
     // hold the shell lazily, and gets its frame object on the way out.
     interp.pop_frame_shell();
@@ -10352,6 +10472,7 @@ mod scalar_update_guard_tests {
 
     #[test]
     fn mutable_descriptor_classes_never_certify_an_update() {
+        let _gil = crate::gil::hold_gil();
         let object = crate::builtin_types::builtin_types().object_.clone();
         let descriptor_type =
             TypeObject::new_user("MutableValue", vec![object.clone()], DictData::default())
@@ -10422,6 +10543,7 @@ mod attr_pin_tests {
 
     #[test]
     fn stale_hints_check_the_current_activation_and_object_identity() {
+        let _gil = crate::gil::hold_gil();
         let class = TypeObject::new_user("PinValue", vec![], DictData::default()).unwrap();
         let a = Object::Instance(Rc::new(crate::types::PyInstance::new(class.clone())));
         let b = Object::Instance(Rc::new(crate::types::PyInstance::new(class)));
@@ -10873,11 +10995,7 @@ unsafe fn cached_chain_peek<'a>(
                         .or_else(|| slots.get(name.as_ref()))
                 }
                 _ => {
-                    let index = extension
-                        .attr_poly
-                        .get()?
-                        .get(pc as usize)?
-                        .index(version)?;
+                    let index = extension.attr_poly_slot(pc as usize)?.index(version)?;
                     // SAFETY: the same callback-free, rooted interval.
                     let (key, value) = unsafe { inst.attr_peek_index(index as usize) }?;
                     key_is(key, name).then_some(value)
@@ -11207,9 +11325,6 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
         // execution. Watched instance dicts deopt so the generic path
         // fires the exact watcher events.
         AttrStorage::NewKey => {
-            use indexmap::map::raw_entry_v1::{RawEntryApiV1, RawEntryMut};
-            use std::hash::BuildHasher;
-
             if crate::capi_watchers::dicts_active() {
                 return 1;
             }
@@ -11238,25 +11353,22 @@ unsafe extern "C" fn wpjit_attr_set(frame: *mut JitFrame, pin: i64, site: i64) -
                 &mut **dict
             };
             let probe = crate::object::LeafNameProbe::new(&g.name, g.name_hash);
-            let hash = crate::fasthash::FxBuildHasher.hash_one(g.name_hash);
-            let entry = dict
-                .raw_entry_mut_v1()
-                .from_key_hashed_nocheck(hash, &probe);
+            let entry = dict.probe_entry(&probe);
             // A hash-colliding user key could run Python during equality.
             // Resume before the store so the interpreter owns that callback.
             if probe.saw_exotic() {
                 return 1;
             }
             let old = match entry {
-                RawEntryMut::Occupied(mut entry) => {
+                crate::dictmap::ProbeEntry::Occupied(mut entry) => {
                     let dst = entry.get_mut();
                     // The displaced-value discipline of the indexed arm.
                     Some(std::mem::replace(dst, v))
                 }
-                RawEntryMut::Vacant(entry) => {
+                crate::dictmap::ProbeEntry::Vacant(entry) => {
                     // The guard already owns the interned key. Reuse the
-                    // probe's hash and vacant entry instead of probing again.
-                    entry.insert_hashed_nocheck(hash, DictKey(Object::Str(g.name.clone())), v);
+                    // probe's hash and vacant slot instead of probing again.
+                    entry.insert(DictKey(Object::Str(g.name.clone())), v);
                     None
                 }
             };
@@ -13767,6 +13879,7 @@ pub(crate) fn try_call_native_direct(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
@@ -14724,6 +14837,7 @@ fn enter_compiled(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
@@ -15645,6 +15759,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
     let mut jf = JitFrame {
@@ -15939,6 +16054,7 @@ mod native_pair_tests {
 
     #[test]
     fn shares_cursors_with_interpreted_steps_and_stays_exhausted() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[10, 20, 30], -2);
         assert!(matches!(
             inner.borrow_mut().next_value(),
@@ -15967,6 +16083,7 @@ mod native_pair_tests {
 
     #[test]
     fn counter_overflow_leaves_the_value_for_generic_promotion() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[11, 22, 33], i64::MAX - 1);
         assert_eq!(
             next_enumerated_byte(&outer),
@@ -15996,6 +16113,7 @@ mod native_pair_tests {
 
     #[test]
     fn unsupported_sources_do_not_advance_either_cursor() {
+        let _gil = crate::gil::hold_gil();
         let inner = Rc::new(RefCell::new(PyIterator::Bytes {
             data: crate::shared_value::SharedSlice::from([42_u8].as_slice()),
             index: 0,
@@ -16026,6 +16144,7 @@ mod native_pair_tests {
 
     #[test]
     fn a_live_borrow_does_not_consume_a_byte() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = enumeration(&[42], 0);
         let borrowed = inner.borrow();
         assert_eq!(next_enumerated_byte(&outer), NativeBytePair::Unsupported);
@@ -16048,6 +16167,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_pairs_preserve_identity_shared_cursors_and_exhaustion() {
+        let _gil = crate::gil::hold_gil();
         let value = Object::from_str("retained value");
         let (outer, inner) =
             tuple_enumeration(vec![Object::Int(5), value.clone(), Object::None], -2);
@@ -16084,6 +16204,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_pin_pressure_preserves_values_and_allows_none() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = tuple_enumeration(vec![Object::Int(42), Object::None], 0);
         assert!(matches!(
             next_enumerated_tuple(&outer, false),
@@ -16109,6 +16230,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_mutable_values_and_counter_overflow_keep_generic_continuations() {
+        let _gil = crate::gil::hold_gil();
         let mutable = Object::List(Rc::new(RefCell::new(vec![Object::Int(1)])));
         let (outer, inner) = tuple_enumeration(vec![mutable.clone(), Object::Int(7)], 7);
         assert!(matches!(
@@ -16165,6 +16287,7 @@ mod native_pair_tests {
 
     #[test]
     fn tuple_borrows_and_wrappers_do_not_consume_values() {
+        let _gil = crate::gil::hold_gil();
         let (outer, inner) = tuple_enumeration(vec![Object::Int(42)], 0);
         let borrowed = inner.borrow();
         assert!(matches!(

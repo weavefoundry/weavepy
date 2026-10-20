@@ -2010,7 +2010,7 @@ fn plan_rewrite(
                 && ins[i - 2].arg == 0
                 && matches!(ins[i - 3].op, OpCode::LoadMethodAttr)
                 && matches!(ins[i - 4].op, OpCode::LoadFast)
-                && code.names.get(ins[i - 3].arg as usize).map(String::as_str) == Some("items")
+                && code.names.get(ins[i - 3].arg as usize).map(|n| n.as_str()) == Some("items")
             {
                 plan.pair_src
                     .insert(i - 1, PairSrc::DictItems(ins[i - 4].arg));
@@ -2045,7 +2045,7 @@ fn plan_rewrite(
         // backwards: GET_ITER, CALL k, k simple args, PUSH_NULL,
         // LOAD_GLOBAL <range>.
         if let Some((callee, push_null, step_nop, pops)) = range_prefix(code, &plan, &targets, i) {
-            let name = code.names[ins[callee].arg as usize].clone();
+            let name = code.names[ins[callee].arg as usize].to_string();
             if !plan.guards.iter().any(|g| g.name == name) {
                 plan.guards.push(GlobalGuard {
                     name,
@@ -2352,7 +2352,7 @@ fn plan_rewrite(
     for (i, item) in ins.iter().enumerate() {
         if matches!(item.op, OpCode::LoadGlobal)
             && matches!(
-                code.names.get(item.arg as usize).map(String::as_str),
+                code.names.get(item.arg as usize).map(|n| n.as_str()),
                 Some("eval" | "exec" | "locals" | "vars" | "dir" | "super" | "breakpoint")
             )
         {
@@ -2482,7 +2482,7 @@ fn plan_rewrite(
             let name = &code.names[ins[pc].arg as usize];
             if !plan.guards.iter().any(|g| g.name == *name) {
                 plan.guards.push(GlobalGuard {
-                    name: name.clone(),
+                    name: name.to_string(),
                     expect,
                 });
             }
@@ -2516,7 +2516,7 @@ fn plan_rewrite(
                 plan.obj_globals.insert(item.arg, (token, lane));
                 if !plan.guards.iter().any(|g| g.name == *name) {
                     plan.guards.push(GlobalGuard {
-                        name: name.clone(),
+                        name: name.to_string(),
                         expect: ResolvedGlobal::ObjGlobal { token, lane },
                     });
                 }
@@ -2531,7 +2531,7 @@ fn plan_rewrite(
                 let name = &code.names[item.arg as usize];
                 if !plan.guards.iter().any(|g| g.name == *name) {
                     plan.guards.push(GlobalGuard {
-                        name: name.clone(),
+                        name: name.to_string(),
                         expect: resolved,
                     });
                 }
@@ -2545,7 +2545,7 @@ fn plan_rewrite(
                 plan.obj_globals.insert(item.arg, (token, lane));
                 if !plan.guards.iter().any(|g| g.name == *name) {
                     plan.guards.push(GlobalGuard {
-                        name: name.clone(),
+                        name: name.to_string(),
                         expect: ResolvedGlobal::ObjGlobal { token, lane },
                     });
                 }
@@ -3494,7 +3494,7 @@ impl CtorState {
             CtorFieldSrc::Param(j) => arg_lanes.get(j as usize).copied()?,
             CtorFieldSrc::Lane(l) => l,
         };
-        Some((cls.clone(), field_idx, lane))
+        Some((cls.to_string(), field_idx, lane))
     }
 
     /// Record one same-body new-key attribute store on a direct local

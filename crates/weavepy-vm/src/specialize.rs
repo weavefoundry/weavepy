@@ -223,7 +223,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
 ///
 /// The fast path takes advantage of two facts:
 ///
-/// 1. The `IndexMap` underneath `DictData` exposes O(1) lookup
+/// 1. The table underneath `DictData` exposes O(1) lookup
 ///    by integer index once we know the slot. So caching the
 ///    slot index lets us skip the hash lookup.
 /// 2. Builtins and globals are stable across dispatches in steady
@@ -503,7 +503,8 @@ pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
 }
 
 /// The `CallPyKwNames` permutation nibble of a keyword a `**kwargs`
-/// callee collects into its dict (parameter slots stay below 15 there).
+/// callee collects into its dict. Its consumers read it without checking
+/// the callee, so no parameter slot may be 15 (see [`kw_perm`]).
 pub const KW_TO_VARKW: u32 = 0xF;
 
 /// Decide on a `CALL_KW` specialization (RFC 0069 WS3): a plain Python
@@ -513,7 +514,7 @@ pub const KW_TO_VARKW: u32 = 0xF;
 /// positional count, and every slot left uncovered is filled by a
 /// trailing default. The kw→slot permutation packs 4 bits per keyword
 /// into `perm`; anything that doesn't fit (more than 8 keywords, more
-/// than 16 parameter slots) stays generic. Binder *errors* (multiple
+/// than 15 parameter slots) stays generic. Binder *errors* (multiple
 /// values, unexpected keyword, posonly-as-keyword, missing arguments)
 /// all fail these checks, so the generic binder keeps owning the
 /// error messages.
@@ -522,36 +523,100 @@ pub fn attempt_specialize_call_kw(
     argc: usize,
     kw_names: &[(String, crate::object::Object)],
 ) -> InlineCache {
+    specialize_call_kw_by(f, argc, kw_names.iter().map(|(n, _)| n.as_str()))
+}
+
+/// [`attempt_specialize_call_kw`] for keyword names that are the call
+/// site's own `str` objects (the core loop's `CALL_KW` lane).
+pub fn attempt_specialize_call_kw_names(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+    names: &[crate::object::Object],
+) -> InlineCache {
+    if !names
+        .iter()
+        .all(|n| matches!(n, crate::object::Object::Str(_)))
+    {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    specialize_call_kw_by(
+        f,
+        argc,
+        names.iter().map(|n| match n {
+            crate::object::Object::Str(s) => &**s,
+            _ => "",
+        }),
+    )
+}
+
+fn specialize_call_kw_by<'a>(
+    f: &Rc<crate::object::PyFunction>,
+    argc: usize,
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> InlineCache {
     let code = f.code();
-    // Positional parameters, then the keyword-only ones.
-    let npos = code.arg_count as usize;
-    let total = npos + code.kwonly_count as usize;
-    let kwc = kw_names.len();
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
-        || code.has_varargs
         || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
+    {
+        return InlineCache::Cooldown(COOLDOWN);
+    }
+    let kwc = names.len();
+    match kw_perm(f, &code, argc, names) {
+        Some((perm, _)) => InlineCache::CallPyKwNames {
+            func_id: rc_id(f),
+            perm,
+            argc: argc as u8,
+            kwc: kwc as u8,
+        },
+        None => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+/// The `CallPyKwNames` permutation of a keyword call of `f` (whose code is
+/// `code`) with `argc` positionals (a receiver included) and the keyword
+/// `names`, and the parameter slots the call fills: each keyword's slot in
+/// 4 bits (`KW_TO_VARKW` for one a `**kwargs` callee collects). Each name
+/// is tried first at the parameter its position gives it. `None` for any
+/// call the generic binder must take: `*args`, more than 8 keywords or 15
+/// parameter slots, replaced defaults, a keyword without a distinct
+/// keyword-bindable parameter (or `**kwargs`), a parameter left without a
+/// default.
+pub fn kw_perm<'a>(
+    f: &Rc<crate::object::PyFunction>,
+    code: &weavepy_compiler::CodeObject,
+    argc: usize,
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> Option<(u32, u32)> {
+    // Positional parameters, then the keyword-only ones.
+    let npos = code.arg_count as usize;
+    let total = npos + code.kwonly_count as usize;
+    let kwc = names.len();
+    if code.has_varargs
         || (f.defaults_maybe_overridden()
             && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
-        || total > 16
-        // A `**kwargs` callee reserves nibble 15 for the keywords it
-        // collects (see `KW_TO_VARKW`), and its dict slot follows the
-        // parameters.
-        || (code.has_varkeywords && (total > 15 || code.varnames.len() <= total))
+        // Nibble 15 is `KW_TO_VARKW`, which the binders take as "into
+        // the `**kwargs` dict" for any callee: slot 15 can't be encoded.
+        || total > 15
+        // A `**kwargs` callee's dict slot follows the parameters.
+        || (code.has_varkeywords && code.varnames.len() <= total)
         || kwc == 0
         || kwc > 8
         || argc > npos
     {
-        return InlineCache::Cooldown(COOLDOWN);
+        return None;
     }
     let mut perm: u32 = 0;
     let mut covered: u32 = (1u32 << argc) - 1;
-    for (j, (name, _)) in kw_names.iter().enumerate() {
-        let bindable = code.varnames[..total]
-            .iter()
-            .position(|v| v == name)
-            .filter(|&slot| slot >= code.posonly_count as usize);
+    for (j, name) in names.enumerate() {
+        let at = argc + j;
+        let bindable = if at < total && code.varnames[at] == name {
+            Some(at)
+        } else {
+            code.varnames[..total].iter().position(|v| v == name)
+        }
+        .filter(|&slot| slot >= code.posonly_count as usize);
         let slot = match bindable {
             Some(slot) => slot,
             // No keyword-bindable parameter of that name (a
@@ -561,23 +626,17 @@ pub fn attempt_specialize_call_kw(
                 perm |= KW_TO_VARKW << (4 * j);
                 continue;
             }
-            None => return InlineCache::Cooldown(COOLDOWN),
+            None => return None,
         };
-        if covered & (1 << slot) != 0 {
-            return InlineCache::Cooldown(COOLDOWN);
+        // Nibble 15 means "collected by `**kwargs`" (see `KW_TO_VARKW`):
+        // a keyword can't name the sixteenth parameter slot.
+        if covered & (1 << slot) != 0 || slot as u32 == KW_TO_VARKW {
+            return None;
         }
         perm |= (slot as u32) << (4 * j);
         covered |= 1 << slot;
     }
-    if !kw_uncovered_have_defaults(f, &code, covered) {
-        return InlineCache::Cooldown(COOLDOWN);
-    }
-    InlineCache::CallPyKwNames {
-        func_id: rc_id(f),
-        perm,
-        argc: argc as u8,
-        kwc: kwc as u8,
-    }
+    kw_uncovered_have_defaults(f, code, covered).then_some((perm, covered))
 }
 
 /// Every parameter slot `covered` leaves unbound carries a default:
@@ -599,7 +658,7 @@ pub fn kw_uncovered_have_defaults(
         covered & (1 << slot) != 0
             || f.kw_defaults
                 .iter()
-                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(String::as_str))
+                .any(|(n, _)| Some(n.as_str()) == code.varnames.get(slot).map(|n| n.as_str()))
     })
 }
 
@@ -658,7 +717,9 @@ pub fn native_fn_id(b: &Rc<crate::object::BuiltinFn>) -> u64 {
 /// would invalidate the simple "dict slot" fast path. We bail out
 /// of LOAD_ATTR / STORE_ATTR specialization for these.
 pub(crate) fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
-    if ty.lookup("__getattr__").is_some() {
+    // A `super` proxy resolves attributes along its target's MRO (CPython's
+    // `super_getattro`), never its own class's.
+    if ty.lookup("__getattr__").is_some() || ty.is_super_proxy_type() {
         return true;
     }
     // `object.__getattribute__` lives in `object`'s dict as a sentinel, so a
@@ -997,6 +1058,7 @@ mod tests {
 
     #[test]
     fn subscr_decisions_cover_ws3_shapes() {
+        let _gil = crate::gil::hold_gil();
         let xs = Object::new_list(vec![Object::Int(1)]);
         let idx = Object::Int(0);
         assert_eq!(
@@ -1033,6 +1095,7 @@ mod tests {
 
     #[test]
     fn store_subscr_decisions_cover_ws3_shapes() {
+        let _gil = crate::gil::hold_gil();
         let xs = Object::new_list(vec![Object::Int(1)]);
         let idx = Object::Int(0);
         assert_eq!(
@@ -1053,6 +1116,7 @@ mod tests {
 
     #[test]
     fn for_iter_str_and_dict_specialize() {
+        let _gil = crate::gil::hold_gil();
         let s_iter = Object::Iter(Rc::new(RefCell::new(PyIterator::Str {
             s: crate::shared_value::SharedStr::from("abc"),
             index: 0,

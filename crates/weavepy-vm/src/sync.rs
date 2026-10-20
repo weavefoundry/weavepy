@@ -416,15 +416,50 @@ pub(crate) fn cells_unguarded_flag() -> *const bool {
     CELLS_UNGUARDED.as_ptr()
 }
 
+/// The flags a plain in-line release must find all clear (see
+/// [`crate::plain_release_gate`]), side by side so that compiled code
+/// tests them with one 32-bit load.
+#[repr(C, align(4))]
+pub(crate) struct ReleaseGates {
+    pub(crate) rc_shared: std::sync::atomic::AtomicBool,
+    pub(crate) dicts_watched: std::sync::atomic::AtomicBool,
+    pub(crate) funcs_watched: std::sync::atomic::AtomicBool,
+    pub(crate) reftrace_print: std::sync::atomic::AtomicBool,
+}
+
+pub(crate) static RELEASE_GATES: ReleaseGates = ReleaseGates {
+    rc_shared: std::sync::atomic::AtomicBool::new(false),
+    dicts_watched: std::sync::atomic::AtomicBool::new(false),
+    funcs_watched: std::sync::atomic::AtomicBool::new(false),
+    reftrace_print: std::sync::atomic::AtomicBool::new(false),
+};
+
+/// The four [`RELEASE_GATES`] flags read with one 32-bit load, as compiled
+/// code reads them (see [`crate::plain_release_gate`]): zero when a shared
+/// value's release is a plain decrement.
+#[inline(always)]
+pub(crate) fn release_gates() -> u32 {
+    // SAFETY: `ReleaseGates` is four `AtomicBool`s, 4-aligned (`repr(C)`):
+    // its bytes are a valid `AtomicU32`, read (relaxed) as one word.
+    unsafe {
+        (*std::ptr::from_ref(&RELEASE_GATES).cast::<std::sync::atomic::AtomicU32>())
+            .load(Ordering::Relaxed)
+    }
+}
+
+/// The [`release_gates`] bits of the release observers alone (every flag
+/// but the reference-count bias's `rc_shared`).
+pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff, 0xff]);
+
 /// Whether reference counts must be updated atomically: set whenever the
 /// cell bias is revoked, and also before spawning a thread that may touch
 /// objects before it registers (see [`crate::rc`]). Never cleared.
-static RC_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RC_SHARED: &std::sync::atomic::AtomicBool = &RELEASE_GATES.rc_shared;
 
 /// The flag [`bias_held`] reads (native code that takes references in
 /// line reads it too).
 pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
-    &RC_SHARED
+    RC_SHARED
 }
 
 /// True while one thread owns every reference count (see [`crate::rc`]).
@@ -1984,6 +2019,11 @@ impl GilLock {
 
     pub fn try_lock(&self) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
         self.0.try_lock()
+    }
+
+    /// Whether the calling thread holds the lock.
+    pub fn is_owned_by_current_thread(&self) -> bool {
+        self.0.is_owned_by_current_thread()
     }
 
     pub fn try_lock_for(

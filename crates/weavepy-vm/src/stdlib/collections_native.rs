@@ -1172,6 +1172,46 @@ fn chainmap_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     interp.call_object(missing, std::slice::from_ref(key), &[])
 }
 
+/// The class cache key for "the class has no `maps` attribute" (see
+/// `Interpreter::class_lacks`).
+static MAPS_CLASS_KEY: u8 = 0;
+
+/// A ChainMap instance's own `maps` list, read without running code: the
+/// name's hash computed once, and its position in a split layout
+/// remembered (see [`crate::inst_dict::PosMemo`]).
+fn chainmap_maps_of(inst: &crate::types::PyInstance) -> Option<Rc<RefCell<Vec<Object>>>> {
+    struct MapsName {
+        hash: i64,
+        memo: crate::inst_dict::PosMemo,
+    }
+    static NAME: std::sync::OnceLock<MapsName> = std::sync::OnceLock::new();
+    let n = NAME.get_or_init(|| MapsName {
+        hash: crate::object::py_str_hash("maps"),
+        memo: crate::inst_dict::PosMemo::new(),
+    });
+    let v = match inst.dict.published() {
+        Some(d) => d
+            .try_borrow()
+            .ok()?
+            .get(&crate::object::StrKeyHashed {
+                s: "maps",
+                hash: n.hash,
+            })
+            .cloned(),
+        None => inst
+            .dict
+            .split_cell()
+            .try_borrow()
+            .ok()?
+            .get_memo("maps", n.hash, &n.memo)
+            .cloned(),
+    };
+    match v? {
+        Object::List(l) => Some(l),
+        _ => None,
+    }
+}
+
 /// [`chainmap_getitem`]'s leaf half (see `leaf_builtins::Fast`): a plain
 /// key found by exact native equality in a list of exact dicts held in
 /// the instance's own `maps` attribute. A key no map holds (the
@@ -1180,12 +1220,18 @@ fn chainmap_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>
     let [Object::Instance(inst), key] = args else {
         return None;
     };
-    if crate::object::exotic_str_keys_possible() || inst.cls_raw().lookup("maps").is_some() {
+    // (The class's answer is cached on it under its version, and the
+    // instance's slot for the name remembered; see `chainmap_maps_of`.)
+    if crate::object::exotic_str_keys_possible()
+        || !crate::Interpreter::class_lacks(
+            inst.cls_raw(),
+            std::ptr::addr_of!(MAPS_CLASS_KEY) as usize,
+            "maps",
+        )
+    {
         return None;
     }
-    let Object::List(maps) = inst.attr_get_str("maps")? else {
-        return None;
-    };
+    let maps = chainmap_maps_of(inst)?;
     let probe = crate::object::LeafProbe::new(key)?;
     let maps = maps.try_borrow().ok()?;
     for mapping in maps.iter() {
@@ -1420,22 +1466,25 @@ fn tally_one(
     if let Some(probe) = crate::object::LeafProbe::new(key) {
         if !crate::capi_watchers::dicts_active() {
             if let Ok(mut m) = d.try_borrow_mut() {
-                match m.get_mut(&probe) {
-                    Some(Object::Int(n)) if *n < i64::MAX => {
-                        *n += 1;
-                        drop(m);
-                        crate::object::dict_mutation_event(d);
-                        return Ok(());
+                match m.probe_entry(&probe) {
+                    crate::dictmap::ProbeEntry::Occupied(e) => {
+                        if let Object::Int(n) = e.into_mut() {
+                            if *n < i64::MAX {
+                                *n += 1;
+                                drop(m);
+                                crate::object::dict_mutation_event(d);
+                                return Ok(());
+                            }
+                        }
                     }
-                    Some(_) => {}
-                    None if probe.miss_is_exact() => {
-                        m.insert(DictKey(key.clone()), Object::Int(1));
+                    crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                        e.insert(DictKey(key.clone()), Object::Int(1));
                         drop(m);
                         crate::object::dict_watch_bump(d);
                         crate::object::dict_mutation_event(d);
                         return Ok(());
                     }
-                    None => {}
+                    crate::dictmap::ProbeEntry::Vacant(_) => {}
                 }
             }
         }

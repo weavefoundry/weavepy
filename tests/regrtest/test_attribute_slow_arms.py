@@ -1,0 +1,687 @@
+"""The slower arms of attribute resolution keep their exact semantics.
+
+Module attributes, `inst.__dict__`, a `__getattr__` hook reached without
+the default lookup's `AttributeError`, both forms of `super().name`, and a
+native `__init__` reached through `super()` are each served by a cached or
+direct path once warm. Changes to the module, the class, or the receiver's
+shape must be seen at once.
+"""
+
+import types
+import unittest
+
+
+N = 300
+
+
+class Plain:
+    def __init__(self):
+        self.a = 1
+
+
+class Hooked:
+    def __init__(self):
+        self.a = 1
+
+    def __getattr__(self, name):
+        if name.startswith("x"):
+            return name.upper()
+        raise AttributeError(f"hooked {name}")
+
+
+def read_module_attr(m, n):
+    out = []
+    for _ in range(n):
+        out.append(m.value)
+    return out
+
+
+def read_dict(o, n):
+    out = None
+    for _ in range(n):
+        out = o.__dict__
+    return out
+
+
+def read_hooked(o, n):
+    out = []
+    for _ in range(n):
+        out.append(o.xy)
+    return out
+
+
+class ModuleAttrTest(unittest.TestCase):
+    def test_rebinding_and_deletion(self):
+        m = types.ModuleType("m")
+        m.value = 1
+        m.other = 2
+        self.assertEqual(read_module_attr(m, N), [1] * N)
+        m.value = 3
+        self.assertEqual(read_module_attr(m, 5), [3] * 5)
+        # Keys move: the site must not read a stale position.
+        del m.other
+        m.extra = 4
+        self.assertEqual(read_module_attr(m, 5), [3] * 5)
+        del m.value
+        with self.assertRaises(AttributeError):
+            read_module_attr(m, 1)
+        m.value = 7
+        self.assertEqual(read_module_attr(m, 5), [7] * 5)
+
+    def test_another_module_at_the_same_site(self):
+        a = types.ModuleType("a")
+        b = types.ModuleType("b")
+        a.value, b.pad, b.value = "a", 0, "b"
+        self.assertEqual(read_module_attr(a, N), ["a"] * N)
+        self.assertEqual(read_module_attr(b, 3), ["b"] * 3)
+        self.assertEqual(read_module_attr(a, 3), ["a"] * 3)
+
+    def test_module_getattr(self):
+        m = types.ModuleType("m")
+        m.__getattr__ = lambda name: "dyn:" + name
+        self.assertEqual(read_module_attr(m, N), ["dyn:value"] * N)
+        m.value = 1
+        self.assertEqual(read_module_attr(m, 3), [1] * 3)
+
+
+class InstanceDictTest(unittest.TestCase):
+    def test_identity_and_updates(self):
+        o = Plain()
+        d = read_dict(o, N)
+        self.assertIs(d, o.__dict__)
+        self.assertEqual(d, {"a": 1})
+        o.b = 2
+        self.assertEqual(read_dict(o, 3), {"a": 1, "b": 2})
+
+    def test_class_level_override_is_seen(self):
+        o = Plain()
+        read_dict(o, N)
+        Plain.__dict__  # (the class's own mapping proxy is untouched)
+        try:
+            Plain.__dict__ = property(lambda self: "custom")
+        except (AttributeError, TypeError):
+            pass
+
+        class Sub(Plain):
+            @property
+            def __dict__(self):
+                return "custom"
+
+        self.assertEqual(read_dict(Sub(), 3), "custom")
+        self.assertEqual(read_dict(o, 3), {"a": 1})
+
+    def test_slots_class_has_no_dict(self):
+        class S:
+            __slots__ = ("a",)
+
+        read_dict(Plain(), N)
+        with self.assertRaises(AttributeError):
+            read_dict(S(), 1)
+
+    def test_getattribute_override(self):
+        class G(Plain):
+            def __getattribute__(self, name):
+                if name == "__dict__":
+                    return "intercepted"
+                return object.__getattribute__(self, name)
+
+        read_dict(Plain(), N)
+        self.assertEqual(read_dict(G(), 3), "intercepted")
+
+
+class GetattrHookTest(unittest.TestCase):
+    def test_hook_values_and_errors(self):
+        o = Hooked()
+        self.assertEqual(read_hooked(o, N), ["XY"] * N)
+        with self.assertRaises(AttributeError) as cm:
+            o.missing
+        self.assertEqual(str(cm.exception), "hooked missing")
+        self.assertEqual(cm.exception.name, "missing")
+        self.assertIs(cm.exception.obj, o)
+        self.assertFalse(hasattr(o, "missing"))
+        self.assertEqual(getattr(o, "missing", 9), 9)
+
+    def test_real_attributes_win(self):
+        o = Hooked()
+        read_hooked(o, N)
+        o.xy = "own"
+        self.assertEqual(read_hooked(o, 3), ["own"] * 3)
+        del o.xy
+        Hooked.xy = "class"
+        try:
+            self.assertEqual(read_hooked(o, 3), ["class"] * 3)
+        finally:
+            del Hooked.xy
+        self.assertEqual(read_hooked(o, 3), ["XY"] * 3)
+
+    def test_data_descriptor_raising(self):
+        class D:
+            @property
+            def xy(self):
+                raise AttributeError("from property")
+
+            def __getattr__(self, name):
+                return "hook:" + name
+
+        self.assertEqual(read_hooked(D(), N), ["hook:xy"] * N)
+
+    def test_hook_added_and_removed(self):
+        class C:
+            pass
+
+        o = C()
+        with self.assertRaises(AttributeError):
+            read_hooked(o, 1)
+        C.__getattr__ = lambda self, name: 1
+        self.assertEqual(read_hooked(o, N), [1] * N)
+        del C.__getattr__
+        with self.assertRaises(AttributeError) as cm:
+            read_hooked(o, 1)
+        self.assertEqual(str(cm.exception), "'C' object has no attribute 'xy'")
+
+
+class Slotted:
+    __slots__ = ("_s", "_t")
+
+    def __init__(self):
+        self._t = 1
+
+    def get(self):
+        try:
+            return self._s
+        except AttributeError as e:
+            return e
+
+
+class SlotMissTest(unittest.TestCase):
+    def test_unset_slot_errors(self):
+        o = Slotted()
+        for _ in range(N):
+            e = o.get()
+        self.assertIsInstance(e, AttributeError)
+        self.assertEqual(e.name, "_s")
+        self.assertIs(e.obj, o)
+        # `%T`: the module, unless it is `builtins` or `__main__`.
+        mod = Slotted.__module__
+        prefix = "" if mod in ("builtins", "__main__") else mod + "."
+        self.assertEqual(str(e), f"'{prefix}Slotted' object has no attribute '_s'")
+
+    def test_site_serves_set_and_unset(self):
+        objs = [Slotted() for _ in range(4)]
+        for i, o in enumerate(objs):
+            if i % 2:
+                o._s = i
+        for _ in range(N):
+            got = [o.get() for o in objs]
+        self.assertIsInstance(got[0], AttributeError)
+        self.assertEqual(got[1], 1)
+        self.assertIsInstance(got[2], AttributeError)
+        self.assertEqual(got[3], 3)
+        objs[0]._s = "now"
+        del objs[1]._s
+        self.assertEqual(objs[0].get(), "now")
+        self.assertIsInstance(objs[1].get(), AttributeError)
+
+    def test_renamed_class(self):
+        class R:
+            __slots__ = ("_s",)
+
+        o = R()
+        for _ in range(N):
+            with self.assertRaises(AttributeError):
+                o._s
+        R.__qualname__ = "Renamed"
+        with self.assertRaises(AttributeError) as cm:
+            o._s
+        self.assertIn("Renamed' object has no attribute '_s'", str(cm.exception))
+        R.__module__ = "elsewhere"
+        with self.assertRaises(AttributeError) as cm:
+            o._s
+        self.assertEqual(str(cm.exception), "'elsewhere.Renamed' object has no attribute '_s'")
+
+    def test_getattr_added_later(self):
+        class H:
+            __slots__ = ("_s",)
+
+        o = H()
+        for _ in range(N):
+            with self.assertRaises(AttributeError):
+                o._s
+        H.__getattr__ = lambda self, name: "hook"
+        self.assertEqual(o._s, "hook")
+
+
+class ClassStoreTest(unittest.TestCase):
+    def test_store_is_seen(self):
+        class K:
+            n = 0
+
+        class Sub(K):
+            pass
+
+        k, s = K(), Sub()
+        for i in range(N):
+            K.n = i
+            self.assertEqual(k.n, i)
+            self.assertEqual(s.n, i)
+            self.assertEqual(Sub.n, i)
+        K.fresh = "new"
+        self.assertEqual(k.fresh, "new")
+
+    def test_metaclass_hooks_run(self):
+        seen = []
+
+        class Meta(type):
+            def __setattr__(cls, name, value):
+                seen.append(name)
+                super().__setattr__(name, value)
+
+        class M(metaclass=Meta):
+            n = 0
+
+        def store(c, v):
+            c.n = v
+
+        class P:
+            n = 0
+
+        for i in range(N):
+            store(P, i)
+        store(M, 5)
+        self.assertEqual(seen, ["n"])
+        self.assertEqual(M.n, 5)
+
+    def test_immutable_type(self):
+        def store(c):
+            c.attr = 1
+
+        class P:
+            pass
+
+        for _ in range(N):
+            store(P)
+        with self.assertRaises(TypeError):
+            store(int)
+
+    def test_replaced_value_finalized(self):
+        log = []
+
+        class Fin:
+            def __del__(self):
+                log.append("del")
+
+        class P:
+            v = None
+
+        def store(v):
+            P.v = v
+
+        for _ in range(N):
+            store(1)
+        store(Fin())
+        store(2)
+        self.assertEqual(log, ["del"])
+
+
+class PropertySiteTest(unittest.TestCase):
+    def test_polymorphic_site(self):
+        class A:
+            @property
+            def v(self):
+                return "prop"
+
+        class B:
+            def __init__(self):
+                self.v = "field"
+
+        def read(o):
+            return o.v
+
+        for _ in range(N):
+            self.assertEqual(read(A()), "prop")
+        self.assertEqual(read(B()), "field")
+        self.assertEqual(read(A()), "prop")
+
+    def test_getter_raises(self):
+        class A:
+            def __init__(self):
+                self.fail = False
+
+            @property
+            def v(self):
+                if self.fail:
+                    raise ValueError("boom")
+                return 1
+
+        a = A()
+
+        def read(o):
+            return o.v
+
+        for _ in range(N):
+            self.assertEqual(read(a), 1)
+        a.fail = True
+        with self.assertRaises(ValueError):
+            read(a)
+
+    def test_property_replaced(self):
+        class A:
+            @property
+            def v(self):
+                return 1
+
+        def read(o):
+            return o.v
+
+        a = A()
+        for _ in range(N):
+            self.assertEqual(read(a), 1)
+        A.v = property(lambda self: 2)
+        self.assertEqual(read(a), 2)
+        A.v = 3
+        self.assertEqual(read(a), 3)
+
+
+class ReflectedCompareTest(unittest.TestCase):
+    def test_subclass_reflected_first(self):
+        log = []
+
+        class A:
+            def __lt__(self, other):
+                log.append("A.lt")
+                return "A"
+
+            def __eq__(self, other):
+                log.append("A.eq")
+                return False
+
+        class B(A):
+            def __gt__(self, other):
+                log.append("B.gt")
+                return "B"
+
+            def __eq__(self, other):
+                log.append("B.eq")
+                return NotImplemented
+
+        a, b = A(), B()
+        for _ in range(N):
+            log.clear()
+            self.assertEqual(a < b, "B")
+            self.assertEqual(log, ["B.gt"])
+        log.clear()
+        self.assertFalse(a == b)
+        self.assertEqual(log, ["B.eq", "A.eq"])
+        B.__gt__ = lambda self, other: NotImplemented
+        log.clear()
+        self.assertEqual(a < b, "A")
+        self.assertEqual(log, ["A.lt"])
+
+    def test_unorderable(self):
+        class A:
+            pass
+
+        class B(A):
+            def __gt__(self, other):
+                return NotImplemented
+
+        for _ in range(N):
+            with self.assertRaises(TypeError):
+                A() < B()
+
+
+class FunctionAttrTest(unittest.TestCase):
+    def test_counter_on_wrapper(self):
+        def counted(fn):
+            def wrapper(*args):
+                wrapper.calls += 1
+                return fn(*args)
+
+            wrapper.calls = 0
+            return wrapper
+
+        @counted
+        def double(x):
+            return 2 * x
+
+        for i in range(N):
+            self.assertEqual(double(i), 2 * i)
+        self.assertEqual(double.calls, N)
+        double.__dict__ = {"calls": 100}
+        double(1)
+        self.assertEqual(double.calls, 101)
+        del double.calls
+        with self.assertRaises(AttributeError):
+            double(1)
+
+    def test_function_dunders(self):
+        def f():
+            pass
+
+        def read(fn):
+            return fn.__name__, fn.__qualname__
+
+        for _ in range(N):
+            self.assertEqual(read(f)[0], "f")
+        f.__name__ = "g"
+        self.assertEqual(read(f)[0], "g")
+
+
+class DunderClassTest(unittest.TestCase):
+    def test_class_reads(self):
+        import abc
+        import weakref
+
+        class A(abc.ABC):
+            pass
+
+        class B(A):
+            pass
+
+        class C:
+            pass
+
+        class D(A):
+            pass
+
+        class Lying:
+            @property
+            def __class__(self):
+                return int
+
+        b = B()
+        for _ in range(N):
+            self.assertIsInstance(b, A)
+            self.assertNotIsInstance(C(), A)
+            self.assertIs(b.__class__, B)
+        b.__class__ = D
+        self.assertIs(b.__class__, D)
+        self.assertNotIsInstance(b, B)
+        self.assertIs(Lying().__class__, int)
+        self.assertIsInstance(Lying(), int)
+        c = C()
+        self.assertIs(weakref.proxy(c).__class__, C)
+
+
+class BuiltinTypeHasattrTest(unittest.TestCase):
+    def test_repeated_misses(self):
+        for _ in range(N):
+            self.assertFalse(hasattr(int, "_asyncio_future_blocking"))
+            self.assertTrue(hasattr(int, "from_bytes"))
+            self.assertEqual(getattr(int, "nope", 7), 7)
+
+    def test_struct_sequence_attribute_set(self):
+        import os
+
+        cls = type(os.stat("."))
+        for _ in range(N):
+            self.assertFalse(hasattr(cls, "weavepy_probe"))
+        try:
+            cls.weavepy_probe = 1
+        except TypeError:
+            return
+        self.assertTrue(hasattr(cls, "weavepy_probe"))
+        try:
+            del cls.weavepy_probe
+        except TypeError:
+            return
+        self.assertFalse(hasattr(cls, "weavepy_probe"))
+
+
+class ChainMapTest(unittest.TestCase):
+    def test_maps_changes(self):
+        from collections import ChainMap
+
+        c = ChainMap({"a": 1}, {"b": 2})
+        for _ in range(N):
+            self.assertEqual(c["a"] + c["b"], 3)
+        c.maps = [{"a": 10}]
+        self.assertEqual(c["a"], 10)
+        with self.assertRaises(KeyError):
+            c["b"]
+        c.maps.append({"b": 20})
+        self.assertEqual(c["b"], 20)
+
+    def test_subclass_with_class_level_maps(self):
+        from collections import ChainMap
+
+        class Odd(ChainMap):
+            pass
+
+        o = Odd({"a": 1})
+        for _ in range(N):
+            self.assertEqual(o["a"], 1)
+        o.__dict__["maps"] = [{"a": 5}]
+        self.assertEqual(o["a"], 5)
+        Odd.maps = property(lambda self: [{"a": 7}], lambda self, v: None)
+        try:
+            self.assertEqual(o["a"], 7)
+        finally:
+            del Odd.maps
+        self.assertEqual(o["a"], 5)
+
+
+class StoredCallableTest(unittest.TestCase):
+    def test_stored_callable_method_form(self):
+        class Node:
+            def fn(self, x):
+                return "method"
+
+            def __init__(self, fn):
+                self.fn = fn
+
+            def run(self, x):
+                return self.fn(x)
+
+        a = Node(lambda x: x + 1)
+        b = Node(lambda x: x * 2)
+        for i in range(N):
+            self.assertEqual(a.run(i), i + 1)
+            self.assertEqual(b.run(i), 2 * i)
+        a.fn = lambda x: -x
+        self.assertEqual(a.run(3), -3)
+        del a.fn
+        self.assertEqual(a.run(3), "method")
+        b.__dict__  # publishes the dict
+        self.assertEqual(b.run(3), 6)
+        Node.fn = property(lambda self: (lambda x: "prop"))
+        self.assertEqual(b.run(3), "prop")
+
+
+class Base:
+    def __new__(cls, *args):
+        return super().__new__(cls)
+
+    def __init__(self, x):
+        self.x = x
+
+    def m(self):
+        return "base"
+
+
+class Explicit(Base):
+    def __new__(cls, *args):
+        return super(Explicit, cls).__new__(cls)
+
+    def __init__(self, x):
+        super(Explicit, self).__init__(x * 2)
+
+    def m(self):
+        return "explicit+" + super(Explicit, self).m()
+
+
+class SuperFormsTest(unittest.TestCase):
+    def test_explicit_form(self):
+        for i in range(N):
+            e = Explicit(i)
+            self.assertEqual(e.x, i * 2)
+            self.assertEqual(e.m(), "explicit+base")
+
+    def test_explicit_form_errors(self):
+        def bad(cls, obj):
+            return super(cls, obj).m
+
+        for _ in range(N):
+            bad(Explicit, Explicit(1))
+        with self.assertRaises(TypeError):
+            bad(Explicit, Base(1))
+        with self.assertRaises(TypeError):
+            bad(1, Explicit(1))
+
+    def test_mro_change_is_seen(self):
+        class A:
+            def f(self):
+                return "A"
+
+        class B(A):
+            def f(self):
+                return super(B, self).f()
+
+        b = B()
+        for _ in range(N):
+            self.assertEqual(b.f(), "A")
+        A.f = lambda self: "A2"
+        self.assertEqual(b.f(), "A2")
+
+
+class ObjectInitTest(unittest.TestCase):
+    def test_object_init_through_super(self):
+        class O:
+            def __init__(self, x):
+                super().__init__()
+                self.x = x
+
+        for i in range(N):
+            self.assertEqual(O(i).x, i)
+
+    def test_object_init_excess_arguments(self):
+        class O:
+            def __init__(self, *args):
+                super().__init__(*args)
+
+        for _ in range(N):
+            O()
+        with self.assertRaises(TypeError) as cm:
+            O(1)
+        self.assertIn("object.__init__() takes exactly one argument", str(cm.exception))
+
+    def test_dict_payload_at_a_settled_site(self):
+        class B:
+            def __init__(self, *args):
+                super().__init__(*args)
+
+        class D(dict, B):
+            def __init__(self, *args):
+                dict.__init__(self, *args)
+                # `object.__init__` follows `B` in the MRO: the site sees
+                # a dict payload after settling on plain instances.
+                B.__init__(self)
+
+        for _ in range(N):
+            B()
+        d = D([("k", 1)])
+        self.assertEqual(d, {"k": 1})
+
+
+if __name__ == "__main__":
+    unittest.main()
