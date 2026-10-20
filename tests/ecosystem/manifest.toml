@@ -39,6 +39,9 @@
 #   deselect         — array of `pytest --deselect` arguments; every
 #                      entry carries an inline comment naming the
 #                      measured failure class
+#   deselect_linux, deselect_macos, deselect_windows:
+#                      the same, applied only when the harness runs on
+#                      that OS (an escape one OS's runner needs)
 #   timeout_seconds  — optional budget for the selftest stage alone
 #                      (default 600 s)
 #
@@ -349,6 +352,22 @@ requirements = "pytest==8.4.2"
 # FileNotFoundError only when it detects CI (`on_ci()`) — it skips
 # locally, fails on GitHub Actions, and never exercises WeavePy.
 command = "Tests --deselect Tests/test_tiff_crashes.py"
+# TestAvifLeaks::test_leak_load deselected on macOS only. It bounds the
+# growth of the process's *peak* RSS (`ru_maxrss`) over one AVIF decode
+# at cpu_count * 3 MB (9 MB on the 3-core runner), so it fails whenever
+# the process is at its high-water mark when the test starts. By then
+# the suite has grown the process to about 3 GB on a 7 GB runner, and
+# under that memory pressure WeavePy's RSS sat at its peak (the margin
+# measured 0-54 MB across runs), so the decode's own buffers set a new
+# peak (21.7 MB in the failing run). It isn't a leak: the same binary
+# passed it in 5 of 5 standalone runs of the suite on the same runner
+# image, the other leak tests' 100 iterations grew by 0 KB in the
+# failing run, and it passes on Linux. (main passed only because its
+# collector's scratch, hundreds of MB per full collection, set peaks
+# far above the working set.)
+deselect_macos = [
+    "Tests/test_file_avif.py::TestAvifLeaks::test_leak_load",  # macOS runner peak-RSS headroom
+]
 timeout_seconds = 7200
 
 [packages.lxml]
