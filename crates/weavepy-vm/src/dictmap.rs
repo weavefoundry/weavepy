@@ -311,9 +311,18 @@ impl<V> Table<V> {
     }
 
     /// Remove every entry, keeping the allocations.
+    #[inline]
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.slots.fill(0);
+        // A small table has no slots, so skip the `memset` call. A recycled
+        // keyword dict otherwise made one per call, of zero bytes at the
+        // empty slice's dangling address, and on AMD Zen 4 and Zen 5 that
+        // cost about 100 ns (glibc's AVX-512 `memset` stores through a mask
+        // there, apparently taking a microcode assist for the unmapped
+        // page).
+        if !self.slots.is_empty() {
+            self.slots.fill(0);
+        }
     }
 
     /// Rebuild the slot table at `n` slots (a power of two) from the
