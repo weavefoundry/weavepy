@@ -209,13 +209,8 @@ proptest    = "1.5"
 # patch only flips on the already-compiled coders; the crate is otherwise byte-
 # for-byte lzma-sys 0.1.20 (heavy non-compiled trees like docs/po/tests/cli are
 # trimmed). The override applies transitively, so `xz2` picks it up too.
-#
-# It also vendors `libmimalloc-sys` 0.1.49 with a one-function macOS patch:
-# a purge maps fresh pages over the freed range, so freed memory leaves the
-# resident size (see `vendor/libmimalloc-sys/README.md` for why and the diff).
 [patch.crates-io]
 lzma-sys = { path = "vendor/lzma-sys" }
-libmimalloc-sys = { path = "vendor/libmimalloc-sys" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

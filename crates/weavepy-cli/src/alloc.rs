@@ -84,27 +84,8 @@ extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
 }
 
-/// mimalloc 3's `mi_option_purge_delay` (its position in `mi_option_t`).
-#[cfg(target_os = "macos")]
-const MI_OPTION_PURGE_DELAY: c_int = 15;
-
 /// mimalloc 3's `mi_option_arena_reserve` (its position in `mi_option_t`).
 const MI_OPTION_ARENA_RESERVE: c_int = 23;
-
-/// How long freed pages wait before mimalloc purges them on macOS, in
-/// milliseconds, unless the environment sets `MIMALLOC_PURGE_DELAY`.
-///
-/// A purge there maps fresh pages over the range (the vendored crate's
-/// patch, see `vendor/libmimalloc-sys/README.md`), so it is what takes
-/// freed memory out of the resident size. (Elsewhere mimalloc's own
-/// default stands.)
-/// mimalloc's default waits 1000 ms, longer than a short program's whole
-/// warm-up: the transient memory of each JIT compile, and of the program's
-/// own bursts, stayed resident under every later peak (chaos peaked at
-/// 29 MB against 25 MB). The short wait still spares the steady churn of a
-/// loop that frees and reallocates the same pages from repeated faults.
-#[cfg(target_os = "macos")]
-const PURGE_DELAY_MS: c_long = 10;
 
 /// The size of each arena mimalloc reserves, in KiB, unless the
 /// environment sets `MIMALLOC_ARENA_RESERVE`.
@@ -128,10 +109,6 @@ pub extern "C" fn configure() {
     unsafe {
         if libc::getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
             mi_option_set(MI_OPTION_ARENA_RESERVE, ARENA_RESERVE_KIB);
-        }
-        #[cfg(target_os = "macos")]
-        if libc::getenv(c"MIMALLOC_PURGE_DELAY".as_ptr()).is_null() {
-            mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS);
         }
     }
 }
