@@ -826,12 +826,9 @@ struct JitState {
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process, when the first code object is
-/// halfway to its compile threshold. Not at start-up: paging the code
-/// generator in costs a program that never compiles anything about 2 MB
-/// of resident memory (a third of an empty script's over CPython's), and
-/// on the development host it slowed start-up more than it saved a short
-/// hot loop's first compile.
+/// [`prewarm_codegen`]), once per process: when start-up begins with the
+/// JIT on (see [`prewarm_at_startup`]), or failing that when the first
+/// code object is halfway to its compile threshold.
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -844,6 +841,21 @@ fn spawn_codegen_prewarm() {
         if let Ok(mut slot) = PREWARM_THREAD.lock() {
             *slot = Some(handle);
         }
+    }
+}
+
+/// Start the code generator's warm-up as start-up begins, when the JIT may
+/// run. A hot loop gets from its first iterations to its compile in far
+/// less time than the warm-up takes (about 0.7 ms), so a warm-up started
+/// on the way there leaves the first compile paying most of the cold start
+/// on the thread that needs the code: short hot programs ran 6-11% slower
+/// for it. On a background thread during start-up it costs the main thread
+/// nothing; the price is the code generator's pages (about 2 MB resident)
+/// in a process that never compiles, which start-up also paid when it
+/// warmed the code generator itself.
+pub(crate) fn prewarm_at_startup() {
+    if !jit_off_for_process() {
+        spawn_codegen_prewarm();
     }
 }
 

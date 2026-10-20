@@ -1910,6 +1910,8 @@ impl Interpreter {
     /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
         #[cfg(feature = "jit")]
+        crate::tier2::prewarm_at_startup();
+        #[cfg(feature = "jit")]
         let _compile_guard = crate::tier2::startup_compilation_scope();
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
