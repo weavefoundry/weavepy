@@ -101,11 +101,7 @@ class ChunksTest(unittest.TestCase):
 
     def test_tiny_chunks_match(self):
         whole = self.run_with(WEAVEPY_FRAME_JIT_CHUNK="0")
-        chunked = self.run_with(
-            WEAVEPY_FRAME_JIT_CHUNK="40",
-            WEAVEPY_FRAME_JIT_CHUNK_ABOVE="0",
-            WEAVEPY_FRAME_JIT_HOT="2",
-        )
+        chunked = self.run_with(WEAVEPY_FRAME_JIT_CHUNK="40", WEAVEPY_FRAME_JIT_HOT="2")
         self.assertEqual(whole, chunked)
 
 

@@ -108,26 +108,18 @@ fn lean_above() -> usize {
     })
 }
 
-/// The IR size of the chunks a large body compiles in (see
-/// [`chunk_ranges`]; `WEAVEPY_FRAME_JIT_CHUNK` overrides it, `0` never), and
-/// the size above which it does (`WEAVEPY_FRAME_JIT_CHUNK_ABOVE`, twice the
-/// chunk's by default). The register allocator's working memory grows with
+/// The most IR instructions one compile takes (`WEAVEPY_FRAME_JIT_CHUNK`
+/// overrides it, `0` never splits): a larger body compiles in chunks (see
+/// [`chunk_ranges`]). The register allocator's working memory grows with
 /// the function it allocates, about 1.2 KB an IR instruction, and the
-/// largest compile sets the process's peak memory; a jump between chunks
-/// costs a return and a call, which a body only somewhat large doesn't pay.
-fn chunk_ir() -> (usize, usize) {
-    static CHUNK: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+/// largest compile sets the process's peak memory.
+fn chunk_ir() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CHUNK.get_or_init(|| {
-        let var = |name| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        };
-        let chunk = var("WEAVEPY_FRAME_JIT_CHUNK").unwrap_or(1200);
-        (
-            chunk,
-            var("WEAVEPY_FRAME_JIT_CHUNK_ABOVE").unwrap_or(2 * chunk),
-        )
+        std::env::var("WEAVEPY_FRAME_JIT_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2400)
     })
 }
 
@@ -7169,8 +7161,11 @@ fn compile_with(
         break low;
     };
     let total = engine.ctx.func.dfg.num_insts();
-    let (chunk, above) = chunk_ir();
-    if chunk == 0 || total <= above {
+    let limit = chunk_ir();
+    let ranges = (limit != 0 && total > limit)
+        .then(|| chunk_ranges(code, &whole.starts, &whole.sizes, total, limit))
+        .filter(|r| u8::try_from(r.len()).is_ok());
+    let Some(ranges) = ranges else {
         let func = define(engine, code, lean, t0, None)?;
         return Some(native(
             code,
@@ -7182,10 +7177,9 @@ fn compile_with(
             whole.entries,
             whole.caches,
         ));
-    }
+    };
     // Too large for one compile: each chunk lowered and compiled on its
     // own (the whole body's lowering only measured them).
-    let ranges = chunk_ranges(code, &whole.starts, &whole.sizes, total, chunk);
     engine.release();
     let mut entries = vec![false; n];
     let mut chunk_at = vec![0u8; n];
@@ -7371,49 +7365,93 @@ fn native(
 }
 
 /// The pc ranges a body too large for one compile (`total` IR
-/// instructions, more than `chunk`) compiles in: runs of its blocks
+/// instructions, more than `limit`) compiles in: runs of its blocks
 /// (`starts`, with `sizes` their IR sizes from the whole body's lowering),
-/// each about `chunk` instructions, cut where the fewest loops cross (a
-/// jump between chunks costs a return and a call).
+/// each at most `limit` instructions where its blocks allow, cut where
+/// jumps between chunks cost least. A jump between chunks costs a return
+/// and a call: a cut through straight-line code is taken about once a
+/// call, one through a loop once an iteration, and one through a nested
+/// loop more often still, so the cuts minimize the loops they cross
+/// (weighted by nesting), then their number.
 fn chunk_ranges(
     code: &CodeObject,
     starts: &[bool],
     sizes: &[u32],
     total: usize,
-    chunk: usize,
+    limit: usize,
 ) -> Vec<std::ops::Range<usize>> {
     let n = starts.len();
-    let k = total.div_ceil(chunk).clamp(1, usize::from(u8::MAX));
     let mut prefix = vec![0usize; n + 1];
     for pc in 0..n {
         prefix[pc + 1] = prefix[pc] + sizes.get(pc).copied().unwrap_or(0) as usize;
     }
-    let measured = prefix[n];
-    // The back edges, as (target, source) pcs.
-    let loops: Vec<(usize, usize)> = code
+    // The limit in the blocks' own measure (which leaves out the exits'
+    // shared tails).
+    let room = (limit * prefix[n] / total.max(1)).max(1);
+    // The back edges, as (target, source) pcs, each with its weight: four
+    // times the weight of the loop around it.
+    let mut loops: Vec<(usize, usize, u64)> = code
         .instructions
         .iter()
         .enumerate()
         .filter(|(_, i)| i.op == OpCode::JumpBackward)
-        .map(|(pc, i)| ((pc + 1).saturating_sub(i.arg as usize), pc))
+        .map(|(pc, i)| ((pc + 1).saturating_sub(i.arg as usize), pc, 0))
         .collect();
-    let crossing = |c: usize| loops.iter().filter(|&&(t, j)| t < c && c <= j).count();
-    let mut cuts = vec![0];
-    for i in 1..k {
-        let ideal = measured * i / k;
-        let slack = measured * 3 / (10 * k);
-        let prev = *cuts.last().expect("starts with 0");
-        let off = |c: usize| prefix[c].abs_diff(ideal);
-        let near = (prev + 1..n)
-            .filter(|&c| starts[c] && off(c) <= slack)
-            .min_by_key(|&c| (crossing(c), off(c)))
-            .or_else(|| (prev + 1..n).filter(|&c| starts[c]).min_by_key(|&c| off(c)));
-        match near {
-            Some(c) => cuts.push(c),
-            None => break,
+    for k in 0..loops.len() {
+        let (t, j, _) = loops[k];
+        let outer = loops
+            .iter()
+            .filter(|&&(t2, j2, _)| (t2, j2) != (t, j) && t2 <= t && j <= j2)
+            .count();
+        loops[k].2 = 16 << (2 * outer.min(20));
+    }
+    let cost = |c: usize| -> u64 {
+        1 + loops
+            .iter()
+            .filter(|&&(t, j, _)| t < c && c <= j)
+            .map(|&(_, _, w)| w)
+            .sum::<u64>()
+    };
+    // The cheapest cuts up to each block start (and the end), from the
+    // block starts no more than `room` before it (or the one just before,
+    // for a block larger than that).
+    let at: Vec<usize> = (0..n)
+        .filter(|&pc| pc == 0 || starts[pc])
+        .chain([n])
+        .collect();
+    let mut best: Vec<(u64, usize)> = vec![(0, 0); at.len()];
+    for j in 1..at.len() {
+        let here = if at[j] == n { 0 } else { cost(at[j]) };
+        best[j] = (u64::MAX, j - 1);
+        for i in (0..j).rev() {
+            if i + 1 < j && prefix[at[j]] - prefix[at[i]] > room {
+                break;
+            }
+            let c = best[i].0.saturating_add(here);
+            if c < best[j].0 {
+                best[j] = (c, i);
+            }
         }
     }
-    cuts.push(n);
+    let mut cuts = vec![n];
+    let mut j = at.len() - 1;
+    while j > 0 {
+        j = best[j].1;
+        cuts.push(at[j]);
+    }
+    cuts.reverse();
+    if stats::enabled() {
+        let crossed: Vec<u64> = cuts[1..cuts.len() - 1]
+            .iter()
+            .map(|&c| cost(c) - 1)
+            .collect();
+        eprintln!(
+            "frame jit: {} cut at {:?} crossing {:?}",
+            code.qualname,
+            &cuts[1..cuts.len() - 1],
+            crossed
+        );
+    }
     cuts.windows(2).map(|w| w[0]..w[1]).collect()
 }
 
