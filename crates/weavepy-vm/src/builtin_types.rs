@@ -4472,15 +4472,12 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
         if let Object::Instance(inst_rc) = inst {
-            let rest = if args.len() > 1 {
-                args[1..].to_vec()
-            } else {
-                Vec::new()
-            };
+            let rest = args.get(1..).unwrap_or_default();
             // PEP 380: `StopIteration.value` mirrors args[0] for the
             // built-in class and any user subclass (CPython stores it
             // in `StopIteration.__init__`).
-            if is_subclass_by_name(&inst_rc.cls(), "StopIteration") {
+            let families = crate::exc_family_flags(&inst_rc.class.borrow());
+            if families & crate::EXC_FAM_STOP_ITERATION != 0 {
                 inst_rc.slot_set("value", rest.first().cloned().unwrap_or(Object::None));
             }
             // Only a non-atomic argument can close a cycle through the
@@ -4491,7 +4488,7 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             let old = inst_rc
                 .slots
                 .borrow_mut()
-                .insert("args", Object::new_tuple(rest));
+                .insert("args", Object::tuple_from_exact(rest.iter().cloned()));
             drop(old);
         }
         Ok(Object::None)

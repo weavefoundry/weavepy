@@ -14248,6 +14248,15 @@ impl Object {
         Object::Tuple(TupleStorage::from_vec(items))
     }
 
+    /// A tuple of `items`, moved into its storage without an intermediate
+    /// vector (the empty tuple is the interned one).
+    pub fn tuple_from_exact(items: impl ExactSizeIterator<Item = Object>) -> Self {
+        if items.len() == 0 {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_exact_iter(items))
+    }
+
     /// Build a fixed-size tuple directly in reference-counted storage,
     /// avoiding an intermediate vector allocation. Empty arrays retain
     /// the ordinary constructor's interned empty tuple.

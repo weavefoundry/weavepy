@@ -56991,9 +56991,9 @@ impl Interpreter {
     /// `BaseException_new`'s seeding of a fresh exception instance's
     /// `args` from the constructor's positionals, which holds even when the
     /// class's `__init__` never calls `super().__init__`.
-    fn seed_exception_args(inst: &Object, args: impl Iterator<Item = Object>) {
+    fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
         if let Object::Instance(i) = inst {
-            let args = Object::new_tuple(args.collect());
+            let args = Object::tuple_from_exact(args);
             if i.slots.borrow().is_empty_default() {
                 // Laid out as a built-in construction's (see
                 // `SlotStorage::exception`), so a raise fills its slots in
@@ -58182,13 +58182,7 @@ impl Interpreter {
         // family shapes construction, so `args` is the only slot, built
         // in place without the per-slot probes below.
         if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP) == 0 {
-            let args_tuple = match args {
-                [] => Object::new_tuple(Vec::new()),
-                [a] => Object::new_tuple_array([a.clone()]),
-                _ => Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-                    args.iter().cloned(),
-                )),
-            };
+            let args_tuple = Object::tuple_from_exact(args.iter().cloned());
             let inst =
                 PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
