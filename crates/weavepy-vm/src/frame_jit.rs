@@ -154,6 +154,9 @@ pub(crate) struct State {
     /// hands the return straight back (`DIRECT_RET`) for the caller to
     /// finish, without [`h_return`].
     pub(crate) direct: bool,
+    /// The light activation this state belongs to (see [`LightAct`]),
+    /// null for any other.
+    pub(crate) light: *mut LightAct,
 }
 
 const S_LOCALS: i32 = 0;
@@ -1348,6 +1351,7 @@ unsafe extern "C" fn h_for_iter_rest(
                     // takes over past the loop, synced as for a switch.
                     // SAFETY: as below.
                     unsafe {
+                        ensure_heavy(st);
                         let sw = &mut *st.sw;
                         let frame = &mut *st.frame;
                         let code = &frame.code;
@@ -1371,6 +1375,7 @@ unsafe extern "C" fn h_for_iter_rest(
             // SAFETY: the running activation's frame and switch; the
             // stack is synced (the iterator on top) before the switch.
             unsafe {
+                ensure_heavy(st);
                 let sw = &mut *st.sw;
                 let frame = &mut *st.frame;
                 let len = it.offset_from(st.stack) as usize + 1;
@@ -1748,7 +1753,11 @@ unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
 unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
-        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+        if st.sw.is_null() {
+            return 3;
+        }
+        ensure_heavy(st);
+        if !std::ptr::eq((*st.sw).cur, st.frame) {
             return 3;
         }
         let pc = pc as usize;
@@ -4119,6 +4128,499 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
 /// (each level holds two native frames and the helpers between them).
 const DIRECT_CALL_DEPTH: u32 = 48;
 
+/// A direct call's light activation (see [`light_call`]): the callee's
+/// frame and native state, bound without an [`crate::InlineAct`], without
+/// switching the core loop's running activation, and without entering the
+/// caller on the lazy spine. Direct calls nest strictly, so each nesting
+/// depth (`Interpreter::direct_calls`) has one record, kept with its
+/// buffers for the next call at that depth.
+///
+/// Nothing outside the call sees a light activation. Whatever needs the
+/// core loop's view of it first makes it, and the light activations that
+/// called it, ordinary direct activations ([`reify_light`]): the callee
+/// leaving its native code, a helper that switches the running activation
+/// or publishes the caller, or a return that isn't clean. Those then
+/// finish as any direct activation does ([`direct_done`]).
+pub(crate) struct LightAct {
+    /// The callee's native state: `st.frame` is [`Self::frame`] (until the
+    /// record is reified) and `st.light` the record.
+    st: State,
+    /// The callee's frame. Its code, globals and builtins are borrowed
+    /// from [`Self::callable`], and its cells are the callee's lean cells
+    /// (borrowed too) or fresh ones the record owns ([`Self::owns_cells`]);
+    /// all are stale copies while the record is idle. Its locals and
+    /// operand stack are the record's own.
+    frame: crate::LeanFrame,
+    /// The frame's cells are the record's own (a callee with cell
+    /// variables, see `fresh_cells`).
+    owns_cells: bool,
+    /// The called function, owned while the record is live.
+    callable: std::mem::ManuallyDrop<Object>,
+    /// The caller's `CALL` pc and frame, and its light record (null when
+    /// the caller is an activation the core loop knows).
+    call_pc: usize,
+    caller: *mut crate::Frame,
+    caller_light: *mut LightAct,
+    /// The caller's last-instruction slot on the switch, recorded when the
+    /// caller is the core loop's (see [`direct_call`]'s `saved_last`).
+    saved_last: *mut usize,
+    /// The ordinary activation the record became, and its depth on the
+    /// switch; null while the record is light.
+    reified: *mut crate::InlineAct,
+    depth: usize,
+}
+
+impl LightAct {
+    fn new() -> Box<LightAct> {
+        let mut rec = Box::new(LightAct {
+            st: State {
+                locals: std::ptr::null_mut(),
+                stack: std::ptr::null_mut(),
+                len: 0,
+                cap: 0,
+                pc: 0,
+                last: usize::MAX,
+                countdown: std::ptr::null_mut(),
+                snap_gen: 0,
+                maybe_dead: std::ptr::null(),
+                interp: std::ptr::null(),
+                out: 0,
+                depth_cell: std::ptr::null(),
+                err: None,
+                frame: std::ptr::null_mut(),
+                sw: std::ptr::null_mut(),
+                gen_depth: 0,
+                direct: true,
+                light: std::ptr::null_mut(),
+            },
+            frame: crate::parked_lean_frame(),
+            owns_cells: false,
+            callable: std::mem::ManuallyDrop::new(Object::Unbound),
+            call_pc: 0,
+            caller: std::ptr::null_mut(),
+            caller_light: std::ptr::null_mut(),
+            saved_last: std::ptr::null_mut(),
+            reified: std::ptr::null_mut(),
+            depth: 0,
+        });
+        rec.st.light = &raw mut *rec;
+        rec.st.frame = &raw mut *rec.frame;
+        rec
+    }
+}
+
+// SAFETY: an interpreter (and with it its records) moves to another
+// thread only while idle, when no record is live: their pointers are then
+// stale and never read before the next call rebinds them.
+unsafe impl Send for LightAct {}
+
+impl Drop for LightAct {
+    fn drop(&mut self) {
+        // An idle record's code handle is a stale copy: the frame's drop
+        // releases an owned one instead.
+        // SAFETY: the stale copy is overwritten without a drop.
+        unsafe {
+            std::ptr::write(
+                &raw mut self.frame.code,
+                crate::inline_placeholder().code.clone(),
+            )
+        };
+    }
+}
+
+/// The record for the direct call at nesting depth `nested`.
+#[inline(always)]
+fn light_record(interp: &mut Interpreter, nested: u32) -> *mut LightAct {
+    let i = nested as usize;
+    if i >= interp.light_acts.len() {
+        light_grow(interp, i);
+    }
+    // SAFETY: just checked.
+    unsafe { &raw mut **interp.light_acts.get_unchecked_mut(i) }
+}
+
+#[cold]
+#[inline(never)]
+fn light_grow(interp: &mut Interpreter, i: usize) {
+    while interp.light_acts.len() <= i {
+        interp.light_acts.push(LightAct::new());
+    }
+}
+
+/// How a light call's arguments bind (see [`light_call`]).
+#[derive(Clone, Copy)]
+enum LightArgs {
+    /// Positionally, the last `missing` parameters taking defaults.
+    Positional { missing: usize },
+    /// A `CALL_KW`'s, through the site's verified `CallPyKwNames`
+    /// permutation (see [`direct_call_kw`]): `argc` positionals and `kwc`
+    /// keyword values, the names tuple atop the stack.
+    Keywords {
+        perm: u32,
+        covered: u32,
+        kwc: usize,
+        argc: usize,
+    },
+}
+
+/// [`direct_call`] bound light (see [`LightAct`]): the `CALL` (or
+/// `CALL_KW`) at `pc` (its operands from `start` up a `len`-deep stack)
+/// of the plain function `fp` running `code_rc` (with cells to bind when
+/// `cells`), whose native body `native` is entered at its start, its
+/// arguments bound as `args` says. `nested` is the direct-call depth,
+/// `site` the call's cache (whose [`DirectSite::reifies`] the outcome
+/// updates; null for none), and `binop` an instance operator's (see
+/// [`direct_call`]). `None` touched nothing.
+///
+/// # Safety
+///
+/// As [`direct_call`]'s, with its checks passed.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn light_call(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    fp: *const crate::object::PyFunction,
+    code_rc: &Rc<CodeObject>,
+    has_self: bool,
+    args: LightArgs,
+    cells: bool,
+    native: &Native,
+    nested: u32,
+    site: *mut DirectSite,
+    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let sw = &mut *st.sw;
+        let dc = &*sw.depth_cell;
+        let depth = dc.get() + 1;
+        if depth > crate::recursion::recursion_limit() {
+            return None;
+        }
+        dc.set(depth);
+        let rec = &mut *light_record(interp, nested);
+        // The caller, synced at the call (and past it, its operands gone)
+        // as the core loop's arm leaves it.
+        let caller = &mut *st.frame;
+        let caller_light = if st.light.is_null() || !(*st.light).reified.is_null() {
+            *sw.last = st.last;
+            rec.saved_last = sw.last;
+            std::ptr::null_mut()
+        } else {
+            st.light
+        };
+        rec.caller_light = caller_light;
+        rec.caller = st.frame;
+        rec.call_pc = pc;
+        caller.pc = pc as u32 + 1;
+        let fr: &mut crate::Frame = &mut rec.frame;
+        let locals = &mut *fr.locals.as_ptr();
+        let base = st.stack;
+        match args {
+            LightArgs::Positional { missing } => {
+                // The arguments move into the record's locals, the defaults
+                // follow as copies, and the other locals start unbound.
+                let first = if has_self { start + 1 } else { start + 2 };
+                let nargs = len - first;
+                let total = code_rc.varnames.len().max(nargs + missing);
+                if locals.capacity() < total {
+                    locals.reserve(total);
+                }
+                let dst = locals.as_mut_ptr();
+                crate::move_objects(base.add(first), dst, nargs);
+                let mut k = nargs;
+                if missing > 0 {
+                    let defaults = &(*fp).defaults;
+                    for d in &defaults[defaults.len() - missing..] {
+                        dst.add(k).write(crate::clone_hot(d));
+                        k += 1;
+                    }
+                }
+                crate::fill_unbound_raw(dst.add(k), total - k);
+                locals.set_len(total);
+            }
+            LightArgs::Keywords {
+                perm,
+                covered,
+                kwc,
+                argc,
+            } => {
+                // The keywords take the slots the permutation names, the
+                // positionals the first ones, the rest their defaults (see
+                // `Interpreter::core_bind_kw_direct`).
+                caller.stack.set_len(len);
+                let names = caller.stack.pop().expect("the names tuple");
+                let items: &[Object] = match &names {
+                    Object::Tuple(t) => t,
+                    _ => &[],
+                };
+                Interpreter::kw_names_fill_locals(
+                    locals,
+                    &mut caller.stack,
+                    items,
+                    &*fp,
+                    code_rc,
+                    perm,
+                    covered,
+                    kwc,
+                    argc + usize::from(has_self),
+                );
+                crate::drop_hot(names);
+            }
+        }
+        std::ptr::write(&raw mut *rec.callable, base.add(start).read());
+        caller.stack.set_len(start);
+        // The handles the record borrows from the callable it holds.
+        std::ptr::write(&raw mut fr.code, crate::borrowed_rc(code_rc));
+        std::ptr::write(&raw mut fr.globals, crate::borrowed_rc(&(*fp).globals));
+        std::ptr::write(&raw mut fr.builtins, crate::borrowed_rc(&(*fp).builtins));
+        rec.owns_cells = cells && !code_rc.cellvars.is_empty();
+        let frame_cells = if rec.owns_cells {
+            // (Its parameters that are cells move into them.)
+            crate::fresh_cells(&*fp, code_rc, locals)
+        } else if cells {
+            crate::borrowed_rc((*fp).lean_cells_ref(code_rc).expect("checked by the call"))
+        } else {
+            crate::borrowed_rc(crate::object::empty_cells_ref())
+        };
+        std::ptr::write(&raw mut fr.cells, frame_cells);
+        fr.pc = 0;
+        // As for any inline activation: a hot body is compiled once.
+        let n = code_rc.jit_hint.bump_lean_entries();
+        if n <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+            && n == crate::tier2::lean_warm_at()
+            && !crate::tier2::jit_off_for_process()
+            && !code_rc.jit_hint.is_not_jitable()
+        {
+            crate::tier2::warm_compile(interp, fr);
+        }
+        let stack = &mut fr.stack;
+        if stack.capacity() < native.need() {
+            stack.reserve(native.need());
+        }
+        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LIGHT);
+        let cst = &mut rec.st;
+        cst.locals = locals.as_mut_ptr();
+        cst.stack = stack.as_mut_ptr();
+        cst.len = 0;
+        cst.cap = stack.capacity();
+        cst.pc = 0;
+        cst.last = usize::MAX;
+        cst.countdown = st.countdown;
+        cst.snap_gen = st.snap_gen;
+        cst.maybe_dead = st.maybe_dead;
+        cst.interp = st.interp;
+        cst.depth_cell = st.depth_cell;
+        cst.sw = st.sw;
+        interp.direct_calls.set(nested + 1);
+        let status = native.run_direct(cst, 0);
+        interp.direct_calls.set(nested);
+        if status == DIRECT_RET
+            && rec.reified.is_null()
+            && rec.st.len == 1
+            && Rc::strong_count(&rec.frame.locals) == 1
+            && !interp.countdown_out(2)
+        {
+            // The clean return: nothing saw the activation. (Its operand
+            // stack's length is whatever its own callees last synced; the
+            // value moves out and the rest were released.)
+            if !site.is_null() {
+                (*site).reifies = (*site).reifies.saturating_sub(1);
+            }
+            let v = rec.st.stack.read();
+            rec.frame.stack.set_len(0);
+            crate::release_locals(&mut *rec.frame.locals.as_ptr());
+            if rec.owns_cells {
+                rec.owns_cells = false;
+                // SAFETY: the record's own cells, released once (the field
+                // is a stale copy from here).
+                drop(std::ptr::read(&raw const rec.frame.cells));
+            }
+            dc.set(depth - 1);
+            let callable = std::mem::ManuallyDrop::take(&mut rec.callable);
+            match callable {
+                // A function something else still holds (its class, its
+                // module) can't die here: a plain decrement.
+                Object::Function(f) if crate::rc::try_release_shared(Rc::as_ptr(&f)) => {
+                    std::mem::forget(f);
+                }
+                callable => interp.release(callable),
+            }
+            st.stack.add(start).write(v);
+            caller.stack.set_len(start + 1);
+            interp.gil_countdown -= 1;
+            if caller_light.is_null() {
+                *sw.last = pc;
+            }
+            st.len = start + 1;
+            if (*sw.maybe_dead).get() || crate::hot_gates::loop_gen() != st.snap_gen {
+                // A release queued finalizers (they run with the caller
+                // published), or the hot gates moved: the caller's native
+                // code stops for the core loop.
+                return Some(light_settle(st));
+            }
+            return Some(0);
+        }
+        // Anything else is an ordinary direct activation's to finish.
+        if !site.is_null() {
+            (*site).reifies += LIGHT_REIFY_COST;
+        }
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LIGHT_REIFIED);
+        if rec.reified.is_null() {
+            reify_light(rec);
+        }
+        let act: &mut crate::InlineAct = &mut *rec.reified;
+        let (callee, act_depth, saved_last) = (&raw mut *act.frame, rec.depth, rec.saved_last);
+        rec.reified = std::ptr::null_mut();
+        let r = direct_done::<false>(
+            st,
+            pc,
+            start,
+            callee,
+            act_depth,
+            saved_last,
+            binop,
+            std::ptr::null_mut(),
+            status,
+            &mut rec.st,
+        );
+        rec.st.err = None;
+        rec.st.frame = &raw mut *rec.frame;
+        Some(r)
+    }
+}
+
+/// After a light activation's clean return into `st`'s code: finalizers
+/// its releases queued run, or the hot gates moved. The caller (made an
+/// ordinary activation, if it was light) is synced past its call for the
+/// core loop: `RELOAD`.
+///
+/// # Safety
+///
+/// `st` is the caller's live state, its frame synced past the call.
+#[cold]
+#[inline(never)]
+unsafe fn light_settle(st: &mut State) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        ensure_heavy(st);
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        (*st.frame).stack.set_len(st.len);
+        if (*sw.maybe_dead).get() {
+            let depth = (*sw.inl).len();
+            let mut tmp = None;
+            let (cf, _, cshell) = sw.activation(depth, &mut tmp);
+            interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+            interp.drain_if_maybe_dead();
+        }
+        if sw.pending.is_none() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+        }
+        RELOAD
+    }
+}
+
+/// Make the running activation of `st`'s code an ordinary one, if it is a
+/// light activation (see [`LightAct`]), before anything that relies on the
+/// core loop's switch or spine: its record, and the light records that
+/// called it, become direct activations on the switch.
+///
+/// # Safety
+///
+/// `st` is the live state of native code that is running.
+#[inline(always)]
+pub(crate) unsafe fn ensure_heavy(st: &mut State) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if !st.light.is_null() && (*st.light).reified.is_null() {
+            reify_light(&mut *st.light);
+        }
+    }
+}
+
+/// Whether the activation of `st`'s code is the core loop's running one
+/// (made an ordinary activation first, if it's light: what follows uses
+/// the switch). `st.sw` is non-null.
+///
+/// # Safety
+///
+/// As [`ensure_heavy`]'s.
+#[inline(always)]
+unsafe fn running_here(st: &mut State) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        ensure_heavy(st);
+        std::ptr::eq((*st.sw).cur, st.frame)
+    }
+}
+
+/// Reify the light record `rec` and the unreified light records below it
+/// (its callers), outermost first: each becomes the direct activation the
+/// switch would hold had its call bound one ([`Interpreter::core_bind_plain`]
+/// with a direct call's flags), its caller entered on the pending list.
+///
+/// # Safety
+///
+/// `rec` is live and unreified, and every record its chain reaches is
+/// suspended in its callee's call (or, for `rec`, running native code that
+/// called a helper, or just returned).
+#[cold]
+#[inline(never)]
+unsafe fn reify_light(rec: &mut LightAct) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        // (The chain nests no deeper than the direct calls do.)
+        let mut chain = [std::ptr::null_mut::<LightAct>(); DIRECT_CALL_DEPTH as usize + 1];
+        let mut n = 0;
+        let mut at: *mut LightAct = rec;
+        while !at.is_null() && (*at).reified.is_null() {
+            chain[n] = at;
+            n += 1;
+            at = (*at).caller_light;
+        }
+        let interp = &mut *rec.st.interp.cast_mut();
+        let sw = &mut *rec.st.sw;
+        let mut caller_frame: *mut crate::Frame = std::ptr::null_mut();
+        for &r in chain[..n].iter().rev() {
+            let r = &mut *r;
+            if !caller_frame.is_null() {
+                r.caller = caller_frame;
+                r.saved_last = &raw mut sw.scratch;
+            }
+            let mut act = interp.inline_slot();
+            std::mem::swap::<crate::Frame>(&mut *act.frame, &mut *r.frame);
+            // The activation owns its code handle while active.
+            std::mem::forget(act.frame.code.clone());
+            std::ptr::write(
+                &raw mut act.callable,
+                std::mem::ManuallyDrop::take(&mut r.callable),
+            );
+            act.parked = false;
+            act.direct = true;
+            act.owns_cells = std::mem::take(&mut r.owns_cells);
+            act.call_pc = r.call_pc;
+            act.caller_pending = interp.core_pending_enter_fast(sw, &mut *r.caller, r.call_pc);
+            act.exc_depth = interp.exc_info_len();
+            act.guard = Some(crate::recursion::Guard::adopt(sw.depth_cell));
+            let callee: *mut crate::Frame = &raw mut *act.frame;
+            crate::push_fast(&mut *sw.inl, act);
+            sw.cur = callee;
+            sw.scratch = usize::MAX;
+            sw.last = &raw mut sw.scratch;
+            r.st.frame = callee;
+            r.reified = &raw mut **(*sw.inl).last_mut().unwrap_unchecked();
+            r.depth = (*sw.inl).len();
+            caller_frame = callee;
+        }
+    }
+}
+
 /// Run the activation a compiled caller's `CALL` just switched to, the
 /// callee, through its own native code, from the caller's call helper:
 /// `true` when it returned, the caller running again with the result at
@@ -4203,6 +4705,7 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             sw: st.sw,
             gen_depth: 0,
             direct: false,
+            light: std::ptr::null_mut(),
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run(&mut cst);
@@ -4329,7 +4832,20 @@ pub(crate) struct DirectSite {
     /// callee's code: the next call of that code binds it without taking
     /// a slot from the pool or a reference to the code.
     act: Option<Box<crate::InlineAct>>,
+    /// How often the site's light calls (see [`light_call`]) end up
+    /// reified: up [`LIGHT_REIFY_COST`] for each that does, down one for
+    /// each clean return. Past [`LIGHT_HEAVY_AT`] the site binds ordinary
+    /// direct activations instead.
+    reifies: u32,
 }
+
+/// What a reified light call adds to its site's [`DirectSite::reifies`].
+const LIGHT_REIFY_COST: u32 = 3;
+
+/// The [`DirectSite::reifies`] score past which a site's calls bind
+/// ordinary direct activations: a light call that is then reified costs
+/// more than binding the ordinary activation would have.
+const LIGHT_HEAVY_AT: u32 = 48;
 
 /// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
 /// (code objects are word-aligned).
@@ -4658,7 +5174,7 @@ unsafe fn attr_lane(
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
-        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+        if st.sw.is_null() || !running_here(st) {
             return CALL_DECLINED;
         }
         if local != 0 {
@@ -4930,6 +5446,24 @@ unsafe fn direct_call<const CALL: bool>(
         {
             return None;
         }
+        if site.reifies < LIGHT_HEAVY_AT {
+            return light_call(
+                st,
+                pc,
+                start,
+                len,
+                fp,
+                code_rc,
+                has_self,
+                LightArgs::Positional { missing },
+                cells,
+                native,
+                nested,
+                &raw mut *site,
+                binop,
+            );
+        }
+        ensure_heavy(st);
         // The site's warm slot, still holding this code (another code's
         // goes back to being a plain parked slot), or one from the pool.
         let (act, held) = match site.act.take() {
@@ -5065,8 +5599,7 @@ unsafe fn direct_run<const PUSHED: bool>(
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
-        let interp = &mut *st.interp.cast_mut();
-        let caller = &mut *st.frame;
+        let interp = &*st.interp;
         let cframe = &mut *callee;
         let stack = &mut cframe.stack;
         if stack.capacity() < native.need() {
@@ -5090,10 +5623,43 @@ unsafe fn direct_run<const PUSHED: bool>(
             sw: st.sw,
             gen_depth: 0,
             direct: true,
+            light: std::ptr::null_mut(),
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run_direct(&mut cst, from);
         interp.direct_calls.set(nested);
+        direct_done::<PUSHED>(
+            st, pc, start, callee, depth, saved_last, binop, site, status, &mut cst,
+        )
+    }
+}
+
+/// The end of a direct call's run ([`direct_run`]) that returned `status`
+/// with the callee's state `cst`: its return finished here, or whatever
+/// it left synced for the core loop. The parameters are `direct_run`'s.
+///
+/// # Safety
+///
+/// As [`direct_run`]'s, with the callee's native code just returned.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn direct_done<const PUSHED: bool>(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    callee: *mut crate::Frame,
+    depth: usize,
+    saved_last: *mut usize,
+    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    site: *mut DirectSite,
+    status: u32,
+    cst: &mut State,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let caller = &mut *st.frame;
+        let cframe = &mut *callee;
         let sw = &mut *st.sw;
         let inl = &mut *sw.inl;
         // (Only the callee's own `RETURN_VALUE` hands back `DIRECT_RET`,
@@ -5187,7 +5753,6 @@ unsafe fn direct_run<const PUSHED: bool>(
                 // (A return raised nothing: the callee's state holds no
                 // error to drop.)
                 debug_assert!(cst.err.is_none());
-                std::mem::forget(cst);
                 if sw.pending.is_some() {
                     return RELOAD;
                 }
@@ -5269,6 +5834,7 @@ unsafe extern "C" fn h_call(
         let start = len - argc - 2;
         // The frame synced for a switch, as the core loop's arm syncs it.
         let sync = |st: &mut State| {
+            ensure_heavy(st);
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
             frame.pc = pc as u32;
@@ -5646,6 +6212,7 @@ unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, p
         if st.sw.is_null() {
             return CALL_DECLINED;
         }
+        ensure_heavy(st);
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
@@ -5948,6 +6515,7 @@ unsafe extern "C" fn h_call_native(
         if !hit || s.sw.is_null() {
             return h_call(st, code, ext, pc, len);
         }
+        ensure_heavy(s);
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;
         frame.stack.set_len(lenu);
@@ -6001,6 +6569,7 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
         if st.sw.is_null() {
             return CALL_DECLINED;
         }
+        ensure_heavy(st);
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
@@ -6095,43 +6664,26 @@ unsafe fn direct_call_kw(
         {
             return None;
         }
-        let act = interp.inline_pool.pop()?;
-        let sw = &mut *st.sw;
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            interp.inline_pool.push(act);
-            return None;
-        };
-        // Committed: the caller synced as the core loop's arm syncs it, and
-        // the callee's activation made the running one.
-        let caller = &mut *st.frame;
-        caller.stack.set_len(len);
-        caller.pc = pc as u32;
-        *sw.last = st.last;
-        let saved_last = sw.last;
-        let cframe = interp.core_bind_kw_direct(
-            sw,
-            pc,
-            has_self,
-            fp,
-            (perm, covered, kwc, argc),
-            act,
-            guard,
-        );
-        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
-        let depth = (*sw.inl).len();
-        Some(direct_run::<false>(
+        light_call(
             st,
             pc,
             start,
-            cframe,
-            depth,
+            len,
+            fp,
+            code_rc,
+            has_self,
+            LightArgs::Keywords {
+                perm,
+                covered,
+                kwc,
+                argc,
+            },
+            false,
             native,
-            saved_last,
             nested,
-            None,
-            0,
             std::ptr::null_mut(),
-        ))
+            None,
+        )
     }
 }
 
@@ -6188,6 +6740,7 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             if let Some(r) = direct_call_kw(st, code, pc, start, len, argc, kwc) {
                 return r;
             }
+            ensure_heavy(st);
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
             frame.pc = pc as u32;
@@ -6228,6 +6781,7 @@ unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64,
         if st.sw.is_null() || len < 4 {
             return CALL_DECLINED;
         }
+        ensure_heavy(st);
         let start = len - 4;
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
@@ -6282,6 +6836,7 @@ unsafe extern "C" fn h_call_forward(
         if st.sw.is_null() || len < 3 {
             return CALL_DECLINED;
         }
+        ensure_heavy(st);
         let start = len - 3;
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
@@ -6432,6 +6987,7 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
                 }
             }
         }
+        ensure_heavy(st);
         let interp = &mut *st.interp.cast_mut();
         let sw = &mut *st.sw;
         let frame = &mut *st.frame;
@@ -6494,6 +7050,7 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
         // before the next instruction: the core loop takes over there,
         // synced as for a switch.
         if (*st.maybe_dead).get() {
+            ensure_heavy(st);
             let sw = &mut *st.sw;
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
@@ -6690,6 +7247,7 @@ unsafe extern "C" fn h_catch(st: *mut State) -> u32 {
         if st.sw.is_null() {
             return RAISED;
         }
+        ensure_heavy(st);
         let Some(err) = st.err.take() else {
             return RAISED;
         };

@@ -930,6 +930,11 @@ pub struct Interpreter {
     /// invalidate on every growth.
     #[allow(clippy::vec_box)]
     inline_pool: Vec<Box<InlineAct>>,
+    /// The direct calls' light activations, one per nesting depth (see
+    /// `frame_jit::LightAct`).
+    #[cfg(feature = "jit")]
+    #[allow(clippy::vec_box)]
+    light_acts: Vec<Box<frame_jit::LightAct>>,
     /// Emptied activation stacks of finished quiet runs (see
     /// [`Self::quiet_run`]), for the next run: a generator its native
     /// consumer resumes item by item starts a quiet run per item.
@@ -1262,6 +1267,8 @@ impl Default for Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            #[cfg(feature = "jit")]
+            light_acts: Vec::new(),
             inl_spares: Vec::new(),
             gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
@@ -1395,6 +1402,8 @@ impl Interpreter {
             internal_import_depth: 0,
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
+            #[cfg(feature = "jit")]
+            light_acts: Vec::new(),
             inl_spares: Vec::new(),
             gen_box_pool: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
@@ -11730,6 +11739,7 @@ impl Interpreter {
                             sw: std::ptr::from_mut(sw),
                             gen_depth: 0,
                             direct: false,
+                            light: std::ptr::null_mut(),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -16168,67 +16178,10 @@ impl Interpreter {
         }
     }
 
-    /// [`Self::core_bind_plain`] for the `CALL_KW` at `pc` of `sw`'s
-    /// running activation (a direct call's, see `frame_jit::h_call_kw`):
-    /// the site's verified `CallPyKwNames` permutation `perm` places the
-    /// `kwc` keyword values, the `argc` positionals (after the receiver
-    /// when `has_self`) take the first slots, and the parameters `covered`
-    /// doesn't name take their defaults (see `kw_names_fill_locals`).
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::core_bind_plain`]'s, with the names tuple on the stack's
-    /// top and a callee with no cells and no `**kwargs`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn core_bind_kw_direct(
-        &mut self,
-        sw: &mut CoreSwitch,
-        pc: usize,
-        has_self: bool,
-        fp: *const crate::object::PyFunction,
-        (perm, covered, kwc, argc): (u32, u32, usize, usize),
-        act: Box<InlineAct>,
-        guard: crate::recursion::Guard,
-    ) -> *mut Frame {
-        // SAFETY: the caller's contract.
-        unsafe {
-            let frame = &mut *sw.cur;
-            let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
-            // A parked slot's locals storage is its own, and empty.
-            let locals = &mut *act.frame.locals.as_ptr();
-            let names = frame.stack.pop().expect("the names tuple");
-            let items: &[Object] = match &names {
-                Object::Tuple(t) => t,
-                _ => &[],
-            };
-            Self::kw_names_fill_locals(
-                locals,
-                &mut frame.stack,
-                items,
-                &*fp,
-                code_rc,
-                perm,
-                covered,
-                kwc,
-                argc + usize::from(has_self),
-            );
-            drop_hot(names);
-            if !has_self {
-                // The empty self slot owns nothing.
-                let n = frame.stack.len();
-                frame.stack.set_len(n - 1);
-            }
-            let callable = frame.stack.pop().expect("the callee");
-            self.core_bind_act::<true>(
-                sw, frame, pc, fp, code_rc, act, guard, false, false, callable,
-            )
-        }
-    }
-
-    /// The common half of [`Self::core_bind_plain`] and
-    /// [`Self::core_bind_kw_direct`]: `act`, its locals filled and
-    /// `callable` off the caller's stack, bound to `fp` and pushed as the
-    /// running activation, the caller (`frame`) waiting past its call.
+    /// The second half of [`Self::core_bind_plain`]: `act`, its locals
+    /// filled and `callable` off the caller's stack, bound to `fp` and
+    /// pushed as the running activation, the caller (`frame`) waiting past
+    /// its call.
     ///
     /// # Safety
     ///
@@ -67895,28 +67848,8 @@ impl Delegate {
 impl InlineAct {
     /// A fresh parked slot.
     fn parked() -> Box<InlineAct> {
-        let placeholder = inline_placeholder();
         let mut act = Box::new(InlineAct {
-            frame: LeanFrame(std::mem::ManuallyDrop::new(Frame {
-                code: placeholder.code.clone(),
-                locals: Rc::new(RefCell::new(Vec::new())),
-                cells: borrowed_rc(&placeholder.cells),
-                stack: Vec::with_capacity(16),
-                globals: borrowed_rc(&placeholder.dict),
-                builtins: borrowed_rc(&placeholder.dict),
-                rare: None,
-                exc: None,
-                agen_yielded_value: true,
-                pc: 0,
-                py_frame: None,
-                gen_owner: None,
-                suppress_call_event: false,
-                gen_first_resume: false,
-                sent_consumed: false,
-                shell_cache: None,
-                #[cfg(feature = "jit")]
-                parked_native: None,
-            })),
+            frame: parked_lean_frame(),
             act: LeanAct {
                 frame: std::ptr::null_mut(),
                 shell: None,
@@ -67940,11 +67873,35 @@ impl InlineAct {
             chain: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
-        // SAFETY: parked slots hold a stale code copy (see the type docs):
-        // release the owned placeholder reference it was built with.
-        unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         act
     }
+}
+
+/// A parked activation's frame: stale copies of the placeholder handles
+/// (overwritten without a drop when it's bound), and empty locals and
+/// operand stack of its own.
+fn parked_lean_frame() -> LeanFrame {
+    let placeholder = inline_placeholder();
+    LeanFrame(std::mem::ManuallyDrop::new(Frame {
+        code: borrowed_rc(&placeholder.code),
+        locals: Rc::new(RefCell::new(Vec::new())),
+        cells: borrowed_rc(&placeholder.cells),
+        stack: Vec::with_capacity(16),
+        globals: borrowed_rc(&placeholder.dict),
+        builtins: borrowed_rc(&placeholder.dict),
+        rare: None,
+        exc: None,
+        agen_yielded_value: true,
+        pc: 0,
+        py_frame: None,
+        gen_owner: None,
+        suppress_call_event: false,
+        gen_first_resume: false,
+        sent_consumed: false,
+        shell_cache: None,
+        #[cfg(feature = "jit")]
+        parked_native: None,
+    }))
 }
 
 // SAFETY: an interpreter (and with it its slot pool) moves to another
@@ -68980,7 +68937,9 @@ mod burst_stats {
     pub(crate) const CALL_PURE: usize = 5;
     pub(crate) const CALL_GENERAL: usize = 6;
     pub(crate) const CALL_TIER2: usize = 7;
-    const CALL_NAMES: [&str; 8] = [
+    pub(crate) const CALL_LIGHT: usize = 8;
+    pub(crate) const CALL_LIGHT_REIFIED: usize = 9;
+    const CALL_NAMES: [&str; 10] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -68989,8 +68948,10 @@ mod burst_stats {
         "pure leaf evaluated in place",
         "general frame run",
         "tier-2 entry from the general run",
+        "of the direct calls, light",
+        "of the light calls, reified",
     ];
-    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)

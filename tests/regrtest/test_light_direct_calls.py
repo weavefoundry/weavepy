@@ -1,0 +1,176 @@
+"""Direct calls between compiled functions keep every observable behavior:
+the frame chain, tracebacks, locals, finalizer timing, the recursion limit,
+and warnings' stack levels, from hot callees that never leave native code
+and from ones that do."""
+
+import gc
+import sys
+import traceback
+import warnings
+
+
+class Point:
+    def __init__(self, x):
+        self.x = x
+
+    def get(self):
+        return self.x
+
+    def get_default(self, extra=0):
+        return self.x + extra
+
+    def chained(self, k):
+        return self.get() + self.get_default(k)
+
+
+def leaf(a, b):
+    return a + b
+
+
+def middle(a):
+    return leaf(a, 1) * 2
+
+
+def outer(a):
+    return middle(a) + middle(a + 1)
+
+
+def frames_up():
+    f = sys._getframe(1)
+    names = []
+    while f is not None and len(names) < 4:
+        names.append(f.f_code.co_name)
+        f = f.f_back
+    return names
+
+
+def callee_with_frame():
+    return frames_up()
+
+
+def caller_of_frame():
+    return callee_with_frame()
+
+
+def raise_deep(n):
+    if n == 0:
+        raise ValueError("bottom")
+    return raise_deep(n - 1)
+
+
+def catch_deep():
+    try:
+        raise_deep(3)
+    except ValueError as e:
+        return [fs.name for fs in traceback.extract_tb(e.__traceback__)]
+
+
+def show_locals(a, b):
+    c = a + b
+    return sorted(sys._getframe().f_locals)
+
+
+finalized = []
+
+
+class Fin:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        finalized.append(self.tag)
+
+
+def make_and_drop(tag):
+    obj = Fin(tag)
+    return obj.tag
+
+
+def recurse(n):
+    return 0 if n == 0 else 1 + recurse(n - 1)
+
+
+def warn_up():
+    warnings.warn("careful", UserWarning, stacklevel=2)
+    return 1
+
+
+def calls_warn():
+    return warn_up()
+
+
+def gen_items(n):
+    for i in range(n):
+        yield i
+
+
+def sums_generator(n):
+    total = 0
+    for v in gen_items(n):
+        total += v
+    return total
+
+
+def builds(n):
+    return Point(n).chained(1)
+
+
+def hot_calls():
+    p = Point(5)
+    for i in range(3000):
+        assert outer(i) == 2 * (i + 1) + 2 * (i + 2)
+        assert p.chained(i) == 10 + i
+        assert p.get_default() == 5
+        assert builds(i) == 2 * i + 1
+        assert sums_generator(4) == 6
+
+
+def introspection():
+    for _ in range(300):
+        assert caller_of_frame() == ["callee_with_frame", "caller_of_frame", "introspection", "<module>"]
+        assert catch_deep() == ["catch_deep", "raise_deep", "raise_deep", "raise_deep", "raise_deep"]
+        assert show_locals(1, 2) == ["a", "b", "c"]
+
+
+def finalizers():
+    # A finalizer of an object a callee drops runs by the time the
+    # callee's caller goes on.
+    for i in range(500):
+        finalized.clear()
+        assert make_and_drop(i) == i
+        assert finalized == [i], finalized
+
+
+def recursion():
+    # Deep direct recursion still hits the recursion limit, and recovers.
+    limit = sys.getrecursionlimit()
+    for _ in range(3):
+        try:
+            recurse(limit + 50)
+        except RecursionError:
+            pass
+        else:
+            raise AssertionError("no RecursionError")
+    assert recurse(200) == 200
+
+
+def warning_levels():
+    # A warning's stack level names the caller's caller.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(300):
+            calls_warn()
+    assert caught and all(w.filename == __file__ for w in caught)
+    lines = {w.lineno for w in caught}
+    assert len(lines) == 1, lines
+
+
+for _ in range(3):
+    hot_calls()
+    introspection()
+    finalizers()
+    recursion()
+    warning_levels()
+
+gc.collect()
+print("ok")
