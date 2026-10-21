@@ -1049,7 +1049,7 @@ impl Interpreter {
     /// `next(g)` by fast step (see the module docs): resumes `g` with
     /// `None` and runs it to its next yield when both it and its body
     /// allow. `depth` counts the fast steps this one is nested in.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn gen_fast_next(
         &mut self,
         g: &Rc<PyGenerator>,
@@ -1064,6 +1064,7 @@ impl Interpreter {
     /// the resume's value. A fresh generator, or one an earlier step left
     /// partway, takes only `None` (the general resume raises for, or
     /// continues without, any other).
+    #[inline(always)]
     pub(crate) fn gen_fast_send(
         &mut self,
         g: &Rc<PyGenerator>,
@@ -1074,8 +1075,8 @@ impl Interpreter {
     ) -> GenNext {
         // A level of a collapsed `yield from` chain is the inline resume's
         // (which resumes a parked chain without settling it), and a body no
-        // fast step runs declines at once (its code's verdict is cached:
-        // see `code_ok`). (`gi_code` is the frame's code.)
+        // fast step runs declines at once, in line (its code's verdict is
+        // cached: see `code_ok`). (`gi_code` is the frame's code.)
         let Object::Code(code) = &g.code else {
             return GenNext::Declined;
         };
@@ -1085,6 +1086,21 @@ impl Interpreter {
         if g.chain.get() != 0 || verdicts(code, ext) & CODE_MASK == CODE_NO {
             return GenNext::Declined;
         }
+        self.gen_fast_resume(g, ext, sent, snap_gen, depth, dead)
+    }
+
+    /// [`Self::gen_fast_send`] once the body's verdict admits fast steps
+    /// (`ext` is its code's extension table).
+    #[allow(clippy::too_many_arguments)]
+    fn gen_fast_resume(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        ext: &crate::CodeConstObjects,
+        sent: Object,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> GenNext {
         if depth > MAX_DEPTH
             || crate::recursion::current_depth() + usize::from(depth) + 2
                 >= crate::recursion::recursion_limit()

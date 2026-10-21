@@ -1306,8 +1306,138 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 return 1;
             }
         }
+        if matches!(&*it, Object::Generator(_)) && !(*st).sw.is_null() {
+            return h_for_iter_gen(st, it, out, pc);
+        }
         h_for_iter_rest(st, it, out, pc)
     }
+}
+
+/// [`h_for_iter`] of a generator from a running activation: a simple
+/// body's step in place (see `gen_fast`), any other resumed as an inline
+/// activation, switched to as the core loop's arm does (not from a
+/// generator's own fast step).
+#[inline(never)]
+unsafe extern "C" fn h_for_iter_gen(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
+    // SAFETY: as `h_for_iter_rest`'s; the caller checked the generator and
+    // the switch.
+    let (st, top) = unsafe { (&mut *st, &*it) };
+    let Object::Generator(g) = top else {
+        unreachable!("checked by `h_for_iter`")
+    };
+    // SAFETY: the running thread's interpreter, dormant while the helper
+    // runs; the stack slot keeps `g` alive.
+    let interp = unsafe { &mut *st.interp.cast_mut() };
+    match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+        crate::gen_fast::GenNext::Yielded(v) => {
+            // SAFETY: the slot above the iterator is free.
+            unsafe { out.write(v) };
+            1
+        }
+        crate::gen_fast::GenNext::Exhausted(_) => {
+            // SAFETY: the finished generator leaves the stack.
+            drop(unsafe { it.read() });
+            // SAFETY: the running thread's own flag.
+            if unsafe { (*st.maybe_dead).get() } {
+                // SAFETY: as `for_iter_gen_marked`'s.
+                return unsafe { for_iter_gen_marked(st, it, pc) };
+            }
+            2
+        }
+        crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
+            // SAFETY: as `for_iter_gen_switch`'s.
+            unsafe { for_iter_gen_switch(st, it, pc) }
+        }
+    }
+}
+
+/// [`h_for_iter_gen`] of a finished generator whose frame released
+/// something that queued a finalizer, which runs before the next
+/// instruction: the core loop takes over past the loop, synced as for a
+/// switch.
+///
+/// # Safety
+///
+/// `st` is a live state with a switch, `it` its stack slot the finished
+/// generator left, and `pc` its `FOR_ITER`'s.
+#[cold]
+#[inline(never)]
+unsafe fn for_iter_gen_marked(st: &mut State, it: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the running activation's frame and switch.
+    unsafe {
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        let code = &frame.code;
+        let mut to = pc as usize + 1 + code.instructions[pc as usize].arg as usize;
+        let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+        if op(to) == Some(OpCode::EndFor) {
+            to += 1;
+            if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
+                to += 1;
+            }
+        }
+        frame.stack.set_len(it.offset_from(st.stack) as usize);
+        frame.pc = to as u32;
+        *sw.last = pc as usize;
+        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+    }
+    FOR_SWITCHED
+}
+
+/// [`h_for_iter_gen`] of a generator its fast step declined (or left
+/// partway): resumed as an inline activation.
+///
+/// # Safety
+///
+/// `st` is a live state with a switch, `it` its stack slot holding the
+/// generator, and `pc` its `FOR_ITER`'s.
+#[inline(never)]
+unsafe fn for_iter_gen_switch(st: &mut State, it: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the running thread's interpreter (as above), and the running
+    // activation's frame and switch; the stack is synced (the iterator on
+    // top) before the switch.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        let len = it.offset_from(st.stack) as usize + 1;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            return FOR_SWITCHED;
+        }
+        // A collapsed chain's fast step delivered the value without a
+        // switch (see `Interpreter::chain_step`).
+        if std::ptr::eq(sw.cur, st.frame) {
+            return if sw.pending.is_none() {
+                1
+            } else {
+                FOR_SWITCHED
+            };
+        }
+        // A compiled body runs from here; its yield (the value on top, past
+        // the instruction) or its return (the iterator gone, past the loop)
+        // continues this code natively.
+        if run_switched_directly(st) {
+            let frame = &*st.frame;
+            let at = frame.pc as usize;
+            let depth = frame.stack.len();
+            if at == pc as usize + 1 && depth == len + 1 {
+                return 1;
+            }
+            if depth == len - 1 && at == for_iter_exit(&frame.code, pc as usize) {
+                return 2;
+            }
+        }
+    }
+    FOR_SWITCHED
 }
 
 /// [`h_for_iter`]'s other shapes.
@@ -1323,89 +1453,10 @@ unsafe extern "C" fn h_for_iter_rest(
     let (st, top) = unsafe { (&mut *st, &*it) };
     let rc = match top {
         Object::Iter(rc) => rc,
-        // A generator: a simple body's step in place (see `gen_fast`),
-        // any other resumes as an inline activation, switched to as the
-        // core loop's arm does (not from a generator's own fast step).
-        Object::Generator(g) if !st.sw.is_null() => {
-            // SAFETY: the running thread's interpreter, dormant while the
-            // helper runs; the stack slot keeps `g` alive.
-            let interp = unsafe { &mut *st.interp.cast_mut() };
-            match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
-                crate::gen_fast::GenNext::Yielded(v) => {
-                    // SAFETY: the slot above the iterator is free.
-                    unsafe { out.write(v) };
-                    return 1;
-                }
-                crate::gen_fast::GenNext::Exhausted(_) => {
-                    // SAFETY: the finished generator leaves the stack.
-                    drop(unsafe { it.read() });
-                    // SAFETY: the running thread's own flag.
-                    if !unsafe { (*st.maybe_dead).get() } {
-                        return 2;
-                    }
-                    // Its frame released something that queued a finalizer,
-                    // which runs before the next instruction: the core loop
-                    // takes over past the loop, synced as for a switch.
-                    // SAFETY: as below.
-                    unsafe {
-                        let sw = &mut *st.sw;
-                        let frame = &mut *st.frame;
-                        let code = &frame.code;
-                        let mut to = pc as usize + 1 + code.instructions[pc as usize].arg as usize;
-                        let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
-                        if op(to) == Some(OpCode::EndFor) {
-                            to += 1;
-                            if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
-                                to += 1;
-                            }
-                        }
-                        frame.stack.set_len(it.offset_from(st.stack) as usize);
-                        frame.pc = to as u32;
-                        *sw.last = pc as usize;
-                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
-                    }
-                    return FOR_SWITCHED;
-                }
-                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
-            }
-            // SAFETY: the running activation's frame and switch; the
-            // stack is synced (the iterator on top) before the switch.
-            unsafe {
-                let sw = &mut *st.sw;
-                let frame = &mut *st.frame;
-                let len = it.offset_from(st.stack) as usize + 1;
-                frame.stack.set_len(len);
-                frame.pc = pc as u32;
-                *sw.last = st.last;
-                if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
-                    sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
-                    return FOR_SWITCHED;
-                }
-                // A collapsed chain's fast step delivered the value without
-                // a switch (see `Interpreter::chain_step`).
-                if std::ptr::eq(sw.cur, st.frame) {
-                    return if sw.pending.is_none() {
-                        1
-                    } else {
-                        FOR_SWITCHED
-                    };
-                }
-                // A compiled body runs from here; its yield (the value on
-                // top, past the instruction) or its return (the iterator
-                // gone, past the loop) continues this code natively.
-                if run_switched_directly(st) {
-                    let frame = &*st.frame;
-                    let at = frame.pc as usize;
-                    let depth = frame.stack.len();
-                    if at == pc as usize + 1 && depth == len + 1 {
-                        return 1;
-                    }
-                    if depth == len - 1 && at == for_iter_exit(&frame.code, pc as usize) {
-                        return 2;
-                    }
-                }
-            }
-            return FOR_SWITCHED;
+        // A generator from a running activation (see `h_for_iter_gen`).
+        Object::Generator(_) if !st.sw.is_null() => {
+            // SAFETY: the caller's contract, the generator and switch checked.
+            return unsafe { h_for_iter_gen(st, it, out, pc) };
         }
         // A generator iterated from another generator's fast step: its own
         // fast step in place, nested one deeper, as the fast step's
@@ -5300,7 +5351,11 @@ unsafe extern "C" fn h_call(
             // A simple body steps to its next yield in place, as for
             // `next(gen)` below.
             if let (Some(g), true) = (
-                Interpreter::gen_send_target(&*base.add(start), &*base.add(start + 1)),
+                Interpreter::gen_send_target(
+                    &*base.add(start),
+                    &*base.add(start + 1),
+                    &*base.add(start + 2),
+                ),
                 Interpreter::core_drops_plain(),
             ) {
                 let interp = &mut *st.interp.cast_mut();

@@ -4100,20 +4100,13 @@ impl Interpreter {
     fn retire_gen_frame(&self, boxed: Box<Frame>) {
         const POOL_CAP: usize = 32;
         let raw = Box::into_raw(boxed);
-        // SAFETY: the frame moves out of its box once, and the box goes on
-        // as uninitialized storage.
-        let (frame, boxed) = unsafe {
-            (
-                raw.read(),
-                Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>()),
-            )
-        };
         // (Every field named: one added later must be retired here too.)
+        // SAFETY: the box holds a frame, owned here.
         let Frame {
             code,
             locals,
             cells,
-            mut stack,
+            stack,
             globals,
             builtins,
             rare,
@@ -4128,21 +4121,38 @@ impl Interpreter {
             shell_cache,
             #[cfg(feature = "jit")]
             parked_native,
-        } = frame;
-        // The values go first, in the order the frame's drop releases them,
-        // and none while a pool is borrowed (their drop glue can run code).
-        stack.clear();
-        let sole = Rc::strong_count(&locals) == 1;
-        if sole {
-            // SAFETY: sole owner (checked above).
-            unsafe { release_locals(&mut *locals.as_ptr()) };
-        }
-        drop((
-            code, cells, globals, builtins, rare, exc, py_frame, gen_owner,
-        ));
-        drop(shell_cache);
-        #[cfg(feature = "jit")]
-        drop(parked_native);
+        } = unsafe { &mut *raw };
+        // SAFETY: each field is moved out or dropped in place exactly once,
+        // after which the box holds uninitialized storage. The values go
+        // first, in the order the frame's drop releases them, and none
+        // while a pool is borrowed (their drop glue can run code).
+        let (locals, mut stack, boxed, sole) = unsafe {
+            let (locals, mut stack) = (std::ptr::read(locals), std::ptr::read(stack));
+            stack.clear();
+            // (An escaped `PyFrame` sharing them drops below: the decision
+            // is made before it does.)
+            let sole = Rc::strong_count(&locals) == 1;
+            if sole {
+                release_locals(&mut *locals.as_ptr());
+            }
+            std::ptr::drop_in_place(code);
+            std::ptr::drop_in_place(cells);
+            std::ptr::drop_in_place(globals);
+            std::ptr::drop_in_place(builtins);
+            std::ptr::drop_in_place(rare);
+            std::ptr::drop_in_place(exc);
+            std::ptr::drop_in_place(py_frame);
+            std::ptr::drop_in_place(gen_owner);
+            std::ptr::drop_in_place(shell_cache);
+            #[cfg(feature = "jit")]
+            std::ptr::drop_in_place(parked_native);
+            (
+                locals,
+                stack,
+                Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>()),
+                sole,
+            )
+        };
         if !sole {
             return;
         }
@@ -4163,8 +4173,9 @@ impl Interpreter {
     /// Finish `gen`, running (its frame `boxed` out of its state): the
     /// generator is marked finished, its frame retired (see
     /// [`Self::retire_gen_frame`]), and the collector lets go of it (see
-    /// [`Self::release_finished_gen`]).
-    #[inline]
+    /// [`Self::release_finished_gen`]). (Out of line: the resumes that
+    /// end here keep their registers for the commoner yield.)
+    #[inline(never)]
     fn retire_gen(&self, gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
         Self::finish_running_gen(gen);
         self.retire_gen_frame(boxed);
@@ -14080,7 +14091,11 @@ impl Interpreter {
                             // as for `next(gen)` above.
                             // SAFETY: `len >= 3`: the call's operands.
                             let target = unsafe {
-                                Self::gen_send_target(&*base.add(len - 3), &*base.add(len - 2))
+                                Self::gen_send_target(
+                                    &*base.add(len - 3),
+                                    &*base.add(len - 2),
+                                    &*base.add(len - 1),
+                                )
                             };
                             if let (Some(g), true) = (target, Self::core_drops_plain()) {
                                 // SAFETY: as above.
@@ -46105,9 +46120,12 @@ impl Interpreter {
         }
         // A generator still in the collector's young set has no registry
         // entry to remove: it leaves the set (whose entry would hold its
-        // allocation until the set dropped it).
+        // allocation until the set dropped it). One whose tracking was
+        // deferred never joined it.
         if !gen.gc_slot.is_registered() {
-            gc_trace::forget_young_generator(gen);
+            if !gen.track_deferred.get() {
+                gc_trace::forget_young_generator(gen);
+            }
             return;
         }
         let id = Rc::as_ptr(gen) as usize as u64;
@@ -59446,12 +59464,19 @@ impl Interpreter {
     }
 
     /// The plain generator a call [`Self::gen_send_call`] matched resumes
-    /// (`None` for a coroutine, which no fast step runs).
+    /// with a value, `sent`, a fast step may take (see `gen_fast`): `None`
+    /// for a coroutine, which no fast step runs, and for `send(None)`,
+    /// which keeps its activation (a body tier 2 parks natively resumes
+    /// there; `next()` is the plain resume that steps in place).
     #[inline(always)]
     pub(crate) fn gen_send_target<'a>(
         callee: &'a Object,
         slot: &'a Object,
+        sent: &Object,
     ) -> Option<&'a Rc<PyGenerator>> {
+        if matches!(sent, Object::None) {
+            return None;
+        }
         match (callee, slot) {
             (Object::BoundMethod(bm), _) => match &bm.receiver {
                 Object::Generator(g) => Some(g),
@@ -59577,18 +59602,20 @@ impl Interpreter {
                 v.resize(nlocals, Object::Unbound);
             }
             let gen_frame = Self::gen_frame_lean(f, code, locals, stack, cells, start);
-            let code = Rc::clone(&gen_frame.code);
             let boxed = Box::write(boxed, gen_frame);
+            // SAFETY: the frame, which the generator made below owns, holds
+            // the code.
+            let code: &CodeObject = unsafe { &*Rc::as_ptr(&boxed.code) };
             if await_send.is_some() {
                 // Tracked if it suspends (see `PyGenerator::track_deferred`),
                 // or below if it doesn't start.
-                let obj = Self::make_started_generator(f, &code, boxed);
+                let obj = Self::make_started_generator(f, code, boxed);
                 if let Object::Coroutine(g) = &obj {
                     g.track_deferred.set(true);
                 }
                 obj
             } else {
-                Self::wrap_started_generator(f, &code, boxed)
+                Self::wrap_started_generator(f, code, boxed)
             }
         } else {
             let mut positional = self.pooled_scratch();
