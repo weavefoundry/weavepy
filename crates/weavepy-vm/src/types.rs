@@ -3675,6 +3675,32 @@ impl SlotStorage {
             }
         }
     }
+
+    /// The slot values by representation, for the cycle collector's walk,
+    /// which needs no names (strings, which can't take part in a cycle)
+    /// and passes over an unset slot's [`Object::Unbound`] itself.
+    #[inline]
+    pub(crate) fn values_view(&self) -> SlotValues<'_> {
+        match &self.data {
+            SlotData::Single {
+                key: Some(_),
+                value,
+            } => SlotValues::Values(std::slice::from_ref(value)),
+            SlotData::Single { key: None, .. } => SlotValues::Values(&[]),
+            SlotData::Small(entries) => SlotValues::Pairs(entries),
+            SlotData::Many(table) => SlotValues::Table(table),
+            SlotData::Fixed { values, .. } => SlotValues::Values(values),
+            SlotData::Packed(p) => SlotValues::Values(p.values()),
+        }
+    }
+}
+
+/// [`SlotStorage::values_view`]: a run of values, a run of name-value
+/// pairs, or a table.
+pub(crate) enum SlotValues<'a> {
+    Values(&'a [Object]),
+    Pairs(&'a [(DictKey, Object)]),
+    Table(&'a DictData),
 }
 
 /// Slot storage for targets where an inline object pair would enlarge
@@ -3780,6 +3806,13 @@ impl SlotStorage {
         for (k, v) in self.0.iter() {
             f(k, v);
         }
+    }
+
+    /// The slot values, for the cycle collector's walk (see the 64-bit
+    /// variant).
+    #[inline]
+    pub(crate) fn values_view(&self) -> SlotValues<'_> {
+        SlotValues::Table(&self.0)
     }
 }
 
