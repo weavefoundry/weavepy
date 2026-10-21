@@ -109,28 +109,57 @@ branch and pull request.
 
 ## Done
 
-On branch `perf/cheap-calls` (draft PR #86):
+- **One bind for every direct call** (PR #86, `perf/cheap-calls`). A call
+  between compiled functions, positional or keyword, with defaults or
+  cells, binds through one path (`frame_jit::direct_enter`) into an
+  ordinary `InlineAct`; `core_bind_kw_direct`, `bind_call_cells` and the
+  `DIRECT` variant of `core_bind_plain` are gone. Instructions are within
+  0.3% of before. This replaced a first attempt, light activations that
+  skipped the switch and the pending list (`go` 0.94 of before), because
+  anything that switches activations had to reify them first: that kept
+  constructors, generator resumes and builtin lanes off them, needed a
+  frame swap and 15 reify points, and borrowed code a reassigned
+  `__code__` could free mid-call.
+- **In-line subscripts of stack-held sequences and closure-cell reads**
+  (PR #87, `perf/jit-coverage`). Instructions: `nqueens` 0.958,
+  `sudoku` 0.985, `generators_tree` 0.990.
 
-- **Light direct calls** (`frame_jit::LightAct`). A call between compiled
-  functions binds a per-depth record instead of a pooled `InlineAct`,
-  with no switch or pending-list work; anything that needs the core
-  loop's view reifies it first (`ensure_heavy`). Instructions: `go` 0.94
-  of before, `tomllib_loads` 0.97, `deepcopy` 0.99, suite geomean 0.993.
-  The helper still costs about 360 instructions a call (from 480), spread
-  over checks, field writes, and reference counts. `raytrace` gains
-  nothing: its callees construct objects, which reifies them, so its
-  sites fall back to ordinary activations.
+## What the measurements say
+
+- **The gap is spread thin.** A direct call costs about 480 instructions,
+  a core-loop call and return about 400, generator creation and teardown
+  about 1,200, a dict subscript from compiled code about 200, a young
+  collection about 2,000 per object. Line-level profiles of each show no
+  single cost: 60 or more steps of 1 to 10 instructions each (field
+  writes, flag checks, reference counts, pool and list bookkeeping). Each
+  local fix is worth 1% to 5% on a few workloads, well under 1% on the
+  geomean.
+- **What would move the geomean is a different execution core**: frames
+  allocated on a per-thread stack and linked to their callers (no pending
+  list, no pools, no separate native `State`), one activation record that
+  the interpreter, the frame JIT and generators all share, and a JIT that
+  inlines small callees and reads attributes by shape. That's a rewrite of
+  `quiet_run`, the core loop's switch, `frame_jit`'s calling convention,
+  generators and frame objects, not an incremental change.
+- **Tried and dropped**: compiling `DELETE_ATTR` natively (it lets
+  `contextlib`'s `__enter__` compile, but the compiled `next(self.gen)`
+  costs more than the interpreter's); the single-pass register allocator
+  for lean bodies (peak memory 1.6 to 4.6 MiB lower, warm time 3% to 20%
+  higher).
+- **Memory.** On `go`, WeavePy's resident set is 24.0 MiB against
+  CPython's 13.4: 9.4 against 6.2 file-backed (the binary's touched code)
+  and 14.6 against 7.2 anonymous. The frame JIT accounts for about 4 MiB
+  of the anonymous part, mostly the compiler's working memory at its peak;
+  decoded code objects and their side tables for 1.8 MiB.
 
 ## Next
 
-1. Make the light record the activation: per-depth `InlineAct` records in
-   a per-thread arena that `quiet_run`, the core loop's switch, and native
-   code all share. That removes the pool (`inline_pool`), the per-site warm
-   slots (`DirectSite::act`), `LightAct` and reification, and lets
-   constructors, generators, and lanes run under any caller. About 105
-   sites in `lib.rs` and `frame_jit.rs` move or park activation boxes.
-2. Then have the frame JIT emit the call and return in line against the
-   record's fixed layout, instead of calling `h_call_direct`.
+1. Generators: creation and teardown (about 1,200 instructions of
+   bookkeeping) and the fast step's per-yield cost.
+2. The cycle collector's per-object cost in young collections
+   (`async_tree` spends a fifth of its instructions there).
+3. Dict subscripts from compiled code (`sudoku`, `deepcopy`).
+4. The frame JIT's compile-time peak memory.
 
 ## Measurement notes
 
