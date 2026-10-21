@@ -6627,7 +6627,7 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
             Object::Type(t) => {
                 t.flags.is_builtin
                     && t.flags.is_exception
-                    && !t.is_subclass_of(&bt.base_exception_group)
+                    && crate::exc_family_flags(t) & crate::EXC_FAM_GROUP == 0
             }
             _ => false,
         };

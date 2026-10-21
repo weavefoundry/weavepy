@@ -5302,10 +5302,7 @@ impl Interpreter {
                 }
             }
         };
-        if result.is_err() {
-            self.depart_unwound_top();
-        }
-        self.pop_frame_shell();
+        self.pop_frame_shell_with(result.is_err());
         // A normally-returning frame is dead: CPython deallocates it the
         // instant it returns, releasing every local by refcount. Drop the
         // live-locals mirror (and any materialised `f_locals`) so a
@@ -5580,7 +5577,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
             materialized: RefCell::new(materialized),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
-            departed: RefCell::new(None),
+            departed: crate::object::Departed::default(),
         });
         if let Some(py) = shell.materialized.borrow().as_ref() {
             shell.link(py);
@@ -5634,7 +5631,7 @@ impl Interpreter {
             m.class_namespace_obj = None;
             *m.gen_owner.get_mut() = None;
             *m.materialized.get_mut() = None;
-            *m.departed.get_mut() = None;
+            m.departed = crate::object::Departed::default();
             self.frame_shell_pool.borrow_mut().push(shell);
         }
     }
@@ -6159,30 +6156,18 @@ impl Interpreter {
         }
     }
 
-    /// An exception is ending the activation atop the spine, about to be
-    /// popped: a lazy reference to it with no frame object yet leaves it
-    /// departed instead of materialized (see `FrameShell::depart`).
-    fn depart_unwound_top(&self) {
-        let stack = self.frame_stack.borrow();
-        let n = stack.len();
-        let Some(top) = stack.last() else { return };
-        if top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
-            || top.is_gen
-            || top
-                .has_materialized
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-        let caller = n.checked_sub(2).map(|i| &stack[i]);
-        top.depart(caller);
+    fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
+        self.pop_frame_shell_with(false)
     }
 
-    fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
+    /// [`Self::pop_frame_shell`] for an activation an exception is ending
+    /// (`unwound`), which departs instead of materializing (see
+    /// `FrameShell::depart`).
+    fn pop_frame_shell_with(&self, unwound: bool) -> Option<Rc<crate::object::FrameShell>> {
         // A lazy reference to this activation (a traceback entry, see
         // `PyTraceback::new_lazy`, or a callee frame's `f_back`) still
         // lives: build the frame object CPython would have by now, while
-        // the shell is still whole, unless an exception departed it.
+        // the shell is still whole, or leave the shell to stand for it.
         let lazy_top = self.frame_stack.borrow().last().is_some_and(|top| {
             top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
                 && !top
@@ -6191,7 +6176,14 @@ impl Interpreter {
                 && !top.has_departed()
         });
         if lazy_top {
-            self.materialize_departing_top();
+            let stack = self.frame_stack.borrow();
+            let n = stack.len();
+            if unwound && !stack[n - 1].is_gen {
+                stack[n - 1].depart(n.checked_sub(2).map(|i| &stack[i]));
+            } else {
+                drop(stack);
+                self.materialize_departing_top();
+            }
         }
         let popped = self.frame_stack.borrow_mut().pop();
         if let Some(shell) = &popped {
@@ -9017,7 +9009,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(false),
             materialized: RefCell::new(None),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
-            departed: RefCell::new(None),
+            departed: crate::object::Departed::default(),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
@@ -15237,7 +15229,7 @@ impl Interpreter {
                             Object::Type(t) => {
                                 t.flags.is_builtin
                                     && t.flags.is_exception
-                                    && !t.is_subclass_of(&bt.base_exception_group)
+                                    && exc_family_flags(t) & EXC_FAM_GROUP == 0
                             }
                             _ => false,
                         };
@@ -26538,7 +26530,7 @@ impl Interpreter {
                 if std::ptr::eq(cls, Rc::as_ptr(t)) {
                     return Some(true);
                 }
-                if !t.is_subclass_of(base) {
+                if !t.flags.is_exception && !t.is_subclass_of(base) {
                     return None;
                 }
                 Some(cls.is_subclass_of(t))
@@ -26549,10 +26541,10 @@ impl Interpreter {
                     let Object::Type(t) = t else {
                         return None;
                     };
-                    if !t.is_subclass_of(base) {
+                    if !t.flags.is_exception && !t.is_subclass_of(base) {
                         return None;
                     }
-                    matched = matched || cls.is_subclass_of(t);
+                    matched = matched || std::ptr::eq(cls, Rc::as_ptr(t)) || cls.is_subclass_of(t);
                 }
                 Some(matched)
             }
@@ -33777,18 +33769,17 @@ impl Interpreter {
             return Err(err);
         };
         let raise_pc = frame.pc.wrapping_sub(1);
-        if find_handler(&frame.code.exception_table, raise_pc).is_none()
-            || crate::trace::any_observers_active()
-        {
-            return Err(RuntimeError::PyException(exc));
-        }
+        let handler = match find_handler(&frame.code.exception_table, raise_pc) {
+            Some(handler) if !crate::trace::any_observers_active() => *handler,
+            _ => return Err(RuntimeError::PyException(exc)),
+        };
         self.chain_fresh_exception(&mut exc);
         // The traceback entry records this activation's shell, and the
         // handler's instructions run through `step`, which needs it.
         self.flush_lean(frame, shell)
             .lasti
             .store(raise_pc, std::sync::atomic::Ordering::Relaxed);
-        match self.handle_exception(frame, exc) {
+        match self.handle_exception_with(frame, exc, Some(handler)) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -33846,12 +33837,11 @@ impl Interpreter {
         exc_depth: usize,
     ) -> RuntimeError {
         self.chain_fresh_exception(&mut exc);
-        let err = match self.handle_exception(frame, exc) {
+        let err = match self.handle_exception_with(frame, exc, None) {
             Err(e) => e,
             Ok(_) => RuntimeError::Internal("quiet unwind found a handler".to_owned()),
         };
-        self.depart_unwound_top();
-        self.pop_frame_shell();
+        self.pop_frame_shell_with(true);
         Self::settle_exited_frame_object(&shell, frame, false);
         if self.exc_info_len() > exc_depth {
             self.exc_info_stack.borrow_mut().truncate(exc_depth);
@@ -33924,10 +33914,23 @@ impl Interpreter {
     fn handle_exception(
         &self,
         frame: &mut Frame,
-        mut exc: PyException,
+        exc: PyException,
     ) -> Result<Option<()>, RuntimeError> {
         // Note `pc` was already advanced past the raising instruction,
         // so the protected range matches against `pc - 1`.
+        let handler =
+            find_handler(&frame.code.exception_table, frame.pc.saturating_sub(1)).copied();
+        self.handle_exception_with(frame, exc, handler)
+    }
+
+    /// [`Self::handle_exception`] with the handler covering the raise
+    /// (`find_handler`'s answer) already found.
+    fn handle_exception_with(
+        &self,
+        frame: &mut Frame,
+        mut exc: PyException,
+        handler: Option<ExcHandler>,
+    ) -> Result<Option<()>, RuntimeError> {
         let raise_pc = frame.pc.saturating_sub(1);
         let line = frame
             .code
@@ -33946,7 +33949,7 @@ impl Interpreter {
         } else {
             self.append_traceback(&mut exc, frame, raise_pc, line);
         }
-        if let Some(handler) = find_handler(&frame.code.exception_table, raise_pc) {
+        if let Some(handler) = handler {
             // Drop entries above the recorded stack depth.
             while frame.stack.len() > handler.depth as usize {
                 frame.stack.pop();
@@ -34291,10 +34294,9 @@ impl Interpreter {
         // A builtin exception class (not a group, whose constructor
         // validates): the call's own construction, without the call.
         if let Object::Type(t) = &value {
-            let bt = builtin_types();
             if t.flags.is_builtin
                 && t.flags.is_exception
-                && !t.is_subclass_of(&bt.base_exception_group)
+                && exc_family_flags(t) & EXC_FAM_GROUP == 0
             {
                 return Ok(self.build_exception_instance(t.clone(), &[]));
             }
@@ -34334,8 +34336,11 @@ impl Interpreter {
                 make_exception_with_class(t, "")
             }
             Object::Instance(inst) => {
-                if !inst.cls().flags.is_exception && !inst.cls().is_subclass_of(&bt.base_exception)
-                {
+                let derives = {
+                    let cls = inst.class.borrow();
+                    cls.flags.is_exception || cls.is_subclass_of(&bt.base_exception)
+                };
+                if !derives {
                     return Err(type_error("exceptions must derive from BaseException"));
                 }
                 Object::Instance(inst)
@@ -58166,11 +58171,10 @@ impl Interpreter {
         // The common case (`ValueError("x")`, a plain user subclass): no
         // family shapes construction, so `args` is the only slot, built
         // in place without the per-slot probes below.
-        if families & !EXC_CUSTOM_INIT == 0 {
-            let inst = PyInstance::new(cls);
+        if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP) == 0 {
             let args_tuple = Object::new_tuple(args.to_vec());
-            inst.note_slot_store(&args_tuple);
-            *inst.slots.borrow_mut() = crate::types::SlotStorage::exception(args_tuple, []);
+            let inst =
+                PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
             // See the GC note at the end.
             if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
@@ -70148,7 +70152,7 @@ fn lookup_exception_init(cls: &Rc<TypeObject>) -> Option<Object> {
 /// [`exc_family_flags`]'s pseudo-family: a class between `cls` and
 /// `BaseException` defines its own `__init__` (see
 /// [`lookup_exception_init`]).
-const EXC_CUSTOM_INIT: u16 = 1 << 9;
+const EXC_CUSTOM_INIT: u16 = 1 << 10;
 
 /// [`lookup_exception_init`]'s MRO walk.
 fn exception_init_uncached(cls: &TypeObject) -> Option<Object> {
@@ -77572,7 +77576,7 @@ pub(crate) fn fn_slot_keys() -> &'static [Object; 4] {
 
 /// The exception families `build_exception_instance` branches on, as
 /// bits (see [`exc_family_flags`]).
-const EXC_FAMILIES: [&str; 9] = [
+const EXC_FAMILIES: [&str; 10] = [
     "StopIteration",
     "OSError",
     "BlockingIOError",
@@ -77582,12 +77586,14 @@ const EXC_FAMILIES: [&str; 9] = [
     "UnicodeEncodeError",
     "UnicodeDecodeError",
     "UnicodeTranslateError",
+    "BaseExceptionGroup",
 ];
 
 /// [`EXC_FAMILIES`] bits that Rust-side raise sites test directly.
 pub(crate) const EXC_FAM_STOP_ITERATION: u16 = 1 << 0;
 pub(crate) const EXC_FAM_SYNTAX_ERROR: u16 = 1 << 4;
 pub(crate) const EXC_FAM_IMPORT_ERROR: u16 = 1 << 5;
+pub(crate) const EXC_FAM_GROUP: u16 = 1 << 9;
 
 /// `name`'s bit in an [`exc_family_flags`] set (`0` for a name that is
 /// not a family — never asked in practice).
@@ -77604,8 +77610,8 @@ fn exc_family_bit(name: &str) -> u16 {
 pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     let ver = cls.attr_version.get();
     let memo = cls.exc_families.get();
-    if memo & 1 != 0 && memo >> 11 == ver {
-        return ((memo >> 1) & 0x3FF) as u16;
+    if memo & 1 != 0 && memo >> 12 == ver {
+        return ((memo >> 1) & 0x7FF) as u16;
     }
     let mut flags = 0u16;
     for t in cls.mro.borrow().iter() {
@@ -77614,7 +77620,7 @@ pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     if exception_init_uncached(cls).is_some() {
         flags |= EXC_CUSTOM_INIT;
     }
-    cls.exc_families.set(ver << 11 | u64::from(flags) << 1 | 1);
+    cls.exc_families.set(ver << 12 | u64::from(flags) << 1 | 1);
     flags
 }
 

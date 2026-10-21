@@ -3880,6 +3880,12 @@ thread_local! {
 impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         let slots = class.fresh_slots();
+        Self::with_slots(class, slots)
+    }
+
+    /// An instance of `class` whose slot storage is `slots` (an exception's
+    /// laid-out pseudo-slots, see [`SlotStorage::exception`]).
+    pub(crate) fn with_slots(class: Rc<TypeObject>, slots: SlotStorage) -> Self {
         Self {
             class: RefCell::new(class),
             dict: crate::inst_dict::InstDict::new(),

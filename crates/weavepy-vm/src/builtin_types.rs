@@ -4898,12 +4898,10 @@ pub(crate) fn exception_from_parts_with<const N: usize>(
 ) -> Object {
     use crate::types::{slot_key, PyInstance, SlotStorage};
     let families = crate::exc_family_flags(&class);
-    let inst = PyInstance::new(class);
     let args = match &arg {
         None => Object::new_tuple(Vec::new()),
         Some(a) => Object::new_tuple_array([a.clone()]),
     };
-    inst.note_slot_store(&args);
     // PEP 380: `StopIteration.value` is always present (CPython sets it
     // in `StopIteration.__init__`, defaulting to None). A Rust-raised
     // bare `StopIteration` must answer `.value` too: asyncio's
@@ -4931,9 +4929,8 @@ pub(crate) fn exception_from_parts_with<const N: usize>(
     // real values.
     let msg = (families & (crate::EXC_FAM_IMPORT_ERROR | crate::EXC_FAM_SYNTAX_ERROR) != 0)
         .then(|| arg.unwrap_or_else(|| Object::from_static("")));
-    for v in value.iter().chain(&msg).chain(extra.iter().map(|(_, v)| v)) {
-        inst.note_slot_store(v);
-    }
+    // (A new instance's tracking is not deferred, so its slot stores need
+    // no write barrier.)
     let slots = match (value, msg) {
         (None, None) => SlotStorage::exception(args, extra),
         (Some(value), None) if N == 0 => SlotStorage::exception(args, [("value", value)]),
@@ -4947,8 +4944,7 @@ pub(crate) fn exception_from_parts_with<const N: usize>(
             SlotStorage::from_entries(entries)
         }
     };
-    *inst.slots.borrow_mut() = slots;
-    Object::Instance(Rc::new(inst))
+    Object::Instance(Rc::new(PyInstance::with_slots(class, slots)))
 }
 
 /// PEP 654 — `BaseExceptionGroup.__init__(self, msg, exceptions)`

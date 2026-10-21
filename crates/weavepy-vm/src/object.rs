@@ -1122,15 +1122,23 @@ pub struct FrameShell {
     /// materializes a shell that still has some, unless the activation
     /// departs (see [`Self::depart`]). Zero for a parked shell.
     pub tb_refs: std::sync::atomic::AtomicU32,
-    /// Set when an exception ended the activation while lazy references
-    /// to it lived: the frame object's `f_back` (see [`Self::depart`]).
-    pub(crate) departed: RefCell<Option<DepartedBack>>,
+    /// Whether an exception ended the activation while lazy references to
+    /// it lived, and its caller (see [`Self::depart`]).
+    pub(crate) departed: Departed,
+}
+
+/// [`FrameShell::departed`].
+#[derive(Debug, Default)]
+pub(crate) struct Departed {
+    flag: std::sync::atomic::AtomicBool,
+    back: RefCell<DepartedBack>,
 }
 
 /// A departed activation's caller, for its frame object's `f_back` (see
 /// [`FrameShell::depart`]).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) enum DepartedBack {
+    #[default]
     /// No caller, or the link was handed to the frame object.
     None,
     Frame(Rc<PyFrame>),
@@ -1269,7 +1277,7 @@ impl FrameShell {
             has_materialized: std::sync::atomic::AtomicBool::new(true),
             materialized: RefCell::new(Some(py.clone())),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
-            departed: RefCell::new(None),
+            departed: Departed::default(),
         }
     }
 
@@ -1353,17 +1361,30 @@ impl FrameShell {
     pub(crate) fn depart(&self, caller: Option<&Rc<FrameShell>>) {
         let back = match caller {
             None => DepartedBack::None,
+            Some(c)
+                if !c
+                    .has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                DepartedBack::Lazy(LazyShellRef::new(c.clone()))
+            }
             Some(c) => match c.materialized.borrow().as_ref() {
                 Some(py) => DepartedBack::Frame(py.clone()),
                 None => DepartedBack::Lazy(LazyShellRef::new(c.clone())),
             },
         };
-        *self.departed.borrow_mut() = Some(back);
+        *self.departed.back.borrow_mut() = back;
+        self.departed
+            .flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the activation departed (see [`Self::depart`]).
+    #[inline]
     pub(crate) fn has_departed(&self) -> bool {
-        self.departed.borrow().is_some()
+        self.departed
+            .flag
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The frame object of a departed activation (see [`Self::depart`]):
@@ -1377,15 +1398,11 @@ impl FrameShell {
         py.live
             .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
         py.on_stack.set(0);
-        let back = self
-            .departed
-            .borrow_mut()
-            .as_mut()
-            .map(|b| std::mem::replace(b, DepartedBack::None));
+        let back = std::mem::take(&mut *self.departed.back.borrow_mut());
         match back {
-            Some(DepartedBack::Frame(b)) => py.set_back(Some(b)),
-            Some(DepartedBack::Lazy(l)) => *py.lazy_back.borrow_mut() = Some(l),
-            Some(DepartedBack::None) | None => {}
+            DepartedBack::Frame(b) => py.set_back(Some(b)),
+            DepartedBack::Lazy(l) => *py.lazy_back.borrow_mut() = Some(l),
+            DepartedBack::None => {}
         }
         py
     }
