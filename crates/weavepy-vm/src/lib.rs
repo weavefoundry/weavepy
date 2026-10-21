@@ -34006,7 +34006,7 @@ impl Interpreter {
             }
             // Push the exception instance for the handler to bind /
             // CHECK_EXC_MATCH to inspect.
-            frame.stack.push(exc.instance.clone());
+            frame.stack.push(exc.instance);
             frame.pc = handler.handler;
             return Ok(Some(()));
         }
@@ -34042,7 +34042,10 @@ impl Interpreter {
                 // dispatch-machinery entries above the frame being
                 // annotated (test_sys_settrace jump-from-'call').
                 let found = {
-                    let stack = self.frame_stack.borrow();
+                    // SAFETY: only this thread mutates its spine, and the
+                    // scan runs no code (a guard-free read, as
+                    // `exc_info_len`'s).
+                    let stack = unsafe { &*self.frame_stack.as_ptr() };
                     stack
                         .iter()
                         .rposition(|shell| Rc::ptr_eq(&shell.locals, &frame.locals))
