@@ -517,8 +517,7 @@ impl<T: ?Sized + 'static> Drop for Rc<T> {
 #[inline(always)]
 fn nesting_kind<T: ?Sized + 'static>() -> bool {
     use crate::object::{
-        BoundMethod, DictData, FrozenSetObj, PyFrame, PyFunction, PyGenerator, PyIterator,
-        PyTraceback, SetData,
+        BoundMethod, DictData, FrozenSetObj, PyFrame, PyFunction, PyGenerator, PyIterator, SetData,
     };
     use crate::sync::RefCell;
     use std::any::TypeId;
@@ -534,7 +533,6 @@ fn nesting_kind<T: ?Sized + 'static>() -> bool {
         || t == TypeId::of::<BoundMethod>()
         || t == TypeId::of::<PyGenerator>()
         || t == TypeId::of::<PyFrame>()
-        || t == TypeId::of::<PyTraceback>()
 }
 
 /// How deep releases may nest before the trashcan takes over.

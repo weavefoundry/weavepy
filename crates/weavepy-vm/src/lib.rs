@@ -6085,6 +6085,27 @@ impl Interpreter {
         unsafe { (*self.exc_info_stack.as_ptr()).len() }
     }
 
+    /// `PUSH_EXC_INFO`'s entry: push `exc` as the handled exception and
+    /// return the previous one (`None` for none), under
+    /// [`Self::exc_info_len`]'s contract (the push runs no code).
+    #[inline]
+    fn exc_info_push(&self, exc: Object) -> Object {
+        // SAFETY: see `exc_info_len`; nothing here re-enters.
+        let handled = unsafe { &mut *self.exc_info_stack.as_ptr() };
+        let prev = handled.last().cloned().unwrap_or(Object::None);
+        handled.push(exc);
+        prev
+    }
+
+    /// `POP_EXCEPT`'s exit: the handled exception popped, as
+    /// [`Self::exc_info_push`] pushed it (the caller releases it).
+    #[inline]
+    fn exc_info_pop(&self) -> Option<Object> {
+        // SAFETY: see `exc_info_len`; the popped value is released by the
+        // caller, after the stack is consistent again.
+        unsafe { (*self.exc_info_stack.as_ptr()).pop() }
+    }
+
     fn sync_py_locals(&self, frame: &Frame) {
         // The Python-visible frame shares the live locals storage
         // (see `build_py_frame`), so there is nothing to copy; only the
@@ -6168,24 +6189,27 @@ impl Interpreter {
         // `PyTraceback::new_lazy`, or a callee frame's `f_back`) still
         // lives: build the frame object CPython would have by now, while
         // the shell is still whole, or leave the shell to stand for it.
-        let lazy_top = self.frame_stack.borrow().last().is_some_and(|top| {
-            top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && !top
-                    .has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                && !top.has_departed()
-        });
-        if lazy_top {
-            let stack = self.frame_stack.borrow();
+        let popped = {
+            let mut stack = self.frame_stack.borrow_mut();
             let n = stack.len();
-            if unwound && !stack[n - 1].is_gen {
-                stack[n - 1].depart(n.checked_sub(2).map(|i| &stack[i]));
-            } else {
+            let lazy_top = stack.last().is_some_and(|top| {
+                top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    && !top
+                        .has_materialized
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && !top.has_departed()
+            });
+            if lazy_top && (!unwound || stack[n - 1].is_gen) {
                 drop(stack);
                 self.materialize_departing_top();
+                self.frame_stack.borrow_mut().pop()
+            } else {
+                if lazy_top {
+                    stack[n - 1].depart(n.checked_sub(2).map(|i| &stack[i]));
+                }
+                stack.pop()
             }
-        }
-        let popped = self.frame_stack.borrow_mut().pop();
+        };
         if let Some(shell) = &popped {
             // Borrowed slots (see `FrameSlot`) read through the frame,
             // which dies once its activation unwinds. The spine's handle
@@ -18533,12 +18557,7 @@ impl Interpreter {
                 }
                 // SAFETY: as above.
                 let instance = unsafe { &*base.add(len - 1) }.clone();
-                let prev = {
-                    let mut handled = self.exc_info_stack.borrow_mut();
-                    let prev = handled.last().cloned().unwrap_or(Object::None);
-                    handled.push(instance);
-                    prev
-                };
+                let prev = self.exc_info_push(instance);
                 // SAFETY: the exception moves up one slot and the previous
                 // one takes its place (`len < cap`).
                 unsafe {
@@ -18569,7 +18588,7 @@ impl Interpreter {
                 }
                 // SAFETY: the slot at `len - 1` is initialized.
                 let prev = unsafe { base.add(len - 1).read() };
-                let top = self.exc_info_stack.borrow_mut().pop();
+                let top = self.exc_info_pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
                 if let Some(top) = top {
@@ -19451,8 +19470,9 @@ impl Interpreter {
         if !Self::core_all_droppable(ops) {
             return None;
         }
+        // (`leaf_type_call` ends in `builtin_ctor_pure` for a builtin type
+        // its own arms don't build.)
         self.leaf_type_call(t, &ops[2..])
-            .or_else(|| crate::seqiter::builtin_ctor_pure(t, &ops[2..]))
     }
 
     /// The `__slots__` member `co_names[name_idx]` of the instance at
@@ -23671,20 +23691,17 @@ impl Interpreter {
             return None;
         };
         if cls.native_kind.get() == 0 {
-            // The builtin adapter types and the exact `itertools` classes:
-            // their native adapters, when building one runs no code.
-            if kw || (!cls.flags.is_builtin && cls.lazy_ctor.get() == 0) {
+            // The exact `itertools` classes: their native adapters, when
+            // building one runs no code. (A builtin type's call is
+            // `core_builtin_ctor`'s, which every caller tries as well.)
+            if kw || cls.flags.is_builtin || cls.lazy_ctor.get() == 0 {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
             if !Self::core_all_droppable(ops) {
                 return None;
             }
-            return if cls.flags.is_builtin {
-                crate::seqiter::builtin_ctor_pure(cls, args)
-            } else {
-                crate::stdlib::itertools_mod::native_new_pure(cls, args)
-            };
+            return crate::stdlib::itertools_mod::native_new_pure(cls, args);
         }
         let args = ops.get(2..2 + argc)?;
         let (names, values): (&[Object], &[Object]) = if kw {
@@ -26471,12 +26488,7 @@ impl Interpreter {
                         break;
                     }
                     let exc = stack.pop().expect("checked above");
-                    let prev = {
-                        let mut handled = self.exc_info_stack.borrow_mut();
-                        let prev = handled.last().cloned().unwrap_or(Object::None);
-                        handled.push(exc.clone());
-                        prev
-                    };
+                    let prev = self.exc_info_push(exc.clone());
                     stack.push(prev);
                     stack.push(exc);
                     last = pc;
@@ -26497,7 +26509,7 @@ impl Interpreter {
                 }
                 OpCode::PopExcept => {
                     let Some(prev) = stack.pop() else { break };
-                    let top = self.exc_info_stack.borrow_mut().pop();
+                    let top = self.exc_info_pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
                     last = pc;
@@ -27741,9 +27753,7 @@ impl Interpreter {
         // `__new__`, no class-defined `__init__` to run), as the full
         // call builds it.
         if ty.flags.is_builtin && ty.flags.is_exception {
-            if ty.is_subclass_of(&builtin_types().base_exception_group)
-                || lookup_exception_init(ty).is_some()
-            {
+            if exc_family_flags(ty) & EXC_FAM_GROUP != 0 || lookup_exception_init(ty).is_some() {
                 return None;
             }
             return Some(self.build_exception_instance(ty.clone(), args));
@@ -27757,7 +27767,7 @@ impl Interpreter {
                 [Object::Int(n)] => Some(Object::from_str(itoa::Buffer::new().format(*n))),
                 [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
                 [Object::None] => Some(Object::from_static("None")),
-                _ => None,
+                _ => crate::seqiter::builtin_ctor_pure(ty, args),
             };
         }
         if Rc::ptr_eq(ty, &fns.range_ty) {
@@ -27769,7 +27779,7 @@ impl Interpreter {
                 [Object::Int(start), Object::Int(stop), Object::Int(step)] if *step != 0 => {
                     (i128::from(*start), i128::from(*stop), i128::from(*step))
                 }
-                _ => return None,
+                _ => return crate::seqiter::builtin_ctor_pure(ty, args),
             };
             return Some(Object::Range(Rc::new(crate::object::Range::new(
                 start, stop, step,
@@ -34017,8 +34027,8 @@ impl Interpreter {
         // out-of-range `tb_lasti` values that made `traceback`'s
         // `_get_code_position` StopIterate (RFC 0054: asyncio cancellation
         // tracebacks crashed `format_exc` with PEP 479 RuntimeError).
-        let new_tb = match frame.py_frame.clone() {
-            Some(py_frame) => PyTraceback::new(py_frame, lineno, lasti, None),
+        let new_tb = match &frame.py_frame {
+            Some(py_frame) => PyTraceback::new(py_frame.clone(), lineno, lasti, None),
             None => {
                 // This activation's shell: the traceback must reference
                 // *this* frame's snapshot, and it must be the *same*
@@ -58172,7 +58182,13 @@ impl Interpreter {
         // family shapes construction, so `args` is the only slot, built
         // in place without the per-slot probes below.
         if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP) == 0 {
-            let args_tuple = Object::new_tuple(args.to_vec());
+            let args_tuple = match args {
+                [] => Object::new_tuple(Vec::new()),
+                [a] => Object::new_tuple_array([a.clone()]),
+                _ => Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+                    args.iter().cloned(),
+                )),
+            };
             let inst =
                 PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
@@ -77607,12 +77623,20 @@ fn exc_family_bit(name: &str) -> u16 {
 
 /// Which exception families `cls` inherits from, memoised on the type
 /// against its attribute version (an MRO reshape bumps it).
+#[inline]
 pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
-    let ver = cls.attr_version.get();
     let memo = cls.exc_families.get();
-    if memo & 1 != 0 && memo >> 12 == ver {
+    if memo & 1 != 0 && memo >> 12 == cls.attr_version.get() {
         return ((memo >> 1) & 0x7FF) as u16;
     }
+    exc_family_flags_slow(cls)
+}
+
+/// [`exc_family_flags`] without a current memo: the MRO walk, memoised.
+#[cold]
+#[inline(never)]
+fn exc_family_flags_slow(cls: &crate::types::TypeObject) -> u16 {
+    let ver = cls.attr_version.get();
     let mut flags = 0u16;
     for t in cls.mro.borrow().iter() {
         flags |= exc_family_bit(&t.name);

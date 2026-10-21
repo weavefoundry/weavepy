@@ -4094,9 +4094,20 @@ impl PyInstance {
         if self.c_body.get() != 0 {
             return false;
         }
+        // (A guard-free view when one is free; it ends before anything
+        // else runs.)
+        // SAFETY: as above.
+        if let Some(cls) = unsafe { self.class.peek() } {
+            return self.class_lets_die_plainly(cls);
+        }
         let Ok(cls) = self.class.try_borrow() else {
             return false;
         };
+        self.class_lets_die_plainly(&cls)
+    }
+
+    /// [`Self::dies_by_plain_drop`]'s verdict for the class `cls`.
+    fn class_lets_die_plainly(&self, cls: &TypeObject) -> bool {
         if cls.native_kind.get() != 0 {
             // Never tracked; see `stdlib::datetime_native::plain_drop_ok`.
             return !cls.instances_need_finalize()

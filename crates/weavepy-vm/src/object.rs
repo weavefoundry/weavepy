@@ -1729,12 +1729,13 @@ impl Drop for PyTraceback {
         // and overflow the native stack. Tear the chain down iteratively.
         // (The last owner of each link detaches its successor in place,
         // then frees a node with nothing left to chain to.)
-        let mut link = self.next.borrow_mut().take();
+        let mut link = self.next.get_mut().take();
         while let Some(tb) = link {
             if Rc::strong_count(&tb) != 1 {
                 break;
             }
-            link = tb.next.borrow_mut().take();
+            // SAFETY: the last owner: nothing else can reach the link.
+            link = unsafe { (*tb.next.as_ptr()).take() };
             drop(tb);
         }
     }
