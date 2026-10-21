@@ -3441,6 +3441,31 @@ pub fn untrack_generator(g: &crate::Rc<crate::object::PyGenerator>) {
     }
 }
 
+/// Let go of `g`, a finished generator in the young set (see
+/// `Interpreter::release_finished_gen`): holding no frame, it can close no
+/// cycle, and its entry would keep its allocation until the set dropped
+/// it. Only the set's last few entries are searched (a generator that
+/// finishes young is usually among them); the set drops any other once it
+/// is dead. Its birth still counts toward the young collection, as a dead
+/// entry's does.
+pub fn forget_young_generator(g: &crate::Rc<crate::object::PyGenerator>) {
+    with_state(|s| {
+        // SAFETY: nothing below runs code while the set is borrowed (the
+        // removed entry's release only adjusts a weak count: `g` is alive).
+        let Some(young) = (unsafe { s.young_gens.peek_mut() }) else {
+            return;
+        };
+        let p = crate::Rc::as_ptr(g);
+        let n = young.len();
+        if let Some(i) = (n.saturating_sub(4)..n)
+            .rev()
+            .find(|&i| young[i].as_ptr() == p)
+        {
+            young.swap_remove(i);
+        }
+    });
+}
+
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
 /// child. See [`GcState::reinit_after_fork_in_child`].
 ///

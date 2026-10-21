@@ -186,7 +186,7 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
                 CoroutineKind::Coroutine => Object::Coroutine(g),
                 CoroutineKind::AsyncGenerator => Object::AsyncGenerator(g),
             });
-        } else {
+        } else if let Err(g) = crate::object::recycle_generator(g) {
             crate::rc::drop_arc(g);
         }
     } else {

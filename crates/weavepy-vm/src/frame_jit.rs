@@ -5297,6 +5297,32 @@ unsafe extern "C" fn h_call(
             && !st.sw.is_null()
             && Interpreter::gen_send_call(&*base.add(start), &*base.add(start + 1))
         {
+            // A simple body steps to its next yield in place, as for
+            // `next(gen)` below.
+            if let (Some(g), true) = (
+                Interpreter::gen_send_target(&*base.add(start), &*base.add(start + 1)),
+                Interpreter::core_drops_plain(),
+            ) {
+                let interp = &mut *st.interp.cast_mut();
+                let sent = crate::clone_hot(&*base.add(start + 2));
+                match interp.gen_fast_send(g, sent, st.snap_gen, 0, st.maybe_dead) {
+                    crate::gen_fast::GenNext::Yielded(v) => {
+                        crate::release_run(base.add(start), 3);
+                        base.add(start).write(v);
+                        st.len = start + 1;
+                        return 0;
+                    }
+                    // `send` raises `StopIteration(value)`.
+                    crate::gen_fast::GenNext::Exhausted(v) => {
+                        crate::release_run(base.add(start), 3);
+                        st.len = start;
+                        st.pc = pc + 1;
+                        st.err = Some(crate::error::stop_iteration_with(v));
+                        return RAISED;
+                    }
+                    crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
+                }
+            }
             sync(st);
             let sw = &mut *st.sw;
             let interp = &mut *st.interp.cast_mut();
