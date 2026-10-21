@@ -123,6 +123,38 @@ branch and pull request.
 - **In-line subscripts of stack-held sequences and closure-cell reads**
   (PR #87, `perf/jit-coverage`). Instructions: `nqueens` 0.958,
   `sudoku` 0.985, `generators_tree` 0.990.
+- **Cheaper exceptions** (PR #88, `perf/exceptions`). An unwound frame's
+  object is built only when something reads it, a raise settles its
+  handler and class checks once, and exceptions are built with their
+  slots in place. A raise caught one frame up costs 6,275 instructions,
+  down from 8,179 (CPython 2,984). Instructions: `exceptions` 0.901,
+  `context_managers` 0.979, geomean 0.992.
+- **Cheaper young collections** (PR #89, `perf/gc-young`). A static
+  visitor in place of a `dyn` closure, no reference counting during the
+  walk, direct walks of generator frames and futures, one fewer pass.
+  The collector's cost on `async_tree` fell about 43% (the workload 0.92);
+  geomean 0.994.
+- **Cheaper generator creation, `send` and teardown** (PR #90,
+  `perf/gen-lifecycle`). `send` takes the fast step, finished frames and
+  generator objects are recycled whole. `send` costs 1,243 instructions,
+  down from 1,963 (CPython 985). Instructions: `coroutines` 0.853,
+  `generators_tree` 0.976, geomean 0.991.
+- **Chunked frame-JIT compiles** (PR #91, `perf/jit-memory`). A body that
+  lowers to more than 2,400 IR instructions compiles as chunks of about
+  1,200, chained without the core loop. Peak RSS falls by up to 4.7 MB
+  (`tomllib_loads`, `text_processing`, `stdlib_utils`), and the suite's
+  RSS ratio from 1.777 to 1.705 on a quick build, for 0.13% more
+  instructions.
+- **Frameless container helpers** (PR #92, `perf/subscripts`). The
+  commonest subscripts, item stores and `in` tests run through small
+  helpers picked in line by tag, shared by compiled code and the core
+  loop. `d[str]` costs 169 instructions, down from 217 (CPython 175);
+  `defaultdict` `d[k] += 1` 681, down from 1,257 (CPython 714).
+  Instructions: `sudoku` 0.892, `nqueens` 0.958, geomean 0.988. It adds
+  about 1,100 lines.
+
+Together, PRs #87 to #92 should take the suite's instruction geomean down
+by roughly 4% to 5%; the combined PGO wall-time checkpoint is still to do.
 
 ## What the measurements say
 
@@ -146,20 +178,36 @@ branch and pull request.
   costs more than the interpreter's); the single-pass register allocator
   for lean bodies (peak memory 1.6 to 4.6 MiB lower, warm time 3% to 20%
   higher).
-- **Memory.** On `go`, WeavePy's resident set is 24.0 MiB against
-  CPython's 13.4: 9.4 against 6.2 file-backed (the binary's touched code)
-  and 14.6 against 7.2 anonymous. The frame JIT accounts for about 4 MiB
-  of the anonymous part, mostly the compiler's working memory at its peak;
-  decoded code objects and their side tables for 1.8 MiB.
+- **Memory.** WeavePy's peak RSS is 1.71 times CPython's (PGO). Three
+  causes, measured on `tomllib_loads` with an allocation profiler and
+  `task_info`:
+  - **The frame JIT's compile peak.** The largest single compile's
+    working memory, about 1.2 KB per IR instruction (Cranelift's register
+    allocator and VCode), adds 4 to 7 MB to the heap peak; the JIT's
+    retained data is small (about 230 KB of code). PR #91 bounds it for
+    large bodies; bodies of 1,200 to 2,400 IR instructions still set the
+    peak.
+  - **The binary's touched pages.** 8.3 to 9.9 MiB file-backed against
+    CPython's 6.0 to 6.3: a run touches about 8 MiB of the binary's 25 MB
+    of code, scattered, since the macOS linker ignores LLVM's hot and cold
+    sections. With tier 2 off, start-up touches 2.4 MiB fewer of them.
+  - **Code objects.** About 2,100 code objects load for `tomllib_loads`
+    (376 bytes each plus their vectors and strings, about 2 to 2.5 MiB);
+    most nested functions never run.
+
+  The code generator's warm-up thread costs only about 0.1 MB.
 
 ## Next
 
-1. Generators: creation and teardown (about 1,200 instructions of
-   bookkeeping) and the fast step's per-yield cost.
-2. The cycle collector's per-object cost in young collections
-   (`async_tree` spends a fifth of its instructions there).
-3. Dict subscripts from compiled code (`sudoku`, `deepcopy`).
-4. The frame JIT's compile-time peak memory.
+1. A PGO wall-time and memory checkpoint with PRs #86 to #92 together.
+2. A linker order file from the PGO profile, so a run's code is
+   contiguous (fewer resident pages and TLB misses, faster start-up).
+3. RFC 0078, stage 1 onward: one activation stack for the interpreter,
+   the frame JIT and generators (calls, resumes and exceptional returns
+   are the largest remaining bucket).
+4. Generator expressions without a throwaway function object (about 5%
+   on `nqueens`), and cheaper chunk transitions so the chunking threshold
+   can come down.
 
 ## Measurement notes
 
