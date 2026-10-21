@@ -1142,29 +1142,47 @@ impl GcState {
     /// (a collection is releasing garbage) is left as it is; that
     /// collection prunes the entry.
     fn forget_instance(&self, slot: u32, addr: usize) {
-        let (Ok(mut reg), Ok(mut counts)) =
-            (self.reg.try_borrow_mut(), self.counts.try_borrow_mut())
-        else {
-            return;
+        // SAFETY: nothing runs code while the views live (a removal only
+        // unlinks the entry; its handle is released after).
+        let weak = match unsafe { (self.reg.peek_mut(), self.counts.peek_mut()) } {
+            (Some(reg), Some(counts)) => self.forget_instance_in(reg, counts, slot, addr),
+            // (Shared cells, or a busy registry the guards then refuse.)
+            _ => match (self.reg.try_borrow_mut(), self.counts.try_borrow_mut()) {
+                (Ok(mut reg), Ok(mut counts)) => {
+                    self.forget_instance_in(&mut reg, &mut counts, slot, addr)
+                }
+                _ => return,
+            },
         };
-        let Some(e) = reg.slab.get(slot as usize) else {
-            return;
-        };
+        if weak.is_some() {
+            serial_add(&self.tracked_count, usize::MAX);
+            serial_add(&self.tracked_version, 1);
+        }
+        drop(weak);
+    }
+
+    /// [`Self::forget_instance`] under the registry and count borrows:
+    /// the entry's handle, if it was the instance's.
+    fn forget_instance_in(
+        &self,
+        reg: &mut Registry,
+        counts: &mut [usize; N_GENERATIONS],
+        slot: u32,
+        addr: usize,
+    ) -> Option<WeakObject> {
+        let e = reg.slab.get(slot as usize)?;
         match &e.obj {
             Some(WeakObject::Instance(w)) if w.as_ptr() as usize == addr => {}
-            _ => return,
+            _ => return None,
         }
         if e.gen == GEN_FROZEN {
-            return;
+            return None;
         }
         let weak = reg.remove(slot);
         // (As `untrack_slot` accounts it.)
         counts[0] = counts[0].saturating_sub(1);
         self.sync_gen0_gauge(counts[0], None);
-        drop((reg, counts));
-        serial_add(&self.tracked_count, usize::MAX);
-        serial_add(&self.tracked_version, 1);
-        drop(weak);
+        weak
     }
 
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
@@ -1209,18 +1227,25 @@ impl GcState {
     /// a deallocation; with `young`, a dead entry's id is also searched in
     /// the young sets.
     fn untrack_slot(&self, slot: u32, id: ObjectId, young: bool) {
-        let (weak, dead) = {
-            let mut reg = self.reg.borrow_mut();
+        let remove = |reg: &mut Registry| {
             let dead = reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead);
             (reg.remove(slot), dead)
+        };
+        // SAFETY (both views): nothing runs code while they live.
+        let (weak, dead) = match unsafe { self.reg.peek_mut() } {
+            Some(reg) => remove(reg),
+            None => remove(&mut self.reg.borrow_mut()),
         };
         if young && dead {
             self.untrack_young(id);
         }
-        {
-            let mut counts = self.counts.borrow_mut();
+        let uncount = |counts: &mut [usize; N_GENERATIONS]| {
             counts[0] = counts[0].saturating_sub(1);
             self.sync_gen0_gauge(counts[0], None);
+        };
+        match unsafe { self.counts.peek_mut() } {
+            Some(counts) => uncount(counts),
+            None => uncount(&mut self.counts.borrow_mut()),
         }
         drop(weak);
         serial_add(&self.tracked_count, usize::MAX);
@@ -1880,7 +1905,9 @@ impl GcState {
             // SAFETY: a copy that is never dropped, of an object `temps`
             // owns until the collection ends (a push may move the `Object`
             // itself, never its payload).
-            let obj = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(&temps[scanned].obj) });
+            let obj = std::mem::ManuallyDrop::new(unsafe {
+                std::ptr::read(&raw const temps[scanned].obj)
+            });
             tally(&obj, &mut temps, &mut found, &mut edges);
             scanned += 1;
         }
