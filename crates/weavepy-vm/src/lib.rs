@@ -12633,8 +12633,21 @@ impl Interpreter {
                     | OpCode::MapAdd
                     | OpCode::UnpackSequence => {
                         // SAFETY: the `len` slots at `base` are initialized,
-                        // and the helper touches nothing else.
-                        match unsafe { Self::core_container_op(ins, base, len, cap) } {
+                        // and the helpers touch nothing else.
+                        let subscr = matches!(ins.op, OpCode::BinarySubscr | OpCode::StoreSubscr);
+                        let n = if subscr {
+                            unsafe {
+                                Self::core_subscr_hot(ins.op == OpCode::StoreSubscr, base, len)
+                            }
+                        } else {
+                            usize::MAX
+                        };
+                        let r = if n != usize::MAX {
+                            Some(n)
+                        } else {
+                            unsafe { Self::core_container_op(ins, base, len, cap) }
+                        };
+                        match r {
                             Some(n) => {
                                 len = n;
                                 last = pc;
@@ -18684,6 +18697,195 @@ impl Interpreter {
                     .write(Object::BoundMethod(Rc::new(BoundMethod::new(self_v, f))));
                 Some(len - 2)
             }
+        }
+    }
+
+    /// `d[k]` of an exact dict by a present key that compares natively
+    /// (see [`crate::dictmap::Table::find_object_native`]), settled
+    /// without running code or calling anything (so a caller's fast path
+    /// needs no stack frame). `None` declines, having touched nothing: the
+    /// full arms decide every other shape, a missing key included.
+    #[inline(always)]
+    pub(crate) fn dict_get_hot<'a>(d: &'a RefCell<DictData>, k: &Object) -> Option<&'a Object> {
+        // SAFETY: a read between two instructions (the probe runs no code,
+        // and the caller copies the value before anything else runs).
+        let d = unsafe { d.peek() }?;
+        let i = d.find_object_native(k)?.1.ok()?;
+        // SAFETY: a found position.
+        Some(unsafe { d.value_at_unchecked(i) })
+    }
+
+    /// `c[i]` of a list or a tuple by an in-range index, as
+    /// [`Self::dict_get_hot`] settles a dict's.
+    #[inline(always)]
+    pub(crate) fn seq_get_hot(c: &Object, i: i64) -> Option<Object> {
+        let item = match c {
+            Object::List(xs) => {
+                // SAFETY: a read between two instructions.
+                let xs = unsafe { xs.peek() }?;
+                xs.get(seq_position(i, xs.len())?)?
+            }
+            Object::Tuple(t) => t.get(seq_position(i, t.len())?)?,
+            _ => return None,
+        };
+        Some(clone_hot(item))
+    }
+
+    /// `s[i]` of an ASCII string (one whose length is known) by an
+    /// in-range index, as [`Self::seq_get_hot`] settles a list's.
+    #[inline(always)]
+    pub(crate) fn str_get_hot(s: &SharedStr, i: i64) -> Option<Object> {
+        let bytes = s.as_bytes();
+        if SharedStr::known_char_count(s)? != bytes.len() {
+            return None;
+        }
+        let at = seq_position(i, bytes.len())?;
+        // SAFETY: `at` is inside the string.
+        let c = unsafe { *bytes.get_unchecked(at) };
+        SharedStr::ascii_char_built(c).map(Object::Str)
+    }
+
+    /// Whether a store may displace `old` natively: a scalar, or a value
+    /// whose release runs no code (see [`Self::core_droppable`]).
+    #[inline(always)]
+    fn displaced_ok(old: &Object) -> bool {
+        matches!(
+            old,
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+        ) || Self::core_droppable(old)
+    }
+
+    /// `d[k] = value()` of an exact dict by a key that compares natively
+    /// (as [`Self::dict_get_hot`] reads): a present key's value replaced,
+    /// or a new key added where the table has room (the full arm grows
+    /// it). The displaced value (`None` for a new key), for the caller to
+    /// release after it (`drop_hot`: it was checked droppable); `None`
+    /// declines, having touched nothing.
+    ///
+    /// # Safety
+    ///
+    /// `value` builds the stored value without running code.
+    #[inline(always)]
+    pub(crate) unsafe fn dict_set_hot(
+        cell: &RefCell<DictData>,
+        k: &Object,
+        value: impl FnOnce() -> Object,
+    ) -> Option<Object> {
+        if crate::capi_watchers::dicts_active() {
+            return None;
+        }
+        // SAFETY: a store between two instructions (the probe runs no
+        // code, and the displaced value is released after the view ends).
+        let d = unsafe { cell.peek_mut() }?;
+        // (An instance dict whose owner's tracking is deferred takes the
+        // full arm, which tracks it.)
+        if d.has_deferred_owner() {
+            return None;
+        }
+        let i = match d.find_object_native(k)? {
+            (_, Ok(i)) => i,
+            (hash, Err(pos)) => {
+                // (A stamped access, as every dict store makes.)
+                if !d.push_native(pos, hash, || DictKey(clone_hot(k)), value) {
+                    return None;
+                }
+                crate::object::dict_mutation_event(cell);
+                return Some(Object::None);
+            }
+        };
+        // SAFETY: a found position.
+        if !Self::displaced_ok(unsafe { d.value_at_unchecked(i) }) {
+            return None;
+        }
+        // SAFETY: as above (stamped, as every dict store is).
+        let slot = unsafe { d.value_at_unchecked_mut(i) };
+        let old = std::mem::replace(slot, value());
+        if !same_object(&old, slot) {
+            crate::object::dict_mutation_event(cell);
+        }
+        Some(old)
+    }
+
+    /// `xs[i] = value()` of an exact list at an in-range index. As for
+    /// [`Self::dict_set_hot`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::dict_set_hot`].
+    #[inline(always)]
+    pub(crate) unsafe fn list_set_hot(
+        xs: &RefCell<Vec<Object>>,
+        i: i64,
+        value: impl FnOnce() -> Object,
+    ) -> Option<Object> {
+        // SAFETY: a store between two instructions (the displaced value is
+        // released after the view ends).
+        let xs = unsafe { xs.peek_mut() }?;
+        let at = seq_position(i, xs.len())?;
+        let slot = xs.get_mut(at)?;
+        if !Self::displaced_ok(slot) {
+            return None;
+        }
+        Some(std::mem::replace(slot, value()))
+    }
+
+    /// `item in c` for an exact dict, set or frozenset and an item that
+    /// compares natively (see [`Self::dict_get_hot`]): `None` declines.
+    #[inline(always)]
+    pub(crate) fn contains_hot(c: &Object, item: &Object) -> Option<bool> {
+        let found = match c {
+            // SAFETY: a read between two instructions (the probe runs no
+            // code).
+            Object::Dict(d) => unsafe { d.peek() }?.find_object_native(item)?,
+            // SAFETY: as above.
+            Object::Set(s) => unsafe { s.peek() }?.find_object_native(item)?,
+            Object::FrozenSet(s) => s.find_object_native(item)?,
+            _ => return None,
+        };
+        Some(found.1.is_ok())
+    }
+
+    /// The core loop's commonest subscripts, ahead of
+    /// [`Self::core_container_op`]: `BINARY_SUBSCR` (`store` false) or
+    /// `STORE_SUBSCR` on the top of the `len`-deep stack at `base`, through
+    /// the helpers compiled code calls (see [`h_dict_get`]) with every
+    /// operand owned on the stack. The new stack length, or `usize::MAX`
+    /// declined untouched.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::core_container_op`].
+    #[inline(always)]
+    unsafe fn core_subscr_hot(store: bool, base: *mut Object, len: usize) -> usize {
+        // SAFETY: the caller's contract: the operands are the top two or
+        // three slots, and a read's item takes the container's slot.
+        unsafe {
+            if !store && len >= 2 {
+                let (c, k) = (base.add(len - 2), base.add(len - 1));
+                let r = match (&*c, &*k) {
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_get::<3>(c, c, k),
+                    (Object::List(_) | Object::Tuple(_), Object::Int(_)) => h_seq_get::<3>(c, c, k),
+                    (Object::Str(_), Object::Int(_)) => h_str_get::<3>(c, c, k),
+                    (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+                        h_inst_dict_get::<3>(c, c, k)
+                    }
+                    _ => 1,
+                };
+                return if r == 0 { len - 1 } else { usize::MAX };
+            }
+            if store && len >= 3 {
+                let (v, c, k) = (base.add(len - 3), base.add(len - 2), base.add(len - 1));
+                let r = match (&*c, &*k) {
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_set::<7>(v, c, k),
+                    (Object::List(_), Object::Int(_)) => h_list_set::<7>(v, c, k),
+                    (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+                        h_inst_dict_set::<7>(v, c, k)
+                    }
+                    _ => 1,
+                };
+                return if r == 0 { len - 3 } else { usize::MAX };
+            }
+            usize::MAX
         }
     }
 
@@ -26622,6 +26824,9 @@ impl Interpreter {
     /// for anything else, or a miss a key of another kind might explain.
     #[inline(always)]
     pub(crate) fn leaf_contains_table(container: &Object, item: &Object) -> Option<bool> {
+        if let Some(found) = Self::contains_hot(container, item) {
+            return Some(found);
+        }
         // A `str`, machine `int` or plain class in a set or dict, the
         // commonest tests (`cls in _atomic_types`), probed in line.
         if let (
@@ -75756,6 +75961,422 @@ fn release_gates_clear() -> bool {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 == 0
         }
+}
+
+/// An operand's release, settled before a fast path commits: nothing (a
+/// scalar, or a borrowed operand), or a plain decrement of the count at
+/// its word while [`release_gates_clear`] holds and the count is above
+/// one.
+#[derive(Clone, Copy)]
+pub(crate) struct PlainRelease(*const std::sync::atomic::AtomicUsize);
+
+impl PlainRelease {
+    /// `v`'s release when `owned` (else nothing), or `None` when it isn't
+    /// a plain one.
+    #[inline(always)]
+    pub(crate) fn of(v: &Object, owned: bool) -> Option<Self> {
+        if !owned {
+            return Some(Self(std::ptr::null()));
+        }
+        let Some(word) = v.strong_word() else {
+            return Some(Self(std::ptr::null()));
+        };
+        // SAFETY: `v` owns a reference to the live allocation.
+        let n = unsafe { (*word).load(std::sync::atomic::Ordering::Relaxed) };
+        (release_gates_clear() && n > 1).then_some(Self(word))
+    }
+
+    /// Make the release (the operand's slot is then free).
+    ///
+    /// # Safety
+    ///
+    /// The operand is still live, and nothing released since [`Self::of`]
+    /// reached the same object.
+    #[inline(always)]
+    pub(crate) unsafe fn run(self) {
+        if !self.0.is_null() {
+            // SAFETY: per the caller, the count is above one and only this
+            // thread updates it.
+            unsafe {
+                let c = (*self.0).load(std::sync::atomic::Ordering::Relaxed);
+                (*self.0).store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The position index `i` (negative: from the end) names in a sequence of
+/// `n` items; `None` outside it.
+#[inline(always)]
+fn seq_position(i: i64, n: usize) -> Option<usize> {
+    let i = if i < 0 { i.wrapping_add(n as i64) } else { i };
+    usize::try_from(i).ok().filter(|&i| i < n)
+}
+
+// The commonest container shapes, first, through helpers that call
+// nothing and keep nothing for a fallback (so they need little or no
+// stack frame): compiled code and the core loop pick one by the operands'
+// tags, and a decline leaves everything untouched for the full path. Each
+// reads its operands where they lie (a local's or constant's in place,
+// borrowed), and is instantiated for each `OWNED` (bit `k`: operand `k`
+// is owned in its stack slot, released by a plain decrement, settled
+// first; see [`PlainRelease`]).
+
+/// `BINARY_SUBSCR` of the exact dict at `cont` by the key at `key` (see
+/// [`Interpreter::dict_get_hot`]): `0` the value written to `out` (a free
+/// slot, or the owned container's own), `1` declined.
+pub(crate) unsafe extern "C" fn h_dict_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: the code passes two initialized values and the slot.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Dict(d) = c else {
+            return 1;
+        };
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 1 != 0),
+            PlainRelease::of(k, OWNED & 2 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::dict_get_hot(d, k) else {
+            return 1;
+        };
+        let v = clone_hot(v);
+        rk.run();
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the instance at `cont` of a `dict` subclass that
+/// keeps `dict.__getitem__` (a `defaultdict`, an `OrderedDict`), by a
+/// present key that compares natively: as [`h_dict_get`] (a miss, which
+/// may run `__missing__`, declines).
+pub(crate) unsafe extern "C" fn h_inst_dict_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Instance(inst) = c else {
+            return 1;
+        };
+        // (The payload first: most instances have none.)
+        let Some(Object::Dict(d)) = inst.native.get() else {
+            return 1;
+        };
+        if !inst
+            .class_dunder(crate::types::Dunder::GetItem)
+            .dict_owner()
+        {
+            return 1;
+        }
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 1 != 0),
+            PlainRelease::of(k, OWNED & 2 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::dict_get_hot(d, k) else {
+            return 1;
+        };
+        let v = clone_hot(v);
+        rk.run();
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the list or tuple at `cont` by the `int` at `key`
+/// (see [`Interpreter::seq_get_hot`]; the key needs no release): as
+/// [`h_dict_get`].
+pub(crate) unsafe extern "C" fn h_seq_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let c = &*cont;
+        let Object::Int(i) = *key else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 1 != 0) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::seq_get_hot(c, i) else {
+            return 1;
+        };
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the string at `cont` by the `int` at `key` (see
+/// [`Interpreter::str_get_hot`]): as [`h_seq_get`].
+pub(crate) unsafe extern "C" fn h_str_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let c = &*cont;
+        let (Object::Str(s), Object::Int(i)) = (c, &*key) else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 1 != 0) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::str_get_hot(s, *i) else {
+            return 1;
+        };
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the exact dict at `cont` by
+/// the key at `key` (see [`Interpreter::dict_set_hot`]; an owned value
+/// moves in, a borrowed one is copied): `0` stored, `1` declined.
+pub(crate) unsafe extern "C" fn h_dict_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: the code passes three initialized values.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Dict(d) = c else {
+            return 1;
+        };
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 2 != 0),
+            PlainRelease::of(k, OWNED & 4 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::dict_set_hot(d, k, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rk.run();
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the instance at `cont` of a
+/// `dict` subclass that keeps `dict.__setitem__` (a `defaultdict`), by a
+/// key that compares natively: as [`h_dict_set`].
+pub(crate) unsafe extern "C" fn h_inst_dict_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_set`'s.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Instance(inst) = c else {
+            return 1;
+        };
+        // (The payload first: most instances have none.)
+        let Some(Object::Dict(d)) = inst.native.get() else {
+            return 1;
+        };
+        if !inst
+            .class_dunder(crate::types::Dunder::SetItem)
+            .dict_owner()
+        {
+            return 1;
+        }
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 2 != 0),
+            PlainRelease::of(k, OWNED & 4 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::dict_set_hot(d, k, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rk.run();
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the exact list at `cont` by
+/// the `int` at `key` (see [`Interpreter::list_set_hot`]): as
+/// [`h_dict_set`].
+pub(crate) unsafe extern "C" fn h_list_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_set`'s.
+    unsafe {
+        let c = &*cont;
+        let (Object::List(xs), Object::Int(i)) = (c, &*key) else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 2 != 0) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::list_set_hot(xs, *i, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// The value at `val` for a store: moved out when owned (`OWNED` bit 0),
+/// else copied.
+///
+/// # Safety
+///
+/// `val` addresses an initialized value (one the caller gives up when
+/// owned).
+#[inline(always)]
+unsafe fn owned_or_copy<const OWNED: u32>(val: *const Object) -> Object {
+    // SAFETY: per the caller.
+    unsafe {
+        if OWNED & 1 != 0 {
+            val.read()
+        } else {
+            crate::clone_hot(&*val)
+        }
+    }
+}
+
+/// `CONTAINS_OP` of the item at `item` in the exact dict or set at `cont`
+/// (see [`Interpreter::contains_hot`]): `0` or `1` (found), `2`
+/// declined.
+pub(crate) unsafe extern "C" fn h_table_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: the code passes two initialized values.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        let Some(found) = Interpreter::contains_hot(c, i) else {
+            return 2;
+        };
+        rc.run();
+        ri.run();
+        u32::from(found)
+    }
+}
+
+/// `CONTAINS_OP` of the class at `item` in the exact dict or set at
+/// `cont`, a class whose metaclass keeps `type`'s `__hash__` and `__eq__`
+/// (`cls in _atomic_types`): as [`h_table_contains`].
+pub(crate) unsafe extern "C" fn h_type_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: as `h_table_contains`'s.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let Object::Type(t) = i else {
+            return 2;
+        };
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        if !crate::object::type_hash_is_identity(t) {
+            return 2;
+        }
+        // SAFETY: reads that run no code (the probe compares natively).
+        let found = match c {
+            Object::Set(s) => s.peek().and_then(|s| s.find_type_native(t)),
+            Object::Dict(d) => d.peek().and_then(|d| d.find_type_native(t)),
+            _ => None,
+        };
+        let Some(found) = found else {
+            return 2;
+        };
+        rc.run();
+        ri.run();
+        u32::from(found.is_ok())
+    }
+}
+
+/// `CONTAINS_OP` of the string at `item` in the string at `cont`, for a
+/// needle of at most one byte (an ASCII character, which only ever
+/// matches at a character boundary) in a short haystack: as
+/// [`h_table_contains`].
+pub(crate) unsafe extern "C" fn h_str_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: as `h_table_contains`'s.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let (Object::Str(needle), Object::Str(hay)) = (i, c) else {
+            return 2;
+        };
+        // (Two owned references to one string would each pass the plain
+        // release's count test alone.)
+        if OWNED & 3 == 3 && SharedStr::ptr_eq(needle, hay) {
+            return 2;
+        }
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        let hay = hay.as_bytes();
+        let found = match needle.as_bytes() {
+            [] => true,
+            // (A plain scan: `<[u8]>::contains` calls `memchr`.)
+            [b] if hay.len() <= 64 => hay.iter().any(|x| x == b),
+            _ => return 2,
+        };
+        rc.run();
+        ri.run();
+        u32::from(found)
+    }
+}
+
+/// Whether `a` and `b` are the same object as far as a store's mutation
+/// event cares (CPython compares the pointers): the same scalar, or the
+/// same allocation.
+#[inline(always)]
+fn same_object(a: &Object, b: &Object) -> bool {
+    match (a, b) {
+        (Object::None, Object::None) => true,
+        (Object::Bool(x), Object::Bool(y)) => x == y,
+        (Object::Int(x), Object::Int(y)) => x == y,
+        (Object::Float(x), Object::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => {
+            a.tag() == b.tag()
+                && a.payload_addr()
+                    .is_some_and(|p| Some(p) == b.payload_addr())
+        }
+    }
 }
 
 /// Release the `n` call operands at `p` (moved out: the caller's stack no

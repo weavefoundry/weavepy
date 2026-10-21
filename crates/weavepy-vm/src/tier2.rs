@@ -9211,6 +9211,16 @@ fn dict_pin_and_key(
 /// natively found) reports `Err(())` so the caller deopts and the
 /// interpreter runs the comparison with full semantics.
 fn dict_probe_native(d: &Rc<GilRefCell<DictData>>, key: &Object) -> Result<Option<Object>, ()> {
+    // The commonest keys first, as compiled code's subscripts probe them.
+    // SAFETY: a read that runs no code (the probe compares natively).
+    if let Some(m) = unsafe { d.peek() } {
+        if let Some((_, r)) = m.find_object_native(key) {
+            // SAFETY: a found position.
+            return Ok(r
+                .ok()
+                .map(|i| crate::clone_hot(unsafe { m.value_at_unchecked(i) })));
+        }
+    }
     // A `str` or `int` key settles by native equality unless the table
     // compared it with a key of another kind.
     if let Some(probe) = crate::object::LeafProbe::new(key) {
