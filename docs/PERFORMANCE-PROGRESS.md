@@ -109,7 +109,28 @@ branch and pull request.
 
 ## Done
 
-Nothing yet in this round.
+On branch `perf/cheap-calls` (draft PR #86):
+
+- **Light direct calls** (`frame_jit::LightAct`). A call between compiled
+  functions binds a per-depth record instead of a pooled `InlineAct`,
+  with no switch or pending-list work; anything that needs the core
+  loop's view reifies it first (`ensure_heavy`). Instructions: `go` 0.94
+  of before, `tomllib_loads` 0.97, `deepcopy` 0.99, suite geomean 0.993.
+  The helper still costs about 360 instructions a call (from 480), spread
+  over checks, field writes, and reference counts. `raytrace` gains
+  nothing: its callees construct objects, which reifies them, so its
+  sites fall back to ordinary activations.
+
+## Next
+
+1. Make the light record the activation: per-depth `InlineAct` records in
+   a per-thread arena that `quiet_run`, the core loop's switch, and native
+   code all share. That removes the pool (`inline_pool`), the per-site warm
+   slots (`DirectSite::act`), `LightAct` and reification, and lets
+   constructors, generators, and lanes run under any caller. About 105
+   sites in `lib.rs` and `frame_jit.rs` move or park activation boxes.
+2. Then have the frame JIT emit the call and return in line against the
+   record's fixed layout, instead of calling `h_call_direct`.
 
 ## Measurement notes
 
