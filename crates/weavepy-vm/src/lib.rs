@@ -5302,6 +5302,9 @@ impl Interpreter {
                 }
             }
         };
+        if result.is_err() {
+            self.depart_unwound_top();
+        }
         self.pop_frame_shell();
         // A normally-returning frame is dead: CPython deallocates it the
         // instant it returns, releasing every local by refcount. Drop the
@@ -5577,6 +5580,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
             materialized: RefCell::new(materialized),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
+            departed: RefCell::new(None),
         });
         if let Some(py) = shell.materialized.borrow().as_ref() {
             shell.link(py);
@@ -5630,6 +5634,7 @@ impl Interpreter {
             m.class_namespace_obj = None;
             *m.gen_owner.get_mut() = None;
             *m.materialized.get_mut() = None;
+            *m.departed.get_mut() = None;
             self.frame_shell_pool.borrow_mut().push(shell);
         }
     }
@@ -6154,16 +6159,36 @@ impl Interpreter {
         }
     }
 
+    /// An exception is ending the activation atop the spine, about to be
+    /// popped: a lazy reference to it with no frame object yet leaves it
+    /// departed instead of materialized (see `FrameShell::depart`).
+    fn depart_unwound_top(&self) {
+        let stack = self.frame_stack.borrow();
+        let n = stack.len();
+        let Some(top) = stack.last() else { return };
+        if top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) == 0
+            || top.is_gen
+            || top
+                .has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let caller = n.checked_sub(2).map(|i| &stack[i]);
+        top.depart(caller);
+    }
+
     fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
         // A lazy reference to this activation (a traceback entry, see
         // `PyTraceback::new_lazy`, or a callee frame's `f_back`) still
         // lives: build the frame object CPython would have by now, while
-        // the shell is still whole.
+        // the shell is still whole, unless an exception departed it.
         let lazy_top = self.frame_stack.borrow().last().is_some_and(|top| {
             top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
                 && !top
                     .has_materialized
                     .load(std::sync::atomic::Ordering::Relaxed)
+                && !top.has_departed()
         });
         if lazy_top {
             self.materialize_departing_top();
@@ -8992,6 +9017,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(false),
             materialized: RefCell::new(None),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
+            departed: RefCell::new(None),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
@@ -33824,6 +33850,7 @@ impl Interpreter {
             Err(e) => e,
             Ok(_) => RuntimeError::Internal("quiet unwind found a handler".to_owned()),
         };
+        self.depart_unwound_top();
         self.pop_frame_shell();
         Self::settle_exited_frame_object(&shell, frame, false);
         if self.exc_info_len() > exc_depth {
