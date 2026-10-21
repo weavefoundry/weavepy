@@ -140,11 +140,12 @@ branch and pull request.
   down from 1,963 (CPython 985). Instructions: `coroutines` 0.853,
   `generators_tree` 0.976, geomean 0.991.
 - **Chunked frame-JIT compiles** (PR #91, `perf/jit-memory`). A body that
-  lowers to more than 2,400 IR instructions compiles as chunks of about
-  1,200, chained without the core loop. Peak RSS falls by up to 4.7 MB
-  (`tomllib_loads`, `text_processing`, `stdlib_utils`), and the suite's
-  RSS ratio from 1.777 to 1.705 on a quick build, for 0.13% more
-  instructions.
+  lowers to more than 2,400 IR instructions compiles in chunks, cut where
+  the fewest loops cross (weighted by nesting) and chained without the
+  core loop. Peak RSS falls by 1 to 4 MB (`tomllib_loads` 31.6 to 27.8
+  MB), the suite's RSS ratio from 1.773 to 1.725 on a quick build, at
+  neutral warm time (0.995). Even-sized chunks cut through loops and cost
+  `tomllib_loads` 6.5%: a crossing costs about 100 cycles.
 - **Frameless container helpers** (PR #92, `perf/subscripts`). The
   commonest subscripts, item stores and `in` tests run through small
   helpers picked in line by tag, shared by compiled code and the core
@@ -153,8 +154,13 @@ branch and pull request.
   Instructions: `sudoku` 0.892, `nqueens` 0.958, geomean 0.988. It adds
   about 1,100 lines.
 
-Together, PRs #87 to #92 should take the suite's instruction geomean down
-by roughly 4% to 5%; the combined PGO wall-time checkpoint is still to do.
+**Checkpoint, PRs #86 to #92 merged together** (PGO, October 21, before
+#91's cost-aware cuts): against CPython, warm 1.24 to 1.27 (two runs),
+cold 1.45, peak RSS 1.62 (from 1.276, 1.506 and 1.710). Head to head with
+`main`'s PGO build in one session the warm geomean is 0.991; wall time on
+this host moves by several percent between runs, so only the instruction
+counts (about 0.95 of `main`) and RSS are firm. `tomllib_loads`' 12%
+slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
@@ -196,18 +202,26 @@ by roughly 4% to 5%; the combined PGO wall-time checkpoint is still to do.
     most nested functions never run.
 
   The code generator's warm-up thread costs only about 0.1 MB.
+- **Tried and dropped: a linker order file.** Ordering the binary's
+  functions by how many training programs run them (start-up code first)
+  cut file-backed pages by 0.4 to 0.6 MiB and left warm time unchanged
+  (0.997), less than a simulation predicted (1.4 MiB), since the kernel
+  reads file pages in clusters and the 20 MB of constants don't move. Not
+  worth a second training pass in the PGO build. Ordering by total
+  profile counts made it worse (large hot functions first).
 
 ## Next
 
-1. A PGO wall-time and memory checkpoint with PRs #86 to #92 together.
-2. A linker order file from the PGO profile, so a run's code is
-   contiguous (fewer resident pages and TLB misses, faster start-up).
-3. RFC 0078, stage 1 onward: one activation stack for the interpreter,
+1. RFC 0078, stage 1 onward: one activation stack for the interpreter,
    the frame JIT and generators (calls, resumes and exceptional returns
    are the largest remaining bucket).
-4. Generator expressions without a throwaway function object (about 5%
-   on `nqueens`), and cheaper chunk transitions so the chunking threshold
-   can come down.
+2. Generator expressions without a throwaway function object (about 5%
+   on `nqueens`).
+3. Cheaper chunk crossings (a tail call with a predictable target per
+   site), so the compile limit can come down to about 1,200 IR
+   instructions (about 1 MB more off the peak).
+4. Code objects: about 2 MiB for `tomllib_loads`' 2,100, against
+   CPython's more compact ones.
 
 ## Measurement notes
 
