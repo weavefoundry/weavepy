@@ -941,6 +941,8 @@ struct Tags {
     /// payload word: `(length, first item)` byte offsets.
     tuple: u8,
     tuple_layout: Option<(i32, i32)>,
+    /// Where a frame's cells are (see [`CellLayout`]).
+    cell_layout: Option<CellLayout>,
     /// The `dict`, `set` and `str` tags (the method kernels' receivers).
     dict: u8,
     set: u8,
@@ -1026,6 +1028,7 @@ fn tags() -> Option<Tags> {
         list_layout: list_layout(),
         tuple: tag(&Object::new_tuple_array([Object::None])),
         tuple_layout: tuple_layout(),
+        cell_layout: cell_layout(),
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -1131,6 +1134,69 @@ fn list_layout() -> Option<ListLayout> {
         borrow: off(borrow)?,
         ptr: off(data + 8 * ptr)?,
         len: off(data + 8 * len)?,
+    })
+}
+
+/// Where a frame's cell variables are: the byte offsets of its cells
+/// handle (`Frame::cells`, a word: the vector's allocation), from that
+/// allocation of the vector's pointer and length, and from a cell's
+/// allocation (each pointer in the vector) of its borrow counter (an
+/// `i32`; negative while mutably borrowed) and its value.
+#[derive(Clone, Copy)]
+struct CellLayout {
+    frame_cells: i32,
+    vec_ptr: i32,
+    vec_len: i32,
+    borrow: i32,
+    value: i32,
+}
+
+/// [`CellLayout`], read off a sample cells vector (`None` if it isn't the
+/// shape the code assumes).
+fn cell_layout() -> Option<CellLayout> {
+    const MARK: i64 = 0x5eed_ce11_0000_0001;
+    let cell = Rc::new(crate::sync::RefCell::new(Object::Int(MARK)));
+    let mut v: Vec<Rc<crate::sync::RefCell<Object>>> = Vec::with_capacity(7);
+    v.extend([cell.clone(), cell.clone(), cell]);
+    let (vp, vl) = (v.as_ptr() as u64, v.len() as u64);
+    let cells: Rc<Vec<Rc<crate::sync::RefCell<Object>>>> = Rc::new(v);
+    // SAFETY: an `Rc` is one word, its allocation's address.
+    let alloc = unsafe { std::mem::transmute_copy::<_, usize>(&cells) };
+    let data = (Rc::as_ptr(&cells) as usize).checked_sub(alloc)?;
+    // SAFETY: the vector's three words, inside the live sample.
+    let words: [u64; 3] = unsafe { std::ptr::read((alloc + data) as *const [u64; 3]) };
+    let ptr = words.iter().position(|&w| w == vp)?;
+    let len = words.iter().position(|&w| w == vl)?;
+    let first = &cells[0];
+    // SAFETY: as above, for the cell.
+    let cell_alloc = unsafe { std::mem::transmute_copy::<_, usize>(first) };
+    let cell_data = (Rc::as_ptr(first) as usize).checked_sub(cell_alloc)?;
+    // SAFETY: the vector's first word is the first cell's allocation.
+    let stored = unsafe { *(vp as *const usize) };
+    let (borrow, value) = crate::sync::object_cell_offsets();
+    // SAFETY: the cell's value, inside the live sample.
+    let mark = unsafe { *((cell_alloc + cell_data + value + 8) as *const i64) };
+    let counter =
+        unsafe { &*((cell_alloc + cell_data + borrow) as *const std::sync::atomic::AtomicI32) };
+    let idle = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let held = {
+        let _g = first.borrow_mut();
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let off = |d: usize| i32::try_from(d).ok();
+    (stored == cell_alloc
+        && mark == MARK
+        && idle == 0
+        && held < 0
+        && ptr != len
+        && std::mem::size_of::<Rc<Vec<Rc<crate::sync::RefCell<Object>>>>>() == 8)
+        .then_some(())?;
+    Some(CellLayout {
+        frame_cells: off(std::mem::offset_of!(crate::Frame, cells))?,
+        vec_ptr: off(data + 8 * ptr)?,
+        vec_len: off(data + 8 * len)?,
+        borrow: off(cell_data + borrow)?,
+        value: off(cell_data + value)?,
     })
 }
 
@@ -8722,12 +8788,56 @@ impl<'a> Lower<'a> {
             OpCode::LoadDeref => {
                 let s = self.depth;
                 let dst = self.slot_addr(s);
+                let slow = self.b.create_block();
+                let done = self.b.create_block();
+                if let (Some(cl), false) = (self.tags.cell_layout, self.cold) {
+                    // The cell's value in line: its index in range, the
+                    // cell not mutably borrowed (nor cells shared), and
+                    // its value bound.
+                    let frame = self.b.ins().load(self.ptr, FLAGS, self.st, S_FRAME);
+                    let cells = self.b.ins().load(self.ptr, FLAGS, frame, cl.frame_cells);
+                    let len = self.b.ins().load(types::I64, FLAGS, cells, cl.vec_len);
+                    let outside = self.b.ins().icmp_imm(
+                        IntCC::UnsignedLessThanOrEqual,
+                        len,
+                        i64::from(ins.arg),
+                    );
+                    self.branch_out(outside, slow);
+                    let items = self.b.ins().load(self.ptr, FLAGS, cells, cl.vec_ptr);
+                    let cell = self
+                        .b
+                        .ins()
+                        .load(self.ptr, FLAGS, items, 8 * ins.arg as i32);
+                    let flag = self
+                        .b
+                        .ins()
+                        .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
+                    let unguarded = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+                    self.branch_out(unguarded, slow);
+                    let borrow = self.b.ins().load(types::I32, FLAGS, cell, cl.borrow);
+                    let held = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    self.branch_out(held, slow);
+                    let value = self.b.ins().iadd_imm(cell, i64::from(cl.value));
+                    let tag = self.tag_at(value);
+                    let unbound =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.unbound));
+                    self.branch_out(unbound, slow);
+                    self.copy_value(dst, value);
+                    self.b.ins().jump(done, &[]);
+                } else {
+                    self.b.ins().jump(slow, &[]);
+                }
+                self.b.switch_to_block(slow);
                 let i = self.b.ins().iconst(types::I64, i64::from(ins.arg));
                 let r = self
                     .call(h_load_deref as *const () as usize, &[self.st, i, dst], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
                 self.branch_out(r, out);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
                 self.push(Item::Mem(s));
                 true
             }
@@ -9330,6 +9440,38 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(fast, &[]);
     }
 
+    /// Release the counted heap value at `at` (tagged `tag`) by a plain
+    /// decrement when another owner keeps it alive and nothing observes
+    /// releases; anything else jumps to `slow`, having changed nothing.
+    fn shared_dec(&mut self, at: Value, tag: Value, slow: Block) {
+        let dec = self.b.create_block();
+        let counted = self.b.create_block();
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, tag);
+        let rc = self
+            .b
+            .ins()
+            .band_imm(bit, self.tags.rc_counted | self.tags.rc_counted_hdr);
+        let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+        // The single-thread bias, and the release observers, all off.
+        let addr = self
+            .b
+            .ins()
+            .iconst(self.ptr, crate::plain_release_gate() as i64);
+        let on = self.b.ins().load(types::I32, FLAGS, addr, 0);
+        let off = self.b.ins().icmp_imm(IntCC::Equal, on, 0);
+        let quiet = self.b.ins().band(rc, off);
+        self.b.ins().brif(quiet, counted, &[], slow, &[]);
+        self.b.switch_to_block(counted);
+        let w = self.count_addr(at, bit);
+        let c = self.b.ins().load(types::I64, FLAGS, w, 0);
+        let shared = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, c, 1);
+        self.b.ins().brif(shared, dec, &[], slow, &[]);
+        self.b.switch_to_block(dec);
+        let c1 = self.b.ins().iadd_imm(c, -1);
+        self.b.ins().store(FLAGS, c1, w, 0);
+    }
+
     /// `STORE_FAST i` of the value at stack `slot` (just above the
     /// virtual stack) over a heap value, through the helper.
     fn store_from_slot(&mut self, pc: usize, i: u32, slot: usize) {
@@ -9802,12 +9944,14 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// `local[i]` of a list or tuple local and an `int` index, in line:
-    /// the item is read in place (the local gives no reference to take or
-    /// release) and copied to the stack. Any other operands (a `str` or a
-    /// dict, a borrowed list, an index out of range) take the in-place
-    /// helper, as [`Self::subscr_ref`] does. `false`, emitting nothing, for
-    /// other operand shapes.
+    /// `c[i]` of a list or tuple `c` and an `int` index, in line: the item
+    /// is read in place and copied to the stack. `c` is a local (which
+    /// gives no reference to take or release) or a value on the stack
+    /// that another owner keeps alive (it leaves by a plain decrement).
+    /// Any other operands (a `str` or a dict, a borrowed list, an index
+    /// out of range, a container this release would free) take the
+    /// in-place helper, as [`Self::subscr_ref`] does. `false`, emitting
+    /// nothing, for other operand shapes.
     fn seq_index(&mut self, pc: usize) -> bool {
         let (Some(list), Some((tlen, titems))) = (self.tags.list_layout, self.tags.tuple_layout)
         else {
@@ -9818,8 +9962,11 @@ impl<'a> Lower<'a> {
             return false;
         }
         let (cont, key) = (self.vs[n - 2], self.vs[n - 1]);
-        let Item::Local(l) = cont else {
-            return false;
+        let base = self.depth - n;
+        let local = match cont {
+            Item::Local(l) => Some(l),
+            Item::Mem(s) if s == base + n - 2 => None,
+            _ => return false,
         };
         let int_key = match key {
             Item::Int(_) | Item::Local(_) | Item::Dyn(..) => true,
@@ -9844,7 +9991,10 @@ impl<'a> Lower<'a> {
                 .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.int));
             self.branch_out(other, slow);
         }
-        let addr = self.local_addr(l);
+        let addr = match local {
+            Some(l) => self.local_addr(l),
+            None => self.slot_addr(slot),
+        };
         let tag = self.tag_at(addr);
         let word = self.b.ins().load(self.ptr, FLAGS, addr, 8);
         let as_list = self.b.create_block();
@@ -9891,6 +10041,11 @@ impl<'a> Lower<'a> {
         let i = self.b.ins().select(neg, wrapped, i);
         let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
         self.branch_out(outside, slow);
+        if local.is_none() {
+            // The container's own slot gives up its reference, which
+            // another owner backs: the item takes the slot.
+            self.shared_dec(addr, tag, slow);
+        }
         let off = self.b.ins().ishl_imm(i, 4);
         let item = self.b.ins().iadd(items, off);
         let dst = self.slot_addr(slot);
