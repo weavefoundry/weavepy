@@ -54,7 +54,7 @@ for capacity in (1, 2, 3, 7, 31):
 
 
 # Physical entry order differs from recency before changing the key shape.
-# Exact native tuples stay in dense recency; floats and bools use fallback.
+# Exact native tuples (of floats and bools too) stay in dense recency.
 for next_key in ((4,), 4.0, False):
     calls = []
 
@@ -216,7 +216,7 @@ if sys.implementation.name == 'weavepy':
     pinned.cache_clear()
     assert pinned.cache_info() == (0, 0, 2, 0)
     assert pinned(0) == 0
-    assert pinned(0.0) == 0.0
+    assert pinned(b'0') == b'0'
     assert not native(pinned)
     pinned.cache_clear()
     assert pinned(0) == 0 and not native(pinned)

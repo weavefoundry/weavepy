@@ -126,8 +126,27 @@ assert recursive(99, 1) == 100
 assert recursive.cache_info() == (1, 0, 3, 1)
 
 
+# Floats, bools, and None are native leaves too; numeric equality across
+# them holds as in Python (a key equal to a stored one hits it).
+@functools.lru_cache(4)
+def scalars(*args):
+    return args
+
+
+for _ in range(3):
+    scalars.cache_clear()
+    assert scalars(1.0, None) == (1.0, None)
+    assert scalars(1, None) == (1.0, None)
+    assert scalars(True, None) == (1.0, None)
+    assert scalars(2.5) == (2.5,) and scalars(False) == (False,) and scalars(0.0) == (False,)
+    assert scalars(None) == (None,) and scalars(float('inf')) == (float('inf'),)
+    assert scalars.cache_info() == (3, 5, 4, 4), scalars.cache_info()
+    if is_weavepy:
+        assert native(scalars)
+
+
 # Demote in logical order, including during an outer native-key miss.
-for unsupported in ((4.0,), (False, 'four'), (b'four',)):
+for unsupported in ((frozenset([4.0]),), (frozenset([False]), 'four'), (b'four',)):
     calls = []
 
     @functools.lru_cache(3)
