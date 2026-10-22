@@ -3560,13 +3560,23 @@ unsafe extern "C" fn h_load_method(
                 }
                 let f = match ms.get_held(ver) {
                     Some(f) => {
+                        let f = Object::Function(f);
                         if !cache.is_null() {
                             fill_method_cache(&mut *cache, cls, ver, &f, ext, name);
                         }
-                        Object::Function(f)
+                        f
                     }
                     None => match ms.get_inst_builtin(ver) {
-                        Some(b) => Object::Builtin(b),
+                        // A native method (an asyncio future's, a deque's):
+                        // the in-line cache serves it as it serves a
+                        // function, when compiled code may take its count.
+                        Some(b) => {
+                            let b = Object::Builtin(b);
+                            if !cache.is_null() && builtin_counted() {
+                                fill_method_cache(&mut *cache, cls, ver, &b, ext, name);
+                            }
+                            b
+                        }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
@@ -3616,10 +3626,12 @@ unsafe extern "C" fn h_load_method(
 }
 
 /// A method-load site's in-line cache (see `Lower::load_method`): the
-/// class version (`0` empty) whose plain function `func` (its payload
-/// word) the site loaded, and what proves an instance doesn't shadow it:
-/// the class's shared names `keys` (`0` none) and the name's position
-/// among them (an instance holding fewer values can't hold the name).
+/// class version (`0` empty) whose method `func` (its payload word: a
+/// plain function, or a native method whose count compiled code may take,
+/// see [`builtin_counted`]) the site loaded, and what proves an instance
+/// doesn't shadow it: the class's shared names `keys` (`0` none) and the
+/// name's position among them (an instance holding fewer values can't
+/// hold the name).
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct MethodCache {
@@ -3627,7 +3639,7 @@ pub(crate) struct MethodCache {
     func: u64,
     keys: u64,
     before: u32,
-    /// The function `Object`'s first word (its tag), `func` its second.
+    /// The method `Object`'s first word (its tag), `func` its second.
     head: u64,
     /// The site's other receiver classes (a polymorphic call), checked by
     /// the helper before its general path, most recent first.
@@ -3648,16 +3660,34 @@ const MC_VER: i32 = std::mem::offset_of!(MethodCache, ver) as i32;
 const MC_FUNC: i32 = std::mem::offset_of!(MethodCache, func) as i32;
 const MC_KEYS: i32 = std::mem::offset_of!(MethodCache, keys) as i32;
 const MC_BEFORE: i32 = std::mem::offset_of!(MethodCache, before) as i32;
+const MC_HEAD: i32 = std::mem::offset_of!(MethodCache, head) as i32;
+
+/// Whether compiled code takes a native method's count in line (the
+/// builtin variant is one of [`Tags::rc_counted`]'s), so a method cache
+/// may hold one.
+fn builtin_counted() -> bool {
+    static COUNTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COUNTED.get_or_init(|| {
+        tags().is_some_and(|t| {
+            let b = Object::Builtin(Rc::new(crate::object::BuiltinFn::new("sample", |_| {
+                Ok(Object::None)
+            })));
+            let tag = b.tag();
+            tag < 64 && t.rc_counted & (1i64 << tag) != 0
+        })
+    })
+}
 
 /// Record in `cache` that instances of `cls` at version `ver` load the
-/// plain function `f` for the name `co_names[name]` (the caller proved
+/// method `f` (a plain function, or a native method when
+/// [`builtin_counted`]) for the name `co_names[name]` (the caller proved
 /// this instance doesn't shadow it, and that `cls` keeps the default
-/// `__getattribute__`).
+/// `__getattribute__`). The class holds `f` while the version stands.
 fn fill_method_cache(
     cache: &mut MethodCache,
     cls: &crate::types::TypeObject,
     ver: u64,
-    f: &Rc<crate::object::PyFunction>,
+    f: &Object,
     ext: &CodeConstObjects,
     name: u32,
 ) {
@@ -3676,10 +3706,8 @@ fn fill_method_cache(
         }
         None => (0, 0),
     };
-    let obj = Object::Function(f.clone());
     // SAFETY: an `Object` is 16 bytes; its second word is the payload.
-    let [head, word] = unsafe { std::ptr::from_ref(&obj).cast::<[u64; 2]>().read() };
-    drop(obj);
+    let [head, word] = unsafe { std::ptr::from_ref(f).cast::<[u64; 2]>().read() };
     // The entry it replaces moves down the polymorphic list.
     if cache.ver != 0 && cache.ver != ver {
         cache.poly.copy_within(0..2, 1);
@@ -11130,14 +11158,16 @@ impl<'a> Lower<'a> {
                 let ok = self.b.ins().bor(empty, held);
                 self.b.ins().brif(ok, hit, &[], helper, &[]);
                 self.b.switch_to_block(hit);
-                // The function's count, then the receiver up and the
-                // function in its place.
+                // The method's count, then the receiver up and the method
+                // (its tag word from the cache: a function or a native
+                // method) in its place.
                 let f = self.b.ins().load(types::I64, FLAGS, c, MC_FUNC);
+                let head = self.b.ins().load(types::I64, FLAGS, c, MC_HEAD);
                 let count = self.b.ins().load(types::I64, FLAGS, f, 0);
                 let count = self.b.ins().iadd_imm(count, 1);
                 self.b.ins().store(FLAGS, count, f, 0);
                 self.copy16(above, recv);
-                self.write_tag(recv, self.tags.function);
+                self.b.ins().store(FLAGS, head, recv, 0);
                 self.b.ins().store(FLAGS, f, recv, 8);
                 self.b.ins().jump(done, &[]);
             }

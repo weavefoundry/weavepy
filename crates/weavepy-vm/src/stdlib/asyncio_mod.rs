@@ -1389,6 +1389,37 @@ fn fut_result(args: &[Object]) -> Result<Object, RuntimeError> {
     future_result_impl(interp, &Object::Instance(inst), &st)
 }
 
+/// `Future.result()`'s leaf half: a finished future's result (raising its
+/// exception, or a pending or cancelled future's error, is the full
+/// call's).
+fn fut_result_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let st = existing_state_of(inst)?;
+    let mut s = st.try_borrow_mut().ok()?;
+    if s.status != FutStatus::Finished || !matches!(s.exception(), Object::None) {
+        return None;
+    }
+    s.log_traceback = false;
+    Some(Ok(s.result.clone()))
+}
+
+/// `Future.exception()`'s leaf half: a finished future's exception (or
+/// `None`).
+fn fut_exception_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let st = existing_state_of(inst)?;
+    let mut s = st.try_borrow_mut().ok()?;
+    if s.status != FutStatus::Finished {
+        return None;
+    }
+    s.log_traceback = false;
+    Some(Ok(s.exception()))
+}
+
 fn fut_exception(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let interp = interp()?;
@@ -2995,6 +3026,26 @@ fn future_class_ref() -> &'static Rc<TypeObject> {
             DictKey(Object::from_static("__class_getitem__")),
             method("__class_getitem__", class_getitem),
         );
+        // The state queries run no Python code (the dispatch loop calls
+        // them in place); `result()` and `exception()` of a finished
+        // future do, until they'd raise.
+        for (name, fast) in [
+            ("done", None),
+            ("cancelled", None),
+            ("get_loop", None),
+            (
+                "result",
+                Some(fut_result_leaf as crate::leaf_builtins::Fast),
+            ),
+            ("exception", Some(fut_exception_leaf)),
+        ] {
+            if let Some(Object::Builtin(b)) = dict.get(&DictKey(Object::from_static(name))) {
+                match fast {
+                    Some(fast) => crate::leaf_builtins::register_fast(b, fast),
+                    None => crate::leaf_builtins::register(b),
+                }
+            }
+        }
         let cls = TypeObject::new_user("Future", vec![bt.object_.clone()], dict)
             .expect("Future class must linearise");
         install_getset(&cls, "_state", futprop_state, None);
