@@ -605,7 +605,13 @@ pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
         } else if Rc::ptr_eq(&cls, fut_cls) {
             false
         } else {
-            return false;
+            // A Python subclass that keeps the native `__del__`
+            // (`gather`'s `_GatheringFuture`): CPython's subclass inherits
+            // the C `tp_finalize`, with the same early return.
+            match native_finalizer_kind(&cls, fut_cls, task_cls) {
+                Some(is_task) => is_task,
+                None => return false,
+            }
         }
     };
     if let Some(st) = existing_state_of(inst) {
@@ -625,6 +631,35 @@ pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
     }
     release_state(inst);
     true
+}
+
+/// Whether instances of `cls`, a class other than the native `Future`
+/// (`fut_cls`) and `Task` (`task_cls`), finalize through one of their
+/// native `__del__`s: `Some(true)` the task's, `Some(false)` the future's,
+/// `None` neither (a class of its own, or one that overrides `__del__`).
+/// Memoized per class version.
+fn native_finalizer_kind(
+    cls: &TypeObject,
+    fut_cls: &Rc<TypeObject>,
+    task_cls: &Rc<TypeObject>,
+) -> Option<bool> {
+    use crate::types::Verdict;
+    let inherits = |native: &Rc<TypeObject>| {
+        cls.is_subclass_of(native)
+            && native
+                .dict
+                .try_borrow()
+                .ok()
+                .and_then(|d| d.get(&DictKey(Object::from_static("__del__"))).cloned())
+                .is_some_and(|own| cls.lookup("__del__").is_some_and(|del| del.is_same(&own)))
+    };
+    if cls.memo_verdict(Verdict::NativeFinalizer, "Task", || inherits(task_cls)) {
+        Some(true)
+    } else if cls.memo_verdict(Verdict::NativeFinalizer, "Future", || inherits(fut_cls)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 // ---- cycle-collector integration (RFC 0044 pattern) ----
@@ -759,7 +794,56 @@ fn running_loop() -> Object {
 }
 
 fn set_running_loop(loop_: Object) {
+    let old = THREAD_TASK.try_with(|slot| std::mem::replace(&mut slot.lock().loop_, loop_.clone()));
+    drop(old);
     RUNNING_LOOP.with(|slot| *slot.borrow_mut() = loop_);
+}
+
+/// Whether `loop_` is this thread's running loop.
+fn is_running_loop(loop_: &Object) -> bool {
+    !matches!(loop_, Object::None) && RUNNING_LOOP.with(|slot| slot.borrow().is_same(loop_))
+}
+
+// ---- current task (per OS thread) ----
+
+/// A thread's running loop and the task it is executing: 3.14 keeps the
+/// task in the thread state (`ts->asyncio_running_task`) rather than in a
+/// dictionary keyed by the loop, so entering and leaving a step costs no
+/// hashing. `current_task(loop)` for a loop another thread runs finds that
+/// thread's slot through [`TASK_SLOTS`]. (A loop that isn't its thread's
+/// running loop keeps its task in [`current_tasks_dict`].)
+struct TaskSlot {
+    loop_: Object,
+    task: Object,
+}
+
+type SharedTaskSlot = std::sync::Arc<parking_lot::Mutex<TaskSlot>>;
+
+/// Every thread's [`TaskSlot`] (dead threads' entries are pruned as new
+/// threads register).
+static TASK_SLOTS: parking_lot::Mutex<Vec<std::sync::Weak<parking_lot::Mutex<TaskSlot>>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+thread_local! {
+    static THREAD_TASK: SharedTaskSlot = {
+        let slot = std::sync::Arc::new(parking_lot::Mutex::new(TaskSlot {
+            loop_: Object::None,
+            task: Object::None,
+        }));
+        let mut all = TASK_SLOTS.lock();
+        all.retain(|w| w.strong_count() > 0);
+        all.push(std::sync::Arc::downgrade(&slot));
+        slot
+    };
+}
+
+/// The task `loop_` (running on some other thread) is executing, if any.
+fn other_thread_task(loop_: &Object) -> Option<Object> {
+    let slots: Vec<SharedTaskSlot> = TASK_SLOTS.lock().iter().filter_map(|w| w.upgrade()).collect();
+    slots.iter().find_map(|s| {
+        let s = s.lock();
+        (s.loop_.is_same(loop_) && !matches!(s.task, Object::None)).then(|| s.task.clone())
+    })
 }
 
 // ---- task registries (shared with tasks.py) ----
@@ -785,6 +869,11 @@ fn current_tasks_dict() -> Rc<RefCell<DictData>> {
 /// (`test_unix_events.TestFork.test_fork_not_share_current_task`).
 pub fn clear_current_tasks_after_fork_in_child() {
     current_tasks_dict().borrow_mut().clear();
+    let old = THREAD_TASK.with(|slot| std::mem::replace(&mut slot.lock().task, Object::None));
+    drop(old);
+    // The other threads didn't survive the fork.
+    let own = THREAD_TASK.with(std::sync::Arc::downgrade);
+    *TASK_SLOTS.lock() = vec![own];
 }
 
 /// The state of a native `Task` (or subclass) instance, for the
@@ -865,6 +954,25 @@ fn registered_native_tasks() -> Vec<Object> {
 }
 
 fn enter_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result<(), RuntimeError> {
+    if is_running_loop(loop_) {
+        let busy = THREAD_TASK.with(|slot| {
+            let mut s = slot.lock();
+            if matches!(s.task, Object::None) {
+                s.task = task.clone();
+                None
+            } else {
+                Some(s.task.clone())
+            }
+        });
+        let Some(cur) = busy else {
+            return Ok(());
+        };
+        let task_r = py_repr(interp, task);
+        let cur_r = py_repr(interp, &cur);
+        return Err(runtime_err(format!(
+            "Cannot enter into task {task_r} while another task {cur_r} is being executed."
+        )));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let existing = dict.borrow().get(&key).cloned();
@@ -882,6 +990,29 @@ fn enter_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result
 }
 
 fn leave_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result<(), RuntimeError> {
+    if is_running_loop(loop_) {
+        let left = THREAD_TASK.with(|slot| {
+            let mut s = slot.lock();
+            if s.task.is_same(task) {
+                Ok(std::mem::replace(&mut s.task, Object::None))
+            } else {
+                Err(s.task.clone())
+            }
+        });
+        return match left {
+            Ok(old) => {
+                drop(old);
+                Ok(())
+            }
+            Err(cur) => {
+                let task_r = py_repr(interp, task);
+                let cur_r = py_repr(interp, &cur);
+                Err(runtime_err(format!(
+                    "Leaving task {task_r} does not match the current task {cur_r}."
+                )))
+            }
+        };
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let existing = dict.borrow().get(&key).cloned();
@@ -901,6 +1032,9 @@ fn leave_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result
 }
 
 fn swap_current_task_impl(loop_: &Object, task: &Object) -> Object {
+    if is_running_loop(loop_) {
+        return THREAD_TASK.with(|slot| std::mem::replace(&mut slot.lock().task, task.clone()));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let prev = dict.borrow().get(&key).cloned().unwrap_or(Object::None);
@@ -3020,10 +3154,15 @@ fn mod_current_task(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
     } else {
         loop_
     };
+    if is_running_loop(&loop_) {
+        return Ok(THREAD_TASK.with(|slot| slot.lock().task.clone()));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_);
-    let out = dict.borrow().get(&key).cloned().unwrap_or(Object::None);
-    Ok(out)
+    let out = dict.borrow().get(&key).cloned();
+    Ok(out
+        .or_else(|| other_thread_task(&key.0))
+        .unwrap_or(Object::None))
 }
 
 fn mod_register_task(args: &[Object]) -> Result<Object, RuntimeError> {
