@@ -317,6 +317,56 @@ fn make_struct_time(values: Vec<Object>) -> Object {
     crate::stdlib::os::struct_seq_instance(struct_time_type(), &STRUCT_TIME_FIELDS, values)
 }
 
+/// The keys of a `struct_time`'s fields: the visible ones, then
+/// `tm_gmtoff` and `tm_zone` (the order `with_tz_extras` stores them in).
+fn struct_time_keys() -> std::rc::Rc<[DictKey]> {
+    thread_local! {
+        static KEYS: std::cell::OnceCell<std::rc::Rc<[DictKey]>> =
+            const { std::cell::OnceCell::new() };
+    }
+    KEYS.with(|k| {
+        k.get_or_init(|| {
+            STRUCT_TIME_FIELDS
+                .iter()
+                .chain(&["tm_gmtoff", "tm_zone"])
+                .map(|f| crate::stdlib::os::static_name_key(f))
+                .collect()
+        })
+        .clone()
+    })
+}
+
+/// A `struct_time` of the visible `values` with its zone extras, built in
+/// one pass (see `os::struct_seq_instance_keyed`).
+fn make_struct_time_tz(values: Vec<Object>, gmtoff: i64, zone: Object) -> Object {
+    crate::stdlib::os::struct_seq_instance_keyed(
+        struct_time_type(),
+        &struct_time_keys(),
+        values,
+        &[Object::Int(gmtoff), zone],
+    )
+}
+
+/// The `str` for a zone abbreviation `localtime` reads, the same object as
+/// the last call's when the text is the same (it changes only with `TZ`).
+#[cfg(unix)]
+fn zone_str(bytes: &[u8]) -> Object {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(Vec<u8>, Object)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some((b, z)) = &*last.borrow() {
+            if b.as_slice() == bytes {
+                return z.clone();
+            }
+        }
+        let z = Object::from_str(String::from_utf8_lossy(bytes).into_owned());
+        *last.borrow_mut() = Some((bytes.to_vec(), z.clone()));
+        z
+    })
+}
+
 /// `time.strptime(string[, format])` — parse a time string to a
 /// `struct_time`. CPython's `timemodule.c` delegates to the pure-Python
 /// `_strptime._strptime_time`; we do the same so the full locale-aware
@@ -698,6 +748,17 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
     let illegal = || type_error(format!("{func}(): illegal time tuple argument"));
     let items: Vec<Object> = match arg {
         Some(Object::Tuple(t)) => t.to_vec(),
+        // A `struct_time`'s visible fields are its tuple's (they are
+        // read-only).
+        Some(Object::Instance(inst))
+            if std::ptr::eq(inst.cls_raw(), Rc::as_ptr(&struct_time_type()))
+                && matches!(inst.native.get(), Some(Object::Tuple(t)) if t.len() == 9) =>
+        {
+            match inst.native.get() {
+                Some(Object::Tuple(t)) => t.to_vec(),
+                _ => unreachable!("matched above"),
+            }
+        }
         Some(Object::Instance(inst)) => {
             let d = inst.dict_cell().borrow();
             let keys = crate::stdlib::os::static_name_keys(&STRUCT_TIME_FIELDS);
@@ -739,11 +800,12 @@ fn gettmarg(arg: Option<&Object>, func: &str) -> Result<TmFields, RuntimeError> 
     let (zone, gmtoff) = match arg {
         Some(Object::Instance(inst)) => {
             let d = inst.dict_cell().borrow();
-            let zone = match d.get(&crate::stdlib::os::static_name_key("tm_zone")) {
+            let keys = struct_time_keys();
+            let zone = match d.get(&keys[10]) {
                 Some(z @ (Object::Str(_) | Object::WStr(_))) => Some(z.to_str()),
                 _ => None,
             };
-            let gmtoff = match d.get(&crate::stdlib::os::static_name_key("tm_gmtoff")) {
+            let gmtoff = match d.get(&keys[9]) {
                 Some(Object::Int(v)) => Some(*v),
                 _ => None,
             };
@@ -1209,25 +1271,26 @@ fn time_localtime(args: &[Object]) -> Result<Object, RuntimeError> {
             ));
         }
         let zone = if tm.tm_zone.is_null() {
-            String::new()
+            zone_str(b"")
         } else {
-            unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
-                .to_string_lossy()
-                .into_owned()
+            zone_str(unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_bytes())
         };
-        let base = make_struct_time(vec![
-            Object::Int(i64::from(tm.tm_year) + 1900),
-            Object::Int(i64::from(tm.tm_mon) + 1),
-            Object::Int(i64::from(tm.tm_mday)),
-            Object::Int(i64::from(tm.tm_hour)),
-            Object::Int(i64::from(tm.tm_min)),
-            Object::Int(i64::from(tm.tm_sec)),
-            // C `tm_wday` is days-since-Sunday; Python wants days-since-Monday.
-            Object::Int(i64::from((tm.tm_wday + 6) % 7)),
-            Object::Int(i64::from(tm.tm_yday) + 1),
-            Object::Int(i64::from(tm.tm_isdst)),
-        ]);
-        Ok(with_tz_extras(base, tm.tm_gmtoff as i64, &zone))
+        Ok(make_struct_time_tz(
+            vec![
+                Object::Int(i64::from(tm.tm_year) + 1900),
+                Object::Int(i64::from(tm.tm_mon) + 1),
+                Object::Int(i64::from(tm.tm_mday)),
+                Object::Int(i64::from(tm.tm_hour)),
+                Object::Int(i64::from(tm.tm_min)),
+                Object::Int(i64::from(tm.tm_sec)),
+                // C `tm_wday` is days-since-Sunday; Python wants days-since-Monday.
+                Object::Int(i64::from((tm.tm_wday + 6) % 7)),
+                Object::Int(i64::from(tm.tm_yday) + 1),
+                Object::Int(i64::from(tm.tm_isdst)),
+            ],
+            tm.tm_gmtoff as i64,
+            zone,
+        ))
     }
     #[cfg(not(unix))]
     {
