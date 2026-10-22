@@ -11880,9 +11880,12 @@ unsafe fn call_dyn_impl(
     }
     // A keyword call of a warm pure leaf evaluates frameless on its
     // marshaled values (no Python runs, so nothing needs revalidating).
+    // It counts against the native driver as an interpreter call does:
+    // tier-1 evaluates the same leaf in place, without the marshaling.
     if kwc > 0 {
         // SAFETY: per the function contract — same live buffers.
         if let Some(v) = unsafe { dyn_kw_pure_leaf(jf, ctx, interp, &callee, argc, kwc, names) } {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
             return dyn_leaf_result(jf, ctx, v, int_result);
         }
     }
@@ -11900,13 +11903,15 @@ unsafe fn call_dyn_impl(
             // SAFETY: as above.
             return unsafe { dyn_call_result(jf, ctx, Ok(v), false, false, int_result) };
         }
-        // Not charged against the native driver: the interpreter's own
-        // `CALL_KW` binds through this same permutation and activation,
-        // so tier-1 would not run the call any cheaper.
+        // Charged against the native driver, as a positional generic call
+        // is: the interpreter's own `CALL_KW` binds through this same
+        // permutation into an inline activation, without the activation
+        // shell, the guard revalidation and the pin traffic.
+        note_generic_dyn_call(ctx);
         ctx.dirty = true;
         let called = call_with_activation_shell(interp, ctx, jf, |i| i.run_py_bound(&f, locals));
         // SAFETY: as above.
-        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
+        return unsafe { dyn_call_result(jf, ctx, called, false, true, int_result) };
     }
     // A keyword call of any other plain function (or a bound method over
     // one) binds by name, as the interpreter's keyword calls do: no name
@@ -11919,13 +11924,14 @@ unsafe fn call_dyn_impl(
         let Object::Tuple(name_items) = &names_obj else {
             unreachable!("checked by dyn_kw_named_operands")
         };
-        // (Not charged, as above: tier-1 binds the same way.)
+        // (Charged, as above: tier-1 binds the same way, inline.)
+        note_generic_dyn_call(ctx);
         ctx.dirty = true;
         let called = call_with_activation_shell(interp, ctx, jf, |i| {
             i.call_python_kw_names(&f, args, name_items, kwvals)
         });
         // SAFETY: as above.
-        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
+        return unsafe { dyn_call_result(jf, ctx, called, false, true, int_result) };
     }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
@@ -11999,9 +12005,9 @@ unsafe fn call_dyn_impl(
         }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
-    // WS1's dirtiness discipline). A keyword call pays the generic
-    // binder in tier-1 too, so only positional calls count against the
-    // native driver.
+    // WS1's dirtiness discipline). A keyword call that gets here (of a
+    // native callee, mostly) pays the generic binder in tier-1 too, so
+    // only positional calls count against the native driver.
     let charged = kwc == 0;
     if charged {
         note_generic_dyn_call(ctx);
