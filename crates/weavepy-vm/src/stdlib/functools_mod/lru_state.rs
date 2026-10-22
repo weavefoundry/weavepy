@@ -5,9 +5,10 @@
 //!
 //! The words live in a `bytearray` in one of the wrapper's slots, so
 //! neither the object enum nor every instance needs a native storage
-//! variant. Python reaches the buffer only through `gc.get_referents`,
-//! and every access is bounds-checked: a tampered buffer reads as
-//! inconsistent, never as unsound. The cache's lock (its dictionary's
+//! variant. Python reaches the buffer only through `gc.get_referents` (or
+//! WeavePy's private `_functools._lru_private`), and every access is
+//! bounds-checked: a tampered buffer reads as inconsistent, never as
+//! unsound. The cache's lock (its dictionary's
 //! cell) also serializes these words, and the two stay borrowed together
 //! while either changes.
 

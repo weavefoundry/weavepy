@@ -385,13 +385,18 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 // (CPython keeps it in the C struct): `update_wrapper` copies a cached
 // function's `__dict__` onto the functions that wrap it, so state there
 // would travel with it, and replacing `__wrapped__` mustn't change what
-// the wrapper calls. A bounded cache whose keys all compare natively (an
-// exact `int` or `str`, or a tuple of them) keeps the recency of its
-// entries in links by entry position (see [`lru_state`]): a hit is one
-// probe and one relink, and a full cache's miss replaces its oldest entry
-// in place. The first key whose comparison can run Python moves the cache
-// to the ordered-dictionary fallback for good, where a hit moves its
-// entry to the end with no borrow held across the comparisons.
+// the wrapper calls. A bounded cache whose keys all compare natively
+// (`None`, `bool`, `int`, `float`, `str`, and tuples of them) keeps the
+// recency of its entries in links by entry position (see [`lru_state`]):
+// a hit is one probe and one relink, and a full cache's miss replaces its
+// oldest entry in place. The first key whose comparison can run Python
+// moves the cache to the ordered-dictionary fallback for good, where a hit
+// moves its entry to the end with no borrow held across the comparisons.
+//
+// The core loop and compiled code settle most calls before the native
+// `__call__` (see [`lru_probe`]): a hit in place, and a miss by running
+// the wrapped function in the wrapper's place, as an ordinary call whose
+// activation stores the result when it returns.
 // ---------------------------------------------------------------------------
 
 /// Sentinel string separating positional from keyword parts of a cache key
@@ -1017,7 +1022,8 @@ pub(crate) enum LruProbe {
     /// store its result awaits. The caller runs the function in the
     /// wrapper's place and stores the result when it returns
     /// ([`lru_store_returned`]), or uncounts the miss
-    /// ([`LruPending::uncount_miss`]) if it doesn't make the call.
+    /// ([`lru_uncount_miss`], [`LruPending::release_wrapper`]) if it
+    /// doesn't make the call.
     Miss(Object, LruPending),
 }
 
