@@ -7053,6 +7053,7 @@ fn call_with_activation_shell<T>(
         has_materialized: std::sync::atomic::AtomicBool::new(false),
         materialized: GilRefCell::new(None),
         tb_refs: std::sync::atomic::AtomicU32::new(0),
+        departed: crate::object::Departed::default(),
     });
     interp.frame_stack.borrow_mut().push(shell.clone());
     // Inspection of the shell's frame finds this activation's locals.
