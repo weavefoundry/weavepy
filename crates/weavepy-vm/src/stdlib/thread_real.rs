@@ -374,43 +374,29 @@ fn keeper<T: Send + Sync + 'static>(name: &'static str, lock: Arc<T>) -> Object 
     }))
 }
 
-/// A lock instance's native lock, kept alive by the keeper that owns it.
-struct Held<T: 'static> {
-    _keeper: Rc<BuiltinFn>,
-    lock: *const T,
-}
-
-impl<T> std::ops::Deref for Held<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        // SAFETY: the keeper owns the `Arc` this points into (see `keeper`),
-        // and `self` holds the keeper.
-        unsafe { &*self.lock }
-    }
-}
-
 /// The native lock of `obj`, an instance whose hidden slot holds a keeper
-/// named `name`.
-fn held<T: 'static>(obj: &Object, name: &'static str) -> Option<Held<T>> {
+/// named `name`. The instance never lets go of its keeper (no attribute
+/// access reaches the slot), so the lock lives as long as `obj` does.
+fn held<'a, T: 'static>(obj: &'a Object, name: &'static str) -> Option<&'a T> {
     let Object::Instance(inst) = obj else {
         return None;
     };
-    let pick = |s: &crate::types::SlotStorage| match s.get_hinted(0, LOCK_SLOT) {
-        Some(Object::Builtin(b)) if std::ptr::eq(b.name, name) => Some(b.clone()),
+    let addr = |s: &crate::types::SlotStorage| match s.get_hinted(0, LOCK_SLOT) {
+        Some(Object::Builtin(b)) if std::ptr::eq(b.name, name) => match (b.call)(&[]) {
+            Ok(Object::Int(addr)) => Some(addr as usize),
+            _ => None,
+        },
         _ => None,
     };
-    // SAFETY: a read of one slot that runs no code.
-    let keeper = match unsafe { inst.slots.peek() } {
-        Some(slots) => pick(slots),
-        None => pick(&*inst.slots.try_borrow().ok()?),
+    // SAFETY: a read of one slot that runs no code (the keeper's call
+    // only answers an address).
+    let addr = match unsafe { inst.slots.peek() } {
+        Some(slots) => addr(slots),
+        None => addr(&*inst.slots.try_borrow().ok()?),
     }?;
-    let Ok(Object::Int(addr)) = (keeper.call)(&[]) else {
-        return None;
-    };
-    Some(Held {
-        _keeper: keeper,
-        lock: addr as usize as *const T,
-    })
+    // SAFETY: the keeper, which `obj` holds, owns the `Arc` this points
+    // into (see `keeper`).
+    Some(unsafe { &*(addr as *const T) })
 }
 
 /// A `TypeError` for a lock method called on something else.
@@ -427,14 +413,14 @@ fn not_a_lock(method: &str, cls: &str, recv: Option<&Object>) -> RuntimeError {
 }
 
 /// The receiver's native lock, for `lock` method `method`.
-fn lock_of(args: &[Object], method: &str) -> Result<Held<RealLock>, RuntimeError> {
+fn lock_of<'a>(args: &'a [Object], method: &str) -> Result<&'a RealLock, RuntimeError> {
     args.first()
         .and_then(|o| held(o, LOCK_KEEPER))
         .ok_or_else(|| not_a_lock(method, "lock", args.first()))
 }
 
 /// The receiver's native lock, for `RLock` method `method`.
-fn rlock_of(args: &[Object], method: &str) -> Result<Held<RealRLock>, RuntimeError> {
+fn rlock_of<'a>(args: &'a [Object], method: &str) -> Result<&'a RealRLock, RuntimeError> {
     args.first()
         .and_then(|o| held(o, RLOCK_KEEPER))
         .ok_or_else(|| not_a_lock(method, "RLock", args.first()))
@@ -480,7 +466,7 @@ fn lock_acquire(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     // `_delete()` to release.
     match timeout {
         Some(Duration::ZERO) => Ok(Object::Bool(lock.try_acquire(me))),
-        timeout => Ok(Object::Bool(lock_acquire_interruptible(&lock, me, timeout)?)),
+        timeout => Ok(Object::Bool(lock_acquire_interruptible(lock, me, timeout)?)),
     }
 }
 
@@ -510,7 +496,7 @@ fn lock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
     // drop it to block on a foreign owner. Blocking while *holding* the
     // GIL would deadlock the whole interpreter (the owner that would
     // release the lock could never run).
-    lock_acquire_blocking(&lock, crate::gil::current_thread_id());
+    lock_acquire_blocking(lock, crate::gil::current_thread_id());
     Ok(Object::Bool(true))
 }
 
@@ -615,7 +601,7 @@ fn rlock_acquire(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // absolutely does.
     match timeout {
         Some(Duration::ZERO) => Ok(Object::Bool(lock.try_acquire(me))),
-        timeout => Ok(Object::Bool(rlock_acquire_interruptible(&lock, me, timeout)?)),
+        timeout => Ok(Object::Bool(rlock_acquire_interruptible(lock, me, timeout)?)),
     }
 }
 
@@ -674,7 +660,7 @@ fn rlock_acquire_restore(args: &[Object]) -> Result<Object, RuntimeError> {
     if count >= 1 {
         // First reacquire may block on a foreign owner (drop GIL); the
         // remaining holds are reentrant and cheap.
-        rlock_acquire_blocking(&lock, me);
+        rlock_acquire_blocking(lock, me);
         for _ in 1..count {
             lock.acquire(me);
         }
@@ -700,7 +686,7 @@ fn rlock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
     // while holding the GIL deadlocks the interpreter. A reentrant
     // re-acquire by the owner is cheap, but the foreign-owner case must
     // drop the GIL.
-    rlock_acquire_blocking(&lock, crate::gil::current_thread_id());
+    rlock_acquire_blocking(lock, crate::gil::current_thread_id());
     Ok(Object::Bool(true))
 }
 
