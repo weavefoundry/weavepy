@@ -138,7 +138,7 @@ const CODE_OK: u8 = 2;
 /// Fast steps once the body is compiled (see [`op_native`]).
 const CODE_NATIVE: u8 = 3;
 /// The verdict's bits in the table's byte; the prologue's verdict (see
-/// [`prologue`]) sits above them.
+/// [`verdicts`]) sits above them.
 const CODE_MASK: u8 = 0x0f;
 const PROLOGUE_SHIFT: u32 = 4;
 
@@ -150,32 +150,24 @@ const PROLOGUE_SHIFT: u32 = 4;
 /// them, and the general loop runs them once.
 #[inline(always)]
 fn code_ok(code: &CodeObject) -> u8 {
-    use std::sync::atomic::Ordering;
-    let Some(ext) = crate::code_vm_ext(code) else {
-        return CODE_NO;
-    };
-    match ext.gen_fast.load(Ordering::Relaxed) {
-        0 => code_ok_scan(code, ext) & CODE_MASK,
-        v => v & CODE_MASK,
+    match crate::code_vm_ext(code) {
+        Some(ext) => verdicts(code, ext) & CODE_MASK,
+        None => CODE_NO,
     }
 }
 
-/// [`code_ok`]'s verdict for a body's first resume, everything it can
-/// reach before its first `yield`: [`CODE_OK`] when a fast step runs all
-/// of it, [`CODE_NATIVE`] when only its native form does, [`CODE_NO`]
-/// when the step would stop partway (the general loop runs a prologue
-/// with a call, say, once).
+/// [`code_ok`]'s verdict for `code` (its extension table `ext`), with the
+/// verdict for a body's first resume above it: everything that resume can
+/// reach before its first `yield` is [`CODE_OK`] when a fast step runs all
+/// of it, [`CODE_NATIVE`] when only its native form does, [`CODE_NO`] when
+/// the step would stop partway (the general loop runs a prologue with a
+/// call, say, once).
 #[inline(always)]
-fn prologue(code: &CodeObject) -> u8 {
-    use std::sync::atomic::Ordering;
-    let Some(ext) = crate::code_vm_ext(code) else {
-        return CODE_NO;
-    };
-    let v = match ext.gen_fast.load(Ordering::Relaxed) {
+fn verdicts(code: &CodeObject, ext: &crate::CodeConstObjects) -> u8 {
+    match ext.gen_fast.load(std::sync::atomic::Ordering::Relaxed) {
         0 => code_ok_scan(code, ext),
         v => v,
-    };
-    v >> PROLOGUE_SHIFT
+    }
 }
 
 /// Whether a fast step may run `g`'s body at all (see [`code_ok`]).
@@ -413,40 +405,42 @@ fn scalar_truth(v: &Object) -> Option<bool> {
 }
 
 impl Interpreter {
-    /// Whether `frame`, a suspended generator's, may take fast steps: a
-    /// fast-step body the general machinery holds no extra state for (no
-    /// Python-visible frame, no saved exception state, no parked native
-    /// activation).
+    /// Whether `frame`, a suspended generator's (whose code's extension
+    /// table is `ext`), may take fast steps: a body a fast step runs (see
+    /// [`code_ok`]; with `first`, from its start: see [`verdicts`]) that
+    /// the general machinery holds no extra state for (no Python-visible
+    /// frame, no saved exception state, no parked native activation).
     #[inline(always)]
-    pub(crate) fn gen_fast_frame_ok(frame: &Frame) -> bool {
-        frame.py_frame.is_none()
-            && !frame.has_saved_exc_info()
-            && frame.pc != 0
-            && !frame.shell_cache.as_ref().is_some_and(|c| {
-                c.has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            })
-            && {
-                #[cfg(feature = "jit")]
-                {
-                    frame.parked_native.is_none()
-                }
-                #[cfg(not(feature = "jit"))]
-                {
-                    true
-                }
+    fn gen_fast_ok(frame: &Frame, ext: &crate::CodeConstObjects, first: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        let v = verdicts(&frame.code, ext);
+        let steady = v & CODE_MASK;
+        let start = v >> PROLOGUE_SHIFT;
+        if steady == CODE_NO
+            || (first && start == CODE_NO)
+            || frame.py_frame.is_some()
+            || frame.has_saved_exc_info()
+            || frame.pc == 0
+            || frame
+                .shell_cache
+                .as_ref()
+                .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
+        {
+            return false;
+        }
+        #[cfg(feature = "jit")]
+        {
+            if frame.parked_native.is_some() {
+                return false;
             }
-            && match code_ok(&frame.code) {
-                CODE_OK => true,
-                // A body whose steady state needs its native form, compiled.
-                #[cfg(feature = "jit")]
-                CODE_NATIVE => crate::code_vm_ext(&frame.code).is_some_and(|ext| {
-                    // SAFETY: a length read with nothing running.
-                    let n = frame.locals.len();
-                    ext.frame_jit.get(n).is_some()
-                }),
-                _ => false,
+            // A body that needs its native form, compiled.
+            if steady == CODE_NATIVE || (first && start == CODE_NATIVE) {
+                // SAFETY: a length read with nothing running.
+                let n = frame.locals.len();
+                return ext.frame_jit.get(n).is_some();
             }
+        }
+        true
     }
 
     /// Run `frame` from its pc to its next `yield` (see the module docs).
@@ -460,11 +454,14 @@ impl Interpreter {
     /// With `fold` (a draining consumer's sink, top level only), a yield
     /// the sink takes resumes the body at once with `None` sent. `dead` is
     /// the thread's queued-finalizer flag (`gc_trace::maybe_dead_flag`).
-    /// With `finish`, the step also runs a `return`, which ends it. The
-    /// native code isn't entered at `handed_at` (where it just stopped).
+    /// With `finish`, the step also runs a `return`, which ends it. `ext`
+    /// is the extension table of the frame's code. The native code isn't
+    /// entered at `handed_at` (where it just stopped).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn gen_fast_step(
         &mut self,
         frame: &mut Frame,
+        ext: &crate::CodeConstObjects,
         snap_gen: u64,
         depth: u8,
         fold: Option<FoldSink>,
@@ -479,9 +476,6 @@ impl Interpreter {
         // frame holds it, and nothing here replaces it).
         let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
         let (instrs, ninstrs) = (code.instructions.as_ptr(), code.instructions.len());
-        let Some(ext) = crate::code_vm_ext(code) else {
-            return GenStep::Bail;
-        };
         let cbase = ext.objects.as_ptr();
         // SAFETY: no guard is live on the locals (`peek_mut` checks), and
         // nothing below runs code that could reach them.
@@ -853,7 +847,7 @@ impl Interpreter {
         }
     }
 
-    /// A resume of a compiled body by its native code alone (see
+    /// A resume of a compiled body by its native code `native` alone (see
     /// `frame_jit`), without the general loop's setup: `Ok` with the value
     /// the body yielded, the frame suspended past the yield; `Err` with
     /// the pc the native code stopped at (`usize::MAX` if it didn't run),
@@ -864,6 +858,7 @@ impl Interpreter {
     fn gen_native_yield(
         &mut self,
         frame: &mut Frame,
+        native: &crate::frame_jit::Native,
         snap_gen: u64,
         depth: u8,
         dead: *const std::cell::Cell<bool>,
@@ -872,9 +867,6 @@ impl Interpreter {
         // SAFETY: as in `gen_fast_step`.
         let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
         let pc = frame.pc as usize;
-        let Some(ext) = crate::code_vm_ext(code) else {
-            return Err(usize::MAX);
-        };
         // SAFETY: as in `gen_fast_step`.
         let Some(locals) = (unsafe { frame.locals.peek_mut() }) else {
             return Err(usize::MAX);
@@ -882,9 +874,6 @@ impl Interpreter {
         if locals.len() < code.varnames.len() || pc >= code.instructions.len() {
             return Err(usize::MAX);
         }
-        let Some(native) = ext.frame_jit.get(locals.len()) else {
-            return Err(usize::MAX);
-        };
         let stack = &mut frame.stack;
         // (A stack short of the room `gen_fast_step` makes takes that path.)
         let deepest = code
@@ -1043,13 +1032,17 @@ impl Interpreter {
         snap_gen: u64,
         fold: Option<FoldSink>,
     ) -> GenStep {
-        if !Self::gen_fast_frame_ok(frame)
-            || (frame.gen_first_resume && !Self::gen_fast_prologue_ok(frame))
-        {
+        // SAFETY: the frame's code outlives the step (as in `gen_fast_step`).
+        let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
+        let Some(ext) = crate::code_vm_ext(code) else {
+            return GenStep::Bail;
+        };
+        if !Self::gen_fast_ok(frame, ext, frame.gen_first_resume) {
             return GenStep::Bail;
         }
         self.gen_fast_step(
             frame,
+            ext,
             snap_gen,
             0,
             fold,
@@ -1059,26 +1052,10 @@ impl Interpreter {
         )
     }
 
-    /// Whether a fresh generator's first resume (on `frame`) can take a
-    /// fast step to its first yield (see [`prologue`]): one that would
-    /// stop partway leaves the whole resume to the general loop.
-    #[inline(always)]
-    fn gen_fast_prologue_ok(frame: &Frame) -> bool {
-        match prologue(&frame.code) {
-            CODE_OK => true,
-            #[cfg(feature = "jit")]
-            CODE_NATIVE => crate::code_vm_ext(&frame.code).is_some_and(|ext| {
-                // SAFETY: a length read with nothing running.
-                let n = frame.locals.len();
-                ext.frame_jit.get(n).is_some()
-            }),
-            _ => false,
-        }
-    }
-
     /// `next(g)` by fast step (see the module docs): resumes `g` with
     /// `None` and runs it to its next yield when both it and its body
     /// allow. `depth` counts the fast steps this one is nested in.
+    #[inline(always)]
     pub(crate) fn gen_fast_next(
         &mut self,
         g: &Rc<PyGenerator>,
@@ -1086,13 +1063,50 @@ impl Interpreter {
         depth: u8,
         dead: *const std::cell::Cell<bool>,
     ) -> GenNext {
+        self.gen_fast_send(g, Object::None, snap_gen, depth, dead)
+    }
+
+    /// `g.send(sent)` by fast step: [`Self::gen_fast_next`] with `sent`
+    /// the resume's value. A fresh generator, or one an earlier step left
+    /// partway, takes only `None` (the general resume raises for, or
+    /// continues without, any other).
+    #[inline(always)]
+    pub(crate) fn gen_fast_send(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        sent: Object,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> GenNext {
         // A level of a collapsed `yield from` chain is the inline resume's
         // (which resumes a parked chain without settling it), and a body no
-        // fast step runs declines at once (its code's verdict is cached:
-        // see `code_ok`).
-        if g.chain.get() != 0 || matches!(&g.code, Object::Code(code) if code_ok(code) == CODE_NO) {
+        // fast step runs declines at once, in line (its code's verdict is
+        // cached: see `code_ok`). (`gi_code` is the frame's code.)
+        let Object::Code(code) = &g.code else {
+            return GenNext::Declined;
+        };
+        let Some(ext) = crate::code_vm_ext(code) else {
+            return GenNext::Declined;
+        };
+        if g.chain.get() != 0 || verdicts(code, ext) & CODE_MASK == CODE_NO {
             return GenNext::Declined;
         }
+        self.gen_fast_resume(g, ext, sent, snap_gen, depth, dead)
+    }
+
+    /// [`Self::gen_fast_send`] once the body's verdict admits fast steps
+    /// (`ext` is its code's extension table).
+    #[allow(clippy::too_many_arguments)]
+    fn gen_fast_resume(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        ext: &crate::CodeConstObjects,
+        sent: Object,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> GenNext {
         if depth > MAX_DEPTH
             || crate::recursion::current_depth() + usize::from(depth) + 2
                 >= crate::recursion::recursion_limit()
@@ -1110,12 +1124,15 @@ impl Interpreter {
             return GenNext::Declined;
         };
         let first_resume = matches!(*state, GeneratorState::Created(_));
-        if !Self::gen_fast_frame_ok(boxed) || (first_resume && !Self::gen_fast_prologue_ok(boxed)) {
+        if !Self::gen_fast_ok(boxed, ext, first_resume) {
             return GenNext::Declined;
         }
         // A body an earlier fast step left partway (at the eval breaker,
         // say) continues where it stopped, with no value sent.
         let partial = boxed.sent_consumed;
+        if (first_resume || partial) && !matches!(sent, Object::None) {
+            return GenNext::Declined;
+        }
         let prev = std::mem::replace(state, GeneratorState::Running);
         let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) = prev
         else {
@@ -1127,18 +1144,25 @@ impl Interpreter {
         if partial {
             frame.sent_consumed = false;
         } else {
-            frame.stack.push_fast(Object::None);
+            frame.stack.push_fast(sent);
         }
         // (A partial body may have stopped with nothing on its stack.)
         debug_assert!(partial || !frame.stack.is_empty());
         // A compiled body's resume usually runs natively to its next yield.
         #[cfg(feature = "jit")]
-        let handed = match self.gen_native_yield(frame, snap_gen, depth, dead) {
-            Ok(v) => {
-                Self::park_stepped(g, boxed);
-                return GenNext::Yielded(v);
+        let handed = {
+            // SAFETY: a length read with nothing running.
+            let n = frame.locals.len();
+            match ext.frame_jit.get(n) {
+                Some(native) => match self.gen_native_yield(frame, native, snap_gen, depth, dead) {
+                    Ok(v) => {
+                        Self::park_stepped(g, boxed);
+                        return GenNext::Yielded(v);
+                    }
+                    Err(pc) => pc,
+                },
+                None => usize::MAX,
             }
-            Err(pc) => pc,
         };
         #[cfg(not(feature = "jit"))]
         let handed = usize::MAX;
@@ -1146,21 +1170,17 @@ impl Interpreter {
         let step = if handed == MARKED_AT {
             GenStep::Bail
         } else {
-            self.gen_fast_step(frame, snap_gen, depth, None, dead, true, handed)
+            self.gen_fast_step(frame, ext, snap_gen, depth, None, dead, true, handed)
         };
         #[cfg(not(feature = "jit"))]
-        let step = self.gen_fast_step(frame, snap_gen, depth, None, dead, true, handed);
+        let step = self.gen_fast_step(frame, ext, snap_gen, depth, None, dead, true, handed);
         let out = match step {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             // The general epilogue of a return (`inline_gen_finish`): the
             // generator finishes and its frame is released (anything that
             // dies with it queues its finalizer).
             GenStep::Returned(v) => {
-                Self::finish_running_gen(g);
-                let frame: &mut Frame = &mut boxed;
-                self.recycle_frame_allocs(frame);
-                Self::release_finished_gen(g);
-                self.recycle_gen_box(boxed);
+                self.retire_gen(g, boxed);
                 return GenNext::Exhausted(v);
             }
             GenStep::Bail if frame.pc == start => {

@@ -535,7 +535,7 @@ fn is_finalized(args: &[Object]) -> Result<Object, RuntimeError> {
     let target = args
         .first()
         .ok_or_else(|| type_error("is_finalized() requires 1 argument"))?;
-    Ok(Object::Bool(gc_trace::was_finalized(id_of(target))))
+    Ok(Object::Bool(gc_trace::was_finalized(target)))
 }
 
 fn set_debug(args: &[Object]) -> Result<Object, RuntimeError> {

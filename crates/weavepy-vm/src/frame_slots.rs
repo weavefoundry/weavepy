@@ -285,13 +285,6 @@ impl FrameLocals {
     }
 
     #[inline]
-    pub(crate) fn try_borrow(
-        &self,
-    ) -> Result<crate::sync::Ref<'_, Vec<Object>>, crate::sync::BorrowError> {
-        self.rc.try_borrow()
-    }
-
-    #[inline]
     pub(crate) fn try_borrow_mut(
         &self,
     ) -> Result<crate::sync::RefMut<'_, Vec<Object>>, crate::sync::BorrowMutError> {
