@@ -9202,22 +9202,34 @@ impl Interpreter {
         args: impl ExactSizeIterator<Item = Object>,
         v: &mut Vec<Object>,
     ) {
-        let mut all = std::iter::once(inst).chain(args);
-        let given = all.size_hint().0;
-        let direct = given.min(code.arg_count as usize);
-        v.extend(all.by_ref().take(direct));
+        let mut args = args;
+        let direct = (args.len() + 1).min(code.arg_count as usize);
+        // (With no positional parameters the instance itself is surplus.)
+        let mut surplus_inst = None;
+        if direct == 0 {
+            surplus_inst = Some(inst);
+        } else {
+            v.push(inst);
+            v.extend(args.by_ref().take(direct - 1));
+        }
         if missing > 0 {
             v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
         if !Self::has_extended_params(code) {
             return;
         }
-        for d in Self::kwonly_defaults(f, code) {
-            v.push(d.cloned().unwrap_or(Object::Unbound));
+        if code.kwonly_count != 0 {
+            for d in Self::kwonly_defaults(f, code) {
+                v.push(d.cloned().unwrap_or(Object::Unbound));
+            }
         }
         if code.has_varargs {
-            let rest: Vec<Object> = all.collect();
-            v.push(Object::new_tuple(rest));
+            v.push(match surplus_inst {
+                Some(inst) => Object::new_tuple(std::iter::once(inst).chain(args).collect()),
+                // The interned empty tuple.
+                None if args.len() == 0 => Object::new_tuple(Vec::new()),
+                None => Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(args)),
+            });
         }
         if code.has_varkeywords {
             v.push(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
@@ -58782,6 +58794,17 @@ impl Interpreter {
         if kwargs.is_empty() {
             if let Some(v) = self.call_pure_leaf(f, args) {
                 return Ok(v);
+            }
+            // The exact positional shape (`call_python_owned`'s first):
+            // the fast locals straight from the arguments, in a pooled
+            // vector.
+            let code = f.code();
+            if args.len() == code.arg_count as usize && !Self::has_extended_params(&code) {
+                let mut positional: Vec<Object> = self.pooled_scratch();
+                positional.reserve(code.varnames.len());
+                positional.extend_from_slice(args);
+                positional.resize(code.varnames.len(), Object::Unbound);
+                return self.call_python_bound(f, code, positional);
             }
         }
         self.call_python_owned(f, args.to_vec(), kwargs.to_vec())
