@@ -334,6 +334,15 @@ impl Registry {
         &self.slab[slot as usize]
     }
 
+    /// [`Self::entry`] of a slot a generation list holds.
+    #[inline(always)]
+    fn list_entry(&self, slot: u32) -> &Entry {
+        debug_assert!((slot as usize) < self.slab.len());
+        // SAFETY: every listed slot was handed out by `insert`, which
+        // indexes the slab, and the slab never shrinks.
+        unsafe { self.slab.get_unchecked(slot as usize) }
+    }
+
     #[inline]
     fn list_mut(&mut self, gen: u8) -> &mut Vec<u32> {
         if gen == GEN_FROZEN {
@@ -576,11 +585,6 @@ pub struct GcState {
     pub tracked_version: AtomicUsize,
     /// Total tracked-object population (entries, live or not yet pruned).
     pub tracked_count: AtomicUsize,
-    /// Ids whose `__del__` has been run (or queued) by a finalizing
-    /// collection or teardown. Persists past the point where the handle
-    /// leaves the tracked set so `gc.is_finalized()` still answers `True`
-    /// for an object its finalizer resurrected (PEP 442 / `test_is_finalized`).
-    finalized_ids: RefCell<crate::fasthash::FxHashSet<ObjectId>>,
     /// Where the next prune of the older generations resumes.
     old_prune_cursor: AtomicUsize,
 }
@@ -617,7 +621,6 @@ impl GcState {
             enabled: AtomicBool::new(true),
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
-            finalized_ids: RefCell::new(crate::fasthash::FxHashSet::default()),
             old_prune_cursor: AtomicUsize::new(0),
         }
     }
@@ -653,32 +656,17 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
-            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalized_ids));
             // A peer may have vanished mid-collection with this set.
             (*this).collecting.store(false, Ordering::Release);
         }
     }
 
-    /// Record that `id`'s finalizer has been run (or queued). Survives the
-    /// handle's removal from the tracked set so `gc.is_finalized` keeps
-    /// answering `True` for a resurrected object.
-    pub fn note_finalized(&self, id: ObjectId) {
-        self.finalized_ids.borrow_mut().insert(id);
-    }
-
-    /// Has `id`'s finalizer already run? Backs `gc.is_finalized`.
-    pub fn was_finalized(&self, id: ObjectId) -> bool {
-        self.finalized_ids.borrow().contains(&id)
-    }
-
-    /// Record that `id`'s finalizer has finished running: set `finalized`,
-    /// clear the `finalize_queued` deferral flag, and remember it for
-    /// `gc.is_finalized`. Called by the interpreter the moment a queued
-    /// `__del__` returns, so the next collection treats a non-resurrected
-    /// object as plain dead garbage (and a resurrected one is never
-    /// re-finalized).
+    /// Record that `obj`'s finalizer has finished running: set `finalized`
+    /// and clear the `finalize_queued` deferral flag. Called by the
+    /// interpreter the moment a queued `__del__` returns, so the next
+    /// collection treats a non-resurrected object as plain dead garbage
+    /// (and a resurrected one is never re-finalized).
     pub fn complete_finalizer(&self, obj: &Object) {
-        self.note_finalized(id_of(obj));
         let reg = self.reg.borrow();
         if let Some(slot) = reg.slot_of(obj, &self.tracked_filter) {
             let e = reg.entry(slot);
@@ -770,13 +758,6 @@ impl GcState {
             young.push(crate::Rc::downgrade(obj));
             young.len() >= YOUNG_CAP
         };
-        // As in `track_now`: an id recycled from a finalized object starts
-        // un-finalized (a finalizer that runs from here on is recorded).
-        // SAFETY: a read that runs no code.
-        if unsafe { self.finalized_ids.peek() }.is_none_or(|f| !f.is_empty()) {
-            let id = crate::Rc::as_ptr(obj) as usize as ObjectId;
-            self.finalized_ids.borrow_mut().remove(&id);
-        }
         self.note_gen0_alloc();
         if over {
             self.flush_young();
@@ -792,7 +773,7 @@ impl GcState {
                 for w in fns {
                     if let Some(f) = w.upgrade() {
                         self.track(&Object::Dict(f.globals.clone()));
-                        self.register(&Object::Function(f), false);
+                        self.register(&Object::Function(f));
                     }
                 }
             }
@@ -811,7 +792,7 @@ impl GcState {
                                 Object::AsyncGenerator(g)
                             }
                         };
-                        self.register(&obj, false);
+                        self.register(&obj);
                     }
                 }
             }
@@ -1008,7 +989,7 @@ impl GcState {
                     continue;
                 }
                 // SAFETY: alive (checked above, and nothing has run since).
-                unsafe { self.enter(&mut reg, weak, true) };
+                unsafe { self.enter(&mut reg, weak) };
                 added += 1;
             }
         }
@@ -1030,16 +1011,14 @@ impl GcState {
     /// collector unconditionally. For objects the caller has already decided
     /// must be tracked (a promoted deferral, `gc.is_tracked`, `gc.get_objects`).
     pub fn track_now(&self, obj: &Object) {
-        if self.register(obj, true) {
+        if self.register(obj) {
             self.note_gen0_alloc();
         }
     }
 
     /// Enter `obj` in the registry's generation 0 (`false`: it was already
-    /// there, or has no heap allocation of its own). A `fresh` object's id
-    /// may be a finalized one's, recycled; a young instance's own
-    /// finalizer may already have run, and its entry says so.
-    fn register(&self, obj: &Object, fresh: bool) -> bool {
+    /// there, or has no heap allocation of its own).
+    fn register(&self, obj: &Object) -> bool {
         {
             let mut reg = self.reg.borrow_mut();
             // An entry whose object died can't sit at this address: its
@@ -1052,7 +1031,7 @@ impl GcState {
                 return false;
             };
             // SAFETY: `obj` is alive.
-            unsafe { self.enter(&mut reg, weak, fresh) };
+            unsafe { self.enter(&mut reg, weak) };
         }
         serial_add(&self.tracked_count, 1);
         serial_add(&self.tracked_version, 1);
@@ -1065,37 +1044,40 @@ impl GcState {
     /// # Safety
     ///
     /// The object must be alive.
-    unsafe fn enter(&self, reg: &mut Registry, weak: WeakObject, fresh: bool) -> u32 {
+    unsafe fn enter(&self, reg: &mut Registry, weak: WeakObject) -> u32 {
         let key = weak.addr() as ObjectId;
-        // `finalized_ids` is keyed by object id (a pointer), which the
-        // allocator recycles. A freshly tracked object at a recycled
-        // address must start *un*-finalized (`test_is_finalized`). Almost
-        // always empty (only `__del__`-bearing objects ever land there).
-        let mut flags = 0;
-        // SAFETY: a read that runs no code.
-        if unsafe { self.finalized_ids.peek() }.is_none_or(|f| !f.is_empty()) {
-            if fresh {
-                self.finalized_ids.borrow_mut().remove(&key);
-            } else if self.finalized_ids.borrow().contains(&key) {
-                flags = F_FINALIZED;
-            }
-        }
         // (A pointer: the field lives in the object, not the handle, which
         // moves into the registry below.)
         // SAFETY: alive, per the caller.
         let own = unsafe { weak_intrusive_slot(&weak) }.map(std::ptr::from_ref);
-        if own.is_none() {
-            // Publish to the miss-filter *before* the insert becomes
-            // observable (the caller holds the registry borrow).
-            self.tracked_filter.insert(key);
-        }
-        // (Registered other than through `track`, which retires the
-        // deferral itself.)
-        if let WeakObject::Instance(w) = &weak {
-            // SAFETY: alive, per the caller.
-            let i = unsafe { &*w.as_ptr() };
-            if i.is_gc_deferred() {
-                i.clear_deferred_tracking();
+        // An object whose `__del__` has already run (one its finalizer
+        // resurrected) says so itself, as CPython's header bit does.
+        let mut flags = 0;
+        match &weak {
+            WeakObject::Instance(w) => {
+                // SAFETY: alive, per the caller.
+                let i = unsafe { &*w.as_ptr() };
+                if i.finalize_ran.get() {
+                    flags = F_FINALIZED;
+                }
+                // (Registered other than through `track`, which retires
+                // the deferral itself.)
+                if i.is_gc_deferred() {
+                    i.clear_deferred_tracking();
+                }
+            }
+            WeakObject::Generator(w) | WeakObject::Coroutine(w) | WeakObject::AsyncGenerator(w) => {
+                // SAFETY: alive, per the caller.
+                if unsafe { &*w.as_ptr() }.finalize_ran.get() {
+                    flags = F_FINALIZED;
+                }
+            }
+            _ => {
+                // Publish to the miss-filter *before* the insert becomes
+                // observable (the caller holds the registry borrow).
+                if own.is_none() {
+                    self.tracked_filter.insert(key);
+                }
             }
         }
         let slot = reg.insert(weak, 0, flags);
@@ -1141,7 +1123,7 @@ impl GcState {
                     }
                 };
                 if !registered {
-                    unsafe { self.enter(&mut reg, weak, false) };
+                    unsafe { self.enter(&mut reg, weak) };
                     added += 1;
                 }
             }
@@ -1160,29 +1142,47 @@ impl GcState {
     /// (a collection is releasing garbage) is left as it is; that
     /// collection prunes the entry.
     fn forget_instance(&self, slot: u32, addr: usize) {
-        let (Ok(mut reg), Ok(mut counts)) =
-            (self.reg.try_borrow_mut(), self.counts.try_borrow_mut())
-        else {
-            return;
+        // SAFETY: nothing runs code while the views live (a removal only
+        // unlinks the entry; its handle is released after).
+        let weak = match unsafe { (self.reg.peek_mut(), self.counts.peek_mut()) } {
+            (Some(reg), Some(counts)) => self.forget_instance_in(reg, counts, slot, addr),
+            // (Shared cells, or a busy registry the guards then refuse.)
+            _ => match (self.reg.try_borrow_mut(), self.counts.try_borrow_mut()) {
+                (Ok(mut reg), Ok(mut counts)) => {
+                    self.forget_instance_in(&mut reg, &mut counts, slot, addr)
+                }
+                _ => return,
+            },
         };
-        let Some(e) = reg.slab.get(slot as usize) else {
-            return;
-        };
+        if weak.is_some() {
+            serial_add(&self.tracked_count, usize::MAX);
+            serial_add(&self.tracked_version, 1);
+        }
+        drop(weak);
+    }
+
+    /// [`Self::forget_instance`] under the registry and count borrows:
+    /// the entry's handle, if it was the instance's.
+    fn forget_instance_in(
+        &self,
+        reg: &mut Registry,
+        counts: &mut [usize; N_GENERATIONS],
+        slot: u32,
+        addr: usize,
+    ) -> Option<WeakObject> {
+        let e = reg.slab.get(slot as usize)?;
         match &e.obj {
             Some(WeakObject::Instance(w)) if w.as_ptr() as usize == addr => {}
-            _ => return,
+            _ => return None,
         }
         if e.gen == GEN_FROZEN {
-            return;
+            return None;
         }
         let weak = reg.remove(slot);
         // (As `untrack_slot` accounts it.)
         counts[0] = counts[0].saturating_sub(1);
         self.sync_gen0_gauge(counts[0], None);
-        drop((reg, counts));
-        serial_add(&self.tracked_count, usize::MAX);
-        serial_add(&self.tracked_version, 1);
-        drop(weak);
+        weak
     }
 
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
@@ -1227,18 +1227,25 @@ impl GcState {
     /// a deallocation; with `young`, a dead entry's id is also searched in
     /// the young sets.
     fn untrack_slot(&self, slot: u32, id: ObjectId, young: bool) {
-        let (weak, dead) = {
-            let mut reg = self.reg.borrow_mut();
+        let remove = |reg: &mut Registry| {
             let dead = reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead);
             (reg.remove(slot), dead)
+        };
+        // SAFETY (both views): nothing runs code while they live.
+        let (weak, dead) = match unsafe { self.reg.peek_mut() } {
+            Some(reg) => remove(reg),
+            None => remove(&mut self.reg.borrow_mut()),
         };
         if young && dead {
             self.untrack_young(id);
         }
-        {
-            let mut counts = self.counts.borrow_mut();
+        let uncount = |counts: &mut [usize; N_GENERATIONS]| {
             counts[0] = counts[0].saturating_sub(1);
             self.sync_gen0_gauge(counts[0], None);
+        };
+        match unsafe { self.counts.peek_mut() } {
+            Some(counts) => uncount(counts),
+            None => uncount(&mut self.counts.borrow_mut()),
         }
         drop(weak);
         serial_add(&self.tracked_count, usize::MAX);
@@ -1295,7 +1302,12 @@ impl GcState {
         while examined < budget && i < reg.gens[gen].len() {
             examined += 1;
             let slot = reg.gens[gen][i];
-            if reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead) {
+            if reg
+                .list_entry(slot)
+                .obj
+                .as_ref()
+                .is_none_or(WeakObject::is_dead)
+            {
                 // (The swap brings the list's last member to `i`.)
                 drop(reg.remove(slot));
                 removed += 1;
@@ -1826,35 +1838,25 @@ impl GcState {
         // node per registered candidate, in list order, then one per
         // temporary), so marking what is reachable follows those instead of
         // walking every object a second time.
+        let n_cands: usize = lists.iter().map(Vec::len).sum();
         let mut found: Vec<Object> = Vec::new();
-        let mut edges: Vec<u32> = Vec::new();
-        let mut starts: Vec<u32> = Vec::new();
+        let mut edges: Vec<u32> = Vec::with_capacity(n_cands * 4);
+        let mut starts: Vec<u32> = Vec::with_capacity(n_cands + n_cands / 2 + 1);
         let tally =
             |obj: &Object, temps: &mut Vec<Temp>, found: &mut Vec<Object>, edges: &mut Vec<u32>| {
-                let parent_is_iter = matches!(obj, Object::Iter(_));
-                let parent_is_frame = matches!(obj, Object::Frame(_));
-                traverse_collected(obj, &mut |child| {
-                    if child.never_gc_candidate() {
-                        return;
-                    }
-                    match finder.find(child) {
-                        Some(Hit::Real(s)) => {
-                            let e = reg.entry(s);
-                            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
-                            edges.push(s);
-                        }
-                        Some(Hit::Temp(i)) => {
-                            let t = &temps[i as usize];
-                            t.gc_refs.set(t.gc_refs.get() - 1);
-                            edges.push(i | TEMP_BIT);
-                        }
-                        None => {
-                            if promotes_temporarily(child, parent_is_iter, parent_is_frame) {
-                                found.push(child.clone());
-                            }
-                        }
-                    }
-                });
+                let mut walk = Tally {
+                    reg: &reg,
+                    finder: &finder,
+                    temps: &temps[..],
+                    found: &mut *found,
+                    edges: &mut *edges,
+                    parent_is_iter: matches!(obj, Object::Iter(_)),
+                    parent_is_frame: matches!(obj, Object::Frame(_)),
+                };
+                traverse_collected(obj, &mut walk);
+                if found.is_empty() {
+                    return;
+                }
                 // (One entry per edge: a node reached twice is promoted once and
                 // tallied twice.)
                 for child in found.drain(..) {
@@ -1882,22 +1884,38 @@ impl GcState {
                 }
             };
         for &slot in lists.iter().flatten() {
-            let e = reg.entry(slot);
+            let e = reg.list_entry(slot);
             e.node.set(starts.len() as u32);
             starts.push(edges.len() as u32);
-            // SAFETY: the mark walk runs no code that could release the
-            // object (see `traverse_collected`).
+            let Some(w) = e.obj.as_ref() else { continue };
+            // Phase 3's outer refcount, read here while the entry is at hand:
+            // the walk takes no reference to a candidate that outlives the
+            // visit, so the count is the one it will be after the walk.
+            let strong = w.strong_count();
+            if strong == 0 {
+                continue;
+            }
+            e.gc_refs.set(
+                e.gc_refs
+                    .get()
+                    .wrapping_add(strong.min(i32::MAX as usize) as i32),
+            );
+            // SAFETY: the object is alive (counted above), and the mark walk
+            // runs no code that could release it (see `traverse_collected`).
             unsafe {
-                e.obj.as_ref().and_then(|w| {
-                    w.with_borrowed(|obj| tally(obj, &mut temps, &mut found, &mut edges))
-                });
+                w.with_live(|obj| tally(obj, &mut temps, &mut found, &mut edges));
             }
         }
         let n_real = starts.len();
         let mut scanned = 0;
         while scanned < temps.len() {
             starts.push(edges.len() as u32);
-            let obj = temps[scanned].obj.clone();
+            // SAFETY: a copy that is never dropped, of an object `temps`
+            // owns until the collection ends (a push may move the `Object`
+            // itself, never its payload).
+            let obj = std::mem::ManuallyDrop::new(unsafe {
+                std::ptr::read(&raw const temps[scanned].obj)
+            });
             tally(&obj, &mut temps, &mut found, &mut edges);
             scanned += 1;
         }
@@ -1910,20 +1928,17 @@ impl GcState {
             n_real,
         };
 
-        // Phase 3: add the outer refcount, read after the walk (an iterator
-        // synthesises a fresh wrapper for its buffer on each traverse, alive
-        // only during the visit). A temporary holds one reference of its
-        // own.
-        let mut grey: Vec<u32> = Vec::new();
+        // Phase 3: a candidate's outer refcount was added in its walk. A
+        // temporary's is read after the walk (an iterator synthesises a
+        // fresh wrapper for its buffer on each traverse, alive only during
+        // the visit), less the one reference it holds of its own.
+        // (Each node is pushed at most once, as it is marked.)
+        let mut grey: Vec<u32> = Vec::with_capacity(n_real + temps.len());
         for &slot in lists.iter().flatten() {
-            let e = reg.entry(slot);
-            let strong = e.obj.as_ref().map_or(0, WeakObject::strong_count);
-            let refs = i64::from(e.gc_refs.get()) + strong as i64;
-            e.gc_refs
-                .set(refs.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+            let e = reg.list_entry(slot);
             // Phase 4: anything referenced from outside is reachable; mark
             // it and propagate.
-            if refs > 0 {
+            if e.gc_refs.get() > 0 {
                 e.set(F_REACHED, true);
                 grey.push(slot);
             }
@@ -1976,7 +1991,7 @@ impl GcState {
         // garbage; hold each for the rest of the collection.
         let mut unreachable: Vec<(u32, Object)> = Vec::new();
         for &slot in lists.iter().flatten() {
-            let e = reg.entry(slot);
+            let e = reg.list_entry(slot);
             if !e.has(F_REACHED) {
                 if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
                     unreachable.push((slot, obj));
@@ -2156,15 +2171,14 @@ impl GcState {
             let mut i = 0;
             while i < reg.gens[g].len() {
                 let slot = reg.gens[g][i];
-                let e = reg.entry(slot);
+                let e = reg.list_entry(slot);
                 if e.obj.as_ref().is_none_or(WeakObject::is_dead) {
                     // (The swap brings the list's last member to `i`.)
                     dead.push(reg.remove(slot));
                     continue;
                 }
                 e.gc_refs.set(0);
-                e.set(F_REACHED, false);
-                e.set(F_CAND, true);
+                e.flags.set((e.flags.get() & !F_REACHED) | F_CAND);
                 i += 1;
             }
             n += reg.gens[g].len();
@@ -2189,7 +2203,7 @@ impl GcState {
         for g in 0..=upto {
             let target = (g + 1).min(N_GENERATIONS - 1);
             for slot in std::mem::take(&mut reg.gens[g]) {
-                let e = reg.entry(slot);
+                let e = reg.list_entry(slot);
                 if !e.has(F_CAND) {
                     lists[g].push(slot);
                     continue;
@@ -2241,14 +2255,14 @@ impl Graph<'_> {
     fn propagate(&self, grey: &mut Vec<u32>) {
         while let Some(item) = grey.pop() {
             let node = if item & TEMP_BIT == 0 {
-                self.reg.entry(item).node.get() as usize
+                self.reg.list_entry(item).node.get() as usize
             } else {
                 self.n_real + (item & !TEMP_BIT) as usize
             };
             let range = self.starts[node] as usize..self.starts[node + 1] as usize;
             for &edge in &self.edges[range] {
                 if edge & TEMP_BIT == 0 {
-                    let e = self.reg.entry(edge);
+                    let e = self.reg.list_entry(edge);
                     if !e.has(F_REACHED) {
                         e.set(F_REACHED, true);
                         grey.push(edge);
@@ -2259,6 +2273,108 @@ impl Graph<'_> {
                         t.reached.set(true);
                         grey.push(edge);
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The visitor of a collection's mark walk over one candidate (see
+/// `collect_generation`'s phase 2): each edge to a candidate is tallied
+/// against the child's `gc_refs` and recorded, and each untracked child a
+/// cycle could route through is set aside in `found`.
+struct Tally<'a> {
+    reg: &'a Registry,
+    finder: &'a Finder<'a>,
+    temps: &'a [Temp],
+    found: &'a mut Vec<Object>,
+    edges: &'a mut Vec<u32>,
+    parent_is_iter: bool,
+    parent_is_frame: bool,
+}
+
+impl Visit for Tally<'_> {
+    /// Visit one child. Inlined into every container's loop, which settles
+    /// the common children there: scalars and strings, which never are
+    /// candidates, and the kinds that record their own registry slot (as
+    /// [`Finder::find`] answers for them).
+    #[inline(always)]
+    fn visit(&mut self, child: &Object) {
+        if child.never_gc_candidate() {
+            return;
+        }
+        if let Some(cell) = intrusive_slot(child) {
+            let s = cell.get();
+            if s != NO_SLOT {
+                if self.reg.entry(s).has(F_CAND) {
+                    self.tally(s);
+                    return;
+                }
+                // A registered object outside the candidates: a temporary
+                // only while some temporary is registered, or as an
+                // instance `promotes_temporarily` accepts.
+                if !self.finder.registered_temp.get() {
+                    match child {
+                        Object::Instance(i) if instance_may_promote(i) => {}
+                        _ => return,
+                    }
+                }
+            }
+            // (Of these kinds, only an instance can be a temporary.)
+            if !matches!(child, Object::Instance(_)) {
+                return;
+            }
+        } else if let Some(key) = child.payload_addr() {
+            // Any other kind: the finder's cache answers for a child seen
+            // before (a module's namespace from every frame, ...).
+            let line = Finder::line(key as ObjectId);
+            if self.finder.cache_keys[line].get() == key as ObjectId {
+                let v = self.finder.cache_vals[line].get();
+                if v != NO_SLOT {
+                    self.tally(v);
+                    return;
+                }
+                // Not a candidate: settled unless it may become a temporary.
+                let may_promote = match child {
+                    Object::Dict(_) => self.parent_is_frame,
+                    Object::List(_) => self.parent_is_iter,
+                    _ => may_be_temporary(child),
+                };
+                if !may_promote {
+                    return;
+                }
+            }
+        }
+        self.edge(child);
+    }
+}
+
+impl Tally<'_> {
+    /// Tally an edge to the candidate `v`, a registered candidate's slot or
+    /// a temporary's position tagged [`TEMP_BIT`] (as [`Finder::encode`]
+    /// and the recorded edges have it).
+    #[inline(always)]
+    fn tally(&mut self, v: u32) {
+        if v & TEMP_BIT == 0 {
+            let e = self.reg.entry(v);
+            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+        } else {
+            let t = &self.temps[(v & !TEMP_BIT) as usize];
+            t.gc_refs.set(t.gc_refs.get() - 1);
+        }
+        self.edges.push(v);
+    }
+
+    /// [`Visit::visit`] of a child its fast path leaves open.
+    #[inline(never)]
+    fn edge(&mut self, child: &Object) {
+        match self.finder.find(child) {
+            Some(hit) => self.tally(Finder::encode(Some(hit))),
+            None => {
+                if may_be_temporary(child)
+                    && promotes_temporarily(child, self.parent_is_iter, self.parent_is_frame)
+                {
+                    self.found.push(child.clone());
                 }
             }
         }
@@ -2327,7 +2443,7 @@ impl<'a> Finder<'a> {
     }
 
     /// `child`'s candidate, if it is one.
-    #[inline]
+    #[inline(always)]
     fn find(&self, child: &Object) -> Option<Hit> {
         if let Some(cell) = intrusive_slot(child) {
             let s = cell.get();
@@ -2356,6 +2472,7 @@ impl<'a> Finder<'a> {
     }
 
     /// [`Self::find`] past the intrusive slot and the cache.
+    #[inline(never)]
     fn find_uncached(&self, child: &Object, key: ObjectId) -> Option<Hit> {
         if intrusive_slot(child).is_none() && self.filter.may_contain(key) {
             if let Some(&s) = self.reg.index.get(&key) {
@@ -2460,12 +2577,24 @@ fn promotes_temporarily(child: &Object, parent_is_iter: bool, parent_is_frame: b
         // -> frame -> f_locals -> group` loop), or an instance whose
         // tracking is still deferred, whose edge to its class can close a
         // cycle (`A.a = A(); del A`).
-        Object::Instance(i) => i.cls().flags.is_exception || i.is_gc_deferred(),
+        Object::Instance(i) => instance_may_promote(i),
         // A frame's `f_locals` cache carries the frame's only edges to its
         // locals.
         Object::Dict(_) => parent_is_frame,
         _ => false,
     }
+}
+
+/// [`promotes_temporarily`] for an instance: an exception, or one whose
+/// tracking is still deferred.
+#[inline(always)]
+fn instance_may_promote(i: &crate::types::PyInstance) -> bool {
+    // SAFETY: a read that runs no code.
+    let is_exception = match unsafe { i.class.peek() } {
+        Some(cls) => cls.flags.is_exception,
+        None => i.cls().flags.is_exception,
+    };
+    is_exception || i.is_gc_deferred()
 }
 
 /// Queue the collected weakref callbacks for the interpreter's next safe
@@ -2592,66 +2721,112 @@ pub fn strong_count_for(obj: &Object) -> usize {
 /// refcount-seeded reachability model — an unvisited child keeps its
 /// external `gc_refs` and therefore survives the pass.
 pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    traverse_impl::<false>(obj, visit);
+    traverse_impl::<false, _>(obj, visit);
+}
+
+/// The per-child callback of a traversal: a trait object for
+/// [`traverse_object`]'s callers, and the collection's own visitor, whose
+/// calls are resolved (and inlined) statically.
+pub(crate) trait Visit {
+    fn visit(&mut self, child: &Object);
+}
+
+impl Visit for dyn FnMut(&Object) + '_ {
+    #[inline(always)]
+    fn visit(&mut self, child: &Object) {
+        self(child);
+    }
 }
 
 /// [`traverse_object`] for a collection's mark walk, whose visitor runs no
 /// code and borrows no container: the common containers' cells are read
-/// without borrow bookkeeping while nothing holds them mutably, and an
-/// instance's class is visited through a handle that takes no reference.
-fn traverse_collected(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    traverse_impl::<true>(obj, visit);
+/// without borrow bookkeeping while nothing holds them mutably, an object
+/// a field holds by `Rc` is visited through a handle that takes no
+/// reference, and the visitor is called directly rather than through a
+/// trait object.
+#[inline(always)]
+fn traverse_collected<V: Visit>(obj: &Object, visit: &mut V) {
+    traverse_impl::<true, V>(obj, visit);
+}
+
+/// Visit the object `wrap` makes of `rc`, a field's handle: when `PEEK`
+/// allows it, through a view that takes no reference (see
+/// [`traverse_collected`]), else through a counted copy.
+#[inline(always)]
+pub(crate) fn visit_rc<const PEEK: bool, T: ?Sized + 'static, V: Visit + ?Sized>(
+    visit: &mut V,
+    rc: &crate::sync::Rc<T>,
+    wrap: fn(crate::sync::Rc<T>) -> Object,
+) {
+    if PEEK {
+        // SAFETY: the field keeps the payload alive while the visitor,
+        // which runs no code, looks at it; the view, which owns no
+        // reference, is never dropped.
+        let view = std::mem::ManuallyDrop::new(wrap(unsafe {
+            crate::sync::Rc::from_raw(crate::sync::Rc::as_ptr(rc))
+        }));
+        visit.visit(&view);
+    } else {
+        visit.visit(&wrap(rc.clone()));
+    }
 }
 
 /// Run `f` on `cell`'s value: a guard-free view when `PEEK` allows one,
 /// else a shared borrow (`None` while the cell is borrowed mutably).
 #[inline(always)]
-fn with_read<const PEEK: bool, T, R>(cell: &RefCell<T>, f: impl FnOnce(&T) -> R) -> Option<R> {
-    if PEEK {
-        // SAFETY: a `PEEK` traversal's visitor runs no code and borrows no
-        // container (see `traverse_collected`), so nothing can borrow the
-        // cell mutably while the view lives.
-        if let Some(v) = unsafe { cell.peek() } {
-            return Some(f(v));
+pub(crate) fn with_read<const PEEK: bool, T, R>(
+    cell: &RefCell<T>,
+    f: impl FnOnce(&T) -> R,
+) -> Option<R> {
+    let guard;
+    // SAFETY: a `PEEK` traversal's visitor runs no code and borrows no
+    // container (see `traverse_collected`), so nothing can borrow the cell
+    // mutably while the view lives.
+    let value = match PEEK.then(|| unsafe { cell.peek() }).flatten() {
+        Some(v) => v,
+        None => {
+            guard = cell.try_borrow().ok()?;
+            &*guard
         }
-    }
-    cell.try_borrow().ok().map(|g| f(&g))
+    };
+    // (One call site, so the walk inlines `f`.)
+    Some(f(value))
 }
 
 #[inline(always)]
-fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+fn traverse_impl<const PEEK: bool, V: Visit + ?Sized>(obj: &Object, visit: &mut V) {
     match obj {
         Object::List(l) => {
             with_read::<PEEK, _, _>(l, |v| {
                 for item in v.iter() {
-                    visit(item);
+                    visit.visit(item);
                 }
             });
         }
         Object::Tuple(t) => {
             for item in t.iter() {
-                visit(item);
+                visit.visit(item);
             }
         }
         Object::Dict(d) | Object::MappingProxy(d) | Object::SimpleNamespace(d) => {
             with_read::<PEEK, _, _>(d, |m| {
                 for (k, v) in m.iter() {
-                    visit(&k.0);
-                    visit(v);
+                    visit.visit(&k.0);
+                    visit.visit(v);
                 }
             });
         }
-        Object::MappingProxyObj(inner) => visit(inner),
+        Object::MappingProxyObj(inner) => visit.visit(inner),
         Object::Set(s) => {
             with_read::<PEEK, _, _>(s, |m| {
                 for k in m.iter() {
-                    visit(&k.0);
+                    visit.visit(&k.0);
                 }
             });
         }
         Object::FrozenSet(s) => {
             for k in s.iter() {
-                visit(&k.0);
+                visit.visit(&k.0);
             }
         }
         Object::Instance(i) => {
@@ -2661,21 +2836,17 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // instances (e.g. `A.a = A(); del A`) must see that edge subtracted
             // or it never collects. Built-in types are immortal and untracked,
             // so skip them (the `by_id` lookup would miss anyway).
-            // SAFETY: as `with_read`'s; the instance keeps its class alive,
-            // and the view, which owns no reference, is never dropped.
+            // SAFETY: as `with_read`'s; the instance keeps its class alive.
             match PEEK.then(|| unsafe { i.class.peek() }).flatten() {
                 Some(cls) => {
                     if !cls.flags.is_builtin {
-                        let view = std::mem::ManuallyDrop::new(Object::Type(unsafe {
-                            crate::sync::Rc::from_raw(crate::sync::Rc::as_ptr(cls))
-                        }));
-                        visit(&view);
+                        visit_rc::<PEEK, _, V>(visit, cls, Object::Type);
                     }
                 }
                 None => {
                     let cls = i.cls();
                     if !cls.flags.is_builtin {
-                        visit(&Object::Type(cls));
+                        visit.visit(&Object::Type(cls));
                     }
                 }
             }
@@ -2695,27 +2866,48 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
                 // CPython's inline values visit only the values).
                 with_read::<PEEK, _, _>(i.dict.split_cell(), |split| {
                     for v in split.values() {
-                        visit(v);
+                        visit.visit(v);
                     }
                 });
             } else if let Some(dict) = i.dict.get_shared() {
                 let dict_obj = Object::Dict(dict);
                 if is_tracked(&dict_obj) {
-                    visit(&dict_obj);
+                    visit.visit(&dict_obj);
                 } else if let Object::Dict(dict) = &dict_obj {
                     if let Ok(m) = dict.try_borrow() {
                         for (k, v) in m.iter() {
-                            visit(&k.0);
-                            visit(v);
+                            visit.visit(&k.0);
+                            visit.visit(v);
                         }
                     }
                 }
             }
             with_read::<PEEK, _, _>(&i.slots, |slots| {
-                slots.for_each_entry(|k, v| {
-                    visit(&k.0);
-                    visit(v);
-                });
+                if PEEK {
+                    // (The names are strings, never candidates.)
+                    match slots.values_view() {
+                        crate::types::SlotValues::Values(values) => {
+                            for v in values {
+                                visit.visit(v);
+                            }
+                        }
+                        crate::types::SlotValues::Pairs(pairs) => {
+                            for (_, v) in pairs {
+                                visit.visit(v);
+                            }
+                        }
+                        crate::types::SlotValues::Table(table) => {
+                            for (_, v) in table.iter() {
+                                visit.visit(v);
+                            }
+                        }
+                    }
+                } else {
+                    slots.for_each_entry(|k, v| {
+                        visit.visit(&k.0);
+                        visit.visit(v);
+                    });
+                }
             });
             // A built-in *container* subclass (`class C(list)`, `D(dict)`,
             // `S(set)`, …) keeps its payload in `native`; that container is
@@ -2725,12 +2917,15 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // prompt reclamation can follow such a chain (a leaf `native`
             // like an `int`/`str` subclass simply has no children).
             if let Some(native) = i.native.get() {
-                traverse_impl::<PEEK>(native, visit);
+                traverse_impl::<PEEK, V>(native, visit);
             }
+            // A native asyncio future keeps its fields in a state the
+            // instance doesn't hold directly.
+            crate::stdlib::asyncio_mod::gc_traverse_state(i, visit);
             // A C extension type (RFC 0044) may hold child references in
             // C-managed memory invisible to the dict walk above; give its
             // registered `tp_traverse` bridge a chance to surface them.
-            run_external_traverse(obj, visit);
+            run_external_traverse(obj, &mut |c: &Object| visit.visit(c));
         }
         Object::Module(m) => {
             // The module holds exactly one strong edge: its namespace
@@ -2740,24 +2935,24 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // dict was never tracked (pre-dating that pairing), the
             // `by_id` miss makes this visit harmless and its entries
             // simply count as externally referenced — conservative.
-            visit(&Object::Dict(m.dict.clone()));
+            visit_rc::<PEEK, _, V>(visit, &m.dict, Object::Dict);
         }
         Object::Cell(c) => {
             let Ok(v) = c.try_borrow() else { return };
-            visit(&v);
+            visit.visit(&v);
         }
         Object::File(f) => {
             // User attributes on a stream (`f.f = f`) are its only
             // cycle-capable edges; the fixed fields hold no objects.
             if let Ok(attrs) = f.extra_attrs.try_borrow() {
                 for (_, v) in attrs.iter() {
-                    visit(v);
+                    visit.visit(v);
                 }
             }
         }
         Object::BoundMethod(b) => {
-            visit(&b.function);
-            visit(&b.receiver);
+            visit.visit(&b.function);
+            visit.visit(&b.receiver);
         }
         Object::MemoryView(m) => {
             // CPython's `memory_traverse` visits `view->obj`: an exporter
@@ -2766,31 +2961,31 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // `PickleBuffer._view`).
             if let Ok(exp) = m.exporter.try_borrow() {
                 if let Some(exp) = exp.as_ref() {
-                    visit(exp);
+                    visit.visit(exp);
                 }
             }
         }
         Object::Slice(s) => {
-            visit(&s.start);
-            visit(&s.stop);
-            visit(&s.step);
+            visit.visit(&s.start);
+            visit.visit(&s.stop);
+            visit.visit(&s.step);
         }
         Object::Property(p) => {
             for member in [&p.fget, &p.fset, &p.fdel] {
                 if let Ok(v) = member.try_borrow() {
-                    visit(&v);
+                    visit.visit(&v);
                 }
             }
             if let Ok(doc) = p.doc.try_borrow() {
-                visit(&doc);
+                visit.visit(&doc);
             }
         }
         Object::StaticMethod(o) | Object::ClassMethod(o) => {
-            visit(&o.func());
+            visit.visit(&o.func());
             if let Ok(d) = o.dict.try_borrow() {
                 for (k, v) in d.iter() {
-                    visit(&k.0);
-                    visit(v);
+                    visit.visit(&k.0);
+                    visit.visit(v);
                 }
             }
         }
@@ -2800,7 +2995,7 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // traversal accounts `dict -> entries` (bug #3680, test_dict
             // `test_container_iterator`). Visiting the entries here would
             // subtract edges the view doesn't actually hold.
-            visit(&Object::Dict(v.dict.clone()));
+            visit_rc::<PEEK, _, V>(visit, &v.dict, Object::Dict);
         }
         Object::Type(t) => {
             // Class dict + base list. Without this, classes that
@@ -2808,12 +3003,12 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // (a very common pattern via decorators) leak.
             if let Ok(dict) = t.dict.try_borrow() {
                 for (k, v) in dict.iter() {
-                    visit(&k.0);
-                    visit(v);
+                    visit.visit(&k.0);
+                    visit.visit(v);
                 }
             }
             for base in t.bases.borrow().iter() {
-                visit(&Object::Type(base.clone()));
+                visit_rc::<PEEK, _, V>(visit, base, Object::Type);
             }
             // The MRO holds strong refs — including one to the class
             // itself (every class self-cycles through `mro[0]`). The
@@ -2821,12 +3016,12 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // can never collapse to gc_refs == 0.
             if let Ok(mro) = t.mro.try_borrow() {
                 for entry in mro.iter() {
-                    visit(&Object::Type(entry.clone()));
+                    visit_rc::<PEEK, _, V>(visit, entry, Object::Type);
                 }
             }
             if let Ok(meta) = t.metaclass.try_borrow() {
                 if let Some(meta) = meta.as_ref() {
-                    visit(&Object::Type(meta.clone()));
+                    visit_rc::<PEEK, _, V>(visit, meta, Object::Type);
                 }
             }
             // The cached instantiation plan holds strong refs to the
@@ -2841,21 +3036,21 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
                 if let Some((_, plan)) = plan.as_ref() {
                     for slot in [&plan.user_new, &plan.init_fn] {
                         let Some(f) = slot else { continue };
-                        visit(f);
+                        visit.visit(f);
                         // A classmethod-form `__new__` is cached as a
                         // plan-private BoundMethod over the class — that
                         // wrapper is never itself a tracked candidate, so
                         // its edges (function + the class receiver) are
                         // this class's edges.
                         if let Object::BoundMethod(bm) = f {
-                            visit(&bm.function);
-                            visit(&bm.receiver);
+                            visit.visit(&bm.function);
+                            visit.visit(&bm.receiver);
                         }
                     }
                     // The plain-construction fast path's own handle on the
                     // same `__init__` is one more such edge.
                     if let Some((init, _)) = &plan.lean_init {
-                        visit(&Object::Function(init.clone()));
+                        visit_rc::<PEEK, _, V>(visit, init, Object::Function);
                     }
                 }
             }
@@ -2868,7 +3063,7 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // be walked. A module-level function's globals is the module
             // namespace dict, which isn't a tracked candidate on its own —
             // the `by_id` lookup simply misses it, so visiting is harmless.
-            visit(&Object::Dict(f.globals.clone()));
+            visit_rc::<PEEK, _, V>(visit, &f.globals, Object::Dict);
             // `func_builtins` too. For the main interpreter this edge is
             // moot (its builtins dict is rooted from Rust for the process
             // lifetime), but a destroyed sub-interpreter's builtins dict
@@ -2878,15 +3073,15 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             // `__loader__` (its `_frozen_importlib.BuiltinImporter`), its
             // `open`, its `__import__` — pinned the whole module graph of
             // every closed interpreter for the life of the process.
-            visit(&Object::Dict(f.builtins.clone()));
+            visit_rc::<PEEK, _, V>(visit, &f.builtins, Object::Dict);
             for d in &f.defaults {
-                visit(d);
+                visit.visit(d);
             }
             for (_, v) in &f.kw_defaults {
-                visit(v);
+                visit.visit(v);
             }
             for cell in &f.closure {
-                visit(cell);
+                visit.visit(cell);
             }
             // The lean call paths cache the closure's cells as a frame
             // `cells` vector (`PyFunction::closure_cells`): a second strong
@@ -2899,40 +3094,37 @@ fn traverse_impl<const PEEK: bool>(obj: &Object, visit: &mut dyn FnMut(&Object))
             if let Some(cells) = f.closure_cells.get() {
                 if crate::sync::Rc::strong_count(cells) == 1 {
                     for cell in cells.iter() {
-                        visit(&Object::Cell(cell.clone()));
+                        visit_rc::<PEEK, _, V>(visit, cell, Object::Cell);
                     }
                 }
             }
             if let Some(attrs_rc) = f.attrs.try_borrow().ok().and_then(|a| a.clone()) {
                 if let Ok(attrs) = attrs_rc.try_borrow() {
                     for (k, v) in attrs.iter() {
-                        visit(&k.0);
-                        visit(v);
+                        visit.visit(&k.0);
+                        visit.visit(v);
                     }
                 }
             }
             // (An unplanted seed holds only the shared name strings.)
             if let Some(Ok(slots)) = f.slots_raw.get().map(RefCell::try_borrow) {
                 for (k, v) in slots.iter() {
-                    visit(&k.0);
-                    visit(v);
+                    visit.visit(&k.0);
+                    visit.visit(v);
                 }
             }
         }
-        Object::LazyIter(l) => l.gc_referents(visit),
-        Object::Builtin(_)
-        | Object::Generator(_)
-        | Object::Coroutine(_)
-        | Object::AsyncGenerator(_)
-        | Object::Iter(_)
-        | Object::Frame(_)
-        | Object::Traceback(_) => {
+        Object::LazyIter(l) => l.gc_referents(&mut |c: &Object| visit.visit(c)),
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+            crate::generator_frame_traverse::<PEEK, V>(g, visit);
+        }
+        Object::Builtin(_) | Object::Iter(_) | Object::Frame(_) | Object::Traceback(_) => {
             // The fields of these variants are private to the
             // module that defined them; the GC cooperates with
             // them via the external `*_traverse` helper, but
             // we don't crash if no helper is registered. (See
             // the `register_traverse` extension hook below.)
-            run_external_traverse(obj, visit);
+            run_external_traverse(obj, &mut |c: &Object| visit.visit(c));
         }
         _ => {}
     }
@@ -2992,8 +3184,13 @@ const HOOK_TABLE_CAP: usize = 16;
 
 struct HookTable<H: Copy> {
     len: std::sync::atomic::AtomicUsize,
-    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H, u8)>; HOOK_TABLE_CAP],
+    slots: [std::sync::OnceLock<(fn(&Object) -> bool, H)>; HOOK_TABLE_CAP],
+    /// Per [`hook_kind`] bit, the slots whose hook accepts that kind, as a
+    /// bit set (published after the slot is filled).
+    by_kind: [std::sync::atomic::AtomicU16; 8],
 }
+
+const _: () = assert!(HOOK_TABLE_CAP <= 16);
 
 impl<H: Copy> HookTable<H> {
     const CAP: usize = HOOK_TABLE_CAP;
@@ -3002,24 +3199,35 @@ impl<H: Copy> HookTable<H> {
         Self {
             len: std::sync::atomic::AtomicUsize::new(0),
             slots: [const { std::sync::OnceLock::new() }; HOOK_TABLE_CAP],
+            by_kind: [const { std::sync::atomic::AtomicU16::new(0) }; 8],
         }
     }
 
     fn push(&self, kinds: u8, matches: fn(&Object) -> bool, hook: H) {
         let i = self.len.fetch_add(1, Ordering::AcqRel);
         assert!(i < Self::CAP, "too many GC hook registrations");
-        let _ = self.slots[i].set((matches, hook, kinds));
+        let _ = self.slots[i].set((matches, hook));
+        for (bit, set) in self.by_kind.iter().enumerate() {
+            if kinds & (1 << bit) != 0 {
+                set.fetch_or(1 << i, Ordering::Release);
+            }
+        }
     }
 
-    /// The hooks offered an object of [`hook_kind`] `kind`.
+    /// The hooks offered an object of [`hook_kind`] `kind`, in the order
+    /// they were registered.
     #[inline]
     fn iter(&self, kind: u8) -> impl Iterator<Item = (fn(&Object) -> bool, H)> + '_ {
-        let n = self.len.load(Ordering::Acquire).min(Self::CAP);
-        // A slot past a registration in flight is still unset; skip it.
-        self.slots[..n].iter().filter_map(move |s| {
-            s.get()
-                .filter(|(_, _, kinds)| kinds & kind != 0)
-                .map(|&(m, h, _)| (m, h))
+        let mut set = self.by_kind[(kind.trailing_zeros() & 7) as usize].load(Ordering::Acquire);
+        std::iter::from_fn(move || {
+            while set != 0 {
+                let i = set.trailing_zeros() as usize;
+                set &= set - 1;
+                if let Some(&(m, h)) = self.slots[i].get() {
+                    return Some((m, h));
+                }
+            }
+            None
         })
     }
 }
@@ -3449,6 +3657,31 @@ pub fn untrack_generator(g: &crate::Rc<crate::object::PyGenerator>) {
     }
 }
 
+/// Let go of `g`, a finished generator in the young set (see
+/// `Interpreter::release_finished_gen`): holding no frame, it can close no
+/// cycle, and its entry would keep its allocation until the set dropped
+/// it. Only the set's last few entries are searched (a generator that
+/// finishes young is usually among them); the set drops any other once it
+/// is dead. Its birth still counts toward the young collection, as a dead
+/// entry's does.
+pub fn forget_young_generator(g: &crate::Rc<crate::object::PyGenerator>) {
+    with_state(|s| {
+        // SAFETY: nothing below runs code while the set is borrowed (the
+        // removed entry's release only adjusts a weak count: `g` is alive).
+        let Some(young) = (unsafe { s.young_gens.peek_mut() }) else {
+            return;
+        };
+        let p = crate::Rc::as_ptr(g);
+        let n = young.len();
+        if let Some(i) = (n.saturating_sub(4)..n)
+            .rev()
+            .find(|&i| young[i].as_ptr() == p)
+        {
+            young.swap_remove(i);
+        }
+    });
+}
+
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
 /// child. See [`GcState::reinit_after_fork_in_child`].
 ///
@@ -3681,10 +3914,25 @@ pub fn claim_finalizer(obj: &Object) -> bool {
     with_state(|s| s.claim_finalizer(obj)) != Some(true)
 }
 
-/// Convenience: has `id`'s finalizer already run on the current thread?
-/// Backs `gc.is_finalized`.
-pub fn was_finalized(id: ObjectId) -> bool {
-    with_state(|s| s.was_finalized(id))
+/// Whether `obj`'s finalizer has run (or started). Backs `gc.is_finalized`.
+/// The object records it (CPython keeps the bit in the object's header), so
+/// the answer survives the object's untracking and resurrection, and an
+/// object born at a finalized one's address starts out unfinalized.
+pub fn was_finalized(obj: &Object) -> bool {
+    finalize_ran(obj)
+}
+
+/// Whether the finalizer of `obj`, an instance or a generator-family
+/// object, has been claimed by a run (see `Interpreter::invoke_finalizer`).
+#[inline]
+fn finalize_ran(obj: &Object) -> bool {
+    match obj {
+        Object::Instance(i) => i.finalize_ran.get(),
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+            g.finalize_ran.get()
+        }
+        _ => false,
+    }
 }
 
 /// Convenience: mark `id`'s finalizer as finished on the current thread's GC

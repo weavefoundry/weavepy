@@ -713,21 +713,31 @@ fn fut_gc_matches(obj: &Object) -> bool {
     }
 }
 
-/// [`fut_gc_matches`]'s cheap superset for the traverse hook, which every
-/// instance a collection walks is offered: an instance with slot storage
-/// (a future's handle lives in a slot). [`fut_gc_traverse`] finds the
-/// state itself, so the precise lookup runs once.
-fn fut_gc_may_match(obj: &Object) -> bool {
-    match obj {
-        // SAFETY: a read that runs no code. (A borrowed cell answers
-        // "maybe".)
-        Object::Instance(i) => unsafe { i.slots.peek() }.is_none_or(|s| !s.is_empty_default()),
-        _ => false,
+/// The cycle GC's walk of a native future's state (CPython's
+/// `FutureObj_traverse`), which `gc_trace` runs for every instance it
+/// walks. Only an instance of the native `Future` or `Task`, or of a
+/// subclass, carries a state, so any other is settled by its class
+/// without a look for the state's handle among its slots.
+#[inline]
+pub(crate) fn gc_traverse_state<V: crate::gc_trace::Visit + ?Sized>(
+    inst: &PyInstance,
+    visit: &mut V,
+) {
+    let Some(fut) = FUTURE_CLASS.get() else {
+        return;
+    };
+    // SAFETY: reads that run no code. (A borrowed cell answers "maybe".)
+    if unsafe { inst.slots.peek() }.is_some_and(crate::types::SlotStorage::is_empty_default) {
+        return;
     }
-}
-
-fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let Object::Instance(inst) = obj else { return };
+    if let Some(cls) = unsafe { inst.class.peek() } {
+        let native = Rc::ptr_eq(cls, fut)
+            || TASK_CLASS.get().is_some_and(|task| Rc::ptr_eq(cls, task))
+            || cls.is_subclass_of(fut);
+        if !native {
+            return;
+        }
+    }
     let Some(st) = existing_state_of(inst) else {
         return;
     };
@@ -740,17 +750,17 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
         &s.context,
         &s.fut_waiter,
     ] {
-        visit(o);
+        visit.visit(o);
     }
     for (cb, ctx) in &s.callbacks {
-        visit(cb);
-        visit(&ctx.clone().into_held());
+        visit.visit(cb);
+        visit.visit(&ctx.clone().into_held());
     }
     // 3.14 `FutureObj_traverse` visits `fut_awaited_by`: the strong
     // waiter references it holds close the `task -> coro frame -> future
     // -> awaited_by -> task` loop (test_log_destroyed_pending_task).
     for w in &s.awaited_by {
-        visit(w);
+        visit.visit(w);
     }
     if let Some(cold) = &s.cold {
         for o in [
@@ -760,7 +770,7 @@ fn fut_gc_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             &cold.cancel_message,
             &cold.source_traceback,
         ] {
-            visit(o);
+            visit.visit(o);
         }
     }
 }
@@ -814,7 +824,6 @@ fn register_gc_hooks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let kind = crate::gc_trace::hook_kind::INSTANCE;
-        crate::gc_trace::register_traverse_for(kind, fut_gc_may_match, fut_gc_traverse);
         crate::gc_trace::register_clear_for(kind, fut_gc_matches, fut_gc_clear);
     });
 }
