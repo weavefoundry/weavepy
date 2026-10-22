@@ -80,6 +80,9 @@ const DIRECT_RET: u32 = 5;
 /// started the coroutine, which returned (see [`gen_call_done`]): the
 /// await's `END_SEND` goes on, `[coroutine, result]` atop the stack.
 const AWAITED: u32 = 6;
+/// A jump into another chunk of the same code (see [`chunk_ranges`]), the
+/// state synced at its target: [`Native::run`] goes on there.
+const CHAIN: u32 = 7;
 
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
@@ -102,6 +105,21 @@ fn lean_above() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000)
+    })
+}
+
+/// The most IR instructions one compile takes (`WEAVEPY_FRAME_JIT_CHUNK`
+/// overrides it, `0` never splits): a larger body compiles in chunks (see
+/// [`chunk_ranges`]). The register allocator's working memory grows with
+/// the function it allocates, about 1.2 KB an IR instruction, and the
+/// largest compile sets the process's peak memory.
+fn chunk_ir() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2400)
     })
 }
 
@@ -188,6 +206,11 @@ type NativeFn = unsafe extern "C" fn(*mut State) -> u32;
 /// A code object's native code.
 pub(crate) struct Native {
     func: NativeFn,
+    /// A body compiled in chunks (see [`chunk_ranges`]): each chunk's
+    /// function, and the chunk each instruction is in (`func` is the
+    /// first's). Empty for a body compiled whole.
+    chunks: Box<[NativeFn]>,
+    chunk_at: Box<[u8]>,
     /// The locals vector's length the code was compiled for.
     nlocals: usize,
     /// The pcs worth entering at: block starts whose first instruction
@@ -203,27 +226,40 @@ pub(crate) struct Native {
     ops: Box<[OpCode]>,
     depths: Box<[i64]>,
     need: usize,
-    /// The `LOAD_GLOBAL` and `LOAD_ATTR` sites' caches, which the code
-    /// addresses.
-    #[allow(clippy::vec_box)]
-    _globals: Vec<Box<GlobalCache>>,
-    #[allow(clippy::vec_box)]
-    _slots: Vec<Box<SlotCache>>,
+    /// The caches the code addresses.
+    _caches: Caches,
+}
+
+/// The per-site caches a lowering allocates, which its code addresses.
+#[derive(Default)]
+#[allow(clippy::vec_box)]
+struct Caches {
+    /// The `LOAD_GLOBAL` and `LOAD_ATTR` sites' caches.
+    globals: Vec<Box<GlobalCache>>,
+    slots: Vec<Box<SlotCache>>,
     /// The method-load sites' in-line caches.
-    #[allow(clippy::vec_box)]
-    _methods: Vec<Box<MethodCache>>,
+    methods: Vec<Box<MethodCache>>,
     /// The `CALL` sites' direct-call caches.
-    #[allow(clippy::vec_box)]
-    _direct: Vec<Box<DirectSite>>,
+    direct: Vec<Box<DirectSite>>,
     /// The `CALL` sites' settled builtins.
-    #[allow(clippy::vec_box)]
-    _builtin_sites: Vec<Box<BuiltinSite>>,
-    #[allow(clippy::vec_box)]
-    _type_sites: Vec<Box<TypeSite>>,
+    builtin_sites: Vec<Box<BuiltinSite>>,
+    type_sites: Vec<Box<TypeSite>>,
     /// The builtins the method kernels' calls address.
-    _held: Vec<Rc<crate::object::BuiltinFn>>,
-    #[allow(clippy::vec_box)]
-    _mods: Vec<Box<ModCache>>,
+    held: Vec<Rc<crate::object::BuiltinFn>>,
+    mods: Vec<Box<ModCache>>,
+}
+
+impl Caches {
+    fn append(&mut self, mut other: Caches) {
+        self.globals.append(&mut other.globals);
+        self.slots.append(&mut other.slots);
+        self.methods.append(&mut other.methods);
+        self.direct.append(&mut other.direct);
+        self.builtin_sites.append(&mut other.builtin_sites);
+        self.type_sites.append(&mut other.type_sites);
+        self.held.append(&mut other.held);
+        self.mods.append(&mut other.mods);
+    }
 }
 
 // SAFETY: the code only touches the state it is handed; it is only
@@ -233,6 +269,38 @@ unsafe impl Send for Native {}
 unsafe impl Sync for Native {}
 
 impl Native {
+    /// Run the native code from `st.pc`: the whole body's function, or the
+    /// chunk the pc is in and the chunks it jumps into.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::run`]'s.
+    #[inline(always)]
+    unsafe fn call(&self, st: &mut State) -> u32 {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if self.chunks.is_empty() {
+                (self.func)(st)
+            } else {
+                self.call_chunks(st)
+            }
+        }
+    }
+
+    /// [`Self::call`] for a body compiled in chunks.
+    #[inline(never)]
+    unsafe fn call_chunks(&self, st: &mut State) -> u32 {
+        loop {
+            let at = self.chunk_at.get(st.pc).copied().unwrap_or(0);
+            // SAFETY: the caller's contract; every chunk is compiled from
+            // the same code, for the same state.
+            let status = unsafe { (self.chunks[at as usize])(st) };
+            if status != CHAIN {
+                return status;
+            }
+        }
+    }
+
     /// The stack capacity the code needs.
     #[inline(always)]
     pub(crate) fn need(&self) -> usize {
@@ -266,7 +334,7 @@ impl Native {
     pub(crate) unsafe fn run_direct(&self, st: &mut State, from: usize) -> u32 {
         let (len, cap) = (st.len, st.cap);
         // SAFETY: the caller's contract.
-        let status = unsafe { (self.func)(st) };
+        let status = unsafe { self.call(st) };
         if status != DIRECT_RET || stats::enabled() {
             self.ran(st, from, len, cap, usize::MAX, status);
         }
@@ -307,7 +375,7 @@ impl Native {
     pub(crate) unsafe fn run(&self, st: &mut State) -> u32 {
         let (from, len, cap, last) = (st.pc, st.len, st.cap, st.last);
         // SAFETY: the caller's contract.
-        let status = unsafe { (self.func)(st) };
+        let status = unsafe { self.call(st) };
         if status == INTERP && st.pc == from && st.last == last {
             self.note_fail(from);
         }
@@ -941,6 +1009,8 @@ struct Tags {
     /// payload word: `(length, first item)` byte offsets.
     tuple: u8,
     tuple_layout: Option<(i32, i32)>,
+    /// Where a frame's cells are (see [`CellLayout`]).
+    cell_layout: Option<CellLayout>,
     /// The `dict`, `set` and `str` tags (the method kernels' receivers).
     dict: u8,
     set: u8,
@@ -1026,6 +1096,7 @@ fn tags() -> Option<Tags> {
         list_layout: list_layout(),
         tuple: tag(&Object::new_tuple_array([Object::None])),
         tuple_layout: tuple_layout(),
+        cell_layout: cell_layout(),
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -1131,6 +1202,69 @@ fn list_layout() -> Option<ListLayout> {
         borrow: off(borrow)?,
         ptr: off(data + 8 * ptr)?,
         len: off(data + 8 * len)?,
+    })
+}
+
+/// Where a frame's cell variables are: the byte offsets of its cells
+/// handle (`Frame::cells`, a word: the vector's allocation), from that
+/// allocation of the vector's pointer and length, and from a cell's
+/// allocation (each pointer in the vector) of its borrow counter (an
+/// `i32`; negative while mutably borrowed) and its value.
+#[derive(Clone, Copy)]
+struct CellLayout {
+    frame_cells: i32,
+    vec_ptr: i32,
+    vec_len: i32,
+    borrow: i32,
+    value: i32,
+}
+
+/// [`CellLayout`], read off a sample cells vector (`None` if it isn't the
+/// shape the code assumes).
+fn cell_layout() -> Option<CellLayout> {
+    const MARK: i64 = 0x5eed_ce11_0000_0001;
+    let cell = Rc::new(crate::sync::RefCell::new(Object::Int(MARK)));
+    let mut v: Vec<Rc<crate::sync::RefCell<Object>>> = Vec::with_capacity(7);
+    v.extend([cell.clone(), cell.clone(), cell]);
+    let (vp, vl) = (v.as_ptr() as u64, v.len() as u64);
+    let cells: Rc<Vec<Rc<crate::sync::RefCell<Object>>>> = Rc::new(v);
+    // SAFETY: an `Rc` is one word, its allocation's address.
+    let alloc = unsafe { std::mem::transmute_copy::<_, usize>(&cells) };
+    let data = (Rc::as_ptr(&cells) as usize).checked_sub(alloc)?;
+    // SAFETY: the vector's three words, inside the live sample.
+    let words: [u64; 3] = unsafe { std::ptr::read((alloc + data) as *const [u64; 3]) };
+    let ptr = words.iter().position(|&w| w == vp)?;
+    let len = words.iter().position(|&w| w == vl)?;
+    let first = &cells[0];
+    // SAFETY: as above, for the cell.
+    let cell_alloc = unsafe { std::mem::transmute_copy::<_, usize>(first) };
+    let cell_data = (Rc::as_ptr(first) as usize).checked_sub(cell_alloc)?;
+    // SAFETY: the vector's first word is the first cell's allocation.
+    let stored = unsafe { *(vp as *const usize) };
+    let (borrow, value) = crate::sync::object_cell_offsets();
+    // SAFETY: the cell's value, inside the live sample.
+    let mark = unsafe { *((cell_alloc + cell_data + value + 8) as *const i64) };
+    let counter =
+        unsafe { &*((cell_alloc + cell_data + borrow) as *const std::sync::atomic::AtomicI32) };
+    let idle = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let held = {
+        let _g = first.borrow_mut();
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let off = |d: usize| i32::try_from(d).ok();
+    (stored == cell_alloc
+        && mark == MARK
+        && idle == 0
+        && held < 0
+        && ptr != len
+        && std::mem::size_of::<Rc<Vec<Rc<crate::sync::RefCell<Object>>>>>() == 8)
+        .then_some(())?;
+    Some(CellLayout {
+        frame_cells: off(std::mem::offset_of!(crate::Frame, cells))?,
+        vec_ptr: off(data + 8 * ptr)?,
+        vec_len: off(data + 8 * len)?,
+        borrow: off(cell_data + borrow)?,
+        value: off(cell_data + value)?,
     })
 }
 
@@ -1306,8 +1440,138 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                 return 1;
             }
         }
+        if matches!(&*it, Object::Generator(_)) && !(*st).sw.is_null() {
+            return h_for_iter_gen(st, it, out, pc);
+        }
         h_for_iter_rest(st, it, out, pc)
     }
+}
+
+/// [`h_for_iter`] of a generator from a running activation: a simple
+/// body's step in place (see `gen_fast`), any other resumed as an inline
+/// activation, switched to as the core loop's arm does (not from a
+/// generator's own fast step).
+#[inline(never)]
+unsafe extern "C" fn h_for_iter_gen(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
+    // SAFETY: as `h_for_iter_rest`'s; the caller checked the generator and
+    // the switch.
+    let (st, top) = unsafe { (&mut *st, &*it) };
+    let Object::Generator(g) = top else {
+        unreachable!("checked by `h_for_iter`")
+    };
+    // SAFETY: the running thread's interpreter, dormant while the helper
+    // runs; the stack slot keeps `g` alive.
+    let interp = unsafe { &mut *st.interp.cast_mut() };
+    match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+        crate::gen_fast::GenNext::Yielded(v) => {
+            // SAFETY: the slot above the iterator is free.
+            unsafe { out.write(v) };
+            1
+        }
+        crate::gen_fast::GenNext::Exhausted(_) => {
+            // SAFETY: the finished generator leaves the stack.
+            drop(unsafe { it.read() });
+            // SAFETY: the running thread's own flag.
+            if unsafe { (*st.maybe_dead).get() } {
+                // SAFETY: as `for_iter_gen_marked`'s.
+                return unsafe { for_iter_gen_marked(st, it, pc) };
+            }
+            2
+        }
+        crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
+            // SAFETY: as `for_iter_gen_switch`'s.
+            unsafe { for_iter_gen_switch(st, it, pc) }
+        }
+    }
+}
+
+/// [`h_for_iter_gen`] of a finished generator whose frame released
+/// something that queued a finalizer, which runs before the next
+/// instruction: the core loop takes over past the loop, synced as for a
+/// switch.
+///
+/// # Safety
+///
+/// `st` is a live state with a switch, `it` its stack slot the finished
+/// generator left, and `pc` its `FOR_ITER`'s.
+#[cold]
+#[inline(never)]
+unsafe fn for_iter_gen_marked(st: &mut State, it: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the running activation's frame and switch.
+    unsafe {
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        let code = &frame.code;
+        let mut to = pc as usize + 1 + code.instructions[pc as usize].arg as usize;
+        let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+        if op(to) == Some(OpCode::EndFor) {
+            to += 1;
+            if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
+                to += 1;
+            }
+        }
+        frame.stack.set_len(it.offset_from(st.stack) as usize);
+        frame.pc = to as u32;
+        *sw.last = pc as usize;
+        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+    }
+    FOR_SWITCHED
+}
+
+/// [`h_for_iter_gen`] of a generator its fast step declined (or left
+/// partway): resumed as an inline activation.
+///
+/// # Safety
+///
+/// `st` is a live state with a switch, `it` its stack slot holding the
+/// generator, and `pc` its `FOR_ITER`'s.
+#[inline(never)]
+unsafe fn for_iter_gen_switch(st: &mut State, it: *mut Object, pc: u64) -> u32 {
+    // SAFETY: the running thread's interpreter (as above), and the running
+    // activation's frame and switch; the stack is synced (the iterator on
+    // top) before the switch.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let sw = &mut *st.sw;
+        let frame = &mut *st.frame;
+        let len = it.offset_from(st.stack) as usize + 1;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *sw.last = st.last;
+        if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            return FOR_SWITCHED;
+        }
+        // A collapsed chain's fast step delivered the value without a
+        // switch (see `Interpreter::chain_step`).
+        if std::ptr::eq(sw.cur, st.frame) {
+            return if sw.pending.is_none() {
+                1
+            } else {
+                FOR_SWITCHED
+            };
+        }
+        // A compiled body runs from here; its yield (the value on top, past
+        // the instruction) or its return (the iterator gone, past the loop)
+        // continues this code natively.
+        if run_switched_directly(st) {
+            let frame = &*st.frame;
+            let at = frame.pc as usize;
+            let depth = frame.stack.len();
+            if at == pc as usize + 1 && depth == len + 1 {
+                return 1;
+            }
+            if depth == len - 1 && at == for_iter_exit(&frame.code, pc as usize) {
+                return 2;
+            }
+        }
+    }
+    FOR_SWITCHED
 }
 
 /// [`h_for_iter`]'s other shapes.
@@ -1323,89 +1587,10 @@ unsafe extern "C" fn h_for_iter_rest(
     let (st, top) = unsafe { (&mut *st, &*it) };
     let rc = match top {
         Object::Iter(rc) => rc,
-        // A generator: a simple body's step in place (see `gen_fast`),
-        // any other resumes as an inline activation, switched to as the
-        // core loop's arm does (not from a generator's own fast step).
-        Object::Generator(g) if !st.sw.is_null() => {
-            // SAFETY: the running thread's interpreter, dormant while the
-            // helper runs; the stack slot keeps `g` alive.
-            let interp = unsafe { &mut *st.interp.cast_mut() };
-            match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
-                crate::gen_fast::GenNext::Yielded(v) => {
-                    // SAFETY: the slot above the iterator is free.
-                    unsafe { out.write(v) };
-                    return 1;
-                }
-                crate::gen_fast::GenNext::Exhausted(_) => {
-                    // SAFETY: the finished generator leaves the stack.
-                    drop(unsafe { it.read() });
-                    // SAFETY: the running thread's own flag.
-                    if !unsafe { (*st.maybe_dead).get() } {
-                        return 2;
-                    }
-                    // Its frame released something that queued a finalizer,
-                    // which runs before the next instruction: the core loop
-                    // takes over past the loop, synced as for a switch.
-                    // SAFETY: as below.
-                    unsafe {
-                        let sw = &mut *st.sw;
-                        let frame = &mut *st.frame;
-                        let code = &frame.code;
-                        let mut to = pc as usize + 1 + code.instructions[pc as usize].arg as usize;
-                        let op = |pc: usize| code.instructions.get(pc).map(|i| i.op);
-                        if op(to) == Some(OpCode::EndFor) {
-                            to += 1;
-                            if matches!(op(to), Some(OpCode::PopIter | OpCode::PopTop)) {
-                                to += 1;
-                            }
-                        }
-                        frame.stack.set_len(it.offset_from(st.stack) as usize);
-                        frame.pc = to as u32;
-                        *sw.last = pc as usize;
-                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
-                    }
-                    return FOR_SWITCHED;
-                }
-                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
-            }
-            // SAFETY: the running activation's frame and switch; the
-            // stack is synced (the iterator on top) before the switch.
-            unsafe {
-                let sw = &mut *st.sw;
-                let frame = &mut *st.frame;
-                let len = it.offset_from(st.stack) as usize + 1;
-                frame.stack.set_len(len);
-                frame.pc = pc as u32;
-                *sw.last = st.last;
-                if !interp.core_gen_resume(sw, pc as usize, crate::InlineResume::ForIter) {
-                    sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
-                    return FOR_SWITCHED;
-                }
-                // A collapsed chain's fast step delivered the value without
-                // a switch (see `Interpreter::chain_step`).
-                if std::ptr::eq(sw.cur, st.frame) {
-                    return if sw.pending.is_none() {
-                        1
-                    } else {
-                        FOR_SWITCHED
-                    };
-                }
-                // A compiled body runs from here; its yield (the value on
-                // top, past the instruction) or its return (the iterator
-                // gone, past the loop) continues this code natively.
-                if run_switched_directly(st) {
-                    let frame = &*st.frame;
-                    let at = frame.pc as usize;
-                    let depth = frame.stack.len();
-                    if at == pc as usize + 1 && depth == len + 1 {
-                        return 1;
-                    }
-                    if depth == len - 1 && at == for_iter_exit(&frame.code, pc as usize) {
-                        return 2;
-                    }
-                }
-            }
-            return FOR_SWITCHED;
+        // A generator from a running activation (see `h_for_iter_gen`).
+        Object::Generator(_) if !st.sw.is_null() => {
+            // SAFETY: the caller's contract, the generator and switch checked.
+            return unsafe { h_for_iter_gen(st, it, out, pc) };
         }
         // A generator iterated from another generator's fast step: its own
         // fast step in place, nested one deeper, as the fast step's
@@ -5492,6 +5677,36 @@ unsafe extern "C" fn h_call(
             && !st.sw.is_null()
             && Interpreter::gen_send_call(&*base.add(start), &*base.add(start + 1))
         {
+            // A simple body steps to its next yield in place, as for
+            // `next(gen)` below.
+            if let (Some(g), true) = (
+                Interpreter::gen_send_target(
+                    &*base.add(start),
+                    &*base.add(start + 1),
+                    &*base.add(start + 2),
+                ),
+                Interpreter::core_drops_plain(),
+            ) {
+                let interp = &mut *st.interp.cast_mut();
+                let sent = crate::clone_hot(&*base.add(start + 2));
+                match interp.gen_fast_send(g, sent, st.snap_gen, 0, st.maybe_dead) {
+                    crate::gen_fast::GenNext::Yielded(v) => {
+                        crate::release_run(base.add(start), 3);
+                        base.add(start).write(v);
+                        st.len = start + 1;
+                        return 0;
+                    }
+                    // `send` raises `StopIteration(value)`.
+                    crate::gen_fast::GenNext::Exhausted(v) => {
+                        crate::release_run(base.add(start), 3);
+                        st.len = start;
+                        st.pc = pc + 1;
+                        st.err = Some(crate::error::stop_iteration_with(v));
+                        return RAISED;
+                    }
+                    crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {}
+                }
+            }
             sync(st);
             let sw = &mut *st.sw;
             let interp = &mut *st.interp.cast_mut();
@@ -6805,7 +7020,7 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
             Object::Type(t) => {
                 t.flags.is_builtin
                     && t.flags.is_exception
-                    && !t.is_subclass_of(&bt.base_exception_group)
+                    && crate::exc_family_flags(t) & crate::EXC_FAM_GROUP == 0
             }
             _ => false,
         };
@@ -7250,76 +7465,174 @@ fn compile_with(
     nlocals: usize,
     depths: &[i64],
 ) -> Option<Native> {
-    engine.module.clear_context(&mut engine.ctx);
-    let ptr = engine.ptr;
-    let sig = &mut engine.ctx.func.signature;
-    sig.params.push(AbiParam::new(ptr));
-    sig.returns.push(AbiParam::new(types::I32));
-    let signature = sig.clone();
-    let name = format!("wpframe_{}", engine.next);
-    engine.next += 1;
-    let id = engine
-        .module
-        .declare_function(&name, Linkage::Local, &engine.ctx.func.signature)
-        .ok()?;
-    let ninstrs = code.instructions.len();
+    let n = code.instructions.len();
     // The attribute sites' field caches (allocated here if no read has
     // recorded one yet: the code addresses them).
     let field_slots = ext.alloc_field_sites(code);
-    let mut entries: Vec<bool>;
-    let mut globals: Vec<Box<GlobalCache>>;
-    let mut slots: Vec<Box<SlotCache>>;
-    let mut methods: Vec<Box<MethodCache>>;
-    let mut direct: Vec<Box<DirectSite>>;
-    let mut builtin_sites: Vec<Box<BuiltinSite>>;
-    let mut type_sites: Vec<Box<TypeSite>>;
-    let mut held: Vec<Rc<crate::object::BuiltinFn>>;
-    let mut mods: Vec<Box<ModCache>>;
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
     // goes to its calls more than to the shortcuts in line.
     let mut lean = false;
-    let built = loop {
-        let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
-        let mut lower = Lower::new(b, ptr, engine.tags, code, ext, nlocals, depths, field_slots);
-        lower.cold = lean;
-        let done = lower.lower();
-        entries = (0..ninstrs).map(|pc| lower.enters_at(pc)).collect();
-        globals = std::mem::take(&mut lower.global_caches);
-        slots = std::mem::take(&mut lower.slot_caches);
-        methods = std::mem::take(&mut lower.method_caches);
-        direct = std::mem::take(&mut lower.direct_sites);
-        builtin_sites = std::mem::take(&mut lower.builtin_sites);
-        type_sites = std::mem::take(&mut lower.type_sites);
-        held = std::mem::take(&mut lower.held);
-        mods = std::mem::take(&mut lower.mod_caches);
+    let whole = loop {
+        let low = lower_range(engine, code, ext, nlocals, depths, field_slots, 0..n, lean)?;
         // (Measured as if every exit's tail were in line, the size the
         // threshold was tuned with.)
-        let size_in_line = lower.tail_savings;
+        if !lean && engine.ctx.func.dfg.num_insts() + low.tail_savings > lean_above() {
+            lean = true;
+            engine.release();
+            continue;
+        }
+        break low;
+    };
+    let total = engine.ctx.func.dfg.num_insts();
+    let limit = chunk_ir();
+    let ranges = (limit != 0 && total > limit)
+        .then(|| chunk_ranges(code, &whole.starts, &whole.sizes, total, limit))
+        .filter(|r| u8::try_from(r.len()).is_ok());
+    let Some(ranges) = ranges else {
+        let func = define(engine, code, lean, t0, None)?;
+        return Some(native(
+            code,
+            nlocals,
+            depths,
+            func,
+            Vec::new(),
+            Vec::new(),
+            whole.entries,
+            whole.caches,
+        ));
+    };
+    // Too large for one compile: each chunk lowered and compiled on its
+    // own (the whole body's lowering only measured them).
+    engine.release();
+    let mut entries = vec![false; n];
+    let mut chunk_at = vec![0u8; n];
+    let mut chunks = Vec::with_capacity(ranges.len());
+    let mut caches = Caches::default();
+    for (i, range) in ranges.into_iter().enumerate() {
+        let low = lower_range(
+            engine,
+            code,
+            ext,
+            nlocals,
+            depths,
+            field_slots,
+            range.clone(),
+            lean,
+        )?;
+        chunks.push(define(engine, code, lean, t0, Some(&range))?);
+        for pc in range {
+            entries[pc] = low.entries[pc];
+            chunk_at[pc] = i as u8;
+        }
+        caches.append(low.caches);
+    }
+    Some(native(
+        code, nlocals, depths, chunks[0], chunks, chunk_at, entries, caches,
+    ))
+}
+
+/// A lowering of a code's instructions in a range (see [`lower_range`]).
+struct Lowered {
+    /// Where its code enters, by pc.
+    entries: Vec<bool>,
+    /// Which instructions start blocks (in the whole code), and the IR
+    /// size of each block in the range, by its start.
+    starts: Vec<bool>,
+    sizes: Vec<u32>,
+    tail_savings: usize,
+    caches: Caches,
+}
+
+/// Lower `code`'s instructions in `range` (lean, when `lean`) into the
+/// engine's context, its function finalized: `None` when it can't be
+/// compiled (the context released).
+#[allow(clippy::too_many_arguments)]
+fn lower_range(
+    engine: &mut Engine,
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    nlocals: usize,
+    depths: &[i64],
+    field_slots: crate::Sites<'_, FieldSlot>,
+    range: std::ops::Range<usize>,
+    lean: bool,
+) -> Option<Lowered> {
+    engine.module.clear_context(&mut engine.ctx);
+    let ptr = engine.ptr;
+    let sig = &mut engine.ctx.func.signature;
+    sig.params.push(AbiParam::new(ptr));
+    sig.returns.push(AbiParam::new(types::I32));
+    let n = code.instructions.len();
+    let low = {
+        let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
+        let mut lower = Lower::new(
+            b,
+            ptr,
+            engine.tags,
+            code,
+            ext,
+            nlocals,
+            depths,
+            field_slots,
+            range,
+        );
+        lower.cold = lean;
+        let done = lower.lower();
+        let low = Lowered {
+            entries: (0..n).map(|pc| lower.enters_at(pc)).collect(),
+            starts: std::mem::take(&mut lower.starts),
+            sizes: std::mem::take(&mut lower.sizes),
+            tail_savings: lower.tail_savings,
+            caches: Caches {
+                globals: std::mem::take(&mut lower.global_caches),
+                slots: std::mem::take(&mut lower.slot_caches),
+                methods: std::mem::take(&mut lower.method_caches),
+                direct: std::mem::take(&mut lower.direct_sites),
+                builtin_sites: std::mem::take(&mut lower.builtin_sites),
+                type_sites: std::mem::take(&mut lower.type_sites),
+                held: std::mem::take(&mut lower.held),
+                mods: std::mem::take(&mut lower.mod_caches),
+            },
+        };
         if done {
             lower.b.seal_all_blocks();
             lower.b.finalize();
         }
-        if done && !lean && engine.ctx.func.dfg.num_insts() + size_in_line > lean_above() {
-            lean = true;
-            engine.release();
-            engine.ctx.func.signature = signature.clone();
-            continue;
-        }
-        break done;
+        done.then_some(low)
     };
-    if !built {
+    if low.is_none() {
         // An unfinished function leaves the builder's state behind.
         engine.release();
-        return None;
     }
+    low
+}
+
+/// Compile the function in the engine's context (the code's, or its
+/// chunk `range`'s) and release the context: its entry, or `None`.
+fn define(
+    engine: &mut Engine,
+    code: &CodeObject,
+    lean: bool,
+    t0: Option<std::time::Instant>,
+    range: Option<&std::ops::Range<usize>>,
+) -> Option<NativeFn> {
     if std::env::var("WEAVEPY_FRAME_JIT_DUMP").is_ok_and(|n| code.qualname.contains(&n)) {
         eprintln!("{}", engine.ctx.func.display());
     }
     let t1 = stats::enabled().then(std::time::Instant::now);
     let insts = engine.ctx.func.dfg.num_insts();
     let blocks = engine.ctx.func.dfg.num_blocks();
+    let name = format!("wpframe_{}", engine.next);
+    engine.next += 1;
+    let Ok(id) = engine
+        .module
+        .declare_function(&name, Linkage::Local, &engine.ctx.func.signature)
+    else {
+        engine.release();
+        return None;
+    };
     let defined = engine.module.define_function(id, &mut engine.ctx);
     if let (Some(t0), Some(t1)) = (t0, t1) {
         let bytes = engine
@@ -7327,8 +7640,9 @@ fn compile_with(
             .compiled_code()
             .map_or(0, |c| c.code_buffer().len());
         eprintln!(
-            "frame jit: {} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}, {bytes} bytes), compiled in {:?}",
+            "frame jit: {}{} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}, {bytes} bytes), compiled in {:?}",
             code.qualname,
+            range.map_or(String::new(), |r| format!(" [{}..{})", r.start, r.end)),
             t1 - t0,
             if lean { ", lean" } else { "" },
             t1.elapsed()
@@ -7346,9 +7660,24 @@ fn compile_with(
     let func = engine.module.get_finalized_function(id);
     // SAFETY: `func` is a finalized function with exactly the signature
     // declared above, and the module (never dropped) keeps it alive.
-    let func = unsafe { std::mem::transmute::<*const u8, NativeFn>(func) };
-    Some(Native {
+    Some(unsafe { std::mem::transmute::<*const u8, NativeFn>(func) })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native(
+    code: &CodeObject,
+    nlocals: usize,
+    depths: &[i64],
+    func: NativeFn,
+    chunks: Vec<NativeFn>,
+    chunk_at: Vec<u8>,
+    entries: Vec<bool>,
+    caches: Caches,
+) -> Native {
+    Native {
         func,
+        chunks: chunks.into(),
+        chunk_at: chunk_at.into(),
         nlocals,
         fails: entries.iter().map(|_| AtomicU8::new(0)).collect(),
         entries: entries.into_iter().map(AtomicBool::new).collect(),
@@ -7356,15 +7685,99 @@ fn compile_with(
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
         need: stack_need(depths),
-        _globals: globals,
-        _slots: slots,
-        _methods: methods,
-        _direct: direct,
-        _builtin_sites: builtin_sites,
-        _type_sites: type_sites,
-        _held: held,
-        _mods: mods,
-    })
+        _caches: caches,
+    }
+}
+
+/// The pc ranges a body too large for one compile (`total` IR
+/// instructions, more than `limit`) compiles in: runs of its blocks
+/// (`starts`, with `sizes` their IR sizes from the whole body's lowering),
+/// each at most `limit` instructions where its blocks allow, cut where
+/// jumps between chunks cost least. A jump between chunks costs a return
+/// and a call: a cut through straight-line code is taken about once a
+/// call, one through a loop once an iteration, and one through a nested
+/// loop more often still, so the cuts minimize the loops they cross
+/// (weighted by nesting), then their number.
+fn chunk_ranges(
+    code: &CodeObject,
+    starts: &[bool],
+    sizes: &[u32],
+    total: usize,
+    limit: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let n = starts.len();
+    let mut prefix = vec![0usize; n + 1];
+    for pc in 0..n {
+        prefix[pc + 1] = prefix[pc] + sizes.get(pc).copied().unwrap_or(0) as usize;
+    }
+    // The limit in the blocks' own measure (which leaves out the exits'
+    // shared tails).
+    let room = (limit * prefix[n] / total.max(1)).max(1);
+    // The back edges, as (target, source) pcs, each with its weight: four
+    // times the weight of the loop around it.
+    let mut loops: Vec<(usize, usize, u64)> = code
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.op == OpCode::JumpBackward)
+        .map(|(pc, i)| ((pc + 1).saturating_sub(i.arg as usize), pc, 0))
+        .collect();
+    for k in 0..loops.len() {
+        let (t, j, _) = loops[k];
+        let outer = loops
+            .iter()
+            .filter(|&&(t2, j2, _)| (t2, j2) != (t, j) && t2 <= t && j <= j2)
+            .count();
+        loops[k].2 = 16 << (2 * outer.min(20));
+    }
+    let cost = |c: usize| -> u64 {
+        1 + loops
+            .iter()
+            .filter(|&&(t, j, _)| t < c && c <= j)
+            .map(|&(_, _, w)| w)
+            .sum::<u64>()
+    };
+    // The cheapest cuts up to each block start (and the end), from the
+    // block starts no more than `room` before it (or the one just before,
+    // for a block larger than that).
+    let at: Vec<usize> = (0..n)
+        .filter(|&pc| pc == 0 || starts[pc])
+        .chain([n])
+        .collect();
+    let mut best: Vec<(u64, usize)> = vec![(0, 0); at.len()];
+    for j in 1..at.len() {
+        let here = if at[j] == n { 0 } else { cost(at[j]) };
+        best[j] = (u64::MAX, j - 1);
+        for i in (0..j).rev() {
+            if i + 1 < j && prefix[at[j]] - prefix[at[i]] > room {
+                break;
+            }
+            let c = best[i].0.saturating_add(here);
+            if c < best[j].0 {
+                best[j] = (c, i);
+            }
+        }
+    }
+    let mut cuts = vec![n];
+    let mut j = at.len() - 1;
+    while j > 0 {
+        j = best[j].1;
+        cuts.push(at[j]);
+    }
+    cuts.reverse();
+    if stats::enabled() {
+        let crossed: Vec<u64> = cuts[1..cuts.len() - 1]
+            .iter()
+            .map(|&c| cost(c) - 1)
+            .collect();
+        eprintln!(
+            "frame jit: {} cut at {:?} crossing {:?}",
+            code.qualname,
+            &cuts[1..cuts.len() - 1],
+            crossed
+        );
+    }
+    cuts.windows(2).map(|w| w[0]..w[1]).collect()
 }
 
 const FLAGS: MemFlags = MemFlags::trusted();
@@ -7440,8 +7853,16 @@ struct Lower<'a> {
     /// bound.
     maybe_unbound: Vec<bool>,
     bound: Vec<bool>,
-    /// Each block start's block (instruction index → block).
+    /// Each block start's block (instruction index → block), for the
+    /// starts in `range`.
     blocks: Vec<Option<Block>>,
+    /// Which instructions start blocks, in the whole code.
+    starts: Vec<bool>,
+    /// The instructions this lowering covers: the whole code, or a chunk
+    /// (see [`chunk_ranges`]).
+    range: std::ops::Range<usize>,
+    /// Each block's IR size, by its start.
+    sizes: Vec<u32>,
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
@@ -7615,6 +8036,7 @@ impl<'a> Lower<'a> {
         nlocals: usize,
         depths: &'a [i64],
         field_slots: crate::Sites<'a, FieldSlot>,
+        range: std::ops::Range<usize>,
     ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -7654,6 +8076,9 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
+            starts: Vec::new(),
+            range,
+            sizes: Vec::new(),
             dispatch: Block::from_u32(0),
             cold: false,
             vs: Vec::new(),
@@ -8086,6 +8511,8 @@ impl<'a> Lower<'a> {
                 self.store_last();
                 self.b.ins().jump(b, &[]);
             }
+            // Another chunk's block.
+            None if self.starts.get(pc).copied().unwrap_or(false) => self.exit(CHAIN, pc),
             None => self.exit(INTERP, pc),
         }
     }
@@ -8376,8 +8803,10 @@ impl<'a> Lower<'a> {
         }
         self.blocks = starts
             .iter()
-            .map(|&s| s.then(|| self.b.create_block()))
+            .enumerate()
+            .map(|(pc, &s)| (s && self.range.contains(&pc)).then(|| self.b.create_block()))
             .collect();
+        self.starts = starts;
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
@@ -8422,9 +8851,12 @@ impl<'a> Lower<'a> {
         }
         // The blocks: each from its start until it ends or the next block
         // starts.
+        self.sizes = vec![0; n];
         for start in 0..n {
             if let Some(blk) = self.blocks[start] {
+                let before = self.b.func.dfg.num_insts();
                 self.lower_block(start, blk);
+                self.sizes[start] = (self.b.func.dfg.num_insts() - before) as u32;
             }
         }
         self.side_exits();
@@ -8450,7 +8882,7 @@ impl<'a> Lower<'a> {
                 self.exit(INTERP, pc);
                 break;
             }
-            if self.blocks[pc].is_some() {
+            if self.starts[pc] {
                 self.goto(pc);
                 break;
             }
@@ -8810,7 +9242,7 @@ impl<'a> Lower<'a> {
                     && self.depth > fused_function_attrs(self.code, pc) =>
             {
                 let k = fused_function_attrs(self.code, pc);
-                if self.blocks.get(pc + 1 + k).copied().flatten().is_none() {
+                if !self.starts.get(pc + 1 + k).copied().unwrap_or(false) {
                     self.exit(INTERP, pc);
                     return false;
                 }
@@ -8900,12 +9332,56 @@ impl<'a> Lower<'a> {
             OpCode::LoadDeref => {
                 let s = self.depth;
                 let dst = self.slot_addr(s);
+                let slow = self.b.create_block();
+                let done = self.b.create_block();
+                if let (Some(cl), false) = (self.tags.cell_layout, self.cold) {
+                    // The cell's value in line: its index in range, the
+                    // cell not mutably borrowed (nor cells shared), and
+                    // its value bound.
+                    let frame = self.b.ins().load(self.ptr, FLAGS, self.st, S_FRAME);
+                    let cells = self.b.ins().load(self.ptr, FLAGS, frame, cl.frame_cells);
+                    let len = self.b.ins().load(types::I64, FLAGS, cells, cl.vec_len);
+                    let outside = self.b.ins().icmp_imm(
+                        IntCC::UnsignedLessThanOrEqual,
+                        len,
+                        i64::from(ins.arg),
+                    );
+                    self.branch_out(outside, slow);
+                    let items = self.b.ins().load(self.ptr, FLAGS, cells, cl.vec_ptr);
+                    let cell = self
+                        .b
+                        .ins()
+                        .load(self.ptr, FLAGS, items, 8 * ins.arg as i32);
+                    let flag = self
+                        .b
+                        .ins()
+                        .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
+                    let unguarded = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+                    self.branch_out(unguarded, slow);
+                    let borrow = self.b.ins().load(types::I32, FLAGS, cell, cl.borrow);
+                    let held = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    self.branch_out(held, slow);
+                    let value = self.b.ins().iadd_imm(cell, i64::from(cl.value));
+                    let tag = self.tag_at(value);
+                    let unbound =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.unbound));
+                    self.branch_out(unbound, slow);
+                    self.copy_value(dst, value);
+                    self.b.ins().jump(done, &[]);
+                } else {
+                    self.b.ins().jump(slow, &[]);
+                }
+                self.b.switch_to_block(slow);
                 let i = self.b.ins().iconst(types::I64, i64::from(ins.arg));
                 let r = self
                     .call(h_load_deref as *const () as usize, &[self.st, i, dst], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
                 self.branch_out(r, out);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(done);
                 self.push(Item::Mem(s));
                 true
             }
@@ -9193,7 +9669,7 @@ impl<'a> Lower<'a> {
             }
             k += 1;
         };
-        if call_pc + 1 >= n || self.blocks.get(call_pc + 1).copied().flatten().is_none() {
+        if call_pc + 1 >= n || !self.starts.get(call_pc + 1).copied().unwrap_or(false) {
             return;
         }
         let Some((tag, kind, f)) = crate::builtin_method_site(self.ext, pc + 1, call_pc) else {
@@ -9506,6 +9982,38 @@ impl<'a> Lower<'a> {
         let c1 = self.b.ins().iadd_imm(c, -1);
         self.b.ins().store(FLAGS, c1, w, 0);
         self.b.ins().jump(fast, &[]);
+    }
+
+    /// Release the counted heap value at `at` (tagged `tag`) by a plain
+    /// decrement when another owner keeps it alive and nothing observes
+    /// releases; anything else jumps to `slow`, having changed nothing.
+    fn shared_dec(&mut self, at: Value, tag: Value, slow: Block) {
+        let dec = self.b.create_block();
+        let counted = self.b.create_block();
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, tag);
+        let rc = self
+            .b
+            .ins()
+            .band_imm(bit, self.tags.rc_counted | self.tags.rc_counted_hdr);
+        let rc = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+        // The single-thread bias, and the release observers, all off.
+        let addr = self
+            .b
+            .ins()
+            .iconst(self.ptr, crate::plain_release_gate() as i64);
+        let on = self.b.ins().load(types::I32, FLAGS, addr, 0);
+        let off = self.b.ins().icmp_imm(IntCC::Equal, on, 0);
+        let quiet = self.b.ins().band(rc, off);
+        self.b.ins().brif(quiet, counted, &[], slow, &[]);
+        self.b.switch_to_block(counted);
+        let w = self.count_addr(at, bit);
+        let c = self.b.ins().load(types::I64, FLAGS, w, 0);
+        let shared = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, c, 1);
+        self.b.ins().brif(shared, dec, &[], slow, &[]);
+        self.b.switch_to_block(dec);
+        let c1 = self.b.ins().iadd_imm(c, -1);
+        self.b.ins().store(FLAGS, c1, w, 0);
     }
 
     /// `STORE_FAST i` of the value at stack `slot` (just above the
@@ -9980,12 +10488,14 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// `local[i]` of a list or tuple local and an `int` index, in line:
-    /// the item is read in place (the local gives no reference to take or
-    /// release) and copied to the stack. Any other operands (a `str` or a
-    /// dict, a borrowed list, an index out of range) take the in-place
-    /// helper, as [`Self::subscr_ref`] does. `false`, emitting nothing, for
-    /// other operand shapes.
+    /// `c[i]` of a list or tuple `c` and an `int` index, in line: the item
+    /// is read in place and copied to the stack. `c` is a local (which
+    /// gives no reference to take or release) or a value on the stack
+    /// that another owner keeps alive (it leaves by a plain decrement).
+    /// Any other operands (a `str` or a dict, a borrowed list, an index
+    /// out of range, a container this release would free) take the
+    /// in-place helper, as [`Self::subscr_ref`] does. `false`, emitting
+    /// nothing, for other operand shapes.
     fn seq_index(&mut self, pc: usize) -> bool {
         let (Some(list), Some((tlen, titems))) = (self.tags.list_layout, self.tags.tuple_layout)
         else {
@@ -9996,8 +10506,11 @@ impl<'a> Lower<'a> {
             return false;
         }
         let (cont, key) = (self.vs[n - 2], self.vs[n - 1]);
-        let Item::Local(l) = cont else {
-            return false;
+        let base = self.depth - n;
+        let local = match cont {
+            Item::Local(l) => Some(l),
+            Item::Mem(s) if s == base + n - 2 => None,
+            _ => return false,
         };
         let int_key = match key {
             Item::Int(_) | Item::Local(_) | Item::Dyn(..) => true,
@@ -10022,7 +10535,10 @@ impl<'a> Lower<'a> {
                 .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.int));
             self.branch_out(other, slow);
         }
-        let addr = self.local_addr(l);
+        let addr = match local {
+            Some(l) => self.local_addr(l),
+            None => self.slot_addr(slot),
+        };
         let tag = self.tag_at(addr);
         let word = self.b.ins().load(self.ptr, FLAGS, addr, 8);
         let as_list = self.b.create_block();
@@ -10069,6 +10585,11 @@ impl<'a> Lower<'a> {
         let i = self.b.ins().select(neg, wrapped, i);
         let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, len);
         self.branch_out(outside, slow);
+        if local.is_none() {
+            // The container's own slot gives up its reference, which
+            // another owner backs: the item takes the slot.
+            self.shared_dec(addr, tag, slow);
+        }
         let off = self.b.ins().ishl_imm(i, 4);
         let item = self.b.ins().iadd(items, off);
         let dst = self.slot_addr(slot);
@@ -11696,7 +12217,7 @@ impl<'a> Lower<'a> {
     /// leaves at the `BUILD_MAP`, where the core loop runs it.
     fn call_forward(&mut self, pc: usize) -> bool {
         let after = self.depths.get(pc + 4).copied().unwrap_or(-1);
-        if after < 0 || self.depth < 3 || self.blocks.get(pc + 4).copied().flatten().is_none() {
+        if after < 0 || self.depth < 3 || !self.starts.get(pc + 4).copied().unwrap_or(false) {
             return self.build_map(pc, 0);
         }
         self.flush();

@@ -410,6 +410,16 @@ pub(crate) fn object_vec_cell_offsets() -> (usize, usize) {
     )
 }
 
+/// [`object_vec_cell_offsets`] for a cell holding one object (a closure
+/// cell): its borrow counter's and value's byte offsets.
+pub(crate) fn object_cell_offsets() -> (usize, usize) {
+    type Cell = GilCell<crate::object::Object>;
+    (
+        std::mem::offset_of!(Cell, borrow),
+        std::mem::offset_of!(Cell, data),
+    )
+}
+
 /// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
 /// nonzero once cells are shared between threads).
 pub(crate) fn cells_unguarded_flag() -> *const bool {
