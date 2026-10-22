@@ -59063,12 +59063,17 @@ impl Interpreter {
         // A generator-family body's activations never start at pc 0, where
         // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
         // the creation of one that awaits or delegates counts instead (its
-        // `SEND`s run natively; a plain generator's body still warms by
-        // its loops and fast steps, which pays off more reliably).
+        // `SEND`s run natively), as does a loop-free one's (a
+        // `@contextmanager` body, which has no loop to warm it and runs
+        // once per creation); a looping plain generator's body still warms
+        // by its loops and fast steps, which pays off more reliably.
         #[cfg(feature = "jit")]
         if let Some(ext) = code_vm_ext(code) {
             let start = ext.gen_start.load(std::sync::atomic::Ordering::Relaxed);
-            if code.is_coroutine || (start != u32::MAX && start & GEN_DELEGATES != 0) {
+            if code.is_coroutine
+                || (start != u32::MAX && start & GEN_DELEGATES != 0)
+                || code.jit_hint.loop_free(code)
+            {
                 ext.frame_jit
                     .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
             }
