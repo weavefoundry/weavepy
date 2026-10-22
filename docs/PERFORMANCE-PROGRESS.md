@@ -154,6 +154,14 @@ branch and pull request.
   Instructions: `sudoku` 0.892, `nqueens` 0.958, geomean 0.988. It adds
   about 1,100 lines.
 
+- **RFC 0078 stage 1** (PR #93, `perf/activation-stack`). A frame's
+  operand stack and locals are types of their own (`frame_slots.rs`):
+  `FrameStack` with the operations frames use, `FrameLocals` with each
+  way the VM reaches the locals named (`shared()` for frame objects and
+  shells, unguarded `slots()` and `as_mut_ptr()`, and `storage()`, the
+  vector itself, at 29 binding sites that stage 2 replaces). Neutral
+  (instructions 0.997).
+
 **Checkpoint, PRs #86 to #92 merged together** (PGO, October 21, before
 #91's cost-aware cuts): against CPython, warm 1.24 to 1.27 (two runs),
 cold 1.45, peak RSS 1.62 (from 1.276, 1.506 and 1.710). Head to head with
@@ -212,7 +220,7 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. RFC 0078, stage 1 onward: one activation stack for the interpreter,
+1. RFC 0078, stage 2 onward: one activation stack for the interpreter,
    the frame JIT and generators (calls, resumes and exceptional returns
    are the largest remaining bucket).
 2. Generator expressions without a throwaway function object (about 5%
