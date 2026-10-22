@@ -281,20 +281,6 @@ fn b_dyn(
     }))
 }
 
-/// Like [`b_dyn`] but kwargs-aware — CPython's `lock.acquire` accepts
-/// `blocking=` / `timeout=` by keyword, and the verbatim `threading.py`
-/// relies on it.
-fn b_dyn_kw(
-    name: &'static str,
-    body: impl Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
-        + Send
-        + Sync
-        + Clone
-        + 'static,
-) -> Object {
-    Object::Builtin(Rc::new(BuiltinFn::with_kwargs(name, body)))
-}
-
 /// Resolve the `(blocking, timeout_obj)` pair for a lock `acquire`
 /// call from positional `(blocking, timeout)` and/or the `blocking=`,
 /// `timeout=` keyword forms.
@@ -351,110 +337,205 @@ fn resolve_acquire_args(
 /// internal nanosecond deadline without overflow.
 const TIMEOUT_MAX_SECS: f64 = 9_223_372_036.0;
 
-/// A *type-level* trampoline for a special method whose real implementation
-/// lives in the **instance** dict.
-///
-/// The lock / RLock methods capture per-instance `Arc<RealLock>` state in
-/// closures, so they're stored on each instance rather than the shared type.
-/// CPython, however, exposes a lock's `__enter__`/`__exit__` on the *type* —
-/// and the implicit context-manager protocol is a *type-only* lookup
-/// (`_PyType_Lookup`, which a Cython `with` statement performs directly). This
-/// trampoline lives on the type, recovers `self` (the bound instance), and
-/// forwards to that instance's own closure, so both the VM's instance-dict
-/// path and a C extension's type-level lookup reach the identical
-/// implementation.
-/// Where a trampoline last found its instance-dict entry: the name's hash
-/// (computed on first use; `0` is "not yet") and the entry's position.
-/// Every lock's dict is built in the same order, so the position settles a
-/// lookup with one key comparison.
-#[derive(Default)]
-struct ClosureSite {
-    hash: std::sync::atomic::AtomicI64,
-    at: std::sync::atomic::AtomicUsize,
+// ---- lock objects ----
+//
+// CPython's `_thread.lock` and `_thread.RLock` are C objects whose methods
+// live on their type. Here an instance keeps its native lock in a hidden
+// slot (it has no `__dict__` entries), and the type's methods reach it
+// there: `with lock:` is a type-level `__enter__`/`__exit__` call, which
+// the dispatch loop's leaf lanes run in line whenever it can't block.
+
+/// The hidden slot a lock instance lays out: its keeper (see [`keeper`]).
+const LOCK_SLOT: &str = "__wp_lock__";
+
+fn lock_layout() -> &'static crate::shared_value::SharedSlice<DictKey> {
+    static LAYOUT: OnceLock<crate::shared_value::SharedSlice<DictKey>> = OnceLock::new();
+    LAYOUT.get_or_init(|| vec![crate::types::slot_key(LOCK_SLOT)].into())
 }
 
-/// The instance-dict entry `name` of `inst`, at the position `site` last
-/// found it in, else probed with `name`'s hash.
-fn instance_closure(
-    inst: &crate::types::PyInstance,
-    name: &'static str,
-    site: &ClosureSite,
-) -> Option<Object> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let at = site.at.load(Relaxed);
-    // SAFETY: a read under the GIL that ends before anything else runs.
-    if let Some(d) = inst.dict.published().and_then(|d| unsafe { d.peek() }) {
-        if let Some((DictKey(Object::Str(k)), v)) = d.get_index(at) {
-            // (A short name compared in line, without `memcmp`.)
-            let (k, n) = (k.as_bytes(), name.as_bytes());
-            if k.len() == n.len() && k.iter().zip(n).all(|(a, b)| a == b) {
-                return Some(v.clone());
-            }
-        }
-    }
-    let d = inst.dict_cell().borrow();
-    let mut h = site.hash.load(Relaxed);
-    if h == 0 {
-        h = crate::object::py_str_hash(name);
-        site.hash.store(h, Relaxed);
-    }
-    let (i, _, v) = d.get_full(&crate::object::StrKeyHashed { s: name, hash: h })?;
-    site.at.store(i, Relaxed);
-    Some(v.clone())
-}
+/// The keepers' names, which tell a `lock`'s from an `RLock`'s (compared
+/// by address: nothing else builds a builtin named by these statics).
+static LOCK_KEEPER: &str = "_thread.lock state";
+static RLOCK_KEEPER: &str = "_thread.RLock state";
 
-fn instance_dunder_trampoline(name: &'static str) -> Object {
-    let site = ClosureSite::default();
+/// The builtin that owns a lock instance's native lock: called, it
+/// answers the lock's address. It lives only in the instance's hidden
+/// slot, which no attribute access reaches.
+fn keeper<T: Send + Sync + 'static>(name: &'static str, lock: Arc<T>) -> Object {
+    let addr = Arc::as_ptr(&lock) as usize;
     Object::Builtin(Rc::new(BuiltinFn {
         name,
-        binds_instance: true,
-        call: Box::new(move |args: &[Object]| -> Result<Object, RuntimeError> {
-            let Some(Object::Instance(inst)) = args.first() else {
-                return Err(type_error(format!("{name}() requires an instance")));
-            };
-            let closure = instance_closure(inst, name, &site);
-            match closure {
-                Some(Object::Builtin(b)) => (b.call)(&args[1..]),
-                _ => Err(type_error(format!("instance has no {name}"))),
-            }
+        binds_instance: false,
+        call: Box::new(move |_| {
+            let _owned = &lock;
+            Ok(Object::Int(addr as i64))
         }),
         call_kw: None,
     }))
 }
 
-/// Like [`instance_dunder_trampoline`] but for the ordinary method
-/// surface (`acquire`/`release`/…), kwargs included. gevent's
-/// `_threading.acquire_with_timeout` swizzles itself to
-/// `type(lock).acquire` and calls it *unbound* —
-/// `type(lock).acquire(lock, timeout=-1)` — so the methods must be
-/// reachable via the type, not just the instance dict (RFC 0072 WS2).
-fn instance_method_trampoline(name: &'static str) -> Object {
-    // (Shared by both halves below.)
-    let site = std::sync::Arc::new(ClosureSite::default());
-    let forward =
-        move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
-            let Some(Object::Instance(inst)) = args.first() else {
-                return Err(type_error(format!(
-                    "descriptor '{name}' requires a lock instance"
-                )));
-            };
-            let closure = instance_closure(inst, name, &site);
-            match closure {
-                Some(Object::Builtin(b)) => match &b.call_kw {
-                    Some(kw) => kw(&args[1..], kwargs),
-                    None if kwargs.is_empty() => (b.call)(&args[1..]),
-                    None => Err(type_error(format!("{name}() takes no keyword arguments"))),
-                },
-                _ => Err(type_error(format!("instance has no {name}"))),
-            }
-        };
-    let forward_pos = forward.clone();
+/// A lock instance's native lock, kept alive by the keeper that owns it.
+struct Held<T: 'static> {
+    _keeper: Rc<BuiltinFn>,
+    lock: *const T,
+}
+
+impl<T> std::ops::Deref for Held<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the keeper owns the `Arc` this points into (see `keeper`),
+        // and `self` holds the keeper.
+        unsafe { &*self.lock }
+    }
+}
+
+/// The native lock of `obj`, an instance whose hidden slot holds a keeper
+/// named `name`.
+fn held<T: 'static>(obj: &Object, name: &'static str) -> Option<Held<T>> {
+    let Object::Instance(inst) = obj else {
+        return None;
+    };
+    let pick = |s: &crate::types::SlotStorage| match s.get_hinted(0, LOCK_SLOT) {
+        Some(Object::Builtin(b)) if std::ptr::eq(b.name, name) => Some(b.clone()),
+        _ => None,
+    };
+    // SAFETY: a read of one slot that runs no code.
+    let keeper = match unsafe { inst.slots.peek() } {
+        Some(slots) => pick(slots),
+        None => pick(&*inst.slots.try_borrow().ok()?),
+    }?;
+    let Ok(Object::Int(addr)) = (keeper.call)(&[]) else {
+        return None;
+    };
+    Some(Held {
+        _keeper: keeper,
+        lock: addr as usize as *const T,
+    })
+}
+
+/// A `TypeError` for a lock method called on something else.
+fn not_a_lock(method: &str, cls: &str, recv: Option<&Object>) -> RuntimeError {
+    match recv {
+        Some(obj) => type_error(format!(
+            "descriptor '{method}' for '_thread.{cls}' objects doesn't apply to a '{}' object",
+            crate::builtins::class_of(obj).name
+        )),
+        None => type_error(format!(
+            "unbound method {cls}.{method}() needs an argument"
+        )),
+    }
+}
+
+/// The receiver's native lock, for `lock` method `method`.
+fn lock_of(args: &[Object], method: &str) -> Result<Held<RealLock>, RuntimeError> {
+    args.first()
+        .and_then(|o| held(o, LOCK_KEEPER))
+        .ok_or_else(|| not_a_lock(method, "lock", args.first()))
+}
+
+/// The receiver's native lock, for `RLock` method `method`.
+fn rlock_of(args: &[Object], method: &str) -> Result<Held<RealRLock>, RuntimeError> {
+    args.first()
+        .and_then(|o| held(o, RLOCK_KEEPER))
+        .ok_or_else(|| not_a_lock(method, "RLock", args.first()))
+}
+
+/// A type-level lock method.
+fn lock_method(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: true,
-        call: Box::new(move |args| forward_pos(args, &[])),
-        call_kw: Some(Box::new(forward)),
+        call: Box::new(body),
+        call_kw: None,
     }))
+}
+
+/// A type-level lock method that takes keywords.
+fn lock_method_kw(
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |args| body(args, &[])),
+        call_kw: Some(Box::new(body)),
+    }))
+}
+
+// `lock`'s methods (the argument lists start with the lock).
+
+fn lock_acquire(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let lock = lock_of(args, "acquire")?;
+    let (blocking, timeout_obj) = resolve_acquire_args(&args[1..], kwargs)?;
+    let timeout = parse_timeout(timeout_obj.as_ref());
+    let me = crate::gil::current_thread_id();
+    if !blocking {
+        return Ok(Object::Bool(lock.try_acquire(me)));
+    }
+    // RFC 0025: drop the GIL across the blocking acquire so other threads
+    // (including the one holding the lock) can run. Without this,
+    // `Thread.join` would deadlock — the joining thread sits in
+    // `acquire()` with the GIL held, and the worker can never run
+    // `_delete()` to release.
+    match timeout {
+        Some(Duration::ZERO) => Ok(Object::Bool(lock.try_acquire(me))),
+        timeout => Ok(Object::Bool(lock_acquire_interruptible(&lock, me, timeout)?)),
+    }
+}
+
+/// `lock.acquire()`'s and `lock.__enter__()`'s leaf half: an uncontended
+/// acquire (anything else may block, which only the full call does).
+fn lock_try_acquire_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
+    };
+    let lock = held::<RealLock>(recv, LOCK_KEEPER)?;
+    lock.try_acquire(crate::gil::current_thread_id())
+        .then_some(Ok(Object::Bool(true)))
+}
+
+fn lock_release(args: &[Object]) -> Result<Object, RuntimeError> {
+    lock_of(args, "release")?.release().map_err(runtime_error)?;
+    Ok(Object::None)
+}
+
+fn lock_locked(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(lock_of(args, "locked")?.is_locked()))
+}
+
+fn lock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = lock_of(args, "__enter__")?;
+    // `with lock:` is just `lock.acquire()`: try under the GIL, and only
+    // drop it to block on a foreign owner. Blocking while *holding* the
+    // GIL would deadlock the whole interpreter (the owner that would
+    // release the lock could never run).
+    lock_acquire_blocking(&lock, crate::gil::current_thread_id());
+    Ok(Object::Bool(true))
+}
+
+fn lock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = lock_of(args, "__exit__")?.release();
+    Ok(Object::Bool(false))
+}
+
+fn lock_at_fork_reinit(args: &[Object]) -> Result<Object, RuntimeError> {
+    lock_of(args, "_at_fork_reinit")?.force_reset();
+    Ok(Object::None)
+}
+
+/// `type(lock).__repr__` — CPython renders
+/// `<unlocked _thread.lock object at 0x...>` (or `locked`).
+fn lock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = lock_of(args, "__repr__")?;
+    let st = if lock.is_locked() { "locked" } else { "unlocked" };
+    let addr = match &args[0] {
+        Object::Instance(inst) => Rc::as_ptr(inst) as usize,
+        _ => 0,
+    };
+    Ok(Object::from_str(format!(
+        "<{st} _thread.lock object at 0x{addr:x}>"
+    )))
 }
 
 /// Returns the user-visible "lock" type. Built lazily so
@@ -469,40 +550,39 @@ fn lock_type() -> Rc<TypeObject> {
             DictKey(Object::from_static("__module__")),
             Object::from_static("_thread"),
         );
-        d.insert(
-            DictKey(Object::from_static("__repr__")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__repr__",
-                binds_instance: true,
-                call: Box::new(lock_repr),
-                call_kw: None,
-            })),
-        );
-        // Expose the context-manager protocol on the *type* (CPython's
-        // `_thread.lock` does), so a C extension's type-only `_PyType_Lookup`
-        // for `with lock:` finds them. They forward to the per-instance
-        // closures that hold the `Arc<RealLock>`.
-        d.insert(
-            DictKey(Object::from_static("__enter__")),
-            instance_dunder_trampoline("__enter__"),
-        );
-        d.insert(
-            DictKey(Object::from_static("__exit__")),
-            instance_dunder_trampoline("__exit__"),
-        );
-        for name in [
-            "acquire",
-            "release",
-            "locked",
-            "acquire_lock",
-            "release_lock",
-            "locked_lock",
-            "_at_fork_reinit",
+        let acquire = lock_method_kw("acquire", lock_acquire);
+        let release = lock_method("release", lock_release);
+        let locked = lock_method("locked", lock_locked);
+        let enter = lock_method("__enter__", lock_enter);
+        let exit = lock_method("__exit__", lock_exit);
+        // None of these runs Python code; the acquires' leaf halves take
+        // only an uncontended lock (blocking is the full call's).
+        for m in [&release, &locked, &exit] {
+            if let Object::Builtin(b) = m {
+                crate::leaf_builtins::register(b);
+            }
+        }
+        for m in [&acquire, &enter] {
+            if let Object::Builtin(b) = m {
+                crate::leaf_builtins::register_fast(b, lock_try_acquire_leaf);
+            }
+        }
+        for (name, m) in [
+            ("__repr__", lock_method("__repr__", lock_repr)),
+            ("__enter__", enter),
+            ("__exit__", exit),
+            ("acquire", acquire.clone()),
+            ("acquire_lock", acquire),
+            ("release", release.clone()),
+            ("release_lock", release),
+            ("locked", locked.clone()),
+            ("locked_lock", locked),
+            (
+                "_at_fork_reinit",
+                lock_method("_at_fork_reinit", lock_at_fork_reinit),
+            ),
         ] {
-            d.insert(
-                DictKey(Object::from_static(name)),
-                instance_method_trampoline(name),
-            );
+            d.insert(DictKey(Object::from_static(name)), m);
         }
         let t = TypeObject::new_with_flags(
             "lock",
@@ -519,29 +599,136 @@ fn lock_type() -> Rc<TypeObject> {
     })
 }
 
-/// `type(lock).__repr__` — CPython renders
-/// `<unlocked _thread.lock object at 0x...>` (or `locked`). The lock
-/// state is read back through the instance's own `locked()` method.
-fn lock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
-    let Some(Object::Instance(inst)) = args.first() else {
-        return Err(type_error("__repr__ requires a lock instance"));
+// `RLock`'s methods.
+
+fn rlock_acquire(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "acquire")?;
+    let (blocking, timeout_obj) = resolve_acquire_args(&args[1..], kwargs)?;
+    let timeout = parse_timeout(timeout_obj.as_ref());
+    let me = crate::gil::current_thread_id();
+    if !blocking {
+        return Ok(Object::Bool(lock.try_acquire(me)));
+    }
+    // Mirror the non-reentrant lock's GIL-drop behaviour (RFC 0025) — a
+    // reentrant acquire by the owning thread is a cheap counter bump and
+    // doesn't need the drop, but the blocking-on-foreign-owner case
+    // absolutely does.
+    match timeout {
+        Some(Duration::ZERO) => Ok(Object::Bool(lock.try_acquire(me))),
+        timeout => Ok(Object::Bool(rlock_acquire_interruptible(&lock, me, timeout)?)),
+    }
+}
+
+/// `RLock.acquire()`'s and `RLock.__enter__()`'s leaf half: an acquire
+/// that needn't wait (a free lock, or a reentrant one).
+fn rlock_try_acquire_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
     };
-    let locked_fn = inst
-        .dict_cell()
-        .borrow()
-        .get(&DictKey(Object::from_static("locked")))
-        .cloned();
-    let is_locked = matches!(
-        locked_fn.and_then(|f| match f {
-            Object::Builtin(b) => (b.call)(&[]).ok(),
-            _ => None,
-        }),
-        Some(Object::Bool(true))
-    );
-    let st = if is_locked { "locked" } else { "unlocked" };
-    let addr = Rc::as_ptr(inst) as usize;
+    let lock = held::<RealRLock>(recv, RLOCK_KEEPER)?;
+    lock.try_acquire(crate::gil::current_thread_id())
+        .then_some(Ok(Object::Bool(true)))
+}
+
+fn rlock_release(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "release")?;
+    lock.release(crate::gil::current_thread_id())
+        .map_err(runtime_error)?;
+    Ok(Object::None)
+}
+
+fn rlock_is_owned(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "_is_owned")?;
+    Ok(Object::Bool(lock.is_owned_by(crate::gil::current_thread_id())))
+}
+
+fn rlock_locked(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(rlock_of(args, "locked")?.depth() > 0))
+}
+
+// CPython's RLock exposes `_release_save` / `_acquire_restore` so
+// `Condition.wait()` can drop the *entire* reentrant hold and later
+// restore it. The opaque "state" is just the saved recursion count.
+fn rlock_release_save(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "_release_save")?;
+    let me = crate::gil::current_thread_id();
+    // CPython raises `RuntimeError("cannot release un-acquired lock")` if
+    // the calling thread doesn't hold the RLock.
+    if !lock.is_owned_by(me) {
+        return Err(runtime_error("cannot release un-acquired lock"));
+    }
+    let count = lock.depth();
+    for _ in 0..count {
+        lock.release(me).map_err(runtime_error)?;
+    }
+    Ok(Object::Int(count as i64))
+}
+
+fn rlock_acquire_restore(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "_acquire_restore")?;
+    let me = crate::gil::current_thread_id();
+    let count = match args.get(1) {
+        Some(Object::Int(n)) => *n,
+        _ => 1,
+    };
+    if count >= 1 {
+        // First reacquire may block on a foreign owner (drop GIL); the
+        // remaining holds are reentrant and cheap.
+        rlock_acquire_blocking(&lock, me);
+        for _ in 1..count {
+            lock.acquire(me);
+        }
+    }
+    Ok(Object::None)
+}
+
+/// `_recursion_count()` — CPython returns the owning thread's acquisition
+/// depth, or 0 when the caller isn't the owner.
+fn rlock_recursion_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "_recursion_count")?;
+    let n = if lock.is_owned_by(crate::gil::current_thread_id()) {
+        lock.depth()
+    } else {
+        0
+    };
+    Ok(Object::Int(n as i64))
+}
+
+fn rlock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "__enter__")?;
+    // See the non-reentrant lock's `__enter__`: blocking on the acquire
+    // while holding the GIL deadlocks the interpreter. A reentrant
+    // re-acquire by the owner is cheap, but the foreign-owner case must
+    // drop the GIL.
+    rlock_acquire_blocking(&lock, crate::gil::current_thread_id());
+    Ok(Object::Bool(true))
+}
+
+fn rlock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "__exit__")?;
+    let _ = lock.release(crate::gil::current_thread_id());
+    Ok(Object::Bool(false))
+}
+
+fn rlock_at_fork_reinit(args: &[Object]) -> Result<Object, RuntimeError> {
+    rlock_of(args, "_at_fork_reinit")?.force_reset();
+    Ok(Object::None)
+}
+
+/// `type(RLock).__repr__` — 3.14's
+/// `<unlocked _thread.RLock object owner=0 count=0 at 0x...>` (or
+/// `locked`, with the owning thread id and recursion depth; gh-134322,
+/// `lock_tests.RLockTests.test_repr_count`).
+fn rlock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let lock = rlock_of(args, "__repr__")?;
+    let (owner, count) = lock.owner_and_depth();
+    let st = if count > 0 { "locked" } else { "unlocked" };
+    let addr = match &args[0] {
+        Object::Instance(inst) => Rc::as_ptr(inst) as usize,
+        _ => 0,
+    };
     Ok(Object::from_str(format!(
-        "<{st} _thread.lock object at 0x{addr:x}>"
+        "<{st} _thread.RLock object owner={owner} count={count} at 0x{addr:x}>"
     )))
 }
 
@@ -555,39 +742,48 @@ fn rlock_type() -> Rc<TypeObject> {
             DictKey(Object::from_static("__module__")),
             Object::from_static("_thread"),
         );
-        d.insert(
-            DictKey(Object::from_static("__repr__")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__repr__",
-                binds_instance: true,
-                call: Box::new(rlock_repr),
-                call_kw: None,
-            })),
-        );
-        // Same as `lock`: surface the context-manager protocol on the type so
-        // `with rlock:` resolves through a C extension's type-only lookup.
-        d.insert(
-            DictKey(Object::from_static("__enter__")),
-            instance_dunder_trampoline("__enter__"),
-        );
-        d.insert(
-            DictKey(Object::from_static("__exit__")),
-            instance_dunder_trampoline("__exit__"),
-        );
-        for name in [
-            "acquire",
-            "release",
-            "locked",
-            "_is_owned",
-            "_release_save",
-            "_acquire_restore",
-            "_recursion_count",
-            "_at_fork_reinit",
+        let acquire = lock_method_kw("acquire", rlock_acquire);
+        let release = lock_method("release", rlock_release);
+        let is_owned = lock_method("_is_owned", rlock_is_owned);
+        let locked = lock_method("locked", rlock_locked);
+        let count = lock_method("_recursion_count", rlock_recursion_count);
+        let enter = lock_method("__enter__", rlock_enter);
+        let exit = lock_method("__exit__", rlock_exit);
+        // As `lock`'s: no Python code runs, and the acquires' leaf halves
+        // take only a lock that needn't wait.
+        for m in [&release, &is_owned, &locked, &count, &exit] {
+            if let Object::Builtin(b) = m {
+                crate::leaf_builtins::register(b);
+            }
+        }
+        for m in [&acquire, &enter] {
+            if let Object::Builtin(b) = m {
+                crate::leaf_builtins::register_fast(b, rlock_try_acquire_leaf);
+            }
+        }
+        for (name, m) in [
+            ("__repr__", lock_method("__repr__", rlock_repr)),
+            ("__enter__", enter),
+            ("__exit__", exit),
+            ("acquire", acquire),
+            ("release", release),
+            ("locked", locked),
+            ("_is_owned", is_owned),
+            (
+                "_release_save",
+                lock_method("_release_save", rlock_release_save),
+            ),
+            (
+                "_acquire_restore",
+                lock_method("_acquire_restore", rlock_acquire_restore),
+            ),
+            ("_recursion_count", count),
+            (
+                "_at_fork_reinit",
+                lock_method("_at_fork_reinit", rlock_at_fork_reinit),
+            ),
         ] {
-            d.insert(
-                DictKey(Object::from_static(name)),
-                instance_method_trampoline(name),
-            );
+            d.insert(DictKey(Object::from_static(name)), m);
         }
         let t = TypeObject::new_with_flags(
             "RLock",
@@ -604,46 +800,11 @@ fn rlock_type() -> Rc<TypeObject> {
     })
 }
 
-/// `type(RLock).__repr__` — 3.14's
-/// `<unlocked _thread.RLock object owner=0 count=0 at 0x...>` (or
-/// `locked`, with the owning thread id and recursion depth; gh-134322,
-/// `lock_tests.RLockTests.test_repr_count`), read from the instance's
-/// `_weave_repr_state()` snapshot.
-fn rlock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
-    let Some(Object::Instance(inst)) = args.first() else {
-        return Err(type_error("__repr__ requires an RLock instance"));
-    };
-    let state_fn = inst
-        .dict_cell()
-        .borrow()
-        .get(&DictKey(Object::from_static("_weave_repr_state")))
-        .cloned();
-    let (owner, count) = match state_fn.and_then(|f| match f {
-        Object::Builtin(b) => (b.call)(&[]).ok(),
-        _ => None,
-    }) {
-        Some(Object::Tuple(t)) => match (t.first(), t.get(1)) {
-            (Some(Object::Int(o)), Some(Object::Int(c))) => (*o, *c),
-            _ => (0, 0),
-        },
-        _ => (0, 0),
-    };
-    let st = if count > 0 { "locked" } else { "unlocked" };
-    let addr = Rc::as_ptr(inst) as usize;
-    Ok(Object::from_str(format!(
-        "<{st} _thread.RLock object owner={owner} count={count} at 0x{addr:x}>"
-    )))
-}
-
-/// Build a Python-visible `lock` object backed by an
-/// `Arc<RealLock>`. Methods are bound closures that capture the
-/// shared lock; `_lock.acquire(...)`/`release()` flow through to
-/// the [`RealLock`] under the hood, which means lock state is
-/// observable from any thread that received a clone of the
-/// `Object`.
+/// Build a Python-visible `lock` object backed by an `Arc<RealLock>`
+/// (shared: lock state is observable from any thread that received a
+/// clone of the `Object`).
 fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let lock = Arc::new(RealLock::new());
-    Ok(make_lock_object(lock))
+    Ok(make_lock_object(Arc::new(RealLock::new())))
 }
 
 /// Public constructor so calling the `lock` type itself —
@@ -659,95 +820,17 @@ pub fn new_rlock_object() -> Object {
     make_rlock_object(Arc::new(RealRLock::new()))
 }
 
-fn make_lock_object(lock: Arc<RealLock>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::default()));
-    let acquire_lock = lock.clone();
-    let acquire =
-        move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
-            let (blocking, timeout_obj) = resolve_acquire_args(args, kwargs)?;
-            let timeout = parse_timeout(timeout_obj.as_ref());
-            let me = crate::gil::current_thread_id();
-            if !blocking {
-                return Ok(Object::Bool(acquire_lock.try_acquire(me)));
-            }
-            // RFC 0025: drop the GIL across the blocking acquire so
-            // other threads (including the one holding the lock) can
-            // run. Without this, `Thread.join` would deadlock — the
-            // joining thread sits in `acquire()` with the GIL held,
-            // and the worker can never run `_delete()` to release.
-            match timeout {
-                Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
-                Some(d) => Ok(Object::Bool(lock_acquire_interruptible(
-                    &acquire_lock,
-                    me,
-                    Some(d),
-                )?)),
-                None => Ok(Object::Bool(lock_acquire_interruptible(
-                    &acquire_lock,
-                    me,
-                    None,
-                )?)),
-            }
-        };
-    let release_lock = lock.clone();
-    let release = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        release_lock.release().map_err(runtime_error)?;
-        Ok(Object::None)
-    };
-    let locked_lock = lock.clone();
-    let locked = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        Ok(Object::Bool(locked_lock.is_locked()))
-    };
-    let enter_lock = lock.clone();
-    let enter = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        // `with lock:` is just `lock.acquire()`: try under the GIL,
-        // and only drop it to block on a foreign owner. Blocking while
-        // *holding* the GIL would deadlock the whole interpreter (the
-        // owner that would release the lock could never run).
-        lock_acquire_blocking(&enter_lock, me);
-        Ok(Object::Bool(true))
-    };
-    let exit_lock = lock.clone();
-    let exit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let _ = exit_lock.release();
-        Ok(Object::Bool(false))
-    };
-    let reinit_lock = lock.clone();
-    let at_fork_reinit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        reinit_lock.force_reset();
-        Ok(Object::None)
-    };
-    {
-        let acquire_obj = b_dyn_kw("acquire", acquire);
-        let release_obj = b_dyn("release", release);
-        let locked_obj = b_dyn("locked", locked);
-        let mut d = dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("acquire")), acquire_obj.clone());
-        d.insert(DictKey(Object::from_static("release")), release_obj.clone());
-        d.insert(DictKey(Object::from_static("locked")), locked_obj.clone());
-        d.insert(DictKey(Object::from_static("acquire_lock")), acquire_obj);
-        d.insert(DictKey(Object::from_static("release_lock")), release_obj);
-        d.insert(DictKey(Object::from_static("locked_lock")), locked_obj);
-        d.insert(
-            DictKey(Object::from_static("__enter__")),
-            b_dyn("__enter__", enter),
-        );
-        d.insert(
-            DictKey(Object::from_static("__exit__")),
-            b_dyn("__exit__", exit),
-        );
-        d.insert(
-            DictKey(Object::from_static("_at_fork_reinit")),
-            b_dyn("_at_fork_reinit", at_fork_reinit),
-        );
-    }
+/// An instance of `cls` holding `keeper` in its hidden slot.
+fn lock_instance(cls: Rc<TypeObject>, keeper: Object) -> Object {
     let inst = Rc::new(PyInstance {
-        class: crate::sync::RefCell::new(lock_type()),
-        dict: dict.into(),
+        class: crate::sync::RefCell::new(cls),
+        dict: crate::inst_dict::InstDict::new(),
         native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
+        slots: crate::sync::RefCell::new(crate::types::SlotStorage::from_layout(
+            lock_layout().clone(),
+            vec![keeper],
+        )),
         hash_cache: crate::sync::CachedHash::new(None),
         finalize_ran: crate::sync::Cell::new(false),
         deferred: crate::sync::Cell::new(false),
@@ -757,190 +840,14 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
     Object::Instance(inst)
 }
 
-/// Build a Python-visible `RLock` object backed by an
-/// `Arc<RealRLock>`. Same shape as [`make_lock_object`] but
-/// reentrant for the owning thread.
+fn make_lock_object(lock: Arc<RealLock>) -> Object {
+    lock_instance(lock_type(), keeper(LOCK_KEEPER, lock))
+}
+
+/// Build a Python-visible `RLock` object backed by an `Arc<RealRLock>`:
+/// [`make_lock_object`]'s shape, reentrant for the owning thread.
 fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::default()));
-    let acquire_lock = rlock.clone();
-    let acquire =
-        move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
-            let (blocking, timeout_obj) = resolve_acquire_args(args, kwargs)?;
-            let timeout = parse_timeout(timeout_obj.as_ref());
-            let me = crate::gil::current_thread_id();
-            if !blocking {
-                return Ok(Object::Bool(acquire_lock.try_acquire(me)));
-            }
-            // Mirror the non-reentrant lock's GIL-drop behaviour
-            // (RFC 0025) — a reentrant acquire by the owning thread is
-            // a cheap counter bump and doesn't need the drop, but the
-            // blocking-on-foreign-owner case absolutely does.
-            match timeout {
-                Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
-                Some(d) => Ok(Object::Bool(rlock_acquire_interruptible(
-                    &acquire_lock,
-                    me,
-                    Some(d),
-                )?)),
-                None => Ok(Object::Bool(rlock_acquire_interruptible(
-                    &acquire_lock,
-                    me,
-                    None,
-                )?)),
-            }
-        };
-    let release_lock = rlock.clone();
-    let release = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        release_lock.release(me).map_err(runtime_error)?;
-        Ok(Object::None)
-    };
-    let owned_lock = rlock.clone();
-    let owned = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        Ok(Object::Bool(owned_lock.is_owned_by(me)))
-    };
-    let locked_lock = rlock.clone();
-    let locked = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        Ok(Object::Bool(locked_lock.depth() > 0))
-    };
-    // `(owner, count)` snapshot for `__repr__` (3.14 prints both,
-    // gh-134322); not part of CPython's public surface.
-    let repr_state_lock = rlock.clone();
-    let repr_state = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let (owner, depth) = repr_state_lock.owner_and_depth();
-        Ok(Object::new_tuple_array([
-            Object::Int(i64::try_from(owner).unwrap_or(i64::MAX)),
-            Object::Int(depth as i64),
-        ]))
-    };
-    // CPython's RLock exposes `_release_save` / `_acquire_restore` so
-    // `Condition.wait()` can drop the *entire* reentrant hold and later
-    // restore it. The opaque "state" is just the saved recursion count.
-    let release_save_lock = rlock.clone();
-    let release_save = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        // CPython raises `RuntimeError("cannot release un-acquired
-        // lock")` if the calling thread doesn't hold the RLock.
-        if !release_save_lock.is_owned_by(me) {
-            return Err(runtime_error("cannot release un-acquired lock"));
-        }
-        let count = release_save_lock.depth();
-        for _ in 0..count {
-            release_save_lock.release(me).map_err(runtime_error)?;
-        }
-        Ok(Object::Int(count as i64))
-    };
-    // `_recursion_count()` — CPython returns the owning thread's
-    // acquisition depth, or 0 when the caller isn't the owner.
-    let recursion_count_lock = rlock.clone();
-    let recursion_count = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        let n = if recursion_count_lock.is_owned_by(me) {
-            recursion_count_lock.depth()
-        } else {
-            0
-        };
-        Ok(Object::Int(n as i64))
-    };
-    let acquire_restore_lock = rlock.clone();
-    let acquire_restore = move |args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        let count = match args.first() {
-            Some(Object::Int(n)) => *n,
-            _ => 1,
-        };
-        if count >= 1 {
-            // First reacquire may block on a foreign owner (drop GIL);
-            // the remaining holds are reentrant and cheap.
-            rlock_acquire_blocking(&acquire_restore_lock, me);
-            for _ in 1..count {
-                acquire_restore_lock.acquire(me);
-            }
-        }
-        Ok(Object::None)
-    };
-    let enter_lock = rlock.clone();
-    let enter = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        // See the non-reentrant lock's `__enter__`: blocking on the
-        // acquire while holding the GIL deadlocks the interpreter. A
-        // reentrant re-acquire by the owner is cheap, but the
-        // foreign-owner case must drop the GIL.
-        rlock_acquire_blocking(&enter_lock, me);
-        Ok(Object::Bool(true))
-    };
-    let exit_lock = rlock.clone();
-    let exit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        let me = crate::gil::current_thread_id();
-        let _ = exit_lock.release(me);
-        Ok(Object::Bool(false))
-    };
-    let reinit_lock = rlock.clone();
-    let at_fork_reinit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-        reinit_lock.force_reset();
-        Ok(Object::None)
-    };
-    {
-        let mut d = dict.borrow_mut();
-        d.insert(
-            DictKey(Object::from_static("acquire")),
-            b_dyn_kw("acquire", acquire),
-        );
-        d.insert(
-            DictKey(Object::from_static("_at_fork_reinit")),
-            b_dyn("_at_fork_reinit", at_fork_reinit),
-        );
-        d.insert(
-            DictKey(Object::from_static("release")),
-            b_dyn("release", release),
-        );
-        d.insert(
-            DictKey(Object::from_static("_is_owned")),
-            b_dyn("_is_owned", owned),
-        );
-        d.insert(
-            DictKey(Object::from_static("_release_save")),
-            b_dyn("_release_save", release_save),
-        );
-        d.insert(
-            DictKey(Object::from_static("_acquire_restore")),
-            b_dyn("_acquire_restore", acquire_restore),
-        );
-        d.insert(
-            DictKey(Object::from_static("_recursion_count")),
-            b_dyn("_recursion_count", recursion_count),
-        );
-        d.insert(
-            DictKey(Object::from_static("locked")),
-            b_dyn("locked", locked),
-        );
-        d.insert(
-            DictKey(Object::from_static("_weave_repr_state")),
-            b_dyn("_weave_repr_state", repr_state),
-        );
-        d.insert(
-            DictKey(Object::from_static("__enter__")),
-            b_dyn("__enter__", enter),
-        );
-        d.insert(
-            DictKey(Object::from_static("__exit__")),
-            b_dyn("__exit__", exit),
-        );
-    }
-    let inst = Rc::new(PyInstance {
-        class: crate::sync::RefCell::new(rlock_type()),
-        dict: dict.into(),
-        native: crate::sync::OnceBox::new(),
-        inline_values: crate::sync::Cell::new(true),
-        slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
-        hash_cache: crate::sync::CachedHash::new(None),
-        finalize_ran: crate::sync::Cell::new(false),
-        deferred: crate::sync::Cell::new(false),
-        c_body: crate::types::CBody::default(),
-        gc_slot: crate::gc_trace::GcSlot::new(),
-    });
-    Object::Instance(inst)
+    lock_instance(rlock_type(), keeper(RLOCK_KEEPER, rlock))
 }
 
 fn parse_timeout(arg: Option<&Object>) -> Option<Duration> {
