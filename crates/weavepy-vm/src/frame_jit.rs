@@ -3567,6 +3567,17 @@ unsafe extern "C" fn h_load_method(
                     }
                     None => match ms.get_inst_builtin(ver) {
                         Some(b) => Object::Builtin(b),
+                        // A static or class method the site resolved for
+                        // this class: the function, with an empty self slot
+                        // or the class.
+                        None if ms.holds_inst_unbound(ver) => {
+                            return u32::from(!Interpreter::core_class_fn_method(
+                                code,
+                                name,
+                                top,
+                                Ok(ms),
+                            ));
+                        }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
@@ -3579,6 +3590,9 @@ unsafe extern "C" fn h_load_method(
                                 ms.set(ver, &f);
                                 Object::Function(f)
                             }
+                            // (The core loop's arm resolves the rest, a
+                            // static or class method's function into the
+                            // site's slot.)
                             None => return 1,
                         },
                     },

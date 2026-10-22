@@ -9890,7 +9890,8 @@ impl Interpreter {
         let bound = Self::lean_bind_keywords(
             f,
             &code,
-            frame.stack[first..len - 1 - kwc].iter(),
+            None,
+            &frame.stack[first..len - 1 - kwc],
             names.iter().zip(values),
             locals,
         );
@@ -14769,10 +14770,14 @@ impl Interpreter {
                         }
                         let Some(ms) = mslots!(cold_mslots, ext).get(pc) else {
                             // (No site slots yet: a static or class method
-                            // read through an instance still loads here.)
+                            // read through an instance still loads here, and
+                            // a warm code's slot, allocated now, remembers
+                            // it.)
                             // SAFETY: `len < cap`: `top` and the slot above.
                             if matches!(unsafe { &*top }, Object::Instance(_))
-                                && unsafe { Self::core_class_fn_method(code, ins.arg, top) }
+                                && unsafe {
+                                    Self::core_class_fn_method(code, ins.arg, top, Err(pc as u32))
+                                }
                             {
                                 len += 1;
                                 last = pc;
@@ -14817,7 +14822,12 @@ impl Interpreter {
                                             // SAFETY: `len < cap`: `top` and
                                             // the slot above it.
                                             None if unsafe {
-                                                Self::core_class_fn_method(code, ins.arg, top)
+                                                Self::core_class_fn_method(
+                                                    code,
+                                                    ins.arg,
+                                                    top,
+                                                    Ok(ms),
+                                                )
                                             } =>
                                             {
                                                 len += 1;
@@ -16098,7 +16108,8 @@ impl Interpreter {
         };
         // A callee with cell or free variables binds its cells too (see
         // `bind_call_cells`).
-        let cells = !code_rc.cellvars.is_empty() || !code_rc.freevars.is_empty() || !f.closure.is_empty();
+        let cells =
+            !code_rc.cellvars.is_empty() || !code_rc.freevars.is_empty() || !f.closure.is_empty();
         if (missing > 0 && !Self::defaults_cover(f, missing))
             || (cells && !Self::call_cells_ok(f, code_rc))
             || !Self::kwonly_defaults_cover(f, code_rc)
@@ -16221,7 +16232,9 @@ impl Interpreter {
             // defaults follow as copies, and the other locals start
             // unbound, in one pass; the callable moves out of its slot, and
             // an empty self slot owns nothing.
-            unsafe { Self::core_fill_plain(frame, fp, first, callee_slot, nargs, missing, total, locals) }
+            unsafe {
+                Self::core_fill_plain(frame, fp, first, callee_slot, nargs, missing, total, locals)
+            }
         };
         // SAFETY: as above.
         unsafe {
@@ -17382,8 +17395,9 @@ impl Interpreter {
 
     /// The `CALL_FUNCTION_EX` at `pc` (operands `[callee, NULL, spread,
     /// mapping]` on top of `frame`'s stack) of a warm pure or effect leaf
-    /// over an exact tuple of its arity, with no keywords: evaluated in
-    /// place, its result replacing the operands. `false` touches nothing.
+    /// over an exact tuple of its positional arity, with no keywords (its
+    /// keyword-only parameters take their defaults): evaluated in place,
+    /// its result replacing the operands. `false` touches nothing.
     fn try_leaf_call_ex(&mut self, frame: &mut Frame, pc: usize) -> bool {
         let n = frame.stack.len();
         let Some(cs) = n.checked_sub(4) else {
@@ -17396,17 +17410,21 @@ impl Interpreter {
         };
         match mapping {
             Object::Unbound => {}
-            Object::Dict(d) if d.borrow().is_empty() => {}
+            // SAFETY: a read that runs no code.
+            Object::Dict(d) if unsafe { d.peek() }.is_some_and(|d| d.is_empty()) => {}
             _ => return false,
         }
-        let code = f.code();
-        let pure = code_is_pure_leaf(&code);
+        // SAFETY: GIL-serialized raw read of the function's code cell; the
+        // stack holds the function (and so the code) across the call.
+        let code: &CodeObject = unsafe { &*f.code.as_ptr() };
+        let pure = code_is_pure_leaf(code);
         let depth = crate::recursion::current_depth();
-        if !(pure || code_is_effect_leaf(&code))
+        let arity = leaf_arity(code);
+        if !(pure || code_is_effect_leaf(code))
             || code.has_varkeywords
             || items.len() != code.arg_count as usize
-            || items.len() > 8
-            || !pure_leaf_warm(&code)
+            || arity > 8
+            || !pure_leaf_warm(code)
             || depth >= crate::recursion::recursion_limit()
         {
             return false;
@@ -17415,11 +17433,20 @@ impl Interpreter {
         for (k, a) in items.iter().enumerate() {
             ptrs[k] = a;
         }
-        let f = f.clone();
-        let Some(r) = self.pure_leaf_call(&code, &f, &ptrs[..items.len()], !pure, depth) else {
+        // The keyword-only parameters take their defaults.
+        if code.kwonly_count != 0 && leaf_kwonly_defaults(f, code, &mut ptrs, 0).is_none() {
+            return false;
+        }
+        let Some(r) = self.pure_leaf_call(code, f, &ptrs[..arity], !pure, depth) else {
             return false;
         };
-        let operands: Vec<Object> = frame.stack.drain(cs..).collect();
+        // SAFETY: the four operands leave the stack (read out once), and
+        // the result takes their place.
+        let operands: [Object; 4] = unsafe {
+            let ops = frame.stack.as_ptr().add(cs).cast::<[Object; 4]>().read();
+            frame.stack.set_len(cs);
+            ops
+        };
         frame.stack.push(r);
         frame.pc = pc as u32 + 1;
         for o in operands {
@@ -17568,7 +17595,8 @@ impl Interpreter {
         let bound = Self::lean_bind_keywords(
             &f,
             &code,
-            receiver.iter().chain(items.iter()),
+            receiver.as_ref(),
+            items,
             kw.iter().flat_map(|kw| kw.iter()).map(|(k, v)| (&k.0, v)),
             locals,
         );
@@ -17589,7 +17617,8 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard))
     }
 
-    /// Bind `f(*positional, **kw)` (a plain dictionary) to `code`'s
+    /// Bind `f(first, *rest, **kw)` (`first` absent for none, `kw` a plain
+    /// dictionary's or a call site's names and values) to `code`'s
     /// parameters as the generic binder would: the positional
     /// parameters, the keyword-only ones, then `*args` and `**kwargs`
     /// when present. `None` when anything needs the generic binder: a
@@ -17599,41 +17628,50 @@ impl Interpreter {
     fn lean_bind_keywords<'a>(
         f: &PyFunction,
         code: &CodeObject,
-        positional: impl Iterator<Item = &'a Object>,
+        first: Option<&Object>,
+        rest: &[Object],
         kw: impl Iterator<Item = (&'a Object, &'a Object)>,
         out: &mut Vec<Object>,
     ) -> Option<()> {
         let npos = code.arg_count as usize;
         let total = npos + code.kwonly_count as usize;
         let posonly = code.posonly_count as usize;
+        let nargs = rest.len() + usize::from(first.is_some());
+        if nargs > npos && !code.has_varargs {
+            return None;
+        }
         debug_assert!(out.is_empty());
+        out.reserve(code.varnames.len());
+        // The positionals the parameters take, then the unbound rest of
+        // the keyword-bindable ones.
+        let direct = nargs.min(npos);
+        let skip = usize::from(first.is_some());
+        out.extend(first.into_iter().chain(rest).take(direct).cloned());
         fill_unbound(out, total);
         // (Every slot written below still holds `Unbound`, which owns
         // nothing: it is overwritten without drop glue.)
         let bind =
             |slot: &mut Object, v: &Object| std::mem::forget(std::mem::replace(slot, v.clone()));
-        let mut surplus: Vec<Object> = Vec::new();
-        for (i, v) in positional.enumerate() {
-            if i < npos {
-                bind(&mut out[i], v);
-            } else if code.has_varargs {
-                surplus.push(v.clone());
-            } else {
-                return None;
-            }
-        }
         let mut varkw: Option<DictData> = None;
         let kw_hint = kw.size_hint().0;
-        for (key, v) in kw {
+        let names = &code.varnames[..total];
+        for (j, (key, v)) in kw.enumerate() {
             let Object::Str(name) = key else {
                 return None;
             };
-            match code.varnames[posonly..total]
-                .iter()
-                .position(|n| n.as_str() == &**name)
-            {
-                Some(p) => {
-                    let slot = &mut out[posonly + p];
+            // The parameter after the positionals is the likeliest.
+            let guess = direct + j;
+            let slot = if guess < total && guess >= posonly && names[guess].as_str() == &**name {
+                Some(guess)
+            } else {
+                names[posonly..]
+                    .iter()
+                    .position(|n| n.as_str() == &**name)
+                    .map(|p| posonly + p)
+            };
+            match slot {
+                Some(slot) => {
+                    let slot = &mut out[slot];
                     if !matches!(slot, Object::Unbound) {
                         return None;
                     }
@@ -17652,25 +17690,37 @@ impl Interpreter {
                 None => return None,
             }
         }
-        let first_default = npos.checked_sub(f.defaults.len())?;
-        for (i, slot) in out[..npos].iter_mut().enumerate() {
-            if matches!(slot, Object::Unbound) {
-                if i < first_default {
-                    return None;
+        if direct < npos {
+            let first_default = npos.checked_sub(f.defaults.len())?;
+            for (i, slot) in out[..npos].iter_mut().enumerate().skip(direct) {
+                if matches!(slot, Object::Unbound) {
+                    if i < first_default {
+                        return None;
+                    }
+                    bind(slot, &f.defaults[i - first_default]);
                 }
-                bind(slot, &f.defaults[i - first_default]);
             }
         }
-        for (slot, d) in out[npos..total]
-            .iter_mut()
-            .zip(Self::kwonly_defaults(f, code))
-        {
+        for (i, slot) in out[npos..total].iter_mut().enumerate() {
             if matches!(slot, Object::Unbound) {
-                bind(slot, d?);
+                let name = code.varnames[npos + i].as_str();
+                let (_, d) = f.kw_defaults.iter().find(|(n, _)| n == name)?;
+                bind(slot, d);
             }
         }
         if code.has_varargs {
-            out.push(Object::new_tuple(surplus));
+            out.push(if nargs <= npos {
+                // The interned empty tuple.
+                Object::new_tuple(Vec::new())
+            } else if direct >= skip {
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+                    rest[direct - skip..].iter().cloned(),
+                ))
+            } else {
+                // (`first` itself is surplus: a callee with no positional
+                // parameters.)
+                Object::new_tuple(first.into_iter().chain(rest).cloned().collect())
+            });
         }
         if code.has_varkeywords {
             out.push(Object::Dict(Rc::new(RefCell::new(
@@ -17864,7 +17914,8 @@ impl Interpreter {
         let bound = Self::lean_bind_keywords(
             init,
             code,
-            std::iter::once(&receiver).chain(&frame.stack[callee_slot + 2..len - 1 - kwc]),
+            Some(&receiver),
+            &frame.stack[callee_slot + 2..len - 1 - kwc],
             names.iter().zip(values),
             locals,
         );
@@ -19455,22 +19506,50 @@ impl Interpreter {
     }
 
     /// [`Self::core_value_method`] for a static or class method read
-    /// through an instance: the function, with an empty self slot or the
-    /// instance's class as its self, as the helper loads it.
+    /// through an instance the attribute can't shadow: the function, with
+    /// an empty self slot or the instance's class as its self, as the
+    /// helper loads it. The site's slot (`ms`, or the one allocated for
+    /// the site at the `Err` pc once its code is warm) remembers the
+    /// function for the instance's class.
     ///
     /// # Safety
     ///
     /// As for [`Self::core_value_method`].
     #[inline(never)]
-    unsafe fn core_class_fn_method(code: &CodeObject, name_idx: u32, top: *mut Object) -> bool {
+    unsafe fn core_class_fn_method(
+        code: &CodeObject,
+        name_idx: u32,
+        top: *mut Object,
+        ms: Result<&MethodSlot, u32>,
+    ) -> bool {
         // SAFETY: the caller's contract.
         let Object::Instance(inst) = (unsafe { &*top }) else {
             return false;
         };
-        let (f, self_obj) = match Self::leaf_resolve_instance_attr(code, inst, name_idx) {
-            Some(LeafAttr::Value(f @ Object::Function(_))) => (f, Object::Unbound),
-            Some(LeafAttr::ClassMethod(f)) => (Object::Function(f), Object::Type(inst.cls())),
-            _ => return false,
+        let ver = inst.cls_raw().attr_version.get();
+        let slot = || match ms {
+            _ if ver == 0 => None,
+            Ok(ms) => Some(ms),
+            Err(pc) => code_method_slot(code, pc),
+        };
+        let (f, self_obj) = match ms.ok().and_then(|ms| ms.get_inst_unbound(ver)) {
+            Some((f, false)) => (Object::Function(f), Object::Unbound),
+            Some((f, true)) => (Object::Function(f), Object::Type(inst.cls())),
+            None => match Self::leaf_resolve_instance_attr(code, inst, name_idx) {
+                Some(LeafAttr::Value(Object::Function(f))) => {
+                    if let Some(ms) = slot() {
+                        ms.set_static(ver, &f);
+                    }
+                    (Object::Function(f), Object::Unbound)
+                }
+                Some(LeafAttr::ClassMethod(f)) => {
+                    if let Some(ms) = slot() {
+                        ms.set_class_fn(ver, &f);
+                    }
+                    (Object::Function(f), Object::Type(inst.cls()))
+                }
+                _ => return false,
+            },
         };
         // SAFETY: as above.
         if !Self::core_droppable(unsafe { &*top }) {
@@ -58882,12 +58961,11 @@ impl Interpreter {
     }
 
     /// A keyword call of `f`: the positional `args`, then `kwvals` named by
-    /// `names` (the call site's `str` objects, one per value). Bound by the
-    /// `CALL_KW` specialization's permutation ([`specialize::kw_perm`],
-    /// computed for this call: no `String` per keyword) through
-    /// [`Self::kw_names_fill_locals`] when the shape has one; anything else,
-    /// its errors included, through the full binder.
-    fn call_python_kw_names(
+    /// `names` (the call site's `str` objects, one per value). Bound by
+    /// name as the core loop's keyword calls bind ([`Self::lean_bind_keywords`]:
+    /// no `String` per keyword); anything that binder declines, errors
+    /// included, through the full binder.
+    pub(crate) fn call_python_kw_names(
         &mut self,
         f: &Rc<PyFunction>,
         args: Vec<Object>,
@@ -58895,38 +58973,30 @@ impl Interpreter {
         kwvals: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         let code = f.code();
-        let strs = || {
-            names.iter().map(|n| match n {
-                Object::Str(s) => &**s,
-                _ => "",
-            })
-        };
-        let plan = if self.pending_raw_kwargs.borrow().is_none()
-            && names.iter().all(|n| matches!(n, Object::Str(_)))
+        if self.pending_raw_kwargs.borrow().is_none()
+            && !(f.defaults_maybe_overridden()
+                && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         {
-            specialize::kw_perm(f, &code, args.len(), strs())
-        } else {
-            None
-        };
-        if let Some((perm, covered)) = plan {
-            let (eff_argc, kwc) = (args.len(), kwvals.len());
-            let mut stack: Vec<Object> = self.pooled_scratch();
-            stack.extend(args);
-            stack.extend(kwvals);
             let mut positional: Vec<Object> = self.pooled_scratch();
-            Self::kw_names_fill_locals(
-                &mut positional,
-                &mut stack,
-                names,
+            if Self::lean_bind_keywords(
                 f,
                 &code,
-                perm,
-                covered,
-                kwc,
-                eff_argc,
-            );
-            self.recycle_scratch(stack);
-            return self.call_python_bound(f, code, positional);
+                None,
+                &args,
+                names.iter().zip(&kwvals),
+                &mut positional,
+            )
+            .is_some()
+            {
+                fill_unbound(&mut positional, code.varnames.len());
+                // The bound locals hold their own references.
+                for v in args.into_iter().chain(kwvals) {
+                    self.release(v);
+                }
+                return self.call_python_bound(f, code, positional);
+            }
+            positional.clear();
+            self.recycle_scratch(positional);
         }
         let kwargs = names
             .iter()
@@ -76036,10 +76106,13 @@ struct PolyMethods {
 /// (keyed by [`MethodSlot::BUILTIN_TAG`] plus the receiver's variant).
 enum MethodSlotFn {
     Py(crate::sync::Weak<crate::object::PyFunction>),
-    /// A static method's function read through the class (keyed by the
-    /// class's attribute version): called unbound, never with the
-    /// receiver — an instance at the same site must not take it.
+    /// A static method's function read through the class or an instance
+    /// of it (keyed by the class's attribute version): called unbound,
+    /// never with the receiver.
     Static(crate::sync::Weak<crate::object::PyFunction>),
+    /// A class method's function read through an instance of the class
+    /// (keyed by the class's attribute version): called with the class.
+    ClassFn(crate::sync::Weak<crate::object::PyFunction>),
     Builtin(Rc<crate::object::BuiltinFn>),
     /// A `CALL` site's leaf builtin and its kind (the identity check is
     /// the pointer compare on read).
@@ -76280,6 +76353,45 @@ impl MethodSlot {
         self.poly_remember(ver);
         // SAFETY: as `set`.
         unsafe { *self.0.get() = (ver, MethodSlotFn::Static(Rc::downgrade(f))) };
+    }
+
+    /// Remember a class method's function read through an instance of a
+    /// class at `ver`.
+    #[inline]
+    fn set_class_fn(&self, ver: u64, f: &Rc<crate::object::PyFunction>) {
+        self.poly_remember(ver);
+        // SAFETY: as `set`.
+        unsafe { *self.0.get() = (ver, MethodSlotFn::ClassFn(Rc::downgrade(f))) };
+    }
+
+    /// Whether the slot names a static or class method's function for an
+    /// instance of a class at `ver` (see `get_inst_unbound`).
+    #[inline]
+    fn holds_inst_unbound(&self, ver: u64) -> bool {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        matches!(
+            unsafe { &*self.0.get() },
+            (v, MethodSlotFn::Static(_) | MethodSlotFn::ClassFn(_)) if *v == ver
+        )
+    }
+
+    /// The static method's function (`false`) or class method's function
+    /// (`true`, to bind to the class) the slot resolved for an instance of
+    /// a class at `ver` (see `get_held`).
+    #[inline]
+    fn get_inst_unbound(&self, ver: u64) -> Option<(Rc<crate::object::PyFunction>, bool)> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set`.
+        let (w, class) = match unsafe { &*self.0.get() } {
+            (v, MethodSlotFn::Static(w)) if *v == ver => (w, false),
+            (v, MethodSlotFn::ClassFn(w)) if *v == ver => (w, true),
+            _ => return None,
+        };
+        if w.strong_count() == 0 {
+            return None;
+        }
+        // SAFETY: as `get_held` — the class holds the function's wrapper,
+        // which holds it, while it reads `ver`.
+        Some((unsafe { Self::held(w.as_ptr()) }, class))
     }
 
     /// The native method a plain class (at version `ver`) resolves for its
