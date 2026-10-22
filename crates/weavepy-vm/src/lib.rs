@@ -76063,21 +76063,40 @@ fn class_attr_fill_via(
         | Object::Module(_)
             if via == CLASS_ATTR_VIA_INSTANCE =>
         {
-            match class_entry_of(code, cls, pc, v) {
-                Some(bits) => (CLASS_ATTR_ENTRY, bits),
-                None => return,
-            }
+            return class_entry_fill(code, cls, pc, v, via);
         }
         Object::Builtin(b) if !b.binds_instance && via == CLASS_ATTR_VIA_INSTANCE => {
-            match class_entry_of(code, cls, pc, v) {
-                Some(bits) => (CLASS_ATTR_ENTRY, bits),
-                None => return,
-            }
+            return class_entry_fill(code, cls, pc, v, via);
         }
         _ => return,
     };
     if let Some(slot) = code_stamp_slot(code, pc as u32) {
         slot.set([cls.attr_version.get(), tag ^ via, bits]);
+    }
+}
+
+/// [`class_attr_fill_via`] for an object value (see [`CLASS_ATTR_ENTRY`]).
+/// The stamp names its class (in the slot's value word): a site whose
+/// stamp another class's entry holds keeps it, as re-locating the entry
+/// at every read of a polymorphic site would cost more than its misses.
+#[cold]
+fn class_entry_fill(
+    code: &CodeObject,
+    cls: &crate::types::TypeObject,
+    pc: usize,
+    v: &Object,
+    via: u64,
+) {
+    let Some(slot) = code_stamp_slot(code, pc as u32) else {
+        return;
+    };
+    let owner = std::ptr::from_ref(cls) as u64;
+    if slot.get()[1] == CLASS_ATTR_ENTRY ^ via && slot.value() != owner {
+        return;
+    }
+    if let Some(bits) = class_entry_of(code, cls, pc, v) {
+        slot.set([cls.attr_version.get(), CLASS_ATTR_ENTRY ^ via, bits]);
+        slot.1.set(owner);
     }
 }
 
@@ -76097,6 +76116,18 @@ fn class_entry_of(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, 
     let name = code.names.get(code.instructions.get(pc)?.arg as usize)?.as_str();
     // SAFETY: reads between two instructions, running no code.
     let mro = unsafe { cls.mro.peek() }?;
+    // The type cache's entry for the name, which the read just resolved.
+    let ver = cls.attr_version.get();
+    let h = crate::types::type_cache::name_hash(name);
+    if let Some(crate::types::type_cache::Hit::At { mro_idx, dict_idx }) =
+        crate::types::type_cache::probe(std::ptr::from_ref(cls) as usize, ver, name, h)
+    {
+        // SAFETY: as above.
+        let d = unsafe { mro.get(mro_idx as usize)?.dict.peek() }?;
+        if d.get_index(dict_idx as usize).is_some_and(|(_, found)| found.is_same(v)) {
+            return Some(u64::from(mro_idx) << 32 | u64::from(dict_idx));
+        }
+    }
     for (i, ty) in mro.iter().enumerate() {
         // SAFETY: as above.
         let d = unsafe { ty.dict.peek() }?;

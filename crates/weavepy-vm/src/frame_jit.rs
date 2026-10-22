@@ -468,6 +468,98 @@ impl Slot {
     }
 }
 
+/// The block starts (`starts`) of `code` whose blocks never ran before
+/// the compile. A block with a `LOAD_GLOBAL` whose site never resolved a
+/// global (its first run fills the site's cache, as CPython's
+/// specializing `LOAD_GLOBAL` does) and no site that resolved anything
+/// never ran; neither did a block that only such blocks lead to. The
+/// rest are the blocks the entry and the exception handlers reach
+/// without passing through one. Those blocks are mostly the paths the
+/// code's work never takes (a loop over an empty list, an option that
+/// isn't set, an error check's raise, a handler), whose lowering costs
+/// compile time and code size for nothing: they leave for the core loop
+/// instead, which runs them as it would have. Code none of whose sites
+/// resolved (run some other way so far) compiles whole.
+/// (`WEAVEPY_FRAME_JIT_COLD=0` compiles every block, a tuning aid.)
+fn never_ran_blocks(code: &CodeObject, starts: &[bool]) -> Vec<bool> {
+    use weavepy_compiler::{InlineCache as IC, OpCode};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let n = starts.len();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("WEAVEPY_FRAME_JIT_COLD").is_none_or(|v| v != "0")
+    });
+    let resolved = |pc: usize| !matches!(code.caches.get(pc as u32), IC::Empty);
+    if !on || n == 0 || !(0..n).any(resolved) {
+        return vec![false; n];
+    }
+    let ins = &code.instructions;
+    // Each instruction's block start.
+    let mut block_of = vec![0; n];
+    let mut start = 0;
+    for (pc, b) in block_of.iter_mut().enumerate() {
+        if starts[pc] {
+            start = pc;
+        }
+        *b = start;
+    }
+    let mut reached = vec![false; n];
+    let mut work: Vec<usize> = std::iter::once(0)
+        .chain(code.exception_table.iter().map(|h| h.handler as usize))
+        .filter(|&h| h < n)
+        .map(|h| block_of[h])
+        .collect();
+    while let Some(start) = work.pop() {
+        if std::mem::replace(&mut reached[start], true) {
+            continue;
+        }
+        let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+        let unresolved_global =
+            (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+        if start > 0 && unresolved_global && !(start..end).any(resolved) {
+            // Never ran: what it leads to counts only if reached otherwise.
+            continue;
+        }
+        for k in start..end {
+            let next = k + 1;
+            let target = match ins[k].op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(next + ins[k].arg as usize),
+                OpCode::JumpBackward => Some(next.saturating_sub(ins[k].arg as usize)),
+                _ => None,
+            };
+            if let Some(t) = target.filter(|&t| t < n) {
+                work.push(block_of[t]);
+            }
+        }
+        let falls = !matches!(
+            ins[end - 1].op,
+            OpCode::JumpForward
+                | OpCode::JumpBackward
+                | OpCode::ReturnValue
+                | OpCode::RaiseVarargs
+                | OpCode::Reraise
+        );
+        if falls && end < n {
+            work.push(end);
+        }
+    }
+    let mut out = vec![false; n];
+    for start in 0..n {
+        if starts[start] && start > 0 {
+            let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+            let unresolved_global =
+                (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+            out[start] = !reached[start] || (unresolved_global && !(start..end).any(resolved));
+        }
+    }
+    out
+}
+
 /// What warmed a code object.
 #[derive(Clone, Copy)]
 pub(crate) enum Heat {
@@ -7264,6 +7356,10 @@ struct Lower<'a> {
     bound: Vec<bool>,
     /// Each block start's block (instruction index → block).
     blocks: Vec<Option<Block>>,
+    /// The block starts whose blocks never ran before the compile (see
+    /// [`never_ran_blocks`]): lowered as an exit to the core loop, and not
+    /// entered.
+    never_ran: Vec<bool>,
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
@@ -7476,6 +7572,7 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
+            never_ran: Vec::new(),
             dispatch: Block::from_u32(0),
             cold: false,
             vs: Vec::new(),
@@ -8077,7 +8174,10 @@ impl<'a> Lower<'a> {
     /// instruction the native code runs (not one it hands straight back).
     fn enters_at(&self, pc: usize) -> bool {
         let instrs = &self.code.instructions;
-        if pc >= instrs.len() || self.blocks[pc].is_none() {
+        if pc >= instrs.len()
+            || self.blocks[pc].is_none()
+            || self.never_ran.get(pc).copied().unwrap_or(false)
+        {
             return false;
         }
         native_at(self.code, pc)
@@ -8200,6 +8300,7 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|&s| s.then(|| self.b.create_block()))
             .collect();
+        self.never_ran = never_ran_blocks(code, &starts);
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
@@ -8221,7 +8322,7 @@ impl<'a> Lower<'a> {
         let mut tramps = Vec::new();
         let mut calls = Vec::with_capacity(n);
         for pc in 0..n {
-            let target = match self.blocks[pc] {
+            let target = match self.blocks[pc].filter(|_| !self.never_ran[pc]) {
                 Some(blk) => {
                     let t = self.b.create_block();
                     tramps.push((t, blk, self.depths[pc]));
@@ -8262,6 +8363,11 @@ impl<'a> Lower<'a> {
         self.depth = self.depths[start] as usize;
         self.last_pc = None;
         self.bound.iter_mut().for_each(|b| *b = false);
+        if self.never_ran[start] {
+            // The core loop runs it, as it ran it before (or never).
+            self.exit(INTERP, start);
+            return;
+        }
         let mut pc = start;
         loop {
             if !self.instruction(pc) {
