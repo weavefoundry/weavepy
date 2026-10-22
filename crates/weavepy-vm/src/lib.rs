@@ -23915,7 +23915,11 @@ impl Interpreter {
             // A scalar class attribute the instance doesn't shadow, or a
             // named tuple field (see `leaf_attr_resolve_site`).
             if let Some(slot) = ext.stamp_slot(attr_pc) {
-                if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
+                let cls = inst.cls_raw();
+                let v = class_attr_hit_via(slot, cls, CLASS_ATTR_VIA_INSTANCE).or_else(|| {
+                    class_entry_hit(slot, cls, CLASS_ATTR_VIA_INSTANCE, code, attr_pc)
+                });
+                if let Some(v) = v {
                     if !inst_may_shadow(inst, code, name_idx) {
                         return Some(v);
                     }
@@ -28890,7 +28894,11 @@ impl Interpreter {
         // shadow it (the stamp was filled below, at this class version),
         // or a named tuple field.
         if let Some(slot) = code_stamp_slot(code, cache_pc) {
-            if let Some(v) = class_attr_hit_via(slot, inst.cls_raw(), CLASS_ATTR_VIA_INSTANCE) {
+            let cls = inst.cls_raw();
+            let v = class_attr_hit_via(slot, cls, CLASS_ATTR_VIA_INSTANCE).or_else(|| {
+                class_entry_hit(slot, cls, CLASS_ATTR_VIA_INSTANCE, code, cache_pc as usize)
+            });
+            if let Some(v) = v {
                 if !inst_may_shadow(inst, code, name_idx) {
                     return Some(v);
                 }
@@ -28901,6 +28909,19 @@ impl Interpreter {
         }
         let poly = code_attr_poly(code, cache_pc);
         let ver = inst.cls_raw().attr_version.get();
+        // A native method of the class the site last bound (see the
+        // `BuiltinMethod` arm below), which the instance doesn't shadow.
+        if let Some(b) = code_vm_ext(code)
+            .and_then(|e| e.method_slot(cache_pc as usize))
+            .and_then(|s| s.get_inst_builtin(ver))
+        {
+            if !inst_may_shadow(inst, code, name_idx) {
+                return Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    receiver.clone(),
+                    Object::Builtin(b),
+                ))));
+            }
+        }
         // A never-specialized site resolves once and takes the indexed
         // shape; the polymorphic entries serve it from the second class on.
         let unspecialized = matches!(code.caches.get(cache_pc), IC::Empty);
@@ -28938,10 +28959,16 @@ impl Interpreter {
                 Object::Function(f),
             )))),
             // A native method on the class (`re.Pattern.match`), bound as
-            // its descriptor binds it.
-            (LeafAttr::BuiltinMethod(b), _) => Some(Object::BoundMethod(Rc::new(
-                BoundMethod::new(receiver.clone(), Object::Builtin(b)),
-            ))),
+            // its descriptor binds it, and remembered for the site.
+            (LeafAttr::BuiltinMethod(b), _) => {
+                if let Some(slot) = code_method_slot(code, cache_pc) {
+                    slot.set_inst_builtin(ver, &b);
+                }
+                Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    receiver.clone(),
+                    Object::Builtin(b),
+                ))))
+            }
             // A named tuple field: the tuple item (an index out of range
             // is the descriptor's to raise), remembered for the site.
             (LeafAttr::TupleField(ix), _) => {
@@ -76026,11 +76053,84 @@ fn class_attr_fill_via(
         Object::Float(x) => (CLASS_ATTR_FLOAT, x.to_bits()),
         Object::Bool(b) => (CLASS_ATTR_BOOL, u64::from(*b)),
         Object::None => (CLASS_ATTR_NONE, 0),
+        // A value no access can bind or call `__get__` on, however its
+        // class changes later, read through an instance.
+        Object::Str(_)
+        | Object::Bytes(_)
+        | Object::Long(_)
+        | Object::Tuple(_)
+        | Object::FrozenSet(_)
+        | Object::Module(_)
+            if via == CLASS_ATTR_VIA_INSTANCE =>
+        {
+            match class_entry_of(code, cls, pc, v) {
+                Some(bits) => (CLASS_ATTR_ENTRY, bits),
+                None => return,
+            }
+        }
+        Object::Builtin(b) if !b.binds_instance && via == CLASS_ATTR_VIA_INSTANCE => {
+            match class_entry_of(code, cls, pc, v) {
+                Some(bits) => (CLASS_ATTR_ENTRY, bits),
+                None => return,
+            }
+        }
         _ => return,
     };
     if let Some(slot) = code_stamp_slot(code, pc as u32) {
         slot.set([cls.attr_version.get(), tag ^ via, bits]);
     }
+}
+
+/// A `LOAD_ATTR` site's stamp tag for a class attribute that is an object
+/// rather than a scalar (a string constant, a module, a plain native
+/// function): the bits locate the entry that holds it at that version,
+/// `(mro index << 32) | dict index`. A read checks the entry's key
+/// against the site's name and clones the entry's own value, so the
+/// stamp holds no reference (see [`class_entry_hit`]).
+const CLASS_ATTR_ENTRY: u64 = 0x5ca1_a770_0000_000a;
+
+/// Where `cls`'s MRO holds the site at `pc`'s name with the value `v`, as
+/// [`CLASS_ATTR_ENTRY`]'s bits: the first class that has the name, if
+/// its entry holds `v` itself.
+#[cold]
+fn class_entry_of(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) -> Option<u64> {
+    let name = code.names.get(code.instructions.get(pc)?.arg as usize)?.as_str();
+    // SAFETY: reads between two instructions, running no code.
+    let mro = unsafe { cls.mro.peek() }?;
+    for (i, ty) in mro.iter().enumerate() {
+        // SAFETY: as above.
+        let d = unsafe { ty.dict.peek() }?;
+        if let Some((j, _, found)) = d.get_full(&crate::object::StrKey(name)) {
+            let (i, j) = (u32::try_from(i).ok()?, u32::try_from(j).ok()?);
+            return found.is_same(v).then_some(u64::from(i) << 32 | u64::from(j));
+        }
+    }
+    None
+}
+
+/// The object-valued class attribute the `LOAD_ATTR` site at `pc`'s stamp
+/// remembers for `cls`'s current version (filled with `via`; see
+/// [`CLASS_ATTR_ENTRY`]): the value of the entry it locates, when the
+/// entry still has the site's name.
+#[inline]
+fn class_entry_hit(
+    slot: &StampSlot,
+    cls: &crate::types::TypeObject,
+    via: u64,
+    code: &CodeObject,
+    pc: usize,
+) -> Option<Object> {
+    let [ver, tag, bits] = slot.get();
+    if tag != CLASS_ATTR_ENTRY ^ via || ver != cls.attr_version.get() {
+        return None;
+    }
+    // SAFETY: reads between two instructions, running no code; the view
+    // ends with the value's clone.
+    let mro = unsafe { cls.mro.peek() }?;
+    // SAFETY: as above.
+    let d = unsafe { mro.get((bits >> 32) as usize)?.dict.peek() }?;
+    let (k, v) = d.get_index(bits as u32 as usize)?;
+    slot_name_matches(code, code.instructions.get(pc)?.arg, k).then(|| clone_hot(v))
 }
 
 /// The function a `LoadAttrMethod` site resolved to, keyed by the
