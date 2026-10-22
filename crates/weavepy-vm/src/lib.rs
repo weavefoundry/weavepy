@@ -16536,8 +16536,9 @@ impl Interpreter {
     /// nothing.
     #[inline(never)]
     /// The `CALL` at the running activation's pc of an exact builtin
-    /// container type (or `weakref.ref`, or `types.MappingProxyType`) over
-    /// one positional argument (`set(genexpr)`, `list(xs)`), through the
+    /// container type or `str` (or `weakref.ref`, or
+    /// `types.MappingProxyType`) over one positional argument
+    /// (`set(genexpr)`, `list(xs)`, `str(path)`), through the
     /// ordinary call with the caller published
     /// (consuming the argument may run Python code), as the builtin lane
     /// runs a builtin function. `false` touches nothing.
@@ -16562,7 +16563,8 @@ impl Interpreter {
             return false;
         };
         let bt = builtin_types();
-        if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_]
+        // (`str(obj)` runs the object's `__str__`.)
+        if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_, &bt.str_]
             .iter()
             .any(|t| Rc::ptr_eq(t, ty))
             // (`weakref.ref(obj)` and `types.MappingProxyType(mapping)`,
