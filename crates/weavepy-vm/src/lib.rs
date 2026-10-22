@@ -8839,12 +8839,7 @@ impl Interpreter {
         // stored before the caller takes it (an error stores nothing).
         if let Some(pending) = done.lru.take() {
             if let Ok(v) = &result {
-                if let Some((key, value)) =
-                    crate::stdlib::functools_mod::lru_store_returned(&pending, v)
-                {
-                    self.release(key.0);
-                    self.release(value);
-                }
+                self.lru_store_returned(pending, v);
             }
         }
         let call_pc = done.call_pc;
@@ -14049,7 +14044,7 @@ impl Interpreter {
                                     unsafe { frame.stack.set_len(len) };
                                     frame.pc = pc as u32;
                                     *last_pc = last;
-                                    if self.core_lru_miss(sw, pc, func, pending) {
+                                    if self.core_lru_miss(sw, pc, start, func, pending) {
                                         break Some(CoreExit::Reload);
                                     }
                                 }
@@ -22979,11 +22974,11 @@ impl Interpreter {
             && (done.init_inst.is_none() || matches!(v, Object::None))
             && done.binop.is_none()
             && !done.discard
-            && done.lru.is_none()
         {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
             let v = done.init_inst.take().unwrap_or(v);
+            let lru = done.lru.take();
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -23003,6 +22998,11 @@ impl Interpreter {
                 self.inline_park(done);
             } else {
                 self.inline_park_clean(done);
+            }
+            // A `functools.lru_cache` miss's function returned: its result
+            // is stored before the caller takes it (`inline_deliver`'s).
+            if let Some(pending) = lru {
+                self.lru_store_returned(pending, &v);
             }
             // SAFETY: as above.
             unsafe { push_fast(&mut (*cframe).stack, v) };
@@ -23831,45 +23831,32 @@ impl Interpreter {
         &mut self,
         sw: &mut CoreSwitch,
         pc: usize,
+        at: usize,
         func: Object,
         mut pending: crate::stdlib::functools_mod::LruPending,
     ) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
-        // unborrowed here.
+        // unborrowed here, its operands from `at` the call's.
         let frame = unsafe { &mut *sw.cur };
-        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
-            return false;
-        };
         let n = frame.stack.len();
-        let Some(at) = n.checked_sub(argc + 2) else {
-            return false;
-        };
-        if !crate::stdlib::functools_mod::is_lru_wrapper(&frame.stack[at]) {
-            return false;
-        }
+        debug_assert!(crate::stdlib::functools_mod::is_lru_wrapper(&frame.stack[at]));
         // The function takes the wrapper's place; the store holds the
         // wrapper until the call finishes.
         pending.hold(std::mem::replace(&mut frame.stack[at], func));
         let ops = &frame.stack[at..];
-        if Self::core_all_droppable(ops) {
+        if matches!(&ops[0], Object::Function(f) if fn_is_leaf(f)) && Self::core_all_droppable(ops) {
             if let Some(r) = self.core_pure_call(&frame.code, pc, ops, sw.depth_cell) {
-                pending.count_miss();
-                let evicted = crate::stdlib::functools_mod::lru_store_returned(&pending, &r);
                 // SAFETY: every operand was checked to leave by a plain
                 // decrement; the result takes the callee's slot.
                 unsafe {
                     release_run(frame.stack.as_ptr().add(at), n - at);
                     frame.stack.set_len(at);
                 }
+                self.lru_store_returned(pending, &r);
                 frame.stack.push(r);
                 frame.pc = pc as u32 + 1;
                 // SAFETY: the running activation's last-pc slot.
                 unsafe { *sw.last = pc };
-                if let Some((key, value)) = evicted {
-                    self.release(key.0);
-                    self.release(value);
-                }
-                drop(pending);
                 // SAFETY: the running thread's own flag (see `quiet_run`).
                 if unsafe { (*sw.maybe_dead).get() } {
                     sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
@@ -23878,7 +23865,6 @@ impl Interpreter {
             }
         }
         if self.core_call(sw, pc) {
-            pending.count_miss();
             // SAFETY: see `CoreSwitch`: the call pushed its activation,
             // the running one.
             let inl = unsafe { &mut *sw.inl };
@@ -23889,10 +23875,27 @@ impl Interpreter {
             }
             return true;
         }
-        // Declined: the wrapper back in its place.
+        // Declined: the wrapper back in its place, the miss uncounted.
         let func = std::mem::replace(&mut frame.stack[at], pending.release_wrapper());
         drop(func);
         false
+    }
+
+    /// Store a `functools.lru_cache` miss's returned `value` (see
+    /// `InlineAct::lru`) and finish the call: the entry a full cache
+    /// evicted is released, then the wrapper and its nesting level.
+    #[inline(never)]
+    pub(crate) fn lru_store_returned(
+        &mut self,
+        pending: crate::stdlib::functools_mod::LruPending,
+        value: &Object,
+    ) {
+        if let Some((key, old)) = crate::stdlib::functools_mod::lru_store_returned(&pending, value)
+        {
+            self.release(key.0);
+            self.release(old);
+        }
+        drop(pending);
     }
 
     /// A call of a bound natively served class method

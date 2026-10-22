@@ -92,6 +92,11 @@ pub(super) fn miss(bytes: &mut [u8]) -> Option<()> {
     write(bytes, MISSES, read(bytes, MISSES)?.wrapping_add(1))
 }
 
+/// Take back one miss.
+pub(super) fn unmiss(bytes: &mut [u8]) -> Option<()> {
+    write(bytes, MISSES, read(bytes, MISSES)?.wrapping_sub(1))
+}
+
 /// Zero both counts.
 pub(super) fn reset_counts(bytes: &mut [u8]) -> Option<()> {
     write(bytes, HITS, 0)?;

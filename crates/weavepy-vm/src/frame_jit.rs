@@ -4723,7 +4723,8 @@ unsafe extern "C" fn h_call_direct(
         debug_assert!(len_u >= argc + 2);
         if !s.sw.is_null() {
             let start = len_u - argc - 2;
-            if let Some(r) = direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None) {
+            if let Some(r) = direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None, None)
+            {
                 return r;
             }
         }
@@ -4757,6 +4758,8 @@ unsafe extern "C" fn h_call_site(
                 return h_call_direct(st, code, ext, pc_argc, len, site);
             }
             site.retry -= 1;
+        } else if crate::stdlib::functools_mod::is_lru_wrapper(callee) {
+            return h_call_instance(st, code, ext, pc_argc, len, site);
         }
         h_call(st, code, ext, pc_argc & u64::from(u32::MAX), len)
     }
@@ -4814,7 +4817,7 @@ unsafe fn direct_call_out(
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
-    unsafe { direct_call::<false>(st, pc, start, len, site, binop) }
+    unsafe { direct_call::<false>(st, pc, start, len, site, binop, None) }
 }
 
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
@@ -4826,7 +4829,9 @@ unsafe fn direct_call_out(
 /// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
 /// state synced), `None` touched nothing. An instance operator's method
 /// (`binop`) that leaves the direct return to the core loop carries the
-/// operator, whose `TypeError` its `NotImplemented` becomes there.
+/// operator, whose `TypeError` its `NotImplemented` becomes there. A
+/// `functools.lru_cache` miss's function takes its store (`lru`, left in
+/// place by `None`) to its activation.
 #[inline(always)]
 unsafe fn direct_call<const CALL: bool>(
     st: &mut State,
@@ -4835,6 +4840,7 @@ unsafe fn direct_call<const CALL: bool>(
     len: usize,
     site: &mut DirectSite,
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
     unsafe {
@@ -4962,6 +4968,11 @@ unsafe fn direct_call<const CALL: bool>(
         );
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
+        if let Some(lru) = lru {
+            if let Some(top) = (*sw.inl).last_mut() {
+                top.lru = lru.take();
+            }
+        }
         Some(direct_run::<false>(
             st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
         ))
@@ -4999,7 +5010,6 @@ unsafe fn run_pushed_directly(
         if top.gen.is_some()
             || top.binop.is_some()
             || top.discard
-            || top.lru.is_some()
             || top.direct
             || !std::ptr::eq(&raw const *top.frame, callee)
         {
@@ -5144,6 +5154,7 @@ unsafe fn direct_run<const PUSHED: bool>(
                 } else {
                     v
                 };
+                let lru = done.lru.take();
                 crate::release_locals(&mut *cframe.locals.as_ptr());
                 drop(done.guard.take());
                 interp.lean_pending_exit(done.caller_pending);
@@ -5159,6 +5170,11 @@ unsafe fn direct_run<const PUSHED: bool>(
                     (*site).act = Some(interp.inline_park_warm(done));
                 } else {
                     interp.inline_park_direct(done);
+                }
+                // A `functools.lru_cache` miss's function returned: its
+                // result is stored before the caller takes it.
+                if let Some(pending) = lru {
+                    interp.lru_store_returned(pending, &v);
                 }
                 st.stack.add(start).write(v);
                 caller.stack.set_len(start + 1);
@@ -5234,6 +5250,121 @@ unsafe fn direct_run<const PUSHED: bool>(
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
         }
         RELOAD
+    }
+}
+
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
+/// a `functools.lru_cache` wrapper that missed its cache
+/// (`Interpreter::core_lru_probe`): its function in the wrapper's place,
+/// switched to as [`call_activation`] switches to a Python callee
+/// (`Interpreter::core_lru_miss`). `None` declined, the miss uncounted and
+/// the operands as they were.
+///
+/// # Safety
+///
+/// As `h_call`'s.
+#[inline(never)]
+unsafe fn lru_miss_switch(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    func: Object,
+    pending: crate::stdlib::functools_mod::LruPending,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+            drop(func);
+            crate::stdlib::functools_mod::lru_uncount_miss(&*st.stack.add(start));
+            drop(pending);
+            return None;
+        }
+        // The frame synced for a switch, as the core loop's arm syncs it.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let saved_last = sw.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_lru_miss(sw, pc, start, func, pending) {
+            return None;
+        }
+        if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+            if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                return Some(r);
+            }
+            if run_callee_directly(st, start) {
+                st.len = start + 1;
+                return Some(0);
+            }
+        }
+        Some(if finished_in_place(st, start) { 0 } else { RELOAD })
+    }
+}
+
+/// `CALL` of an instance from a site with a direct-call cache (see
+/// `Lower::call_choice`): a `functools.lru_cache` wrapper's hit in place,
+/// and its miss's function in the wrapper's place, run straight from here
+/// as [`direct_call`] runs a Python callee (the result stored when it
+/// returns: see `InlineAct::lru`). Anything else goes through [`h_call`].
+unsafe extern "C" fn h_call_instance(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc_argc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    use crate::stdlib::functools_mod::LruProbe;
+    // SAFETY: as `h_call_direct`'s: the callee's slot is on the stack
+    // below the arguments and its self slot, and `site` is this `CALL`'s
+    // own cache.
+    unsafe {
+        let s = &mut *st;
+        let pc = (pc_argc & u64::from(u32::MAX)) as usize;
+        let argc = (pc_argc >> 32) as usize;
+        let len_u = len as usize;
+        let start = len_u - argc - 2;
+        let ops = std::slice::from_raw_parts(s.stack.add(start), argc + 2);
+        match Interpreter::core_lru_probe(ops) {
+            Some(LruProbe::Hit(r)) => {
+                crate::release_run(s.stack.add(start), len_u - start);
+                s.stack.add(start).write(r);
+                s.len = start + 1;
+                return 0;
+            }
+            Some(LruProbe::Miss(func, mut pending)) => {
+                let site = &mut *site;
+                // (While the function has no native body, the site waits
+                // out its retries as `h_call_site` does.)
+                if !s.sw.is_null() && (site.hot != 0 || site.retry == 0) {
+                    pending.hold(std::mem::replace(&mut *s.stack.add(start), func));
+                    let mut lru = Some(pending);
+                    if let Some(r) = direct_call::<false>(s, pc, start, len_u, site, None, Some(&mut lru)) {
+                        return r;
+                    }
+                    // Not run directly: the wrapper back in its place.
+                    let pending = lru.take().expect("a declined direct call keeps the store");
+                    let func = std::mem::replace(&mut *s.stack.add(start), Object::Unbound);
+                    let mut pending = pending;
+                    s.stack.add(start).write(pending.take_wrapper());
+                    if let Some(r) = lru_miss_switch(s, pc, start, len_u, func, pending) {
+                        return r;
+                    }
+                } else {
+                    if site.retry != 0 {
+                        site.retry -= 1;
+                    }
+                    if let Some(r) = lru_miss_switch(s, pc, start, len_u, func, pending) {
+                        return r;
+                    }
+                }
+            }
+            None => {}
+        }
+        h_call(st, code, ext, pc as u64, len)
     }
 }
 
@@ -5422,24 +5553,12 @@ unsafe extern "C" fn h_call(
             let ops = std::slice::from_raw_parts(base.add(start), argc + 2);
             match Interpreter::core_lru_probe(ops) {
                 Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => return done(st, r),
-                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending))
-                    if !st.sw.is_null() && std::ptr::eq((*st.sw).cur, st.frame) =>
-                {
-                    sync(st);
-                    let sw = &mut *st.sw;
-                    let interp = &mut *st.interp.cast_mut();
-                    if interp.core_lru_miss(sw, pc, func, pending) {
-                        if sw.pending.is_none()
-                            && !std::ptr::eq(sw.cur, st.frame)
-                            && run_callee_directly(st, start)
-                        {
-                            st.len = start + 1;
-                            return 0;
-                        }
-                        return if finished_in_place(st, start) { 0 } else { RELOAD };
+                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending)) => {
+                    if let Some(r) = lru_miss_switch(st, pc, start, len, func, pending) {
+                        return r;
                     }
                 }
-                _ => {}
+                None => {}
             }
         }
         Interpreter::core_instance_callee(base.add(start));
@@ -11416,6 +11535,29 @@ impl<'a> Lower<'a> {
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(general);
+        // An instance (a `functools.lru_cache` wrapper's call) takes the
+        // site's cache too.
+        let is_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.instance));
+        let instance = self.b.create_block();
+        let plain = self.b.create_block();
+        self.b.ins().brif(is_inst, instance, &[], plain, &[]);
+        self.b.switch_to_block(instance);
+        let pc_argc = self
+            .b
+            .ins()
+            .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+        let r = self
+            .call(
+                h_call_instance as *const () as usize,
+                &[self.st, code, ext, pc_argc, len, site_at],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().jump(called, &[r.into()]);
+        self.b.switch_to_block(plain);
         let r = self
             .call(
                 h_call as *const () as usize,

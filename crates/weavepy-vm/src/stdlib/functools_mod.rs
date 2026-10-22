@@ -926,12 +926,30 @@ fn lru_native_store(
     result: &Object,
     limit: u64,
 ) -> Result<Option<Option<(DictKey, Object)>>, RuntimeError> {
+    native_store_in(
+        &mut cache.borrow_mut(),
+        &mut state.borrow_mut(),
+        state,
+        key,
+        result,
+        limit,
+    )
+}
+
+/// [`lru_native_store`] with the cache and its words (`state`'s) in hand.
+#[inline]
+fn native_store_in(
+    data: &mut DictData,
+    bytes: &mut Vec<u8>,
+    state: &Rc<RefCell<Vec<u8>>>,
+    key: &Object,
+    result: &Object,
+    limit: u64,
+) -> Result<Option<Option<(DictKey, Object)>>, RuntimeError> {
     let Some(probe) = crate::object::LeafProbe::new(key) else {
         return Ok(None);
     };
-    let mut data = cache.borrow_mut();
-    let mut bytes = state.borrow_mut();
-    let Some((_, flags)) = lru_state::mode(&bytes) else {
+    let Some((_, flags)) = lru_state::mode(bytes) else {
         return Ok(None);
     };
     match data.get_index_of(&probe) {
@@ -949,7 +967,7 @@ fn lru_native_store(
     if flags & lru_state::FALLBACK != 0 || len > limit {
         return Ok(None);
     }
-    let Some(mut links) = lru_state::Links::new(&mut bytes, len) else {
+    let Some(mut links) = lru_state::Links::new(bytes, len) else {
         return Ok(None);
     };
     if len == limit {
@@ -973,11 +991,11 @@ fn lru_native_store(
 pub(crate) enum LruProbe {
     /// The cached value, its hit counted and its recency refreshed.
     Hit(Object),
-    /// An exact miss, not yet counted: the wrapped (plain Python) function
-    /// and the store its result awaits. The caller runs the function in
-    /// the wrapper's place, then counts the miss
-    /// ([`LruPending::count_miss`]) once the call is committed, and stores
-    /// the result when it returns ([`lru_store_returned`]).
+    /// An exact miss, counted: the wrapped (plain Python) function and the
+    /// store its result awaits. The caller runs the function in the
+    /// wrapper's place and stores the result when it returns
+    /// ([`lru_store_returned`]), or uncounts the miss
+    /// ([`LruPending::uncount_miss`]) if it doesn't make the call.
     Miss(Object, LruPending),
 }
 
@@ -986,18 +1004,41 @@ pub(crate) enum LruProbe {
 /// the wrapper (as the call's operands held it) and the wrapper's native
 /// nesting level until the activation finishes.
 pub(crate) struct LruPending {
-    _wrapper: Object,
-    cache: Rc<RefCell<DictData>>,
-    state: Rc<RefCell<Vec<u8>>>,
+    wrapper: Object,
     key: Object,
     _depth: LruDepthGuard,
 }
 
-impl LruPending {
-    /// Count the miss (when the call is committed).
-    pub(crate) fn count_miss(&self) {
+/// A wrapper's cache and state words, read in place.
+///
+/// # Safety
+///
+/// Nothing that runs Python code may run while the references live (the
+/// slots are set once by the constructor; only the collector's clear,
+/// which needs a collection, replaces them).
+#[inline(always)]
+unsafe fn lru_cells(
+    wrapper: &Object,
+) -> Option<(&Rc<RefCell<DictData>>, &Rc<RefCell<Vec<u8>>>)> {
+    let Object::Instance(inst) = wrapper else {
+        return None;
+    };
+    let keys = lru_keys();
+    // SAFETY: the caller's contract.
+    let slots = unsafe { inst.slots.peek() }?;
+    match slots.leading_interned([&keys[0], &keys[1]])? {
+        [Object::Dict(cache), Object::ByteArray(state)] => Some((cache, state)),
+        _ => None,
+    }
+}
+
+/// Take back the miss [`lru_probe`] counted for a call of `wrapper` that
+/// wasn't made (nothing ran in between).
+pub(crate) fn lru_uncount_miss(wrapper: &Object) {
+    // SAFETY: nothing below runs code.
+    if let Some((_, state)) = unsafe { lru_cells(wrapper) } {
         // (Only a tampered buffer could fail.)
-        let _ = lru_count(&self.state, false);
+        let _ = lru_state::unmiss(&mut state.borrow_mut());
     }
 }
 
@@ -1080,17 +1121,20 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     }
     let Some(index) = found else {
         // A miss the caller can run in place: a plain function, and words
-        // the store may resize.
-        if !matches!(func, Object::Function(_)) || crate::object::bytearray_is_exported(state) {
+        // the store may resize if it must add links.
+        if !matches!(func, Object::Function(_))
+            || (limit != lru_state::UNBOUNDED
+                && (data.len() as u64) < limit
+                && crate::object::bytearray_is_exported(state))
+        {
             return None;
         }
         let depth = lru_enter_native().ok()?;
+        lru_state::miss(bytes)?;
         return Some(LruProbe::Miss(
             func.clone(),
             LruPending {
-                _wrapper: Object::Unbound,
-                cache: cache.clone(),
-                state: state.clone(),
+                wrapper: Object::Unbound,
                 key: key.clone(),
                 _depth: depth,
             },
@@ -1107,13 +1151,23 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
 impl LruPending {
     /// Hold the wrapper (moved out of the call's operands) until the call
     /// finishes.
+    #[inline(always)]
     pub(crate) fn hold(&mut self, wrapper: Object) {
-        self._wrapper = wrapper;
+        self.wrapper = wrapper;
     }
 
-    /// Take the held wrapper back (a declined call restores its operands).
-    pub(crate) fn release_wrapper(&mut self) -> Object {
-        std::mem::replace(&mut self._wrapper, Object::Unbound)
+    /// Take the held wrapper back, keeping the store (a call that goes on
+    /// another way).
+    pub(crate) fn take_wrapper(&mut self) -> Object {
+        std::mem::replace(&mut self.wrapper, Object::Unbound)
+    }
+
+    /// Take the held wrapper back (a declined call restores its operands,
+    /// the miss uncounted).
+    pub(crate) fn release_wrapper(mut self) -> Object {
+        let wrapper = std::mem::replace(&mut self.wrapper, Object::Unbound);
+        lru_uncount_miss(&wrapper);
+        wrapper
     }
 }
 
@@ -1123,16 +1177,31 @@ impl LruPending {
 /// A store that needs Python's equality waits for the next call into the
 /// native core ([`LRU_DEFERRED`]).
 pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(DictKey, Object)> {
-    let (limit, _) = lru_state::mode(&p.state.borrow())?;
-    match lru_native_store(&p.cache, &p.state, &p.key, value, limit) {
-        Ok(Some(evicted)) => return evicted,
-        Ok(None) => {}
+    // SAFETY: nothing below runs code (an evicted entry is returned, not
+    // released).
+    let (cache, state) = unsafe { lru_cells(&p.wrapper) }?;
+    // The cells in place while nothing holds them (always, but while
+    // another thread shares them), else under their locks.
+    // SAFETY: as above.
+    let stored = match unsafe { (cache.peek_mut(), state.peek_mut()) } {
+        (Some(data), Some(bytes)) => {
+            let (limit, _) = lru_state::mode(bytes)?;
+            native_store_in(data, bytes, state, &p.key, value, limit).map(|r| (r, limit))
+        }
+        _ => {
+            let (limit, _) = lru_state::mode(&state.borrow())?;
+            lru_native_store(cache, state, &p.key, value, limit).map(|r| (r, limit))
+        }
+    };
+    let limit = match stored {
+        Ok((Some(evicted), _)) => return evicted,
+        Ok((None, limit)) => limit,
         // A tampered buffer: nothing stored (the full path would raise).
         Err(_) => return None,
-    }
+    };
     // The ordered-dictionary fallback, when its probe settles natively.
     if let Some(probe) = crate::object::LeafProbe::new(&p.key) {
-        let mut data = p.cache.borrow_mut();
+        let mut data = cache.borrow_mut();
         let found = data.get_index_of(&probe);
         if probe.miss_is_exact() {
             if found.is_some() {
@@ -1153,7 +1222,7 @@ pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(Dict
     LRU_DEFERRED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((p.cache.clone(), p.state.clone(), p.key.clone(), value.clone()));
+        .push((cache.clone(), state.clone(), p.key.clone(), value.clone()));
     LRU_DEFERRED_ANY.store(true, std::sync::atomic::Ordering::Release);
     None
 }
