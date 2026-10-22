@@ -232,6 +232,14 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+/// A generator frame's allocations (see [`Interpreter::gen_parts`]): its
+/// locals vector and operand stack, both empty, and its box.
+struct GenParts {
+    locals: Rc<RefCell<Vec<Object>>>,
+    stack: Vec<Object>,
+    boxed: Box<std::mem::MaybeUninit<Frame>>,
+}
+
 // Every live generator holds its frame boxed for its whole life, so the
 // state few frames carry stays out of line (see `FrameRare`, `FrameExc`).
 const _: () = assert!(std::mem::size_of::<Frame>() <= 128);
@@ -430,9 +438,6 @@ impl Drop for TraceEventGuard {
     }
 }
 
-/// Cycle-GC traversal hook for generator-family objects: walk the
-/// suspended frame's locals, evaluation stack, and cells so cycles
-/// running through a generator frame (`g.send(g)`) are detectable.
 /// Registered with `gc_trace::register_traverse`: lets the cycle GC walk
 /// the objects a built-in iterator ([`Object::Iter`]) keeps alive. The
 /// `PyIterator` body is private to `object`, so tracing routes through
@@ -445,84 +450,81 @@ fn iter_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
 }
 
-/// Registered with `gc_trace::register_traverse` at interpreter init
-/// because `Frame` is private to this module.
-fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let g = match obj {
-        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g,
-        _ => return,
-    };
-    let Ok(state) = g.state_raw().try_borrow() else {
-        return;
-    };
-    let boxed = match &*state {
-        GeneratorState::Created(b)
-        | GeneratorState::Suspended(b)
-        | GeneratorState::Delegating(b) => b,
-        _ => return,
-    };
-    let frame: &Frame = boxed;
-    {
-        if let Ok(locals) = frame.locals.try_borrow() {
+/// The cycle GC's walk of a generator-family object (see
+/// `gc_trace::traverse_object`, which reaches it directly because `Frame`
+/// is private to this module): the suspended frame's locals, evaluation
+/// stack, and cells, so cycles running through a generator frame
+/// (`g.send(g)`) are detectable. `PEEK` as in `gc_trace::with_read`.
+#[inline(always)]
+pub(crate) fn generator_frame_traverse<const PEEK: bool, V: crate::gc_trace::Visit + ?Sized>(
+    g: &crate::object::PyGenerator,
+    visit: &mut V,
+) {
+    use crate::gc_trace::{visit_rc, with_read};
+    with_read::<PEEK, _, _>(g.state_raw(), |state| {
+        let (GeneratorState::Created(frame)
+        | GeneratorState::Suspended(frame)
+        | GeneratorState::Delegating(frame)) = state
+        else {
+            return;
+        };
+        let frame: &Frame = frame;
+        with_read::<PEEK, _, _>(&*frame.locals, |locals| {
             for v in locals.iter() {
-                visit(v);
+                visit.visit(v);
             }
-        }
+        });
         for v in &frame.stack {
-            visit(v);
+            visit.visit(v);
         }
         for c in frame.cells.iter() {
-            if let Ok(v) = c.try_borrow() {
-                visit(&v);
-            }
+            with_read::<PEEK, _, _>(&**c, |v| visit.visit(v));
         }
         // `f_globals` is a real edge (CPython's `frame_traverse` visits
         // it): a generator parked in an `exec()` namespace that also names
         // the generator is a dict -> generator -> frame -> dict cycle, and
         // the collector must see the back-edge to reclaim (and close) it
         // (test_generators.test_generator_resurrect).
-        visit(&Object::Dict(frame.globals.clone()));
+        visit_rc::<PEEK, _, V>(visit, &frame.globals, Object::Dict);
         // The frame-stack shell and the Python-visible snapshot each hold
         // their own strong handle on the same globals dict; the collector
         // seeds reachability from refcounts, so every handle must be
         // accounted for or the dict looks externally referenced.
         if let Some(shell) = &frame.shell_cache {
-            visit(&Object::Dict(shell.globals.clone()));
+            visit_rc::<PEEK, _, V>(visit, &shell.globals, Object::Dict);
         }
         if let Some(py) = &frame.py_frame {
-            visit(&Object::Dict(py.globals.clone()));
+            visit_rc::<PEEK, _, V>(visit, &py.globals, Object::Dict);
         }
         // `f_builtins` likewise (CPython's `frame_traverse` visits it):
         // a destroyed sub-interpreter's builtins dict is held only by its
         // functions and parked frames, and an unaccounted handle would
         // make it look externally rooted (see `func_builtins` in
         // `gc_trace::traverse_object`).
-        visit(&Object::Dict(frame.builtins.clone()));
+        visit_rc::<PEEK, _, V>(visit, &frame.builtins, Object::Dict);
         if let Some(shell) = &frame.shell_cache {
-            visit(&Object::Dict(shell.builtins.clone()));
+            visit_rc::<PEEK, _, V>(visit, &shell.builtins, Object::Dict);
         }
         if let Some(py) = &frame.py_frame {
-            visit(&Object::Dict(py.builtins.clone()));
-        }
-        // The cached Python-visible frame snapshot shares the locals
-        // storage visited above (no separate mirror copies), but its
-        // materialised f_locals dict is a distinct edge.
-        if let Some(py) = &frame.py_frame {
+            visit_rc::<PEEK, _, V>(visit, &py.builtins, Object::Dict);
+            // The cached Python-visible frame snapshot shares the locals
+            // storage visited above (no separate mirror copies), but its
+            // materialised f_locals dict is a distinct edge.
             if let Ok(cache) = py.locals_cache.try_borrow() {
                 if let Some(d) = cache.as_ref() {
-                    visit(d);
+                    visit.visit(d);
                 }
             }
         }
-        // RFC 0073 WS4 — a parked native activation's pin table is the
+        // RFC 0073 WS4: a parked native activation's pin table is the
         // real owner of everything the compiled frame still holds
         // (locals visited above are the stale park-time snapshot; the
         // live edges are the pins).
         #[cfg(feature = "jit")]
         if let Some(act) = &frame.parked_native {
-            act.visit_objects(visit);
+            act.visit_objects(&mut |c: &Object| visit.visit(c));
         }
-    }
+    });
 }
 
 /// Registered with `gc_trace::register_traverse`: the object edges a
@@ -935,10 +937,9 @@ pub struct Interpreter {
     /// consumer resumes item by item starts a quiet run per item.
     #[allow(clippy::vec_box)]
     inl_spares: Vec<Vec<Box<InlineAct>>>,
-    /// Finished generators' frame boxes, their frames dropped, for the
-    /// next generators' frames (see [`Self::box_gen_frame`]).
-    #[allow(clippy::vec_box)]
-    gen_box_pool: ThreadCell<Vec<Box<std::mem::MaybeUninit<Frame>>>>,
+    /// Finished generators' frame allocations, their frames retired, for
+    /// the next generators' frames (see [`Self::gen_parts`]).
+    gen_spares: ThreadCell<Vec<GenParts>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1160,20 +1161,11 @@ impl Default for Interpreter {
                 dict: builtins.clone(),
             })),
         );
-        // RFC 0024: teach the cycle GC to walk suspended generator
-        // frames (their `Frame` type is private to this module).
+        // RFC 0024: teach the cycle GC to walk the objects whose types are
+        // private to this module. (It walks a suspended generator's frame
+        // itself, through `generator_frame_traverse`.)
         static GEN_TRAVERSE: std::sync::Once = std::sync::Once::new();
         GEN_TRAVERSE.call_once(|| {
-            crate::gc_trace::register_traverse_for(
-                crate::gc_trace::hook_kind::GENERATOR,
-                |o| {
-                    matches!(
-                        o,
-                        Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_)
-                    )
-                },
-                generator_frame_traverse,
-            );
             // Bug #3680: a built-in iterator (list/set/dict-keys/… iterator)
             // can close a reference cycle through the items it buffers or the
             // live set it walks. Teach the cycle GC to trace through it so
@@ -1263,7 +1255,7 @@ impl Default for Interpreter {
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
-            gen_box_pool: ThreadCell::new(Vec::new()),
+            gen_spares: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1396,7 +1388,7 @@ impl Interpreter {
             frame_locals_pool: ThreadCell::new(Vec::new()),
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
-            gen_box_pool: ThreadCell::new(Vec::new()),
+            gen_spares: ThreadCell::new(Vec::new()),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -4037,34 +4029,142 @@ impl Interpreter {
         }
     }
 
-    /// `frame` boxed for a new generator: in a finished generator's box
-    /// (see [`Self::recycle_gen_box`]) when the pool has one.
+    /// A new generator frame's allocations: an empty locals vector with
+    /// room for `nlocals`, an empty operand stack, and the box, a finished
+    /// generator's (see [`Self::retire_gen_frame`]) when the pool has them.
     #[inline]
-    fn box_gen_frame(&self, frame: Frame) -> Box<Frame> {
-        let spare = self.gen_box_pool.borrow_mut().pop();
+    fn gen_parts(&self, nlocals: usize) -> GenParts {
+        let spare = self.gen_spares.borrow_mut().pop();
         match spare {
-            Some(b) => Box::write(b, frame),
-            None => Box::new(frame),
+            Some(parts) => {
+                // SAFETY: sole owner (see `retire_gen_frame`).
+                unsafe { (*parts.locals.as_ptr()).reserve(nlocals) };
+                parts
+            }
+            None => GenParts {
+                locals: self.pooled_locals_empty(nlocals),
+                stack: self.pooled_stack(),
+                boxed: Box::new_uninit(),
+            },
         }
     }
 
-    /// A finished generator's frame box: the frame is dropped here (what
-    /// dropping the box would do) and the allocation kept for the next
-    /// generator's (see [`Self::box_gen_frame`]).
-    fn recycle_gen_box(&self, boxed: Box<Frame>) {
+    /// `frame`, whose locals and stack are its own, boxed for a new
+    /// generator: in a finished generator's box when the pool has one
+    /// (its locals and stack go to the frame pools).
+    fn box_gen_frame(&self, frame: Frame) -> Box<Frame> {
+        let spare = self.gen_spares.borrow_mut().pop();
+        let Some(GenParts {
+            locals,
+            stack,
+            boxed,
+        }) = spare
+        else {
+            return Box::new(frame);
+        };
+        const POOL_CAP: usize = 64;
+        let mut pool = self.frame_stack_pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(stack);
+        }
+        drop(pool);
+        let mut pool = self.frame_locals_pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(locals);
+        }
+        drop(pool);
+        Box::write(boxed, frame)
+    }
+
+    /// Retire a finished generator's frame: its values are released (an
+    /// object that dies with them queues its finalizer), and its locals
+    /// vector, operand stack and box are kept for the next generator's
+    /// frame (see [`Self::gen_parts`]). The locals are kept only when the
+    /// frame is their sole owner: an escaped `PyFrame` shares them (see
+    /// [`Self::recycle_frame_allocs`]).
+    fn retire_gen_frame(&self, boxed: Box<Frame>) {
         const POOL_CAP: usize = 32;
         let raw = Box::into_raw(boxed);
-        // SAFETY: the frame is dropped in place once, and its allocation
-        // goes on as uninitialized storage (freed as such past the cap).
-        // The frame's drop glue runs before the pool's borrow.
-        let spare = unsafe {
-            std::ptr::drop_in_place(raw);
-            Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>())
+        // (Every field named: one added later must be retired here too.)
+        // SAFETY: the box holds a frame, owned here.
+        let Frame {
+            code,
+            locals,
+            cells,
+            stack,
+            globals,
+            builtins,
+            rare,
+            exc,
+            agen_yielded_value: _,
+            pc: _,
+            py_frame,
+            gen_owner,
+            suppress_call_event: _,
+            gen_first_resume: _,
+            sent_consumed: _,
+            shell_cache,
+            #[cfg(feature = "jit")]
+            parked_native,
+        } = unsafe { &mut *raw };
+        // SAFETY: each field is moved out or dropped in place exactly once,
+        // after which the box holds uninitialized storage. The values go
+        // first, in the order the frame's drop releases them, and none
+        // while a pool is borrowed (their drop glue can run code).
+        let (locals, mut stack, boxed, sole) = unsafe {
+            let (locals, mut stack) = (std::ptr::read(locals), std::ptr::read(stack));
+            stack.clear();
+            // (An escaped `PyFrame` sharing them drops below: the decision
+            // is made before it does.)
+            let sole = Rc::strong_count(&locals) == 1;
+            if sole {
+                release_locals(&mut *locals.as_ptr());
+            }
+            std::ptr::drop_in_place(code);
+            std::ptr::drop_in_place(cells);
+            std::ptr::drop_in_place(globals);
+            std::ptr::drop_in_place(builtins);
+            std::ptr::drop_in_place(rare);
+            std::ptr::drop_in_place(exc);
+            std::ptr::drop_in_place(py_frame);
+            std::ptr::drop_in_place(gen_owner);
+            std::ptr::drop_in_place(shell_cache);
+            #[cfg(feature = "jit")]
+            std::ptr::drop_in_place(parked_native);
+            (
+                locals,
+                stack,
+                Box::from_raw(raw.cast::<std::mem::MaybeUninit<Frame>>()),
+                sole,
+            )
         };
-        let mut pool = self.gen_box_pool.borrow_mut();
-        if pool.len() < POOL_CAP {
-            pool.push(spare);
+        if !sole {
+            return;
         }
+        // (A compacted stack regains the room a pooled one has.)
+        if stack.capacity() < POOLED_STACK_CAPACITY {
+            stack.reserve(POOLED_STACK_CAPACITY);
+        }
+        let mut pool = self.gen_spares.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(GenParts {
+                locals,
+                stack,
+                boxed,
+            });
+        }
+    }
+
+    /// Finish `gen`, running (its frame `boxed` out of its state): the
+    /// generator is marked finished, its frame retired (see
+    /// [`Self::retire_gen_frame`]), and the collector lets go of it (see
+    /// [`Self::release_finished_gen`]). (Out of line: the resumes that
+    /// end here keep their registers for the commoner yield.)
+    #[inline(never)]
+    fn retire_gen(&self, gen: &Rc<PyGenerator>, boxed: Box<Frame>) {
+        Self::finish_running_gen(gen);
+        self.retire_gen_frame(boxed);
+        Self::release_finished_gen(gen);
     }
 
     fn make_frame(
@@ -5302,7 +5402,7 @@ impl Interpreter {
                 }
             }
         };
-        self.pop_frame_shell();
+        self.pop_frame_shell_with(result.is_err());
         // A normally-returning frame is dead: CPython deallocates it the
         // instant it returns, releasing every local by refcount. Drop the
         // live-locals mirror (and any materialised `f_locals`) so a
@@ -5577,6 +5677,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(materialized.is_some()),
             materialized: RefCell::new(materialized),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
+            departed: crate::object::Departed::default(),
         });
         if let Some(py) = shell.materialized.borrow().as_ref() {
             shell.link(py);
@@ -5630,6 +5731,7 @@ impl Interpreter {
             m.class_namespace_obj = None;
             *m.gen_owner.get_mut() = None;
             *m.materialized.get_mut() = None;
+            m.departed = crate::object::Departed::default();
             self.frame_shell_pool.borrow_mut().push(shell);
         }
     }
@@ -6083,6 +6185,27 @@ impl Interpreter {
         unsafe { (*self.exc_info_stack.as_ptr()).len() }
     }
 
+    /// `PUSH_EXC_INFO`'s entry: push `exc` as the handled exception and
+    /// return the previous one (`None` for none), under
+    /// [`Self::exc_info_len`]'s contract (the push runs no code).
+    #[inline]
+    fn exc_info_push(&self, exc: Object) -> Object {
+        // SAFETY: see `exc_info_len`; nothing here re-enters.
+        let handled = unsafe { &mut *self.exc_info_stack.as_ptr() };
+        let prev = handled.last().cloned().unwrap_or(Object::None);
+        handled.push(exc);
+        prev
+    }
+
+    /// `POP_EXCEPT`'s exit: the handled exception popped, as
+    /// [`Self::exc_info_push`] pushed it (the caller releases it).
+    #[inline]
+    fn exc_info_pop(&self) -> Option<Object> {
+        // SAFETY: see `exc_info_len`; the popped value is released by the
+        // caller, after the stack is consistent again.
+        unsafe { (*self.exc_info_stack.as_ptr()).pop() }
+    }
+
     fn sync_py_locals(&self, frame: &Frame) {
         // The Python-visible frame shares the live locals storage
         // (see `build_py_frame`), so there is nothing to copy; only the
@@ -6155,20 +6278,38 @@ impl Interpreter {
     }
 
     fn pop_frame_shell(&self) -> Option<Rc<crate::object::FrameShell>> {
+        self.pop_frame_shell_with(false)
+    }
+
+    /// [`Self::pop_frame_shell`] for an activation an exception is ending
+    /// (`unwound`), which departs instead of materializing (see
+    /// `FrameShell::depart`).
+    fn pop_frame_shell_with(&self, unwound: bool) -> Option<Rc<crate::object::FrameShell>> {
         // A lazy reference to this activation (a traceback entry, see
         // `PyTraceback::new_lazy`, or a callee frame's `f_back`) still
         // lives: build the frame object CPython would have by now, while
-        // the shell is still whole.
-        let lazy_top = self.frame_stack.borrow().last().is_some_and(|top| {
-            top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && !top
-                    .has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-        });
-        if lazy_top {
-            self.materialize_departing_top();
-        }
-        let popped = self.frame_stack.borrow_mut().pop();
+        // the shell is still whole, or leave the shell to stand for it.
+        let popped = {
+            let mut stack = self.frame_stack.borrow_mut();
+            let n = stack.len();
+            let lazy_top = stack.last().is_some_and(|top| {
+                top.tb_refs.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    && !top
+                        .has_materialized
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && !top.has_departed()
+            });
+            if lazy_top && (!unwound || stack[n - 1].is_gen) {
+                drop(stack);
+                self.materialize_departing_top();
+                self.frame_stack.borrow_mut().pop()
+            } else {
+                if lazy_top {
+                    stack[n - 1].depart(n.checked_sub(2).map(|i| &stack[i]));
+                }
+                stack.pop()
+            }
+        };
         if let Some(shell) = &popped {
             // Borrowed slots (see `FrameSlot`) read through the frame,
             // which dies once its activation unwinds. The spine's handle
@@ -8616,10 +8757,7 @@ impl Interpreter {
                 Ok(GenStep::Yielded(v))
             }
             Ok(FrameOutcome::Returned(v)) => {
-                Self::finish_running_gen(&gen);
-                let frame: &mut Frame = &mut boxed;
-                self.recycle_frame_allocs(frame);
-                Self::release_finished_gen(&gen);
+                self.retire_gen(&gen, boxed);
                 Ok(GenStep::Exhausted(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -8992,6 +9130,7 @@ impl Interpreter {
             has_materialized: std::sync::atomic::AtomicBool::new(false),
             materialized: RefCell::new(None),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
+            departed: crate::object::Departed::default(),
         });
         self.frame_stack.borrow_mut().push(shell.clone());
         shell
@@ -14058,6 +14197,47 @@ impl Interpreter {
                                 &*base.add(len - 2)
                             })
                         {
+                            // A simple body steps to its next yield in place,
+                            // as for `next(gen)` above.
+                            // SAFETY: `len >= 3`: the call's operands.
+                            let target = unsafe {
+                                Self::gen_send_target(
+                                    &*base.add(len - 3),
+                                    &*base.add(len - 2),
+                                    &*base.add(len - 1),
+                                )
+                            };
+                            if let (Some(g), true) = (target, Self::core_drops_plain()) {
+                                // SAFETY: as above.
+                                let sent = clone_hot(unsafe { &*base.add(len - 1) });
+                                match self.gen_fast_send(g, sent, snap_gen, 0, pending_work) {
+                                    gen_fast::GenNext::Yielded(v) => {
+                                        // SAFETY: as for `next(gen)` above.
+                                        unsafe {
+                                            release_run(base.add(len - 3), 3);
+                                            base.add(len - 3).write(v);
+                                        }
+                                        len -= 2;
+                                        last = pc;
+                                        pc += 1;
+                                        after_release!();
+                                        continue;
+                                    }
+                                    // `send` raises `StopIteration(value)`.
+                                    gen_fast::GenNext::Exhausted(v) => {
+                                        // SAFETY: as above.
+                                        unsafe {
+                                            release_run(base.add(len - 3), 3);
+                                        }
+                                        len -= 3;
+                                        pc += 1;
+                                        break Some(CoreExit::Stop(LeafStop::Raised(
+                                            crate::error::stop_iteration_with(v),
+                                        )));
+                                    }
+                                    gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
+                                }
+                            }
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
@@ -15311,7 +15491,7 @@ impl Interpreter {
                             Object::Type(t) => {
                                 t.flags.is_builtin
                                     && t.flags.is_exception
-                                    && !t.is_subclass_of(&bt.base_exception_group)
+                                    && exc_family_flags(t) & EXC_FAM_GROUP == 0
                             }
                             _ => false,
                         };
@@ -19031,12 +19211,7 @@ impl Interpreter {
                 }
                 // SAFETY: as above.
                 let instance = unsafe { &*base.add(len - 1) }.clone();
-                let prev = {
-                    let mut handled = self.exc_info_stack.borrow_mut();
-                    let prev = handled.last().cloned().unwrap_or(Object::None);
-                    handled.push(instance);
-                    prev
-                };
+                let prev = self.exc_info_push(instance);
                 // SAFETY: the exception moves up one slot and the previous
                 // one takes its place (`len < cap`).
                 unsafe {
@@ -19067,7 +19242,7 @@ impl Interpreter {
                 }
                 // SAFETY: the slot at `len - 1` is initialized.
                 let prev = unsafe { base.add(len - 1).read() };
-                let top = self.exc_info_stack.borrow_mut().pop();
+                let top = self.exc_info_pop();
                 // See the full handler: the handled exception dies here
                 // unless something else holds it.
                 if let Some(top) = top {
@@ -19977,8 +20152,9 @@ impl Interpreter {
         if !Self::core_all_droppable(ops) {
             return None;
         }
+        // (`leaf_type_call` ends in `builtin_ctor_pure` for a builtin type
+        // its own arms don't build.)
         self.leaf_type_call(t, &ops[2..])
-            .or_else(|| crate::seqiter::builtin_ctor_pure(t, &ops[2..]))
     }
 
     /// The `__slots__` member `co_names[name_idx]` of the instance at
@@ -23214,12 +23390,9 @@ impl Interpreter {
         }
         drop(done.guard.take());
         let gen = done.gen.take().expect("a generator activation");
-        let mut boxed = done.gen_box.take().expect("a generator activation");
+        let boxed = done.gen_box.take().expect("a generator activation");
         done.gen_frame = std::ptr::null_mut();
-        Self::finish_running_gen(&gen);
-        self.recycle_frame_allocs(&mut boxed);
-        Self::release_finished_gen(&gen);
-        self.recycle_gen_box(boxed);
+        self.retire_gen(&gen, boxed);
         drop(gen);
         // A collapsed chain's innermost level takes the return value: it
         // resumes in its `SEND`, the rest of the chain still collapsed.
@@ -24090,20 +24263,17 @@ impl Interpreter {
             return None;
         };
         if cls.native_kind.get() == 0 {
-            // The builtin adapter types and the exact `itertools` classes:
-            // their native adapters, when building one runs no code.
-            if kw || (!cls.flags.is_builtin && cls.lazy_ctor.get() == 0) {
+            // The exact `itertools` classes: their native adapters, when
+            // building one runs no code. (A builtin type's call is
+            // `core_builtin_ctor`'s, which every caller tries as well.)
+            if kw || cls.flags.is_builtin || cls.lazy_ctor.get() == 0 {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
             if !Self::core_all_droppable(ops) {
                 return None;
             }
-            return if cls.flags.is_builtin {
-                crate::seqiter::builtin_ctor_pure(cls, args)
-            } else {
-                crate::stdlib::itertools_mod::native_new_pure(cls, args)
-            };
+            return crate::stdlib::itertools_mod::native_new_pure(cls, args);
         }
         let args = ops.get(2..2 + argc)?;
         let (names, values): (&[Object], &[Object]) = if kw {
@@ -26890,12 +27060,7 @@ impl Interpreter {
                         break;
                     }
                     let exc = stack.pop().expect("checked above");
-                    let prev = {
-                        let mut handled = self.exc_info_stack.borrow_mut();
-                        let prev = handled.last().cloned().unwrap_or(Object::None);
-                        handled.push(exc.clone());
-                        prev
-                    };
+                    let prev = self.exc_info_push(exc.clone());
                     stack.push(prev);
                     stack.push(exc);
                     last = pc;
@@ -26916,7 +27081,7 @@ impl Interpreter {
                 }
                 OpCode::PopExcept => {
                     let Some(prev) = stack.pop() else { break };
-                    let top = self.exc_info_stack.borrow_mut().pop();
+                    let top = self.exc_info_pop();
                     // See the full handler: the handled exception dies
                     // here unless something else holds it.
                     last = pc;
@@ -26949,7 +27114,7 @@ impl Interpreter {
                 if std::ptr::eq(cls, Rc::as_ptr(t)) {
                     return Some(true);
                 }
-                if !t.is_subclass_of(base) {
+                if !t.flags.is_exception && !t.is_subclass_of(base) {
                     return None;
                 }
                 Some(cls.is_subclass_of(t))
@@ -26960,10 +27125,10 @@ impl Interpreter {
                     let Object::Type(t) = t else {
                         return None;
                     };
-                    if !t.is_subclass_of(base) {
+                    if !t.flags.is_exception && !t.is_subclass_of(base) {
                         return None;
                     }
-                    matched = matched || cls.is_subclass_of(t);
+                    matched = matched || std::ptr::eq(cls, Rc::as_ptr(t)) || cls.is_subclass_of(t);
                 }
                 Some(matched)
             }
@@ -28160,9 +28325,7 @@ impl Interpreter {
         // `__new__`, no class-defined `__init__` to run), as the full
         // call builds it.
         if ty.flags.is_builtin && ty.flags.is_exception {
-            if ty.is_subclass_of(&builtin_types().base_exception_group)
-                || lookup_exception_init(ty).is_some()
-            {
+            if exc_family_flags(ty) & EXC_FAM_GROUP != 0 || lookup_exception_init(ty).is_some() {
                 return None;
             }
             return Some(self.build_exception_instance(ty.clone(), args));
@@ -28176,7 +28339,7 @@ impl Interpreter {
                 [Object::Int(n)] => Some(Object::from_str(itoa::Buffer::new().format(*n))),
                 [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
                 [Object::None] => Some(Object::from_static("None")),
-                _ => None,
+                _ => crate::seqiter::builtin_ctor_pure(ty, args),
             };
         }
         if Rc::ptr_eq(ty, &fns.range_ty) {
@@ -28188,7 +28351,7 @@ impl Interpreter {
                 [Object::Int(start), Object::Int(stop), Object::Int(step)] if *step != 0 => {
                     (i128::from(*start), i128::from(*stop), i128::from(*step))
                 }
-                _ => return None,
+                _ => return crate::seqiter::builtin_ctor_pure(ty, args),
             };
             return Some(Object::Range(Rc::new(crate::object::Range::new(
                 start, stop, step,
@@ -34188,18 +34351,17 @@ impl Interpreter {
             return Err(err);
         };
         let raise_pc = frame.pc.wrapping_sub(1);
-        if find_handler(&frame.code.exception_table, raise_pc).is_none()
-            || crate::trace::any_observers_active()
-        {
-            return Err(RuntimeError::PyException(exc));
-        }
+        let handler = match find_handler(&frame.code.exception_table, raise_pc) {
+            Some(handler) if !crate::trace::any_observers_active() => *handler,
+            _ => return Err(RuntimeError::PyException(exc)),
+        };
         self.chain_fresh_exception(&mut exc);
         // The traceback entry records this activation's shell, and the
         // handler's instructions run through `step`, which needs it.
         self.flush_lean(frame, shell)
             .lasti
             .store(raise_pc, std::sync::atomic::Ordering::Relaxed);
-        match self.handle_exception(frame, exc) {
+        match self.handle_exception_with(frame, exc, Some(handler)) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -34257,11 +34419,11 @@ impl Interpreter {
         exc_depth: usize,
     ) -> RuntimeError {
         self.chain_fresh_exception(&mut exc);
-        let err = match self.handle_exception(frame, exc) {
+        let err = match self.handle_exception_with(frame, exc, None) {
             Err(e) => e,
             Ok(_) => RuntimeError::Internal("quiet unwind found a handler".to_owned()),
         };
-        self.pop_frame_shell();
+        self.pop_frame_shell_with(true);
         Self::settle_exited_frame_object(&shell, frame, false);
         if self.exc_info_len() > exc_depth {
             self.exc_info_stack.borrow_mut().truncate(exc_depth);
@@ -34334,10 +34496,23 @@ impl Interpreter {
     fn handle_exception(
         &self,
         frame: &mut Frame,
-        mut exc: PyException,
+        exc: PyException,
     ) -> Result<Option<()>, RuntimeError> {
         // Note `pc` was already advanced past the raising instruction,
         // so the protected range matches against `pc - 1`.
+        let handler =
+            find_handler(&frame.code.exception_table, frame.pc.saturating_sub(1)).copied();
+        self.handle_exception_with(frame, exc, handler)
+    }
+
+    /// [`Self::handle_exception`] with the handler covering the raise
+    /// (`find_handler`'s answer) already found.
+    fn handle_exception_with(
+        &self,
+        frame: &mut Frame,
+        mut exc: PyException,
+        handler: Option<ExcHandler>,
+    ) -> Result<Option<()>, RuntimeError> {
         let raise_pc = frame.pc.saturating_sub(1);
         let line = frame
             .code
@@ -34356,7 +34531,7 @@ impl Interpreter {
         } else {
             self.append_traceback(&mut exc, frame, raise_pc, line);
         }
-        if let Some(handler) = find_handler(&frame.code.exception_table, raise_pc) {
+        if let Some(handler) = handler {
             // Drop entries above the recorded stack depth.
             while frame.stack.len() > handler.depth as usize {
                 frame.stack.pop();
@@ -34403,7 +34578,7 @@ impl Interpreter {
             }
             // Push the exception instance for the handler to bind /
             // CHECK_EXC_MATCH to inspect.
-            frame.stack.push(exc.instance.clone());
+            frame.stack.push(exc.instance);
             frame.pc = handler.handler;
             return Ok(Some(()));
         }
@@ -34424,8 +34599,8 @@ impl Interpreter {
         // out-of-range `tb_lasti` values that made `traceback`'s
         // `_get_code_position` StopIterate (RFC 0054: asyncio cancellation
         // tracebacks crashed `format_exc` with PEP 479 RuntimeError).
-        let new_tb = match frame.py_frame.clone() {
-            Some(py_frame) => PyTraceback::new(py_frame, lineno, lasti, None),
+        let new_tb = match &frame.py_frame {
+            Some(py_frame) => PyTraceback::new(py_frame.clone(), lineno, lasti, None),
             None => {
                 // This activation's shell: the traceback must reference
                 // *this* frame's snapshot, and it must be the *same*
@@ -34439,7 +34614,10 @@ impl Interpreter {
                 // dispatch-machinery entries above the frame being
                 // annotated (test_sys_settrace jump-from-'call').
                 let found = {
-                    let stack = self.frame_stack.borrow();
+                    // SAFETY: only this thread mutates its spine, and the
+                    // scan runs no code (a guard-free read, as
+                    // `exc_info_len`'s).
+                    let stack = unsafe { &*self.frame_stack.as_ptr() };
                     stack
                         .iter()
                         .rposition(|shell| Rc::ptr_eq(&shell.locals, &frame.locals))
@@ -34701,10 +34879,9 @@ impl Interpreter {
         // A builtin exception class (not a group, whose constructor
         // validates): the call's own construction, without the call.
         if let Object::Type(t) = &value {
-            let bt = builtin_types();
             if t.flags.is_builtin
                 && t.flags.is_exception
-                && !t.is_subclass_of(&bt.base_exception_group)
+                && exc_family_flags(t) & EXC_FAM_GROUP == 0
             {
                 return Ok(self.build_exception_instance(t.clone(), &[]));
             }
@@ -34744,8 +34921,11 @@ impl Interpreter {
                 make_exception_with_class(t, "")
             }
             Object::Instance(inst) => {
-                if !inst.cls().flags.is_exception && !inst.cls().is_subclass_of(&bt.base_exception)
-                {
+                let derives = {
+                    let cls = inst.class.borrow();
+                    cls.flags.is_exception || cls.is_subclass_of(&bt.base_exception)
+                };
+                if !derives {
                     return Err(type_error("exceptions must derive from BaseException"));
                 }
                 Object::Instance(inst)
@@ -45734,12 +45914,11 @@ impl Interpreter {
     /// without a `GeneratorExit` (and, like CPython's, without unwind
     /// events while no tool observes them). Returns whether it did.
     fn gen_close_quiet(&mut self, g: &Rc<PyGenerator>) -> bool {
-        let Some(mut boxed) = Self::gen_close_quiet_detached(g) else {
+        let Some(boxed) = Self::gen_close_quiet_detached(g) else {
             return false;
         };
-        self.recycle_frame_allocs(&mut boxed);
+        self.retire_gen_frame(boxed);
         Self::release_finished_gen(g);
-        drop(boxed);
         true
     }
 
@@ -46375,11 +46554,7 @@ impl Interpreter {
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
-                Self::finish_running_gen(gen);
-                let frame: &mut Frame = &mut boxed;
-                self.recycle_frame_allocs(frame);
-                Self::release_finished_gen(gen);
-                self.recycle_gen_box(boxed);
+                self.retire_gen(gen, boxed);
                 Self::generator_returned(v, raw_return)
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -46411,8 +46586,13 @@ impl Interpreter {
             return;
         }
         // A generator still in the collector's young set has no registry
-        // entry to remove (the set drops it once it's dead).
+        // entry to remove: it leaves the set (whose entry would hold its
+        // allocation until the set dropped it). One whose tracking was
+        // deferred never joined it.
         if !gen.gc_slot.is_registered() {
+            if !gen.track_deferred.get() {
+                gc_trace::forget_young_generator(gen);
+            }
             return;
         }
         let id = Rc::as_ptr(gen) as usize as u64;
@@ -57386,9 +57566,9 @@ impl Interpreter {
     /// `BaseException_new`'s seeding of a fresh exception instance's
     /// `args` from the constructor's positionals, which holds even when the
     /// class's `__init__` never calls `super().__init__`.
-    fn seed_exception_args(inst: &Object, args: impl Iterator<Item = Object>) {
+    fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
         if let Object::Instance(i) = inst {
-            let args = Object::new_tuple(args.collect());
+            let args = Object::tuple_from_exact(args);
             if i.slots.borrow().is_empty_default() {
                 // Laid out as a built-in construction's (see
                 // `SlotStorage::exception`), so a raise fills its slots in
@@ -58576,11 +58756,10 @@ impl Interpreter {
         // The common case (`ValueError("x")`, a plain user subclass): no
         // family shapes construction, so `args` is the only slot, built
         // in place without the per-slot probes below.
-        if families & !EXC_CUSTOM_INIT == 0 {
-            let inst = PyInstance::new(cls);
-            let args_tuple = Object::new_tuple(args.to_vec());
-            inst.note_slot_store(&args_tuple);
-            *inst.slots.borrow_mut() = crate::types::SlotStorage::exception(args_tuple, []);
+        if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP) == 0 {
+            let args_tuple = Object::tuple_from_exact(args.iter().cloned());
+            let inst =
+                PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
             // See the GC note at the end.
             if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
@@ -59501,12 +59680,30 @@ impl Interpreter {
             }
         }
         let gen_code = Object::Code(frame.code.clone());
-        let mut frame = frame;
+        // The code's names, which the generator reads by default, in a
+        // dead generator's object when the pool has one.
+        let named = f.code_names_kept(|| code_gen_names(code));
+        let (gen_code, mut frame) = if named {
+            match crate::object::pooled_generator(kind, gen_code, frame) {
+                Ok(gen) => {
+                    return if code.is_coroutine {
+                        Object::Coroutine(gen)
+                    } else if code.is_async_generator {
+                        Object::AsyncGenerator(gen)
+                    } else {
+                        Object::Generator(gen)
+                    };
+                }
+                Err(back) => back,
+            }
+        } else {
+            (gen_code, frame)
+        };
         // The frame's weak backlink (see `set_frame_gen_owner`), stamped as
         // the generator is made.
         let gen = Rc::new_cyclic(|owner| {
             frame.gen_owner = Some(owner.clone());
-            if f.code_names_kept(|| code_gen_names(code)) {
+            if named {
                 // The code's names, which the generator reads by default.
                 PyGenerator::new(kind, gen_code, frame)
             } else {
@@ -59554,9 +59751,13 @@ impl Interpreter {
         // locals, as `core_gen_call` passes a call's arguments.
         if let Some(cells) = f.lean_cells_ref(&code) {
             let nlocals = code.varnames.len();
-            let locals = self.pooled_locals_empty(nlocals);
+            let GenParts {
+                locals,
+                stack,
+                boxed,
+            } = self.gen_parts(nlocals);
             {
-                // SAFETY: sole owner (see `pooled_locals_empty`).
+                // SAFETY: sole owner (see `gen_parts`).
                 let l = unsafe { &mut *locals.as_ptr() };
                 l.push(v.clone());
                 let missing = (code.arg_count as usize).saturating_sub(1);
@@ -59565,12 +59766,11 @@ impl Interpreter {
                 }
                 l.resize(nlocals, Object::Unbound);
             }
-            let mut frame = Self::gen_frame_lean(&f, code.clone(), locals, cells.clone(), start);
-            frame.stack = self.pooled_stack();
+            let frame = Self::gen_frame_lean(&f, code.clone(), locals, stack, cells.clone(), start);
             return Some(Self::wrap_started_generator(
                 &f,
                 &code,
-                self.box_gen_frame(frame),
+                Box::write(boxed, frame),
             ));
         }
         let mut positional = self.pooled_scratch();
@@ -59664,11 +59864,22 @@ impl Interpreter {
         let frame = match f.lean_cells_ref(code) {
             // No cells of its own: the function's (see `core_gen_call`).
             Some(cells) => {
-                let locals = self.pooled_locals_from_args(&mut positional, code.varnames.len());
+                let nlocals = code.varnames.len();
+                let GenParts {
+                    locals,
+                    stack,
+                    boxed,
+                } = self.gen_parts(nlocals);
+                {
+                    // SAFETY: sole owner (see `gen_parts`).
+                    let l = unsafe { &mut *locals.as_ptr() };
+                    l.append(&mut positional);
+                    l.resize(nlocals, Object::Unbound);
+                }
                 self.recycle_scratch(positional);
-                let mut frame = Self::gen_frame_lean(f, code.clone(), locals, cells.clone(), start);
-                frame.stack = self.pooled_stack();
-                frame
+                let frame =
+                    Self::gen_frame_lean(f, code.clone(), locals, stack, cells.clone(), start);
+                return Self::wrap_started_generator(f, code, Box::write(boxed, frame));
             }
             None => {
                 let mut frame = self.make_frame(
@@ -59686,13 +59897,15 @@ impl Interpreter {
     }
 
     /// The frame of a generator-family call of `f` (its code `code`, which
-    /// defines no cells of its own) with its `locals` filled and `cells`
-    /// the function's, just past the `RETURN_GENERATOR` at `start`.
+    /// defines no cells of its own) with its `locals` filled, its empty
+    /// `stack`, and `cells` the function's, just past the
+    /// `RETURN_GENERATOR` at `start`.
     #[inline]
     fn gen_frame_lean(
         f: &PyFunction,
         code: Rc<CodeObject>,
         locals: Rc<RefCell<Vec<Object>>>,
+        stack: Vec<Object>,
         cells: Rc<Vec<Rc<RefCell<Object>>>>,
         start: usize,
     ) -> Frame {
@@ -59700,7 +59913,7 @@ impl Interpreter {
             code,
             locals,
             cells,
-            stack: Vec::new(),
+            stack,
             globals: f.globals.clone(),
             builtins: f.builtins.clone(),
             rare: None,
@@ -59715,6 +59928,30 @@ impl Interpreter {
             shell_cache: None,
             #[cfg(feature = "jit")]
             parked_native: None,
+        }
+    }
+
+    /// The plain generator a call [`Self::gen_send_call`] matched resumes
+    /// with a value, `sent`, a fast step may take (see `gen_fast`): `None`
+    /// for a coroutine, which no fast step runs, and for `send(None)`,
+    /// which keeps its activation (a body tier 2 parks natively resumes
+    /// there; `next()` is the plain resume that steps in place).
+    #[inline(always)]
+    pub(crate) fn gen_send_target<'a>(
+        callee: &'a Object,
+        slot: &'a Object,
+        sent: &Object,
+    ) -> Option<&'a Rc<PyGenerator>> {
+        if matches!(sent, Object::None) {
+            return None;
+        }
+        match (callee, slot) {
+            (Object::BoundMethod(bm), _) => match &bm.receiver {
+                Object::Generator(g) => Some(g),
+                _ => None,
+            },
+            (_, Object::Generator(g)) => Some(g),
+            _ => None,
         }
     }
 
@@ -59813,9 +60050,13 @@ impl Interpreter {
         let gen = if let Some(cells) = cells {
             // The arguments move straight into the locals (no staging).
             let nlocals = code.varnames.len();
-            let locals = self.pooled_locals_empty(nlocals);
+            let GenParts {
+                locals,
+                stack,
+                boxed,
+            } = self.gen_parts(nlocals);
             {
-                // SAFETY: sole owner (see `pooled_locals_empty`).
+                // SAFETY: sole owner (see `gen_parts`).
                 let v = unsafe { &mut *locals.as_ptr() };
                 v.extend(callee_receiver);
                 if !matches!(slot, Object::Unbound) {
@@ -59828,20 +60069,21 @@ impl Interpreter {
                 }
                 v.resize(nlocals, Object::Unbound);
             }
-            let mut gen_frame = Self::gen_frame_lean(f, code, locals, cells, start);
-            gen_frame.stack = self.pooled_stack();
-            let code = Rc::clone(&gen_frame.code);
-            let boxed = self.box_gen_frame(gen_frame);
+            let gen_frame = Self::gen_frame_lean(f, code, locals, stack, cells, start);
+            let boxed = Box::write(boxed, gen_frame);
+            // SAFETY: the frame, which the generator made below owns, holds
+            // the code.
+            let code: &CodeObject = unsafe { &*Rc::as_ptr(&boxed.code) };
             if await_send.is_some() {
                 // Tracked if it suspends (see `PyGenerator::track_deferred`),
                 // or below if it doesn't start.
-                let obj = Self::make_started_generator(f, &code, boxed);
+                let obj = Self::make_started_generator(f, code, boxed);
                 if let Object::Coroutine(g) = &obj {
                     g.track_deferred.set(true);
                 }
                 obj
             } else {
-                Self::wrap_started_generator(f, &code, boxed)
+                Self::wrap_started_generator(f, code, boxed)
             }
         } else {
             let mut positional = self.pooled_scratch();
@@ -70564,7 +70806,7 @@ fn lookup_exception_init(cls: &Rc<TypeObject>) -> Option<Object> {
 /// [`exc_family_flags`]'s pseudo-family: a class between `cls` and
 /// `BaseException` defines its own `__init__` (see
 /// [`lookup_exception_init`]).
-const EXC_CUSTOM_INIT: u16 = 1 << 9;
+const EXC_CUSTOM_INIT: u16 = 1 << 10;
 
 /// [`lookup_exception_init`]'s MRO walk.
 fn exception_init_uncached(cls: &TypeObject) -> Option<Object> {
@@ -78030,7 +78272,7 @@ pub(crate) fn fn_slot_keys() -> &'static [Object; 4] {
 
 /// The exception families `build_exception_instance` branches on, as
 /// bits (see [`exc_family_flags`]).
-const EXC_FAMILIES: [&str; 9] = [
+const EXC_FAMILIES: [&str; 10] = [
     "StopIteration",
     "OSError",
     "BlockingIOError",
@@ -78040,12 +78282,14 @@ const EXC_FAMILIES: [&str; 9] = [
     "UnicodeEncodeError",
     "UnicodeDecodeError",
     "UnicodeTranslateError",
+    "BaseExceptionGroup",
 ];
 
 /// [`EXC_FAMILIES`] bits that Rust-side raise sites test directly.
 pub(crate) const EXC_FAM_STOP_ITERATION: u16 = 1 << 0;
 pub(crate) const EXC_FAM_SYNTAX_ERROR: u16 = 1 << 4;
 pub(crate) const EXC_FAM_IMPORT_ERROR: u16 = 1 << 5;
+pub(crate) const EXC_FAM_GROUP: u16 = 1 << 9;
 
 /// `name`'s bit in an [`exc_family_flags`] set (`0` for a name that is
 /// not a family — never asked in practice).
@@ -78059,12 +78303,20 @@ fn exc_family_bit(name: &str) -> u16 {
 
 /// Which exception families `cls` inherits from, memoised on the type
 /// against its attribute version (an MRO reshape bumps it).
+#[inline]
 pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
-    let ver = cls.attr_version.get();
     let memo = cls.exc_families.get();
-    if memo & 1 != 0 && memo >> 11 == ver {
-        return ((memo >> 1) & 0x3FF) as u16;
+    if memo & 1 != 0 && memo >> 12 == cls.attr_version.get() {
+        return ((memo >> 1) & 0x7FF) as u16;
     }
+    exc_family_flags_slow(cls)
+}
+
+/// [`exc_family_flags`] without a current memo: the MRO walk, memoised.
+#[cold]
+#[inline(never)]
+fn exc_family_flags_slow(cls: &crate::types::TypeObject) -> u16 {
+    let ver = cls.attr_version.get();
     let mut flags = 0u16;
     for t in cls.mro.borrow().iter() {
         flags |= exc_family_bit(&t.name);
@@ -78072,7 +78324,7 @@ pub(crate) fn exc_family_flags(cls: &crate::types::TypeObject) -> u16 {
     if exception_init_uncached(cls).is_some() {
         flags |= EXC_CUSTOM_INIT;
     }
-    cls.exc_families.set(ver << 11 | u64::from(flags) << 1 | 1);
+    cls.exc_families.set(ver << 12 | u64::from(flags) << 1 | 1);
     flags
 }
 

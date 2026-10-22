@@ -36,6 +36,22 @@ impl Name {
         false
     }
 
+    /// The name's value, when finding it runs no code.
+    fn peek(&self, function: &PyFunction) -> Option<Object> {
+        for dict in [&function.globals, &function.builtins] {
+            let probe = LeafNameProbe::new(self.text, self.hash);
+            let dict = dict.borrow();
+            let value = dict.get(&probe);
+            if probe.saw_exotic() {
+                return None;
+            }
+            if let Some(value) = value {
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
     fn resolve(&self, function: &PyFunction) -> Result<Object, RuntimeError> {
         for dict in [&function.globals, &function.builtins] {
             let probe = LeafNameProbe::new(self.text, self.hash);
@@ -86,6 +102,16 @@ impl Builder<'_> {
         result
     }
 
+    /// Whether a node's fields go through the builtin `setattr`. A Python
+    /// setter that raises leaves the Python builder's frame, which holds
+    /// the node, in the traceback above the setter's own frame, so the
+    /// node outlives the setter's locals; the native walk has no frame to
+    /// keep it, so such a node is the Python builder's.
+    fn builtin_setter(&self, function: &PyFunction) -> bool {
+        matches!(self.setter.peek(function), Some(Object::Builtin(b))
+            if b.name == "setattr" && crate::descr_registry::module_of_builtin(&b).is_none())
+    }
+
     fn walk(
         &mut self,
         vm: &mut Interpreter,
@@ -113,6 +139,7 @@ impl Builder<'_> {
                 .iter()
                 .zip(&self.state[1..])
                 .all(|(name, expected)| name.matches(function, expected))
+                && (!matches!(spec, Object::Dict(_)) || self.builtin_setter(function))
         });
         let simple = matches!(
             spec,

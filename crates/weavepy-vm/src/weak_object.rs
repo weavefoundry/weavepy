@@ -42,6 +42,7 @@ macro_rules! weak_object {
             }
 
             /// The number of strong owners left (0 once the object died).
+            #[inline]
             pub fn strong_count(&self) -> usize {
                 match self {
                     Self::Tuple(w) => w.strong_count(),
@@ -67,8 +68,22 @@ macro_rules! weak_object {
                     return None;
                 }
                 // SAFETY: the payload is alive (its strong count isn't
-                // zero), stays so per the caller, and the view is never
-                // dropped, so it releases nothing.
+                // zero) and stays so, per the caller.
+                Some(unsafe { self.with_live(f) })
+            }
+
+            /// [`Self::with_borrowed`] for an object the caller knows is
+            /// alive.
+            ///
+            /// # Safety
+            ///
+            /// The object must be alive, and nothing `f` does may release
+            /// its last reference.
+            #[inline]
+            pub unsafe fn with_live<R>(&self, f: impl FnOnce(&Object) -> R) -> R {
+                // SAFETY: the payload is alive and stays so, per the
+                // caller, and the view is never dropped, so it releases
+                // nothing.
                 let obj = std::mem::ManuallyDrop::new(unsafe {
                     match self {
                         Self::Tuple(w) => {
@@ -77,7 +92,7 @@ macro_rules! weak_object {
                         $(Self::$variant(w) => Object::$variant(Rc::from_raw(w.as_ptr())),)*
                     }
                 });
-                Some(f(&obj))
+                f(&obj)
             }
 
             /// The payload's address, as [`Object::payload_addr`] reports
