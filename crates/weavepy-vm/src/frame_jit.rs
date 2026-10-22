@@ -154,6 +154,14 @@ pub(crate) struct State {
     /// hands the return straight back (`DIRECT_RET`) for the caller to
     /// finish, without [`h_return`].
     pub(crate) direct: bool,
+    /// A direct call's callee that runs *lazily* (see [`register_lazy`]):
+    /// its activation, bound but not yet the switch's running one or on
+    /// the spine. Null for any other.
+    pub(crate) lazy: *mut crate::InlineAct,
+    /// Once a lazy callee registered: its depth on the switch and its
+    /// caller's last-instruction slot, for its return to restore.
+    pub(crate) lazy_depth: usize,
+    pub(crate) lazy_last: *mut usize,
 }
 
 const S_LOCALS: i32 = 0;
@@ -1348,6 +1356,7 @@ unsafe extern "C" fn h_for_iter_rest(
                     // takes over past the loop, synced as for a switch.
                     // SAFETY: as below.
                     unsafe {
+                        settle(st);
                         let sw = &mut *st.sw;
                         let frame = &mut *st.frame;
                         let code = &frame.code;
@@ -1371,6 +1380,7 @@ unsafe extern "C" fn h_for_iter_rest(
             // SAFETY: the running activation's frame and switch; the
             // stack is synced (the iterator on top) before the switch.
             unsafe {
+                settle(st);
                 let sw = &mut *st.sw;
                 let frame = &mut *st.frame;
                 let len = it.offset_from(st.stack) as usize + 1;
@@ -1748,6 +1758,9 @@ unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
 unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
+        if !st.sw.is_null() {
+            settle(st);
+        }
         if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
             return 3;
         }
@@ -1756,6 +1769,7 @@ unsafe fn for_iter_lane(st: &mut State, it: *mut Object, pc: u64) -> u32 {
         let frame = &mut *st.frame;
         frame.stack.set_len(slot + 1);
         frame.pc = pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         let interp = &mut *st.interp.cast_mut();
@@ -4162,6 +4176,7 @@ fn for_iter_exit(code: &CodeObject, pc: usize) -> usize {
 unsafe fn run_switched_directly(st: &mut State) -> bool {
     // SAFETY: the caller's contract.
     unsafe {
+        settle(st);
         let sw = &mut *st.sw;
         let interp = &*st.interp;
         let nested = interp.direct_calls.get();
@@ -4203,10 +4218,14 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             sw: st.sw,
             gen_depth: 0,
             direct: false,
+            lazy: std::ptr::null_mut(),
+            lazy_depth: 0,
+            lazy_last: std::ptr::null_mut(),
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run(&mut cst);
         interp.direct_calls.set(nested);
+        settle(st);
         let sw = &mut *st.sw;
         if status == RELOAD {
             // Back in the caller, nothing pending: done. Otherwise whoever
@@ -4241,6 +4260,7 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
 unsafe fn gen_call_done(st: &mut State, pc: usize, start: usize) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
+        settle(st);
         let sw = &*st.sw;
         if !std::ptr::eq(sw.cur, st.frame) {
             if sw.pending.is_none() && run_switched_directly(st) {
@@ -4273,6 +4293,7 @@ unsafe fn gen_call_done(st: &mut State, pc: usize, start: usize) -> u32 {
 unsafe fn finished_in_place(st: &mut State, start: usize) -> bool {
     // SAFETY: the caller's contract.
     unsafe {
+        settle(st);
         let sw = &*st.sw;
         let done = sw.pending.is_none()
             && std::ptr::eq(sw.cur, st.frame)
@@ -4658,6 +4679,9 @@ unsafe fn attr_lane(
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
+        if !st.sw.is_null() {
+            settle(st);
+        }
         if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
             return CALL_DECLINED;
         }
@@ -4667,6 +4691,7 @@ unsafe fn attr_lane(
         let frame = &mut *st.frame;
         frame.stack.set_len(slot + 1);
         frame.pc = pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         let interp = &mut *st.interp.cast_mut();
@@ -4799,6 +4824,64 @@ unsafe fn leaf_site_call(st: &mut State, start: usize, len: usize, missing: usiz
         base.add(start).write(r);
         st.len = start + 1;
         true
+    }
+}
+
+/// Register a lazily running direct callee (see [`direct_enter`]) with the
+/// core loop, as `direct_enter` registers an eager one: its lazy callers
+/// first (outermost first), then its caller entered on the pending list,
+/// the callee pushed on the switch and made its running activation. A
+/// lazy callee's caller is the switch's running activation until then, so
+/// this is due before anything uses the switch for the callee or links a
+/// newer activation onto the spine (see `Interpreter::settle_lazy`).
+///
+/// # Safety
+///
+/// `st` is a running native activation's state (or one whose native code
+/// just returned), and its lazy callers' states are live.
+#[cold]
+#[inline(never)]
+pub(crate) unsafe fn register_lazy(st: &mut State) {
+    // SAFETY: the caller's contract; the activation is the box
+    // `direct_enter` leaked, owned by the switch from here on.
+    unsafe {
+        let act = std::mem::replace(&mut st.lazy, std::ptr::null_mut());
+        if act.is_null() {
+            return;
+        }
+        let interp = &mut *st.interp.cast_mut();
+        // (The spine's own registration hook stays out of the way: this
+        // links the callees in order itself.)
+        let outer = interp.lazy_top.replace(0);
+        let caller = &mut *(*act).lazy_caller;
+        if !caller.lazy.is_null() {
+            register_lazy(caller);
+        }
+        let sw = &mut *st.sw;
+        *sw.last = caller.last;
+        st.lazy_last = sw.last;
+        let call_pc = (*act).call_pc;
+        (*act).caller_pending = interp.core_pending_enter_fast(sw, &mut *caller.frame, call_pc);
+        crate::push_fast(&mut *sw.inl, Box::from_raw(act));
+        sw.cur = st.frame;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        st.lazy_depth = (*sw.inl).len();
+        interp.lazy_top.set(outer);
+    }
+}
+
+/// [`register_lazy`] when `st`'s activation runs lazily: before a helper
+/// uses the switch for it.
+///
+/// # Safety
+///
+/// As [`register_lazy`]'s.
+#[inline(always)]
+unsafe fn settle(st: &mut State) {
+    if !st.lazy.is_null() {
+        // SAFETY: the caller's contract.
+        unsafe { register_lazy(st) };
     }
 }
 
@@ -5024,8 +5107,6 @@ unsafe fn direct_enter(
             None => (interp.inline_slot(), false),
         };
         let caller = &mut *st.frame;
-        *sw.last = st.last;
-        let saved_last = sw.last;
         caller.pc = pc as u32 + 1;
         let fr: &mut crate::Frame = &mut act.frame;
         // SAFETY: a parked slot's locals storage is its own, and empty.
@@ -5107,8 +5188,6 @@ unsafe fn direct_enter(
         act.parked = false;
         act.direct = true;
         act.call_pc = pc;
-        // The caller waits on the pending list (see `lean_pending_enter`).
-        act.caller_pending = interp.core_pending_enter_fast(sw, caller, pc);
         act.exc_depth = interp.exc_info_len();
         act.guard = Some(crate::recursion::Guard::adopt(dc));
         // As for any inline activation: a hot body is compiled once.
@@ -5121,14 +5200,25 @@ unsafe fn direct_enter(
             crate::tier2::warm_compile(interp, &mut act.frame);
         }
         let callee: *mut crate::Frame = &raw mut *act.frame;
-        crate::push_fast(&mut *sw.inl, act);
-        sw.cur = callee;
-        sw.scratch = usize::MAX;
-        sw.last = &raw mut sw.scratch;
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
-        let depth = (*sw.inl).len();
+        // The callee runs lazily (see `register_lazy`): the caller stays
+        // the switch's running activation, off the pending list, unless
+        // something needs the core loop's view of the callee.
+        act.lazy_caller = st;
+        let act = Box::into_raw(act);
         Some(direct_run::<false>(
-            st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
+            st,
+            pc,
+            start,
+            callee,
+            act,
+            0,
+            native,
+            std::ptr::null_mut(),
+            nested,
+            binop,
+            0,
+            site,
         ))
     }
 }
@@ -5191,6 +5281,7 @@ unsafe fn run_pushed_directly(
             pc,
             start,
             callee,
+            std::ptr::null_mut(),
             depth,
             native,
             saved_last,
@@ -5202,17 +5293,19 @@ unsafe fn run_pushed_directly(
     }
 }
 
-/// Run a direct call's callee (the running activation, `callee`, at
-/// `depth`, marked `direct`) through its native code from `from`, and
-/// finish its return here: [`direct_call`]'s `Some` results. `PUSHED`
-/// for an activation the core loop's call paths bound (see
-/// [`run_pushed_directly`]), whose cells its clean return checks; one
-/// [`direct_enter`] bound otherwise, whose clean return parks it in its
-/// call site's warm slot (`site`'s, when it has one free).
+/// Run a direct call's callee (`callee`, marked `direct`) through its
+/// native code from `from`, and finish its return here: [`direct_call`]'s
+/// `Some` results. `PUSHED` for an activation the core loop's call paths
+/// bound and switched to (see [`run_pushed_directly`]), at `depth` with
+/// its caller's last-instruction slot `saved_last`, whose cells its clean
+/// return checks; one [`direct_enter`] bound otherwise, `lazy` (see
+/// [`register_lazy`]), whose clean return parks it in its call site's warm
+/// slot (`site`'s, when it has one free).
 ///
 /// # Safety
 ///
-/// As [`direct_call`]'s, with the callee bound and switched to.
+/// As [`direct_call`]'s, with the callee bound (and switched to, when
+/// pushed).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn direct_run<const PUSHED: bool>(
@@ -5220,6 +5313,7 @@ unsafe fn direct_run<const PUSHED: bool>(
     pc: usize,
     start: usize,
     callee: *mut crate::Frame,
+    lazy: *mut crate::InlineAct,
     depth: usize,
     native: &Native,
     saved_last: *mut usize,
@@ -5254,9 +5348,17 @@ unsafe fn direct_run<const PUSHED: bool>(
             sw: st.sw,
             gen_depth: 0,
             direct: true,
+            lazy,
+            lazy_depth: 0,
+            lazy_last: std::ptr::null_mut(),
         };
         interp.direct_calls.set(nested + 1);
+        let outer = interp.lazy_top.get();
+        if !PUSHED {
+            interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
+        }
         let status = native.run_direct(&mut cst, from);
+        interp.lazy_top.set(outer);
         interp.direct_calls.set(nested);
         direct_done::<PUSHED>(
             st, pc, start, callee, depth, saved_last, binop, site, status, &mut cst,
@@ -5291,6 +5393,68 @@ unsafe fn direct_done<const PUSHED: bool>(
         let caller = &mut *st.frame;
         let cframe = &mut *callee;
         let sw = &mut *st.sw;
+        if !PUSHED && !cst.lazy.is_null() {
+            if status == DIRECT_RET
+                && cst.len == 1
+                && !cframe.locals.is_shared()
+                && !interp.countdown_out(2)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+            {
+                // A clean return of a callee that never registered: the
+                // caller is still the running activation, and its switch
+                // and pending list never saw the callee.
+                let v = cst.stack.read();
+                cframe.stack.set_len(0);
+                let mut done = Box::from_raw(cst.lazy);
+                crate::release_locals(cframe.locals.storage());
+                drop(done.guard.take());
+                // SAFETY: moved out once; the parked slot treats the field
+                // as stale (see `inline_deliver`).
+                let callable = std::ptr::read(&raw const done.callable);
+                if done.owns_cells {
+                    done.clean = true;
+                    interp.inline_park_clean(done);
+                } else if !site.is_null() && (*site).act.is_none() {
+                    (*site).act = Some(interp.inline_park_warm(done));
+                } else {
+                    interp.inline_park_direct(done);
+                }
+                st.stack.add(start).write(v);
+                caller.stack.set_len(start + 1);
+                match callable {
+                    Object::Function(f) if crate::rc::try_release_shared(Rc::as_ptr(&f)) => {
+                        std::mem::forget(f);
+                    }
+                    callable => interp.release(callable),
+                }
+                interp.gil_countdown -= 1;
+                if (*sw.maybe_dead).get() {
+                    // (The finalizers may run Python code: the caller's
+                    // view first.)
+                    settle(st);
+                    let mut tmp = None;
+                    let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+                    interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+                    if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+                    }
+                }
+                if sw.pending.is_some() {
+                    return RELOAD;
+                }
+                st.len = start + 1;
+                return 0;
+            }
+            // Anything else is the core loop's to finish: the callee
+            // registers first.
+            register_lazy(cst);
+        }
+        // A lazy callee that registered: where it went on the switch.
+        let (depth, saved_last) = if PUSHED {
+            (depth, saved_last)
+        } else {
+            (cst.lazy_depth, cst.lazy_last)
+        };
         let inl = &mut *sw.inl;
         // (Only the callee's own `RETURN_VALUE` hands back `DIRECT_RET`,
         // with its activation the running one.)
@@ -5467,6 +5631,7 @@ unsafe extern "C" fn h_call(
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
             frame.pc = pc as u32;
+            settle(st);
             *(*st.sw).last = st.last;
         };
         // A generator function's call makes its generator in place
@@ -5476,6 +5641,7 @@ unsafe extern "C" fn h_call(
             let c = &*f.code.as_ptr();
             if (c.is_generator || c.is_coroutine || c.is_async_generator) && !st.sw.is_null() {
                 sync(st);
+                settle(st);
                 let sw = &mut *st.sw;
                 let interp = &mut *st.interp.cast_mut();
                 if !interp.core_gen_call(sw, pc) {
@@ -5493,6 +5659,7 @@ unsafe extern "C" fn h_call(
             && Interpreter::gen_send_call(&*base.add(start), &*base.add(start + 1))
         {
             sync(st);
+            settle(st);
             let sw = &mut *st.sw;
             let interp = &mut *st.interp.cast_mut();
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::SendCall) {
@@ -5545,6 +5712,7 @@ unsafe extern "C" fn h_call(
                 }
             }
             sync(st);
+            settle(st);
             let sw = &mut *st.sw;
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextCall) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
@@ -5593,6 +5761,7 @@ unsafe extern "C" fn h_call(
                 }
             }
             sync(st);
+            settle(st);
             let sw = &mut *st.sw;
             if !interp.core_gen_resume(sw, pc, crate::InlineResume::NextDefault) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
@@ -5685,6 +5854,7 @@ unsafe extern "C" fn h_call(
                 }
                 if argc == 1 && !st.sw.is_null() {
                     sync(st);
+                    settle(st);
                     let sw = &mut *st.sw;
                     let interp = &mut *st.interp.cast_mut();
                     if interp.core_type_lane(sw) {
@@ -5727,6 +5897,7 @@ unsafe extern "C" fn h_call(
             });
             if let Some(via_call) = settled {
                 sync(st);
+                settle(st);
                 let sw = &mut *st.sw;
                 let interp = &mut *st.interp.cast_mut();
                 if interp.core_builtin_lane(sw, pc, via_call) {
@@ -5844,7 +6015,9 @@ unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, p
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        settle(st);
         *(*st.sw).last = st.last;
+        settle(st);
         let sw = &mut *st.sw;
         let saved_last = sw.last;
         let interp = &mut *st.interp.cast_mut();
@@ -6146,6 +6319,7 @@ unsafe extern "C" fn h_call_native(
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;
         frame.stack.set_len(lenu);
+        settle(s);
         let sw = &mut *s.sw;
         *sw.last = s.last;
         let interp = &mut *s.interp.cast_mut();
@@ -6199,6 +6373,7 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         let interp = &mut *st.interp.cast_mut();
@@ -6369,6 +6544,7 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
             frame.pc = pc as u32;
+            settle(st);
             let sw = &mut *st.sw;
             *sw.last = st.last;
             let saved_last = sw.last;
@@ -6410,6 +6586,7 @@ unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64,
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         let saved_last = sw.last;
@@ -6464,6 +6641,7 @@ unsafe extern "C" fn h_call_forward(
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         let saved_last = sw.last;
@@ -6504,6 +6682,7 @@ unsafe extern "C" fn h_return(st: *mut State, pc: u64, len: u64) -> u32 {
     // its stack depth.
     unsafe {
         let st = &mut *st;
+        settle(st);
         let sw = &mut *st.sw;
         let Some(top) = (*sw.inl).last() else {
             return 0;
@@ -6611,6 +6790,7 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
             }
         }
         let interp = &mut *st.interp.cast_mut();
+        settle(st);
         let sw = &mut *st.sw;
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
@@ -6672,6 +6852,7 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
         // before the next instruction: the core loop takes over there,
         // synced as for a switch.
         if (*st.maybe_dead).get() {
+            settle(st);
             let sw = &mut *st.sw;
             let frame = &mut *st.frame;
             frame.stack.set_len(len);
@@ -6698,6 +6879,7 @@ unsafe extern "C" fn h_gen_yield(st: *mut State, pc: u64, len: u64) -> u32 {
         if st.sw.is_null() || (*(*st.sw).inl).is_empty() {
             return 1;
         }
+        settle(st);
         let sw = &mut *st.sw;
         let frame = &mut *st.frame;
         frame.stack.set_len(len as usize);
@@ -6727,6 +6909,7 @@ unsafe extern "C" fn h_gen_return(st: *mut State, pc: u64, len: u64) -> u32 {
         if st.sw.is_null() || (*(*st.sw).inl).is_empty() {
             return 1;
         }
+        settle(st);
         let sw = &mut *st.sw;
         let frame = &mut *st.frame;
         frame.stack.set_len(len as usize);
@@ -6874,6 +7057,7 @@ unsafe extern "C" fn h_catch(st: *mut State) -> u32 {
         let frame = &mut *st.frame;
         frame.stack.set_len(st.len);
         frame.pc = st.pc as u32;
+        settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
         if !std::ptr::eq(sw.cur, st.frame) {

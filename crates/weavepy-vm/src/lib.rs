@@ -1009,6 +1009,11 @@ pub struct Interpreter {
     /// ever dereferenced on the thread that pushed them, while the
     /// activations they name are live.
     lean_pending: Vec<usize>,
+    /// The innermost lazily running direct callee's native state (see
+    /// `frame_jit::register_lazy`), registered before anything links onto
+    /// the spine or reads it; `0` when none runs lazily. (An address, as
+    /// for `lean_pending`.)
+    pub(crate) lazy_top: std::cell::Cell<usize>,
     /// Spare [`ChainRec`]s (empty), boxed: a parked chain's levels point
     /// at their record.
     #[allow(clippy::vec_box)]
@@ -1278,6 +1283,7 @@ impl Default for Interpreter {
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            lazy_top: std::cell::Cell::new(0),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -1411,6 +1417,7 @@ impl Interpreter {
                 && !crate::hot_gates::env_flags::no_quiet()
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
+            lazy_top: std::cell::Cell::new(0),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -5438,6 +5445,7 @@ impl Interpreter {
     /// refreshed `lasti` — its `back` link is refreshed lazily by the
     /// next materialisation walk.
     fn push_frame_shell(&self, frame: &mut Frame) -> Rc<crate::object::FrameShell> {
+        self.settle_lazy();
         // RFC 0061 (WS3c): a generator-family resume re-pushes the shell
         // it built on a previous entry. The identity-bearing fields
         // (code, locals, cells, globals, builtins, namespaces) cannot
@@ -5638,6 +5646,7 @@ impl Interpreter {
     /// Push an already-materialised `PyFrame` (event dispatch around
     /// generator throw/unwind) onto the spine.
     fn push_materialized_frame(&self, py: &Rc<PyFrame>) {
+        self.settle_lazy();
         py.on_stack.set(py.on_stack.get() + 1);
         let shell = Rc::new(crate::object::FrameShell::from_py_frame(py));
         shell.link(py);
@@ -8878,6 +8887,7 @@ impl Interpreter {
         frame: &mut Frame,
         shell: &'s mut QuietShell<'_>,
     ) -> &'s crate::object::FrameShell {
+        self.settle_lazy();
         match shell {
             QuietShell::Ready(shell) => shell,
             QuietShell::Lazy(act) => {
@@ -8954,6 +8964,7 @@ impl Interpreter {
     /// (never generator-family, never pre-materialized) frame, with an
     /// explicit `lasti`.
     fn push_lean_shell(&self, frame: &Frame, lasti: u32) -> Rc<crate::object::FrameShell> {
+        self.settle_lazy();
         let cells = if frame.cells.is_empty() {
             // SAFETY: see `push_frame_shell`.
             unsafe { crate::object::FrameSlot::borrowed(&frame.cells) }
@@ -10507,6 +10518,7 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
     ) -> Option<usize> {
+        self.settle_lazy();
         match shell {
             QuietShell::Lazy(act) if act.shell.is_none() => {
                 // Re-derive the frame pointer: every use of `frame` since
@@ -10529,6 +10541,34 @@ impl Interpreter {
                     .lasti
                     .store(pc as u32, std::sync::atomic::Ordering::Relaxed);
                 None
+            }
+        }
+    }
+
+    /// Register the lazily running direct callees (see
+    /// `frame_jit::register_lazy`) before anything links onto the spine or
+    /// reads it: they are older than whatever comes next, and a stack walk
+    /// must find them.
+    #[inline(always)]
+    pub(crate) fn settle_lazy(&self) {
+        if self.lazy_top.get() != 0 {
+            self.settle_lazy_cold();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_lazy_cold(&self) {
+        // (Cleared first: registering links the callees onto the spine,
+        // which mustn't come back here.)
+        let st = self.lazy_top.replace(0) as *mut frame_jit::State;
+        // SAFETY: `lazy_top` is a running native activation's state (see
+        // `frame_jit::direct_run`, which restores it as that one ends),
+        // under the GIL; registering works through the state's own
+        // handles.
+        unsafe {
+            if !(*st).lazy.is_null() {
+                frame_jit::register_lazy(&mut *st);
             }
         }
     }
@@ -10762,6 +10802,7 @@ impl Interpreter {
     /// ones up to it and leaving the newer ones pending. Returns its depth
     /// from the spine's top.
     pub(crate) fn flush_pending_through(&mut self, depth: usize) -> usize {
+        self.settle_lazy();
         let n = self.lean_pending.len();
         if depth >= n {
             return depth - n;
@@ -10782,6 +10823,7 @@ impl Interpreter {
     /// How many activations the whole stack holds (see
     /// [`Self::flush_pending_through`]).
     pub(crate) fn stack_depth(&self) -> usize {
+        self.settle_lazy();
         self.lean_pending.len() + self.frame_stack.borrow().len()
     }
 
@@ -10793,6 +10835,7 @@ impl Interpreter {
         &self,
         depth: usize,
     ) -> Option<(Rc<CodeObject>, u32, Rc<RefCell<DictData>>)> {
+        self.settle_lazy();
         let n = self.lean_pending.len();
         if depth < n {
             // SAFETY: as in `frame_globals_at`.
@@ -10816,6 +10859,7 @@ impl Interpreter {
     /// The globals of the activation `depth` levels up the whole stack
     /// (see [`Self::flush_pending_through`]), without pushing any shell.
     pub(crate) fn frame_globals_at(&self, depth: usize) -> Option<Rc<RefCell<DictData>>> {
+        self.settle_lazy();
         let n = self.lean_pending.len();
         if depth < n {
             // SAFETY: a pending address names a live `LeanAct` whose
@@ -10833,6 +10877,7 @@ impl Interpreter {
     /// Push the shells of every pending lean *caller* (see
     /// [`Self::flush_lean_cold`], which also pushes the running one's).
     pub(crate) fn flush_pending_callers(&mut self) {
+        self.settle_lazy();
         if self.lean_pending.is_empty() {
             return;
         }
@@ -11736,6 +11781,9 @@ impl Interpreter {
                             sw: std::ptr::from_mut(sw),
                             gen_depth: 0,
                             direct: false,
+                            lazy: std::ptr::null_mut(),
+                            lazy_depth: 0,
+                            lazy_last: std::ptr::null_mut(),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -15393,6 +15441,7 @@ impl Interpreter {
         frame: &mut Frame,
         pc: usize,
     ) -> Option<usize> {
+        self.settle_lazy();
         // SAFETY: see `CoreSwitch`: the running activation's handles are
         // live, and nothing else borrows them here.
         unsafe {
@@ -67645,6 +67694,9 @@ struct InlineAct {
     /// A native caller runs the activation and finishes its return itself
     /// (see `frame_jit::direct_call`).
     direct: bool,
+    /// While a direct call's activation runs lazily (see
+    /// `frame_jit::register_lazy`), its caller's native state.
+    lazy_caller: *mut frame_jit::State,
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
@@ -67780,6 +67832,7 @@ impl InlineAct {
             init_inst: None,
             owns_cells: false,
             direct: false,
+            lazy_caller: std::ptr::null_mut(),
             binop: None,
             discard: false,
             chain: None,
