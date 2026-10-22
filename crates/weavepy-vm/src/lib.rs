@@ -430,9 +430,6 @@ impl Drop for TraceEventGuard {
     }
 }
 
-/// Cycle-GC traversal hook for generator-family objects: walk the
-/// suspended frame's locals, evaluation stack, and cells so cycles
-/// running through a generator frame (`g.send(g)`) are detectable.
 /// Registered with `gc_trace::register_traverse`: lets the cycle GC walk
 /// the objects a built-in iterator ([`Object::Iter`]) keeps alive. The
 /// `PyIterator` body is private to `object`, so tracing routes through
@@ -445,84 +442,81 @@ fn iter_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
 }
 
-/// Registered with `gc_trace::register_traverse` at interpreter init
-/// because `Frame` is private to this module.
-fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let g = match obj {
-        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g,
-        _ => return,
-    };
-    let Ok(state) = g.state_raw().try_borrow() else {
-        return;
-    };
-    let boxed = match &*state {
-        GeneratorState::Created(b)
-        | GeneratorState::Suspended(b)
-        | GeneratorState::Delegating(b) => b,
-        _ => return,
-    };
-    let frame: &Frame = boxed;
-    {
-        if let Ok(locals) = frame.locals.try_borrow() {
+/// The cycle GC's walk of a generator-family object (see
+/// `gc_trace::traverse_object`, which reaches it directly because `Frame`
+/// is private to this module): the suspended frame's locals, evaluation
+/// stack, and cells, so cycles running through a generator frame
+/// (`g.send(g)`) are detectable. `PEEK` as in `gc_trace::with_read`.
+#[inline(always)]
+pub(crate) fn generator_frame_traverse<const PEEK: bool, V: crate::gc_trace::Visit + ?Sized>(
+    g: &crate::object::PyGenerator,
+    visit: &mut V,
+) {
+    use crate::gc_trace::{visit_rc, with_read};
+    with_read::<PEEK, _, _>(g.state_raw(), |state| {
+        let (GeneratorState::Created(frame)
+        | GeneratorState::Suspended(frame)
+        | GeneratorState::Delegating(frame)) = state
+        else {
+            return;
+        };
+        let frame: &Frame = frame;
+        with_read::<PEEK, _, _>(&*frame.locals, |locals| {
             for v in locals.iter() {
-                visit(v);
+                visit.visit(v);
             }
-        }
+        });
         for v in &frame.stack {
-            visit(v);
+            visit.visit(v);
         }
         for c in frame.cells.iter() {
-            if let Ok(v) = c.try_borrow() {
-                visit(&v);
-            }
+            with_read::<PEEK, _, _>(&**c, |v| visit.visit(v));
         }
         // `f_globals` is a real edge (CPython's `frame_traverse` visits
         // it): a generator parked in an `exec()` namespace that also names
         // the generator is a dict -> generator -> frame -> dict cycle, and
         // the collector must see the back-edge to reclaim (and close) it
         // (test_generators.test_generator_resurrect).
-        visit(&Object::Dict(frame.globals.clone()));
+        visit_rc::<PEEK, _, V>(visit, &frame.globals, Object::Dict);
         // The frame-stack shell and the Python-visible snapshot each hold
         // their own strong handle on the same globals dict; the collector
         // seeds reachability from refcounts, so every handle must be
         // accounted for or the dict looks externally referenced.
         if let Some(shell) = &frame.shell_cache {
-            visit(&Object::Dict(shell.globals.clone()));
+            visit_rc::<PEEK, _, V>(visit, &shell.globals, Object::Dict);
         }
         if let Some(py) = &frame.py_frame {
-            visit(&Object::Dict(py.globals.clone()));
+            visit_rc::<PEEK, _, V>(visit, &py.globals, Object::Dict);
         }
         // `f_builtins` likewise (CPython's `frame_traverse` visits it):
         // a destroyed sub-interpreter's builtins dict is held only by its
         // functions and parked frames, and an unaccounted handle would
         // make it look externally rooted (see `func_builtins` in
         // `gc_trace::traverse_object`).
-        visit(&Object::Dict(frame.builtins.clone()));
+        visit_rc::<PEEK, _, V>(visit, &frame.builtins, Object::Dict);
         if let Some(shell) = &frame.shell_cache {
-            visit(&Object::Dict(shell.builtins.clone()));
+            visit_rc::<PEEK, _, V>(visit, &shell.builtins, Object::Dict);
         }
         if let Some(py) = &frame.py_frame {
-            visit(&Object::Dict(py.builtins.clone()));
-        }
-        // The cached Python-visible frame snapshot shares the locals
-        // storage visited above (no separate mirror copies), but its
-        // materialised f_locals dict is a distinct edge.
-        if let Some(py) = &frame.py_frame {
+            visit_rc::<PEEK, _, V>(visit, &py.builtins, Object::Dict);
+            // The cached Python-visible frame snapshot shares the locals
+            // storage visited above (no separate mirror copies), but its
+            // materialised f_locals dict is a distinct edge.
             if let Ok(cache) = py.locals_cache.try_borrow() {
                 if let Some(d) = cache.as_ref() {
-                    visit(d);
+                    visit.visit(d);
                 }
             }
         }
-        // RFC 0073 WS4 — a parked native activation's pin table is the
+        // RFC 0073 WS4: a parked native activation's pin table is the
         // real owner of everything the compiled frame still holds
         // (locals visited above are the stale park-time snapshot; the
         // live edges are the pins).
         #[cfg(feature = "jit")]
         if let Some(act) = &frame.parked_native {
-            act.visit_objects(visit);
+            act.visit_objects(&mut |c: &Object| visit.visit(c));
         }
-    }
+    });
 }
 
 /// Registered with `gc_trace::register_traverse`: the object edges a
@@ -1160,20 +1154,11 @@ impl Default for Interpreter {
                 dict: builtins.clone(),
             })),
         );
-        // RFC 0024: teach the cycle GC to walk suspended generator
-        // frames (their `Frame` type is private to this module).
+        // RFC 0024: teach the cycle GC to walk the objects whose types are
+        // private to this module. (It walks a suspended generator's frame
+        // itself, through `generator_frame_traverse`.)
         static GEN_TRAVERSE: std::sync::Once = std::sync::Once::new();
         GEN_TRAVERSE.call_once(|| {
-            crate::gc_trace::register_traverse_for(
-                crate::gc_trace::hook_kind::GENERATOR,
-                |o| {
-                    matches!(
-                        o,
-                        Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_)
-                    )
-                },
-                generator_frame_traverse,
-            );
             // Bug #3680: a built-in iterator (list/set/dict-keys/… iterator)
             // can close a reference cycle through the items it buffers or the
             // live set it walks. Teach the cycle GC to trace through it so
