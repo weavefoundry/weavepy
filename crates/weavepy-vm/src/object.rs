@@ -5839,6 +5839,84 @@ impl fmt::Debug for PyGenerator {
     }
 }
 
+/// Dead generators kept for the next ones (see [`recycle_generator`]): a
+/// generator's object costs an allocation, its construction and its
+/// release, and most generators finish and die young.
+struct GenPool(std::cell::UnsafeCell<Vec<Rc<PyGenerator>>>);
+
+// SAFETY: the pool is touched only while `datetime_native::pool_ok()`:
+// then every thread that reaches VM objects holds the GIL, which
+// serializes the accesses (each is a push or a pop that runs no other
+// code).
+unsafe impl Sync for GenPool {}
+
+static GEN_POOL: GenPool = GenPool(std::cell::UnsafeCell::new(Vec::new()));
+
+/// Keep `g`, the last reference to a finished generator or coroutine, for
+/// the next one (see [`pooled_generator`]) when nothing could tell: no
+/// weak reference (a weakref callback, a frame's backlink), no registry
+/// entry, no state beyond its code. `Err` hands it back, to be released
+/// as usual.
+pub(crate) fn recycle_generator(
+    g: std::sync::Arc<PyGenerator>,
+) -> Result<(), std::sync::Arc<PyGenerator>> {
+    if !crate::stdlib::datetime_native::pool_ok()
+        || std::sync::Arc::weak_count(&g) != 0
+        || g.kind == CoroutineKind::AsyncGenerator
+        || g.chain.get() != 0
+        || g.gc_slot.is_registered()
+        || crate::weakref_registry::may_have_weakrefs(std::sync::Arc::as_ptr(&g) as usize as u64)
+    {
+        return Err(g);
+    }
+    // SAFETY: the last reference, with no weak one (checked above):
+    // nothing else can observe the generator while it changes.
+    let m = unsafe { &mut *std::sync::Arc::as_ptr(&g).cast_mut() };
+    if !matches!(m.gen_state.get_mut(), GeneratorState::Finished) || m.extras.get_mut().is_some() {
+        return Err(g);
+    }
+    // SAFETY: the pool's accesses are serialized (see `GenPool`).
+    let pool = unsafe { &mut *GEN_POOL.0.get() };
+    if pool.len() >= 64 {
+        return Err(g);
+    }
+    // (A code object's release runs no Python code.)
+    m.code = Object::None;
+    pool.push(Rc::from_arc(g));
+    Ok(())
+}
+
+/// A pooled generator (see [`recycle_generator`]) remade as one of `kind`
+/// over `frame`, running `code` and named after it, whose frame's
+/// backlink it stamps; `None` when the pool is empty.
+#[inline]
+pub(crate) fn pooled_generator(
+    kind: CoroutineKind,
+    code: Object,
+    mut frame: Box<crate::Frame>,
+) -> Result<Rc<PyGenerator>, (Object, Box<crate::Frame>)> {
+    if !crate::stdlib::datetime_native::pool_ok() {
+        return Err((code, frame));
+    }
+    // SAFETY: as in `recycle_generator`.
+    let Some(g) = (unsafe { &mut *GEN_POOL.0.get() }).pop() else {
+        return Err((code, frame));
+    };
+    frame.gen_owner = Some(Rc::downgrade(&g));
+    // SAFETY: a pooled generator is unique (see `recycle_generator`), and
+    // the backlink just made can't be used before the generator is
+    // returned.
+    let m = unsafe { &mut *Rc::as_ptr(&g).cast_mut() };
+    m.kind = kind;
+    m.code = code;
+    // (The displaced `Finished` owns nothing.)
+    *m.gen_state.get_mut() = GeneratorState::Created(frame);
+    m.hooks_inited.set(false);
+    m.finalize_ran.set(false);
+    m.track_deferred.set(false);
+    Ok(g)
+}
+
 impl Drop for PyGenerator {
     fn drop(&mut self) {
         // A suspended generator's `close()` (and a never-awaited
