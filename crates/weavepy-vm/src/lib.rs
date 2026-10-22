@@ -26961,19 +26961,20 @@ impl Interpreter {
         }
     }
 
-    /// A call of a bound method (`obj.meth` loaded as a plain attribute, as
-    /// `x.f()` of an imported `x` loads it): the method's function in the
-    /// callee slot and its receiver in the (empty) self slot after it, the
-    /// shape a method-call load leaves, so the call takes the method
-    /// call's lanes. That is the call itself: a method's call prepends its
-    /// receiver to the arguments. A Python function's method expands as
-    /// CPython's `CALL` expands it; a native method (CPython's builtin
-    /// bound to its object, which `CALL` doesn't expand) only while no
-    /// observer could see the callee and when the native call lanes may
-    /// run its body (see [`native_call_ic_safe`]). A method something
-    /// could watch die (a weak reference) stays whole, so its death stays
-    /// after the call, and a deferred special-method dispatch is left
-    /// alone.
+    /// A call of a bound method just loaded as a plain attribute (`x.f()` of
+    /// an imported `x`, which CPython's compiler leaves without the
+    /// method-call load): the method's function in the callee slot and its
+    /// receiver in the (empty) self slot after it, the shape a method-call
+    /// load leaves, so the call takes the method call's lanes. That is the
+    /// call itself: a method's call prepends its receiver to the
+    /// arguments. A Python function's method expands as CPython's `CALL`
+    /// expands it; a native method (CPython's builtin bound to its object,
+    /// which `CALL` doesn't expand) only while no observer could see the
+    /// callee and when the native call lanes may run its body (see
+    /// [`native_call_ic_safe`]). Only a method the call holds alone
+    /// expands, and not one something could watch die (a weak reference),
+    /// so its death stays after the call; a saved method (`m = x.f`) keeps
+    /// its own lanes, and a deferred special-method dispatch is left alone.
     ///
     /// # Safety
     ///
@@ -26985,7 +26986,7 @@ impl Interpreter {
         let Object::BoundMethod(bm) = (unsafe { &*callee }) else {
             return;
         };
-        if bm.redispatch_descriptor {
+        if bm.redispatch_descriptor || Rc::strong_count(bm) != 1 {
             return;
         }
         let expands = match &bm.function {
@@ -27000,10 +27001,7 @@ impl Interpreter {
             }
             _ => false,
         };
-        if !expands
-            || (Rc::strong_count(bm) == 1
-                && crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(bm) as usize as u64))
-        {
+        if !expands || crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(bm) as usize as u64) {
             return;
         }
         let (function, receiver) = (bm.function.clone(), bm.receiver.clone());
