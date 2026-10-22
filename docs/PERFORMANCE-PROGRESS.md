@@ -162,6 +162,14 @@ branch and pull request.
   vector itself, at 29 binding sites that stage 2 replaces). Neutral
   (instructions 0.997).
 
+- **RFC 0078 stage 2: lazy direct calls** (PR #94, `perf/activation-records`,
+  stacked on #93 and #86). A direct call's callee is bound but not
+  registered with the core loop or the spine until its native code leaves
+  for the core loop, a helper uses the switch for it, or something links a
+  newer activation onto the spine or reads it (`register_lazy`,
+  `Interpreter::settle_lazy`). About 88 instructions fewer per direct
+  call: `go` 0.960, `tomllib_loads` 0.982, geomean 0.997.
+
 **Checkpoint, PRs #86 to #92 merged together** (PGO, October 21, before
 #91's cost-aware cuts): against CPython, warm 1.24 to 1.27 (two runs),
 cold 1.45, peak RSS 1.62 (from 1.276, 1.506 and 1.710). Head to head with
@@ -210,6 +218,23 @@ slowdown in that run was the even-sized chunks, since fixed.
     most nested functions never run.
 
   The code generator's warm-up thread costs only about 0.1 MB.
+- **The call protocol, measured again.** Frame-JIT direct calls are 85% to
+  95% of all calls in the call-heavy workloads (`go` 540,000 per run).
+  After stage 2 a direct call still retires about 416 instructions in its
+  helpers, spread thinly (19 building the callee's `State`, 20 in the entry
+  helper's prologue and epilogue, about 30 of admission checks, about 80 of
+  reference counts and moves). Tier 2 already makes native calls at about
+  100 instructions with frameless activations; stage 3 (compiled code
+  guarding, binding and entering a warm callee in line) is the remaining
+  structural step. The frameless leaf paths cost 490 (pure) to 1,040
+  (effect) instructions a call, no less than an activation, but turning
+  them off costs 1.25 to 1.7 times as much where native code calls them
+  (`sorted`'s keys, `oo_patterns`), so they stay until such calls are
+  cheap.
+- **The worst workloads are dominated by their own library paths**, not
+  calls: in `closures_decorators` the native `functools.lru_cache` is 17%
+  of the instructions; decorator wrappers' `f(*args, **kwargs)` costs 5.2
+  times CPython's and `functools.partial` 6.2 times.
 - **Tried and dropped: a linker order file.** Ordering the binary's
   functions by how many training programs run them (start-up code first)
   cut file-backed pages by 0.4 to 0.6 MiB and left warm time unchanged
@@ -220,16 +245,18 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. RFC 0078, stage 2 onward: one activation stack for the interpreter,
-   the frame JIT and generators (calls, resumes and exceptional returns
-   are the largest remaining bucket).
-2. Generator expressions without a throwaway function object (about 5%
-   on `nqueens`).
-3. Cheaper chunk crossings (a tail call with a predictable target per
-   site), so the compile limit can come down to about 1,200 IR
-   instructions (about 1 MB more off the peak).
-4. Code objects: about 2 MiB for `tomllib_loads`' 2,100, against
-   CPython's more compact ones.
+1. In flight (agent branches): `functools.lru_cache` (`perf/lru-cache`);
+   `*args`/`**kwargs` forwarding, `partial`, keyword, default, static and
+   class method calls (`perf/call-shapes`); the `with` protocol,
+   `contextlib` and asyncio (`perf/with-async`); `stdlib_utils`,
+   `logging_mix` and `tomllib_loads`' library paths (`perf/stdlib-paths`).
+2. RFC 0078 stage 3: compiled code guards a warm direct call's site, binds
+   into its persistent record and enters the callee in line.
+3. Generator expressions without a throwaway function object (about 5% on
+   `nqueens`).
+4. Cheaper chunk crossings, so the compile limit can come down to about
+   1,200 IR instructions (about 1 MB more off the peak).
+5. Code objects: about 2 MiB for `tomllib_loads`' 2,100.
 
 ## Measurement notes
 
