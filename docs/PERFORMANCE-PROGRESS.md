@@ -20,6 +20,22 @@ CPython; below 1.00 means WeavePy is faster or smaller.
 | `-c pass` startup | 0.74 (19.2 ms against 25.9 ms) |
 | Importing `json`, `re`, `collections`, `dataclasses` | 1.11 time, 1.38 memory |
 
+With the open PRs merged together (October 22: #87 to #92 and #95 to
+#97; not yet #98 or the RFC 0078 stack #86, #93 and #94), a PGO build
+measures:
+
+| Measure | `main` | Merged |
+| --- | ---: | ---: |
+| Warm time (geomean) | 1.276 | 1.221 |
+| Cold time | 1.506 | 1.427 |
+| Peak resident memory | 1.710 | 1.660 |
+| Instructions (quick build) | 1.318 | 1.261 |
+
+Head to head with `main`'s PGO build the merged warm time is 0.953;
+`closures_decorators` 0.59, `coroutines` 0.81, `context_managers` 0.85,
+`exceptions` 0.87, `nqueens` 0.88. #98 alone takes `async_tree` and
+`context_managers` to 0.82 to 0.84 of `main`'s wall time (quick builds).
+
 Nine workloads beat CPython's warm time (`pickle_roundtrip` 0.59 is the
 best). The worst are `context_managers` 2.44, `async_tree` 2.33, `deepcopy`
 2.08, `closures_decorators` 2.02, `stdlib_utils` 1.94, and `logging_mix`
@@ -170,6 +186,32 @@ branch and pull request.
   `Interpreter::settle_lazy`). About 88 instructions fewer per direct
   call: `go` 0.960, `tomllib_loads` 0.982, geomean 0.997.
 
+- **`functools.lru_cache`** (PR #95, `perf/lru-cache`): state in the
+  wrapper's slots, hits answered at the call site, misses run as ordinary
+  calls with a pending store. A hit costs 614 instructions against
+  CPython's 859; `closures_decorators` 0.690.
+- **Library and compile paths** (PR #96, `perf/stdlib-paths`): bound-method
+  expansion, class attributes read through instances cached at the site,
+  never-run blocks left to the core loop, `isdisjoint`, struct sequences,
+  `str()` with a Python `__str__`. `logging_mix` 0.943, `tomllib_loads`
+  0.952.
+- **Call shapes** (PR #97, `perf/call-shapes`): one fill for extended
+  parameters, one by-name keyword binder, `partial` inline, static and
+  class methods cached. The 26 call micro-ops' geomean goes from 1.42 to
+  1.20 times CPython.
+- **`with`, locks and asyncio** (PR #98, `perf/with-async`): lock methods
+  on the lock types, the running task per thread, `del obj.attr` and
+  `LOAD_SPECIAL` cached and compiled, native-method load caches, idle
+  collections pacing the older generations. `async_tree` 0.864,
+  `context_managers` 0.907.
+
+**Merge order.** The agents' PRs (#88 to #92, #95 to #98, and #87) each
+branch from `main` and merge together with two small conflicts (#92's doc
+comment against #87's, #96's never-run blocks against #91's chunk fields;
+both are additive). The RFC 0078 stack (#86, then #93, then #94) reworks
+the direct-call code they all touch; it is cheapest merged last and
+rebased then.
+
 **Checkpoint, PRs #86 to #92 merged together** (PGO, October 21, before
 #91's cost-aware cuts): against CPython, warm 1.24 to 1.27 (two runs),
 cold 1.45, peak RSS 1.62 (from 1.276, 1.506 and 1.710). Head to head with
@@ -245,11 +287,7 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. In flight (agent branches): `functools.lru_cache` (`perf/lru-cache`);
-   `*args`/`**kwargs` forwarding, `partial`, keyword, default, static and
-   class method calls (`perf/call-shapes`); the `with` protocol,
-   `contextlib` and asyncio (`perf/with-async`); `stdlib_utils`,
-   `logging_mix` and `tomllib_loads`' library paths (`perf/stdlib-paths`).
+1. Merge the open PRs (order above) and rebase the RFC 0078 stack.
 2. RFC 0078 stage 3: compiled code guards a warm direct call's site, binds
    into its persistent record and enters the callee in line.
 3. Generator expressions without a throwaway function object (about 5% on
@@ -257,6 +295,12 @@ slowdown in that run was the even-sized chunks, since fixed.
 4. Cheaper chunk crossings, so the compile limit can come down to about
    1,200 IR instructions (about 1 MB more off the peak).
 5. Code objects: about 2 MiB for `tomllib_loads`' 2,100.
+6. Frame-compile cost in the first warm repetitions (`stdlib_utils`,
+   `logging_mix`): Cranelift spends about 7,400 host instructions per IR
+   instruction, and about 20% of the compiled bytecode still never ran.
+7. Immortal shared objects (one-character strings, interned names), whose
+   reference counts CPython never touches: about 100 instructions per
+   string helper in `tomllib_loads` are reference counting.
 
 ## Measurement notes
 
