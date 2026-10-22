@@ -18869,7 +18869,10 @@ impl Interpreter {
                         // stack into the list.
                         std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
                     }
-                    (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+                    // Any key the leaf probe hashes and compares natively
+                    // (a `str`, an `int`, a tuple of them, or an object
+                    // keyed by identity).
+                    (Object::Dict(cell), _) => {
                         if crate::capi_watchers::dicts_active() {
                             return None;
                         }

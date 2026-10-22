@@ -2759,7 +2759,10 @@ unsafe fn store_subscr_fast(
                 }
                 std::mem::replace(&mut xs[i as usize], value())
             }
-            (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+            // Any key the leaf probe hashes and compares natively (a `str`,
+            // an `int`, a tuple of them, or an object keyed by identity:
+            // `gather`'s coroutines).
+            (Object::Dict(cell), _) => {
                 if crate::capi_watchers::dicts_active() {
                     return 1;
                 }
@@ -3615,7 +3618,14 @@ unsafe extern "C" fn h_load_method(
                                 ms.set(ver, &f);
                                 Object::Function(f)
                             }
-                            None => return 1,
+                            // A value the class holds (a static method's
+                            // function): the value with an empty self slot,
+                            // as the core loop's arm loads it.
+                            None => {
+                                return u32::from(!Interpreter::core_value_method(
+                                    code, name, pc, top,
+                                ))
+                            }
                         },
                     },
                 };
