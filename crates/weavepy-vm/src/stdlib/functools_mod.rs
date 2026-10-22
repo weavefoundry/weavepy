@@ -6,14 +6,14 @@
 //! `test_traceback` asserts that a `partial(exec, …)` call site shows
 //! only the caller's frame.
 
-mod lru_order;
+mod lru_state;
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, StrKey};
+use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
@@ -71,6 +71,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("_lru_cache_wrapper")),
             Object::Type(lru_type()),
+        );
+        d.insert(
+            DictKey(Object::from_static("_lru_private")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_lru_private",
+                binds_instance: false,
+                call: Box::new(lru_private),
+                call_kw: None,
+            })),
         );
     }
     Rc::new(PyModule {
@@ -371,12 +380,28 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 // warning (`tests/io/formats/test_to_excel.py::test_css_to_excel_bad_colors`
 // asserts the warning points at the *caller*). The frozen `functools.py`
 // falls back to its pure-Python wrapper only if this import fails.
+//
+// The wrapper's state lives in its instance slots, outside its `__dict__`
+// (CPython keeps it in the C struct): `update_wrapper` copies a cached
+// function's `__dict__` onto the functions that wrap it, so state there
+// would travel with it, and replacing `__wrapped__` mustn't change what
+// the wrapper calls. A bounded cache whose keys all compare natively (an
+// exact `int` or `str`, or a tuple of them) keeps the recency of its
+// entries in links by entry position (see [`lru_state`]): a hit is one
+// probe and one relink, and a full cache's miss replaces its oldest entry
+// in place. The first key whose comparison can run Python moves the cache
+// to the ordered-dictionary fallback for good, where a hit moves its
+// entry to the end with no borrow held across the comparisons.
 // ---------------------------------------------------------------------------
 
 /// Sentinel string separating positional from keyword parts of a cache key
 /// (CPython uses a fresh `object()`; the embedded NULs keep any real user
 /// string from colliding).
 const LRU_KWD_MARK: &str = "\0\0__weavepy_lru_kwd_mark__\0\0";
+
+/// The address of the `_lru_cache_wrapper` class, for the call sites'
+/// quick check (see [`lru_hit`]); zero until the class exists.
+static LRU_TYPE_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn lru_type() -> Rc<crate::types::TypeObject> {
     thread_local! {
@@ -446,6 +471,12 @@ fn lru_type() -> Rc<crate::types::TypeObject> {
             dict,
         )
         .expect("_lru_cache_wrapper class must linearise");
+        let _ = LRU_TYPE_ADDR.compare_exchange(
+            0,
+            Rc::as_ptr(&cls) as usize,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *slot.borrow_mut() = Some(cls.clone());
         cls
     })
@@ -458,113 +489,45 @@ fn lru_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeErro
     }
 }
 
-/// The wrapper's own entries in its instance dictionary, in the order
-/// [`lru_cache_wrapper_new`] inserts them: each is found at its position
-/// (checked by name) without hashing the name, unless the dictionary was
-/// rearranged.
-#[derive(Clone, Copy)]
-enum LruField {
-    Wrapped,
-    Maxsize,
-    State,
-    Cache,
-    Hits,
-    Misses,
-    InfoCls,
+/// The wrapper's private slots, in the order [`lru_cache_wrapper_new`]
+/// stores them: the cache, the state words (see [`lru_state`]), the
+/// wrapped function, and the `CacheInfo` class.
+const LRU_SLOTS: [&str; 4] = ["_lru_cache", "_lru_state", "_lru_func", "_lru_info"];
+
+/// The interned names of [`LRU_SLOTS`], which every wrapper's slots are
+/// keyed by (so a read compares pointers).
+fn lru_keys() -> &'static [crate::shared_value::SharedStr; 4] {
+    static KEYS: std::sync::OnceLock<[crate::shared_value::SharedStr; 4]> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        LRU_SLOTS.map(|name| match crate::stdlib::sys::intern_name(name) {
+            Object::Str(s) => s,
+            _ => unreachable!("interned names are strs"),
+        })
+    })
 }
 
-impl LruField {
-    const ALL: [LruField; 7] = [
-        LruField::Wrapped,
-        LruField::Maxsize,
-        LruField::State,
-        LruField::Cache,
-        LruField::Hits,
-        LruField::Misses,
-        LruField::InfoCls,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            LruField::Wrapped => "__wrapped__",
-            LruField::Maxsize => "_lru_maxsize",
-            LruField::State => "_lru_state",
-            LruField::Cache => "_lru_cache",
-            LruField::Hits => "_lru_hits",
-            LruField::Misses => "_lru_misses",
-            LruField::InfoCls => "_lru_cache_info_cls",
-        }
-    }
-
-    /// The interned name every wrapper's dictionary is built with.
-    #[inline]
-    fn key(self) -> &'static crate::shared_value::SharedStr {
-        static KEYS: std::sync::OnceLock<[crate::shared_value::SharedStr; 7]> =
-            std::sync::OnceLock::new();
-        &KEYS.get_or_init(|| {
-            LruField::ALL.map(
-                |field| match crate::stdlib::sys::intern_name(field.name()) {
-                    Object::Str(s) => s,
-                    _ => unreachable!("interned names are strs"),
-                },
-            )
-        })[self as usize]
-    }
-
-    /// The field's key, for a new entry.
-    fn key_object(self) -> DictKey {
-        DictKey(Object::Str(self.key().clone()))
-    }
-
-    /// Whether `key` names this field: the interned name itself (one
-    /// compare), or an equal string.
-    #[inline]
-    fn is(self, key: &DictKey) -> bool {
-        matches!(&key.0, Object::Str(s)
-            if crate::shared_value::SharedStr::ptr_eq(s, self.key()) || name_eq(s, self.name()))
-    }
+/// A wrapper's cache, state words, and wrapped function, held for a call.
+struct LruParts {
+    cache: Rc<RefCell<DictData>>,
+    state: Rc<RefCell<Vec<u8>>>,
+    func: Object,
 }
 
-/// `a == b` for a field name `b` of 8 to 24 bytes, as three word compares
-/// (the general comparison calls `memcmp`, which showed in the profile).
-#[inline]
-fn name_eq(a: &str, b: &'static str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let n = b.len();
-    debug_assert!((8..=24).contains(&n));
-    let word = |s: &[u8], at: usize| u64::from_ne_bytes(s[at..at + 8].try_into().expect("8 bytes"));
-    a.len() == n
-        && word(a, 0) == word(b, 0)
-        && word(a, (n - 8).min(8)) == word(b, (n - 8).min(8))
-        && word(a, n - 8) == word(b, n - 8)
+fn lru_lost() -> RuntimeError {
+    type_error("lru_cache wrapper lost its state")
 }
 
-fn lru_slot(dict: &DictData, field: LruField) -> Option<&Object> {
-    match dict.get_index(field as usize) {
-        Some((key, value)) if field.is(key) => Some(value),
-        _ => dict.get(&StrKey(field.name())),
-    }
-}
-
-fn lru_slot_mut(dict: &mut DictData, field: LruField) -> Option<&mut Object> {
-    let at = field as usize;
-    if dict.get_index(at).is_some_and(|(key, _)| field.is(key)) {
-        return dict.get_index_mut(at).map(|(_, value)| value);
-    }
-    dict.get_mut(&StrKey(field.name()))
-}
-
-fn lru_get(inst: &crate::types::PyInstance, field: LruField) -> Option<Object> {
-    lru_slot(&inst.dict_cell().borrow(), field).cloned()
-}
-
-fn lru_set(inst: &crate::types::PyInstance, field: LruField, v: Object) {
-    let mut dict = inst.dict_cell().borrow_mut();
-    match lru_slot_mut(&mut dict, field) {
-        Some(slot) => *slot = v,
-        None => {
-            dict.insert(field.key_object(), v);
-        }
+fn lru_parts(inst: &crate::types::PyInstance) -> Result<LruParts, RuntimeError> {
+    let keys = lru_keys();
+    let slots = inst.slots.borrow();
+    match slots.leading_interned([&keys[0], &keys[1], &keys[2]]) {
+        Some([Object::Dict(cache), Object::ByteArray(state), func]) => Ok(LruParts {
+            cache: cache.clone(),
+            state: state.clone(),
+            func: func.clone(),
+        }),
+        _ => Err(lru_lost()),
     }
 }
 
@@ -573,44 +536,63 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
     let [user_function, maxsize, typed, cache_info_cls] = args else {
         return Err(type_error("_lru_cache_wrapper() takes exactly 4 arguments"));
     };
-    match maxsize {
-        Object::None | Object::Int(_) => {}
-        _ => return Err(type_error("maxsize should be integer or None")),
+    if !crate::builtins::object_is_callable(user_function) {
+        return Err(type_error("the first argument must be callable"));
     }
-    let inst = Rc::new(crate::types::PyInstance::new(lru_type()));
-    // Reuse the state field for recency state. An immediate sentinel keeps
-    // empty typed wrappers allocation-free; their active links get a tuple
-    // tag. Another field would grow a normally decorated wrapper's
-    // dictionary.
-    let state = if typed.is_truthy() {
-        Object::Int(1)
-    } else {
-        Object::Bool(false)
+    // CPython's `lru_cache_new`: `None` is unbounded, and a negative size
+    // caches nothing.
+    let limit = match maxsize {
+        Object::None => lru_state::UNBOUNDED,
+        Object::Int(n) => u64::try_from(*n).unwrap_or(0),
+        Object::Bool(b) => u64::from(*b),
+        Object::Long(_) => {
+            return Err(RuntimeError::PyException(
+                crate::error::PyException::from_builtin(
+                    "OverflowError",
+                    "Python int too large to convert to C ssize_t",
+                ),
+            ))
+        }
+        _ => return Err(type_error("maxsize should be integer or None")),
     };
-    let cache = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+    let flags = if typed.is_truthy() { lru_state::TYPED } else { 0 };
+    let inst = Rc::new(crate::types::PyInstance::new(lru_type()));
     let values = [
+        Object::Dict(Rc::new(RefCell::new(DictData::default()))),
+        Object::ByteArray(Rc::new(RefCell::new(lru_state::new(limit, flags)))),
         user_function.clone(),
-        maxsize.clone(),
-        state,
-        cache,
-        Object::Int(0),
-        Object::Int(0),
         cache_info_cls.clone(),
     ];
     {
-        let mut dict = inst.dict_cell().borrow_mut();
-        for (field, value) in LruField::ALL.into_iter().zip(values) {
-            dict.insert(field.key_object(), value);
+        let mut slots = inst.slots.borrow_mut();
+        for (key, value) in lru_keys().iter().zip(values) {
+            slots.insert_shared(key, value);
         }
     }
-    // CPython's `lru_cache_new` GC-tracks the wrapper: its `__wrapped__`
-    // edge closes the `module dict -> wrapper -> function -> __globals__`
+    // CPython's `lru_cache_new` GC-tracks the wrapper: its function edge
+    // closes the `module dict -> wrapper -> function -> __globals__`
     // cycle of every `@lru_cache` at module level, and an untracked
     // wrapper counted as an external root that made that namespace
     // immortal.
     let wrapper = Object::Instance(inst);
     crate::gc_trace::track(&wrapper);
     Ok(wrapper)
+}
+
+/// `_lru_private(wrapper)`: the cache, the state words, and whether the
+/// cache keeps native recency links (see [`lru_state`]). For WeavePy's
+/// own regression tests, which check the mode the native core is in.
+fn lru_private(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = lru_self(args)?;
+    let parts = lru_parts(&inst)?;
+    let (limit, flags) =
+        lru_state::mode(&parts.state.borrow()).ok_or_else(invalid_lru_order)?;
+    let native = limit != 0 && limit != lru_state::UNBOUNDED && flags & lru_state::FALLBACK == 0;
+    Ok(Object::new_tuple_array([
+        Object::Dict(parts.cache),
+        Object::ByteArray(parts.state),
+        Object::Bool(native),
+    ]))
 }
 
 /// Build the cache key for one call (CPython's `lru_cache_make_key`): a
@@ -642,22 +624,15 @@ fn lru_make_key(call_args: &[Object], kwargs: &[(String, Object)], typed: bool) 
     Object::new_tuple(parts)
 }
 
-fn lru_counter_bump(inst: &crate::types::PyInstance, field: LruField) {
-    // Keep the read and increment under one lock. Separate get/set borrows
-    // lose updates when multiple threads hit a shared cache under gil=0.
-    lru_bump(&mut inst.dict_cell().borrow_mut(), field);
-}
-
-/// Count one more of the counter `field` in the wrapper's `dict`.
-#[inline]
-fn lru_bump(dict: &mut DictData, field: LruField) {
-    match lru_slot_mut(dict, field) {
-        Some(Object::Int(n)) => *n += 1,
-        Some(count) => *count = Object::Int(1),
-        None => {
-            dict.insert(field.key_object(), Object::Int(1));
-        }
+/// Count one more hit (or miss) in `state`, under its lock.
+fn lru_count(state: &RefCell<Vec<u8>>, hit: bool) -> Result<(), RuntimeError> {
+    let mut bytes = state.borrow_mut();
+    if hit {
+        lru_state::hit(&mut bytes)
+    } else {
+        lru_state::miss(&mut bytes)
     }
+    .ok_or_else(invalid_lru_order)
 }
 
 /// Per-thread nesting depth of the native wrapper, standing in for
@@ -757,136 +732,70 @@ fn invalid_lru_order() -> RuntimeError {
     type_error("lru_cache has inconsistent private recency data")
 }
 
-fn lru_state_links(state: &Object) -> Option<&Rc<RefCell<Vec<u8>>>> {
-    match state {
-        Object::ByteArray(links) => Some(links),
-        Object::Tuple(parts) if parts.len() == 1 => match &parts[0] {
-            Object::ByteArray(links) => Some(links),
-            _ => None,
-        },
-        _ => None,
+/// Leave native mode for good: put the entries in recency order (oldest
+/// first, the order the fallback keeps) and drop the links. `data` and
+/// `bytes` are `state`'s cache and words, both borrowed.
+fn lru_demote(
+    state: &Rc<RefCell<Vec<u8>>>,
+    data: &mut DictData,
+    bytes: &mut Vec<u8>,
+) -> Result<(), RuntimeError> {
+    crate::object::bytearray_check_resizable(state)?;
+    let indices = lru_state::Links::new(bytes, data.len())
+        .and_then(|links| links.indices())
+        .ok_or_else(invalid_lru_order)?;
+    if !data.keys().all(|stored| native_lru_key(&stored.0)) {
+        return Err(invalid_lru_order());
     }
+    // Restore logical oldest-to-newest order once, before any
+    // callback-capable comparison reaches the fallback.
+    let old = std::mem::take(data);
+    let mut entries: Vec<_> = old.into_iter().map(Some).collect();
+    for index in indices {
+        let (key, value) = entries
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or_else(invalid_lru_order)?;
+        data.insert(key, value);
+    }
+    lru_state::clear_links(bytes).ok_or_else(invalid_lru_order)?;
+    lru_state::add_flag(bytes, lru_state::FALLBACK).ok_or_else(invalid_lru_order)?;
+    #[cfg(test)]
+    note_scalar_lru_event(2);
+    Ok(())
 }
 
-fn lru_mode(state: Option<&Object>) -> Result<(bool, bool), RuntimeError> {
-    // Read the tag without cloning active recency storage. The caller
-    // releases its borrow before hashing the key or calling the wrapped
-    // function.
-    match state {
-        Some(Object::Bool(true)) => Ok((true, false)),
-        Some(Object::Int(1)) => Ok((true, true)),
-        Some(state @ Object::Tuple(_)) => {
-            if lru_state_links(state).is_none() {
-                return Err(invalid_lru_order());
-            }
-            Ok((true, true))
-        }
-        Some(Object::None) => Ok((false, false)),
-        _ => Ok((false, true)),
-    }
-}
-
-/// Once a cache admits a key that can invoke Python, retain its existing
-/// ordered-map implementation. The native representation holds no Python
-/// owners outside that map and never changes the layout of ordinary objects.
-fn scalar_lru_links(
-    inst: &crate::types::PyInstance,
-    scalar: bool,
-) -> Result<Option<Rc<RefCell<Vec<u8>>>>, RuntimeError> {
-    let mut dict = inst.dict_cell().borrow_mut();
-    if lru_slot(&dict, LruField::State).is_none() {
-        dict.insert(LruField::State.key_object(), Object::Bool(false));
-    }
-    let Some(state) = lru_slot_mut(&mut dict, LruField::State) else {
-        unreachable!("just inserted")
-    };
-    // False/Int(1) are uninitialized untyped/typed states. None/True retain
-    // permanent fallback. A one-element tuple tags typed active links.
-    let typed = matches!(state, Object::Int(1));
-    if typed || matches!(state, Object::Bool(false)) {
-        *state = if scalar {
-            let links = Object::ByteArray(Rc::new(RefCell::new(lru_order::empty())));
-            if typed {
-                Object::new_tuple_array([links])
-            } else {
-                links
-            }
-        } else if typed {
-            Object::Bool(true)
-        } else {
-            Object::None
-        };
-    }
-    match state {
-        Object::Bool(true) | Object::None => Ok(None),
-        _ => lru_state_links(state)
-            .cloned()
-            .map(Some)
-            .ok_or_else(invalid_lru_order),
-    }
-}
-
+/// The lookup of a native `key` in a bounded cache in native mode (or,
+/// with `insert`, the store of a miss's result with `limit` entries at
+/// most), under one hold of the cache and its words: `Slow` when the
+/// fallback must settle it, after leaving native mode if `key` needs it.
+/// Covers the keys [`lru_native_lookup`] can't probe (big `int`s, nested
+/// or typed tuples): their comparisons run no Python either, and one that
+/// would (a tampered cache) is an error.
 fn scalar_lru_operation(
-    inst: &crate::types::PyInstance,
-    cache: &Rc<RefCell<DictData>>,
+    cache: &RefCell<DictData>,
+    state: &Rc<RefCell<Vec<u8>>>,
     key: &Object,
     insert: Option<(&Object, usize)>,
 ) -> Result<ScalarLru, RuntimeError> {
     let scalar = native_lru_key(key);
-    let Some(links) = scalar_lru_links(inst, scalar)? else {
-        return Ok(ScalarLru::Slow);
-    };
     let removed;
     {
-        // The shared cache lock also serializes its recency metadata under
+        // The shared cache lock also serializes its recency words under
         // gil=0. Neither key comparison nor an owner release may run Python
         // while these two cells are borrowed.
         let mut data = cache.borrow_mut();
-        let mut bytes = links.borrow_mut();
-        if bytes.is_empty() {
+        let mut bytes = state.borrow_mut();
+        let (_, flags) = lru_state::mode(&bytes).ok_or_else(invalid_lru_order)?;
+        if flags & lru_state::FALLBACK != 0 {
             return Ok(ScalarLru::Slow);
         }
-        let mut order =
-            lru_order::Order::new(&mut bytes, data.len()).ok_or_else(invalid_lru_order)?;
-        if !scalar || insert.is_some_and(|(_, limit)| data.len() > limit) {
-            crate::object::bytearray_check_resizable(&links)?;
-            let indices = order.indices().ok_or_else(invalid_lru_order)?;
-            if !data.keys().all(|stored| native_lru_key(&stored.0)) {
-                return Err(invalid_lru_order());
-            }
-            // Restore logical oldest-to-newest order once, before any
-            // callback-capable comparison reaches the existing slow path.
-            let old = std::mem::take(&mut *data);
-            let mut entries: Vec<_> = old.into_iter().map(Some).collect();
-            for index in indices {
-                let (key, value) = entries
-                    .get_mut(index)
-                    .and_then(Option::take)
-                    .ok_or_else(invalid_lru_order)?;
-                data.insert(key, value);
-            }
-            bytes.clear();
-            // Keep the empty buffer for in-flight users of this snapshot,
-            // but let future calls decline from their existing state read.
-            // Demotion is serialized by the cache lock. Read its stable
-            // typed tag here instead of carrying it through every call.
-            let typed = matches!(
-                lru_slot(&inst.dict_cell().borrow(), LruField::State),
-                Some(Object::Tuple(_))
-            );
-            lru_set(
-                inst,
-                LruField::State,
-                if typed {
-                    Object::Bool(true)
-                } else {
-                    Object::None
-                },
-            );
-            #[cfg(test)]
-            note_scalar_lru_event(2);
+        let len = data.len();
+        if !scalar || insert.is_some_and(|(_, limit)| len > limit) {
+            lru_demote(state, &mut data, &mut bytes)?;
             return Ok(ScalarLru::Slow);
         }
+        let mut links = lru_state::Links::new(&mut bytes, len).ok_or_else(invalid_lru_order)?;
         // A `str` or `int` key settles by native equality in one probe;
         // its hash is kept for the insert below.
         let probe = crate::object::LeafProbe::new(key);
@@ -898,8 +807,8 @@ fn scalar_lru_operation(
             },
             None => None,
         };
-        let (found, exact_miss) = match exact {
-            Some(found) => (found, found.is_none()),
+        let found = match exact {
+            Some(found) => found,
             None => {
                 // Deferral also protects against private-cache tampering: a
                 // foreign key must not invoke Python inside the paired borrow.
@@ -909,7 +818,7 @@ fn scalar_lru_operation(
                 if deferred {
                     return Err(invalid_lru_order());
                 }
-                (found, false)
+                found
             }
         };
         if let Some(index) = found {
@@ -922,143 +831,187 @@ fn scalar_lru_operation(
             return if insert.is_some() {
                 Ok(ScalarLru::Complete(None))
             } else {
-                order.touch(index).ok_or_else(invalid_lru_order)?;
+                let value = value.clone();
+                links.touch(index).ok_or_else(invalid_lru_order)?;
                 #[cfg(test)]
                 note_scalar_lru_event(0);
-                Ok(ScalarLru::Complete(Some(value.clone())))
+                Ok(ScalarLru::Complete(Some(value)))
             };
         }
         let Some((value, limit)) = insert else {
             return Ok(ScalarLru::Complete(None));
         };
-        crate::object::bytearray_check_resizable(&links)?;
-        removed = if data.len() == limit {
-            let index = order.head().ok_or_else(invalid_lru_order)?;
-            order.swap_remove(index).ok_or_else(invalid_lru_order)?;
+        // Proven absent above (an eviction keeps it so): no second probe.
+        let hash = probe
+            .as_ref()
+            .map_or_else(|| crate::object::dict_key_hash(key), |p| p.hash);
+        removed = if len == limit {
+            // The least recent entry's place takes the new one, which
+            // becomes the most recent.
+            let head = links.head().ok_or_else(invalid_lru_order)?;
+            links.touch(head).ok_or_else(invalid_lru_order)?;
             #[cfg(test)]
             note_scalar_lru_event(1);
-            Some(
-                data.swap_remove_index(index)
-                    .ok_or_else(invalid_lru_order)?,
-            )
+            data.replace_index_unique(head, hash, DictKey(key.clone()), value.clone())
         } else {
+            crate::object::bytearray_check_resizable(state)?;
+            links.push(limit).ok_or_else(invalid_lru_order)?;
+            data.insert_unique_hashed(hash, DictKey(key.clone()), value.clone());
             None
         };
-        match &probe {
-            // Proven absent above (an eviction keeps it so): no second probe.
-            Some(p) if exact_miss => {
-                data.insert_unique_hashed(p.hash, DictKey(key.clone()), value.clone());
-            }
-            _ => {
-                data.insert(DictKey(key.clone()), value.clone());
-            }
-        }
-        order.push(limit).ok_or_else(invalid_lru_order)?;
     }
     // Publish a consistent cache before releasing an evicted result.
     drop(removed);
     Ok(ScalarLru::Complete(None))
 }
 
-/// What [`lru_fast_lookup`] settled.
-enum FastLookup {
+/// What [`lru_native_lookup`] settled.
+enum NativeLookup {
     /// The cached value, its hit counted and its recency refreshed.
     Hit(Object),
-    /// An exact miss, counted: the wrapped function to call (`None` if the
-    /// wrapper lost it).
-    Miss(Option<Object>),
+    /// An exact miss, counted.
+    Miss,
 }
 
-/// The lookup of a native `key` in a bounded cache whose recency links are
-/// live, under one hold of the cache and its links: the hit or the counted
-/// miss, or `None` (nothing touched) for the general path to settle.
+/// The lookup of `probe` under one hold of the cache and its words,
+/// settled natively: the hit or the counted miss, or `None` (nothing
+/// touched) for the general path. A bounded cache must be in native mode;
+/// an unbounded one needs only that no stored key the probe met could
+/// equal it through Python.
 #[inline]
-fn lru_fast_lookup(
-    inst: &crate::types::PyInstance,
+fn lru_native_lookup(
     cache: &RefCell<DictData>,
-    links: &RefCell<Vec<u8>>,
+    state: &RefCell<Vec<u8>>,
     probe: &crate::object::LeafProbe<'_>,
-) -> Option<FastLookup> {
-    // The cache lock also serializes the links and the counters under
-    // gil=0 (taken in the order `lru_cache_clear` takes them). Nothing
-    // here runs Python.
+    bounded: bool,
+) -> Option<NativeLookup> {
+    // The cache lock also serializes the words under gil=0 (taken in the
+    // order `lru_cache_clear` takes them). Nothing here runs Python.
     let data = cache.borrow_mut();
-    let mut bytes = links.borrow_mut();
-    if bytes.is_empty() {
+    let mut bytes = state.borrow_mut();
+    let (_, flags) = lru_state::mode(&bytes)?;
+    if bounded && flags & lru_state::FALLBACK != 0 {
         return None;
     }
-    let mut order = lru_order::Order::new(&mut bytes, data.len())?;
-    match data.get_index_of(probe) {
+    let found = data.get_index_of(probe);
+    if !probe.miss_is_exact() {
+        return None;
+    }
+    match found {
         Some(index) => {
-            let (stored, value) = data.get_index(index)?;
-            if !native_lru_key(&stored.0) {
-                return None;
+            let value = data.get_index(index)?.1.clone();
+            if bounded {
+                lru_state::Links::new(&mut bytes, data.len())?.touch(index)?;
             }
-            order.touch(index)?;
-            let value = value.clone();
-            lru_bump(&mut inst.dict_cell().borrow_mut(), LruField::Hits);
-            Some(FastLookup::Hit(value))
+            lru_state::hit(&mut bytes)?;
+            Some(NativeLookup::Hit(value))
         }
-        None if probe.miss_is_exact() => {
-            let mut dict = inst.dict_cell().borrow_mut();
-            lru_bump(&mut dict, LruField::Misses);
-            Some(FastLookup::Miss(
-                lru_slot(&dict, LruField::Wrapped).cloned(),
-            ))
+        None => {
+            lru_state::miss(&mut bytes)?;
+            Some(NativeLookup::Miss)
         }
-        None => None,
     }
 }
 
-/// Store `result` under the native `key` after [`lru_fast_lookup`]'s miss,
-/// evicting the least recent entry of a full cache in place: `Some` with
-/// the evicted entry (to release once the cache is consistent and
-/// unborrowed) when stored or already present, `None` (nothing touched)
-/// for the general path.
-fn lru_fast_store(
+/// Store `result` under the native `key` after [`lru_native_lookup`]'s
+/// miss, evicting the least recent entry of a full bounded cache in place:
+/// `Some` with the evicted entry (to release once the cache is consistent
+/// and unborrowed) when stored or already present, `None` (nothing
+/// touched) for the general path.
+fn lru_native_store(
     cache: &RefCell<DictData>,
-    links: &Rc<RefCell<Vec<u8>>>,
+    state: &Rc<RefCell<Vec<u8>>>,
     key: &Object,
     result: &Object,
-    limit: usize,
+    limit: u64,
 ) -> Result<Option<Option<(DictKey, Object)>>, RuntimeError> {
     let Some(probe) = crate::object::LeafProbe::new(key) else {
         return Ok(None);
     };
     let mut data = cache.borrow_mut();
-    let mut bytes = links.borrow_mut();
-    let len = data.len();
-    if bytes.is_empty() || len > limit {
-        return Ok(None);
-    }
-    let Some(mut order) = lru_order::Order::new(&mut bytes, len) else {
+    let mut bytes = state.borrow_mut();
+    let Some((_, flags)) = lru_state::mode(&bytes) else {
         return Ok(None);
     };
     match data.get_index_of(&probe) {
         // A recursive call populated the key: its entry and recency win.
-        Some(_) => return Ok(Some(None)),
-        None if !probe.miss_is_exact() => return Ok(None),
-        None => {}
+        Some(_) if probe.miss_is_exact() => return Ok(Some(None)),
+        None if probe.miss_is_exact() => {}
+        _ => return Ok(None),
     }
+    if limit == lru_state::UNBOUNDED {
+        data.insert_unique_hashed(probe.hash, DictKey(key.clone()), result.clone());
+        return Ok(Some(None));
+    }
+    let len = data.len();
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    if flags & lru_state::FALLBACK != 0 || len > limit {
+        return Ok(None);
+    }
+    let Some(mut links) = lru_state::Links::new(&mut bytes, len) else {
+        return Ok(None);
+    };
     if len == limit {
         // The least recent entry's place takes the new one, which becomes
         // the most recent.
-        let Some(head) = order.head() else {
+        let Some(head) = links.head() else {
             return Ok(None);
         };
-        if order.touch(head).is_none() {
-            return Err(invalid_lru_order());
-        }
+        links.touch(head).ok_or_else(invalid_lru_order)?;
         let evicted =
             data.replace_index_unique(head, probe.hash, DictKey(key.clone()), result.clone());
         return Ok(Some(evicted));
     }
-    crate::object::bytearray_check_resizable(links)?;
-    if order.push(limit).is_none() {
-        return Err(invalid_lru_order());
-    }
+    crate::object::bytearray_check_resizable(state)?;
+    links.push(limit).ok_or_else(invalid_lru_order)?;
     data.insert_unique_hashed(probe.hash, DictKey(key.clone()), result.clone());
     Ok(Some(None))
+}
+
+/// A call of `inst`, a `functools.lru_cache` wrapper, with the positional
+/// `args` that hits its cache: the cached value (the hit counted, its
+/// recency refreshed), or `None`, nothing touched, for the full call. The
+/// core loop and the frame JIT try it at a `CALL` of an instance. It
+/// settles natively and runs no Python code: a sole exact `int` or `str`
+/// argument of an untyped wrapper, while nothing else holds its state.
+#[inline]
+pub(crate) fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Option<Object> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let [key @ (Object::Int(_) | Object::Str(_))] = args else {
+        return None;
+    };
+    let keys = lru_keys();
+    // SAFETY: reads that run no code. The slots of a wrapper are set once
+    // by its constructor.
+    let slots = unsafe { inst.slots.peek() }?;
+    let [Object::Dict(cache), Object::ByteArray(state)] =
+        slots.leading_interned([&keys[0], &keys[1]])?
+    else {
+        return None;
+    };
+    // SAFETY: as above: nothing below runs code that could borrow either
+    // cell, and `peek_mut` declines while any borrow is live (another
+    // thread's included: it declines once cells are shared).
+    let (data, bytes) = unsafe { (cache.peek()?, state.peek_mut()?) };
+    let (limit, flags) = lru_state::mode(bytes)?;
+    if limit == 0 || flags & (lru_state::TYPED | lru_state::FALLBACK) != 0 {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let index = data.get_index_of(&probe)?;
+    if !probe.miss_is_exact() {
+        return None;
+    }
+    let value = data.get_index(index)?.1.clone();
+    if limit != lru_state::UNBOUNDED {
+        lru_state::Links::new(bytes, data.len())?.touch(index)?;
+    }
+    lru_state::hit(bytes)?;
+    Some(value)
 }
 
 fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -1067,69 +1020,36 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         return Err(type_error("expected _lru_cache_wrapper instance"));
     };
     let call_args = &args[1..];
-    // One borrow reads the size, the mode, the cache, and live links.
-    let (maxsize, mode, cache, links) = {
-        let dict = inst.dict_cell().borrow();
-        let cache = match lru_slot(&dict, LruField::Cache) {
-            Some(Object::Dict(cache)) => Some(cache.clone()),
-            _ => None,
-        };
-        let maxsize = lru_slot(&dict, LruField::Maxsize)
-            .cloned()
-            .unwrap_or(Object::None);
-        let state = lru_slot(&dict, LruField::State);
-        let links = state.and_then(lru_state_links).cloned();
-        (maxsize, lru_mode(state), cache, links)
-    };
-    let interp = || match crate::vm_singletons::current_interpreter_ptr() {
-        // SAFETY: published by the enclosing VM frame on this thread.
-        Some(ptr) => Ok(unsafe { &mut *ptr }),
-        None => Err(type_error("lru_cache requires a running interpreter")),
-    };
-    let func = || {
-        lru_get(inst, LruField::Wrapped)
-            .ok_or_else(|| type_error("lru_cache wrapper lost its function"))
-    };
+    let LruParts { cache, state, func } = lru_parts(inst)?;
+    let (limit, flags) = lru_state::mode(&state.borrow()).ok_or_else(invalid_lru_order)?;
+    let interp = crate::builtins::reentrant_interp()?;
+    let globals = interp.builtins_dict();
 
     // maxsize == 0: no caching, statistics only.
-    if matches!(maxsize, Object::Int(0)) {
-        let interp = interp()?;
-        lru_counter_bump(inst, LruField::Misses);
-        let globals = interp.builtins_dict();
-        return interp.call(&func()?, call_args, kwargs, &globals);
+    if limit == 0 {
+        lru_count(&state, false)?;
+        return interp.call(&func, call_args, kwargs, &globals);
     }
 
-    let (typed, scalar_enabled) = mode?;
-    let key = lru_make_key(call_args, kwargs, typed);
-    // The warm shape: an `int`, `str`, or tuple of them in a bounded cache
-    // whose recency links are live.
-    if let (Object::Int(limit @ 1..), Some(cache), Some(links), true) =
-        (&maxsize, &cache, &links, scalar_enabled)
-    {
-        let probe = native_lru_key(&key)
-            .then(|| crate::object::LeafProbe::new(&key))
-            .flatten();
-        let found = probe.and_then(|p| lru_fast_lookup(inst, cache, links, &p));
-        match found {
-            Some(FastLookup::Hit(v)) => return Ok(v),
-            Some(FastLookup::Miss(func)) => {
-                let func = func.ok_or_else(|| type_error("lru_cache wrapper lost its function"))?;
-                let interp = interp()?;
-                let globals = interp.builtins_dict();
+    let bounded = limit != lru_state::UNBOUNDED;
+    let key = lru_make_key(call_args, kwargs, flags & lru_state::TYPED != 0);
+    // The warm shape: an `int`, `str`, or tuple of them, settled by one
+    // native probe under the cache's lock.
+    if let Some(probe) = crate::object::LeafProbe::new(&key).filter(|_| native_lru_key(&key)) {
+        match lru_native_lookup(&cache, &state, &probe, bounded) {
+            Some(NativeLookup::Hit(v)) => return Ok(v),
+            Some(NativeLookup::Miss) => {
                 let result = interp.call(&func, call_args, kwargs, &globals)?;
-                let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
-                if let Some(evicted) = lru_fast_store(cache, links, &key, &result, limit)? {
+                if let Some(evicted) = lru_native_store(&cache, &state, &key, &result, limit)? {
                     // Released with the cache consistent and unborrowed.
                     drop(evicted);
                     return Ok(result);
                 }
-                return lru_store(inst, cache, &key, result, &maxsize, true);
+                return lru_store(&cache, &state, &key, result, limit, bounded);
             }
             None => {}
         }
     }
-    let interp = interp()?;
-    let globals = interp.builtins_dict();
     // Compute a tuple key's hash before touching the cache. Successful
     // hashes are retained by the tuple, so lookup, recency updates, and
     // insertion invoke each argument's hash only once per call. Errors
@@ -1138,13 +1058,8 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     if matches!(key, Object::Tuple(_)) {
         interp.do_hash_call(&key, &globals)?;
     }
-    let Some(cache) = cache else {
-        return Err(type_error("lru_cache wrapper lost its cache"));
-    };
-    let bounded = matches!(maxsize, Object::Int(m) if m > 0);
-
-    let scalar_hit = if bounded && scalar_enabled {
-        scalar_lru_operation(inst, &cache, &key, None)?
+    let scalar_hit = if bounded {
+        scalar_lru_operation(&cache, &state, &key, None)?
     } else {
         ScalarLru::Slow
     };
@@ -1171,31 +1086,28 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         ),
     };
     if let Some(v) = hit {
-        lru_counter_bump(inst, LruField::Hits);
+        lru_count(&state, true)?;
         return Ok(v);
     }
-    lru_counter_bump(inst, LruField::Misses);
-    let result = interp.call(&func()?, call_args, kwargs, &globals)?;
-    lru_store(inst, &cache, &key, result, &maxsize, scalar)
+    lru_count(&state, false)?;
+    let result = interp.call(&func, call_args, kwargs, &globals)?;
+    lru_store(&cache, &state, &key, result, limit, scalar)
 }
 
-/// Store a miss's `result` under `key` (through the scalar links when
+/// Store a miss's `result` under `key` (through the native links when
 /// `scalar`), unless a reentrant call stored the key first.
 fn lru_store(
-    inst: &crate::types::PyInstance,
     cache: &Rc<RefCell<DictData>>,
+    state: &Rc<RefCell<Vec<u8>>>,
     key: &Object,
     result: Object,
-    maxsize: &Object,
+    limit: u64,
     scalar: bool,
 ) -> Result<Object, RuntimeError> {
-    if scalar {
-        let Object::Int(limit) = *maxsize else {
-            unreachable!()
-        };
+    if scalar && limit != lru_state::UNBOUNDED {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         if matches!(
-            scalar_lru_operation(inst, cache, key, Some((&result, limit)))?,
+            scalar_lru_operation(cache, state, key, Some((&result, limit)))?,
             ScalarLru::Complete(_)
         ) {
             return Ok(result);
@@ -1207,8 +1119,9 @@ fn lru_store(
             // keep the existing entry (CPython does the same).
             if !c.contains_key(&DictKey(key.clone())) {
                 c.insert(DictKey(key.clone()), result.clone());
-                if let Object::Int(m) = *maxsize {
-                    while c.len() > m.max(0) as usize {
+                if limit != lru_state::UNBOUNDED {
+                    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+                    while c.len() > limit {
                         c.shift_remove_index(0);
                     }
                 }
@@ -1251,51 +1164,63 @@ fn with_stolen_cache<T>(cache: &Rc<RefCell<DictData>>, op: impl FnOnce(&mut Dict
 
 fn lru_cache_info(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
-    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
-        return Err(type_error("cache_info requires a running interpreter"));
+    let interp = crate::builtins::reentrant_interp()?;
+    let parts = lru_parts(&inst)?;
+    let cls = {
+        let keys = lru_keys();
+        let slots = inst.slots.borrow();
+        match slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]]) {
+            Some([_, _, _, cls]) => cls.clone(),
+            None => return Err(lru_lost()),
+        }
     };
-    // SAFETY: published by the enclosing VM frame on this thread.
-    let interp = unsafe { &mut *ptr };
-    let cls = lru_get(&inst, LruField::InfoCls)
-        .ok_or_else(|| type_error("lru_cache wrapper lost its CacheInfo class"))?;
-    let hits = lru_get(&inst, LruField::Hits).unwrap_or(Object::Int(0));
-    let misses = lru_get(&inst, LruField::Misses).unwrap_or(Object::Int(0));
-    let maxsize = lru_get(&inst, LruField::Maxsize).unwrap_or(Object::None);
-    let currsize = match lru_get(&inst, LruField::Cache) {
-        Some(Object::Dict(c)) => Object::Int(c.borrow().len() as i64),
-        _ => Object::Int(0),
+    let (hits, misses, limit, currsize) = {
+        let data = parts.cache.borrow();
+        let bytes = parts.state.borrow();
+        let (hits, misses) = lru_state::counts(&bytes).ok_or_else(invalid_lru_order)?;
+        let (limit, _) = lru_state::mode(&bytes).ok_or_else(invalid_lru_order)?;
+        (hits, misses, limit, data.len())
     };
+    let count = |n: u64| Object::Int(i64::try_from(n).unwrap_or(i64::MAX));
+    let maxsize = if limit == lru_state::UNBOUNDED {
+        Object::None
+    } else {
+        count(limit)
+    };
+    let currsize = Object::Int(i64::try_from(currsize).unwrap_or(i64::MAX));
     let globals = interp.builtins_dict();
-    interp.call(&cls, &[hits, misses, maxsize, currsize], &[], &globals)
+    interp.call(
+        &cls,
+        &[count(hits), count(misses), maxsize, currsize],
+        &[],
+        &globals,
+    )
 }
 
 fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
-    if let Some(Object::Dict(c)) = lru_get(&inst, LruField::Cache) {
-        let retired = {
-            // Read the mode after locking the cache: a concurrent first call
-            // may initialize recency storage before we acquire this lock.
-            let mut cache = c.borrow_mut();
-            let state = lru_get(&inst, LruField::State);
-            if let Some(links) = state.as_ref().and_then(lru_state_links) {
-                let mut bytes = links.borrow_mut();
-                if bytes.is_empty() {
-                    cache.clear();
-                    None
-                } else {
-                    crate::object::bytearray_check_resizable(links)?;
-                    *bytes = lru_order::empty();
-                    Some(std::mem::take(&mut *cache))
-                }
-            } else {
-                cache.clear();
-                None
-            }
-        };
-        drop(retired);
-    }
-    lru_set(&inst, LruField::Hits, Object::Int(0));
-    lru_set(&inst, LruField::Misses, Object::Int(0));
+    let LruParts { cache, state, .. } = lru_parts(&inst)?;
+    let retired = {
+        // The cache's lock first, then its words (as every caller takes
+        // them): a concurrent call can't see the one cleared without the
+        // other.
+        let mut data = cache.borrow_mut();
+        let mut bytes = state.borrow_mut();
+        let (limit, flags) = lru_state::mode(&bytes).ok_or_else(invalid_lru_order)?;
+        if limit != 0
+            && limit != lru_state::UNBOUNDED
+            && flags & lru_state::FALLBACK == 0
+            && !data.is_empty()
+        {
+            crate::object::bytearray_check_resizable(&state)?;
+            lru_state::clear_links(&mut bytes).ok_or_else(invalid_lru_order)?;
+        }
+        lru_state::reset_counts(&mut bytes).ok_or_else(invalid_lru_order)?;
+        std::mem::take(&mut *data)
+    };
+    // The entries die with the cache empty and unborrowed (their
+    // finalizers may call the wrapper).
+    drop(retired);
     Ok(Object::None)
 }
 

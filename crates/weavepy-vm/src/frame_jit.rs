@@ -5408,13 +5408,20 @@ unsafe extern "C" fn h_call(
             }
             return RELOAD;
         }
-        Interpreter::core_instance_callee(base.add(start));
         let done = |st: &mut State, r: Object| {
             crate::release_run(base.add(start), len - start);
             base.add(start).write(r);
             st.len = start + 1;
             0
         };
+        // A `functools.lru_cache` wrapper's cache hit, in place.
+        if let Object::Instance(_) = &*base.add(start) {
+            let ops = std::slice::from_raw_parts(base.add(start), argc + 2);
+            if let Some(r) = Interpreter::core_lru_hit(ops) {
+                return done(st, r);
+            }
+        }
+        Interpreter::core_instance_callee(base.add(start));
         // The commonest settled leaf builtins first (`isinstance(x, C)`, a
         // fast half), without the shape checks below; a decline falls
         // through to them untouched.

@@ -14004,6 +14004,28 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // A `functools.lru_cache` wrapper's cache hit, in place.
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        if let Object::Instance(_) = unsafe { &*base.add(len - argc - 2) } {
+                            let start = len - argc - 2;
+                            // SAFETY: as above.
+                            let ops =
+                                unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
+                            if let Some(r) = Self::core_lru_hit(ops) {
+                                // SAFETY: every operand was checked to leave by a
+                                // plain decrement; the result takes the callee's
+                                // slot.
+                                unsafe {
+                                    release_run(base.add(start), len - start);
+                                    base.add(start).write(r);
+                                }
+                                len = start + 1;
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
+                        }
                         // SAFETY: `len >= argc + 2`: the callee and its self
                         // slot.
                         unsafe { Self::core_instance_callee(base.add(len - argc - 2)) };
@@ -23746,6 +23768,22 @@ impl Interpreter {
         args.push(recv.clone());
         args.extend(bound[..n].iter().map(|a| (*a).expect("prefix").clone()));
         fast(&args)?.ok()
+    }
+
+    /// A call of a `functools.lru_cache` wrapper whose cache holds the
+    /// result (see [`crate::stdlib::functools_mod::lru_hit`]): `ops` is
+    /// the core loop's `CALL` operands (the wrapper, an empty self slot and
+    /// the arguments). The cached value, or `None` (nothing touched) for
+    /// the full call.
+    #[inline(never)]
+    pub(crate) fn core_lru_hit(ops: &[Object]) -> Option<Object> {
+        let (Object::Instance(inst), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
+            return None;
+        };
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        crate::stdlib::functools_mod::lru_hit(inst, &ops[2..])
     }
 
     /// A call of a bound natively served class method
