@@ -29355,9 +29355,14 @@ impl Interpreter {
     /// (`__dict__`, `__name__`, `__text_signature__`, …), and the full
     /// path serves several more from outside its dict, so only the one
     /// the explicit-base-call idiom needs is admitted here (`__new__`
-    /// keeps its own exception at the call site).
+    /// keeps its own exception at the call site), with the context-manager
+    /// protocol's methods, which neither `type` nor `object` defines
+    /// (`ExitStack.enter_context` reads them off the class).
     fn type_dunder_transparent(name: &str) -> bool {
-        name == "__init__"
+        matches!(
+            name,
+            "__init__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+        )
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
@@ -74590,6 +74595,7 @@ fn is_site_op(op: OpCode) -> bool {
             | OpCode::LoadMethodAttr
             | OpCode::LoadSuperAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::LoadSpecial
             | OpCode::BinarySubscr
             | OpCode::StoreSubscr
