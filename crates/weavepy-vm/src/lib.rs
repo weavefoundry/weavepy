@@ -26897,7 +26897,8 @@ impl Interpreter {
     /// A call of an instance whose class's `__call__` is a plain Python
     /// function: the callee slot at `callee` takes that function and the
     /// (empty) self slot after it the instance, as `type(obj).__call__(obj,
-    /// ...)`. Anything else is left alone.
+    /// ...)`. A bound method's call takes the same shape (see
+    /// [`Self::core_bound_callee`]). Anything else is left alone.
     ///
     /// # Safety
     ///
@@ -26906,10 +26907,14 @@ impl Interpreter {
     #[inline(always)]
     unsafe fn core_instance_callee(callee: *mut Object) {
         // SAFETY: the caller's contract.
-        let (Object::Instance(inst), Object::Unbound) =
-            (unsafe { &*callee }, unsafe { &*callee.add(1) })
-        else {
-            return;
+        let inst = match (unsafe { &*callee }, unsafe { &*callee.add(1) }) {
+            (Object::Instance(inst), Object::Unbound) => inst,
+            (Object::BoundMethod(_), Object::Unbound) => {
+                // SAFETY: the caller's contract.
+                unsafe { Self::core_bound_callee(callee) };
+                return;
+            }
+            _ => return,
         };
         if let Some(f) = Self::instance_call_function(inst) {
             // SAFETY: the instance moves to the (dropless) self slot.
@@ -26948,6 +26953,62 @@ impl Interpreter {
             let obj = callee.read();
             callee.write(Object::Builtin(b));
             callee.add(1).write(obj);
+        }
+    }
+
+    /// A call of a bound method (`obj.meth` loaded as a plain attribute, as
+    /// `x.f()` of an imported `x` loads it): the method's function in the
+    /// callee slot and its receiver in the (empty) self slot after it, the
+    /// shape a method-call load leaves, so the call takes the method
+    /// call's lanes. That is the call itself: a method's call prepends its
+    /// receiver to the arguments. A Python function's method expands as
+    /// CPython's `CALL` expands it; a native method (CPython's builtin
+    /// bound to its object, which `CALL` doesn't expand) only while no
+    /// observer could see the callee and when the native call lanes may
+    /// run its body (see [`native_call_ic_safe`]). A method something
+    /// could watch die (a weak reference) stays whole, so its death stays
+    /// after the call, and a deferred special-method dispatch is left
+    /// alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_instance_callee`]'s, with a bound method in the
+    /// callee slot and an empty self slot.
+    #[inline(never)]
+    unsafe fn core_bound_callee(callee: *mut Object) {
+        // SAFETY: the caller's contract.
+        let Object::BoundMethod(bm) = (unsafe { &*callee }) else {
+            return;
+        };
+        if bm.redispatch_descriptor {
+            return;
+        }
+        let expands = match &bm.function {
+            Object::Function(_) => true,
+            // (One whose call the interpreter's dispatch routes by name
+            // keeps its bound shape, as a method-call load leaves it.)
+            Object::Builtin(b) => {
+                b.binds_instance
+                    && !bm.py_method
+                    && !crate::trace::any_observers_active()
+                    && native_call_ic_safe(b.name)
+            }
+            _ => false,
+        };
+        if !expands
+            || (Rc::strong_count(bm) == 1
+                && crate::weakref_registry::may_have_weakrefs(Rc::as_ptr(bm) as usize as u64))
+        {
+            return;
+        }
+        let (function, receiver) = (bm.function.clone(), bm.receiver.clone());
+        // SAFETY: the slots are rewritten in place: the method leaves the
+        // callee slot (its parts live on in the two slots), and the self
+        // slot held no value.
+        unsafe {
+            drop(callee.read());
+            callee.write(function);
+            callee.add(1).write(receiver);
         }
     }
 
