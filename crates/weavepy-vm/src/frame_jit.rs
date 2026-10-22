@@ -611,6 +611,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             OpCode::LoadGlobal
             | OpCode::LoadMethodAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::BuildTuple
             | OpCode::BuildList
             | OpCode::BuildMap
@@ -3233,6 +3234,31 @@ unsafe extern "C" fn h_store_attr(
             name,
             &*slot,
         ))
+    }
+}
+
+/// `DELETE_ATTR` (the `pc`th instruction of `code`) of the instance atop a
+/// `len`-deep stack, as the core loop's arm runs it
+/// (`Interpreter::core_delete_attr`): `0` the attribute and the receiver
+/// gone (whose release may have queued a finalizer: the code checks),
+/// anything else declined untouched.
+unsafe extern "C" fn h_delete_attr(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `DELETE_ATTR`s, and its stack depth (at least one).
+    unsafe {
+        let st = &mut *st;
+        let (code, pc) = (&*code, pc as usize);
+        let interp = &mut *st.interp.cast_mut();
+        u32::from(
+            interp
+                .core_delete_attr(code, code.instructions[pc], pc, st.stack, len as usize)
+                .is_none(),
+        )
     }
 }
 
@@ -7397,6 +7423,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::PushNull
             | OpCode::LoadMethodAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::BuildTuple
             | OpCode::BuildList
             | OpCode::LoadDeref
@@ -8586,6 +8613,7 @@ impl<'a> Lower<'a> {
             }
             OpCode::LoadMethodAttr => return self.load_method(pc),
             OpCode::StoreAttr => return self.stack_store_attr(pc),
+            OpCode::DeleteAttr => return self.delete_attr(pc),
             OpCode::BuildTuple if (1..=3).contains(&ins.arg) => {
                 return self.build(pc, ins.arg as usize, false)
             }
@@ -11225,6 +11253,31 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
         self.depth += 1;
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// `DELETE_ATTR` of the stack's top through [`h_delete_attr`].
+    fn delete_attr(&mut self, pc: usize) -> bool {
+        if self.depth == 0 {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let r = self
+            .call(
+                h_delete_attr as *const () as usize,
+                &[self.st, code, pcv, len],
+                true,
+            )
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth -= 1;
         self.set_last(pc);
         self.check_released(pc + 1);
         true
