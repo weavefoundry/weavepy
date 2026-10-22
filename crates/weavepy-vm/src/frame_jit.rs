@@ -3569,14 +3569,20 @@ unsafe extern "C" fn h_load_method(
                         Some(b) => Object::Builtin(b),
                         // A static or class method the site resolved for
                         // this class: the function, with an empty self slot
-                        // or the class.
-                        None if ms.holds_inst_unbound(ver) => {
-                            return u32::from(!Interpreter::core_class_fn_method(
-                                code,
-                                name,
-                                top,
-                                Ok(ms),
-                            ));
+                        // or the class; the receiver leaves by a plain
+                        // decrement.
+                        None if ms.holds_inst_unbound(ver) && droppable(&*top) => {
+                            let Some((f, class)) = ms.get_inst_unbound(ver) else {
+                                return 1;
+                            };
+                            let self_obj = if class {
+                                Object::Type(inst.cls())
+                            } else {
+                                Object::Unbound
+                            };
+                            crate::drop_hot(std::mem::replace(&mut *top, Object::Function(f)));
+                            st.stack.add(len).write(self_obj);
+                            return 0;
                         }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
@@ -6113,11 +6119,10 @@ unsafe fn direct_call_kw(
         if callee.is_generator
             || callee.is_coroutine
             || callee.is_async_generator
-            || callee.has_varargs
-            || callee.has_varkeywords
             || !callee.cellvars.is_empty()
-            || !callee.freevars.is_empty()
-            || !f.closure.is_empty()
+            // (A closure runs on its lean cells.)
+            || ((!callee.freevars.is_empty() || !f.closure.is_empty())
+                && f.lean_cells_ref(callee).is_none())
             || !Interpreter::lean_code_ok(callee)
         {
             return None;

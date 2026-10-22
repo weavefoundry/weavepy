@@ -9515,12 +9515,12 @@ impl Interpreter {
         let total = npos + code.kwonly_count as usize;
         if specialize::rc_id(f) != func_id
             || total > 15
-            || (code.has_varkeywords && code.varnames.len() <= total)
-            || eff_argc > npos
+            || code.varnames.len()
+                < total + usize::from(code.has_varargs) + usize::from(code.has_varkeywords)
+            || (eff_argc > npos && !code.has_varargs)
             || code.is_generator
             || code.is_coroutine
             || code.is_async_generator
-            || code.has_varargs
             || !code.cellvars.is_empty()
             || code.freevars.len() != f.closure.len()
             // SAFETY: GIL-serialized raw read of the slot store's
@@ -9530,7 +9530,7 @@ impl Interpreter {
         {
             return None;
         }
-        let mut covered: u32 = (1u32 << eff_argc) - 1;
+        let mut covered: u32 = (1u32 << eff_argc.min(npos)) - 1;
         for (j, name) in name_items.iter().enumerate() {
             let nibble = (perm >> (4 * j)) & 0xF;
             if nibble == specialize::KW_TO_VARKW {
@@ -9606,8 +9606,8 @@ impl Interpreter {
     /// Move a verified `CallPyKwNames` call's operands off `stack` into
     /// `locals` (cleared and sized here): keyword values to their
     /// permuted slots, the positional run (with a real self as slot 0)
-    /// in order, defaults for the rest. The callable and its self slot
-    /// stay on the stack.
+    /// in order, its surplus as a `*args` callee's tuple, defaults for
+    /// the rest. The callable and its self slot stay on the stack.
     #[allow(clippy::too_many_arguments)]
     fn kw_names_fill_locals(
         locals: &mut Vec<Object>,
@@ -9646,14 +9646,26 @@ impl Interpreter {
             locals[nibble as usize] = v;
         }
         let plen = stack.len();
-        for (slot, v) in stack.drain(plen - eff_argc..).enumerate() {
+        let direct = eff_argc.min(npos);
+        let mut run = stack.drain(plen - eff_argc..);
+        for (slot, v) in run.by_ref().take(direct).enumerate() {
             locals[slot] = v;
         }
+        if code.has_varargs {
+            locals[total] = if run.len() == 0 {
+                // The interned empty tuple.
+                Object::new_tuple(Vec::new())
+            } else {
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(run))
+            };
+        } else {
+            drop(run);
+        }
         if let Some(d) = varkw {
-            locals[total] = Object::Dict(Rc::new(RefCell::new(d)));
+            locals[total + usize::from(code.has_varargs)] = Object::Dict(Rc::new(RefCell::new(d)));
         }
         #[allow(clippy::needless_range_loop)]
-        for slot in eff_argc..total {
+        for slot in direct..total {
             if covered & (1 << slot) == 0 {
                 locals[slot] = if slot < npos {
                     f.defaults[f.defaults.len() - (npos - slot)].clone()
@@ -16523,7 +16535,8 @@ impl Interpreter {
     /// # Safety
     ///
     /// As [`Self::core_bind_plain`]'s, with the names tuple on the stack's
-    /// top and a callee with no cells and no `**kwargs`.
+    /// top and a callee with no cell variables of its own (a closure's
+    /// cells are its lean cells).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn core_bind_kw_direct(
         &mut self,
@@ -16564,8 +16577,9 @@ impl Interpreter {
                 frame.stack.set_len(n - 1);
             }
             let callable = frame.stack.pop().expect("the callee");
+            let cells = !code_rc.freevars.is_empty() || !(*fp).closure.is_empty();
             self.core_bind_act::<true>(
-                sw, frame, pc, fp, code_rc, act, guard, false, false, callable,
+                sw, frame, pc, fp, code_rc, act, guard, false, cells, callable,
             )
         }
     }
@@ -31778,7 +31792,7 @@ impl Interpreter {
                                     frame.pop()?; // the Unbound self slot
                                 }
                                 let callable = frame.pop()?;
-                                let r = self.run_py_exact_nofree(&f, locals)?;
+                                let r = self.call_python_bound(&f, code, locals)?;
                                 frame.push(r);
                                 self.release(callable);
                                 return Ok(StepOutcome::Continue);
@@ -60610,6 +60624,10 @@ impl Interpreter {
                     return result;
                 }
             }
+        }
+        // (A closure's frame takes its cells.)
+        if !code.freevars.is_empty() || !code.cellvars.is_empty() || !f.closure.is_empty() {
+            return self.call_python_bound(f, code, locals);
         }
         self.run_py_exact_nofree_with(f, code, locals)
     }
