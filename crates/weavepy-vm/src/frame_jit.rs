@@ -5494,6 +5494,7 @@ unsafe extern "C" fn h_call(
             Object::Function(_) => 1,
             Object::BoundMethod(bm) => u8::from(matches!(bm.function, Object::Function(_))),
             Object::Type(ty) if !ty.flags.is_builtin => 2,
+            callee if Interpreter::partial_callee(callee, &ops[1]) => 1,
             _ => 0,
         };
         // A pure leaf callee: evaluated in place, no activation.

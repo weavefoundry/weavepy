@@ -3320,14 +3320,28 @@ impl SlotStorage {
         same
     }
 
-    /// [`Self::leading`] for its common shape, inlined: a small store
-    /// whose first `N` keys are the given interned names themselves. Any
+    /// [`Self::leading`] for its common shapes, inlined: a small store, or
+    /// a `__slots__` layout, whose first `N` keys are the given interned
+    /// names themselves (a layout's are interned, see [`slot_key`]). Any
     /// other shape takes the full comparison.
     #[inline(always)]
     pub fn leading_interned<const N: usize>(
         &self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&Object; N]> {
+        if let SlotData::Fixed { layout, values } = &self.data {
+            if let (Some(keys), Some(values)) = (layout.get(..N), values.get(..N)) {
+                let mut same = true;
+                for (key, name) in keys.iter().zip(names) {
+                    same &= matches!(&key.0, Object::Str(s)
+                        if crate::shared_value::SharedStr::ptr_eq(s, name));
+                }
+                if same && !values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return Some(std::array::from_fn(|i| &values[i]));
+                }
+            }
+            return self.leading(names);
+        }
         if !self.leads_with_interned(&names) {
             return self.leading(names);
         }
