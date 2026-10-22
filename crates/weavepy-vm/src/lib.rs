@@ -11338,7 +11338,9 @@ impl Interpreter {
         len: usize,
         cap: usize,
     ) -> Option<usize> {
-        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        use weavepy_compiler::bytecode::{
+            SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
+        };
         if len == 0 || len >= cap {
             return None;
         }
@@ -11361,6 +11363,8 @@ impl Interpreter {
                 let name = match ins.arg {
                     SPECIAL_ENTER => "__enter__",
                     SPECIAL_EXIT => "__exit__",
+                    SPECIAL_AENTER => "__aenter__",
+                    SPECIAL_AEXIT => "__aexit__",
                     _ => return None,
                 };
                 match cls.lookup(name) {
