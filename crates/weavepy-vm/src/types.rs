@@ -3675,6 +3675,32 @@ impl SlotStorage {
             }
         }
     }
+
+    /// The slot values by representation, for the cycle collector's walk,
+    /// which needs no names (strings, which can't take part in a cycle)
+    /// and passes over an unset slot's [`Object::Unbound`] itself.
+    #[inline]
+    pub(crate) fn values_view(&self) -> SlotValues<'_> {
+        match &self.data {
+            SlotData::Single {
+                key: Some(_),
+                value,
+            } => SlotValues::Values(std::slice::from_ref(value)),
+            SlotData::Single { key: None, .. } => SlotValues::Values(&[]),
+            SlotData::Small(entries) => SlotValues::Pairs(entries),
+            SlotData::Many(table) => SlotValues::Table(table),
+            SlotData::Fixed { values, .. } => SlotValues::Values(values),
+            SlotData::Packed(p) => SlotValues::Values(p.values()),
+        }
+    }
+}
+
+/// [`SlotStorage::values_view`]: a run of values, a run of name-value
+/// pairs, or a table.
+pub(crate) enum SlotValues<'a> {
+    Values(&'a [Object]),
+    Pairs(&'a [(DictKey, Object)]),
+    Table(&'a DictData),
 }
 
 /// Slot storage for targets where an inline object pair would enlarge
@@ -3781,6 +3807,13 @@ impl SlotStorage {
             f(k, v);
         }
     }
+
+    /// The slot values, for the cycle collector's walk (see the 64-bit
+    /// variant).
+    #[inline]
+    pub(crate) fn values_view(&self) -> SlotValues<'_> {
+        SlotValues::Table(&self.0)
+    }
 }
 
 /// An instance of a user-defined class.
@@ -3880,6 +3913,12 @@ thread_local! {
 impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         let slots = class.fresh_slots();
+        Self::with_slots(class, slots)
+    }
+
+    /// An instance of `class` whose slot storage is `slots` (an exception's
+    /// laid-out pseudo-slots, see [`SlotStorage::exception`]).
+    pub(crate) fn with_slots(class: Rc<TypeObject>, slots: SlotStorage) -> Self {
         Self {
             class: RefCell::new(class),
             dict: crate::inst_dict::InstDict::new(),
@@ -4088,9 +4127,20 @@ impl PyInstance {
         if self.c_body.get() != 0 {
             return false;
         }
+        // (A guard-free view when one is free; it ends before anything
+        // else runs.)
+        // SAFETY: as above.
+        if let Some(cls) = unsafe { self.class.peek() } {
+            return self.class_lets_die_plainly(cls);
+        }
         let Ok(cls) = self.class.try_borrow() else {
             return false;
         };
+        self.class_lets_die_plainly(&cls)
+    }
+
+    /// [`Self::dies_by_plain_drop`]'s verdict for the class `cls`.
+    fn class_lets_die_plainly(&self, cls: &TypeObject) -> bool {
         if cls.native_kind.get() != 0 {
             // Never tracked; see `stdlib::datetime_native::plain_drop_ok`.
             return !cls.instances_need_finalize()
