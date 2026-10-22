@@ -8259,6 +8259,7 @@ impl Interpreter {
         act.guard = None;
         act.caller_pending = None;
         act.init_inst = None;
+        act.lru = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
@@ -8269,7 +8270,9 @@ impl Interpreter {
     /// only the code handle and the slot's own fields remain.
     #[inline(always)]
     fn inline_park_clean(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(act.clean && act.frame.stack.is_empty() && act.chain.is_none());
+        debug_assert!(
+            act.clean && act.frame.stack.is_empty() && act.chain.is_none() && act.lru.is_none()
+        );
         // SAFETY: as `inline_park`: the code handle is owned while active.
         unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         if act.owns_cells {
@@ -8302,6 +8305,7 @@ impl Interpreter {
                 && !act.discard
                 && act.guard.is_none()
                 && act.init_inst.is_none()
+                && act.lru.is_none()
                 && act.act.shell.is_none()
         );
         // SAFETY: as `inline_park`: the code handle is owned while active;
@@ -8335,6 +8339,7 @@ impl Interpreter {
                 && !act.discard
                 && act.guard.is_none()
                 && act.init_inst.is_none()
+                && act.lru.is_none()
                 && act.act.shell.is_none()
         );
         act.parked = true;
@@ -8830,6 +8835,18 @@ impl Interpreter {
             }
             (_, result) => result,
         };
+        // A `functools.lru_cache` miss's function returned: its result is
+        // stored before the caller takes it (an error stores nothing).
+        if let Some(pending) = done.lru.take() {
+            if let Ok(v) = &result {
+                if let Some((key, value)) =
+                    crate::stdlib::functools_mod::lru_store_returned(&pending, v)
+                {
+                    self.release(key.0);
+                    self.release(value);
+                }
+            }
+        }
         let call_pc = done.call_pc;
         let discard = done.discard;
         self.lean_pending_exit(done.caller_pending);
@@ -14004,26 +14021,39 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
-                        // A `functools.lru_cache` wrapper's cache hit, in place.
+                        // A `functools.lru_cache` wrapper's call: a cache hit
+                        // in place, a miss's function in the wrapper's place.
                         // SAFETY: `len >= argc + 2`: the call's operands.
                         if let Object::Instance(_) = unsafe { &*base.add(len - argc - 2) } {
                             let start = len - argc - 2;
                             // SAFETY: as above.
                             let ops =
                                 unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
-                            if let Some(r) = Self::core_lru_hit(ops) {
-                                // SAFETY: every operand was checked to leave by a
-                                // plain decrement; the result takes the callee's
-                                // slot.
-                                unsafe {
-                                    release_run(base.add(start), len - start);
-                                    base.add(start).write(r);
+                            match Self::core_lru_probe(ops) {
+                                Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => {
+                                    // SAFETY: every operand was checked to leave by
+                                    // a plain decrement; the result takes the
+                                    // callee's slot.
+                                    unsafe {
+                                        release_run(base.add(start), len - start);
+                                        base.add(start).write(r);
+                                    }
+                                    len = start + 1;
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
                                 }
-                                len = start + 1;
-                                last = pc;
-                                pc += 1;
-                                after_release!();
-                                continue;
+                                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending)) => {
+                                    // SAFETY: `len <= cap`, every slot initialized.
+                                    unsafe { frame.stack.set_len(len) };
+                                    frame.pc = pc as u32;
+                                    *last_pc = last;
+                                    if self.core_lru_miss(sw, pc, func, pending) {
+                                        break Some(CoreExit::Reload);
+                                    }
+                                }
+                                None => {}
                             }
                         }
                         // SAFETY: `len >= argc + 2`: the callee and its self
@@ -22949,6 +22979,7 @@ impl Interpreter {
             && (done.init_inst.is_none() || matches!(v, Object::None))
             && done.binop.is_none()
             && !done.discard
+            && done.lru.is_none()
         {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
@@ -23770,20 +23801,98 @@ impl Interpreter {
         fast(&args)?.ok()
     }
 
-    /// A call of a `functools.lru_cache` wrapper whose cache holds the
-    /// result (see [`crate::stdlib::functools_mod::lru_hit`]): `ops` is
-    /// the core loop's `CALL` operands (the wrapper, an empty self slot and
-    /// the arguments). The cached value, or `None` (nothing touched) for
-    /// the full call.
+    /// A call of a `functools.lru_cache` wrapper settled natively (see
+    /// [`crate::stdlib::functools_mod::lru_probe`]): `ops` is the core
+    /// loop's `CALL` operands (the wrapper, an empty self slot and the
+    /// arguments). The hit, the miss to run in place
+    /// ([`Self::core_lru_miss`]), or `None` (nothing touched) for the full
+    /// call.
     #[inline(never)]
-    pub(crate) fn core_lru_hit(ops: &[Object]) -> Option<Object> {
+    pub(crate) fn core_lru_probe(ops: &[Object]) -> Option<crate::stdlib::functools_mod::LruProbe> {
         let (Object::Instance(inst), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
             return None;
         };
         if !Self::core_all_droppable(ops) {
             return None;
         }
-        crate::stdlib::functools_mod::lru_hit(inst, &ops[2..])
+        crate::stdlib::functools_mod::lru_probe(inst, &ops[2..])
+    }
+
+    /// The `CALL` at `pc` of `sw`'s synced running activation of a
+    /// `functools.lru_cache` wrapper that missed its cache (see
+    /// [`Self::core_lru_probe`]): the wrapped function `func` runs in the
+    /// wrapper's place, as CPython's C wrapper calls it with no frame of its
+    /// own. A pure leaf is evaluated in place and its result stored at once;
+    /// anything else runs as an inline activation switched to here, which
+    /// stores its result when it returns (see `InlineAct::lru`). `false`
+    /// touches nothing (the operands as they were, the miss uncounted).
+    #[inline(never)]
+    pub(crate) fn core_lru_miss(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        func: Object,
+        mut pending: crate::stdlib::functools_mod::LruPending,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(argc) = frame.code.instructions.get(pc).map(|i| i.arg as usize) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        let Some(at) = n.checked_sub(argc + 2) else {
+            return false;
+        };
+        if !crate::stdlib::functools_mod::is_lru_wrapper(&frame.stack[at]) {
+            return false;
+        }
+        // The function takes the wrapper's place; the store holds the
+        // wrapper until the call finishes.
+        pending.hold(std::mem::replace(&mut frame.stack[at], func));
+        let ops = &frame.stack[at..];
+        if Self::core_all_droppable(ops) {
+            if let Some(r) = self.core_pure_call(&frame.code, pc, ops, sw.depth_cell) {
+                pending.count_miss();
+                let evicted = crate::stdlib::functools_mod::lru_store_returned(&pending, &r);
+                // SAFETY: every operand was checked to leave by a plain
+                // decrement; the result takes the callee's slot.
+                unsafe {
+                    release_run(frame.stack.as_ptr().add(at), n - at);
+                    frame.stack.set_len(at);
+                }
+                frame.stack.push(r);
+                frame.pc = pc as u32 + 1;
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+                if let Some((key, value)) = evicted {
+                    self.release(key.0);
+                    self.release(value);
+                }
+                drop(pending);
+                // SAFETY: the running thread's own flag (see `quiet_run`).
+                if unsafe { (*sw.maybe_dead).get() } {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+                }
+                return true;
+            }
+        }
+        if self.core_call(sw, pc) {
+            pending.count_miss();
+            // SAFETY: see `CoreSwitch`: the call pushed its activation,
+            // the running one.
+            let inl = unsafe { &mut *sw.inl };
+            let top = inl.last_mut().filter(|a| std::ptr::eq(&raw const *a.frame, sw.cur));
+            debug_assert!(top.is_some(), "an inline call pushes its activation");
+            if let Some(top) = top {
+                top.lru = Some(pending);
+            }
+            return true;
+        }
+        // Declined: the wrapper back in its place.
+        let func = std::mem::replace(&mut frame.stack[at], pending.release_wrapper());
+        drop(func);
+        false
     }
 
     /// A call of a bound natively served class method
@@ -67832,6 +67941,11 @@ struct InlineAct {
     /// none). The activation's consumer-facing fields (`call_pc`,
     /// `exhaust_arg`, `caller_pending`) are the consumer's.
     chain: Option<Box<ChainRec>>,
+    /// A `functools.lru_cache` miss's function (see
+    /// `Interpreter::core_lru_miss`): the activation's result is stored in
+    /// the wrapper's cache when it returns, before its caller takes it
+    /// (`inline_deliver`).
+    lru: Option<crate::stdlib::functools_mod::LruPending>,
 }
 
 /// The levels of a collapsed `yield from` chain (see
@@ -67976,6 +68090,7 @@ impl InlineAct {
             binop: None,
             discard: false,
             chain: None,
+            lru: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):

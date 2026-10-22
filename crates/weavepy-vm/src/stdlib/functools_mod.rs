@@ -584,6 +584,7 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
 /// own regression tests, which check the mode the native core is in.
 fn lru_private(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
+    lru_flush_deferred()?;
     let parts = lru_parts(&inst)?;
     let (limit, flags) =
         lru_state::mode(&parts.state.borrow()).ok_or_else(invalid_lru_order)?;
@@ -968,16 +969,87 @@ fn lru_native_store(
     Ok(Some(None))
 }
 
+/// What [`lru_probe`] settled for a `CALL` of a wrapper.
+pub(crate) enum LruProbe {
+    /// The cached value, its hit counted and its recency refreshed.
+    Hit(Object),
+    /// An exact miss, not yet counted: the wrapped (plain Python) function
+    /// and the store its result awaits. The caller runs the function in
+    /// the wrapper's place, then counts the miss
+    /// ([`LruPending::count_miss`]) once the call is committed, and stores
+    /// the result when it returns ([`lru_store_returned`]).
+    Miss(Object, LruPending),
+}
+
+/// A `functools.lru_cache` miss whose wrapped function runs as an inline
+/// activation in the wrapper's place: the store of its result. It holds
+/// the wrapper (as the call's operands held it) and the wrapper's native
+/// nesting level until the activation finishes.
+pub(crate) struct LruPending {
+    _wrapper: Object,
+    cache: Rc<RefCell<DictData>>,
+    state: Rc<RefCell<Vec<u8>>>,
+    key: Object,
+    _depth: LruDepthGuard,
+}
+
+impl LruPending {
+    /// Count the miss (when the call is committed).
+    pub(crate) fn count_miss(&self) {
+        // (Only a tampered buffer could fail.)
+        let _ = lru_count(&self.state, false);
+    }
+}
+
+/// Whether `obj` is a `functools.lru_cache` wrapper (by its class).
+#[inline(always)]
+pub(crate) fn is_lru_wrapper(obj: &Object) -> bool {
+    matches!(obj, Object::Instance(inst)
+        if std::ptr::from_ref(inst.cls_raw()) as usize
+            == LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set while a returned result waits in [`LRU_DEFERRED`].
+static LRU_DEFERRED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A returned result an inline miss couldn't store natively (an equal-hash
+/// stored key whose comparison needs Python): its cache, words, key, and
+/// value, stored by the next call into the native core that can run
+/// Python ([`lru_flush_deferred`]), before anything reads that cache.
+type DeferredStore = (Rc<RefCell<DictData>>, Rc<RefCell<Vec<u8>>>, Object, Object);
+
+static LRU_DEFERRED: std::sync::Mutex<Vec<DeferredStore>> = std::sync::Mutex::new(Vec::new());
+
+/// Store every deferred result (see [`LRU_DEFERRED`]), in order.
+fn lru_flush_deferred() -> Result<(), RuntimeError> {
+    while LRU_DEFERRED_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        let items = {
+            let mut list = LRU_DEFERRED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            LRU_DEFERRED_ANY.store(false, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut *list)
+        };
+        for (cache, state, key, value) in items {
+            let (limit, _) = lru_state::mode(&state.borrow()).ok_or_else(invalid_lru_order)?;
+            lru_store(&cache, &state, &key, value, limit, false)?;
+        }
+    }
+    Ok(())
+}
+
 /// A call of `inst`, a `functools.lru_cache` wrapper, with the positional
-/// `args` that hits its cache: the cached value (the hit counted, its
-/// recency refreshed), or `None`, nothing touched, for the full call. The
-/// core loop and the frame JIT try it at a `CALL` of an instance. It
-/// settles natively and runs no Python code: a sole exact `int` or `str`
-/// argument of an untyped wrapper, while nothing else holds its state.
+/// `args`, settled natively without running Python code: the hit, or the
+/// exact miss the caller may run the wrapped function for in place (see
+/// [`LruProbe`]), or `None`, nothing touched, for the full call. The core
+/// loop and the frame JIT try it at a `CALL` of an instance: a sole exact
+/// `int` or `str` argument of an untyped wrapper, while nothing else holds
+/// its state.
 #[inline]
-pub(crate) fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Option<Object> {
+pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Option<LruProbe> {
     if std::ptr::from_ref(inst.cls_raw()) as usize
         != LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+        || LRU_DEFERRED_ANY.load(std::sync::atomic::Ordering::Relaxed)
     {
         return None;
     }
@@ -988,8 +1060,8 @@ pub(crate) fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Optio
     // SAFETY: reads that run no code. The slots of a wrapper are set once
     // by its constructor.
     let slots = unsafe { inst.slots.peek() }?;
-    let [Object::Dict(cache), Object::ByteArray(state)] =
-        slots.leading_interned([&keys[0], &keys[1]])?
+    let [Object::Dict(cache), Object::ByteArray(state), func] =
+        slots.leading_interned([&keys[0], &keys[1], &keys[2]])?
     else {
         return None;
     };
@@ -1002,16 +1074,88 @@ pub(crate) fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Optio
         return None;
     }
     let probe = crate::object::LeafProbe::new(key)?;
-    let index = data.get_index_of(&probe)?;
+    let found = data.get_index_of(&probe);
     if !probe.miss_is_exact() {
         return None;
     }
+    let Some(index) = found else {
+        // A miss the caller can run in place: a plain function, and words
+        // the store may resize.
+        if !matches!(func, Object::Function(_)) || crate::object::bytearray_is_exported(state) {
+            return None;
+        }
+        let depth = lru_enter_native().ok()?;
+        return Some(LruProbe::Miss(
+            func.clone(),
+            LruPending {
+                _wrapper: Object::Unbound,
+                cache: cache.clone(),
+                state: state.clone(),
+                key: key.clone(),
+                _depth: depth,
+            },
+        ));
+    };
     let value = data.get_index(index)?.1.clone();
     if limit != lru_state::UNBOUNDED {
         lru_state::Links::new(bytes, data.len())?.touch(index)?;
     }
     lru_state::hit(bytes)?;
-    Some(value)
+    Some(LruProbe::Hit(value))
+}
+
+impl LruPending {
+    /// Hold the wrapper (moved out of the call's operands) until the call
+    /// finishes.
+    pub(crate) fn hold(&mut self, wrapper: Object) {
+        self._wrapper = wrapper;
+    }
+
+    /// Take the held wrapper back (a declined call restores its operands).
+    pub(crate) fn release_wrapper(&mut self) -> Object {
+        std::mem::replace(&mut self._wrapper, Object::Unbound)
+    }
+}
+
+/// Store an inline miss's returned `value` (see [`LruProbe::Miss`]) as the
+/// wrapper's own miss path would, without running Python code: the entry a
+/// full cache evicted, for the caller to release once nothing is borrowed.
+/// A store that needs Python's equality waits for the next call into the
+/// native core ([`LRU_DEFERRED`]).
+pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(DictKey, Object)> {
+    let (limit, _) = lru_state::mode(&p.state.borrow())?;
+    match lru_native_store(&p.cache, &p.state, &p.key, value, limit) {
+        Ok(Some(evicted)) => return evicted,
+        Ok(None) => {}
+        // A tampered buffer: nothing stored (the full path would raise).
+        Err(_) => return None,
+    }
+    // The ordered-dictionary fallback, when its probe settles natively.
+    if let Some(probe) = crate::object::LeafProbe::new(&p.key) {
+        let mut data = p.cache.borrow_mut();
+        let found = data.get_index_of(&probe);
+        if probe.miss_is_exact() {
+            if found.is_some() {
+                // A recursive call populated the key: its entry wins.
+                return None;
+            }
+            data.insert_unique_hashed(probe.hash, DictKey(p.key.clone()), value.clone());
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut evicted = None;
+            while data.len() > limit {
+                // (More than one only if the cache was tampered with.)
+                drop(evicted.take());
+                evicted = data.shift_remove_index(0);
+            }
+            return evicted;
+        }
+    }
+    LRU_DEFERRED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((p.cache.clone(), p.state.clone(), p.key.clone(), value.clone()));
+    LRU_DEFERRED_ANY.store(true, std::sync::atomic::Ordering::Release);
+    None
 }
 
 fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -1019,6 +1163,7 @@ fn lru_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("expected _lru_cache_wrapper instance"));
     };
+    lru_flush_deferred()?;
     let call_args = &args[1..];
     let LruParts { cache, state, func } = lru_parts(inst)?;
     let (limit, flags) = lru_state::mode(&state.borrow()).ok_or_else(invalid_lru_order)?;
@@ -1164,6 +1309,7 @@ fn with_stolen_cache<T>(cache: &Rc<RefCell<DictData>>, op: impl FnOnce(&mut Dict
 
 fn lru_cache_info(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
+    lru_flush_deferred()?;
     let interp = crate::builtins::reentrant_interp()?;
     let parts = lru_parts(&inst)?;
     let cls = {
@@ -1199,6 +1345,7 @@ fn lru_cache_info(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Objec
 
 fn lru_cache_clear(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
+    lru_flush_deferred()?;
     let LruParts { cache, state, .. } = lru_parts(&inst)?;
     let retired = {
         // The cache's lock first, then its words (as every caller takes

@@ -4999,6 +4999,7 @@ unsafe fn run_pushed_directly(
         if top.gen.is_some()
             || top.binop.is_some()
             || top.discard
+            || top.lru.is_some()
             || top.direct
             || !std::ptr::eq(&raw const *top.frame, callee)
         {
@@ -5414,11 +5415,31 @@ unsafe extern "C" fn h_call(
             st.len = start + 1;
             0
         };
-        // A `functools.lru_cache` wrapper's cache hit, in place.
+        // A `functools.lru_cache` wrapper's call: a cache hit in place, a
+        // miss's function in the wrapper's place (switched to as
+        // `call_activation` switches to a Python callee).
         if let Object::Instance(_) = &*base.add(start) {
             let ops = std::slice::from_raw_parts(base.add(start), argc + 2);
-            if let Some(r) = Interpreter::core_lru_hit(ops) {
-                return done(st, r);
+            match Interpreter::core_lru_probe(ops) {
+                Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => return done(st, r),
+                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending))
+                    if !st.sw.is_null() && std::ptr::eq((*st.sw).cur, st.frame) =>
+                {
+                    sync(st);
+                    let sw = &mut *st.sw;
+                    let interp = &mut *st.interp.cast_mut();
+                    if interp.core_lru_miss(sw, pc, func, pending) {
+                        if sw.pending.is_none()
+                            && !std::ptr::eq(sw.cur, st.frame)
+                            && run_callee_directly(st, start)
+                        {
+                            st.len = start + 1;
+                            return 0;
+                        }
+                        return if finished_in_place(st, start) { 0 } else { RELOAD };
+                    }
+                }
+                _ => {}
             }
         }
         Interpreter::core_instance_callee(base.add(start));
