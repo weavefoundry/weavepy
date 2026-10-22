@@ -485,9 +485,8 @@ fn never_ran_blocks(code: &CodeObject, starts: &[bool]) -> Vec<bool> {
     use weavepy_compiler::{InlineCache as IC, OpCode};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let n = starts.len();
-    let on = *ON.get_or_init(|| {
-        std::env::var_os("WEAVEPY_FRAME_JIT_COLD").is_none_or(|v| v != "0")
-    });
+    let on =
+        *ON.get_or_init(|| std::env::var_os("WEAVEPY_FRAME_JIT_COLD").is_none_or(|v| v != "0"));
     let resolved = |pc: usize| !matches!(code.caches.get(pc as u32), IC::Empty);
     if !on || n == 0 || !(0..n).any(resolved) {
         return vec![false; n];
@@ -519,17 +518,17 @@ fn never_ran_blocks(code: &CodeObject, starts: &[bool]) -> Vec<bool> {
             // Never ran: what it leads to counts only if reached otherwise.
             continue;
         }
-        for k in start..end {
+        for (k, i) in ins.iter().enumerate().take(end).skip(start) {
             let next = k + 1;
-            let target = match ins[k].op {
+            let target = match i.op {
                 OpCode::JumpForward
                 | OpCode::PopJumpIfFalse
                 | OpCode::PopJumpIfTrue
                 | OpCode::PopJumpIfNone
                 | OpCode::PopJumpIfNotNone
                 | OpCode::ForIter
-                | OpCode::Send => Some(next + ins[k].arg as usize),
-                OpCode::JumpBackward => Some(next.saturating_sub(ins[k].arg as usize)),
+                | OpCode::Send => Some(next + i.arg as usize),
+                OpCode::JumpBackward => Some(next.saturating_sub(i.arg as usize)),
                 _ => None,
             };
             if let Some(t) = target.filter(|&t| t < n) {

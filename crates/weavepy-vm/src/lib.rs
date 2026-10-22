@@ -23918,9 +23918,8 @@ impl Interpreter {
             // named tuple field (see `leaf_attr_resolve_site`).
             if let Some(slot) = ext.stamp_slot(attr_pc) {
                 let cls = inst.cls_raw();
-                let v = class_attr_hit_via(slot, cls, CLASS_ATTR_VIA_INSTANCE).or_else(|| {
-                    class_entry_hit(slot, cls, CLASS_ATTR_VIA_INSTANCE, code, attr_pc)
-                });
+                let v = class_attr_hit_via(slot, cls, CLASS_ATTR_VIA_INSTANCE)
+                    .or_else(|| class_entry_hit(slot, cls, CLASS_ATTR_VIA_INSTANCE, code, attr_pc));
                 if let Some(v) = v {
                     if !inst_may_shadow(inst, code, name_idx) {
                         return Some(v);
@@ -76114,8 +76113,16 @@ const CLASS_ATTR_ENTRY: u64 = 0x5ca1_a770_0000_000a;
 /// [`CLASS_ATTR_ENTRY`]'s bits: the first class that has the name, if
 /// its entry holds `v` itself.
 #[cold]
-fn class_entry_of(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) -> Option<u64> {
-    let name = code.names.get(code.instructions.get(pc)?.arg as usize)?.as_str();
+fn class_entry_of(
+    code: &CodeObject,
+    cls: &crate::types::TypeObject,
+    pc: usize,
+    v: &Object,
+) -> Option<u64> {
+    let name = code
+        .names
+        .get(code.instructions.get(pc)?.arg as usize)?
+        .as_str();
     // SAFETY: reads between two instructions, running no code.
     let mro = unsafe { cls.mro.peek() }?;
     // The type cache's entry for the name, which the read just resolved.
@@ -76126,7 +76133,9 @@ fn class_entry_of(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, 
     {
         // SAFETY: as above.
         let d = unsafe { mro.get(mro_idx as usize)?.dict.peek() }?;
-        if d.get_index(dict_idx as usize).is_some_and(|(_, found)| found.is_same(v)) {
+        if d.get_index(dict_idx as usize)
+            .is_some_and(|(_, found)| found.is_same(v))
+        {
             return Some(u64::from(mro_idx) << 32 | u64::from(dict_idx));
         }
     }
@@ -76135,7 +76144,9 @@ fn class_entry_of(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, 
         let d = unsafe { ty.dict.peek() }?;
         if let Some((j, _, found)) = d.get_full(&crate::object::StrKey(name)) {
             let (i, j) = (u32::try_from(i).ok()?, u32::try_from(j).ok()?);
-            return found.is_same(v).then_some(u64::from(i) << 32 | u64::from(j));
+            return found
+                .is_same(v)
+                .then_some(u64::from(i) << 32 | u64::from(j));
         }
     }
     None
