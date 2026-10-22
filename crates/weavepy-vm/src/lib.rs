@@ -13729,7 +13729,9 @@ impl Interpreter {
                         let start = len - kwc - argc - 3;
                         // A `functools.lru_cache` wrapper's cache hit, in place.
                         // SAFETY: the callee is live.
-                        if crate::stdlib::functools_mod::is_lru_wrapper(unsafe { &*base.add(start) }) {
+                        if crate::stdlib::functools_mod::is_lru_wrapper(unsafe {
+                            &*base.add(start)
+                        }) {
                             // SAFETY: `start + kwc + argc + 3 == len`.
                             let ops =
                                 unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
@@ -14060,7 +14062,10 @@ impl Interpreter {
                                     after_release!();
                                     continue;
                                 }
-                                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending)) => {
+                                Some(crate::stdlib::functools_mod::LruProbe::Miss(
+                                    func,
+                                    pending,
+                                )) => {
                                     // SAFETY: `len <= cap`, every slot initialized.
                                     unsafe { frame.stack.set_len(len) };
                                     frame.pc = pc as u32;
@@ -23862,7 +23867,9 @@ impl Interpreter {
     /// [`Self::core_lru_probe`] when `ops[0]` is a wrapper (one compare
     /// in line for any other callee).
     #[inline(always)]
-    pub(crate) fn lru_probe_if_wrapper(ops: &[Object]) -> Option<crate::stdlib::functools_mod::LruProbe> {
+    pub(crate) fn lru_probe_if_wrapper(
+        ops: &[Object],
+    ) -> Option<crate::stdlib::functools_mod::LruProbe> {
         if crate::stdlib::functools_mod::is_lru_wrapper(ops.first()?) {
             Self::core_lru_probe(ops)
         } else {
@@ -23891,12 +23898,15 @@ impl Interpreter {
         // unborrowed here, its operands from `at` the call's.
         let frame = unsafe { &mut *sw.cur };
         let n = frame.stack.len();
-        debug_assert!(crate::stdlib::functools_mod::is_lru_wrapper(&frame.stack[at]));
+        debug_assert!(crate::stdlib::functools_mod::is_lru_wrapper(
+            &frame.stack[at]
+        ));
         // The function takes the wrapper's place; the store holds the
         // wrapper until the call finishes.
         pending.hold(std::mem::replace(&mut frame.stack[at], func));
         let ops = &frame.stack[at..];
-        if matches!(&ops[0], Object::Function(f) if fn_is_leaf(f)) && Self::core_all_droppable(ops) {
+        if matches!(&ops[0], Object::Function(f) if fn_is_leaf(f)) && Self::core_all_droppable(ops)
+        {
             if let Some(r) = self.core_pure_call(&frame.code, pc, ops, sw.depth_cell) {
                 // SAFETY: every operand was checked to leave by a plain
                 // decrement; the result takes the callee's slot.
@@ -23920,7 +23930,9 @@ impl Interpreter {
             // SAFETY: see `CoreSwitch`: the call pushed its activation,
             // the running one.
             let inl = unsafe { &mut *sw.inl };
-            let top = inl.last_mut().filter(|a| std::ptr::eq(&raw const *a.frame, sw.cur));
+            let top = inl
+                .last_mut()
+                .filter(|a| std::ptr::eq(&raw const *a.frame, sw.cur));
             debug_assert!(top.is_some(), "an inline call pushes its activation");
             if let Some(top) = top {
                 top.lru = Some(pending);

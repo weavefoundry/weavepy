@@ -139,7 +139,11 @@ impl<'a> Links<'a> {
         // word or the link of an entry below `len`; the read is unaligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            self.bytes.as_ptr().cast::<u64>().add(index).read_unaligned()
+            self.bytes
+                .as_ptr()
+                .cast::<u64>()
+                .add(index)
+                .read_unaligned()
         }
     }
 
@@ -185,7 +189,11 @@ impl<'a> Links<'a> {
         let (prev, next) = (self.get(at), self.get(at + 1));
         // Unlink it (it isn't the tail, so it has a next entry)...
         let after = self.entry(next)?;
-        let before = if prev == NONE { None } else { Some(self.entry(prev)?) };
+        let before = if prev == NONE {
+            None
+        } else {
+            Some(self.entry(prev)?)
+        };
         self.set(HEADER + 2 * after, prev);
         match before {
             None => self.set(HEAD, next),
@@ -205,7 +213,11 @@ impl<'a> Links<'a> {
     pub(super) fn push(&mut self, limit: usize) -> Option<()> {
         let index = self.len;
         let tail = self.get(TAIL);
-        let tail = if tail == NONE { None } else { Some(self.entry(tail)?) };
+        let tail = if tail == NONE {
+            None
+        } else {
+            Some(self.entry(tail)?)
+        };
         let needed = (HEADER + 2 * (index + 1)).checked_mul(WORD)?;
         if needed > self.bytes.capacity() {
             let nodes = index.saturating_mul(2).max(1).min(limit.max(index + 1));

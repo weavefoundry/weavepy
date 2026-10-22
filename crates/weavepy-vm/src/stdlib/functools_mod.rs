@@ -573,7 +573,11 @@ fn lru_cache_wrapper_new(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         _ => return Err(type_error("maxsize should be integer or None")),
     };
-    let flags = if typed.is_truthy() { lru_state::TYPED } else { 0 };
+    let flags = if typed.is_truthy() {
+        lru_state::TYPED
+    } else {
+        0
+    };
     let inst = Rc::new(crate::types::PyInstance::new(lru_type()));
     let values = [
         Object::Dict(Rc::new(RefCell::new(DictData::default()))),
@@ -604,8 +608,7 @@ fn lru_private(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = lru_self(args)?;
     lru_flush_deferred()?;
     let parts = lru_parts(&inst)?;
-    let (limit, flags) =
-        lru_state::mode(&parts.state.borrow()).ok_or_else(invalid_lru_order)?;
+    let (limit, flags) = lru_state::mode(&parts.state.borrow()).ok_or_else(invalid_lru_order)?;
     let native = limit != 0 && limit != lru_state::UNBOUNDED && flags & lru_state::FALLBACK == 0;
     Ok(Object::new_tuple_array([
         Object::Dict(parts.cache),
@@ -1047,9 +1050,7 @@ pub(crate) struct LruPending {
 /// slots are set once by the constructor; only the collector's clear,
 /// which needs a collection, replaces them).
 #[inline(always)]
-unsafe fn lru_cells(
-    wrapper: &Object,
-) -> Option<(&Rc<RefCell<DictData>>, &Rc<RefCell<Vec<u8>>>)> {
+unsafe fn lru_cells(wrapper: &Object) -> Option<(&Rc<RefCell<DictData>>, &Rc<RefCell<Vec<u8>>>)> {
     let Object::Instance(inst) = wrapper else {
         return None;
     };
@@ -1126,18 +1127,16 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     }
     match args {
         // A sole exact `int` or `str` is its own key.
-        [key @ (Object::Int(_) | Object::Str(_))] => lru_probe_with::<_, true>(
-            inst,
-            &crate::object::LeafProbe::new(key)?,
-            || key.clone(),
-        ),
+        [key @ (Object::Int(_) | Object::Str(_))] => {
+            lru_probe_with::<_, true>(inst, &crate::object::LeafProbe::new(key)?, || key.clone())
+        }
         // Other native positional arguments key on their tuple, probed
         // without building it unless the call misses.
-        [_, ..] if args.len() <= LRU_ARGS_MAX => lru_probe_with::<_, true>(
-            inst,
-            &ArgsProbe::new(args, &[], &[])?,
-            || Object::new_tuple(args.to_vec()),
-        ),
+        [_, ..] if args.len() <= LRU_ARGS_MAX => {
+            lru_probe_with::<_, true>(inst, &ArgsProbe::new(args, &[], &[])?, || {
+                Object::new_tuple(args.to_vec())
+            })
+        }
         _ => None,
     }
 }
@@ -1149,16 +1148,16 @@ fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Option<Object> {
         return None;
     }
     let probe = match args {
-        [key @ (Object::Int(_) | Object::Str(_))] => lru_probe_with::<_, false>(
-            inst,
-            &crate::object::LeafProbe::new(key)?,
-            || unreachable!("no miss is run"),
-        ),
-        [_, ..] if args.len() <= LRU_ARGS_MAX => lru_probe_with::<_, false>(
-            inst,
-            &ArgsProbe::new(args, &[], &[])?,
-            || unreachable!("no miss is run"),
-        ),
+        [key @ (Object::Int(_) | Object::Str(_))] => {
+            lru_probe_with::<_, false>(inst, &crate::object::LeafProbe::new(key)?, || {
+                unreachable!("no miss is run")
+            })
+        }
+        [_, ..] if args.len() <= LRU_ARGS_MAX => {
+            lru_probe_with::<_, false>(inst, &ArgsProbe::new(args, &[], &[])?, || {
+                unreachable!("no miss is run")
+            })
+        }
         _ => None,
     };
     match probe? {
@@ -1256,7 +1255,12 @@ struct ArgsProbe<'a> {
 impl<'a> ArgsProbe<'a> {
     #[inline]
     fn new(args: &'a [Object], names: &'a [Object], values: &'a [Object]) -> Option<Self> {
-        let len = args.len() + if names.is_empty() { 0 } else { 1 + 2 * names.len() };
+        let len = args.len()
+            + if names.is_empty() {
+                0
+            } else {
+                1 + 2 * names.len()
+            };
         let mut probe = Self {
             args,
             names,
@@ -1352,9 +1356,11 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
                 true
             }
             // Builtin keys a tuple of these never equals.
-            Object::Int(_) | Object::Long(_) | Object::Str(_) | Object::WStr(_) | Object::Tuple(_) => {
-                false
-            }
+            Object::Int(_)
+            | Object::Long(_)
+            | Object::Str(_)
+            | Object::WStr(_)
+            | Object::Tuple(_) => false,
             _ => {
                 self.foreign.set(true);
                 false
@@ -1461,11 +1467,7 @@ impl LruPending {
 pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(DictKey, Object)> {
     match &p.key {
         Object::Tuple(items) => store_returned_with(p, value, &ArgsProbe::with_hash(items, p.hash)),
-        key => store_returned_with(
-            p,
-            value,
-            &crate::object::LeafProbe::with_hash(key, p.hash),
-        ),
+        key => store_returned_with(p, value, &crate::object::LeafProbe::with_hash(key, p.hash)),
     }
 }
 

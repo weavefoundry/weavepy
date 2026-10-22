@@ -4723,7 +4723,8 @@ unsafe extern "C" fn h_call_direct(
         debug_assert!(len_u >= argc + 2);
         if !s.sw.is_null() {
             let start = len_u - argc - 2;
-            if let Some(r) = direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None, None)
+            if let Some(r) =
+                direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None, None)
             {
                 return r;
             }
@@ -5299,7 +5300,11 @@ unsafe fn lru_miss_switch(
                 return Some(0);
             }
         }
-        Some(if finished_in_place(st, start) { 0 } else { RELOAD })
+        Some(if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
+        })
     }
 }
 
@@ -5388,7 +5393,9 @@ unsafe extern "C" fn h_call_instance(
                 if !s.sw.is_null() && (site.hot != 0 || site.retry == 0) {
                     pending.hold(std::mem::replace(&mut *s.stack.add(start), func));
                     let mut lru = Some(pending);
-                    if let Some(r) = direct_call::<false>(s, pc, start, len_u, site, None, Some(&mut lru)) {
+                    if let Some(r) =
+                        direct_call::<false>(s, pc, start, len_u, site, None, Some(&mut lru))
+                    {
                         return r;
                     }
                     // Not run directly: the wrapper back in its place.
