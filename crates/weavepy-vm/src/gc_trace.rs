@@ -1523,14 +1523,23 @@ impl GcState {
         if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
             return false;
         }
+        // How many collections in a row have found nothing (see `wanted`
+        // below).
+        let idle = self.idle_collections.load(Ordering::Relaxed).min(3);
         let (due, eligible, threshold0) = {
             let counts = self.counts.borrow();
             let thresholds = self.thresholds.borrow();
             if thresholds[0] == 0 {
                 return false;
             }
+            // The older generations' turn comes later too while collections
+            // find nothing: each idle one doubles the young collections the
+            // next older one waits for, up to eight times the threshold (an
+            // older collection rescans every survivor promoted since the
+            // last, so a program whose objects live on, as a pending task
+            // tree does, pays for it again and again).
             let mut gen = 0;
-            if counts[1] + 1 >= thresholds[1] {
+            if counts[1] + 1 >= thresholds[1].saturating_mul(1 << idle) {
                 gen = 1;
                 if counts[2] + 1 >= thresholds[2] {
                     gen = 2;
@@ -1557,7 +1566,6 @@ impl GcState {
         // eight thresholds' worth, and any that reclaims something resets
         // the pace. (A young collection costs far more per object than
         // CPython's, whose candidates sit on intrusive lists.)
-        let idle = self.idle_collections.load(Ordering::Relaxed).min(3);
         let wanted = if eligible == 0 {
             (threshold0 / 2) << idle
         } else {
