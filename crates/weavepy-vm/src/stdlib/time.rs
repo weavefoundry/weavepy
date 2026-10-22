@@ -338,6 +338,7 @@ fn struct_time_keys() -> std::rc::Rc<[DictKey]> {
 
 /// A `struct_time` of the visible `values` with its zone extras, built in
 /// one pass (see `os::struct_seq_instance_keyed`).
+#[cfg(unix)]
 fn make_struct_time_tz(values: Vec<Object>, gmtoff: i64, zone: Object) -> Object {
     crate::stdlib::os::struct_seq_instance_keyed(
         struct_time_type(),
