@@ -9160,14 +9160,6 @@ impl Interpreter {
         code.has_varargs || code.has_varkeywords || code.kwonly_count != 0
     }
 
-    /// Whether `code` binds keyword-only parameters or `**kwargs` (the
-    /// extended parameters a positional call's cached shape can't bind;
-    /// `*args` it can).
-    #[inline(always)]
-    fn has_keyword_params(code: &CodeObject) -> bool {
-        code.has_varkeywords || code.kwonly_count != 0
-    }
-
     /// How many trailing positional defaults a call of `f` (running
     /// `code`) with `given` positional arguments, self included, takes
     /// from `f.defaults`. `None` when too many arguments come, too few
@@ -9341,27 +9333,93 @@ impl Interpreter {
         missing: usize,
         v: &mut Vec<Object>,
     ) {
+        let nargs = frame.stack.len() - first_arg;
+        let Object::Function(f) = &frame.stack[callee_slot] else {
+            unreachable!("callee variant checked by the caller")
+        };
+        let f: *const PyFunction = &raw const **f;
+        // SAFETY: the `nargs` operands above `first_arg` move into the
+        // locals and the stack forgets them; the callee below them keeps
+        // `f` alive.
+        unsafe {
+            Self::fill_extended_raw(
+                &*f,
+                code,
+                frame.stack.as_ptr().add(first_arg),
+                nargs,
+                missing,
+                v,
+            );
+            frame.stack.set_len(first_arg);
+        }
+    }
+
+    /// Whether `f`'s compiled keyword-only defaults (never replaced) give
+    /// each of `code`'s keyword-only parameters a value, so a call that
+    /// names none of them binds without the generic binder.
+    #[inline(always)]
+    fn kwonly_defaults_cover(f: &PyFunction, code: &CodeObject) -> bool {
+        code.kwonly_count == 0 || Self::kwonly_defaults_cover_slow(f, code)
+    }
+
+    /// [`Self::kwonly_defaults_cover`] for code with keyword-only
+    /// parameters.
+    #[inline(never)]
+    fn kwonly_defaults_cover_slow(f: &PyFunction, code: &CodeObject) -> bool {
+        !f.defaults_maybe_overridden() && Self::kwonly_defaults(f, code).all(|d| d.is_some())
+    }
+
+    /// Append to `v` the parameters of a positional call of `f` (running
+    /// `code`, which has `*args`, `**kwargs` or keyword-only parameters)
+    /// from the `nargs` arguments at `src`, in the locals' parameter order:
+    /// the positional parameters, the last `missing` of them from `f`'s
+    /// defaults, each keyword-only parameter's compiled default, the
+    /// surplus as the `*args` tuple, and an empty `**kwargs` dictionary.
+    /// The shape is the caller's to check (the defaults cover `missing`
+    /// and the keyword-only parameters, and only a `*args` callee takes a
+    /// surplus).
+    ///
+    /// # Safety
+    ///
+    /// The `nargs` objects at `src` are initialized and move into `v`: the
+    /// caller forgets them.
+    #[inline(never)]
+    unsafe fn fill_extended_raw(
+        f: &PyFunction,
+        code: &CodeObject,
+        src: *const Object,
+        nargs: usize,
+        missing: usize,
+        v: &mut Vec<Object>,
+    ) {
         let npos = code.arg_count as usize;
-        let direct = (frame.stack.len() - first_arg).min(npos);
-        v.extend(frame.stack.drain(first_arg..first_arg + direct));
+        let direct = nargs.min(npos);
+        debug_assert!(code.has_varargs || nargs == direct);
+        v.reserve(code.varnames.len().max(direct + missing));
+        // SAFETY: the caller's contract.
+        unsafe {
+            for k in 0..direct {
+                v.push(src.add(k).read());
+            }
+        }
         let star = code.has_varargs.then(|| {
-            if frame.stack.len() == first_arg {
+            if nargs == direct {
                 // The interned empty tuple.
                 Object::new_tuple(Vec::new())
             } else {
                 Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-                    frame.stack.drain(first_arg..),
+                    // SAFETY: the caller's contract.
+                    (direct..nargs).map(|k| unsafe { src.add(k).read() }),
                 ))
             }
         });
-        let Object::Function(f) = &frame.stack[callee_slot] else {
-            unreachable!("callee variant checked by the caller")
-        };
         if missing > 0 {
             v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
         }
-        for d in Self::kwonly_defaults(f, code) {
-            v.push(d.cloned().unwrap_or(Object::Unbound));
+        if code.kwonly_count != 0 {
+            for d in Self::kwonly_defaults(f, code) {
+                v.push(d.cloned().unwrap_or(Object::Unbound));
+            }
         }
         v.extend(star);
         if code.has_varkeywords {
@@ -15463,29 +15521,22 @@ impl Interpreter {
             let depth = (*sw.inl).len();
             let (frame, _, shell) = sw.activation(depth, &mut tmp);
             let (frame, shell) = (&mut *frame, &mut *shell.cast::<QuietShell<'_>>());
-            match self.core_call_cached(frame, shell, pc, sw.depth_cell) {
-                Some(act) => Some(act),
-                None => {
-                    // The site's shape for next time: what the general
-                    // inline call is about to bind.
-                    let shape = Self::core_call_probe(frame, pc);
-                    let act = self.try_inline_call(frame, shell, pc);
-                    if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
-                        let code = &act.frame.code;
-                        if let Some(slot) = code_call_slot(&frame.code, pc)
-                            .filter(|_| !Self::has_keyword_params(code))
-                        {
-                            slot.set(CallShape {
-                                func,
-                                code: Rc::downgrade(code),
-                                missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
-                                has_self,
-                            });
-                        }
-                    }
-                    act
+            // The site's shape for next time (`core_call_plain`'s): what
+            // the general inline call is about to bind.
+            let shape = Self::core_call_probe(frame, pc);
+            let act = self.try_inline_call(frame, shell, pc);
+            if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
+                let code = &act.frame.code;
+                if let Some(slot) = code_call_slot(&frame.code, pc) {
+                    slot.set(CallShape {
+                        func,
+                        code: Rc::downgrade(code),
+                        missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
+                        has_self,
+                    });
                 }
             }
+            act
         };
         let Some(mut act) = act else {
             return false;
@@ -16010,10 +16061,11 @@ impl Interpreter {
     }
 
     /// [`Self::core_call`]'s common case, with every check the site's
-    /// [`CallSlot`] settles done once: a plain function (no cells, no
-    /// closure, positional parameters only) that the site saw before,
-    /// called with exactly its arity, switched to in a pooled slot. The
-    /// general path's work, without its probes: `false` touches nothing.
+    /// [`CallSlot`] settles done once: a plain function that the site saw
+    /// before, called positionally (its surplus collected by `*args`, its
+    /// keyword-only parameters and any `**kwargs` taking their defaults),
+    /// switched to in a pooled slot with its cells bound. The general
+    /// path's work, without its probes: `false` touches nothing.
     #[inline(always)]
     fn core_call_plain(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
@@ -16044,21 +16096,23 @@ impl Interpreter {
         else {
             return false;
         };
+        // A callee with cell or free variables binds its cells too (see
+        // `bind_call_cells`).
+        let cells = !code_rc.cellvars.is_empty() || !code_rc.freevars.is_empty() || !f.closure.is_empty();
         if (missing > 0 && !Self::defaults_cover(f, missing))
-            || !code_rc.cellvars.is_empty()
-            || !code_rc.freevars.is_empty()
-            || !f.closure.is_empty()
-            || Self::has_extended_params(code_rc)
+            || (cells && !Self::call_cells_ok(f, code_rc))
+            || !Self::kwonly_defaults_cover(f, code_rc)
             || !Self::lean_code_ok(code_rc)
             || crate::gil::free_threading_enabled()
         {
             return false;
         }
-        let Some(act) = self.inline_pool.pop() else {
-            return false;
+        let act = match self.inline_pool.pop() {
+            Some(act) => act,
+            None => InlineAct::parked(),
         };
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            self.inline_pool.push(act);
+            self.inline_unslot(act);
             return false;
         };
         // SAFETY: as above; the checks above hold.
@@ -16069,7 +16123,8 @@ impl Interpreter {
                 callee_slot,
                 has_self,
                 missing,
-                false,
+                cells,
+                Self::has_extended_params(code_rc),
                 fp,
                 act,
                 guard,
@@ -16077,6 +16132,18 @@ impl Interpreter {
             )
         };
         true
+    }
+
+    /// Whether [`Self::bind_call_cells`] can bind the cells of a call of
+    /// `f` running `code`: fresh cells of its own plus a closure of cells,
+    /// or the closure's lean cells.
+    #[inline]
+    fn call_cells_ok(f: &PyFunction, code: &CodeObject) -> bool {
+        if code.cellvars.is_empty() {
+            f.lean_cells_ref(code).is_some()
+        } else {
+            closure_cells_ok(f, code)
+        }
     }
 
     /// Whether `f`'s compiled positional defaults (`__defaults__` never
@@ -16092,16 +16159,20 @@ impl Interpreter {
     /// the `CALL` at `pc` of `sw`'s running activation (the callable at
     /// `callee_slot`, its self slot filled when `has_self`) move into the
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
-    /// `fp` (with exactly its arity) under the recursion `guard`, is
+    /// `fp` under the recursion `guard` (its cells too, with `cells`), is
     /// pushed and made the running activation. The last `missing`
-    /// parameters take `fp`'s positional defaults. `DIRECT` marks the
+    /// positional parameters take `fp`'s defaults; with `extended` (the
+    /// code has extended parameters) they bind as
+    /// [`Self::fill_extended_raw`] binds them. `DIRECT` marks the
     /// activation a direct call's (see `frame_jit::direct_call`).
     ///
     /// # Safety
     ///
     /// The running activation is synced and unborrowed, and the call's
     /// shape is one `core_call_plain` admits (the defaults cover
-    /// `missing`, see [`Self::defaults_cover`]).
+    /// `missing` and the keyword-only parameters, see
+    /// [`Self::defaults_cover`], and only a `*args` callee takes more
+    /// arguments than its positional parameters).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn core_bind_plain<const DIRECT: bool>(
@@ -16112,6 +16183,7 @@ impl Interpreter {
         has_self: bool,
         missing: usize,
         cells: bool,
+        extended: bool,
         fp: *const crate::object::PyFunction,
         act: Box<InlineAct>,
         guard: crate::recursion::Guard,
@@ -16134,16 +16206,54 @@ impl Interpreter {
             callee_slot + 2
         };
         let nargs = n - first;
-        let total = nlocals.max(nargs + missing);
-        if locals.capacity() < total {
-            locals.reserve(total);
+        let callable = if extended {
+            // SAFETY: as below; the binding is `fill_extended_raw`'s.
+            unsafe {
+                Self::core_fill_extended(frame, fp, code_rc, first, callee_slot, missing, locals)
+            }
+        } else {
+            let total = nlocals.max(nargs + missing);
+            if locals.capacity() < total {
+                locals.reserve(total);
+            }
+            // SAFETY: the `nargs` operands above `first` move into the
+            // locals (reserved above) and the stack forgets them, the
+            // defaults follow as copies, and the other locals start
+            // unbound, in one pass; the callable moves out of its slot, and
+            // an empty self slot owns nothing.
+            unsafe { Self::core_fill_plain(frame, fp, first, callee_slot, nargs, missing, total, locals) }
+        };
+        // SAFETY: as above.
+        unsafe {
+            self.core_bind_act::<DIRECT>(
+                sw, frame, pc, fp, code_rc, act, guard, held, cells, callable,
+            )
         }
-        // SAFETY: the `nargs` operands above `first` move into the locals
-        // (reserved above) and the stack forgets them, the defaults follow
-        // as copies, and the other locals start unbound, in one pass; the
-        // callable moves out of its slot, and an empty self slot owns
-        // nothing.
-        let callable = unsafe {
+    }
+
+    /// [`Self::core_bind_plain`]'s binding for a callee with positional
+    /// parameters only: the `nargs` arguments from `first` up move into
+    /// the empty `locals` (with room for `total`), the last `missing`
+    /// parameters take `fp`'s defaults, the rest start unbound, and the
+    /// callable leaves its slot, which is returned.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s, with `locals` reserved for `total`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_fill_plain(
+        frame: &mut Frame,
+        fp: *const crate::object::PyFunction,
+        first: usize,
+        callee_slot: usize,
+        nargs: usize,
+        missing: usize,
+        total: usize,
+        locals: &mut Vec<Object>,
+    ) -> Object {
+        // SAFETY: the caller's contract.
+        unsafe {
             let (src, dst) = (frame.stack.as_ptr().add(first), locals.as_mut_ptr());
             move_objects(src, dst, nargs);
             let mut k = nargs;
@@ -16159,12 +16269,39 @@ impl Interpreter {
             let callable = frame.stack.as_ptr().add(callee_slot).read();
             frame.stack.set_len(callee_slot);
             callable
-        };
-        // SAFETY: as above.
+        }
+    }
+
+    /// [`Self::core_bind_plain`]'s binding for a callee with extended
+    /// parameters (see [`Self::fill_extended_raw`]): the arguments from
+    /// `first` up move into the empty `locals`, and the callable leaves
+    /// its slot, which is returned.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_bind_plain`]'s.
+    #[cold]
+    #[inline(never)]
+    unsafe fn core_fill_extended(
+        frame: &mut Frame,
+        fp: *const crate::object::PyFunction,
+        code: &CodeObject,
+        first: usize,
+        callee_slot: usize,
+        missing: usize,
+        locals: &mut Vec<Object>,
+    ) -> Object {
+        // SAFETY: the caller's contract: the operands above `first` move
+        // into the locals and the stack forgets them, the callable moves
+        // out of its slot, and an empty self slot owns nothing.
         unsafe {
-            self.core_bind_act::<DIRECT>(
-                sw, frame, pc, fp, code_rc, act, guard, held, cells, callable,
-            )
+            let nargs = frame.stack.len() - first;
+            let src = frame.stack.as_ptr().add(first);
+            Self::fill_extended_raw(&*fp, code, src, nargs, missing, locals);
+            fill_unbound(locals, code.varnames.len());
+            let callable = frame.stack.as_ptr().add(callee_slot).read();
+            frame.stack.set_len(callee_slot);
+            callable
         }
     }
 
@@ -19947,7 +20084,7 @@ impl Interpreter {
     }
 
     /// The `(function, has_self, effective argc)` of a plain-function
-    /// `CALL` at `pc` (the shapes [`Self::core_call_cached`] serves).
+    /// `CALL` at `pc` (the shapes [`Self::core_call_plain`] serves).
     #[inline]
     fn core_call_probe(
         frame: &Frame,
@@ -19961,122 +20098,6 @@ impl Interpreter {
         };
         let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
         Some((Rc::downgrade(f), has_self, argc + usize::from(has_self)))
-    }
-
-    /// [`Self::try_inline_call`] for a site whose [`CallSlot`] names the
-    /// callee: the shape checks settled by the slot, the arguments moved
-    /// in bulk. `None` touches nothing.
-    #[inline]
-    fn core_call_cached(
-        &mut self,
-        frame: &mut Frame,
-        shell: &mut QuietShell<'_>,
-        pc: usize,
-        depth_cell: *const std::cell::Cell<usize>,
-    ) -> Option<Box<InlineAct>> {
-        let slot = code_call_slot(&frame.code, pc)?;
-        let argc = frame.code.instructions.get(pc)?.arg as usize;
-        let n = frame.stack.len();
-        let self_slot = n.checked_sub(argc + 1)?;
-        let callee_slot = self_slot.checked_sub(1)?;
-        let Object::Function(f) = &frame.stack[callee_slot] else {
-            return None;
-        };
-        let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
-        // (A filled slot means the site already ran its first, specializing
-        // execution.)
-        if crate::gil::free_threading_enabled() {
-            return None;
-        }
-        // SAFETY: GIL-serialized raw read of the function's code cell (see
-        // `PyFunction::code`); only compared, then cloned below.
-        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        let (missing, slot_self) = slot.hit(Rc::as_ptr(f), Rc::as_ptr(code_rc))?;
-        if slot_self != has_self
-            || !Self::lean_code_ok(code_rc)
-            || Self::has_keyword_params(code_rc)
-        {
-            return None;
-        }
-        let missing = missing as usize;
-        if missing > 0
-            && (f.defaults.len() < missing
-                || (f.defaults_maybe_overridden() && f.slot("__defaults__").is_some()))
-        {
-            return None;
-        }
-        let own_cells = !code_rc.cellvars.is_empty();
-        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = if own_cells {
-            if !closure_cells_ok(f, code_rc) {
-                return None;
-            }
-            std::ptr::null()
-        } else {
-            f.lean_cells_ref(code_rc)?
-        };
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(depth_cell) else {
-            return None;
-        };
-        // Committed.
-        let code = code_rc.clone();
-        let act = self.inline_slot();
-        // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
-        let nlocals = code.varnames.len();
-        let first_arg = if has_self { self_slot } else { self_slot + 1 };
-        let nargs = n - first_arg;
-        locals.reserve(nlocals.max(nargs + missing));
-        // SAFETY: the `nargs` operands above `first_arg` move into the
-        // (empty, large enough) locals; the stack forgets them.
-        unsafe {
-            let (src, dst) = (frame.stack.as_ptr().add(first_arg), locals.as_mut_ptr());
-            for k in 0..nargs {
-                dst.add(k).write(src.add(k).read());
-            }
-            frame.stack.set_len(first_arg);
-            locals.set_len(nargs);
-        }
-        let callable = {
-            // The NULL self slot (unbound: no drop glue), then the callee.
-            if !has_self {
-                frame.stack.pop();
-            }
-            frame.stack.pop().expect("callee slot checked above")
-        };
-        // A `*args` callee's surplus positionals become its tuple, which
-        // follows the positional parameters (there are no keyword ones).
-        let star = code.has_varargs.then(|| {
-            let npos = code.arg_count as usize;
-            if locals.len() > npos {
-                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-                    locals.drain(npos..),
-                ))
-            } else {
-                // The interned empty tuple.
-                Object::new_tuple(Vec::new())
-            }
-        });
-        if missing > 0 {
-            let Object::Function(f) = &callable else {
-                unreachable!("checked above")
-            };
-            locals.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
-        }
-        locals.extend(star);
-        fill_unbound(locals, nlocals);
-        frame.pc = pc as u32 + 1;
-        if own_cells {
-            let Object::Function(f) = &callable else {
-                unreachable!("checked above")
-            };
-            let cells = fresh_cells(f, &code, locals);
-            return Some(
-                self.inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true),
-            );
-        }
-        // The cells handle is `f`'s (now `callable`'s) or the shared empty
-        // vector: moving the callable leaves it where it was.
-        Some(self.inline_bind_cells(frame, shell, pc, act, code, callable, guard, cells))
     }
 
     /// The operands of a simple call whose argument loads start at
@@ -20437,15 +20458,18 @@ impl Interpreter {
             return None;
         }
         let total = nargs + missing;
-        if total != code_rc.arg_count as usize || total > 8 {
+        // (A positional call binds no `**kwargs` dictionary.)
+        let arity = leaf_arity(code_rc);
+        if total != code_rc.arg_count as usize || arity > 8 || code_rc.has_varkeywords {
             return None;
         }
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
+        leaf_kwonly_defaults(f, code_rc, args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..total], effect, depth)
+        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -20763,9 +20787,10 @@ impl Interpreter {
 
     /// [`Self::core_pure_call`] for a `CALL` site of the frame JIT that
     /// cached its leaf callee (see `frame_jit::leaf_site_call`): the site
-    /// settled the callee's shape (positional parameters only, at most
-    /// eight, the last `missing` of them from the defaults), so only the
-    /// checks that can change from call to call remain.
+    /// settled the callee's shape (no `*args` or `**kwargs`, at most eight
+    /// parameters, the last `missing` positional ones and every
+    /// keyword-only one from the defaults), so only the checks that can
+    /// change from call to call remain.
     pub(crate) fn site_leaf_eval(
         &self,
         ops: &[Object],
@@ -20812,7 +20837,12 @@ impl Interpreter {
         for (k, o) in f.defaults[f.defaults.len() - missing..].iter().enumerate() {
             args[nargs + k] = o;
         }
-        self.pure_leaf_call(code_rc, f, &args[..nargs + missing], effect, depth)
+        // The keyword-only parameters take their defaults.
+        if code_rc.kwonly_count != 0 {
+            leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
+        }
+        let arity = nargs + missing + code_rc.kwonly_count as usize;
+        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the

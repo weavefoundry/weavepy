@@ -4434,13 +4434,19 @@ impl DirectSite {
 /// arguments binds as [`Interpreter::core_call_plain`] binds it, and
 /// `code`'s native body runs from its start: that body, and how many
 /// trailing parameters take `f`'s defaults (with [`CELLS_BIT`] when the
-/// callee has cells to bind).
+/// callee has cells to bind, and [`EXTENDED_BIT`] when it has extended
+/// parameters).
 fn direct_body<'a>(
     f: &crate::object::PyFunction,
     code: &'a CodeObject,
     nargs: usize,
 ) -> Option<(&'a Native, usize)> {
-    let missing = (code.arg_count as usize).checked_sub(nargs)?;
+    // A surplus goes to `*args`.
+    let missing = match (code.arg_count as usize).checked_sub(nargs) {
+        Some(missing) => missing,
+        None if code.has_varargs => 0,
+        None => return None,
+    };
     // A callee with cell or free variables binds its cells too (see
     // `Interpreter::bind_call_cells`).
     let cells = !code.cellvars.is_empty() || !code.freevars.is_empty() || !f.closure.is_empty();
@@ -4448,9 +4454,12 @@ fn direct_body<'a>(
         || code.is_coroutine
         || code.is_async_generator
         || (cells && code.cellvars.is_empty() && f.lean_cells_ref(code).is_none())
-        || missing >= CELLS_BIT as usize
-        || Interpreter::has_extended_params(code)
+        || missing >= EXTENDED_BIT as usize
         || (missing > 0 && !Interpreter::defaults_cover(f, missing))
+        || !Interpreter::kwonly_defaults_cover(f, code)
+        // (A frameless leaf with extended parameters evaluates in place:
+        // see `site_leaf_fits`.)
+        || (Interpreter::has_extended_params(code) && crate::fn_is_leaf(f))
         || code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
     {
         return None;
@@ -4459,12 +4468,25 @@ fn direct_body<'a>(
     if ext.dispatch_len == 0 {
         return None;
     }
-    let packed = missing | if cells { CELLS_BIT as usize } else { 0 };
-    Some((ext.frame_jit.get(code.varnames.len().max(nargs))?, packed))
+    let extended = Interpreter::has_extended_params(code);
+    let packed = missing
+        | if cells { CELLS_BIT as usize } else { 0 }
+        | if extended { EXTENDED_BIT as usize } else { 0 };
+    // (Extended parameters bind exactly the code's locals.)
+    let nlocals = if extended {
+        code.varnames.len()
+    } else {
+        code.varnames.len().max(nargs)
+    };
+    Some((ext.frame_jit.get(nlocals)?, packed))
 }
 
 /// A [`DirectSite`]'s `missing` flag for a callee with cells to bind.
 const CELLS_BIT: u32 = 1 << 31;
+
+/// A [`DirectSite`]'s `missing` flag for a callee with `*args`, `**kwargs`
+/// or keyword-only parameters (see `Interpreter::fill_extended_raw`).
+const EXTENDED_BIT: u32 = 1 << 30;
 
 /// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
 /// stack slots `slot` and above it whose class's method runs alone (see
@@ -4764,13 +4786,15 @@ unsafe extern "C" fn h_call_site(
 
 /// Whether a site may evaluate a call of `f` (running `code`) with `nargs`
 /// positional arguments as a frameless leaf ([`leaf_site_call`]): a leaf
-/// with only positional parameters, at most eight, `nargs` of them given.
-/// How many take defaults.
+/// with no `*args` or `**kwargs` and at most eight parameters, `nargs` of
+/// its positional ones given (the keyword-only ones take their defaults).
+/// How many positional ones take defaults.
 fn site_leaf_fits(f: &crate::object::PyFunction, code: &CodeObject, nargs: usize) -> Option<usize> {
     let missing = (code.arg_count as usize).checked_sub(nargs)?;
     (crate::fn_is_leaf(f)
-        && !Interpreter::has_extended_params(code)
-        && code.arg_count <= 8
+        && !code.has_varargs
+        && !code.has_varkeywords
+        && crate::leaf_arity(code) <= 8
         && Interpreter::leaf_code_ok(code))
     .then_some(missing)
 }
@@ -4901,15 +4925,17 @@ unsafe fn direct_call<const CALL: bool>(
             site.promote(code_rc, has_self, native, missing);
             (native, missing)
         };
-        let (missing, cells) = (
-            packed & !(CELLS_BIT as usize),
+        let (missing, cells, extended) = (
+            packed & !((CELLS_BIT | EXTENDED_BIT) as usize),
             packed & CELLS_BIT as usize != 0,
+            packed & EXTENDED_BIT as usize != 0,
         );
         // (Another function running the same code may have rebound its
         // defaults, or, a closure, have cells the lean binding can't take.)
         if packed != 0
             && ((missing > 0 && !Interpreter::defaults_cover(f, missing))
-                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none()))
+                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none())
+                || (extended && !Interpreter::kwonly_defaults_cover(f, code_rc)))
         {
             return None;
         }
@@ -4958,7 +4984,7 @@ unsafe fn direct_call<const CALL: bool>(
         *sw.last = st.last;
         let saved_last = sw.last;
         let callee = interp.core_bind_plain::<true>(
-            sw, pc, start, has_self, missing, cells, fp, act, guard, held,
+            sw, pc, start, has_self, missing, cells, extended, fp, act, guard, held,
         );
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
