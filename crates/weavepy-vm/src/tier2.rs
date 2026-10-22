@@ -6949,7 +6949,9 @@ fn finish_deopted(
     let py_frame = shared_locals.as_ref().and(adopted);
     let mut frame = super::Frame {
         code: code.clone(),
-        locals: shared_locals.unwrap_or_else(|| Rc::new(GilRefCell::new(locals_v))),
+        locals: crate::frame_slots::FrameLocals::from_shared(
+            shared_locals.unwrap_or_else(|| Rc::new(GilRefCell::new(locals_v))),
+        ),
         cells: crate::object::empty_cells(),
         stack: crate::frame_slots::FrameStack::new(),
         globals: func.globals.clone(),
@@ -14865,7 +14867,9 @@ fn enter_compiled(
     // call and is only touched by the `wpjit_call_py` helper.
     let jf_ptr: *mut JitFrame = &raw mut jf;
     // SAFETY: as above.
-    let status = with_native_frame(&frame.locals, jf_ptr, || unsafe { cf.enter(jf_ptr) });
+    let status = with_native_frame(frame.locals.shared(), jf_ptr, || unsafe {
+        cf.enter(jf_ptr)
+    });
     end_introspection(&ctx);
 
     // A loop's entry at its back edge: how many iterations it ran before
@@ -15789,7 +15793,9 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
     // thread-local for the process lifetime; `ctx` outlives the call.
     let jf_ptr: *mut JitFrame = &raw mut jf;
     // SAFETY: as above.
-    let status = with_native_frame(&frame.locals, jf_ptr, || unsafe { cf.enter(jf_ptr) });
+    let status = with_native_frame(frame.locals.shared(), jf_ptr, || unsafe {
+        cf.enter(jf_ptr)
+    });
     end_introspection(&ctx);
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);
     note_native_exit(frame, &jf, status, ctx.pin_pressure_exit, cold_exit);

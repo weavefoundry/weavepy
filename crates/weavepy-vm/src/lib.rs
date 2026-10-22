@@ -137,7 +137,7 @@ pub struct Frame {
     /// refcounts and defeated pandas' chained-assignment detection
     /// (`getrefcount(self) <= REF_COUNT` in `Series.__setitem__` &
     /// friends).
-    locals: Rc<RefCell<Vec<Object>>>,
+    locals: frame_slots::FrameLocals,
     /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
     /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
     /// resized afterwards, and shared with the frame's `FrameShell` /
@@ -4024,16 +4024,16 @@ impl Interpreter {
                 pool.push(stack);
             }
         }
-        if Rc::strong_count(&frame.locals) == 1 {
+        if !frame.locals.is_shared() {
             // Clear before touching the pool: dropping the leftover
             // values runs arbitrary Rust `Drop` glue (file handles, GC
             // bookkeeping), which must not observe a held pool borrow.
             // SAFETY: sole owner (checked above) — no other path can
             // reach this vector, including the drop glue of its elements.
-            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
+            unsafe { release_locals(frame.locals.storage()) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
-                pool.push(frame.locals.clone());
+                pool.push(frame.locals.shared().clone());
             }
         }
     }
@@ -4138,7 +4138,7 @@ impl Interpreter {
         };
         Frame {
             code,
-            locals: locals_rc,
+            locals: frame_slots::FrameLocals::from_shared(locals_rc),
             cells,
             stack,
             globals,
@@ -5520,7 +5520,7 @@ impl Interpreter {
                     // A generator's shell outlives this activation inside
                     // the generator object: its slots own their values.
                     m.code = crate::object::FrameSlot::new(frame.code.clone());
-                    m.locals = crate::object::FrameSlot::new(frame.locals.clone());
+                    m.locals = crate::object::FrameSlot::new(frame.locals.shared().clone());
                     m.cells = crate::object::FrameSlot::new(frame.cells.clone());
                     m.globals = crate::object::FrameSlot::new(frame.globals.clone());
                     m.builtins = crate::object::FrameSlot::new(frame.builtins.clone());
@@ -5532,7 +5532,7 @@ impl Interpreter {
                     // holds before the frame can die.
                     unsafe {
                         m.code = crate::object::FrameSlot::borrowed(&frame.code);
-                        m.locals = crate::object::FrameSlot::borrowed(&frame.locals);
+                        m.locals = crate::object::FrameSlot::borrowed(frame.locals.shared());
                         m.globals = crate::object::FrameSlot::borrowed(&frame.globals);
                         m.builtins = crate::object::FrameSlot::borrowed(&frame.builtins);
                     }
@@ -5565,7 +5565,7 @@ impl Interpreter {
         }
         let shell = Rc::new(crate::object::FrameShell {
             code: crate::object::FrameSlot::new(frame.code.clone()),
-            locals: crate::object::FrameSlot::new(frame.locals.clone()),
+            locals: crate::object::FrameSlot::new(frame.locals.shared().clone()),
             cells: crate::object::FrameSlot::new(frame.cells.clone()),
             globals: crate::object::FrameSlot::new(frame.globals.clone()),
             builtins: crate::object::FrameSlot::new(frame.builtins.clone()),
@@ -5724,7 +5724,7 @@ impl Interpreter {
             // `dir()` reflects the module namespace instead of an
             // (empty) function-style snapshot.
             is_module_scope: frame.code.name == "<module>",
-            locals_mirror: RefCell::new(Some(frame.locals.clone())),
+            locals_mirror: RefCell::new(Some(frame.locals.shared().clone())),
             trace: RefCell::new(Object::None),
             gen_owner: RefCell::new(frame.gen_owner.clone()),
             override_lineno: crate::sync::RefCell::new(None),
@@ -6017,7 +6017,9 @@ impl Interpreter {
             // SAFETY: see the method docs — GIL-serialized, non-
             // escaping, non-re-entrant, bounds-checked.
             unsafe {
-                (&*frame.locals.as_ptr())
+                frame
+                    .locals
+                    .slots()
                     .get(arg as usize)
                     .map(Self::clone_operand)
             }
@@ -7351,7 +7353,7 @@ impl Interpreter {
                 } else {
                     // SAFETY: as for the plain store below.
                     unsafe {
-                        let locals = &mut *frame.locals.as_ptr();
+                        let locals = frame.locals.storage();
                         if slot < locals.len() {
                             Some(std::mem::replace(&mut locals[slot], Object::Unbound))
                         } else {
@@ -7376,7 +7378,7 @@ impl Interpreter {
             // bounds-checked in-place swap (the displaced value
             // is dropped *after* it dies, below).
             unsafe {
-                let locals = &mut *frame.locals.as_ptr();
+                let locals = frame.locals.storage();
                 if slot < locals.len() {
                     Some(std::mem::replace(&mut locals[slot], v))
                 } else {
@@ -8106,7 +8108,7 @@ impl Interpreter {
         };
         if !code.cellvars.is_empty() {
             // SAFETY: a bound slot's locals storage is its own.
-            let cells = fresh_cells(f, &code, unsafe { &mut *act.frame.locals.as_ptr() });
+            let cells = fresh_cells(f, &code, unsafe { act.frame.locals.storage() });
             return self
                 .inline_bind_with(frame, shell, pc, act, code, callable, guard, cells, true);
         }
@@ -8206,9 +8208,9 @@ impl Interpreter {
         // Leftover operands drop before anything is reused (their drop
         // glue is arbitrary Rust code).
         fr.stack.clear();
-        if Rc::strong_count(&fr.locals) == 1 {
+        if !fr.locals.is_shared() {
             // SAFETY: sole owner — no other path reaches this vector.
-            let v = unsafe { &mut *fr.locals.as_ptr() };
+            let v = unsafe { fr.locals.storage() };
             // SAFETY: sole owner (checked above).
             unsafe { release_locals(v) };
         } else {
@@ -8218,7 +8220,10 @@ impl Interpreter {
                 Some(rc) => rc,
                 None => Rc::new(RefCell::new(Vec::new())),
             };
-            drop(std::mem::replace(&mut fr.locals, fresh));
+            drop(std::mem::replace(
+                &mut fr.locals,
+                frame_slots::FrameLocals::from_shared(fresh),
+            ));
         }
         // Everything the general loop may have set on the way (a clean
         // activation never left the quiet loop's leaf paths).
@@ -8729,10 +8734,10 @@ impl Interpreter {
                 done.clean = true;
                 if frame.stack.is_empty()
                     && (frame.code.cellvars.is_empty() || done.owns_cells)
-                    && Rc::strong_count(&frame.locals) == 1
+                    && !frame.locals.is_shared()
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    unsafe { release_locals(&mut *frame.locals.as_ptr()) };
+                    unsafe { release_locals(frame.locals.storage()) };
                     drop(done.guard.take());
                     return Ok(v);
                 }
@@ -8961,7 +8966,7 @@ impl Interpreter {
                 // its shell through `pop_frame_shell` like any other.
                 unsafe {
                     m.code = crate::object::FrameSlot::borrowed(&frame.code);
-                    m.locals = crate::object::FrameSlot::borrowed(&frame.locals);
+                    m.locals = crate::object::FrameSlot::borrowed(frame.locals.shared());
                     m.globals = crate::object::FrameSlot::borrowed(&frame.globals);
                     m.builtins = crate::object::FrameSlot::borrowed(&frame.builtins);
                 }
@@ -8980,7 +8985,7 @@ impl Interpreter {
         }
         let shell = Rc::new(crate::object::FrameShell {
             code: crate::object::FrameSlot::new(frame.code.clone()),
-            locals: crate::object::FrameSlot::new(frame.locals.clone()),
+            locals: crate::object::FrameSlot::new(frame.locals.shared().clone()),
             cells,
             globals: crate::object::FrameSlot::new(frame.globals.clone()),
             builtins: crate::object::FrameSlot::new(frame.builtins.clone()),
@@ -9426,7 +9431,7 @@ impl Interpreter {
         let has_self = !matches!(frame.stack[self_slot], Object::Unbound);
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let callable = Self::lean_call_fill(
             frame,
             &code,
@@ -9779,7 +9784,7 @@ impl Interpreter {
         let code = shape.code.clone();
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let callable = Self::lean_call_kw_fill(frame, shape, locals);
         frame.pc = pc as u32 + 1;
         Some(self.inline_bind(frame, shell, pc, act, code, callable, guard))
@@ -9829,7 +9834,7 @@ impl Interpreter {
         let values = &frame.stack[len - 1 - kwc..len - 1];
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let bound = Self::lean_bind_keywords(
             f,
             &code,
@@ -9995,7 +10000,7 @@ impl Interpreter {
         let receiver = frame.stack.pop()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         locals.push(receiver);
         fill_unbound(locals, code.varnames.len());
         frame.pc = pc as u32 + 1;
@@ -10057,7 +10062,7 @@ impl Interpreter {
         let value = frame.stack.pop()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         locals.push(receiver);
         locals.push(value);
         fill_unbound(locals, code.varnames.len());
@@ -10164,7 +10169,7 @@ impl Interpreter {
         let receiver = frame.stack.pop()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         locals.push(descr);
         locals.push(receiver);
         locals.push(owner);
@@ -10263,7 +10268,7 @@ impl Interpreter {
         let container = frame.stack.pop()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         locals.push(container);
         locals.push(key);
         fill_unbound(locals, code.varnames.len());
@@ -10329,7 +10334,7 @@ impl Interpreter {
         let value = frame.stack.pop()?;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         locals.push(container);
         locals.push(key);
         locals.push(value);
@@ -10444,7 +10449,7 @@ impl Interpreter {
     ) -> LeanFrame {
         LeanFrame(std::mem::ManuallyDrop::new(Frame {
             code,
-            locals,
+            locals: frame_slots::FrameLocals::from_shared(locals),
             cells: borrowed_rc(cells),
             stack: self.pooled_stack(),
             globals: borrowed_rc(&f.globals),
@@ -10972,7 +10977,7 @@ impl Interpreter {
             code_vm_ext(&frame.code).is_some_and(|e| {
                 // SAFETY: as in `leaf_core` (a GIL-serialized read of the
                 // locals vector's length).
-                let nlocals = unsafe { (*frame.locals.as_ptr()).len() };
+                let nlocals = frame.locals.len();
                 e.frame_jit.get(nlocals).is_some()
             })
         };
@@ -11203,7 +11208,7 @@ impl Interpreter {
                 let next = frame.code.instructions.get(pc + 1).copied();
                 // SAFETY: see `leaf_burst_slow` (locals are never resized
                 // during an activation; nothing here runs Python code).
-                let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
+                let locals: &[Object] = unsafe { frame.locals.slots() };
                 let Some(local) = locals.get(ins.arg as usize) else {
                     return CoreAttr::Decline;
                 };
@@ -11550,7 +11555,7 @@ impl Interpreter {
             return None;
         }
         // SAFETY: as in `leaf_core_helper`.
-        let locals: &Vec<Object> = unsafe { &*frame.locals.as_ptr() };
+        let locals: &[Object] = unsafe { frame.locals.slots() };
         let local = locals.get(load.arg as usize)?;
         self.leaf_fused_len(
             &frame.code,
@@ -11617,7 +11622,7 @@ impl Interpreter {
             let (cbase, nconsts) = (consts.as_ptr(), consts.len());
             // SAFETY: as in `leaf_burst_slow` (the locals vector is not resized
             // during an activation, and nothing here runs Python code).
-            let locals: &mut Vec<Object> = unsafe { &mut *frame.locals.as_ptr() };
+            let locals: &mut Vec<Object> = unsafe { frame.locals.storage() };
             let (lbase, nlocals) = (locals.as_mut_ptr(), locals.len());
             // The code's native form (see `frame_jit`): the native copy of
             // this loop runs it from every pc the arms below leave it at,
@@ -14894,7 +14899,7 @@ impl Interpreter {
                             // object's field (the helper's plain values).
                             _ => {
                                 // SAFETY: `top` is the receiver's slot.
-                                let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+                                let running = (frame.locals.identity(), pc as u32);
                                 if unsafe { self.core_plain_attr(code, ins.arg, top, running) } {
                                     last = pc;
                                     pc += 1;
@@ -15925,7 +15930,7 @@ impl Interpreter {
             let n = frame.stack.len();
             let act = self.inline_slot();
             // SAFETY: a parked slot's locals storage is its own, and empty.
-            let locals = &mut *act.frame.locals.as_ptr();
+            let locals = act.frame.locals.storage();
             let callable = Self::lean_call_fill(frame, &code, true, n - 4, n - 5, missing, locals);
             frame.pc = pc as u32 + 1;
             self.inline_bind(frame, shell, pc, act, code, callable, guard)
@@ -16110,7 +16115,7 @@ impl Interpreter {
         // locals; the callable and the empty self slot leave the stack.
         let nlocals = code_rc.varnames.len();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let first = if has_self {
             callee_slot + 1
         } else {
@@ -17073,7 +17078,7 @@ impl Interpreter {
             let frame = &mut *frame;
             let local = frame.code.instructions.get(pc + 1).map(|i| i.arg as usize);
             // SAFETY: GIL-serialized read of the running activation's locals.
-            let locals: &Vec<Object> = &*frame.locals.as_ptr();
+            let locals: &[Object] = frame.locals.slots();
             let mapping = match local.and_then(|i| locals.get(i)) {
                 Some(Object::Dict(d)) => Object::Dict(d.clone()),
                 _ => return false,
@@ -17224,7 +17229,7 @@ impl Interpreter {
         let self_slot = callee_slot + 1;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let callable = Self::lean_call_fill(
             frame,
             &code,
@@ -17287,7 +17292,7 @@ impl Interpreter {
         };
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let bound = Self::lean_bind_keywords(
             &f,
             &code,
@@ -17579,7 +17584,7 @@ impl Interpreter {
         let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         // (The instance isn't made until the binding holds: `None` keeps
         // its parameter's place.)
         let receiver = Object::None;
@@ -17881,7 +17886,7 @@ impl Interpreter {
         let frame = unsafe { &mut *sw.cur };
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let nlocals = code.varnames.len();
         locals.reserve(nlocals.max(argc + 1 + missing));
         Self::lean_init_extend(
@@ -19881,7 +19886,7 @@ impl Interpreter {
         let code = code_rc.clone();
         let act = self.inline_slot();
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { &mut *act.frame.locals.as_ptr() };
+        let locals = unsafe { act.frame.locals.storage() };
         let nlocals = code.varnames.len();
         let first_arg = if has_self { self_slot } else { self_slot + 1 };
         let nargs = n - first_arg;
@@ -22780,7 +22785,7 @@ impl Interpreter {
         // queues its finalizer, which runs below before the caller goes on.
         let clean = frame.stack.is_empty()
             && (frame.code.cellvars.is_empty() || done.owns_cells)
-            && Rc::strong_count(&frame.locals) == 1;
+            && !frame.locals.is_shared();
         let mut tmp = None;
         let (cframe, clast, cshell, entry);
         if clean
@@ -22794,7 +22799,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
+            unsafe { release_locals(frame.locals.storage()) };
             drop(done.guard.take());
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
@@ -22855,7 +22860,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(&mut *frame.locals.as_ptr()) };
+            unsafe { release_locals(frame.locals.storage()) };
             drop(done.guard.take());
             Ok(v)
         } else {
@@ -22939,7 +22944,7 @@ impl Interpreter {
         // `y.append` (a builtin container's method read as a value) and
         // `obj.__dict__`: sites the full handler never specializes.
         if ins.op == OpCode::LoadAttr {
-            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+            let running = (frame.locals.identity(), pc as u32);
             if let Some(v) = self.leaf_plain_attr_value(code, stack.last(), ins.arg, Some(running))
             {
                 if let Some(top) = stack.last_mut() {
@@ -24523,7 +24528,7 @@ impl Interpreter {
         // under the GIL (it is disabled in free-threaded mode), executes no
         // Python code, and never lets the reference escape; the locals
         // vector is not resized during an activation.
-        let locals: &mut Vec<Object> = unsafe { &mut *locals.as_ptr() };
+        let locals: &mut Vec<Object> = unsafe { locals.storage() };
         let mut pc = frame.pc as usize;
         let mut last = *last_pc;
         let mut stop = LeafStop::Step;
@@ -30317,7 +30322,7 @@ impl Interpreter {
                                 // escapes this match arm, and the arm
                                 // only reads other cells (class/dict),
                                 // never this locals storage.
-                                let locals = unsafe { &*frame.locals.as_ptr() };
+                                let locals = unsafe { frame.locals.slots() };
                                 match locals.get(ins.arg as usize) {
                                     Some(Object::Instance(inst)) => {
                                         let guard_ok = {
@@ -33865,7 +33870,7 @@ impl Interpreter {
                     let stack = self.frame_stack.borrow();
                     stack
                         .iter()
-                        .rposition(|shell| Rc::ptr_eq(&shell.locals, &frame.locals))
+                        .rposition(|shell| Rc::ptr_eq(&shell.locals, frame.locals.shared()))
                         .map(|idx| (idx, stack[idx].clone()))
                 };
                 match found {
@@ -48598,7 +48603,7 @@ impl Interpreter {
         let ins = frame.code.instructions[pc];
         // A frame's or code object's plain field.
         if frame_field {
-            let running = (Rc::as_ptr(&frame.locals).cast::<()>(), pc as u32);
+            let running = (frame.locals.identity(), pc as u32);
             let v = match (frame.stack.last(), frame.code.names.get(ins.arg as usize)) {
                 (Some(recv), Some(name)) => Self::frame_plain_attr(recv, name, Some(running)),
                 _ => None,
@@ -59119,7 +59124,7 @@ impl Interpreter {
     ) -> Frame {
         Frame {
             code,
-            locals,
+            locals: frame_slots::FrameLocals::from_shared(locals),
             cells,
             stack: frame_slots::FrameStack::new(),
             globals: f.globals.clone(),
@@ -60094,7 +60099,7 @@ impl Interpreter {
         self.recycle_scratch(args);
         let mut frame = Frame {
             code,
-            locals: locals_rc,
+            locals: frame_slots::FrameLocals::from_shared(locals_rc),
             cells: crate::object::empty_cells(),
             stack: self.pooled_stack(),
             globals: f.globals.clone(),
@@ -67791,7 +67796,7 @@ fn parked_lean_frame() -> LeanFrame {
     let placeholder = inline_placeholder();
     LeanFrame(std::mem::ManuallyDrop::new(Frame {
         code: borrowed_rc(&placeholder.code),
-        locals: Rc::new(RefCell::new(Vec::new())),
+        locals: frame_slots::FrameLocals::from_shared(Rc::new(RefCell::new(Vec::new()))),
         cells: borrowed_rc(&placeholder.cells),
         stack: frame_slots::FrameStack::with_capacity(16),
         globals: borrowed_rc(&placeholder.dict),
@@ -68383,7 +68388,7 @@ impl LeanFrame {
         std::mem::forget(globals);
         std::mem::forget(builtins);
         std::mem::forget(cells);
-        (locals, stack)
+        (locals.into_shared(), stack)
     }
 }
 

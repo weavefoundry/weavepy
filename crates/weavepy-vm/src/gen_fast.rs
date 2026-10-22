@@ -442,7 +442,7 @@ impl Interpreter {
                 #[cfg(feature = "jit")]
                 CODE_NATIVE => crate::code_vm_ext(&frame.code).is_some_and(|ext| {
                     // SAFETY: a length read with nothing running.
-                    let n = unsafe { (*frame.locals.as_ptr()).len() };
+                    let n = frame.locals.len();
                     ext.frame_jit.get(n).is_some()
                 }),
                 _ => false,
@@ -1063,7 +1063,7 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             CODE_NATIVE => crate::code_vm_ext(&frame.code).is_some_and(|ext| {
                 // SAFETY: a length read with nothing running.
-                let n = unsafe { (*frame.locals.as_ptr()).len() };
+                let n = frame.locals.len();
                 ext.frame_jit.get(n).is_some()
             }),
             _ => false,

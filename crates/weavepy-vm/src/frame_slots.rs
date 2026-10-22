@@ -8,6 +8,7 @@
 use std::ops::{Deref, DerefMut, RangeBounds};
 
 use crate::object::Object;
+use crate::sync::{Rc, RefCell};
 
 /// A frame's operand stack: a growable run of values, the top last.
 #[derive(Default)]
@@ -186,5 +187,126 @@ impl DerefMut for FrameStack {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [Object] {
         &mut self.buf
+    }
+}
+
+/// The handle frame objects and the spine's shells hold on a frame's
+/// locals, so that `f_locals` reads the live values (see `Frame::locals`).
+pub(crate) type SharedLocals = Rc<RefCell<Vec<Object>>>;
+
+/// A frame's local variables: one slot per name, fixed while the frame
+/// runs.
+pub(crate) struct FrameLocals {
+    rc: SharedLocals,
+}
+
+impl FrameLocals {
+    #[inline]
+    pub(crate) fn from_shared(rc: SharedLocals) -> Self {
+        FrameLocals { rc }
+    }
+
+    #[inline]
+    pub(crate) fn into_shared(self) -> SharedLocals {
+        self.rc
+    }
+
+    /// The handle a frame object or shell holds, to read the live values.
+    #[inline(always)]
+    pub(crate) fn shared(&self) -> &SharedLocals {
+        &self.rc
+    }
+
+    /// The frame's identity while it runs (its locals' storage, which no
+    /// other frame shares).
+    #[inline(always)]
+    pub(crate) fn identity(&self) -> *const () {
+        Rc::as_ptr(&self.rc).cast()
+    }
+
+    /// Whether anything else (a frame object, a shell, a traceback's
+    /// frame) holds the locals.
+    #[inline(always)]
+    pub(crate) fn is_shared(&self) -> bool {
+        Rc::strong_count(&self.rc) > 1
+    }
+
+    /// The number of slots, read without the borrow flag (the running
+    /// frame is the only writer).
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        // SAFETY: a read of the vector's length; nothing resizes the
+        // locals while the frame runs.
+        unsafe { (*self.rc.as_ptr()).len() }
+    }
+
+    /// The first slot, for the native code and the binding paths.
+    #[inline(always)]
+    pub(crate) fn as_mut_ptr(&self) -> *mut Object {
+        // SAFETY: as `len`'s.
+        unsafe { (*self.rc.as_ptr()).as_mut_ptr() }
+    }
+
+    /// The live slots, read without the borrow flag.
+    ///
+    /// # Safety
+    ///
+    /// Nothing writes the locals while the result is held (the running
+    /// frame's own reads, under the GIL, with no Python code in between).
+    #[inline(always)]
+    pub(crate) unsafe fn slots(&self) -> &[Object] {
+        // SAFETY: the caller's contract.
+        unsafe { &*self.rc.as_ptr() }
+    }
+
+    /// The storage itself, without the borrow flag: the binding paths
+    /// size, fill and empty it through this (RFC 0078 stage 2 replaces
+    /// them).
+    ///
+    /// # Safety
+    ///
+    /// No borrow of the locals (a frame object's read, say) is live, and
+    /// the result isn't held across code that could take one.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn storage(&self) -> &mut Vec<Object> {
+        // SAFETY: the caller's contract.
+        unsafe { &mut *self.rc.as_ptr() }
+    }
+
+    #[inline]
+    pub(crate) fn borrow(&self) -> crate::sync::Ref<'_, Vec<Object>> {
+        self.rc.borrow()
+    }
+
+    #[inline]
+    pub(crate) fn borrow_mut(&self) -> crate::sync::RefMut<'_, Vec<Object>> {
+        self.rc.borrow_mut()
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow(
+        &self,
+    ) -> Result<crate::sync::Ref<'_, Vec<Object>>, crate::sync::BorrowError> {
+        self.rc.try_borrow()
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow_mut(
+        &self,
+    ) -> Result<crate::sync::RefMut<'_, Vec<Object>>, crate::sync::BorrowMutError> {
+        self.rc.try_borrow_mut()
+    }
+
+    /// The storage when no borrow is live (see `GilCell::peek_mut`).
+    ///
+    /// # Safety
+    ///
+    /// As `GilCell::peek_mut`'s.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn peek_mut(&self) -> Option<&mut Vec<Object>> {
+        // SAFETY: the caller's contract.
+        unsafe { self.rc.peek_mut() }
     }
 }
