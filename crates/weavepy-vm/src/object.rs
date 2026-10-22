@@ -1119,8 +1119,30 @@ pub struct FrameShell {
     pub materialized: RefCell<Option<Rc<PyFrame>>>,
     /// Live traceback entries that recorded this activation without
     /// materializing it (see `PyTraceback::new_lazy`). The pop
-    /// materializes a shell that still has some. Zero for a parked shell.
+    /// materializes a shell that still has some, unless the activation
+    /// departs (see [`Self::depart`]). Zero for a parked shell.
     pub tb_refs: std::sync::atomic::AtomicU32,
+    /// Whether an exception ended the activation while lazy references to
+    /// it lived, and its caller (see [`Self::depart`]).
+    pub(crate) departed: Departed,
+}
+
+/// [`FrameShell::departed`].
+#[derive(Debug, Default)]
+pub(crate) struct Departed {
+    flag: std::sync::atomic::AtomicBool,
+    back: RefCell<DepartedBack>,
+}
+
+/// A departed activation's caller, for its frame object's `f_back` (see
+/// [`FrameShell::depart`]).
+#[derive(Debug, Default)]
+pub(crate) enum DepartedBack {
+    #[default]
+    /// No caller, or the link was handed to the frame object.
+    None,
+    Frame(Rc<PyFrame>),
+    Lazy(LazyShellRef),
 }
 
 /// Metadata in a live frame shell. Recycled shells leave these slots
@@ -1255,6 +1277,7 @@ impl FrameShell {
             has_materialized: std::sync::atomic::AtomicBool::new(true),
             materialized: RefCell::new(Some(py.clone())),
             tb_refs: std::sync::atomic::AtomicU32::new(0),
+            departed: Departed::default(),
         }
     }
 
@@ -1322,6 +1345,65 @@ impl FrameShell {
         *self.materialized.borrow_mut() = Some(py.clone());
         self.has_materialized
             .store(true, std::sync::atomic::Ordering::Release);
+        py
+    }
+
+    /// An exception is ending this activation, the top of its spine above
+    /// `caller`, while lazy references to it live (a traceback entry, a
+    /// callee frame's `f_back`) and it has no frame object: instead of
+    /// building the object now, as the pop otherwise would, keep the shell
+    /// as its source. The pop upgrades the borrowed slots, so the shell
+    /// holds what the object would (the code, the locals storage, the
+    /// cells, the namespaces, the last instruction), and the object is
+    /// built on first use (see [`Self::materialize_departed`]), as the pop
+    /// would have built it. An exception caught and dropped in the caller
+    /// (`try: f() except E: pass`) then builds none.
+    pub(crate) fn depart(&self, caller: Option<&Rc<FrameShell>>) {
+        let back = match caller {
+            None => DepartedBack::None,
+            Some(c)
+                if !c
+                    .has_materialized
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                DepartedBack::Lazy(LazyShellRef::new(c.clone()))
+            }
+            Some(c) => match c.materialized.borrow().as_ref() {
+                Some(py) => DepartedBack::Frame(py.clone()),
+                None => DepartedBack::Lazy(LazyShellRef::new(c.clone())),
+            },
+        };
+        *self.departed.back.borrow_mut() = back;
+        self.departed
+            .flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the activation departed (see [`Self::depart`]).
+    #[inline]
+    pub(crate) fn has_departed(&self) -> bool {
+        self.departed
+            .flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The frame object of a departed activation (see [`Self::depart`]):
+    /// what the pop would have left, off the spine at its last
+    /// instruction, its `f_back` the caller's.
+    pub(crate) fn materialize_departed(&self) -> Rc<PyFrame> {
+        if let Some(py) = self.materialized.borrow().as_ref() {
+            return py.clone();
+        }
+        let py = self.materialize_departing(None);
+        py.live
+            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        py.on_stack.set(0);
+        let back = std::mem::take(&mut *self.departed.back.borrow_mut());
+        match back {
+            DepartedBack::Frame(b) => py.set_back(Some(b)),
+            DepartedBack::Lazy(l) => *py.lazy_back.borrow_mut() = Some(l),
+            DepartedBack::None => {}
+        }
         py
     }
 
@@ -1573,11 +1655,18 @@ impl PyTraceback {
         py
     }
 
-    /// The frame object if one exists already (no materialization).
+    /// The frame object if one exists already, or the activation departed
+    /// (see [`FrameShell::depart`]): the collector's view, which finds a
+    /// departed activation's locals through its object as it would had
+    /// the pop built it. A live activation's object isn't built.
     pub fn frame_if_ready(&self) -> Option<Rc<PyFrame>> {
         match &*self.frame.borrow() {
             TbFrame::Ready(py) => Some(py.clone()),
-            TbFrame::Lazy(lazy) => lazy.0.materialized.borrow().clone(),
+            TbFrame::Lazy(lazy) => {
+                let shell = &lazy.0;
+                let existing = shell.materialized.borrow().clone();
+                existing.or_else(|| shell.has_departed().then(|| shell.materialize_departed()))
+            }
         }
     }
 
@@ -1594,6 +1683,9 @@ impl PyTraceback {
 /// the one it already has, else materialized where it sits on this
 /// thread's spine (linking `f_back` like any other materialization).
 pub(crate) fn materialize_shell(shell: &Rc<FrameShell>) -> Rc<PyFrame> {
+    if shell.has_departed() {
+        return shell.materialize_departed();
+    }
     if let Some(frame_stack) = crate::vm_singletons::current_frame_stack() {
         let idx = frame_stack
             .borrow()
@@ -1637,12 +1729,13 @@ impl Drop for PyTraceback {
         // and overflow the native stack. Tear the chain down iteratively.
         // (The last owner of each link detaches its successor in place,
         // then frees a node with nothing left to chain to.)
-        let mut link = self.next.borrow_mut().take();
+        let mut link = self.next.get_mut().take();
         while let Some(tb) = link {
             if Rc::strong_count(&tb) != 1 {
                 break;
             }
-            link = tb.next.borrow_mut().take();
+            // SAFETY: the last owner: nothing else can reach the link.
+            link = unsafe { (*tb.next.as_ptr()).take() };
             drop(tb);
         }
     }
@@ -14153,6 +14246,15 @@ impl Object {
             return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
         }
         Object::Tuple(TupleStorage::from_vec(items))
+    }
+
+    /// A tuple of `items`, moved into its storage without an intermediate
+    /// vector (the empty tuple is the interned one).
+    pub fn tuple_from_exact(items: impl ExactSizeIterator<Item = Object>) -> Self {
+        if items.len() == 0 {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_exact_iter(items))
     }
 
     /// Build a fixed-size tuple directly in reference-counted storage,

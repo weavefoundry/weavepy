@@ -136,10 +136,14 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             inst
         };
         let owes = !inst.finalize_ran.get()
-            && inst
-                .class
-                .try_borrow()
-                .is_ok_and(|cls| cls.instances_need_finalize())
+            && if Arc::weak_count(&inst) == 0 {
+                // SAFETY: as above.
+                unsafe { &*inst.class.as_ptr() }.instances_need_finalize()
+            } else {
+                inst.class
+                    .try_borrow()
+                    .is_ok_and(|cls| cls.instances_need_finalize())
+            }
             // An asyncio future with nothing to log needs no `__del__`.
             && !crate::stdlib::asyncio_mod::finalizer_is_noop(&inst);
         if owes {
