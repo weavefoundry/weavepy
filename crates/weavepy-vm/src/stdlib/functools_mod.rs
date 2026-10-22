@@ -931,23 +931,30 @@ fn lru_native_store(
         &mut state.borrow_mut(),
         state,
         key,
+        None,
         result,
         limit,
     )
 }
 
-/// [`lru_native_store`] with the cache and its words (`state`'s) in hand.
+/// [`lru_native_store`] with the cache and its words (`state`'s) in hand,
+/// and `key`'s hash if known.
 #[inline]
 fn native_store_in(
     data: &mut DictData,
     bytes: &mut Vec<u8>,
     state: &Rc<RefCell<Vec<u8>>>,
     key: &Object,
+    hash: Option<i64>,
     result: &Object,
     limit: u64,
 ) -> Result<Option<Option<(DictKey, Object)>>, RuntimeError> {
-    let Some(probe) = crate::object::LeafProbe::new(key) else {
-        return Ok(None);
+    let probe = match hash {
+        Some(hash) => crate::object::LeafProbe::with_hash(key, hash),
+        None => match crate::object::LeafProbe::new(key) {
+            Some(probe) => probe,
+            None => return Ok(None),
+        },
     };
     let Some((_, flags)) = lru_state::mode(bytes) else {
         return Ok(None);
@@ -1006,6 +1013,8 @@ pub(crate) enum LruProbe {
 pub(crate) struct LruPending {
     wrapper: Object,
     key: Object,
+    /// The key's Python hash.
+    hash: i64,
     _depth: LruDepthGuard,
 }
 
@@ -1094,9 +1103,129 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     {
         return None;
     }
-    let [key @ (Object::Int(_) | Object::Str(_))] = args else {
-        return None;
-    };
+    match args {
+        // A sole exact `int` or `str` is its own key.
+        [key @ (Object::Int(_) | Object::Str(_))] => {
+            lru_probe_with(inst, &crate::object::LeafProbe::new(key)?, || key.clone())
+        }
+        // Positional `int`s and `str`s key on their tuple, probed without
+        // building it unless the call misses.
+        [_, _, ..] if args.len() <= LRU_ARGS_MAX => {
+            lru_probe_with(inst, &ArgsProbe::new(args)?, || Object::new_tuple(args.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// The most positional arguments [`lru_probe`] keys natively.
+const LRU_ARGS_MAX: usize = 8;
+
+/// A probe that settles by native equality, and knows afterwards whether
+/// it met a stored key whose comparison could need Python.
+trait ExactProbe: crate::dictmap::Probe {
+    /// No stored key the lookup compared could equal the probe through
+    /// Python (see [`crate::object::LeafProbe::miss_is_exact`]).
+    fn exact(&self) -> bool;
+}
+
+impl ExactProbe for crate::object::LeafProbe<'_> {
+    #[inline(always)]
+    fn exact(&self) -> bool {
+        self.miss_is_exact()
+    }
+}
+
+/// The key of a call with two or more positional exact `int`s and `str`s
+/// (the tuple of them, as `lru_cache_make_key` makes it), probed in place:
+/// its hash is the tuple's, and it equals a stored tuple of the same items.
+struct ArgsProbe<'a> {
+    args: &'a [Object],
+    hash: i64,
+    /// Set when a stored tuple's item paired with one of `args` might
+    /// equal it through Python (`1.0`, `True`, an instance).
+    foreign: std::cell::Cell<bool>,
+}
+
+impl<'a> ArgsProbe<'a> {
+    #[inline]
+    fn new(args: &'a [Object]) -> Option<Self> {
+        let mut hash = crate::object::TupleHasher::new();
+        for arg in args {
+            hash.push(match arg {
+                Object::Int(i) => crate::object::py_hash_long_i64(*i),
+                Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+                _ => return None,
+            });
+        }
+        Some(Self {
+            args,
+            hash: hash.finish(args.len()),
+            foreign: std::cell::Cell::new(false),
+        })
+    }
+}
+
+impl crate::dictmap::Probe for ArgsProbe<'_> {
+    #[inline(always)]
+    fn probe_hash(&self) -> i64 {
+        self.hash
+    }
+
+    fn probe_eq(&self, stored: &DictKey) -> bool {
+        match &stored.0 {
+            // Item by item, as the tuple's own comparison goes: the first
+            // unequal pair settles it.
+            Object::Tuple(items) if items.len() == self.args.len() => {
+                for (arg, item) in self.args.iter().zip(items.iter()) {
+                    let equal = match (arg, item) {
+                        (Object::Int(a), Object::Int(b)) => a == b,
+                        (Object::Str(a), Object::Str(b)) => {
+                            crate::shared_value::SharedStr::ptr_eq(a, b)
+                                || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
+                        }
+                        // Builtin values of kinds that are never equal.
+                        (Object::Int(_), Object::Str(_) | Object::Long(_) | Object::Tuple(_))
+                        | (
+                            Object::Str(_),
+                            Object::Int(_) | Object::Long(_) | Object::Tuple(_) | Object::WStr(_),
+                        ) => false,
+                        _ => {
+                            self.foreign.set(true);
+                            return false;
+                        }
+                    };
+                    if !equal {
+                        return false;
+                    }
+                }
+                true
+            }
+            // Builtin keys a tuple of these never equals.
+            Object::Int(_) | Object::Long(_) | Object::Str(_) | Object::WStr(_) | Object::Tuple(_) => {
+                false
+            }
+            _ => {
+                self.foreign.set(true);
+                false
+            }
+        }
+    }
+}
+
+impl ExactProbe for ArgsProbe<'_> {
+    #[inline(always)]
+    fn exact(&self) -> bool {
+        !self.foreign.get()
+    }
+}
+
+/// [`lru_probe`] of the key `probe` stands for (`key` makes it).
+#[inline(always)]
+fn lru_probe_with<P: ExactProbe>(
+    inst: &crate::types::PyInstance,
+    probe: &P,
+    key: impl FnOnce() -> Object,
+) -> Option<LruProbe> {
     let keys = lru_keys();
     // SAFETY: reads that run no code. The slots of a wrapper are set once
     // by its constructor.
@@ -1114,9 +1243,8 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     if limit == 0 || flags & (lru_state::TYPED | lru_state::FALLBACK) != 0 {
         return None;
     }
-    let probe = crate::object::LeafProbe::new(key)?;
-    let found = data.get_index_of(&probe);
-    if !probe.miss_is_exact() {
+    let found = data.get_index_of(probe);
+    if !probe.exact() {
         return None;
     }
     let Some(index) = found else {
@@ -1135,7 +1263,8 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
             func.clone(),
             LruPending {
                 wrapper: Object::Unbound,
-                key: key.clone(),
+                key: key(),
+                hash: probe.probe_hash(),
                 _depth: depth,
             },
         ));
@@ -1186,7 +1315,8 @@ pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(Dict
     let stored = match unsafe { (cache.peek_mut(), state.peek_mut()) } {
         (Some(data), Some(bytes)) => {
             let (limit, _) = lru_state::mode(bytes)?;
-            native_store_in(data, bytes, state, &p.key, value, limit).map(|r| (r, limit))
+            native_store_in(data, bytes, state, &p.key, Some(p.hash), value, limit)
+                .map(|r| (r, limit))
         }
         _ => {
             let (limit, _) = lru_state::mode(&state.borrow())?;
@@ -1200,7 +1330,8 @@ pub(crate) fn lru_store_returned(p: &LruPending, value: &Object) -> Option<(Dict
         Err(_) => return None,
     };
     // The ordered-dictionary fallback, when its probe settles natively.
-    if let Some(probe) = crate::object::LeafProbe::new(&p.key) {
+    {
+        let probe = crate::object::LeafProbe::with_hash(&p.key, p.hash);
         let mut data = cache.borrow_mut();
         let found = data.get_index_of(&probe);
         if probe.miss_is_exact() {

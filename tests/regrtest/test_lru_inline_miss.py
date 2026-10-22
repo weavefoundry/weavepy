@@ -156,7 +156,44 @@ def check_recursion_limit():
     assert fib(300) == 222232244629420445529739893461909967206666939096499764990979600
 
 
+def check_leaf_and_multi_args():
+    @functools.lru_cache(maxsize=2)
+    def leaf(n):
+        return n * 2
+
+    def run_leaf():
+        return [leaf(i % 3) for i in range(9)]
+
+    for _ in range(40):
+        leaf.cache_clear()
+        assert run_leaf() == [0, 2, 4] * 3
+        assert leaf.cache_info() == (0, 9, 2, 2), leaf.cache_info()
+
+    calls = []
+
+    @functools.lru_cache(maxsize=3)
+    def pair(a, b):
+        calls.append((a, b))
+        return a, b
+
+    def run_pair():
+        return [pair(1, 'x'), pair(1, 'x'), pair(True, 'x'), pair(1.0, 'x'),
+                pair(2, 'x'), pair(3, 'x'), pair(4, 'x'), pair(1, 'x'),
+                pair('x', 1), pair(1, 'x', ), pair(10**30, 'x')]
+
+    for _ in range(40):
+        pair.cache_clear()
+        calls.clear()
+        # Equal keys of other types hit the stored entry.
+        assert run_pair() == [(1, 'x')] * 4 + [(2, 'x'), (3, 'x'), (4, 'x'), (1, 'x'),
+                                              ('x', 1), (1, 'x'), (10**30, 'x')]
+        assert calls == [(1, 'x'), (2, 'x'), (3, 'x'), (4, 'x'), (1, 'x'), ('x', 1),
+                         (10**30, 'x')], calls
+        assert pair.cache_info() == (4, 7, 3, 3), pair.cache_info()
+
+
 check_frames()
+check_leaf_and_multi_args()
 check_exceptions()
 check_traceback()
 check_wrapper_lifetime()

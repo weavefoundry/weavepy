@@ -14024,7 +14024,7 @@ impl Interpreter {
                             // SAFETY: as above.
                             let ops =
                                 unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
-                            match Self::core_lru_probe(ops) {
+                            match Self::lru_probe_if_wrapper(ops) {
                                 Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => {
                                     // SAFETY: every operand was checked to leave by
                                     // a plain decrement; the result takes the
@@ -22978,12 +22978,16 @@ impl Interpreter {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
             let v = done.init_inst.take().unwrap_or(v);
-            let lru = done.lru.take();
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
             unsafe { release_locals(&mut *frame.locals.as_ptr()) };
             drop(done.guard.take());
+            // A `functools.lru_cache` miss's function returned: its result
+            // is stored before the caller takes it (`inline_deliver`'s).
+            if done.lru.is_some() {
+                self.lru_finish(&mut done.lru, &v);
+            }
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
             // `inline_deliver` for a plain function's return, directly.
@@ -22998,11 +23002,6 @@ impl Interpreter {
                 self.inline_park(done);
             } else {
                 self.inline_park_clean(done);
-            }
-            // A `functools.lru_cache` miss's function returned: its result
-            // is stored before the caller takes it (`inline_deliver`'s).
-            if let Some(pending) = lru {
-                self.lru_store_returned(pending, &v);
             }
             // SAFETY: as above.
             unsafe { push_fast(&mut (*cframe).stack, v) };
@@ -23818,6 +23817,17 @@ impl Interpreter {
         crate::stdlib::functools_mod::lru_probe(inst, &ops[2..])
     }
 
+    /// [`Self::core_lru_probe`] when `ops[0]` is a wrapper (one compare
+    /// in line for any other callee).
+    #[inline(always)]
+    pub(crate) fn lru_probe_if_wrapper(ops: &[Object]) -> Option<crate::stdlib::functools_mod::LruProbe> {
+        if crate::stdlib::functools_mod::is_lru_wrapper(ops.first()?) {
+            Self::core_lru_probe(ops)
+        } else {
+            None
+        }
+    }
+
     /// The `CALL` at `pc` of `sw`'s synced running activation of a
     /// `functools.lru_cache` wrapper that missed its cache (see
     /// [`Self::core_lru_probe`]): the wrapped function `func` runs in the
@@ -23879,6 +23889,20 @@ impl Interpreter {
         let func = std::mem::replace(&mut frame.stack[at], pending.release_wrapper());
         drop(func);
         false
+    }
+
+    /// [`Self::lru_store_returned`] for an activation's pending store
+    /// (`InlineAct::lru`), out of the return paths' line.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn lru_finish(
+        &mut self,
+        slot: &mut Option<crate::stdlib::functools_mod::LruPending>,
+        value: &Object,
+    ) {
+        if let Some(pending) = slot.take() {
+            self.lru_store_returned(pending, value);
+        }
     }
 
     /// Store a `functools.lru_cache` miss's returned `value` (see
