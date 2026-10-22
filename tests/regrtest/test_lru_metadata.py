@@ -90,4 +90,16 @@ def passthrough(x):
 assert not [name for name in vars(passthrough) if name.startswith('_lru')]
 assert passthrough(2) == 4
 assert inner.cache_info() == (2, 2, 8, 2), inner.cache_info()
+# The wrapper's class is CPython's immutable `functools._lru_cache_wrapper`.
+wrapper_type = functools._lru_cache_wrapper
+assert type(inner) is wrapper_type
+assert wrapper_type.__module__ == 'functools', wrapper_type.__module__
+assert repr(wrapper_type) == "<class 'functools._lru_cache_wrapper'>", repr(wrapper_type)
+try:
+    wrapper_type.__call__ = lambda self, *args: None
+except TypeError as error:
+    assert 'immutable type' in str(error), error
+else:
+    raise AssertionError('the wrapper class must be immutable')
+assert inner(2) == 4
 print('LRU state outside the instance dictionary: ok')

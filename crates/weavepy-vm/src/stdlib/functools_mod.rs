@@ -399,6 +399,12 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 /// string from colliding).
 const LRU_KWD_MARK: &str = "\0\0__weavepy_lru_kwd_mark__\0\0";
 
+/// The [`LRU_KWD_MARK`] string every key shares (its hash computed once).
+fn lru_kwd_mark() -> &'static Object {
+    static MARK: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+    MARK.get_or_init(|| Object::from_static(LRU_KWD_MARK))
+}
+
 /// The address of the `_lru_cache_wrapper` class, for the call sites'
 /// quick check (see [`lru_hit`]); zero until the class exists.
 static LRU_TYPE_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -414,6 +420,10 @@ fn lru_type() -> Rc<crate::types::TypeObject> {
         }
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::default();
+        dict.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("functools"),
+        );
         // `attr` is the Python-visible dict key; `name` is the builtin's
         // internal (dotted) name, which `builtin_display_name` folds back
         // to the last component and `builtin_text_signature` keys on —
@@ -471,6 +481,9 @@ fn lru_type() -> Rc<crate::types::TypeObject> {
             dict,
         )
         .expect("_lru_cache_wrapper class must linearise");
+        // An immutable type, as CPython's static one: its `__call__` is
+        // the native core the call sites settle wrappers' calls by.
+        cls.immutable.set(true);
         let _ = LRU_TYPE_ADDR.compare_exchange(
             0,
             Rc::as_ptr(&cls) as usize,
@@ -608,7 +621,7 @@ fn lru_make_key(call_args: &[Object], kwargs: &[(String, Object)], typed: bool) 
     }
     let mut parts: Vec<Object> = call_args.to_vec();
     if !kwargs.is_empty() {
-        parts.push(Object::from_static(LRU_KWD_MARK));
+        parts.push(lru_kwd_mark().clone());
         for (k, v) in kwargs {
             parts.push(Object::from_str(k.clone()));
             parts.push(v.clone());
@@ -1105,20 +1118,99 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     }
     match args {
         // A sole exact `int` or `str` is its own key.
-        [key @ (Object::Int(_) | Object::Str(_))] => {
-            lru_probe_with(inst, &crate::object::LeafProbe::new(key)?, || key.clone())
-        }
+        [key @ (Object::Int(_) | Object::Str(_))] => lru_probe_with::<_, true>(
+            inst,
+            &crate::object::LeafProbe::new(key)?,
+            || key.clone(),
+        ),
         // Positional `int`s and `str`s key on their tuple, probed without
         // building it unless the call misses.
-        [_, _, ..] if args.len() <= LRU_ARGS_MAX => {
-            lru_probe_with(inst, &ArgsProbe::new(args)?, || Object::new_tuple(args.to_vec()))
-        }
+        [_, _, ..] if args.len() <= LRU_ARGS_MAX => lru_probe_with::<_, true>(
+            inst,
+            &ArgsProbe::new(args, &[], &[])?,
+            || Object::new_tuple(args.to_vec()),
+        ),
         _ => None,
+    }
+}
+
+/// [`lru_probe`]'s hit for a native caller (`Interpreter::call`), which
+/// can't run a miss in place: `None`, nothing touched, for the full call.
+fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Option<Object> {
+    if LRU_DEFERRED_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let probe = match args {
+        [key @ (Object::Int(_) | Object::Str(_))] => lru_probe_with::<_, false>(
+            inst,
+            &crate::object::LeafProbe::new(key)?,
+            || unreachable!("no miss is run"),
+        ),
+        [_, _, ..] if args.len() <= LRU_ARGS_MAX => lru_probe_with::<_, false>(
+            inst,
+            &ArgsProbe::new(args, &[], &[])?,
+            || unreachable!("no miss is run"),
+        ),
+        _ => None,
+    };
+    match probe? {
+        LruProbe::Hit(value) => Some(value),
+        LruProbe::Miss(..) => None,
+    }
+}
+
+/// A native caller's call (`Interpreter::call`) of `wrapper` (`inst`), a
+/// `functools.lru_cache` wrapper: a hit settled natively, else its
+/// `__call__` (the class is immutable), without binding a method.
+pub(crate) fn lru_call_native(
+    inst: &crate::types::PyInstance,
+    wrapper: &Object,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    if kwargs.is_empty() {
+        if let Some(value) = lru_hit(inst, args) {
+            return Ok(value);
+        }
+    }
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(wrapper.clone());
+    call_args.extend_from_slice(args);
+    lru_call(&call_args, kwargs)
+}
+
+/// A keyword call of `inst`, a `functools.lru_cache` wrapper, with the
+/// positional `args` and the keyword arguments `names` and `values`, that
+/// hits its cache: [`lru_probe`]'s hit (a miss, or any other shape, is
+/// `None`, nothing touched, for the full call). The key is the tuple of the
+/// arguments, the keyword mark, and each name and value, probed in place.
+pub(crate) fn lru_hit_kw(
+    inst: &crate::types::PyInstance,
+    args: &[Object],
+    names: &[Object],
+    values: &[Object],
+) -> Option<Object> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+        || LRU_DEFERRED_ANY.load(std::sync::atomic::Ordering::Relaxed)
+        || names.is_empty()
+        || names.len() != values.len()
+        || args.len() + 1 + 2 * names.len() > LRU_KEY_MAX
+    {
+        return None;
+    }
+    let probe = ArgsProbe::new(args, names, values)?;
+    match lru_probe_with::<_, false>(inst, &probe, || unreachable!("no miss is run"))? {
+        LruProbe::Hit(value) => Some(value),
+        LruProbe::Miss(..) => None,
     }
 }
 
 /// The most positional arguments [`lru_probe`] keys natively.
 const LRU_ARGS_MAX: usize = 8;
+
+/// The most items a key [`ArgsProbe`] probes may have.
+const LRU_KEY_MAX: usize = 16;
 
 /// A probe that settles by native equality, and knows afterwards whether
 /// it met a stored key whose comparison could need Python.
@@ -1135,33 +1227,59 @@ impl ExactProbe for crate::object::LeafProbe<'_> {
     }
 }
 
-/// The key of a call with two or more positional exact `int`s and `str`s
-/// (the tuple of them, as `lru_cache_make_key` makes it), probed in place:
-/// its hash is the tuple's, and it equals a stored tuple of the same items.
+/// The key of a call whose arguments are exact `int`s and `str`s (the
+/// tuple `lru_cache_make_key` makes of them: the positional arguments,
+/// then, for a keyword call, the keyword mark and each name and value),
+/// probed in place: its hash is the tuple's, and it equals a stored tuple
+/// of the same items.
 struct ArgsProbe<'a> {
     args: &'a [Object],
+    /// A keyword call's names and values (empty for none).
+    names: &'a [Object],
+    values: &'a [Object],
+    /// The key's item count.
+    len: usize,
     hash: i64,
-    /// Set when a stored tuple's item paired with one of `args` might
+    /// Set when a stored tuple's item paired with one of the key's might
     /// equal it through Python (`1.0`, `True`, an instance).
     foreign: std::cell::Cell<bool>,
 }
 
 impl<'a> ArgsProbe<'a> {
     #[inline]
-    fn new(args: &'a [Object]) -> Option<Self> {
+    fn new(args: &'a [Object], names: &'a [Object], values: &'a [Object]) -> Option<Self> {
+        let len = args.len() + if names.is_empty() { 0 } else { 1 + 2 * names.len() };
+        let mut probe = Self {
+            args,
+            names,
+            values,
+            len,
+            hash: 0,
+            foreign: std::cell::Cell::new(false),
+        };
         let mut hash = crate::object::TupleHasher::new();
-        for arg in args {
-            hash.push(match arg {
+        for i in 0..len {
+            hash.push(match probe.item(i) {
                 Object::Int(i) => crate::object::py_hash_long_i64(*i),
                 Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
                 _ => return None,
             });
         }
-        Some(Self {
-            args,
-            hash: hash.finish(args.len()),
-            foreign: std::cell::Cell::new(false),
-        })
+        probe.hash = hash.finish(len);
+        Some(probe)
+    }
+
+    /// The key's item `i` (below `len`).
+    #[inline(always)]
+    fn item(&self, i: usize) -> &Object {
+        if i < self.args.len() {
+            return &self.args[i];
+        }
+        match i - self.args.len() {
+            0 => lru_kwd_mark(),
+            j if j % 2 == 1 => &self.names[j / 2],
+            j => &self.values[j / 2 - 1],
+        }
     }
 }
 
@@ -1175,9 +1293,9 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
         match &stored.0 {
             // Item by item, as the tuple's own comparison goes: the first
             // unequal pair settles it.
-            Object::Tuple(items) if items.len() == self.args.len() => {
-                for (arg, item) in self.args.iter().zip(items.iter()) {
-                    let equal = match (arg, item) {
+            Object::Tuple(items) if items.len() == self.len => {
+                for (i, item) in items.iter().enumerate() {
+                    let equal = match (self.item(i), item) {
                         (Object::Int(a), Object::Int(b)) => a == b,
                         (Object::Str(a), Object::Str(b)) => {
                             crate::shared_value::SharedStr::ptr_eq(a, b)
@@ -1219,9 +1337,10 @@ impl ExactProbe for ArgsProbe<'_> {
     }
 }
 
-/// [`lru_probe`] of the key `probe` stands for (`key` makes it).
+/// [`lru_probe`] of the key `probe` stands for (`key` makes it), with a
+/// miss to run in place when `MISS` (else `None`, nothing touched).
 #[inline(always)]
-fn lru_probe_with<P: ExactProbe>(
+fn lru_probe_with<P: ExactProbe, const MISS: bool>(
     inst: &crate::types::PyInstance,
     probe: &P,
     key: impl FnOnce() -> Object,
@@ -1250,7 +1369,8 @@ fn lru_probe_with<P: ExactProbe>(
     let Some(index) = found else {
         // A miss the caller can run in place: a plain function, and words
         // the store may resize if it must add links.
-        if !matches!(func, Object::Function(_))
+        if !MISS
+            || !matches!(func, Object::Function(_))
             || (limit != lru_state::UNBOUNDED
                 && (data.len() as u64) < limit
                 && crate::object::bytearray_is_exported(state))

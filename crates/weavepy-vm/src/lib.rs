@@ -13727,6 +13727,27 @@ impl Interpreter {
                             break None;
                         }
                         let start = len - kwc - argc - 3;
+                        // A `functools.lru_cache` wrapper's cache hit, in place.
+                        // SAFETY: the callee is live.
+                        if crate::stdlib::functools_mod::is_lru_wrapper(unsafe { &*base.add(start) }) {
+                            // SAFETY: `start + kwc + argc + 3 == len`.
+                            let ops =
+                                unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
+                            if let Some(r) = Self::core_lru_hit_kw(ops, argc) {
+                                // SAFETY: every operand was checked to leave by a
+                                // plain decrement; the result takes the callee's
+                                // slot.
+                                unsafe {
+                                    release_run(base.add(start), len - start);
+                                    base.add(start).write(r);
+                                }
+                                len = start + 1;
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
+                        }
                         // SAFETY: the callee and its self slot are live.
                         unsafe { Self::core_instance_callee(base.add(start)) };
                         // SAFETY: `start + kwc + argc + 3 == len`.
@@ -23815,6 +23836,27 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::functools_mod::lru_probe(inst, &ops[2..])
+    }
+
+    /// A keyword call of a `functools.lru_cache` wrapper whose cache holds
+    /// the result (see [`crate::stdlib::functools_mod::lru_hit_kw`]): `ops`
+    /// is the `CALL_KW`'s operands (the wrapper, an empty self slot, `argc`
+    /// positional arguments, the keyword values and the names tuple). The
+    /// cached value, or `None` (nothing touched) for the full call.
+    #[inline(never)]
+    pub(crate) fn core_lru_hit_kw(ops: &[Object], argc: usize) -> Option<Object> {
+        let (Object::Instance(inst), Object::Unbound, Some(Object::Tuple(names))) =
+            (ops.first()?, ops.get(1)?, ops.last())
+        else {
+            return None;
+        };
+        let names: &[Object] = names;
+        let args = ops.get(2..2 + argc)?;
+        let values = ops.get(2 + argc..ops.len() - 1)?;
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        crate::stdlib::functools_mod::lru_hit_kw(inst, args, names, values)
     }
 
     /// [`Self::core_lru_probe`] when `ops[0]` is a wrapper (one compare
@@ -54490,6 +54532,10 @@ impl Interpreter {
                     }
                 }
                 self.type_call_default(ty, args, kwargs)
+            }
+            // A `functools.lru_cache` wrapper: its native core directly.
+            Object::Instance(inst) if crate::stdlib::functools_mod::is_lru_wrapper(callable) => {
+                crate::stdlib::functools_mod::lru_call_native(inst, callable, args, kwargs)
             }
             Object::Instance(inst) => {
                 // Honour __call__ if defined. The `__call__` chase is a

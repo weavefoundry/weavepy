@@ -192,8 +192,30 @@ def check_leaf_and_multi_args():
         assert pair.cache_info() == (4, 7, 3, 3), pair.cache_info()
 
 
+def check_native_callers():
+    @functools.lru_cache(maxsize=4)
+    def square(n):
+        return n * n
+
+    @functools.lru_cache(maxsize=None)
+    def keyed(a, b=0):
+        return a + b
+
+    for _ in range(30):
+        square.cache_clear()
+        keyed.cache_clear()
+        # Native callers (`map`, `sorted`'s key) reach the wrapper too.
+        assert list(map(square, [1, 2, 1, 3, 2])) == [1, 4, 1, 9, 4]
+        assert sorted([3, -1, 2], key=square) == [-1, 2, 3]
+        assert square.cache_info() == (4, 4, 4, 4), square.cache_info()
+        # Keyword calls key on their names and values, in order.
+        assert [keyed(1, b=2), keyed(1, b=2), keyed(1, 2), keyed(a=1, b=2), keyed(1, b=2)] == [3] * 5
+        assert keyed.cache_info() == (2, 3, None, 3), keyed.cache_info()
+
+
 check_frames()
 check_leaf_and_multi_args()
+check_native_callers()
 check_exceptions()
 check_traceback()
 check_wrapper_lifetime()

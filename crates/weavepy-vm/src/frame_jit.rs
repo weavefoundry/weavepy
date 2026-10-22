@@ -6352,6 +6352,16 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             return CALL_DECLINED;
         }
         let start = len - kwc - argc - 3;
+        // A `functools.lru_cache` wrapper's cache hit, in place.
+        if crate::stdlib::functools_mod::is_lru_wrapper(&*base.add(start)) {
+            let ops = std::slice::from_raw_parts(base.add(start), len - start);
+            if let Some(r) = Interpreter::core_lru_hit_kw(ops, argc) {
+                crate::release_run(base.add(start), len - start);
+                base.add(start).write(r);
+                st.len = start + 1;
+                return 0;
+            }
+        }
         Interpreter::core_instance_callee(base.add(start));
         let ops = std::slice::from_raw_parts(base.add(start), len - start);
         let interp = &*st.interp;
