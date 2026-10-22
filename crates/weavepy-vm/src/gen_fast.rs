@@ -1121,7 +1121,7 @@ impl Interpreter {
         if partial {
             frame.sent_consumed = false;
         } else {
-            crate::push_fast(&mut frame.stack, Object::None);
+            frame.stack.push_fast(Object::None);
         }
         // (A partial body may have stopped with nothing on its stack.)
         debug_assert!(partial || !frame.stack.is_empty());

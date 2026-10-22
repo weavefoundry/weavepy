@@ -6951,7 +6951,7 @@ fn finish_deopted(
         code: code.clone(),
         locals: shared_locals.unwrap_or_else(|| Rc::new(GilRefCell::new(locals_v))),
         cells: crate::object::empty_cells(),
-        stack: Vec::new(),
+        stack: crate::frame_slots::FrameStack::new(),
         globals: func.globals.clone(),
         builtins: func.builtins.clone(),
         rare: None,
@@ -14099,7 +14099,7 @@ fn short_scalar_range(frame: &super::Frame) -> bool {
     {
         return false;
     }
-    let [Object::Iter(iterator)] = frame.stack.as_slice() else {
+    let [Object::Iter(iterator)] = &frame.stack[..] else {
         return false;
     };
     let remaining = match &*iterator.borrow() {

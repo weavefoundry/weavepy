@@ -54,6 +54,7 @@ pub mod fasthash;
 pub mod foreign;
 #[cfg(feature = "jit")]
 mod frame_jit;
+mod frame_slots;
 pub mod frozen_code_cache;
 pub mod frozen_table;
 pub mod gc_trace;
@@ -143,7 +144,7 @@ pub struct Frame {
     /// `PyFrame` without a per-call `Vec` clone.
     cells: Rc<Vec<Rc<RefCell<Object>>>>,
     /// Evaluation stack.
-    stack: Vec<Object>,
+    stack: frame_slots::FrameStack,
     /// Globals shared across frames within the same module.
     globals: Rc<RefCell<DictData>>,
     /// The builtins mapping this frame resolves names against —
@@ -468,7 +469,7 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 visit(v);
             }
         }
-        for v in &frame.stack {
+        for v in frame.stack.iter() {
             visit(v);
         }
         for c in frame.cells.iter() {
@@ -955,7 +956,7 @@ pub struct Interpreter {
     tuple_pool: ThreadCell<[Vec<crate::object::SharedTuple>; 16]>,
     /// Recycled operand-stack vectors, same motivation. The operand
     /// stack is never shared, so every returned frame donates one.
-    frame_stack_pool: ThreadCell<Vec<Vec<Object>>>,
+    frame_stack_pool: ThreadCell<Vec<frame_slots::FrameStack>>,
     /// RFC 0061 (WS3b) — recycled argument-staging vectors, kept apart
     /// from [`Self::frame_stack_pool`]: staging vectors grow only to
     /// the hottest call's argc, and handing such a small allocation
@@ -3893,11 +3894,11 @@ impl Interpreter {
     /// function's cached `func_builtins` — and `None` for module /
     /// exec / class-body frames, which resolve from `globals` here.
     /// Fetch a recycled operand-stack vector, or allocate one.
-    fn pooled_stack(&self) -> Vec<Object> {
+    fn pooled_stack(&self) -> frame_slots::FrameStack {
         self.frame_stack_pool
             .borrow_mut()
             .pop()
-            .unwrap_or_else(|| Vec::with_capacity(POOLED_STACK_CAPACITY))
+            .unwrap_or_else(|| frame_slots::FrameStack::with_capacity(POOLED_STACK_CAPACITY))
     }
 
     /// RFC 0061 (WS3b): args-first locals fill. The arguments *move*
@@ -9553,7 +9554,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn kw_names_fill_locals(
         locals: &mut Vec<Object>,
-        stack: &mut Vec<Object>,
+        stack: &mut impl frame_slots::Operands,
         names: &[Object],
         f: &PyFunction,
         code: &CodeObject,
@@ -9566,7 +9567,7 @@ impl Interpreter {
         let total = npos + code.kwonly_count as usize;
         locals.clear();
         locals.resize(code.varnames.len().max(total), Object::Unbound);
-        let len = stack.len();
+        let len = stack.depth();
         // A `**kwargs` callee's dict: the keywords it collects, in call
         // order (always a fresh dict, empty when none).
         let mut varkw: Option<DictData> = code.has_varkeywords.then(|| {
@@ -9577,7 +9578,7 @@ impl Interpreter {
                 .count();
             DictData::with_capacity_and_hasher(collected, crate::fasthash::FxBuildHasher)
         });
-        for (j, v) in stack.drain(len - kwc..).enumerate() {
+        for (j, v) in stack.take_from(len - kwc).enumerate() {
             let nibble = (perm >> (4 * j)) & 0xF;
             if nibble == specialize::KW_TO_VARKW {
                 if let (Some(d), Some(name)) = (varkw.as_mut(), names.get(j)) {
@@ -9587,8 +9588,8 @@ impl Interpreter {
             }
             locals[nibble as usize] = v;
         }
-        let plen = stack.len();
-        for (slot, v) in stack.drain(plen - eff_argc..).enumerate() {
+        let plen = stack.depth();
+        for (slot, v) in stack.take_from(plen - eff_argc).enumerate() {
             locals[slot] = v;
         }
         if let Some(d) = varkw {
@@ -9858,7 +9859,7 @@ impl Interpreter {
     /// temporary the collector tracks (the `**` mapping a call site
     /// built, say) is reaped at once, so what it held is released with
     /// the callee's own references rather than at the next collection.
-    fn release_call_operands(&mut self, stack: &mut Vec<Object>, callee_slot: usize) {
+    fn release_call_operands(&mut self, stack: &mut frame_slots::FrameStack, callee_slot: usize) {
         let callee = std::mem::replace(&mut stack[callee_slot], Object::Unbound);
         self.release(callee);
         self.reap_call_args(&mut stack[callee_slot + 1..]);
@@ -22580,7 +22581,7 @@ impl Interpreter {
                 continue;
             }
             // SAFETY: as above.
-            unsafe { push_fast(&mut (*cframe).stack, v) };
+            unsafe { (*cframe).stack.push_fast(v) };
             if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
@@ -22811,7 +22812,7 @@ impl Interpreter {
                 self.inline_park_clean(done);
             }
             // SAFETY: as above.
-            unsafe { push_fast(&mut (*cframe).stack, v) };
+            unsafe { (*cframe).stack.push_fast(v) };
             match callable {
                 // A function something else still holds (its class, its
                 // module) can't die here: a plain decrement.
@@ -23297,7 +23298,7 @@ impl Interpreter {
     #[inline]
     fn leaf_function_attr(
         code: &CodeObject,
-        stack: &mut Vec<Object>,
+        stack: &mut frame_slots::FrameStack,
         ins: weavepy_compiler::Instruction,
     ) -> Option<CoreAttr> {
         let Some(Object::Function(f)) = stack.last() else {
@@ -23437,7 +23438,7 @@ impl Interpreter {
             };
             r
         } else {
-            let stack: &Vec<Object> = &frame.stack;
+            let stack: &[Object] = &frame.stack;
             let Object::Builtin(b) = &stack[callee_slot] else {
                 return CoreAttr::Decline;
             };
@@ -29437,7 +29438,7 @@ impl Interpreter {
     #[inline]
     fn leaf_store_attr(
         code: &CodeObject,
-        stack: &mut Vec<Object>,
+        stack: &mut frame_slots::FrameStack,
         cache_pc: u32,
         name_idx: u32,
     ) -> Option<Option<Object>> {
@@ -59120,7 +59121,7 @@ impl Interpreter {
             code,
             locals,
             cells,
-            stack: Vec::new(),
+            stack: frame_slots::FrameStack::new(),
             globals: f.globals.clone(),
             builtins: f.builtins.clone(),
             rare: None,
@@ -67792,7 +67793,7 @@ fn parked_lean_frame() -> LeanFrame {
         code: borrowed_rc(&placeholder.code),
         locals: Rc::new(RefCell::new(Vec::new())),
         cells: borrowed_rc(&placeholder.cells),
-        stack: Vec::with_capacity(16),
+        stack: frame_slots::FrameStack::with_capacity(16),
         globals: borrowed_rc(&placeholder.dict),
         builtins: borrowed_rc(&placeholder.dict),
         rare: None,
@@ -68367,7 +68368,7 @@ impl LeanFrame {
     /// locals and operand stack returned for recycling, and everything
     /// else released.
     #[inline]
-    fn into_parts(self) -> (Rc<RefCell<Vec<Object>>>, Vec<Object>) {
+    fn into_parts(self) -> (Rc<RefCell<Vec<Object>>>, frame_slots::FrameStack) {
         let mut this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is never used again (and never dropped).
         let frame = unsafe { std::mem::ManuallyDrop::take(&mut this.0) };
