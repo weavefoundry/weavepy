@@ -875,7 +875,11 @@ thread_local! {
 
 /// The task `loop_` (running on some other thread) is executing, if any.
 fn other_thread_task(loop_: &Object) -> Option<Object> {
-    let slots: Vec<SharedTaskSlot> = TASK_SLOTS.lock().iter().filter_map(|w| w.upgrade()).collect();
+    let slots: Vec<SharedTaskSlot> = TASK_SLOTS
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
     slots.iter().find_map(|s| {
         let s = s.lock();
         (s.loop_.is_same(loop_) && !matches!(s.task, Object::None)).then(|| s.task.clone())

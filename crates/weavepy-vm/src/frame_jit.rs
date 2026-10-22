@@ -3688,7 +3688,8 @@ unsafe extern "C" fn h_load_special(
         // The method now sits under its receiver.
         let (m, recv) = (&*st.stack.add(len - 1), &*st.stack.add(len));
         if let Object::Instance(inst) = recv {
-            if matches!(m, Object::Function(_)) || (matches!(m, Object::Builtin(_)) && builtin_counted())
+            if matches!(m, Object::Function(_))
+                || (matches!(m, Object::Builtin(_)) && builtin_counted())
             {
                 // SAFETY: an `Object` is 16 bytes; its second word is the
                 // payload. The class holds the method while the version

@@ -406,9 +406,7 @@ fn not_a_lock(method: &str, cls: &str, recv: Option<&Object>) -> RuntimeError {
             "descriptor '{method}' for '_thread.{cls}' objects doesn't apply to a '{}' object",
             crate::builtins::class_of(obj).name
         )),
-        None => type_error(format!(
-            "unbound method {cls}.{method}() needs an argument"
-        )),
+        None => type_error(format!("unbound method {cls}.{method}() needs an argument")),
     }
 }
 
@@ -514,7 +512,11 @@ fn lock_at_fork_reinit(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `<unlocked _thread.lock object at 0x...>` (or `locked`).
 fn lock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let lock = lock_of(args, "__repr__")?;
-    let st = if lock.is_locked() { "locked" } else { "unlocked" };
+    let st = if lock.is_locked() {
+        "locked"
+    } else {
+        "unlocked"
+    };
     let addr = match &args[0] {
         Object::Instance(inst) => Rc::as_ptr(inst) as usize,
         _ => 0,
@@ -601,7 +603,9 @@ fn rlock_acquire(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // absolutely does.
     match timeout {
         Some(Duration::ZERO) => Ok(Object::Bool(lock.try_acquire(me))),
-        timeout => Ok(Object::Bool(rlock_acquire_interruptible(lock, me, timeout)?)),
+        timeout => Ok(Object::Bool(rlock_acquire_interruptible(
+            lock, me, timeout,
+        )?)),
     }
 }
 
@@ -625,7 +629,9 @@ fn rlock_release(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn rlock_is_owned(args: &[Object]) -> Result<Object, RuntimeError> {
     let lock = rlock_of(args, "_is_owned")?;
-    Ok(Object::Bool(lock.is_owned_by(crate::gil::current_thread_id())))
+    Ok(Object::Bool(
+        lock.is_owned_by(crate::gil::current_thread_id()),
+    ))
 }
 
 fn rlock_locked(args: &[Object]) -> Result<Object, RuntimeError> {
