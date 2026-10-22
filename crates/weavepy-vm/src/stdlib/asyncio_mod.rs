@@ -538,6 +538,42 @@ fn is_exact_native(obj: &Object) -> bool {
     }
 }
 
+/// Whether a task step awaiting `obj` may take the exact native future's
+/// path: `obj` is an instance of a Python subclass of the native `Future`
+/// (`gather`'s `_GatheringFuture`) that keeps the default attribute
+/// access and the native `add_done_callback`, `get_loop` and
+/// `_asyncio_future_blocking`, and holds neither method in its own
+/// `__dict__`. The C task's generic path, which looks those up, would
+/// reach exactly the native implementations.
+fn behaves_native(obj: &Object) -> bool {
+    use crate::types::Verdict;
+    const NAMES: [&str; 3] = ["add_done_callback", "get_loop", "_asyncio_future_blocking"];
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    let cls = inst.cls_raw();
+    let native = cls.memo_verdict(Verdict::NativeFutureLike, "", || {
+        let fut = future_class_ref();
+        cls.is_subclass_of(fut)
+            && crate::Interpreter::default_getattribute(cls)
+            && crate::Interpreter::default_setattr(cls)
+            && fut.dict.try_borrow().is_ok_and(|own| {
+                NAMES.iter().all(|&n| {
+                    match (cls.lookup(n), own.get(&DictKey(Object::from_static(n)))) {
+                        (Some(found), Some(own)) => found.is_same(own),
+                        _ => false,
+                    }
+                })
+            })
+    });
+    // (`_asyncio_future_blocking` is a data descriptor: no instance
+    // attribute can shadow it.)
+    native
+        && inst.native.get().is_none()
+        && inst.attr_get_str(NAMES[0]).is_none()
+        && inst.attr_get_str(NAMES[1]).is_none()
+}
+
 /// 3.14 `future_awaited_by_add`: record that `waiter` awaits `fut`. Only
 /// native futures take part (foreign future-likes are ignored, matching
 /// the C accelerator and the pure-Python `_PyFuture`-only fallback).
@@ -2413,10 +2449,11 @@ fn task_step_handle_result(
             }
         }
         SendOutcome::Raise(other) => Err(other),
-        SendOutcome::Yield(result) if is_exact_native(&result) => {
-            // The coroutine suspended on an exact native Future or Task:
-            // its state is read and its callback list appended directly
-            // (the C Task's `Future_CheckExact` fast path).
+        SendOutcome::Yield(result) if is_exact_native(&result) || behaves_native(&result) => {
+            // The coroutine suspended on an exact native Future or Task (or
+            // a subclass that behaves as one, see `behaves_native`): its
+            // state is read and its callback list appended directly (the C
+            // Task's `Future_CheckExact` fast path).
             let Object::Instance(rinst) = &result else {
                 unreachable!("is_exact_native checks for an instance")
             };

@@ -181,6 +181,11 @@ pub(crate) enum Verdict {
     /// native class that doesn't override it (see
     /// `stdlib::asyncio_mod::finalizer_is_noop`).
     NativeFinalizer = 8,
+    /// The class is a Python subclass of the native asyncio `Future` that
+    /// keeps its attribute access and the native methods a task step
+    /// awaits through (see `stdlib::asyncio_mod::behaves_native`); `name`
+    /// unused.
+    NativeFutureLike = 9,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
