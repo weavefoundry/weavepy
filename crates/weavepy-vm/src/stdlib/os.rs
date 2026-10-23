@@ -7703,23 +7703,52 @@ pub(crate) fn struct_seq_instance(
     fields: &'static [&'static str],
     values: Vec<Object>,
 ) -> Object {
-    let inst = crate::types::PyInstance::new(ty);
-    {
-        let mut d = inst.dict_cell().borrow_mut();
-        // (Room for the hidden extras `time.struct_time` adds.)
-        d.reserve(fields.len() + 2);
-        let keys = static_name_keys(fields);
-        for (key, value) in keys.iter().zip(values.iter()) {
-            d.insert(key.clone(), value.clone());
-        }
-    }
+    struct_seq_instance_keyed(ty, &static_name_keys(fields), values, &[])
+}
+
+/// [`struct_seq_instance`] with the field names' keys in hand (`keys`: the
+/// visible fields', then those of the `hidden` values, which only the
+/// names reach, as `time.struct_time`'s `tm_gmtoff` and `tm_zone`). The
+/// names are distinct strings whose hashes the keys keep, so the
+/// instance's dictionary is built in one pass, without hashing or
+/// comparing.
+pub(crate) fn struct_seq_instance_keyed(
+    ty: Rc<crate::types::TypeObject>,
+    keys: &[DictKey],
+    values: Vec<Object>,
+    hidden: &[Object],
+) -> Object {
+    let inst = Rc::new(crate::types::PyInstance::new(ty));
+    let n = (values.len() + hidden.len()).min(keys.len());
+    let map = crate::dictmap::DictMap::from_unique_hashed(n, |i| {
+        let key = &keys[i];
+        let hash = match &key.0 {
+            Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+            _ => unreachable!("struct sequence field names are strings"),
+        };
+        let value = match values.get(i) {
+            Some(v) => v.clone(),
+            None => hidden[i - values.len()].clone(),
+        };
+        (hash, key.clone(), value)
+    });
+    // (The dictionary's owner, as `dict_cell` records it for a deferred
+    // instance; the fields are numbers, strings and `None`, which a
+    // deferred owner may hold untracked.)
+    let owner = if inst.deferred.get() {
+        Rc::as_ptr(&inst) as usize
+    } else {
+        0
+    };
+    let d = DictData::from_map_for(owner, map);
+    inst.dict.get_or_init(|| Rc::new(RefCell::new(d)));
     // Struct sequences subclass `tuple`, so give the instance a native tuple
     // "view" of its visible fields. The inherited `tuple` slots
     // (`__contains__`, `__add__`, `__mul__`, `index`, `count`, …) unwrap this
     // payload, so they operate on the same values the `__getitem__`/`__len__`
     // overrides expose — without us re-implementing every sequence method.
     let _ = inst.native.set(Object::new_tuple(values));
-    Object::Instance(Rc::new(inst))
+    Object::Instance(inst)
 }
 
 /// [`static_name_key`] for each of a struct sequence's `fields`, looked up

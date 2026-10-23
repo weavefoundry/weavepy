@@ -14799,12 +14799,75 @@ fn set_issuperset(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
-    let a: crate::object::SetData = set_iter_items(args.first().unwrap())?.into_iter().collect();
-    let b = match args.get(1) {
-        Some(o) => set_iter_items(o)?,
-        None => return Err(type_error("isdisjoint() expected 1 arg")),
+    let this = args.first().unwrap();
+    let Some(other) = args.get(1) else {
+        return Err(type_error("isdisjoint() expected 1 arg"));
     };
-    Ok(Object::Bool(!b.iter().any(|k| a.contains(k))))
+    // CPython's `set_isdisjoint`: the receiver's own table probed with
+    // each of the other's items in turn, stopping at the first one found
+    // (two sets: the smaller's items in the larger), not copies of both.
+    let probe = |set: &Object, k: &DictKey| -> Result<bool, RuntimeError> {
+        match set {
+            Object::Set(s) => crate::object::key_cmp_scope(|| s.borrow().contains(k)),
+            Object::FrozenSet(s) => crate::object::key_cmp_scope(|| s.contains(k)),
+            _ => unreachable!("probed sets are exact"),
+        }
+    };
+    let len = |set: &Object| match set {
+        Object::Set(s) => Some(s.borrow().len()),
+        Object::FrozenSet(s) => Some(s.len()),
+        _ => None,
+    };
+    let Some(n) = len(this) else {
+        // A subclass instance's receiver: both sides' items.
+        let a: crate::object::SetData = set_iter_items(this)?.into_iter().collect();
+        let b = set_iter_items(other)?;
+        return Ok(Object::Bool(!b.iter().any(|k| a.contains(k))));
+    };
+    if let Some(m) = len(other) {
+        let (small, large) = if n <= m { (this, other) } else { (other, this) };
+        for k in set_iter_items(small)? {
+            if probe(large, &k)? {
+                return Ok(Object::Bool(false));
+            }
+        }
+        return Ok(Object::Bool(true));
+    }
+    // A native key probes the table in place, running no Python code (as
+    // `x in s` does in the core loop); the full probe settles the rest.
+    let found = |v: &Object| -> Result<bool, RuntimeError> {
+        if let Some(p) = crate::object::LeafProbe::new(v) {
+            let hit = match this {
+                // SAFETY: a read that runs no code, released before the
+                // next item.
+                Object::Set(s) => unsafe { s.peek() }.map(|m| m.contains_hot(&p)),
+                Object::FrozenSet(s) => Some(s.contains_hot(&p)),
+                _ => None,
+            };
+            if let Some(hit) = hit {
+                if hit || p.miss_is_exact() {
+                    return Ok(hit);
+                }
+            }
+        }
+        probe(this, &set_insert_key(v)?)
+    };
+    // A string's characters, without an iterator object.
+    if let Object::Str(s) = other {
+        for ch in s.chars() {
+            if found(&Object::from_char(ch))? {
+                return Ok(Object::Bool(false));
+            }
+        }
+        return Ok(Object::Bool(true));
+    }
+    let mut it = other.make_iter()?;
+    while let Some(v) = it.next_value_checked()? {
+        if found(&v)? {
+            return Ok(Object::Bool(false));
+        }
+    }
+    Ok(Object::Bool(true))
 }
 
 fn set_intersection_update(args: &[Object]) -> Result<Object, RuntimeError> {

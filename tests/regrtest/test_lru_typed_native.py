@@ -4,6 +4,15 @@ import sys
 import weakref
 
 is_weavepy = sys.implementation.name == 'weavepy'
+if is_weavepy:
+    import _functools
+
+    def native(wrapper):
+        """Whether the wrapper's bounded cache keeps native recency links."""
+        return _functools._lru_private(wrapper)[2]
+
+    def private_cache(wrapper):
+        return _functools._lru_private(wrapper)[0]
 
 
 def check_order(capacity, kind):
@@ -56,8 +65,7 @@ def check_order(capacity, kind):
         assert calls == misses
         assert cached.cache_info() == (hits, misses, capacity, len(order))
     if is_weavepy and capacity:
-        assert len(cached._lru_state) == 1
-        assert isinstance(cached._lru_state[0], bytearray)
+        assert native(cached)
     assert cached.cache_parameters() == {'maxsize': capacity, 'typed': True}
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, capacity, 0)
@@ -81,7 +89,7 @@ for count, admitted in ((31, True), (32, False)):
     assert many(*args) == many(*args) == count
     assert many.cache_info() == (1, 1, 2, 1)
     if is_weavepy:
-        assert isinstance(many._lru_state, tuple) == admitted
+        assert native(many) == admitted
 
 
 # The typed flag survives unsupported-key demotion and subsequent clearing.
@@ -97,7 +105,7 @@ for _ in range(3):
         assert kinds(key) is type(key)
     assert kinds.cache_info() == (4, 4, 8, 4)
     if is_weavepy:
-        assert kinds._lru_state is True
+        assert not native(kinds)
     kinds.cache_clear()
 
 
@@ -126,7 +134,7 @@ assert first is not second and first == second
 assert owners(first) == owners(second) == 19
 assert owners.cache_info() == (1, 1, 2, 1)
 if is_weavepy:
-    assert next(iter(owners._lru_cache))[0] is first
+    assert next(iter(private_cache(owners)))[0] is first
 
 
 # Recursive miss insertion wins, and clearing doesn't discard typedness.
@@ -219,7 +227,7 @@ callbacks.clear()
 assert callback_cache(Key()) == 19
 assert callbacks == ['hash', 'class hash', 'eq'], callbacks
 if is_weavepy:
-    assert callback_cache._lru_state is True
+    assert not native(callback_cache)
 
 
 class BrokenMeta(type):
@@ -251,7 +259,7 @@ if is_weavepy:
         return 19
 
     assert tampered(7) == 19
-    cache = tampered._lru_cache
+    cache = private_cache(tampered)
     cached_key = next(iter(cache))
     value = cache.pop(cached_key)
     owner = IntOwner(7)
@@ -273,9 +281,9 @@ if is_weavepy:
     fields = set(pinned.__dict__)
     assert pinned(0) is int
     assert set(pinned.__dict__) == fields
-    storage = pinned._lru_state[0]
+    storage = _functools._lru_private(pinned)[1]
     view = memoryview(storage)
-    before = bytes(storage)
+    before = len(storage)
     assert pinned(0) is int
     for operation in (lambda: pinned(1), lambda: pinned(1.0), pinned.cache_clear):
         try:
@@ -284,13 +292,13 @@ if is_weavepy:
             pass
         else:
             raise AssertionError('resized exported typed recency storage')
-        assert bytes(storage) == before
+        assert len(storage) == before
         assert pinned.cache_info().currsize == 1
     view.release()
     pinned.cache_clear()
     assert pinned(1) is int
     assert pinned(1.0) is float
-    assert pinned._lru_state is True and len(storage) == 0
+    assert not native(pinned)
     pinned.cache_clear()
     assert pinned(1) is int and pinned(1.0) is float
 

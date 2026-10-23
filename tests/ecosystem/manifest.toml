@@ -162,7 +162,11 @@ source = "python-dateutil==2.9.0.post0"
 # -W: tests/conftest.py applies pytest-cov's `no_cover` marker; without
 # the plugin the unknown-mark warning would be escalated to an error by
 # the suite's `filterwarnings = error` (cmdline -W outranks ini).
-requirements = "pytest==8.3.5 six==1.17.0 hypothesis==6.155.7 freezegun==1.5.5"
+# python-dateutil itself, again: freezegun's `python-dateutil` dependency
+# otherwise resolves to the newest wheel (3.0.0, which deprecates
+# `dateutil.zoneinfo`, so the suite's `filterwarnings = error` stops
+# collection at `tests/test_tz.py`) over the 2.9.0.post0 under test.
+requirements = "python-dateutil==2.9.0.post0 pytest==8.3.5 six==1.17.0 hypothesis==6.155.7 freezegun==1.5.5"
 command = "tests -W ignore::pytest.PytestUnknownMarkWarning"
 # Engine gap (hypothesis-found, measured 2026-08: 2030 passed, 1
 # failed): for pre-epoch datetimes (e.g. 1901-12-13T12:45:52Z),

@@ -1,8 +1,12 @@
-"""Metadata mutations must remain visible, with equal stored keys retained."""
+"""A wrapper's state stays out of its `__dict__`, which may change freely.
+
+CPython keeps an `lru_cache` wrapper's cache, counters, and function in
+its C struct: the instance dictionary holds only what `update_wrapper`
+copies (and `cache_parameters`), and the wrapper never reads it.
+"""
 
 import functools
 import gc
-import sys
 
 for limit in (0, 3, None):
     calls = []
@@ -15,9 +19,8 @@ for limit in (0, 3, None):
     assert cached(1) == 2
     assert cached(1) == 2
     assert len(calls) == (2 if limit == 0 else 1)
-    if sys.implementation.name != 'weavepy':
-        continue
     values = vars(cached)
+    assert not [name for name in values if name.startswith('_lru')], sorted(values)
     events = []
 
     class Name:
@@ -31,11 +34,10 @@ for limit in (0, 3, None):
             events.append((self.name, other))
             return self.name == other
 
+    # Rekey every entry by an owner whose `__eq__` records its calls: the
+    # wrapper consults none of them.
     owners = []
-    for name in (
-        '__wrapped__', '_lru_maxsize', '_lru_cache', '_lru_state',
-        '_lru_cache_info_cls', '_lru_hits', '_lru_misses',
-    ):
+    for name in list(values):
         value = values.pop(name)
         owner = Name(name)
         owners.append(owner)
@@ -47,21 +49,57 @@ for limit in (0, 3, None):
         assert after.misses == before.misses + 1
     else:
         assert after.hits == before.hits + 1
-    assert events
+    assert not events, events
     assert all(any(key is owner for key in values) for owner in owners)
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, limit, 0)
     assert all(any(key is owner for key in values) for owner in owners)
     assert cached(2) == 3
-    # Missing counters and scalar state retain their initialization behavior.
+    # An emptied dictionary leaves the cache and its counters working.
     cached.cache_clear()
-    del values['_lru_hits']
-    del values['_lru_misses']
-    if limit == 3:
-        del values['_lru_state']
+    values.clear()
     assert cached(4) == 5
     assert cached(4) == 5
     assert cached.cache_info() == ((0, 2, 0, 0) if limit == 0 else (1, 1, limit, 1))
     gc.collect()
 
-print('LRU metadata mutations and stored key owners: ok')
+
+# The wrapper calls the function it was built with, whatever `__wrapped__`
+# says, and a cached function wrapped again keeps a cache of its own.
+def double(x):
+    return 2 * x
+
+
+inner = functools.lru_cache(maxsize=8)(double)
+outer = functools.lru_cache(maxsize=8)(inner)
+assert outer.__wrapped__ is inner
+assert inner(2) == 4
+assert outer(2) == 4
+assert inner.cache_info() == (1, 1, 8, 1), inner.cache_info()
+assert outer.cache_info() == (0, 1, 8, 1), outer.cache_info()
+outer.__wrapped__ = lambda x: -x
+assert outer(3) == 6
+assert inner.cache_info() == (1, 2, 8, 2), inner.cache_info()
+
+
+@functools.wraps(inner)
+def passthrough(x):
+    return inner(x)
+
+
+assert not [name for name in vars(passthrough) if name.startswith('_lru')]
+assert passthrough(2) == 4
+assert inner.cache_info() == (2, 2, 8, 2), inner.cache_info()
+# The wrapper's class is CPython's immutable `functools._lru_cache_wrapper`.
+wrapper_type = functools._lru_cache_wrapper
+assert type(inner) is wrapper_type
+assert wrapper_type.__module__ == 'functools', wrapper_type.__module__
+assert repr(wrapper_type) == "<class 'functools._lru_cache_wrapper'>", repr(wrapper_type)
+try:
+    wrapper_type.__call__ = lambda self, *args: None
+except TypeError as error:
+    assert 'immutable type' in str(error), error
+else:
+    raise AssertionError('the wrapper class must be immutable')
+assert inner(2) == 4
+print('LRU state outside the instance dictionary: ok')

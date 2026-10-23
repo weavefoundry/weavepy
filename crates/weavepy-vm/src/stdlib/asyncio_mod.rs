@@ -538,6 +538,42 @@ fn is_exact_native(obj: &Object) -> bool {
     }
 }
 
+/// Whether a task step awaiting `obj` may take the exact native future's
+/// path: `obj` is an instance of a Python subclass of the native `Future`
+/// (`gather`'s `_GatheringFuture`) that keeps the default attribute
+/// access and the native `add_done_callback`, `get_loop` and
+/// `_asyncio_future_blocking`, and holds neither method in its own
+/// `__dict__`. The C task's generic path, which looks those up, would
+/// reach exactly the native implementations.
+fn behaves_native(obj: &Object) -> bool {
+    use crate::types::Verdict;
+    const NAMES: [&str; 3] = ["add_done_callback", "get_loop", "_asyncio_future_blocking"];
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    let cls = inst.cls_raw();
+    let native = cls.memo_verdict(Verdict::NativeFutureLike, "", || {
+        let fut = future_class_ref();
+        cls.is_subclass_of(fut)
+            && crate::Interpreter::default_getattribute(cls)
+            && crate::Interpreter::default_setattr(cls)
+            && fut.dict.try_borrow().is_ok_and(|own| {
+                NAMES.iter().all(|&n| {
+                    match (cls.lookup(n), own.get(&DictKey(Object::from_static(n)))) {
+                        (Some(found), Some(own)) => found.is_same(own),
+                        _ => false,
+                    }
+                })
+            })
+    });
+    // (`_asyncio_future_blocking` is a data descriptor: no instance
+    // attribute can shadow it.)
+    native
+        && inst.native.get().is_none()
+        && inst.attr_get_str(NAMES[0]).is_none()
+        && inst.attr_get_str(NAMES[1]).is_none()
+}
+
 /// 3.14 `future_awaited_by_add`: record that `waiter` awaits `fut`. Only
 /// native futures take part (foreign future-likes are ignored, matching
 /// the C accelerator and the pure-Python `_PyFuture`-only fallback).
@@ -605,7 +641,13 @@ pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
         } else if Rc::ptr_eq(&cls, fut_cls) {
             false
         } else {
-            return false;
+            // A Python subclass that keeps the native `__del__`
+            // (`gather`'s `_GatheringFuture`): CPython's subclass inherits
+            // the C `tp_finalize`, with the same early return.
+            match native_finalizer_kind(&cls, fut_cls, task_cls) {
+                Some(is_task) => is_task,
+                None => return false,
+            }
         }
     };
     if let Some(st) = existing_state_of(inst) {
@@ -625,6 +667,35 @@ pub(crate) fn finalizer_is_noop(inst: &PyInstance) -> bool {
     }
     release_state(inst);
     true
+}
+
+/// Whether instances of `cls`, a class other than the native `Future`
+/// (`fut_cls`) and `Task` (`task_cls`), finalize through one of their
+/// native `__del__`s: `Some(true)` the task's, `Some(false)` the future's,
+/// `None` neither (a class of its own, or one that overrides `__del__`).
+/// Memoized per class version.
+fn native_finalizer_kind(
+    cls: &TypeObject,
+    fut_cls: &Rc<TypeObject>,
+    task_cls: &Rc<TypeObject>,
+) -> Option<bool> {
+    use crate::types::Verdict;
+    let inherits = |native: &Rc<TypeObject>| {
+        cls.is_subclass_of(native)
+            && native
+                .dict
+                .try_borrow()
+                .ok()
+                .and_then(|d| d.get(&DictKey(Object::from_static("__del__"))).cloned())
+                .is_some_and(|own| cls.lookup("__del__").is_some_and(|del| del.is_same(&own)))
+    };
+    if cls.memo_verdict(Verdict::NativeFinalizer, "Task", || inherits(task_cls)) {
+        Some(true)
+    } else if cls.memo_verdict(Verdict::NativeFinalizer, "Future", || inherits(fut_cls)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 // ---- cycle-collector integration (RFC 0044 pattern) ----
@@ -768,7 +839,60 @@ fn running_loop() -> Object {
 }
 
 fn set_running_loop(loop_: Object) {
+    let old = THREAD_TASK.try_with(|slot| std::mem::replace(&mut slot.lock().loop_, loop_.clone()));
+    drop(old);
     RUNNING_LOOP.with(|slot| *slot.borrow_mut() = loop_);
+}
+
+/// Whether `loop_` is this thread's running loop.
+fn is_running_loop(loop_: &Object) -> bool {
+    !matches!(loop_, Object::None) && RUNNING_LOOP.with(|slot| slot.borrow().is_same(loop_))
+}
+
+// ---- current task (per OS thread) ----
+
+/// A thread's running loop and the task it is executing: 3.14 keeps the
+/// task in the thread state (`ts->asyncio_running_task`) rather than in a
+/// dictionary keyed by the loop, so entering and leaving a step costs no
+/// hashing. `current_task(loop)` for a loop another thread runs finds that
+/// thread's slot through [`TASK_SLOTS`]. (A loop that isn't its thread's
+/// running loop keeps its task in [`current_tasks_dict`].)
+struct TaskSlot {
+    loop_: Object,
+    task: Object,
+}
+
+type SharedTaskSlot = std::sync::Arc<parking_lot::Mutex<TaskSlot>>;
+
+/// Every thread's [`TaskSlot`] (dead threads' entries are pruned as new
+/// threads register).
+static TASK_SLOTS: parking_lot::Mutex<Vec<std::sync::Weak<parking_lot::Mutex<TaskSlot>>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+thread_local! {
+    static THREAD_TASK: SharedTaskSlot = {
+        let slot = std::sync::Arc::new(parking_lot::Mutex::new(TaskSlot {
+            loop_: Object::None,
+            task: Object::None,
+        }));
+        let mut all = TASK_SLOTS.lock();
+        all.retain(|w| w.strong_count() > 0);
+        all.push(std::sync::Arc::downgrade(&slot));
+        slot
+    };
+}
+
+/// The task `loop_` (running on some other thread) is executing, if any.
+fn other_thread_task(loop_: &Object) -> Option<Object> {
+    let slots: Vec<SharedTaskSlot> = TASK_SLOTS
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    slots.iter().find_map(|s| {
+        let s = s.lock();
+        (s.loop_.is_same(loop_) && !matches!(s.task, Object::None)).then(|| s.task.clone())
+    })
 }
 
 // ---- task registries (shared with tasks.py) ----
@@ -794,6 +918,11 @@ fn current_tasks_dict() -> Rc<RefCell<DictData>> {
 /// (`test_unix_events.TestFork.test_fork_not_share_current_task`).
 pub fn clear_current_tasks_after_fork_in_child() {
     current_tasks_dict().borrow_mut().clear();
+    let old = THREAD_TASK.with(|slot| std::mem::replace(&mut slot.lock().task, Object::None));
+    drop(old);
+    // The other threads didn't survive the fork.
+    let own = THREAD_TASK.with(std::sync::Arc::downgrade);
+    *TASK_SLOTS.lock() = vec![own];
 }
 
 /// The state of a native `Task` (or subclass) instance, for the
@@ -874,6 +1003,25 @@ fn registered_native_tasks() -> Vec<Object> {
 }
 
 fn enter_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result<(), RuntimeError> {
+    if is_running_loop(loop_) {
+        let busy = THREAD_TASK.with(|slot| {
+            let mut s = slot.lock();
+            if matches!(s.task, Object::None) {
+                s.task = task.clone();
+                None
+            } else {
+                Some(s.task.clone())
+            }
+        });
+        let Some(cur) = busy else {
+            return Ok(());
+        };
+        let task_r = py_repr(interp, task);
+        let cur_r = py_repr(interp, &cur);
+        return Err(runtime_err(format!(
+            "Cannot enter into task {task_r} while another task {cur_r} is being executed."
+        )));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let existing = dict.borrow().get(&key).cloned();
@@ -891,6 +1039,29 @@ fn enter_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result
 }
 
 fn leave_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result<(), RuntimeError> {
+    if is_running_loop(loop_) {
+        let left = THREAD_TASK.with(|slot| {
+            let mut s = slot.lock();
+            if s.task.is_same(task) {
+                Ok(std::mem::replace(&mut s.task, Object::None))
+            } else {
+                Err(s.task.clone())
+            }
+        });
+        return match left {
+            Ok(old) => {
+                drop(old);
+                Ok(())
+            }
+            Err(cur) => {
+                let task_r = py_repr(interp, task);
+                let cur_r = py_repr(interp, &cur);
+                Err(runtime_err(format!(
+                    "Leaving task {task_r} does not match the current task {cur_r}."
+                )))
+            }
+        };
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let existing = dict.borrow().get(&key).cloned();
@@ -910,6 +1081,9 @@ fn leave_task_impl(interp: &mut Interp, loop_: &Object, task: &Object) -> Result
 }
 
 fn swap_current_task_impl(loop_: &Object, task: &Object) -> Object {
+    if is_running_loop(loop_) {
+        return THREAD_TASK.with(|slot| std::mem::replace(&mut slot.lock().task, task.clone()));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_.clone());
     let prev = dict.borrow().get(&key).cloned().unwrap_or(Object::None);
@@ -1262,6 +1436,37 @@ fn fut_result(args: &[Object]) -> Result<Object, RuntimeError> {
     let (inst, st) = state_of(args)?;
     let interp = interp()?;
     future_result_impl(interp, &Object::Instance(inst), &st)
+}
+
+/// `Future.result()`'s leaf half: a finished future's result (raising its
+/// exception, or a pending or cancelled future's error, is the full
+/// call's).
+fn fut_result_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let st = existing_state_of(inst)?;
+    let mut s = st.try_borrow_mut().ok()?;
+    if s.status != FutStatus::Finished || !matches!(s.exception(), Object::None) {
+        return None;
+    }
+    s.log_traceback = false;
+    Some(Ok(s.result.clone()))
+}
+
+/// `Future.exception()`'s leaf half: a finished future's exception (or
+/// `None`).
+fn fut_exception_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let st = existing_state_of(inst)?;
+    let mut s = st.try_borrow_mut().ok()?;
+    if s.status != FutStatus::Finished {
+        return None;
+    }
+    s.log_traceback = false;
+    Some(Ok(s.exception()))
 }
 
 fn fut_exception(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2257,10 +2462,11 @@ fn task_step_handle_result(
             }
         }
         SendOutcome::Raise(other) => Err(other),
-        SendOutcome::Yield(result) if is_exact_native(&result) => {
-            // The coroutine suspended on an exact native Future or Task:
-            // its state is read and its callback list appended directly
-            // (the C Task's `Future_CheckExact` fast path).
+        SendOutcome::Yield(result) if is_exact_native(&result) || behaves_native(&result) => {
+            // The coroutine suspended on an exact native Future or Task (or
+            // a subclass that behaves as one, see `behaves_native`): its
+            // state is read and its callback list appended directly (the C
+            // Task's `Future_CheckExact` fast path).
             let Object::Instance(rinst) = &result else {
                 unreachable!("is_exact_native checks for an instance")
             };
@@ -2870,6 +3076,26 @@ fn future_class_ref() -> &'static Rc<TypeObject> {
             DictKey(Object::from_static("__class_getitem__")),
             method("__class_getitem__", class_getitem),
         );
+        // The state queries run no Python code (the dispatch loop calls
+        // them in place); `result()` and `exception()` of a finished
+        // future do, until they'd raise.
+        for (name, fast) in [
+            ("done", None),
+            ("cancelled", None),
+            ("get_loop", None),
+            (
+                "result",
+                Some(fut_result_leaf as crate::leaf_builtins::Fast),
+            ),
+            ("exception", Some(fut_exception_leaf)),
+        ] {
+            if let Some(Object::Builtin(b)) = dict.get(&DictKey(Object::from_static(name))) {
+                match fast {
+                    Some(fast) => crate::leaf_builtins::register_fast(b, fast),
+                    None => crate::leaf_builtins::register(b),
+                }
+            }
+        }
         let cls = TypeObject::new_user("Future", vec![bt.object_.clone()], dict)
             .expect("Future class must linearise");
         install_getset(&cls, "_state", futprop_state, None);
@@ -3029,10 +3255,15 @@ fn mod_current_task(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
     } else {
         loop_
     };
+    if is_running_loop(&loop_) {
+        return Ok(THREAD_TASK.with(|slot| slot.lock().task.clone()));
+    }
     let dict = current_tasks_dict();
     let key = DictKey(loop_);
-    let out = dict.borrow().get(&key).cloned().unwrap_or(Object::None);
-    Ok(out)
+    let out = dict.borrow().get(&key).cloned();
+    Ok(out
+        .or_else(|| other_thread_task(&key.0))
+        .unwrap_or(Object::None))
 }
 
 fn mod_register_task(args: &[Object]) -> Result<Object, RuntimeError> {
