@@ -4961,7 +4961,9 @@ unsafe extern "C" fn h_call_direct(
         debug_assert!(len_u >= argc + 2);
         if !s.sw.is_null() {
             let start = len_u - argc - 2;
-            if let Some(r) = direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None) {
+            if let Some(r) =
+                direct_call::<true>(s, pc as usize, start, len_u, &mut *site, None, None)
+            {
                 return r;
             }
         }
@@ -4995,6 +4997,8 @@ unsafe extern "C" fn h_call_site(
                 return h_call_direct(st, code, ext, pc_argc, len, site);
             }
             site.retry -= 1;
+        } else if crate::stdlib::functools_mod::is_lru_wrapper(callee) {
+            return h_call_instance(st, code, ext, pc_argc, len, site);
         }
         h_call(st, code, ext, pc_argc & u64::from(u32::MAX), len)
     }
@@ -5052,7 +5056,7 @@ unsafe fn direct_call_out(
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
-    unsafe { direct_call::<false>(st, pc, start, len, site, binop) }
+    unsafe { direct_call::<false>(st, pc, start, len, site, binop, None) }
 }
 
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
@@ -5064,7 +5068,9 @@ unsafe fn direct_call_out(
 /// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
 /// state synced), `None` touched nothing. An instance operator's method
 /// (`binop`) that leaves the direct return to the core loop carries the
-/// operator, whose `TypeError` its `NotImplemented` becomes there.
+/// operator, whose `TypeError` its `NotImplemented` becomes there. A
+/// `functools.lru_cache` miss's function takes its store (`lru`, left in
+/// place by `None`) to its activation.
 #[inline(always)]
 unsafe fn direct_call<const CALL: bool>(
     st: &mut State,
@@ -5073,6 +5079,7 @@ unsafe fn direct_call<const CALL: bool>(
     len: usize,
     site: &mut DirectSite,
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
     unsafe {
@@ -5200,6 +5207,11 @@ unsafe fn direct_call<const CALL: bool>(
         );
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
+        if let Some(lru) = lru {
+            if let Some(top) = (*sw.inl).last_mut() {
+                top.lru = lru.take();
+            }
+        }
         Some(direct_run::<false>(
             st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
         ))
@@ -5383,6 +5395,11 @@ unsafe fn direct_run<const PUSHED: bool>(
                 };
                 crate::release_locals(&mut *cframe.locals.as_ptr());
                 drop(done.guard.take());
+                // A `functools.lru_cache` miss's function returned: its
+                // result is stored before the caller takes it.
+                if done.lru.is_some() {
+                    interp.lru_finish(&mut done.lru, &v);
+                }
                 interp.lean_pending_exit(done.caller_pending);
                 // SAFETY: moved out once; the parked slot treats the field
                 // as stale (see `inline_deliver`).
@@ -5471,6 +5488,174 @@ unsafe fn direct_run<const PUSHED: bool>(
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
         }
         RELOAD
+    }
+}
+
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
+/// a `functools.lru_cache` wrapper that missed its cache
+/// (`Interpreter::core_lru_probe`): its function in the wrapper's place,
+/// switched to as [`call_activation`] switches to a Python callee
+/// (`Interpreter::core_lru_miss`). `None` declined, the miss uncounted and
+/// the operands as they were.
+///
+/// # Safety
+///
+/// As `h_call`'s.
+#[inline(never)]
+unsafe fn lru_miss_switch(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    func: Object,
+    pending: crate::stdlib::functools_mod::LruPending,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
+            drop(func);
+            crate::stdlib::functools_mod::lru_uncount_miss(&*st.stack.add(start));
+            drop(pending);
+            return None;
+        }
+        // The frame synced for a switch, as the core loop's arm syncs it.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let saved_last = sw.last;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_lru_miss(sw, pc, start, func, pending) {
+            return None;
+        }
+        if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
+            if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                return Some(r);
+            }
+            if run_callee_directly(st, start) {
+                st.len = start + 1;
+                return Some(0);
+            }
+        }
+        Some(if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
+        })
+    }
+}
+
+/// The frameless leaf the `CALL` (its operands from `start` up a
+/// `len`-deep stack) of a plain function calls, evaluated in place through
+/// the site's leaf cache as [`direct_call`]'s lanes evaluate one: `true`
+/// with the result at `start`, `false` declined untouched.
+///
+/// # Safety
+///
+/// As [`direct_call`]'s; the callee is a plain function with no self slot.
+#[inline(never)]
+unsafe fn lru_leaf_call(st: &mut State, start: usize, len: usize, site: &mut DirectSite) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Function(f) = &*st.stack.add(start) else {
+            return false;
+        };
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        let key = site_key(Rc::as_ptr(code_rc) as usize, false);
+        let missing = if site.leaf_key == key {
+            site.leaf_missing as usize
+        } else if site.alt_leaf_key == key {
+            site.alt_leaf_missing as usize
+        } else {
+            let Some(missing) = site_leaf_fits(f, code_rc, len - start - 2) else {
+                return false;
+            };
+            site.fill_leaf(code_rc, false, missing);
+            missing
+        };
+        leaf_site_call(st, start, len, missing)
+    }
+}
+
+/// `CALL` of an instance from a site with a direct-call cache (see
+/// `Lower::call_choice`): a `functools.lru_cache` wrapper's hit in place,
+/// and its miss's function in the wrapper's place, run straight from here
+/// as [`direct_call`] runs a Python callee (the result stored when it
+/// returns: see `InlineAct::lru`). Anything else goes through [`h_call`].
+unsafe extern "C" fn h_call_instance(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc_argc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    use crate::stdlib::functools_mod::LruProbe;
+    // SAFETY: as `h_call_direct`'s: the callee's slot is on the stack
+    // below the arguments and its self slot, and `site` is this `CALL`'s
+    // own cache.
+    unsafe {
+        let s = &mut *st;
+        let pc = (pc_argc & u64::from(u32::MAX)) as usize;
+        let argc = (pc_argc >> 32) as usize;
+        let len_u = len as usize;
+        let start = len_u - argc - 2;
+        let ops = std::slice::from_raw_parts(s.stack.add(start), argc + 2);
+        match Interpreter::lru_probe_if_wrapper(ops) {
+            Some(LruProbe::Hit(r)) => {
+                crate::release_run(s.stack.add(start), len_u - start);
+                s.stack.add(start).write(r);
+                s.len = start + 1;
+                return 0;
+            }
+            Some(LruProbe::Miss(func, mut pending)) => {
+                let site = &mut *site;
+                // A frameless leaf, evaluated in place as the site's direct
+                // calls evaluate one, its result stored at once.
+                if !s.sw.is_null() && matches!(&func, Object::Function(f) if crate::fn_is_leaf(f)) {
+                    pending.hold(std::mem::replace(&mut *s.stack.add(start), func));
+                    if lru_leaf_call(s, start, len_u, site) {
+                        let interp = &mut *s.interp.cast_mut();
+                        interp.lru_store_returned(pending, &*s.stack.add(start));
+                        return 0;
+                    }
+                    let func = std::mem::replace(&mut *s.stack.add(start), pending.take_wrapper());
+                    if let Some(r) = lru_miss_switch(s, pc, start, len_u, func, pending) {
+                        return r;
+                    }
+                    return h_call(st, code, ext, pc as u64, len);
+                }
+                // (While the function has no native body, the site waits
+                // out its retries as `h_call_site` does.)
+                if !s.sw.is_null() && (site.hot != 0 || site.retry == 0) {
+                    pending.hold(std::mem::replace(&mut *s.stack.add(start), func));
+                    let mut lru = Some(pending);
+                    if let Some(r) =
+                        direct_call::<false>(s, pc, start, len_u, site, None, Some(&mut lru))
+                    {
+                        return r;
+                    }
+                    // Not run directly: the wrapper back in its place.
+                    let pending = lru.take().expect("a declined direct call keeps the store");
+                    let func = std::mem::replace(&mut *s.stack.add(start), Object::Unbound);
+                    let mut pending = pending;
+                    s.stack.add(start).write(pending.take_wrapper());
+                    if let Some(r) = lru_miss_switch(s, pc, start, len_u, func, pending) {
+                        return r;
+                    }
+                } else {
+                    if site.retry != 0 {
+                        site.retry -= 1;
+                    }
+                    if let Some(r) = lru_miss_switch(s, pc, start, len_u, func, pending) {
+                        return r;
+                    }
+                }
+            }
+            None => {}
+        }
+        h_call(st, code, ext, pc as u64, len)
     }
 }
 
@@ -5676,13 +5861,28 @@ unsafe extern "C" fn h_call(
             }
             return RELOAD;
         }
-        Interpreter::core_instance_callee(base.add(start));
         let done = |st: &mut State, r: Object| {
             crate::release_run(base.add(start), len - start);
             base.add(start).write(r);
             st.len = start + 1;
             0
         };
+        // A `functools.lru_cache` wrapper's call: a cache hit in place, a
+        // miss's function in the wrapper's place (switched to as
+        // `call_activation` switches to a Python callee).
+        if let Object::Instance(_) = &*base.add(start) {
+            let ops = std::slice::from_raw_parts(base.add(start), argc + 2);
+            match Interpreter::lru_probe_if_wrapper(ops) {
+                Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => return done(st, r),
+                Some(crate::stdlib::functools_mod::LruProbe::Miss(func, pending)) => {
+                    if let Some(r) = lru_miss_switch(st, pc, start, len, func, pending) {
+                        return r;
+                    }
+                }
+                None => {}
+            }
+        }
+        Interpreter::core_instance_callee(base.add(start));
         // The commonest settled leaf builtins first (`isinstance(x, C)`, a
         // fast half), without the shape checks below; a decline falls
         // through to them untouched.
@@ -6427,6 +6627,16 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             return CALL_DECLINED;
         }
         let start = len - kwc - argc - 3;
+        // A `functools.lru_cache` wrapper's cache hit, in place.
+        if crate::stdlib::functools_mod::is_lru_wrapper(&*base.add(start)) {
+            let ops = std::slice::from_raw_parts(base.add(start), len - start);
+            if let Some(r) = Interpreter::core_lru_hit_kw(ops, argc) {
+                crate::release_run(base.add(start), len - start);
+                base.add(start).write(r);
+                st.len = start + 1;
+                return 0;
+            }
+        }
         Interpreter::core_instance_callee(base.add(start));
         let ops = std::slice::from_raw_parts(base.add(start), len - start);
         let interp = &*st.interp;
@@ -12132,6 +12342,29 @@ impl<'a> Lower<'a> {
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(general);
+        // An instance (a `functools.lru_cache` wrapper's call) takes the
+        // site's cache too.
+        let is_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.instance));
+        let instance = self.b.create_block();
+        let plain = self.b.create_block();
+        self.b.ins().brif(is_inst, instance, &[], plain, &[]);
+        self.b.switch_to_block(instance);
+        let pc_argc = self
+            .b
+            .ins()
+            .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+        let r = self
+            .call(
+                h_call_instance as *const () as usize,
+                &[self.st, code, ext, pc_argc, len, site_at],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().jump(called, &[r.into()]);
+        self.b.switch_to_block(plain);
         let r = self
             .call(
                 h_call as *const () as usize,
