@@ -5767,6 +5767,11 @@ unsafe fn direct_done<const PUSHED: bool>(
                 let mut done = Box::from_raw(cst.lazy);
                 crate::release_locals(cframe.locals.storage());
                 drop(done.guard.take());
+                // A `functools.lru_cache` miss's function returned: its
+                // result is stored before the caller takes it.
+                if done.lru.is_some() {
+                    interp.lru_finish(&mut done.lru, &v);
+                }
                 // SAFETY: moved out once; the parked slot treats the field
                 // as stale (see `inline_deliver`).
                 let callable = std::ptr::read(&raw const done.callable);
@@ -5980,6 +5985,9 @@ unsafe fn lru_miss_switch(
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
     unsafe {
+        if !st.sw.is_null() {
+            settle(st);
+        }
         if st.sw.is_null() || !std::ptr::eq((*st.sw).cur, st.frame) {
             drop(func);
             crate::stdlib::functools_mod::lru_uncount_miss(&*st.stack.add(start));
@@ -5990,6 +5998,7 @@ unsafe fn lru_miss_switch(
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        settle(st);
         *(*st.sw).last = st.last;
         let sw = &mut *st.sw;
         let saved_last = sw.last;
