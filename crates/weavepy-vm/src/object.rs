@@ -3644,6 +3644,17 @@ impl<'a> LeafProbe<'a> {
         })
     }
 
+    /// [`Self::new`]'s probe for a `key` it accepts, whose Python hash
+    /// `hash` the caller already computed.
+    #[inline(always)]
+    pub(crate) fn with_hash(key: &'a Object, hash: i64) -> Self {
+        Self {
+            key,
+            hash,
+            foreign: std::cell::Cell::new(false),
+        }
+    }
+
     /// A probe for a class that hashes and compares by identity (see
     /// [`type_hash_is_identity`]), checked by the caller.
     #[inline(always)]
