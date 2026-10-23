@@ -5,6 +5,15 @@ import sys
 import weakref
 
 is_weavepy = sys.implementation.name == 'weavepy'
+if is_weavepy:
+    import _functools
+
+    def native(wrapper):
+        """Whether the wrapper's bounded cache keeps native recency links."""
+        return _functools._lru_private(wrapper)[2]
+
+    def private_cache(wrapper):
+        return _functools._lru_private(wrapper)[0]
 
 
 def check_order(capacity, kind):
@@ -52,7 +61,7 @@ def check_order(capacity, kind):
         assert cached(*args, **kwargs) == expected, (capacity, kind, index)
         assert cached.cache_info() == (hits, misses, capacity, len(order))
     if is_weavepy:
-        assert isinstance(cached._lru_state, bytearray), kind
+        assert native(cached), kind
     cached.cache_clear()
     assert cached.cache_info() == (0, 0, capacity, 0)
     assert cached() == calls
@@ -88,7 +97,7 @@ assert first is not second and first == second
 assert owners(first) == owners(second) == 19
 assert owners.cache_info() == (1, 1, 2, 1)
 if is_weavepy:
-    assert next(iter(owners._lru_cache))[0] is first
+    assert next(iter(private_cache(owners)))[0] is first
 
 
 # Clear and recursive insertion can occur during a tuple-key miss.
@@ -117,8 +126,27 @@ assert recursive(99, 1) == 100
 assert recursive.cache_info() == (1, 0, 3, 1)
 
 
+# Floats, bools, and None are native leaves too; numeric equality across
+# them holds as in Python (a key equal to a stored one hits it).
+@functools.lru_cache(4)
+def scalars(*args):
+    return args
+
+
+for _ in range(3):
+    scalars.cache_clear()
+    assert scalars(1.0, None) == (1.0, None)
+    assert scalars(1, None) == (1.0, None)
+    assert scalars(True, None) == (1.0, None)
+    assert scalars(2.5) == (2.5,) and scalars(False) == (False,) and scalars(0.0) == (False,)
+    assert scalars(None) == (None,) and scalars(float('inf')) == (float('inf'),)
+    assert scalars.cache_info() == (3, 5, 4, 4), scalars.cache_info()
+    if is_weavepy:
+        assert native(scalars)
+
+
 # Demote in logical order, including during an outer native-key miss.
-for unsupported in ((4.0,), (False, 'four'), (b'four',)):
+for unsupported in ((frozenset([4.0]),), (frozenset([False]), 'four'), (b'four',)):
     calls = []
 
     @functools.lru_cache(3)
@@ -138,7 +166,7 @@ for unsupported in ((4.0,), (False, 'four'), (b'four',)):
     transition((0,))
     assert len(calls) == 6
     if is_weavepy:
-        assert transition._lru_state is None
+        assert not native(transition)
 
     # A fresh wrapper starts native and demotes during its wrapped call.
     nested = functools.lru_cache(3)(transition.__wrapped__)
@@ -173,7 +201,7 @@ for args, admitted in (
     assert bounded(*args) == len(args)
     assert bounded.cache_info() == (1, 1, 3, 1)
     if is_weavepy:
-        assert isinstance(bounded._lru_state, bytearray) == admitted
+        assert native(bounded) == admitted
 
 
 callbacks = []
@@ -202,7 +230,7 @@ callbacks.clear()
 assert callback_cache((Key(),)) == 19
 assert callbacks == ['hash', 'eq'], callbacks
 if is_weavepy:
-    assert callback_cache._lru_state is None
+    assert not native(callback_cache)
 
 
 class BrokenHash:
@@ -237,7 +265,7 @@ for key, equal_key in (((IntOwner(7),), (7,)), (TupleOwner((7,)), (7,))):
     assert subclass(key) == subclass(equal_key) == 19
     assert subclass.cache_info() == (1, 1, 3, 1)
     if is_weavepy:
-        assert subclass._lru_state is None
+        assert not native(subclass)
 
 
 # A private-cache replacement can hide a subclass under an exact tuple.
@@ -248,7 +276,7 @@ if is_weavepy:
         return 19
 
     assert tampered((7,)) == 19
-    cache = tampered._lru_cache
+    cache = private_cache(tampered)
     cached_key = next(iter(cache))
     value = cache.pop(cached_key)
     owner = IntOwner(7)
