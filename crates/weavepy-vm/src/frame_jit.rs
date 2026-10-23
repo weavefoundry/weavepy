@@ -524,7 +524,7 @@ impl Slot {
         let t0 = stats::enabled().then(std::time::Instant::now);
         let n = self
             .native
-            .get_or_init(|| compile(code, ext, nlocals).map(Box::new));
+            .get_or_init(|| compile(code, ext, nlocals, at).map(Box::new));
         if let Some(t0) = t0 {
             eprintln!(
                 "frame jit: {} compiled: {} ({} instructions, {:?})",
@@ -535,6 +535,98 @@ impl Slot {
             );
         }
     }
+}
+
+/// The block starts (`starts`) of `code` whose blocks never ran before
+/// the compile. A block with a `LOAD_GLOBAL` whose site never resolved a
+/// global (its first run fills the site's cache, as CPython's
+/// specializing `LOAD_GLOBAL` does) and no site that resolved anything
+/// never ran; neither did a block that only such blocks lead to. The
+/// rest are the blocks the entry and the exception handlers reach
+/// without passing through one. Those blocks are mostly the paths the
+/// code's work never takes (a loop over an empty list, an option that
+/// isn't set, an error check's raise, a handler), whose lowering costs
+/// compile time and code size for nothing: they leave for the core loop
+/// instead, which runs them as it would have. Code none of whose sites
+/// resolved (run some other way so far) compiles whole, and so does code a
+/// loop made hot (see `compile`).
+/// (`WEAVEPY_FRAME_JIT_COLD=0` compiles every block, a tuning aid.)
+fn never_ran_blocks(code: &CodeObject, starts: &[bool]) -> Vec<bool> {
+    use weavepy_compiler::{InlineCache as IC, OpCode};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let n = starts.len();
+    let on =
+        *ON.get_or_init(|| std::env::var_os("WEAVEPY_FRAME_JIT_COLD").is_none_or(|v| v != "0"));
+    let resolved = |pc: usize| !matches!(code.caches.get(pc as u32), IC::Empty);
+    if !on || n == 0 || !(0..n).any(resolved) {
+        return vec![false; n];
+    }
+    let ins = &code.instructions;
+    // Each instruction's block start.
+    let mut block_of = vec![0; n];
+    let mut start = 0;
+    for (pc, b) in block_of.iter_mut().enumerate() {
+        if starts[pc] {
+            start = pc;
+        }
+        *b = start;
+    }
+    let mut reached = vec![false; n];
+    let mut work: Vec<usize> = std::iter::once(0)
+        .chain(code.exception_table.iter().map(|h| h.handler as usize))
+        .filter(|&h| h < n)
+        .map(|h| block_of[h])
+        .collect();
+    while let Some(start) = work.pop() {
+        if std::mem::replace(&mut reached[start], true) {
+            continue;
+        }
+        let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+        let unresolved_global =
+            (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+        if start > 0 && unresolved_global && !(start..end).any(resolved) {
+            // Never ran: what it leads to counts only if reached otherwise.
+            continue;
+        }
+        for (k, i) in ins.iter().enumerate().take(end).skip(start) {
+            let next = k + 1;
+            let target = match i.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(next + i.arg as usize),
+                OpCode::JumpBackward => Some(next.saturating_sub(i.arg as usize)),
+                _ => None,
+            };
+            if let Some(t) = target.filter(|&t| t < n) {
+                work.push(block_of[t]);
+            }
+        }
+        let falls = !matches!(
+            ins[end - 1].op,
+            OpCode::JumpForward
+                | OpCode::JumpBackward
+                | OpCode::ReturnValue
+                | OpCode::RaiseVarargs
+                | OpCode::Reraise
+        );
+        if falls && end < n {
+            work.push(end);
+        }
+    }
+    let mut out = vec![false; n];
+    for start in 0..n {
+        if starts[start] && start > 0 {
+            let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+            let unresolved_global =
+                (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+            out[start] = !reached[start] || (unresolved_global && !(start..end).any(resolved));
+        }
+    }
+    out
 }
 
 /// What warmed a code object.
@@ -7629,7 +7721,7 @@ fn verify() -> bool {
 /// Compile `code`; `None` leaves it to the core loop. A compiler panic
 /// turns frame compilation off for the process rather than taking the
 /// interpreter down.
-fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) -> Option<Native> {
+fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) -> Option<Native> {
     if code.instructions.is_empty() || code.instructions.len() > MAX_INSTRUCTIONS {
         return None;
     }
@@ -7640,7 +7732,11 @@ fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) -> Option<
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let engine = guard.get_or_insert_with(Engine::new).as_mut()?;
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compile_with(engine, code, ext, nlocals, &depths)
+        // Only code that finished many activations shows which of its
+        // blocks never run: a loop that got hot partway through its first
+        // activation hasn't reached the code after it yet.
+        let prune = matches!(at, Heat::Call);
+        compile_with(engine, code, ext, nlocals, &depths, prune)
     }));
     match built {
         Ok(native) => native,
@@ -7657,6 +7753,7 @@ fn compile_with(
     ext: &CodeConstObjects,
     nlocals: usize,
     depths: &[i64],
+    prune: bool,
 ) -> Option<Native> {
     let n = code.instructions.len();
     // The attribute sites' field caches (allocated here if no read has
@@ -7668,7 +7765,17 @@ fn compile_with(
     // goes to its calls more than to the shortcuts in line.
     let mut lean = false;
     let whole = loop {
-        let low = lower_range(engine, code, ext, nlocals, depths, field_slots, 0..n, lean)?;
+        let low = lower_range(
+            engine,
+            code,
+            ext,
+            nlocals,
+            depths,
+            field_slots,
+            0..n,
+            lean,
+            prune,
+        )?;
         // (Measured as if every exit's tail were in line, the size the
         // threshold was tuned with.)
         if !lean && engine.ctx.func.dfg.num_insts() + low.tail_savings > lean_above() {
@@ -7713,6 +7820,7 @@ fn compile_with(
             field_slots,
             range.clone(),
             lean,
+            prune,
         )?;
         chunks.push(define(engine, code, lean, t0, Some(&range))?);
         for pc in range {
@@ -7751,6 +7859,7 @@ fn lower_range(
     field_slots: crate::Sites<'_, FieldSlot>,
     range: std::ops::Range<usize>,
     lean: bool,
+    prune: bool,
 ) -> Option<Lowered> {
     engine.module.clear_context(&mut engine.ctx);
     let ptr = engine.ptr;
@@ -7772,6 +7881,7 @@ fn lower_range(
             range,
         );
         lower.cold = lean;
+        lower.prune = prune;
         let done = lower.lower();
         let low = Lowered {
             entries: (0..n).map(|pc| lower.enters_at(pc)).collect(),
@@ -8049,6 +8159,13 @@ struct Lower<'a> {
     /// Each block start's block (instruction index → block), for the
     /// starts in `range`.
     blocks: Vec<Option<Block>>,
+    /// The block starts whose blocks never ran before the compile (see
+    /// [`never_ran_blocks`]): lowered as an exit to the core loop, and not
+    /// entered.
+    never_ran: Vec<bool>,
+    /// Whether to leave the blocks that never ran to the core loop (see
+    /// `compile`).
+    prune: bool,
     /// Which instructions start blocks, in the whole code.
     starts: Vec<bool>,
     /// The instructions this lowering covers: the whole code, or a chunk
@@ -8270,6 +8387,8 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
+            never_ran: Vec::new(),
+            prune: false,
             starts: Vec::new(),
             range,
             sizes: Vec::new(),
@@ -8913,7 +9032,10 @@ impl<'a> Lower<'a> {
     /// instruction the native code runs (not one it hands straight back).
     fn enters_at(&self, pc: usize) -> bool {
         let instrs = &self.code.instructions;
-        if pc >= instrs.len() || self.blocks[pc].is_none() {
+        if pc >= instrs.len()
+            || self.blocks[pc].is_none()
+            || self.never_ran.get(pc).copied().unwrap_or(false)
+        {
             return false;
         }
         native_at(self.code, pc)
@@ -9037,6 +9159,11 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(pc, &s)| (s && self.range.contains(&pc)).then(|| self.b.create_block()))
             .collect();
+        self.never_ran = if self.prune {
+            never_ran_blocks(code, &starts)
+        } else {
+            vec![false; n]
+        };
         self.starts = starts;
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
@@ -9059,7 +9186,7 @@ impl<'a> Lower<'a> {
         let mut tramps = Vec::new();
         let mut calls = Vec::with_capacity(n);
         for pc in 0..n {
-            let target = match self.blocks[pc] {
+            let target = match self.blocks[pc].filter(|_| !self.never_ran[pc]) {
                 Some(blk) => {
                     let t = self.b.create_block();
                     tramps.push((t, blk, self.depths[pc]));
@@ -9103,6 +9230,11 @@ impl<'a> Lower<'a> {
         self.depth = self.depths[start] as usize;
         self.last_pc = None;
         self.bound.iter_mut().for_each(|b| *b = false);
+        if self.never_ran[start] {
+            // The core loop runs it, as it ran it before (or never).
+            self.exit(INTERP, start);
+            return;
+        }
         let mut pc = start;
         loop {
             if !self.instruction(pc) {
