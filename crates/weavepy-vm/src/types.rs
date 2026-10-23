@@ -87,6 +87,7 @@ impl DunderInfo {
     const BUILTIN_OWNER: u8 = 1 << 4;
     const OBJECT_OWNER: u8 = 1 << 5;
     const TYPE_OWNER: u8 = 1 << 6;
+    const DICT_OWNER: u8 = 1 << 7;
 
     fn resolve(found: Option<(Object, Rc<TypeObject>)>) -> Self {
         let Some((value, owner)) = found else {
@@ -106,8 +107,15 @@ impl DunderInfo {
             bits |= Self::OBJECT_OWNER;
         } else if Rc::ptr_eq(&owner, &bt.type_) {
             bits |= Self::TYPE_OWNER;
+        } else if Rc::ptr_eq(&owner, &bt.dict_) {
+            bits |= Self::DICT_OWNER;
         }
         Self(bits)
+    }
+
+    /// The defining class is `dict`.
+    pub fn dict_owner(self) -> bool {
+        self.0 & Self::DICT_OWNER != 0
     }
 
     /// The MRO defines the dunder (possibly as `None`).

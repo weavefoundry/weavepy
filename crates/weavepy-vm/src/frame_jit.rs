@@ -48,7 +48,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
-    types, AbiParam, Block, InstBuilder, JumpTableData, MemFlags, SigRef, Signature, Type, Value,
+    types, AbiParam, Block, BlockArg, InstBuilder, JumpTableData, MemFlags, SigRef, Signature,
+    Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -1011,10 +1012,12 @@ struct Tags {
     tuple_layout: Option<(i32, i32)>,
     /// Where a frame's cells are (see [`CellLayout`]).
     cell_layout: Option<CellLayout>,
-    /// The `dict`, `set` and `str` tags (the method kernels' receivers).
+    /// The `dict`, `set` and `str` tags (the method kernels' receivers),
+    /// and a class's.
     dict: u8,
     set: u8,
     str: u8,
+    class: u8,
     /// A module's tag, and where its dict's data is (see
     /// [`module_layout`]).
     module: u8,
@@ -1119,6 +1122,7 @@ fn tags() -> Option<Tags> {
         dict: tag(&Object::new_dict()),
         set: tag(&Object::new_set()),
         str: tag(&Object::from_str("")),
+        class: samples[5],
         module: tag(&sample_module()),
         module_layout: module_layout(),
         rc_counted_hdr: if cfg!(debug_assertions) {
@@ -2748,9 +2752,8 @@ unsafe fn contains_fast(item: *const Object, cont: *const Object, owned: u32) ->
         if owned != 0 && !(droppable(i) && droppable(c)) {
             return 2;
         }
-        let Some(found) =
-            Interpreter::leaf_contains_table(c, i).or_else(|| Interpreter::leaf_contains(c, i))
-        else {
+        // (`leaf_contains` tries the table probes first.)
+        let Some(found) = Interpreter::leaf_contains(c, i) else {
             return 2;
         };
         if owned & 2 != 0 {
@@ -2779,6 +2782,17 @@ unsafe fn subscr_fast(
     // stack slots, and a free slot (or the container's own) for the item.
     unsafe {
         let (c, k) = (&*cont, &*key);
+        // A `dict` subclass's instance that keeps `dict.__getitem__` (no
+        // dispatch ahead of this helper: most instances have no payload,
+        // and declines there would cost every other subscript).
+        if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (c, k) {
+            return match owned & 3 {
+                0 => crate::h_inst_dict_get::<0>(out, cont, key),
+                1 => crate::h_inst_dict_get::<1>(out, cont, key),
+                2 => crate::h_inst_dict_get::<2>(out, cont, key),
+                _ => crate::h_inst_dict_get::<3>(out, cont, key),
+            };
+        }
         if owned != 0 && !(droppable(c) && droppable(k)) {
             return 1;
         }
@@ -2915,6 +2929,20 @@ unsafe fn store_subscr_fast(
     // after it (a finalizer it queues runs before the next instruction).
     unsafe {
         let (c, k) = (&*cont, &*key);
+        // A `dict` subclass's instance that keeps `dict.__setitem__` (see
+        // `subscr_fast`).
+        if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (c, k) {
+            return match owned & 7 {
+                0 => crate::h_inst_dict_set::<0>(val, cont, key),
+                1 => crate::h_inst_dict_set::<1>(val, cont, key),
+                2 => crate::h_inst_dict_set::<2>(val, cont, key),
+                3 => crate::h_inst_dict_set::<3>(val, cont, key),
+                4 => crate::h_inst_dict_set::<4>(val, cont, key),
+                5 => crate::h_inst_dict_set::<5>(val, cont, key),
+                6 => crate::h_inst_dict_set::<6>(val, cont, key),
+                _ => crate::h_inst_dict_set::<7>(val, cont, key),
+            };
+        }
         if !Interpreter::core_droppable(c) || (owned & 4 != 0 && !droppable(k)) {
             return 1;
         }
@@ -3005,6 +3033,31 @@ unsafe fn own_operands(at: *mut Object, ops: &[*const Object], owned: u32) {
             unsafe { at.add(k).write(crate::clone_hot(&*p)) };
         }
     }
+}
+
+/// The instantiation of a hot helper for the operands owned by the bits
+/// of `owned`: its first two, or (`3`) three.
+macro_rules! by_owned {
+    ($($helper:ident)::+, $owned:expr) => {
+        [
+            $($helper)::+::<0> as *const () as usize,
+            $($helper)::+::<1> as *const () as usize,
+            $($helper)::+::<2> as *const () as usize,
+            $($helper)::+::<3> as *const () as usize,
+        ][usize::from($owned & 3)]
+    };
+    ($($helper:ident)::+, $owned:expr, 3) => {
+        [
+            $($helper)::+::<0> as *const () as usize,
+            $($helper)::+::<1> as *const () as usize,
+            $($helper)::+::<2> as *const () as usize,
+            $($helper)::+::<3> as *const () as usize,
+            $($helper)::+::<4> as *const () as usize,
+            $($helper)::+::<5> as *const () as usize,
+            $($helper)::+::<6> as *const () as usize,
+            $($helper)::+::<7> as *const () as usize,
+        ][usize::from($owned & 7)]
+    };
 }
 
 /// `CONTAINS_OP` of a local's, constant's or stack slot's item and
@@ -8062,8 +8115,38 @@ impl<'a> Lower<'a> {
                     }
                     Object::None => self.write_tag(dst, self.tags.none),
                     _ => {
+                        let v = &self.ext.objects[k as usize];
+                        let word = v
+                            .strong_word()
+                            .filter(|_| !self.cold && self.counted_tag(v));
                         let src = self.const_addr(k);
+                        let Some(word) = word else {
+                            self.call(h_clone as *const () as usize, &[dst, src], false);
+                            return;
+                        };
+                        // A counted constant while one thread owns every
+                        // count: a plain increment of its count, whose
+                        // address is known here.
+                        let flag = self.b.ins().iconst(
+                            self.ptr,
+                            std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+                        );
+                        let shared = self.b.ins().load(types::I8, FLAGS, flag, 0);
+                        let by_clone = self.b.create_block();
+                        let counted = self.b.create_block();
+                        let done = self.b.create_block();
+                        self.b.ins().brif(shared, by_clone, &[], counted, &[]);
+                        self.b.switch_to_block(counted);
+                        let at = self.b.ins().iconst(self.ptr, word as i64);
+                        let c = self.b.ins().load(types::I64, FLAGS, at, 0);
+                        let c1 = self.b.ins().iadd_imm(c, 1);
+                        self.b.ins().store(FLAGS, c1, at, 0);
+                        self.copy16(dst, src);
+                        self.b.ins().jump(done, &[]);
+                        self.b.switch_to_block(by_clone);
                         self.call(h_clone as *const () as usize, &[dst, src], false);
+                        self.b.ins().jump(done, &[]);
+                        self.b.switch_to_block(done);
                     }
                 }
             }
@@ -8092,6 +8175,13 @@ impl<'a> Lower<'a> {
                 self.b.ins().store(FLAGS, word, dst, 8);
             }
         }
+    }
+
+    /// Whether `v`'s kind is one whose clone compiled code makes as a
+    /// plain increment of its count (see [`Tags::rc_counted`]).
+    fn counted_tag(&self, v: &Object) -> bool {
+        let tag = v.tag();
+        tag < 64 && (self.tags.rc_counted | self.tags.rc_counted_hdr) & (1i64 << tag) != 0
     }
 
     /// `*dst = (*src).clone()`: a scalar by value, anything else through
@@ -10424,14 +10514,7 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot);
         let (pkey, own_k) = self.ref_or_own(key, slot + 1);
         let owned = u8::from(own_c) | (u8::from(own_k) << 1);
-        self.ref_call(
-            pc,
-            h_subscr_ref as *const () as usize,
-            slot,
-            2,
-            &[pcont, pkey],
-            owned,
-        );
+        self.subscr_call(pc, slot, pcont, pkey, owned);
         // (The helper released the operands; a finalizer it queued runs
         // before the next instruction, as after `Self::container`.)
         self.depth = slot + 1;
@@ -10495,6 +10578,118 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// [`Self::ref_call`] of `full` after the first of `arms` (tag masks
+    /// for the container at `cont` and the key at `key`, and a frameless
+    /// helper for the commonest shapes, see [`crate::h_dict_get`]) that takes
+    /// both operands' tags, called with `hot_args`: its `0` settles the
+    /// instruction, anything else leaves it to `full`, as do tags no arm
+    /// takes.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_call_hot(
+        &mut self,
+        pc: usize,
+        (cont, key): (Value, Value),
+        arms: &[(i64, i64, usize)],
+        hot_args: &[Value],
+        full: usize,
+        slot: usize,
+        n: usize,
+        ops: &[Value],
+        owned: u8,
+    ) {
+        let full_b = self.b.create_block();
+        let done = self.b.create_block();
+        self.hot_arms((cont, key), arms, hot_args, 0, full_b, done);
+        self.b.switch_to_block(full_b);
+        self.ref_call(pc, full, slot, n, ops, owned);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
+    /// The dispatch of [`Self::ref_call_hot`]: the helper of the first of
+    /// `arms` whose masks take the tags of the values at `cont` and `key`
+    /// (picked for one call site: a call site per arm costs compiling far
+    /// more) is called with `args`, and its result above
+    /// `ok_max` goes on to `full_b`, any other to `done` (as its argument
+    /// when `done` takes one); no arm goes to `full_b`.
+    fn hot_arms(
+        &mut self,
+        (cont, key): (Value, Value),
+        arms: &[(i64, i64, usize)],
+        args: &[Value],
+        ok_max: i64,
+        full_b: Block,
+        done: Block,
+    ) {
+        let pass = !self.b.block_params(done).is_empty();
+        let tag = self.tag_at(cont);
+        let key_tag = self.tag_at(key);
+        let call_b = self.b.create_block();
+        self.b.append_block_param(call_b, self.ptr);
+        for &(mask, key_mask, helper) in arms {
+            let key_b = self.b.create_block();
+            let next = self.b.create_block();
+            let hit = self.tag_in(tag, mask);
+            self.b.ins().brif(hit, key_b, &[], next, &[]);
+            self.b.switch_to_block(key_b);
+            let hit = self.tag_in(key_tag, key_mask);
+            let h = self.b.ins().iconst(self.ptr, helper as i64);
+            self.b.ins().brif(hit, call_b, &[h.into()], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(full_b, &[]);
+        self.b.switch_to_block(call_b);
+        let hot = self.b.block_params(call_b)[0];
+        let params: Vec<Type> = args
+            .iter()
+            .map(|&a| self.b.func.dfg.value_type(a))
+            .collect();
+        let sig = self.sig(&params, Some(types::I32));
+        let inst = self.b.ins().call_indirect(sig, hot, args);
+        let r = self.b.inst_results(inst)[0];
+        let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, ok_max);
+        let result: &[BlockArg] = if pass { &[r.into()] } else { &[] };
+        self.b.ins().brif(declined, full_b, &[], done, result);
+    }
+
+    /// Whether `tag` is one of `mask`'s bits (a single bit compares the
+    /// tag itself).
+    fn tag_in(&mut self, tag: Value, mask: i64) -> Value {
+        if mask.count_ones() == 1 {
+            let t = i64::from(mask.trailing_zeros());
+            return self.b.ins().icmp_imm(IntCC::Equal, tag, t);
+        }
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, tag);
+        let m = self.b.ins().band_imm(bit, mask);
+        self.b.ins().icmp_imm(IntCC::NotEqual, m, 0)
+    }
+
+    /// `BINARY_SUBSCR` of the operands at `pcont` and `pkey` (owned from
+    /// `slot` up by the bits of `owned`) through [`crate::h_dict_get`] or
+    /// [`crate::h_seq_get`], then [`h_subscr_ref`]: the item in `slot`.
+    fn subscr_call(&mut self, pc: usize, slot: usize, pcont: Value, pkey: Value, owned: u8) {
+        let out = self.slot_addr(slot);
+        let t = self.tags;
+        let seqs = (1i64 << t.list) | (1 << t.tuple);
+        let (int, keys) = (1i64 << t.int, (1i64 << t.int) | (1 << t.str));
+        self.ref_call_hot(
+            pc,
+            (pcont, pkey),
+            &[
+                (1i64 << t.dict, keys, by_owned!(crate::h_dict_get, owned)),
+                (seqs, int, by_owned!(crate::h_seq_get, owned)),
+                (1i64 << t.str, int, by_owned!(crate::h_str_get, owned)),
+            ],
+            &[out, pcont, pkey],
+            h_subscr_ref as *const () as usize,
+            slot,
+            2,
+            &[pcont, pkey],
+            owned,
+        );
+    }
+
     /// `BINARY_SUBSCR` through [`h_subscr_ref`], which reads a local's or
     /// constant's operand in place (no reference taken or released): the
     /// item in the container's slot. `false`, emitting nothing, where the
@@ -10509,14 +10704,7 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot);
         let (pkey, own_k) = self.ref_or_own(key, slot + 1);
         let owned = u8::from(own_c) | (u8::from(own_k) << 1);
-        self.ref_call(
-            pc,
-            h_subscr_ref as *const () as usize,
-            slot,
-            2,
-            &[pcont, pkey],
-            owned,
-        );
+        self.subscr_call(pc, slot, pcont, pkey, owned);
         self.push(Item::Mem(slot));
         self.set_last(pc);
         // (The helper released the owned operands; a finalizer that queued
@@ -10567,8 +10755,16 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot + 1);
         let (pkey, own_k) = self.ref_or_own(key, slot + 2);
         let owned = u8::from(own_v) | (u8::from(own_c) << 1) | (u8::from(own_k) << 2);
-        self.ref_call(
+        let t = self.tags;
+        let (int, keys) = (1i64 << t.int, (1i64 << t.int) | (1 << t.str));
+        self.ref_call_hot(
             pc,
+            (pcont, pkey),
+            &[
+                (1i64 << t.dict, keys, by_owned!(crate::h_dict_set, owned, 3)),
+                (1i64 << t.list, int, by_owned!(crate::h_list_set, owned)),
+            ],
+            &[pv, pcont, pkey],
             h_store_subscr_ref as *const () as usize,
             slot,
             3,
@@ -10619,18 +10815,45 @@ impl<'a> Lower<'a> {
         let slot = self.depth;
         let (pa, own_a) = self.ref_or_own(ai, slot);
         let (pb, own_b) = self.ref_or_own(bi, slot + 1);
-        let owned = self.b.ins().iconst(
-            types::I32,
-            i64::from(u8::from(own_a) | (u8::from(own_b) << 1)),
-        );
+        let own = u8::from(own_a) | (u8::from(own_b) << 1);
+        let owned = self.b.ins().iconst(types::I32, i64::from(own));
+        // A dict or set by a `str` or `int`, or a string by a string,
+        // through a frameless helper first (as `Self::ref_call_hot` picks
+        // one), then anything declined through the full one.
+        let full_b = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I32);
+        let t = self.tags;
+        let arms = [
+            (
+                (1i64 << t.dict) | (1 << t.set),
+                (1i64 << t.int) | (1 << t.str),
+                by_owned!(crate::h_table_contains, own),
+            ),
+            (
+                1i64 << t.str,
+                1i64 << t.str,
+                by_owned!(crate::h_str_contains, own),
+            ),
+            (
+                (1i64 << t.dict) | (1 << t.set),
+                1i64 << t.class,
+                by_owned!(crate::h_type_contains, own),
+            ),
+        ];
+        self.hot_arms((pb, pa), &arms, &[pa, pb], 1, full_b, done);
+        self.b.switch_to_block(full_b);
         let at = self.slot_addr(slot);
-        let r = self
+        let full = self
             .call(
                 h_contains_ref as *const () as usize,
                 &[pa, pb, owned, at],
                 true,
             )
             .expect("returns");
+        self.b.ins().jump(done, &[full.into()]);
+        self.b.switch_to_block(done);
+        let r = self.b.block_params(done)[0];
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         self.branch_out(declined, out);
