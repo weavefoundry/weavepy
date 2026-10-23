@@ -16332,20 +16332,7 @@ impl Interpreter {
             return false;
         };
         // SAFETY: as above; the checks above hold.
-        unsafe {
-            self.core_bind_plain::<false>(
-                sw,
-                pc,
-                callee_slot,
-                has_self,
-                missing,
-                false,
-                fp,
-                act,
-                guard,
-                false,
-            )
-        };
+        unsafe { self.core_bind_plain(sw, pc, callee_slot, has_self, missing, fp, act, guard) };
         true
     }
 
@@ -16356,16 +16343,13 @@ impl Interpreter {
         f.defaults.len() >= missing && !f.defaults_maybe_overridden()
     }
 
-    /// The committed half of [`Self::core_call_plain`] (`held`: the slot
-    /// is a direct call site's warm one, holding the callee's code): the
-    /// arguments of
+    /// The committed half of [`Self::core_call_plain`]: the arguments of
     /// the `CALL` at `pc` of `sw`'s running activation (the callable at
     /// `callee_slot`, its self slot filled when `has_self`) move into the
     /// pooled slot `act`'s locals, and `act`, bound to the plain function
     /// `fp` (with exactly its arity) under the recursion `guard`, is
     /// pushed and made the running activation. The last `missing`
-    /// parameters take `fp`'s positional defaults. `DIRECT` marks the
-    /// activation a direct call's (see `frame_jit::direct_call`).
+    /// parameters take `fp`'s positional defaults.
     ///
     /// # Safety
     ///
@@ -16374,19 +16358,17 @@ impl Interpreter {
     /// `missing`, see [`Self::defaults_cover`]).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn core_bind_plain<const DIRECT: bool>(
+    unsafe fn core_bind_plain(
         &mut self,
         sw: &mut CoreSwitch,
         pc: usize,
         callee_slot: usize,
         has_self: bool,
         missing: usize,
-        cells: bool,
         fp: *const crate::object::PyFunction,
-        act: Box<InlineAct>,
+        mut act: Box<InlineAct>,
         guard: crate::recursion::Guard,
-        held: bool,
-    ) -> *mut Frame {
+    ) {
         // SAFETY: the caller's contract.
         let frame = unsafe { &mut *sw.cur };
         let n = frame.stack.len();
@@ -16430,104 +16412,13 @@ impl Interpreter {
             frame.stack.set_len(callee_slot);
             callable
         };
-        // SAFETY: as above.
-        unsafe {
-            self.core_bind_act::<DIRECT>(
-                sw, frame, pc, fp, code_rc, act, guard, held, cells, callable,
-            )
-        }
-    }
-
-    /// [`Self::core_bind_plain`] for the `CALL_KW` at `pc` of `sw`'s
-    /// running activation (a direct call's, see `frame_jit::h_call_kw`):
-    /// the site's verified `CallPyKwNames` permutation `perm` places the
-    /// `kwc` keyword values, the `argc` positionals (after the receiver
-    /// when `has_self`) take the first slots, and the parameters `covered`
-    /// doesn't name take their defaults (see `kw_names_fill_locals`).
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::core_bind_plain`]'s, with the names tuple on the stack's
-    /// top and a callee with no cells and no `**kwargs`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn core_bind_kw_direct(
-        &mut self,
-        sw: &mut CoreSwitch,
-        pc: usize,
-        has_self: bool,
-        fp: *const crate::object::PyFunction,
-        (perm, covered, kwc, argc): (u32, u32, usize, usize),
-        act: Box<InlineAct>,
-        guard: crate::recursion::Guard,
-    ) -> *mut Frame {
-        // SAFETY: the caller's contract.
-        unsafe {
-            let frame = &mut *sw.cur;
-            let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
-            // A parked slot's locals storage is its own, and empty.
-            let locals = &mut *act.frame.locals.as_ptr();
-            let names = frame.stack.pop().expect("the names tuple");
-            let items: &[Object] = match &names {
-                Object::Tuple(t) => t,
-                _ => &[],
-            };
-            Self::kw_names_fill_locals(
-                locals,
-                &mut frame.stack,
-                items,
-                &*fp,
-                code_rc,
-                perm,
-                covered,
-                kwc,
-                argc + usize::from(has_self),
-            );
-            drop_hot(names);
-            if !has_self {
-                // The empty self slot owns nothing.
-                let n = frame.stack.len();
-                frame.stack.set_len(n - 1);
-            }
-            let callable = frame.stack.pop().expect("the callee");
-            self.core_bind_act::<true>(
-                sw, frame, pc, fp, code_rc, act, guard, false, false, callable,
-            )
-        }
-    }
-
-    /// The common half of [`Self::core_bind_plain`] and
-    /// [`Self::core_bind_kw_direct`]: `act`, its locals filled and
-    /// `callable` off the caller's stack, bound to `fp` and pushed as the
-    /// running activation, the caller (`frame`) waiting past its call.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::core_bind_plain`]'s.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn core_bind_act<const DIRECT: bool>(
-        &mut self,
-        sw: &mut CoreSwitch,
-        frame: &mut Frame,
-        pc: usize,
-        fp: *const crate::object::PyFunction,
-        code_rc: &Rc<CodeObject>,
-        mut act: Box<InlineAct>,
-        guard: crate::recursion::Guard,
-        held: bool,
-        cells: bool,
-        callable: Object,
-    ) -> *mut Frame {
         frame.pc = pc as u32 + 1;
         // SAFETY: the slot is parked (see `inline_bind_cells`): its handles
         // are stale copies, overwritten without a drop. `fp` stays alive
         // while the slot holds `callable`.
         unsafe {
             let fr: &mut Frame = &mut act.frame;
-            // (A warm slot, `held`, holds this code already.)
-            if !held {
-                std::ptr::write(&raw mut fr.code, code_rc.clone());
-            }
+            std::ptr::write(&raw mut fr.code, code_rc.clone());
             std::ptr::write(
                 &raw mut fr.cells,
                 borrowed_rc(crate::object::empty_cells_ref()),
@@ -16535,13 +16426,9 @@ impl Interpreter {
             std::ptr::write(&raw mut fr.globals, borrowed_rc(&(*fp).globals));
             std::ptr::write(&raw mut fr.builtins, borrowed_rc(&(*fp).builtins));
             std::ptr::write(&raw mut act.callable, callable);
-            if cells {
-                Self::bind_call_cells(&mut act, &*fp);
-            }
         }
         act.frame.pc = 0;
         act.parked = false;
-        act.direct = DIRECT;
         act.call_pc = pc;
         // The caller waits on the pending list (see `lean_pending_enter`).
         act.caller_pending = self.core_pending_enter_fast(sw, frame, pc);
@@ -16566,34 +16453,6 @@ impl Interpreter {
         sw.cur = callee;
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
-        callee
-    }
-
-    /// [`Self::core_bind_plain`]'s cells for a callee with cell or free
-    /// variables (a direct call's, see `frame_jit::direct_body`): fresh
-    /// cells of its own (its parameters that are cells move into them, as
-    /// `inline_bind` binds them), or its closure's lean cells, which `f`
-    /// holds (see `PyFunction::lean_cells_ref`).
-    ///
-    /// # Safety
-    ///
-    /// `act` is freshly bound to `f` (its locals filled, its cells handle
-    /// a stale copy, overwritten without a drop).
-    #[cold]
-    #[inline(never)]
-    unsafe fn bind_call_cells(act: &mut InlineAct, f: &PyFunction) {
-        // SAFETY: the caller's contract; the code outlives the binding.
-        unsafe {
-            let code: &CodeObject = &*Rc::as_ptr(&act.frame.code);
-            if code.cellvars.is_empty() {
-                let cells = f.lean_cells_ref(code).expect("checked by the call");
-                std::ptr::write(&raw mut act.frame.cells, borrowed_rc(cells));
-            } else {
-                let cells = fresh_cells(f, code, &mut *act.frame.locals.as_ptr());
-                std::ptr::write(&raw mut act.frame.cells, cells);
-                act.owns_cells = true;
-            }
-        }
     }
 
     /// A bound method over a plain function with an empty self slot,
@@ -68683,28 +68542,8 @@ impl Delegate {
 impl InlineAct {
     /// A fresh parked slot.
     fn parked() -> Box<InlineAct> {
-        let placeholder = inline_placeholder();
         let mut act = Box::new(InlineAct {
-            frame: LeanFrame(std::mem::ManuallyDrop::new(Frame {
-                code: placeholder.code.clone(),
-                locals: Rc::new(RefCell::new(Vec::new())),
-                cells: borrowed_rc(&placeholder.cells),
-                stack: Vec::with_capacity(16),
-                globals: borrowed_rc(&placeholder.dict),
-                builtins: borrowed_rc(&placeholder.dict),
-                rare: None,
-                exc: None,
-                agen_yielded_value: true,
-                pc: 0,
-                py_frame: None,
-                gen_owner: None,
-                suppress_call_event: false,
-                gen_first_resume: false,
-                sent_consumed: false,
-                shell_cache: None,
-                #[cfg(feature = "jit")]
-                parked_native: None,
-            })),
+            frame: parked_lean_frame(),
             act: LeanAct {
                 frame: std::ptr::null_mut(),
                 shell: None,
@@ -68729,11 +68568,35 @@ impl InlineAct {
             lru: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
-        // SAFETY: parked slots hold a stale code copy (see the type docs):
-        // release the owned placeholder reference it was built with.
-        unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         act
     }
+}
+
+/// A parked activation's frame: stale copies of the placeholder handles
+/// (overwritten without a drop when it's bound), and empty locals and
+/// operand stack of its own.
+fn parked_lean_frame() -> LeanFrame {
+    let placeholder = inline_placeholder();
+    LeanFrame(std::mem::ManuallyDrop::new(Frame {
+        code: borrowed_rc(&placeholder.code),
+        locals: Rc::new(RefCell::new(Vec::new())),
+        cells: borrowed_rc(&placeholder.cells),
+        stack: Vec::with_capacity(16),
+        globals: borrowed_rc(&placeholder.dict),
+        builtins: borrowed_rc(&placeholder.dict),
+        rare: None,
+        exc: None,
+        agen_yielded_value: true,
+        pc: 0,
+        py_frame: None,
+        gen_owner: None,
+        suppress_call_event: false,
+        gen_first_resume: false,
+        sent_consumed: false,
+        shell_cache: None,
+        #[cfg(feature = "jit")]
+        parked_native: None,
+    }))
 }
 
 // SAFETY: an interpreter (and with it its slot pool) moves to another

@@ -5375,43 +5375,209 @@ unsafe fn direct_call<const CALL: bool>(
         {
             return None;
         }
-        // The site's warm slot, still holding this code (another code's
-        // goes back to being a plain parked slot), or one from the pool.
-        let (act, held) = match site.act.take() {
-            Some(act) if std::ptr::eq(Rc::as_ptr(&act.frame.code), code) => (act, true),
+        direct_enter(
+            st,
+            pc,
+            start,
+            len,
+            fp,
+            code_rc,
+            has_self,
+            BindArgs::Positional { missing },
+            cells,
+            native,
+            nested,
+            &raw mut *site,
+            binop,
+            lru,
+        )
+    }
+}
+
+/// How a direct call's arguments bind (see [`direct_enter`]).
+#[derive(Clone, Copy)]
+enum BindArgs {
+    /// Positionally, the last `missing` parameters taking defaults.
+    Positional { missing: usize },
+    /// A `CALL_KW`'s, through the site's verified `CallPyKwNames`
+    /// permutation (see [`direct_call_kw`]): `argc` positionals and `kwc`
+    /// keyword values, the names tuple atop the stack.
+    Keywords {
+        perm: u32,
+        covered: u32,
+        kwc: usize,
+        argc: usize,
+    },
+}
+
+/// The direct call ([`direct_call`], [`direct_call_kw`]) at `pc` (its
+/// operands from `start` up a `len`-deep stack) of the plain function
+/// `fp` running `code_rc`, its checks passed: the callee's activation
+/// bound as the core loop's arm binds one (its arguments as `args` says,
+/// its cells when `cells`), pushed and switched to, then run through its
+/// native body `native` from its start ([`direct_run`]). The activation
+/// is the call site's warm slot (`site`'s, which may still hold the
+/// callee's code; null for none) or one from the pool. `nested` is the
+/// direct-call depth, and `binop` an instance operator's (see
+/// [`direct_call`]). `None` touched nothing.
+///
+/// # Safety
+///
+/// As [`direct_call`]'s.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn direct_enter(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    fp: *const crate::object::PyFunction,
+    code_rc: &Rc<CodeObject>,
+    has_self: bool,
+    args: BindArgs,
+    cells: bool,
+    native: &Native,
+    nested: u32,
+    site: *mut DirectSite,
+    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let sw = &mut *st.sw;
+        let dc = &*sw.depth_cell;
+        let depth = dc.get() + 1;
+        if depth > crate::recursion::recursion_limit() {
+            return None;
+        }
+        // Committed: the caller synced as the core loop's arm syncs it, and
+        // the callee's activation made the running one.
+        dc.set(depth);
+        let warm = if site.is_null() {
+            None
+        } else {
+            (*site).act.take()
+        };
+        let (mut act, held) = match warm {
+            Some(act) if std::ptr::eq(Rc::as_ptr(&act.frame.code), Rc::as_ptr(code_rc)) => {
+                (act, true)
+            }
             Some(act) => {
                 // SAFETY: a warm slot holds its code's count.
                 drop(std::ptr::read(&raw const act.frame.code));
                 (act, false)
             }
-            None => (interp.inline_pool.pop()?, false),
+            None => (interp.inline_slot(), false),
         };
-        let sw = &mut *st.sw;
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            if held {
-                site.act = Some(act);
-            } else {
-                interp.inline_pool.push(act);
-            }
-            return None;
-        };
-        // Committed: the caller synced as the core loop's arm syncs it, and
-        // the callee's activation made the running one.
         let caller = &mut *st.frame;
-        caller.stack.set_len(len);
-        caller.pc = pc as u32;
         *sw.last = st.last;
         let saved_last = sw.last;
-        let callee = interp.core_bind_plain::<true>(
-            sw, pc, start, has_self, missing, cells, fp, act, guard, held,
-        );
-        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
-        let depth = (*sw.inl).len();
-        if let Some(lru) = lru {
-            if let Some(top) = (*sw.inl).last_mut() {
-                top.lru = lru.take();
+        caller.pc = pc as u32 + 1;
+        let fr: &mut crate::Frame = &mut act.frame;
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = &mut *fr.locals.as_ptr();
+        let base = st.stack;
+        match args {
+            BindArgs::Positional { missing } => {
+                // The arguments move into the locals, the defaults follow
+                // as copies, and the other locals start unbound.
+                let first = if has_self { start + 1 } else { start + 2 };
+                let nargs = len - first;
+                let total = code_rc.varnames.len().max(nargs + missing);
+                if locals.capacity() < total {
+                    locals.reserve(total);
+                }
+                let dst = locals.as_mut_ptr();
+                crate::move_objects(base.add(first), dst, nargs);
+                let mut k = nargs;
+                if missing > 0 {
+                    let defaults = &(*fp).defaults;
+                    for d in &defaults[defaults.len() - missing..] {
+                        dst.add(k).write(crate::clone_hot(d));
+                        k += 1;
+                    }
+                }
+                crate::fill_unbound_raw(dst.add(k), total - k);
+                locals.set_len(total);
+            }
+            BindArgs::Keywords {
+                perm,
+                covered,
+                kwc,
+                argc,
+            } => {
+                // The keywords take the slots the permutation names, the
+                // positionals the first ones, the rest their defaults.
+                caller.stack.set_len(len);
+                let names = caller.stack.pop().expect("the names tuple");
+                let items: &[Object] = match &names {
+                    Object::Tuple(t) => t,
+                    _ => &[],
+                };
+                Interpreter::kw_names_fill_locals(
+                    locals,
+                    &mut caller.stack,
+                    items,
+                    &*fp,
+                    code_rc,
+                    perm,
+                    covered,
+                    kwc,
+                    argc + usize::from(has_self),
+                );
+                crate::drop_hot(names);
             }
         }
+        // The callable moves out of its slot, and an empty self slot owns
+        // nothing. The parked slot's handles are stale copies, overwritten
+        // without a drop: the code owned (unless the warm slot holds it),
+        // the rest borrowed from the callable, which the slot holds.
+        std::ptr::write(&raw mut act.callable, base.add(start).read());
+        caller.stack.set_len(start);
+        if !held {
+            std::ptr::write(&raw mut fr.code, code_rc.clone());
+        }
+        std::ptr::write(&raw mut fr.globals, crate::borrowed_rc(&(*fp).globals));
+        std::ptr::write(&raw mut fr.builtins, crate::borrowed_rc(&(*fp).builtins));
+        act.owns_cells = cells && !code_rc.cellvars.is_empty();
+        let frame_cells = if act.owns_cells {
+            // (Its parameters that are cells move into them.)
+            crate::fresh_cells(&*fp, code_rc, locals)
+        } else if cells {
+            crate::borrowed_rc((*fp).lean_cells_ref(code_rc).expect("checked by the call"))
+        } else {
+            crate::borrowed_rc(crate::object::empty_cells_ref())
+        };
+        std::ptr::write(&raw mut fr.cells, frame_cells);
+        fr.pc = 0;
+        act.parked = false;
+        act.direct = true;
+        act.call_pc = pc;
+        // The caller waits on the pending list (see `lean_pending_enter`).
+        act.caller_pending = interp.core_pending_enter_fast(sw, caller, pc);
+        act.exc_depth = interp.exc_info_len();
+        act.guard = Some(crate::recursion::Guard::adopt(dc));
+        // As for any inline activation: a hot body is compiled once.
+        let n = code_rc.jit_hint.bump_lean_entries();
+        if n <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+            && n == crate::tier2::lean_warm_at()
+            && !crate::tier2::jit_off_for_process()
+            && !code_rc.jit_hint.is_not_jitable()
+        {
+            crate::tier2::warm_compile(interp, &mut act.frame);
+        }
+        // A `functools.lru_cache` miss's store goes with the activation.
+        if let Some(lru) = lru {
+            act.lru = lru.take();
+        }
+        let callee: *mut crate::Frame = &raw mut *act.frame;
+        crate::push_fast(&mut *sw.inl, act);
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
+        let depth = (*sw.inl).len();
         Some(direct_run::<false>(
             st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
         ))
@@ -5491,9 +5657,9 @@ unsafe fn run_pushed_directly(
 /// `depth`, marked `direct`) through its native code from `from`, and
 /// finish its return here: [`direct_call`]'s `Some` results. `PUSHED`
 /// for an activation the core loop's call paths bound (see
-/// [`run_pushed_directly`]), whose cells its clean return checks; `site`
-/// the direct call's cache otherwise, where its clean return parks the
-/// slot.
+/// [`run_pushed_directly`]), whose cells its clean return checks; one
+/// [`direct_enter`] bound otherwise, whose clean return parks it in its
+/// call site's warm slot (`site`'s, when it has one free).
 ///
 /// # Safety
 ///
@@ -5515,8 +5681,7 @@ unsafe fn direct_run<const PUSHED: bool>(
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
-        let interp = &mut *st.interp.cast_mut();
-        let caller = &mut *st.frame;
+        let interp = &*st.interp;
         let cframe = &mut *callee;
         let stack = &mut cframe.stack;
         if stack.capacity() < native.need() {
@@ -5544,6 +5709,38 @@ unsafe fn direct_run<const PUSHED: bool>(
         interp.direct_calls.set(nested + 1);
         let status = native.run_direct(&mut cst, from);
         interp.direct_calls.set(nested);
+        direct_done::<PUSHED>(
+            st, pc, start, callee, depth, saved_last, binop, site, status, &mut cst,
+        )
+    }
+}
+
+/// The end of a direct call's run ([`direct_run`]) that returned `status`
+/// with the callee's state `cst`: its return finished here, or whatever
+/// it left synced for the core loop. The parameters are `direct_run`'s.
+///
+/// # Safety
+///
+/// As [`direct_run`]'s, with the callee's native code just returned.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn direct_done<const PUSHED: bool>(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    callee: *mut crate::Frame,
+    depth: usize,
+    saved_last: *mut usize,
+    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    site: *mut DirectSite,
+    status: u32,
+    cst: &mut State,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let caller = &mut *st.frame;
+        let cframe = &mut *callee;
         let sw = &mut *st.sw;
         let inl = &mut *sw.inl;
         // (Only the callee's own `RETURN_VALUE` hands back `DIRECT_RET`,
@@ -5642,7 +5839,6 @@ unsafe fn direct_run<const PUSHED: bool>(
                 // (A return raised nothing: the callee's state holds no
                 // error to drop.)
                 debug_assert!(cst.err.is_none());
-                std::mem::forget(cst);
                 if sw.pending.is_some() {
                     return RELOAD;
                 }
@@ -6763,43 +6959,27 @@ unsafe fn direct_call_kw(
         {
             return None;
         }
-        let act = interp.inline_pool.pop()?;
-        let sw = &mut *st.sw;
-        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter_with(sw.depth_cell) else {
-            interp.inline_pool.push(act);
-            return None;
-        };
-        // Committed: the caller synced as the core loop's arm syncs it, and
-        // the callee's activation made the running one.
-        let caller = &mut *st.frame;
-        caller.stack.set_len(len);
-        caller.pc = pc as u32;
-        *sw.last = st.last;
-        let saved_last = sw.last;
-        let cframe = interp.core_bind_kw_direct(
-            sw,
-            pc,
-            has_self,
-            fp,
-            (perm, covered, kwc, argc),
-            act,
-            guard,
-        );
-        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
-        let depth = (*sw.inl).len();
-        Some(direct_run::<false>(
+        direct_enter(
             st,
             pc,
             start,
-            cframe,
-            depth,
+            len,
+            fp,
+            code_rc,
+            has_self,
+            BindArgs::Keywords {
+                perm,
+                covered,
+                kwc,
+                argc,
+            },
+            false,
             native,
-            saved_last,
             nested,
-            None,
-            0,
             std::ptr::null_mut(),
-        ))
+            None,
+            None,
+        )
     }
 }
 
