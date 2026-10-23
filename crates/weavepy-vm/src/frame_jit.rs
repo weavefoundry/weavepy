@@ -5297,6 +5297,7 @@ unsafe fn direct_call<const CALL: bool>(
             nested,
             &raw mut *site,
             binop,
+            lru,
         )
     }
 }
@@ -5347,6 +5348,7 @@ unsafe fn direct_enter(
     nested: u32,
     site: *mut DirectSite,
     binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
     unsafe {
@@ -5473,6 +5475,10 @@ unsafe fn direct_enter(
         {
             crate::tier2::warm_compile(interp, &mut act.frame);
         }
+        // A `functools.lru_cache` miss's store goes with the activation.
+        if let Some(lru) = lru {
+            act.lru = lru.take();
+        }
         let callee: *mut crate::Frame = &raw mut *act.frame;
         crate::push_fast(&mut *sw.inl, act);
         sw.cur = callee;
@@ -5480,11 +5486,6 @@ unsafe fn direct_enter(
         sw.last = &raw mut sw.scratch;
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         let depth = (*sw.inl).len();
-        if let Some(lru) = lru {
-            if let Some(top) = (*sw.inl).last_mut() {
-                top.lru = lru.take();
-            }
-        }
         Some(direct_run::<false>(
             st, pc, start, callee, depth, native, saved_last, nested, binop, 0, site,
         ))
@@ -6884,6 +6885,7 @@ unsafe fn direct_call_kw(
             native,
             nested,
             std::ptr::null_mut(),
+            None,
             None,
         )
     }
