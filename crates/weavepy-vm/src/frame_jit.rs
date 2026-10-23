@@ -3936,6 +3936,23 @@ unsafe extern "C" fn h_load_method(
                             }
                             b
                         }
+                        // A static or class method the site resolved for
+                        // this class: the function, with an empty self slot
+                        // or the class; the receiver leaves by a plain
+                        // decrement.
+                        None if ms.holds_inst_unbound(ver) && droppable(&*top) => {
+                            let Some((f, class)) = ms.get_inst_unbound(ver) else {
+                                return 1;
+                            };
+                            let self_obj = if class {
+                                Object::Type(inst.cls())
+                            } else {
+                                Object::Unbound
+                            };
+                            crate::drop_hot(std::mem::replace(&mut *top, Object::Function(f)));
+                            st.stack.add(len).write(self_obj);
+                            return 0;
+                        }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
@@ -4872,23 +4889,32 @@ impl DirectSite {
 /// arguments binds as [`Interpreter::core_call_plain`] binds it, and
 /// `code`'s native body runs from its start: that body, and how many
 /// trailing parameters take `f`'s defaults (with [`CELLS_BIT`] when the
-/// callee has cells to bind).
+/// callee has cells to bind, and [`EXTENDED_BIT`] when it has extended
+/// parameters).
 fn direct_body<'a>(
     f: &crate::object::PyFunction,
     code: &'a CodeObject,
     nargs: usize,
 ) -> Option<(&'a Native, usize)> {
-    let missing = (code.arg_count as usize).checked_sub(nargs)?;
+    // A surplus goes to `*args`.
+    let missing = match (code.arg_count as usize).checked_sub(nargs) {
+        Some(missing) => missing,
+        None if code.has_varargs => 0,
+        None => return None,
+    };
     // A callee with cell or free variables binds its cells too (see
-    // `Interpreter::bind_call_cells`).
+    // `direct_enter`).
     let cells = !code.cellvars.is_empty() || !code.freevars.is_empty() || !f.closure.is_empty();
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
         || (cells && code.cellvars.is_empty() && f.lean_cells_ref(code).is_none())
-        || missing >= CELLS_BIT as usize
-        || Interpreter::has_extended_params(code)
+        || missing >= EXTENDED_BIT as usize
         || (missing > 0 && !Interpreter::defaults_cover(f, missing))
+        || !Interpreter::kwonly_defaults_cover(f, code)
+        // (A frameless leaf with extended parameters evaluates in place:
+        // see `site_leaf_fits`.)
+        || (Interpreter::has_extended_params(code) && crate::fn_is_leaf(f))
         || code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
     {
         return None;
@@ -4897,12 +4923,25 @@ fn direct_body<'a>(
     if ext.dispatch_len == 0 {
         return None;
     }
-    let packed = missing | if cells { CELLS_BIT as usize } else { 0 };
-    Some((ext.frame_jit.get(code.varnames.len().max(nargs))?, packed))
+    let extended = Interpreter::has_extended_params(code);
+    let packed = missing
+        | if cells { CELLS_BIT as usize } else { 0 }
+        | if extended { EXTENDED_BIT as usize } else { 0 };
+    // (Extended parameters bind exactly the code's locals.)
+    let nlocals = if extended {
+        code.varnames.len()
+    } else {
+        code.varnames.len().max(nargs)
+    };
+    Some((ext.frame_jit.get(nlocals)?, packed))
 }
 
 /// A [`DirectSite`]'s `missing` flag for a callee with cells to bind.
 const CELLS_BIT: u32 = 1 << 31;
+
+/// A [`DirectSite`]'s `missing` flag for a callee with `*args`, `**kwargs`
+/// or keyword-only parameters (see `Interpreter::fill_extended_raw`).
+const EXTENDED_BIT: u32 = 1 << 30;
 
 /// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
 /// stack slots `slot` and above it whose class's method runs alone (see
@@ -5206,13 +5245,15 @@ unsafe extern "C" fn h_call_site(
 
 /// Whether a site may evaluate a call of `f` (running `code`) with `nargs`
 /// positional arguments as a frameless leaf ([`leaf_site_call`]): a leaf
-/// with only positional parameters, at most eight, `nargs` of them given.
-/// How many take defaults.
+/// with no `*args` or `**kwargs` and at most eight parameters, `nargs` of
+/// its positional ones given (the keyword-only ones take their defaults).
+/// How many positional ones take defaults.
 fn site_leaf_fits(f: &crate::object::PyFunction, code: &CodeObject, nargs: usize) -> Option<usize> {
     let missing = (code.arg_count as usize).checked_sub(nargs)?;
     (crate::fn_is_leaf(f)
-        && !Interpreter::has_extended_params(code)
-        && code.arg_count <= 8
+        && !code.has_varargs
+        && !code.has_varkeywords
+        && crate::leaf_arity(code) <= 8
         && Interpreter::leaf_code_ok(code))
     .then_some(missing)
 }
@@ -5346,15 +5387,17 @@ unsafe fn direct_call<const CALL: bool>(
             site.promote(code_rc, has_self, native, missing);
             (native, missing)
         };
-        let (missing, cells) = (
-            packed & !(CELLS_BIT as usize),
+        let (missing, cells, extended) = (
+            packed & !((CELLS_BIT | EXTENDED_BIT) as usize),
             packed & CELLS_BIT as usize != 0,
+            packed & EXTENDED_BIT as usize != 0,
         );
         // (Another function running the same code may have rebound its
         // defaults, or, a closure, have cells the lean binding can't take.)
         if packed != 0
             && ((missing > 0 && !Interpreter::defaults_cover(f, missing))
-                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none()))
+                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none())
+                || (extended && !Interpreter::kwonly_defaults_cover(f, code_rc)))
         {
             return None;
         }
@@ -5383,7 +5426,7 @@ unsafe fn direct_call<const CALL: bool>(
             fp,
             code_rc,
             has_self,
-            BindArgs::Positional { missing },
+            BindArgs::Positional { missing, extended },
             cells,
             native,
             nested,
@@ -5397,8 +5440,10 @@ unsafe fn direct_call<const CALL: bool>(
 /// How a direct call's arguments bind (see [`direct_enter`]).
 #[derive(Clone, Copy)]
 enum BindArgs {
-    /// Positionally, the last `missing` parameters taking defaults.
-    Positional { missing: usize },
+    /// Positionally, the last `missing` parameters taking defaults; with
+    /// `extended`, the code's `*args`, `**kwargs` and keyword-only
+    /// parameters too (see `Interpreter::fill_extended_raw`).
+    Positional { missing: usize, extended: bool },
     /// A `CALL_KW`'s, through the site's verified `CallPyKwNames`
     /// permutation (see [`direct_call_kw`]): `argc` positionals and `kwc`
     /// keyword values, the names tuple atop the stack.
@@ -5479,7 +5524,24 @@ unsafe fn direct_enter(
         let locals = fr.locals.storage();
         let base = st.stack;
         match args {
-            BindArgs::Positional { missing } => {
+            BindArgs::Positional {
+                missing,
+                extended: true,
+            } => {
+                // `*args`, `**kwargs` or keyword-only parameters: the
+                // arguments move in as `fill_extended_raw` binds them.
+                let first = if has_self { start + 1 } else { start + 2 };
+                Interpreter::fill_extended_raw(
+                    &*fp,
+                    code_rc,
+                    base.add(first),
+                    len - first,
+                    missing,
+                    locals,
+                );
+                crate::fill_unbound(locals, code_rc.varnames.len());
+            }
+            BindArgs::Positional { missing, .. } => {
                 // The arguments move into the locals, the defaults follow
                 // as copies, and the other locals start unbound.
                 let first = if has_self { start + 1 } else { start + 2 };
@@ -6318,6 +6380,7 @@ unsafe extern "C" fn h_call(
             Object::Function(_) => 1,
             Object::BoundMethod(bm) => u8::from(matches!(bm.function, Object::Function(_))),
             Object::Type(ty) if !ty.flags.is_builtin => 2,
+            callee if Interpreter::partial_callee(callee, &ops[1]) => 1,
             _ => 0,
         };
         // A pure leaf callee: evaluated in place, no activation.
@@ -6887,7 +6950,7 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
 /// keyword values and the names tuple) of a plain function whose body has
 /// native code, called directly as [`direct_call`] calls one: the site's
 /// verified `CallPyKwNames` permutation binds the keywords
-/// (`Interpreter::core_bind_kw_direct`), and the callee's return comes
+/// ([`direct_enter`]), and the callee's return comes
 /// back here. `None` touched nothing (the core loop's keyword call takes
 /// it, filling the site's slot).
 ///
@@ -6936,11 +6999,10 @@ unsafe fn direct_call_kw(
         if callee.is_generator
             || callee.is_coroutine
             || callee.is_async_generator
-            || callee.has_varargs
-            || callee.has_varkeywords
             || !callee.cellvars.is_empty()
-            || !callee.freevars.is_empty()
-            || !f.closure.is_empty()
+            // (A closure runs on its lean cells.)
+            || ((!callee.freevars.is_empty() || !f.closure.is_empty())
+                && f.lean_cells_ref(callee).is_none())
             || !Interpreter::lean_code_ok(callee)
         {
             return None;
@@ -6973,7 +7035,8 @@ unsafe fn direct_call_kw(
                 kwc,
                 argc,
             },
-            false,
+            // (A closure's lean cells, checked above.)
+            !callee.freevars.is_empty() || !f.closure.is_empty(),
             native,
             nested,
             std::ptr::null_mut(),
