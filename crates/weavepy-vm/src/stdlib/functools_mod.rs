@@ -156,6 +156,30 @@ pub(crate) fn partial_inline(inst: &crate::types::PyInstance) -> Option<(Object,
     .flatten()
 }
 
+/// Whether `b` is a `partial` class's native `__call__`.
+#[inline]
+pub(crate) fn is_partial_call(b: &BuiltinFn) -> bool {
+    b.name == PARTIAL_CALL_NAME
+}
+
+/// `f` over the call a placeholder-free `partial` instance stands for: its
+/// function, stored positionals and stored keywords, read in place (`f`
+/// must run no code). `None` when the fields aren't laid out as the
+/// constructors store them.
+pub(crate) fn with_partial_call<R>(
+    inst: &crate::types::PyInstance,
+    f: impl FnOnce(&Object, &[Object], &DictData) -> Option<R>,
+) -> Option<R> {
+    with_partial_fields(inst, |[func, args, kw, phcount]| {
+        let (Object::Int(0), Object::Tuple(args), Object::Dict(kw)) = (phcount, args, kw) else {
+            return None;
+        };
+        // SAFETY: a read; `f` runs no code.
+        f(func, args, unsafe { kw.peek() }?)
+    })
+    .flatten()
+}
+
 thread_local! {
     /// The interned names of a partial's first four slots.
     static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]

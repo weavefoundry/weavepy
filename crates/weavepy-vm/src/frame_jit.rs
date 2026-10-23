@@ -532,7 +532,7 @@ impl Slot {
         let t0 = stats::enabled().then(std::time::Instant::now);
         let n = self
             .native
-            .get_or_init(|| compile(code, ext, nlocals).map(Box::new));
+            .get_or_init(|| compile(code, ext, nlocals, at).map(Box::new));
         if let Some(t0) = t0 {
             eprintln!(
                 "frame jit: {} compiled: {} ({} instructions, {:?})",
@@ -543,6 +543,98 @@ impl Slot {
             );
         }
     }
+}
+
+/// The block starts (`starts`) of `code` whose blocks never ran before
+/// the compile. A block with a `LOAD_GLOBAL` whose site never resolved a
+/// global (its first run fills the site's cache, as CPython's
+/// specializing `LOAD_GLOBAL` does) and no site that resolved anything
+/// never ran; neither did a block that only such blocks lead to. The
+/// rest are the blocks the entry and the exception handlers reach
+/// without passing through one. Those blocks are mostly the paths the
+/// code's work never takes (a loop over an empty list, an option that
+/// isn't set, an error check's raise, a handler), whose lowering costs
+/// compile time and code size for nothing: they leave for the core loop
+/// instead, which runs them as it would have. Code none of whose sites
+/// resolved (run some other way so far) compiles whole, and so does code a
+/// loop made hot (see `compile`).
+/// (`WEAVEPY_FRAME_JIT_COLD=0` compiles every block, a tuning aid.)
+fn never_ran_blocks(code: &CodeObject, starts: &[bool]) -> Vec<bool> {
+    use weavepy_compiler::{InlineCache as IC, OpCode};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let n = starts.len();
+    let on =
+        *ON.get_or_init(|| std::env::var_os("WEAVEPY_FRAME_JIT_COLD").is_none_or(|v| v != "0"));
+    let resolved = |pc: usize| !matches!(code.caches.get(pc as u32), IC::Empty);
+    if !on || n == 0 || !(0..n).any(resolved) {
+        return vec![false; n];
+    }
+    let ins = &code.instructions;
+    // Each instruction's block start.
+    let mut block_of = vec![0; n];
+    let mut start = 0;
+    for (pc, b) in block_of.iter_mut().enumerate() {
+        if starts[pc] {
+            start = pc;
+        }
+        *b = start;
+    }
+    let mut reached = vec![false; n];
+    let mut work: Vec<usize> = std::iter::once(0)
+        .chain(code.exception_table.iter().map(|h| h.handler as usize))
+        .filter(|&h| h < n)
+        .map(|h| block_of[h])
+        .collect();
+    while let Some(start) = work.pop() {
+        if std::mem::replace(&mut reached[start], true) {
+            continue;
+        }
+        let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+        let unresolved_global =
+            (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+        if start > 0 && unresolved_global && !(start..end).any(resolved) {
+            // Never ran: what it leads to counts only if reached otherwise.
+            continue;
+        }
+        for (k, i) in ins.iter().enumerate().take(end).skip(start) {
+            let next = k + 1;
+            let target = match i.op {
+                OpCode::JumpForward
+                | OpCode::PopJumpIfFalse
+                | OpCode::PopJumpIfTrue
+                | OpCode::PopJumpIfNone
+                | OpCode::PopJumpIfNotNone
+                | OpCode::ForIter
+                | OpCode::Send => Some(next + i.arg as usize),
+                OpCode::JumpBackward => Some(next.saturating_sub(i.arg as usize)),
+                _ => None,
+            };
+            if let Some(t) = target.filter(|&t| t < n) {
+                work.push(block_of[t]);
+            }
+        }
+        let falls = !matches!(
+            ins[end - 1].op,
+            OpCode::JumpForward
+                | OpCode::JumpBackward
+                | OpCode::ReturnValue
+                | OpCode::RaiseVarargs
+                | OpCode::Reraise
+        );
+        if falls && end < n {
+            work.push(end);
+        }
+    }
+    let mut out = vec![false; n];
+    for start in 0..n {
+        if starts[start] && start > 0 {
+            let end = (start + 1..n).find(|&k| starts[k]).unwrap_or(n);
+            let unresolved_global =
+                (start..end).any(|k| ins[k].op == OpCode::LoadGlobal && !resolved(k));
+            out[start] = !reached[start] || (unresolved_global && !(start..end).any(resolved));
+        }
+    }
+    out
 }
 
 /// What warmed a code object.
@@ -3858,6 +3950,23 @@ unsafe extern "C" fn h_load_method(
                             }
                             b
                         }
+                        // A static or class method the site resolved for
+                        // this class: the function, with an empty self slot
+                        // or the class; the receiver leaves by a plain
+                        // decrement.
+                        None if ms.holds_inst_unbound(ver) && droppable(&*top) => {
+                            let Some((f, class)) = ms.get_inst_unbound(ver) else {
+                                return 1;
+                            };
+                            let self_obj = if class {
+                                Object::Type(inst.cls())
+                            } else {
+                                Object::Unbound
+                            };
+                            crate::drop_hot(std::mem::replace(&mut *top, Object::Function(f)));
+                            st.stack.add(len).write(self_obj);
+                            return 0;
+                        }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
@@ -4801,23 +4910,32 @@ impl DirectSite {
 /// arguments binds as [`Interpreter::core_call_plain`] binds it, and
 /// `code`'s native body runs from its start: that body, and how many
 /// trailing parameters take `f`'s defaults (with [`CELLS_BIT`] when the
-/// callee has cells to bind).
+/// callee has cells to bind, and [`EXTENDED_BIT`] when it has extended
+/// parameters).
 fn direct_body<'a>(
     f: &crate::object::PyFunction,
     code: &'a CodeObject,
     nargs: usize,
 ) -> Option<(&'a Native, usize)> {
-    let missing = (code.arg_count as usize).checked_sub(nargs)?;
+    // A surplus goes to `*args`.
+    let missing = match (code.arg_count as usize).checked_sub(nargs) {
+        Some(missing) => missing,
+        None if code.has_varargs => 0,
+        None => return None,
+    };
     // A callee with cell or free variables binds its cells too (see
-    // `Interpreter::bind_call_cells`).
+    // `direct_enter`).
     let cells = !code.cellvars.is_empty() || !code.freevars.is_empty() || !f.closure.is_empty();
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
         || (cells && code.cellvars.is_empty() && f.lean_cells_ref(code).is_none())
-        || missing >= CELLS_BIT as usize
-        || Interpreter::has_extended_params(code)
+        || missing >= EXTENDED_BIT as usize
         || (missing > 0 && !Interpreter::defaults_cover(f, missing))
+        || !Interpreter::kwonly_defaults_cover(f, code)
+        // (A frameless leaf with extended parameters evaluates in place:
+        // see `site_leaf_fits`.)
+        || (Interpreter::has_extended_params(code) && crate::fn_is_leaf(f))
         || code.wire.as_ref().is_some_and(|w| w.exec_error.is_some())
     {
         return None;
@@ -4826,12 +4944,25 @@ fn direct_body<'a>(
     if ext.dispatch_len == 0 {
         return None;
     }
-    let packed = missing | if cells { CELLS_BIT as usize } else { 0 };
-    Some((ext.frame_jit.get(code.varnames.len().max(nargs))?, packed))
+    let extended = Interpreter::has_extended_params(code);
+    let packed = missing
+        | if cells { CELLS_BIT as usize } else { 0 }
+        | if extended { EXTENDED_BIT as usize } else { 0 };
+    // (Extended parameters bind exactly the code's locals.)
+    let nlocals = if extended {
+        code.varnames.len()
+    } else {
+        code.varnames.len().max(nargs)
+    };
+    Some((ext.frame_jit.get(nlocals)?, packed))
 }
 
 /// A [`DirectSite`]'s `missing` flag for a callee with cells to bind.
 const CELLS_BIT: u32 = 1 << 31;
+
+/// A [`DirectSite`]'s `missing` flag for a callee with `*args`, `**kwargs`
+/// or keyword-only parameters (see `Interpreter::fill_extended_raw`).
+const EXTENDED_BIT: u32 = 1 << 30;
 
 /// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
 /// stack slots `slot` and above it whose class's method runs alone (see
@@ -5139,13 +5270,15 @@ unsafe extern "C" fn h_call_site(
 
 /// Whether a site may evaluate a call of `f` (running `code`) with `nargs`
 /// positional arguments as a frameless leaf ([`leaf_site_call`]): a leaf
-/// with only positional parameters, at most eight, `nargs` of them given.
-/// How many take defaults.
+/// with no `*args` or `**kwargs` and at most eight parameters, `nargs` of
+/// its positional ones given (the keyword-only ones take their defaults).
+/// How many positional ones take defaults.
 fn site_leaf_fits(f: &crate::object::PyFunction, code: &CodeObject, nargs: usize) -> Option<usize> {
     let missing = (code.arg_count as usize).checked_sub(nargs)?;
     (crate::fn_is_leaf(f)
-        && !Interpreter::has_extended_params(code)
-        && code.arg_count <= 8
+        && !code.has_varargs
+        && !code.has_varkeywords
+        && crate::leaf_arity(code) <= 8
         && Interpreter::leaf_code_ok(code))
     .then_some(missing)
 }
@@ -5337,15 +5470,17 @@ unsafe fn direct_call<const CALL: bool>(
             site.promote(code_rc, has_self, native, missing);
             (native, missing)
         };
-        let (missing, cells) = (
-            packed & !(CELLS_BIT as usize),
+        let (missing, cells, extended) = (
+            packed & !((CELLS_BIT | EXTENDED_BIT) as usize),
             packed & CELLS_BIT as usize != 0,
+            packed & EXTENDED_BIT as usize != 0,
         );
         // (Another function running the same code may have rebound its
         // defaults, or, a closure, have cells the lean binding can't take.)
         if packed != 0
             && ((missing > 0 && !Interpreter::defaults_cover(f, missing))
-                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none()))
+                || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none())
+                || (extended && !Interpreter::kwonly_defaults_cover(f, code_rc)))
         {
             return None;
         }
@@ -5374,7 +5509,7 @@ unsafe fn direct_call<const CALL: bool>(
             fp,
             code_rc,
             has_self,
-            BindArgs::Positional { missing },
+            BindArgs::Positional { missing, extended },
             cells,
             native,
             nested,
@@ -5388,8 +5523,10 @@ unsafe fn direct_call<const CALL: bool>(
 /// How a direct call's arguments bind (see [`direct_enter`]).
 #[derive(Clone, Copy)]
 enum BindArgs {
-    /// Positionally, the last `missing` parameters taking defaults.
-    Positional { missing: usize },
+    /// Positionally, the last `missing` parameters taking defaults; with
+    /// `extended`, the code's `*args`, `**kwargs` and keyword-only
+    /// parameters too (see `Interpreter::fill_extended_raw`).
+    Positional { missing: usize, extended: bool },
     /// A `CALL_KW`'s, through the site's verified `CallPyKwNames`
     /// permutation (see [`direct_call_kw`]): `argc` positionals and `kwc`
     /// keyword values, the names tuple atop the stack.
@@ -5468,7 +5605,24 @@ unsafe fn direct_enter(
         let locals = fr.locals.storage();
         let base = st.stack;
         match args {
-            BindArgs::Positional { missing } => {
+            BindArgs::Positional {
+                missing,
+                extended: true,
+            } => {
+                // `*args`, `**kwargs` or keyword-only parameters: the
+                // arguments move in as `fill_extended_raw` binds them.
+                let first = if has_self { start + 1 } else { start + 2 };
+                Interpreter::fill_extended_raw(
+                    &*fp,
+                    code_rc,
+                    base.add(first),
+                    len - first,
+                    missing,
+                    locals,
+                );
+                crate::fill_unbound(locals, code_rc.varnames.len());
+            }
+            BindArgs::Positional { missing, .. } => {
                 // The arguments move into the locals, the defaults follow
                 // as copies, and the other locals start unbound.
                 let first = if has_self { start + 1 } else { start + 2 };
@@ -6404,6 +6558,7 @@ unsafe extern "C" fn h_call(
             Object::Function(_) => 1,
             Object::BoundMethod(bm) => u8::from(matches!(bm.function, Object::Function(_))),
             Object::Type(ty) if !ty.flags.is_builtin => 2,
+            callee if Interpreter::partial_callee(callee, &ops[1]) => 1,
             _ => 0,
         };
         // A pure leaf callee: evaluated in place, no activation.
@@ -6979,7 +7134,7 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
 /// keyword values and the names tuple) of a plain function whose body has
 /// native code, called directly as [`direct_call`] calls one: the site's
 /// verified `CallPyKwNames` permutation binds the keywords
-/// (`Interpreter::core_bind_kw_direct`), and the callee's return comes
+/// ([`direct_enter`]), and the callee's return comes
 /// back here. `None` touched nothing (the core loop's keyword call takes
 /// it, filling the site's slot).
 ///
@@ -7028,11 +7183,10 @@ unsafe fn direct_call_kw(
         if callee.is_generator
             || callee.is_coroutine
             || callee.is_async_generator
-            || callee.has_varargs
-            || callee.has_varkeywords
             || !callee.cellvars.is_empty()
-            || !callee.freevars.is_empty()
-            || !f.closure.is_empty()
+            // (A closure runs on its lean cells.)
+            || ((!callee.freevars.is_empty() || !f.closure.is_empty())
+                && f.lean_cells_ref(callee).is_none())
             || !Interpreter::lean_code_ok(callee)
         {
             return None;
@@ -7065,7 +7219,8 @@ unsafe fn direct_call_kw(
                 kwc,
                 argc,
             },
-            false,
+            // (A closure's lean cells, checked above.)
+            !callee.freevars.is_empty() || !f.closure.is_empty(),
             native,
             nested,
             std::ptr::null_mut(),
@@ -8002,7 +8157,7 @@ fn verify() -> bool {
 /// Compile `code`; `None` leaves it to the core loop. A compiler panic
 /// turns frame compilation off for the process rather than taking the
 /// interpreter down.
-fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) -> Option<Native> {
+fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) -> Option<Native> {
     if code.instructions.is_empty() || code.instructions.len() > MAX_INSTRUCTIONS {
         return None;
     }
@@ -8013,7 +8168,11 @@ fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) -> Option<
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let engine = guard.get_or_insert_with(Engine::new).as_mut()?;
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compile_with(engine, code, ext, nlocals, &depths)
+        // Only code that finished many activations shows which of its
+        // blocks never run: a loop that got hot partway through its first
+        // activation hasn't reached the code after it yet.
+        let prune = matches!(at, Heat::Call);
+        compile_with(engine, code, ext, nlocals, &depths, prune)
     }));
     match built {
         Ok(native) => native,
@@ -8030,6 +8189,7 @@ fn compile_with(
     ext: &CodeConstObjects,
     nlocals: usize,
     depths: &[i64],
+    prune: bool,
 ) -> Option<Native> {
     let n = code.instructions.len();
     // The attribute sites' field caches (allocated here if no read has
@@ -8041,7 +8201,17 @@ fn compile_with(
     // goes to its calls more than to the shortcuts in line.
     let mut lean = false;
     let whole = loop {
-        let low = lower_range(engine, code, ext, nlocals, depths, field_slots, 0..n, lean)?;
+        let low = lower_range(
+            engine,
+            code,
+            ext,
+            nlocals,
+            depths,
+            field_slots,
+            0..n,
+            lean,
+            prune,
+        )?;
         // (Measured as if every exit's tail were in line, the size the
         // threshold was tuned with.)
         if !lean && engine.ctx.func.dfg.num_insts() + low.tail_savings > lean_above() {
@@ -8086,6 +8256,7 @@ fn compile_with(
             field_slots,
             range.clone(),
             lean,
+            prune,
         )?;
         chunks.push(define(engine, code, lean, t0, Some(&range))?);
         for pc in range {
@@ -8124,6 +8295,7 @@ fn lower_range(
     field_slots: crate::Sites<'_, FieldSlot>,
     range: std::ops::Range<usize>,
     lean: bool,
+    prune: bool,
 ) -> Option<Lowered> {
     engine.module.clear_context(&mut engine.ctx);
     let ptr = engine.ptr;
@@ -8145,6 +8317,7 @@ fn lower_range(
             range,
         );
         lower.cold = lean;
+        lower.prune = prune;
         let done = lower.lower();
         let low = Lowered {
             entries: (0..n).map(|pc| lower.enters_at(pc)).collect(),
@@ -8422,6 +8595,13 @@ struct Lower<'a> {
     /// Each block start's block (instruction index → block), for the
     /// starts in `range`.
     blocks: Vec<Option<Block>>,
+    /// The block starts whose blocks never ran before the compile (see
+    /// [`never_ran_blocks`]): lowered as an exit to the core loop, and not
+    /// entered.
+    never_ran: Vec<bool>,
+    /// Whether to leave the blocks that never ran to the core loop (see
+    /// `compile`).
+    prune: bool,
     /// Which instructions start blocks, in the whole code.
     starts: Vec<bool>,
     /// The instructions this lowering covers: the whole code, or a chunk
@@ -8643,6 +8823,8 @@ impl<'a> Lower<'a> {
             },
             bound: vec![false; nlocals],
             blocks: Vec::new(),
+            never_ran: Vec::new(),
+            prune: false,
             starts: Vec::new(),
             range,
             sizes: Vec::new(),
@@ -9286,7 +9468,10 @@ impl<'a> Lower<'a> {
     /// instruction the native code runs (not one it hands straight back).
     fn enters_at(&self, pc: usize) -> bool {
         let instrs = &self.code.instructions;
-        if pc >= instrs.len() || self.blocks[pc].is_none() {
+        if pc >= instrs.len()
+            || self.blocks[pc].is_none()
+            || self.never_ran.get(pc).copied().unwrap_or(false)
+        {
             return false;
         }
         native_at(self.code, pc)
@@ -9410,6 +9595,11 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(pc, &s)| (s && self.range.contains(&pc)).then(|| self.b.create_block()))
             .collect();
+        self.never_ran = if self.prune {
+            never_ran_blocks(code, &starts)
+        } else {
+            vec![false; n]
+        };
         self.starts = starts;
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
@@ -9432,7 +9622,7 @@ impl<'a> Lower<'a> {
         let mut tramps = Vec::new();
         let mut calls = Vec::with_capacity(n);
         for pc in 0..n {
-            let target = match self.blocks[pc] {
+            let target = match self.blocks[pc].filter(|_| !self.never_ran[pc]) {
                 Some(blk) => {
                     let t = self.b.create_block();
                     tramps.push((t, blk, self.depths[pc]));
@@ -9476,6 +9666,11 @@ impl<'a> Lower<'a> {
         self.depth = self.depths[start] as usize;
         self.last_pc = None;
         self.bound.iter_mut().for_each(|b| *b = false);
+        if self.never_ran[start] {
+            // The core loop runs it, as it ran it before (or never).
+            self.exit(INTERP, start);
+            return;
+        }
         let mut pc = start;
         loop {
             if !self.instruction(pc) {
