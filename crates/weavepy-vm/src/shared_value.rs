@@ -869,13 +869,21 @@ impl SharedStr {
         debug_assert!(c.is_ascii());
         small_table()[usize::from(c & 0x7f)].clone()
     }
+
+    /// [`Self::ascii_char`] once the table is built (calling nothing).
+    #[inline(always)]
+    pub fn ascii_char_built(c: u8) -> Option<Self> {
+        SMALL_TABLE.get().map(|t| t[usize::from(c & 0x7f)].clone())
+    }
 }
+
+/// [`small_table`]'s strings, built on first use.
+static SMALL_TABLE: std::sync::OnceLock<[SharedStr; 257]> = std::sync::OnceLock::new();
 
 /// [`SharedStr::small`]'s strings: the 256 Latin-1 characters by code
 /// point, then the empty string.
 fn small_table() -> &'static [SharedStr; 257] {
-    static TABLE: std::sync::OnceLock<[SharedStr; 257]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
+    SMALL_TABLE.get_or_init(|| {
         std::array::from_fn(|i| {
             let mut buf = [0; 4];
             let text: &str = if i == 256 {

@@ -8400,6 +8400,7 @@ impl Interpreter {
         act.guard = None;
         act.caller_pending = None;
         act.init_inst = None;
+        act.lru = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
@@ -8410,7 +8411,9 @@ impl Interpreter {
     /// only the code handle and the slot's own fields remain.
     #[inline(always)]
     fn inline_park_clean(&mut self, mut act: Box<InlineAct>) {
-        debug_assert!(act.clean && act.frame.stack.is_empty() && act.chain.is_none());
+        debug_assert!(
+            act.clean && act.frame.stack.is_empty() && act.chain.is_none() && act.lru.is_none()
+        );
         // SAFETY: as `inline_park`: the code handle is owned while active.
         unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
         if act.owns_cells {
@@ -8443,6 +8446,7 @@ impl Interpreter {
                 && !act.discard
                 && act.guard.is_none()
                 && act.init_inst.is_none()
+                && act.lru.is_none()
                 && act.act.shell.is_none()
         );
         // SAFETY: as `inline_park`: the code handle is owned while active;
@@ -8476,6 +8480,7 @@ impl Interpreter {
                 && !act.discard
                 && act.guard.is_none()
                 && act.init_inst.is_none()
+                && act.lru.is_none()
                 && act.act.shell.is_none()
         );
         act.parked = true;
@@ -8968,6 +8973,13 @@ impl Interpreter {
             }
             (_, result) => result,
         };
+        // A `functools.lru_cache` miss's function returned: its result is
+        // stored before the caller takes it (an error stores nothing).
+        if let Some(pending) = done.lru.take() {
+            if let Ok(v) = &result {
+                self.lru_store_returned(pending, v);
+            }
+        }
         let call_pc = done.call_pc;
         let discard = done.discard;
         self.lean_pending_exit(done.caller_pending);
@@ -11560,7 +11572,9 @@ impl Interpreter {
         len: usize,
         cap: usize,
     ) -> Option<usize> {
-        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        use weavepy_compiler::bytecode::{
+            SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
+        };
         if len == 0 || len >= cap {
             return None;
         }
@@ -11583,6 +11597,8 @@ impl Interpreter {
                 let name = match ins.arg {
                     SPECIAL_ENTER => "__enter__",
                     SPECIAL_EXIT => "__exit__",
+                    SPECIAL_AENTER => "__aenter__",
+                    SPECIAL_AEXIT => "__aexit__",
                     _ => return None,
                 };
                 match cls.lookup(name) {
@@ -12855,8 +12871,21 @@ impl Interpreter {
                     | OpCode::MapAdd
                     | OpCode::UnpackSequence => {
                         // SAFETY: the `len` slots at `base` are initialized,
-                        // and the helper touches nothing else.
-                        match unsafe { Self::core_container_op(ins, base, len, cap) } {
+                        // and the helpers touch nothing else.
+                        let subscr = matches!(ins.op, OpCode::BinarySubscr | OpCode::StoreSubscr);
+                        let n = if subscr {
+                            unsafe {
+                                Self::core_subscr_hot(ins.op == OpCode::StoreSubscr, base, len)
+                            }
+                        } else {
+                            usize::MAX
+                        };
+                        let r = if n != usize::MAX {
+                            Some(n)
+                        } else {
+                            unsafe { Self::core_container_op(ins, base, len, cap) }
+                        };
+                        match r {
                             Some(n) => {
                                 len = n;
                                 last = pc;
@@ -13937,6 +13966,29 @@ impl Interpreter {
                             break None;
                         }
                         let start = len - kwc - argc - 3;
+                        // A `functools.lru_cache` wrapper's cache hit, in place.
+                        // SAFETY: the callee is live.
+                        if crate::stdlib::functools_mod::is_lru_wrapper(unsafe {
+                            &*base.add(start)
+                        }) {
+                            // SAFETY: `start + kwc + argc + 3 == len`.
+                            let ops =
+                                unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
+                            if let Some(r) = Self::core_lru_hit_kw(ops, argc) {
+                                // SAFETY: every operand was checked to leave by a
+                                // plain decrement; the result takes the callee's
+                                // slot.
+                                unsafe {
+                                    release_run(base.add(start), len - start);
+                                    base.add(start).write(r);
+                                }
+                                len = start + 1;
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
+                        }
                         // SAFETY: the callee and its self slot are live.
                         unsafe { Self::core_instance_callee(base.add(start)) };
                         // SAFETY: `start + kwc + argc + 3 == len`.
@@ -14266,6 +14318,44 @@ impl Interpreter {
                                 sw.pending = Some(CoreExit::Stop(LeafStop::Step));
                             }
                             break Some(CoreExit::Reload);
+                        }
+                        // A `functools.lru_cache` wrapper's call: a cache hit
+                        // in place, a miss's function in the wrapper's place.
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        if let Object::Instance(_) = unsafe { &*base.add(len - argc - 2) } {
+                            let start = len - argc - 2;
+                            // SAFETY: as above.
+                            let ops =
+                                unsafe { std::slice::from_raw_parts(base.add(start), argc + 2) };
+                            match Self::lru_probe_if_wrapper(ops) {
+                                Some(crate::stdlib::functools_mod::LruProbe::Hit(r)) => {
+                                    // SAFETY: every operand was checked to leave by
+                                    // a plain decrement; the result takes the
+                                    // callee's slot.
+                                    unsafe {
+                                        release_run(base.add(start), len - start);
+                                        base.add(start).write(r);
+                                    }
+                                    len = start + 1;
+                                    last = pc;
+                                    pc += 1;
+                                    after_release!();
+                                    continue;
+                                }
+                                Some(crate::stdlib::functools_mod::LruProbe::Miss(
+                                    func,
+                                    pending,
+                                )) => {
+                                    // SAFETY: `len <= cap`, every slot initialized.
+                                    unsafe { frame.stack.set_len(len) };
+                                    frame.pc = pc as u32;
+                                    *last_pc = last;
+                                    if self.core_lru_miss(sw, pc, start, func, pending) {
+                                        break Some(CoreExit::Reload);
+                                    }
+                                }
+                                None => {}
+                            }
                         }
                         // SAFETY: `len >= argc + 2`: the callee and its self
                         // slot.
@@ -19378,6 +19468,195 @@ impl Interpreter {
         }
     }
 
+    /// `d[k]` of an exact dict by a present key that compares natively
+    /// (see [`crate::dictmap::Table::find_object_native`]), settled
+    /// without running code or calling anything (so a caller's fast path
+    /// needs no stack frame). `None` declines, having touched nothing: the
+    /// full arms decide every other shape, a missing key included.
+    #[inline(always)]
+    pub(crate) fn dict_get_hot<'a>(d: &'a RefCell<DictData>, k: &Object) -> Option<&'a Object> {
+        // SAFETY: a read between two instructions (the probe runs no code,
+        // and the caller copies the value before anything else runs).
+        let d = unsafe { d.peek() }?;
+        let i = d.find_object_native(k)?.1.ok()?;
+        // SAFETY: a found position.
+        Some(unsafe { d.value_at_unchecked(i) })
+    }
+
+    /// `c[i]` of a list or a tuple by an in-range index, as
+    /// [`Self::dict_get_hot`] settles a dict's.
+    #[inline(always)]
+    pub(crate) fn seq_get_hot(c: &Object, i: i64) -> Option<Object> {
+        let item = match c {
+            Object::List(xs) => {
+                // SAFETY: a read between two instructions.
+                let xs = unsafe { xs.peek() }?;
+                xs.get(seq_position(i, xs.len())?)?
+            }
+            Object::Tuple(t) => t.get(seq_position(i, t.len())?)?,
+            _ => return None,
+        };
+        Some(clone_hot(item))
+    }
+
+    /// `s[i]` of an ASCII string (one whose length is known) by an
+    /// in-range index, as [`Self::seq_get_hot`] settles a list's.
+    #[inline(always)]
+    pub(crate) fn str_get_hot(s: &SharedStr, i: i64) -> Option<Object> {
+        let bytes = s.as_bytes();
+        if SharedStr::known_char_count(s)? != bytes.len() {
+            return None;
+        }
+        let at = seq_position(i, bytes.len())?;
+        // SAFETY: `at` is inside the string.
+        let c = unsafe { *bytes.get_unchecked(at) };
+        SharedStr::ascii_char_built(c).map(Object::Str)
+    }
+
+    /// Whether a store may displace `old` natively: a scalar, or a value
+    /// whose release runs no code (see [`Self::core_droppable`]).
+    #[inline(always)]
+    fn displaced_ok(old: &Object) -> bool {
+        matches!(
+            old,
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+        ) || Self::core_droppable(old)
+    }
+
+    /// `d[k] = value()` of an exact dict by a key that compares natively
+    /// (as [`Self::dict_get_hot`] reads): a present key's value replaced,
+    /// or a new key added where the table has room (the full arm grows
+    /// it). The displaced value (`None` for a new key), for the caller to
+    /// release after it (`drop_hot`: it was checked droppable); `None`
+    /// declines, having touched nothing.
+    ///
+    /// # Safety
+    ///
+    /// `value` builds the stored value without running code.
+    #[inline(always)]
+    pub(crate) unsafe fn dict_set_hot(
+        cell: &RefCell<DictData>,
+        k: &Object,
+        value: impl FnOnce() -> Object,
+    ) -> Option<Object> {
+        if crate::capi_watchers::dicts_active() {
+            return None;
+        }
+        // SAFETY: a store between two instructions (the probe runs no
+        // code, and the displaced value is released after the view ends).
+        let d = unsafe { cell.peek_mut() }?;
+        // (An instance dict whose owner's tracking is deferred takes the
+        // full arm, which tracks it.)
+        if d.has_deferred_owner() {
+            return None;
+        }
+        let i = match d.find_object_native(k)? {
+            (_, Ok(i)) => i,
+            (hash, Err(pos)) => {
+                // (A stamped access, as every dict store makes.)
+                if !d.push_native(pos, hash, || DictKey(clone_hot(k)), value) {
+                    return None;
+                }
+                crate::object::dict_mutation_event(cell);
+                return Some(Object::None);
+            }
+        };
+        // SAFETY: a found position.
+        if !Self::displaced_ok(unsafe { d.value_at_unchecked(i) }) {
+            return None;
+        }
+        // SAFETY: as above (stamped, as every dict store is).
+        let slot = unsafe { d.value_at_unchecked_mut(i) };
+        let old = std::mem::replace(slot, value());
+        if !same_object(&old, slot) {
+            crate::object::dict_mutation_event(cell);
+        }
+        Some(old)
+    }
+
+    /// `xs[i] = value()` of an exact list at an in-range index. As for
+    /// [`Self::dict_set_hot`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::dict_set_hot`].
+    #[inline(always)]
+    pub(crate) unsafe fn list_set_hot(
+        xs: &RefCell<Vec<Object>>,
+        i: i64,
+        value: impl FnOnce() -> Object,
+    ) -> Option<Object> {
+        // SAFETY: a store between two instructions (the displaced value is
+        // released after the view ends).
+        let xs = unsafe { xs.peek_mut() }?;
+        let at = seq_position(i, xs.len())?;
+        let slot = xs.get_mut(at)?;
+        if !Self::displaced_ok(slot) {
+            return None;
+        }
+        Some(std::mem::replace(slot, value()))
+    }
+
+    /// `item in c` for an exact dict, set or frozenset and an item that
+    /// compares natively (see [`Self::dict_get_hot`]): `None` declines.
+    #[inline(always)]
+    pub(crate) fn contains_hot(c: &Object, item: &Object) -> Option<bool> {
+        let found = match c {
+            // SAFETY: a read between two instructions (the probe runs no
+            // code).
+            Object::Dict(d) => unsafe { d.peek() }?.find_object_native(item)?,
+            // SAFETY: as above.
+            Object::Set(s) => unsafe { s.peek() }?.find_object_native(item)?,
+            Object::FrozenSet(s) => s.find_object_native(item)?,
+            _ => return None,
+        };
+        Some(found.1.is_ok())
+    }
+
+    /// The core loop's commonest subscripts, ahead of
+    /// [`Self::core_container_op`]: `BINARY_SUBSCR` (`store` false) or
+    /// `STORE_SUBSCR` on the top of the `len`-deep stack at `base`, through
+    /// the helpers compiled code calls (see [`h_dict_get`]) with every
+    /// operand owned on the stack. The new stack length, or `usize::MAX`
+    /// declined untouched.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::core_container_op`].
+    #[inline(always)]
+    unsafe fn core_subscr_hot(store: bool, base: *mut Object, len: usize) -> usize {
+        // SAFETY: the caller's contract: the operands are the top two or
+        // three slots, and a read's item takes the container's slot.
+        unsafe {
+            if !store && len >= 2 {
+                let (c, k) = (base.add(len - 2), base.add(len - 1));
+                let r = match (&*c, &*k) {
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_get::<3>(c, c, k),
+                    (Object::List(_) | Object::Tuple(_), Object::Int(_)) => h_seq_get::<3>(c, c, k),
+                    (Object::Str(_), Object::Int(_)) => h_str_get::<3>(c, c, k),
+                    (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+                        h_inst_dict_get::<3>(c, c, k)
+                    }
+                    _ => 1,
+                };
+                return if r == 0 { len - 1 } else { usize::MAX };
+            }
+            if store && len >= 3 {
+                let (v, c, k) = (base.add(len - 3), base.add(len - 2), base.add(len - 1));
+                let r = match (&*c, &*k) {
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_set::<7>(v, c, k),
+                    (Object::List(_), Object::Int(_)) => h_list_set::<7>(v, c, k),
+                    (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+                        h_inst_dict_set::<7>(v, c, k)
+                    }
+                    _ => 1,
+                };
+                return if r == 0 { len - 3 } else { usize::MAX };
+            }
+            usize::MAX
+        }
+    }
+
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
     /// exact containers (an in-range index or a present `str`/`int` key),
     /// `seq[i] = v` in range and `d[key] = v`, and a comprehension's
@@ -19560,7 +19839,10 @@ impl Interpreter {
                         // stack into the list.
                         std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
                     }
-                    (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+                    // Any key the leaf probe hashes and compares natively
+                    // (a `str`, an `int`, a tuple of them, or an object
+                    // keyed by identity).
+                    (Object::Dict(cell), _) => {
                         if crate::capi_watchers::dicts_active() {
                             return None;
                         }
@@ -23546,6 +23828,11 @@ impl Interpreter {
             // SAFETY: as above.
             unsafe { release_locals(&mut *frame.locals.as_ptr()) };
             drop(done.guard.take());
+            // A `functools.lru_cache` miss's function returned: its result
+            // is stored before the caller takes it (`inline_deliver`'s).
+            if done.lru.is_some() {
+                self.lru_finish(&mut done.lru, &v);
+            }
             // SAFETY: the caller is the innermost remaining activation.
             (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
             // `inline_deliver` for a plain function's return, directly.
@@ -24353,6 +24640,156 @@ impl Interpreter {
         args.push(recv.clone());
         args.extend(bound[..n].iter().map(|a| (*a).expect("prefix").clone()));
         fast(&args)?.ok()
+    }
+
+    /// A call of a `functools.lru_cache` wrapper settled natively (see
+    /// [`crate::stdlib::functools_mod::lru_probe`]): `ops` is the core
+    /// loop's `CALL` operands (the wrapper, an empty self slot and the
+    /// arguments). The hit, the miss to run in place
+    /// ([`Self::core_lru_miss`]), or `None` (nothing touched) for the full
+    /// call.
+    #[inline(never)]
+    pub(crate) fn core_lru_probe(ops: &[Object]) -> Option<crate::stdlib::functools_mod::LruProbe> {
+        let (Object::Instance(inst), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
+            return None;
+        };
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        crate::stdlib::functools_mod::lru_probe(inst, &ops[2..])
+    }
+
+    /// A keyword call of a `functools.lru_cache` wrapper whose cache holds
+    /// the result (see [`crate::stdlib::functools_mod::lru_hit_kw`]): `ops`
+    /// is the `CALL_KW`'s operands (the wrapper, an empty self slot, `argc`
+    /// positional arguments, the keyword values and the names tuple). The
+    /// cached value, or `None` (nothing touched) for the full call.
+    #[inline(never)]
+    pub(crate) fn core_lru_hit_kw(ops: &[Object], argc: usize) -> Option<Object> {
+        let (Object::Instance(inst), Object::Unbound, Some(Object::Tuple(names))) =
+            (ops.first()?, ops.get(1)?, ops.last())
+        else {
+            return None;
+        };
+        let names: &[Object] = names;
+        let args = ops.get(2..2 + argc)?;
+        let values = ops.get(2 + argc..ops.len() - 1)?;
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        crate::stdlib::functools_mod::lru_hit_kw(inst, args, names, values)
+    }
+
+    /// [`Self::core_lru_probe`] when `ops[0]` is a wrapper (one compare
+    /// in line for any other callee).
+    #[inline(always)]
+    pub(crate) fn lru_probe_if_wrapper(
+        ops: &[Object],
+    ) -> Option<crate::stdlib::functools_mod::LruProbe> {
+        if crate::stdlib::functools_mod::is_lru_wrapper(ops.first()?) {
+            Self::core_lru_probe(ops)
+        } else {
+            None
+        }
+    }
+
+    /// The `CALL` at `pc` of `sw`'s synced running activation of a
+    /// `functools.lru_cache` wrapper that missed its cache (see
+    /// [`Self::core_lru_probe`]): the wrapped function `func` runs in the
+    /// wrapper's place, as CPython's C wrapper calls it with no frame of its
+    /// own. A pure leaf is evaluated in place and its result stored at once;
+    /// anything else runs as an inline activation switched to here, which
+    /// stores its result when it returns (see `InlineAct::lru`). `false`
+    /// touches nothing (the operands as they were, the miss uncounted).
+    #[inline(never)]
+    pub(crate) fn core_lru_miss(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        at: usize,
+        func: Object,
+        mut pending: crate::stdlib::functools_mod::LruPending,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here, its operands from `at` the call's.
+        let frame = unsafe { &mut *sw.cur };
+        let n = frame.stack.len();
+        debug_assert!(crate::stdlib::functools_mod::is_lru_wrapper(
+            &frame.stack[at]
+        ));
+        // The function takes the wrapper's place; the store holds the
+        // wrapper until the call finishes.
+        pending.hold(std::mem::replace(&mut frame.stack[at], func));
+        let ops = &frame.stack[at..];
+        if matches!(&ops[0], Object::Function(f) if fn_is_leaf(f)) && Self::core_all_droppable(ops)
+        {
+            if let Some(r) = self.core_pure_call(&frame.code, pc, ops, sw.depth_cell) {
+                // SAFETY: every operand was checked to leave by a plain
+                // decrement; the result takes the callee's slot.
+                unsafe {
+                    release_run(frame.stack.as_ptr().add(at), n - at);
+                    frame.stack.set_len(at);
+                }
+                self.lru_store_returned(pending, &r);
+                frame.stack.push(r);
+                frame.pc = pc as u32 + 1;
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+                // SAFETY: the running thread's own flag (see `quiet_run`).
+                if unsafe { (*sw.maybe_dead).get() } {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+                }
+                return true;
+            }
+        }
+        if self.core_call(sw, pc) {
+            // SAFETY: see `CoreSwitch`: the call pushed its activation,
+            // the running one.
+            let inl = unsafe { &mut *sw.inl };
+            let top = inl
+                .last_mut()
+                .filter(|a| std::ptr::eq(&raw const *a.frame, sw.cur));
+            debug_assert!(top.is_some(), "an inline call pushes its activation");
+            if let Some(top) = top {
+                top.lru = Some(pending);
+            }
+            return true;
+        }
+        // Declined: the wrapper back in its place, the miss uncounted.
+        let func = std::mem::replace(&mut frame.stack[at], pending.release_wrapper());
+        drop(func);
+        false
+    }
+
+    /// [`Self::lru_store_returned`] for an activation's pending store
+    /// (`InlineAct::lru`), out of the return paths' line.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn lru_finish(
+        &mut self,
+        slot: &mut Option<crate::stdlib::functools_mod::LruPending>,
+        value: &Object,
+    ) {
+        if let Some(pending) = slot.take() {
+            self.lru_store_returned(pending, value);
+        }
+    }
+
+    /// Store a `functools.lru_cache` miss's returned `value` (see
+    /// `InlineAct::lru`) and finish the call: the entry a full cache
+    /// evicted is released, then the wrapper and its nesting level.
+    #[inline(never)]
+    pub(crate) fn lru_store_returned(
+        &mut self,
+        pending: crate::stdlib::functools_mod::LruPending,
+        value: &Object,
+    ) {
+        if let Some((key, old)) = crate::stdlib::functools_mod::lru_store_returned(&pending, value)
+        {
+            self.release(key.0);
+            self.release(old);
+        }
+        drop(pending);
     }
 
     /// A call of a bound natively served class method
@@ -27224,6 +27661,9 @@ impl Interpreter {
     /// for anything else, or a miss a key of another kind might explain.
     #[inline(always)]
     pub(crate) fn leaf_contains_table(container: &Object, item: &Object) -> Option<bool> {
+        if let Some(found) = Self::contains_hot(container, item) {
+            return Some(found);
+        }
         // A `str`, machine `int` or plain class in a set or dict, the
         // commonest tests (`cls in _atomic_types`), probed in line.
         if let (
@@ -29955,9 +30395,14 @@ impl Interpreter {
     /// (`__dict__`, `__name__`, `__text_signature__`, …), and the full
     /// path serves several more from outside its dict, so only the one
     /// the explicit-base-call idiom needs is admitted here (`__new__`
-    /// keeps its own exception at the call site).
+    /// keeps its own exception at the call site), with the context-manager
+    /// protocol's methods, which neither `type` nor `object` defines
+    /// (`ExitStack.enter_context` reads them off the class).
     fn type_dunder_transparent(name: &str) -> bool {
-        name == "__init__"
+        matches!(
+            name,
+            "__init__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+        )
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
@@ -54934,6 +55379,10 @@ impl Interpreter {
                 }
                 self.type_call_default(ty, args, kwargs)
             }
+            // A `functools.lru_cache` wrapper: its native core directly.
+            Object::Instance(inst) if crate::stdlib::functools_mod::is_lru_wrapper(callable) => {
+                crate::stdlib::functools_mod::lru_call_native(inst, callable, args, kwargs)
+            }
             Object::Instance(inst) => {
                 // Honour __call__ if defined. The `__call__` chase is a
                 // native recursion that never enters a Python frame when
@@ -59669,12 +60118,17 @@ impl Interpreter {
         // A generator-family body's activations never start at pc 0, where
         // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
         // the creation of one that awaits or delegates counts instead (its
-        // `SEND`s run natively; a plain generator's body still warms by
-        // its loops and fast steps, which pays off more reliably).
+        // `SEND`s run natively), as does a loop-free one's (a
+        // `@contextmanager` body, which has no loop to warm it and runs
+        // once per creation); a looping plain generator's body still warms
+        // by its loops and fast steps, which pays off more reliably.
         #[cfg(feature = "jit")]
         if let Some(ext) = code_vm_ext(code) {
             let start = ext.gen_start.load(std::sync::atomic::Ordering::Relaxed);
-            if code.is_coroutine || (start != u32::MAX && start & GEN_DELEGATES != 0) {
+            if code.is_coroutine
+                || (start != u32::MAX && start & GEN_DELEGATES != 0)
+                || code.jit_hint.loop_free(code)
+            {
                 ext.frame_jit
                     .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
             }
@@ -68479,6 +68933,11 @@ struct InlineAct {
     /// none). The activation's consumer-facing fields (`call_pc`,
     /// `exhaust_arg`, `caller_pending`) are the consumer's.
     chain: Option<Box<ChainRec>>,
+    /// A `functools.lru_cache` miss's function (see
+    /// `Interpreter::core_lru_miss`): the activation's result is stored in
+    /// the wrapper's cache when it returns, before its caller takes it
+    /// (`inline_deliver`).
+    lru: Option<crate::stdlib::functools_mod::LruPending>,
 }
 
 /// The levels of a collapsed `yield from` chain (see
@@ -68623,6 +69082,7 @@ impl InlineAct {
             binop: None,
             discard: false,
             chain: None,
+            lru: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         // SAFETY: parked slots hold a stale code copy (see the type docs):
@@ -75275,6 +75735,7 @@ fn is_site_op(op: OpCode) -> bool {
             | OpCode::LoadMethodAttr
             | OpCode::LoadSuperAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::LoadSpecial
             | OpCode::BinarySubscr
             | OpCode::StoreSubscr
@@ -76441,6 +76902,422 @@ fn release_gates_clear() -> bool {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 == 0
         }
+}
+
+/// An operand's release, settled before a fast path commits: nothing (a
+/// scalar, or a borrowed operand), or a plain decrement of the count at
+/// its word while [`release_gates_clear`] holds and the count is above
+/// one.
+#[derive(Clone, Copy)]
+pub(crate) struct PlainRelease(*const std::sync::atomic::AtomicUsize);
+
+impl PlainRelease {
+    /// `v`'s release when `owned` (else nothing), or `None` when it isn't
+    /// a plain one.
+    #[inline(always)]
+    pub(crate) fn of(v: &Object, owned: bool) -> Option<Self> {
+        if !owned {
+            return Some(Self(std::ptr::null()));
+        }
+        let Some(word) = v.strong_word() else {
+            return Some(Self(std::ptr::null()));
+        };
+        // SAFETY: `v` owns a reference to the live allocation.
+        let n = unsafe { (*word).load(std::sync::atomic::Ordering::Relaxed) };
+        (release_gates_clear() && n > 1).then_some(Self(word))
+    }
+
+    /// Make the release (the operand's slot is then free).
+    ///
+    /// # Safety
+    ///
+    /// The operand is still live, and nothing released since [`Self::of`]
+    /// reached the same object.
+    #[inline(always)]
+    pub(crate) unsafe fn run(self) {
+        if !self.0.is_null() {
+            // SAFETY: per the caller, the count is above one and only this
+            // thread updates it.
+            unsafe {
+                let c = (*self.0).load(std::sync::atomic::Ordering::Relaxed);
+                (*self.0).store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The position index `i` (negative: from the end) names in a sequence of
+/// `n` items; `None` outside it.
+#[inline(always)]
+fn seq_position(i: i64, n: usize) -> Option<usize> {
+    let i = if i < 0 { i.wrapping_add(n as i64) } else { i };
+    usize::try_from(i).ok().filter(|&i| i < n)
+}
+
+// The commonest container shapes, first, through helpers that call
+// nothing and keep nothing for a fallback (so they need little or no
+// stack frame): compiled code and the core loop pick one by the operands'
+// tags, and a decline leaves everything untouched for the full path. Each
+// reads its operands where they lie (a local's or constant's in place,
+// borrowed), and is instantiated for each `OWNED` (bit `k`: operand `k`
+// is owned in its stack slot, released by a plain decrement, settled
+// first; see [`PlainRelease`]).
+
+/// `BINARY_SUBSCR` of the exact dict at `cont` by the key at `key` (see
+/// [`Interpreter::dict_get_hot`]): `0` the value written to `out` (a free
+/// slot, or the owned container's own), `1` declined.
+pub(crate) unsafe extern "C" fn h_dict_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: the code passes two initialized values and the slot.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Dict(d) = c else {
+            return 1;
+        };
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 1 != 0),
+            PlainRelease::of(k, OWNED & 2 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::dict_get_hot(d, k) else {
+            return 1;
+        };
+        let v = clone_hot(v);
+        rk.run();
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the instance at `cont` of a `dict` subclass that
+/// keeps `dict.__getitem__` (a `defaultdict`, an `OrderedDict`), by a
+/// present key that compares natively: as [`h_dict_get`] (a miss, which
+/// may run `__missing__`, declines).
+pub(crate) unsafe extern "C" fn h_inst_dict_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Instance(inst) = c else {
+            return 1;
+        };
+        // (The payload first: most instances have none.)
+        let Some(Object::Dict(d)) = inst.native.get() else {
+            return 1;
+        };
+        if !inst
+            .class_dunder(crate::types::Dunder::GetItem)
+            .dict_owner()
+        {
+            return 1;
+        }
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 1 != 0),
+            PlainRelease::of(k, OWNED & 2 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::dict_get_hot(d, k) else {
+            return 1;
+        };
+        let v = clone_hot(v);
+        rk.run();
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the list or tuple at `cont` by the `int` at `key`
+/// (see [`Interpreter::seq_get_hot`]; the key needs no release): as
+/// [`h_dict_get`].
+pub(crate) unsafe extern "C" fn h_seq_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let c = &*cont;
+        let Object::Int(i) = *key else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 1 != 0) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::seq_get_hot(c, i) else {
+            return 1;
+        };
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `BINARY_SUBSCR` of the string at `cont` by the `int` at `key` (see
+/// [`Interpreter::str_get_hot`]): as [`h_seq_get`].
+pub(crate) unsafe extern "C" fn h_str_get<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_get`'s.
+    unsafe {
+        let c = &*cont;
+        let (Object::Str(s), Object::Int(i)) = (c, &*key) else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 1 != 0) else {
+            return 1;
+        };
+        let Some(v) = Interpreter::str_get_hot(s, *i) else {
+            return 1;
+        };
+        rc.run();
+        out.write(v);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the exact dict at `cont` by
+/// the key at `key` (see [`Interpreter::dict_set_hot`]; an owned value
+/// moves in, a borrowed one is copied): `0` stored, `1` declined.
+pub(crate) unsafe extern "C" fn h_dict_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: the code passes three initialized values.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Dict(d) = c else {
+            return 1;
+        };
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 2 != 0),
+            PlainRelease::of(k, OWNED & 4 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::dict_set_hot(d, k, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rk.run();
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the instance at `cont` of a
+/// `dict` subclass that keeps `dict.__setitem__` (a `defaultdict`), by a
+/// key that compares natively: as [`h_dict_set`].
+pub(crate) unsafe extern "C" fn h_inst_dict_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_set`'s.
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Instance(inst) = c else {
+            return 1;
+        };
+        // (The payload first: most instances have none.)
+        let Some(Object::Dict(d)) = inst.native.get() else {
+            return 1;
+        };
+        if !inst
+            .class_dunder(crate::types::Dunder::SetItem)
+            .dict_owner()
+        {
+            return 1;
+        }
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, OWNED & 2 != 0),
+            PlainRelease::of(k, OWNED & 4 != 0),
+        ) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::dict_set_hot(d, k, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rk.run();
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` of the value at `val` into the exact list at `cont` by
+/// the `int` at `key` (see [`Interpreter::list_set_hot`]): as
+/// [`h_dict_set`].
+pub(crate) unsafe extern "C" fn h_list_set<const OWNED: u32>(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as `h_dict_set`'s.
+    unsafe {
+        let c = &*cont;
+        let (Object::List(xs), Object::Int(i)) = (c, &*key) else {
+            return 1;
+        };
+        let Some(rc) = PlainRelease::of(c, OWNED & 2 != 0) else {
+            return 1;
+        };
+        let Some(old) = Interpreter::list_set_hot(xs, *i, || owned_or_copy::<OWNED>(val)) else {
+            return 1;
+        };
+        rc.run();
+        crate::drop_hot(old);
+        0
+    }
+}
+
+/// The value at `val` for a store: moved out when owned (`OWNED` bit 0),
+/// else copied.
+///
+/// # Safety
+///
+/// `val` addresses an initialized value (one the caller gives up when
+/// owned).
+#[inline(always)]
+unsafe fn owned_or_copy<const OWNED: u32>(val: *const Object) -> Object {
+    // SAFETY: per the caller.
+    unsafe {
+        if OWNED & 1 != 0 {
+            val.read()
+        } else {
+            crate::clone_hot(&*val)
+        }
+    }
+}
+
+/// `CONTAINS_OP` of the item at `item` in the exact dict or set at `cont`
+/// (see [`Interpreter::contains_hot`]): `0` or `1` (found), `2`
+/// declined.
+pub(crate) unsafe extern "C" fn h_table_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: the code passes two initialized values.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        let Some(found) = Interpreter::contains_hot(c, i) else {
+            return 2;
+        };
+        rc.run();
+        ri.run();
+        u32::from(found)
+    }
+}
+
+/// `CONTAINS_OP` of the class at `item` in the exact dict or set at
+/// `cont`, a class whose metaclass keeps `type`'s `__hash__` and `__eq__`
+/// (`cls in _atomic_types`): as [`h_table_contains`].
+pub(crate) unsafe extern "C" fn h_type_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: as `h_table_contains`'s.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let Object::Type(t) = i else {
+            return 2;
+        };
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        if !crate::object::type_hash_is_identity(t) {
+            return 2;
+        }
+        // SAFETY: reads that run no code (the probe compares natively).
+        let found = match c {
+            Object::Set(s) => s.peek().and_then(|s| s.find_type_native(t)),
+            Object::Dict(d) => d.peek().and_then(|d| d.find_type_native(t)),
+            _ => None,
+        };
+        let Some(found) = found else {
+            return 2;
+        };
+        rc.run();
+        ri.run();
+        u32::from(found.is_ok())
+    }
+}
+
+/// `CONTAINS_OP` of the string at `item` in the string at `cont`, for a
+/// needle of at most one byte (an ASCII character, which only ever
+/// matches at a character boundary) in a short haystack: as
+/// [`h_table_contains`].
+pub(crate) unsafe extern "C" fn h_str_contains<const OWNED: u32>(
+    item: *const Object,
+    cont: *const Object,
+) -> u32 {
+    // SAFETY: as `h_table_contains`'s.
+    unsafe {
+        let (i, c) = (&*item, &*cont);
+        let (Object::Str(needle), Object::Str(hay)) = (i, c) else {
+            return 2;
+        };
+        // (Two owned references to one string would each pass the plain
+        // release's count test alone.)
+        if OWNED & 3 == 3 && SharedStr::ptr_eq(needle, hay) {
+            return 2;
+        }
+        let (Some(ri), Some(rc)) = (
+            PlainRelease::of(i, OWNED & 1 != 0),
+            PlainRelease::of(c, OWNED & 2 != 0),
+        ) else {
+            return 2;
+        };
+        let hay = hay.as_bytes();
+        let found = match needle.as_bytes() {
+            [] => true,
+            // (A plain scan: `<[u8]>::contains` calls `memchr`.)
+            [b] if hay.len() <= 64 => hay.iter().any(|x| x == b),
+            _ => return 2,
+        };
+        rc.run();
+        ri.run();
+        u32::from(found)
+    }
+}
+
+/// Whether `a` and `b` are the same object as far as a store's mutation
+/// event cares (CPython compares the pointers): the same scalar, or the
+/// same allocation.
+#[inline(always)]
+fn same_object(a: &Object, b: &Object) -> bool {
+    match (a, b) {
+        (Object::None, Object::None) => true,
+        (Object::Bool(x), Object::Bool(y)) => x == y,
+        (Object::Int(x), Object::Int(y)) => x == y,
+        (Object::Float(x), Object::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => {
+            a.tag() == b.tag()
+                && a.payload_addr()
+                    .is_some_and(|p| Some(p) == b.payload_addr())
+        }
+    }
 }
 
 /// Release the `n` call operands at `p` (moved out: the caller's stack no

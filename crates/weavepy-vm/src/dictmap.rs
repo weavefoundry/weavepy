@@ -149,6 +149,77 @@ pub fn key_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+/// A probe whose equality with a stored key of equal hash settles
+/// natively (see [`Table::find_native`]).
+pub trait NativeEq {
+    /// Whether the probe equals `stored`; `None` when that needs more
+    /// than a native compare (another kind of key, a long string).
+    fn native_eq(&self, stored: &DictKey) -> Option<bool>;
+}
+
+/// A `str` probe: equal to a stored `str` of the same bytes.
+struct StrEq<'a>(&'a crate::shared_value::SharedStr);
+
+impl NativeEq for StrEq<'_> {
+    #[inline(always)]
+    fn native_eq(&self, stored: &DictKey) -> Option<bool> {
+        match &stored.0 {
+            Object::Str(b) if crate::shared_value::SharedStr::ptr_eq(self.0, b) => Some(true),
+            Object::Str(b) => key_bytes_eq_native(self.0.as_bytes(), b.as_bytes()),
+            _ => None,
+        }
+    }
+}
+
+/// A machine `int` probe: equal to a stored machine `int` of its value.
+struct IntEq(i64);
+
+impl NativeEq for IntEq {
+    #[inline(always)]
+    fn native_eq(&self, stored: &DictKey) -> Option<bool> {
+        match stored.0 {
+            Object::Int(j) => Some(j == self.0),
+            _ => None,
+        }
+    }
+}
+
+/// A class probe hashed by identity: equal to itself (a stored class of
+/// equal hash but another identity might compare through its metaclass's
+/// `__eq__`, so that leaves the lookup undecided).
+struct TypeEq<'a>(&'a crate::Rc<crate::types::TypeObject>);
+
+impl NativeEq for TypeEq<'_> {
+    #[inline(always)]
+    fn native_eq(&self, stored: &DictKey) -> Option<bool> {
+        match &stored.0 {
+            Object::Type(u) if crate::Rc::ptr_eq(self.0, u) => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// [`key_bytes_eq`] for a native lookup: in line (calling nothing) up to
+/// 16 bytes, the commonest keys; a longer pair out of line.
+#[inline(always)]
+fn key_bytes_eq_native(a: &[u8], b: &[u8]) -> Option<bool> {
+    let n = a.len();
+    if n != b.len() {
+        return Some(false);
+    }
+    if n <= 16 {
+        return Some(key_bytes_eq(a, b));
+    }
+    Some(long_key_bytes_eq(a, b))
+}
+
+/// [`key_bytes_eq_native`] past 16 bytes.
+#[cold]
+#[inline(never)]
+fn long_key_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
 /// An ordered hash table from [`DictKey`] to `V` (see the module docs):
 /// [`DictMap`] for a dict, [`SetMap`] for a set.
 pub struct Table<V> {
@@ -483,6 +554,149 @@ impl<V> Table<V> {
         Some(unsafe { &self.entries.get_unchecked(i).value })
     }
 
+    /// A lookup that settles natively, always in line and calling nothing
+    /// (the subscript fast paths that use it need no stack frame): `eq`
+    /// compares the probe with a stored key of equal hash. `Ok(i)` found
+    /// at `i`, `Err(pos)` exactly absent (`pos` as [`Self::find_hashed`]
+    /// gives it), `None` undecided.
+    #[inline(always)]
+    pub fn find_native<E: NativeEq>(&self, hash: i64, eq: &E) -> Option<Result<usize, usize>> {
+        if self.slots.is_empty() {
+            for (i, b) in self.entries.iter().enumerate() {
+                if b.hash == hash && eq.native_eq(&b.key)? {
+                    return Some(Ok(i));
+                }
+            }
+            return Some(Err(0));
+        }
+        let m = mix(hash);
+        let mask = self.slots.len() - 1;
+        let mut pos = (m >> self.shift) as usize;
+        loop {
+            // SAFETY: as in `find_hashed`.
+            unsafe {
+                let s = *self.slots.get_unchecked(pos);
+                if s == 0 {
+                    return Some(Err(pos));
+                }
+                if (s ^ m) <= IX_MASK {
+                    let ix = (s & IX_MASK) as usize - 1;
+                    let b = self.entries.get_unchecked(ix);
+                    if b.hash == hash && eq.native_eq(&b.key)? {
+                        return Some(Ok(ix));
+                    }
+                }
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    /// [`Self::find_native`] for `key`, with its hash: a `str` whose hash
+    /// is known or a machine `int` hashed by itself, met only by stored
+    /// keys of its own kind (any other key, or a stored key of another
+    /// kind with an equal hash, leaves it undecided).
+    #[inline(always)]
+    pub fn find_object_native(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
+        use crate::shared_value::SharedStr;
+        match key {
+            Object::Str(s) => {
+                let hash = SharedStr::known_hash(s)?;
+                Some((hash, self.find_native(hash, &StrEq(s))?))
+            }
+            // (A machine int below the hash modulus is its own hash.)
+            Object::Int(i) if (*i as u64) < (1 << 61) - 1 => {
+                Some((*i, self.find_native(*i, &IntEq(*i))?))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::find_native`] for class `t`, which the caller found hashed
+    /// and compared by identity (see `type_hash_is_identity`).
+    #[inline(always)]
+    pub fn find_type_native(
+        &self,
+        t: &crate::Rc<crate::types::TypeObject>,
+    ) -> Option<Result<usize, usize>> {
+        // (As `identity_hash` hashes a class.)
+        let hash = crate::object::pointer_hash(crate::Rc::as_ptr(t).cast());
+        self.find_native(hash, &TypeEq(t))
+    }
+
+    /// [`Self::find_object_native`], hashing a `str` key first (as an
+    /// insert would; the hash is cached in the string).
+    #[inline]
+    pub fn find_object_hashing(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
+        if let Object::Str(s) = key {
+            crate::shared_value::SharedStr::hash_cached(s);
+        }
+        self.find_object_native(key)
+    }
+
+    /// Append `key()` (Python hash `hash`), exactly absent, with
+    /// `value()`, at the empty slot `pos` a [`Self::find_native`] miss
+    /// gave, when that needs no growth: `false`, changing nothing (and
+    /// building nothing), otherwise. Calls nothing itself.
+    #[inline(always)]
+    pub fn push_native(
+        &mut self,
+        pos: usize,
+        hash: i64,
+        key: impl FnOnce() -> DictKey,
+        value: impl FnOnce() -> V,
+    ) -> bool {
+        let i = self.entries.len();
+        if i == self.entries.capacity() {
+            return false;
+        }
+        if self.slots.is_empty() {
+            if i >= SMALL {
+                return false;
+            }
+        } else {
+            if (i + 1) * 3 > self.slots.len() * 2 || i >= IX_MASK as usize - 1 {
+                return false;
+            }
+            // SAFETY: `pos` is an empty slot inside the table.
+            unsafe {
+                *self.slots.get_unchecked_mut(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
+            }
+        }
+        // SAFETY: `i` is below the capacity (checked); the length covers
+        // the bucket once it's written.
+        unsafe {
+            self.entries.as_mut_ptr().add(i).write(Bucket {
+                hash,
+                key: key(),
+                value: value(),
+            });
+            self.entries.set_len(i + 1);
+        }
+        true
+    }
+
+    /// The value at position `i`, which the caller found.
+    ///
+    /// # Safety
+    ///
+    /// `i` is below [`Self::len`].
+    #[inline(always)]
+    pub unsafe fn value_at_unchecked(&self, i: usize) -> &V {
+        // SAFETY: per the caller.
+        unsafe { &self.entries.get_unchecked(i).value }
+    }
+
+    /// [`Self::value_at_unchecked`], mutably.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::value_at_unchecked`].
+    #[inline(always)]
+    pub unsafe fn value_at_unchecked_mut(&mut self, i: usize) -> &mut V {
+        // SAFETY: per the caller.
+        unsafe { &mut self.entries.get_unchecked_mut(i).value }
+    }
+
     /// [`Self::get_index_of`], always in line (see [`Self::get_hot`]).
     #[inline(always)]
     pub fn get_index_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
@@ -609,7 +823,7 @@ impl<V> Table<V> {
 
     /// Append `key` (hash `hash`), known to be absent, at slot `pos` (from
     /// a missed [`Self::find_hashed`]): its position.
-    #[inline]
+    #[inline(always)]
     fn push_at(&mut self, pos: usize, hash: i64, key: DictKey, value: V) -> usize {
         let i = self.entries.len();
         if self.slots.is_empty() {
@@ -617,27 +831,48 @@ impl<V> Table<V> {
                 self.entries.push(Bucket { hash, key, value });
                 return i;
             }
+        } else if (i + 1) * 3 <= self.slots.len() * 2 && i < IX_MASK as usize - 1 {
+            // SAFETY: `pos` is an empty slot inside the table.
+            unsafe {
+                *self.slots.get_unchecked_mut(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
+            }
             self.entries.push(Bucket { hash, key, value });
-            self.rebuild_slots(slots_for(i + 1));
             return i;
         }
-        if (i + 1) * 3 > self.slots.len() * 2 {
-            self.entries.push(Bucket { hash, key, value });
-            self.rebuild_slots(self.slots.len() * 2);
-            return i;
-        }
+        self.push_growing(Bucket { hash, key, value })
+    }
+
+    /// [`Self::push_at`] for an entry that outgrows the slot table: the
+    /// table is rebuilt larger with it.
+    #[inline(never)]
+    fn push_growing(&mut self, bucket: Bucket<V>) -> usize {
+        let i = self.entries.len();
         assert!(i < IX_MASK as usize - 1, "dict too large");
-        // SAFETY: `pos` is an empty slot inside the table.
-        unsafe {
-            *self.slots.get_unchecked_mut(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
-        }
-        self.entries.push(Bucket { hash, key, value });
+        let n = if self.slots.is_empty() {
+            slots_for(i + 1)
+        } else {
+            self.slots.len() * 2
+        };
+        self.entries.push(bucket);
+        self.rebuild_slots(n);
         i
     }
 
-    /// Insert or replace: the entry's position and the replaced value.
+    /// Insert or replace: the entry's position and the replaced value. A
+    /// key that compares natively (see [`Self::find_object_native`]) is
+    /// probed without the general equality.
     #[inline]
     pub fn insert_full(&mut self, key: DictKey, value: V) -> (usize, Option<V>) {
+        if let Some((hash, r)) = self.find_object_hashing(&key.0) {
+            return match r {
+                Ok(i) => {
+                    // SAFETY: a found position.
+                    let slot = unsafe { &mut self.entries.get_unchecked_mut(i).value };
+                    (i, Some(std::mem::replace(slot, value)))
+                }
+                Err(pos) => (self.push_at(pos, hash, key, value), None),
+            };
+        }
         let hash = key.probe_hash();
         self.insert_hashed(hash, key, value)
     }
@@ -1419,9 +1654,17 @@ impl SetMap {
         self.insert_full(key).1
     }
 
-    /// [`Self::insert`], with the key's position.
+    /// [`Self::insert`], with the key's position. A key that compares
+    /// natively (see [`Table::find_object_native`]) is probed without the
+    /// general equality.
     #[inline]
     pub fn insert_full(&mut self, key: DictKey) -> (usize, bool) {
+        if let Some((hash, r)) = self.0.find_object_hashing(&key.0) {
+            return match r {
+                Ok(i) => (i, false),
+                Err(pos) => (self.0.push_at(pos, hash, key, ()), true),
+            };
+        }
         let hash = key.probe_hash();
         self.insert_hashed(hash, key)
     }
@@ -1474,6 +1717,21 @@ impl SetMap {
     #[inline]
     pub fn contains<Q: Probe + ?Sized>(&self, key: &Q) -> bool {
         self.find(key).is_some()
+    }
+
+    /// [`Table::find_object_native`] over the set's keys.
+    #[inline(always)]
+    pub fn find_object_native(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
+        self.0.find_object_native(key)
+    }
+
+    /// [`Table::find_type_native`] over the set's keys.
+    #[inline(always)]
+    pub fn find_type_native(
+        &self,
+        t: &crate::Rc<crate::types::TypeObject>,
+    ) -> Option<Result<usize, usize>> {
+        self.0.find_type_native(t)
     }
 
     /// [`Self::contains`], always in line, for a probe whose hash runs no
