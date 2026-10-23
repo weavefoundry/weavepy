@@ -11489,7 +11489,9 @@ impl Interpreter {
         len: usize,
         cap: usize,
     ) -> Option<usize> {
-        use weavepy_compiler::bytecode::{SPECIAL_ENTER, SPECIAL_EXIT};
+        use weavepy_compiler::bytecode::{
+            SPECIAL_AENTER, SPECIAL_AEXIT, SPECIAL_ENTER, SPECIAL_EXIT,
+        };
         if len == 0 || len >= cap {
             return None;
         }
@@ -11512,6 +11514,8 @@ impl Interpreter {
                 let name = match ins.arg {
                     SPECIAL_ENTER => "__enter__",
                     SPECIAL_EXIT => "__exit__",
+                    SPECIAL_AENTER => "__aenter__",
+                    SPECIAL_AEXIT => "__aexit__",
                     _ => return None,
                 };
                 match cls.lookup(name) {
@@ -19319,7 +19323,10 @@ impl Interpreter {
                         // stack into the list.
                         std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
                     }
-                    (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+                    // Any key the leaf probe hashes and compares natively
+                    // (a `str`, an `int`, a tuple of them, or an object
+                    // keyed by identity).
+                    (Object::Dict(cell), _) => {
                         if crate::capi_watchers::dicts_active() {
                             return None;
                         }
@@ -29951,9 +29958,14 @@ impl Interpreter {
     /// (`__dict__`, `__name__`, `__text_signature__`, …), and the full
     /// path serves several more from outside its dict, so only the one
     /// the explicit-base-call idiom needs is admitted here (`__new__`
-    /// keeps its own exception at the call site).
+    /// keeps its own exception at the call site), with the context-manager
+    /// protocol's methods, which neither `type` nor `object` defines
+    /// (`ExitStack.enter_context` reads them off the class).
     fn type_dunder_transparent(name: &str) -> bool {
-        name == "__init__"
+        matches!(
+            name,
+            "__init__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+        )
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
@@ -59667,12 +59679,17 @@ impl Interpreter {
         // A generator-family body's activations never start at pc 0, where
         // the core loop counts a call's heat (see `frame_jit::Slot::warm`):
         // the creation of one that awaits or delegates counts instead (its
-        // `SEND`s run natively; a plain generator's body still warms by
-        // its loops and fast steps, which pays off more reliably).
+        // `SEND`s run natively), as does a loop-free one's (a
+        // `@contextmanager` body, which has no loop to warm it and runs
+        // once per creation); a looping plain generator's body still warms
+        // by its loops and fast steps, which pays off more reliably.
         #[cfg(feature = "jit")]
         if let Some(ext) = code_vm_ext(code) {
             let start = ext.gen_start.load(std::sync::atomic::Ordering::Relaxed);
-            if code.is_coroutine || (start != u32::MAX && start & GEN_DELEGATES != 0) {
+            if code.is_coroutine
+                || (start != u32::MAX && start & GEN_DELEGATES != 0)
+                || code.jit_hint.loop_free(code)
+            {
                 ext.frame_jit
                     .warm(code, ext, code.varnames.len(), frame_jit::Heat::Call);
             }
@@ -75275,6 +75292,7 @@ fn is_site_op(op: OpCode) -> bool {
             | OpCode::LoadMethodAttr
             | OpCode::LoadSuperAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::LoadSpecial
             | OpCode::BinarySubscr
             | OpCode::StoreSubscr

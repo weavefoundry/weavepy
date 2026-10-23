@@ -680,6 +680,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             OpCode::LoadGlobal
             | OpCode::LoadMethodAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::BuildTuple
             | OpCode::BuildList
             | OpCode::BuildMap
@@ -2971,7 +2972,10 @@ unsafe fn store_subscr_fast(
                 }
                 std::mem::replace(&mut xs[i as usize], value())
             }
-            (Object::Dict(cell), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) => {
+            // Any key the leaf probe hashes and compares natively (a `str`,
+            // an `int`, a tuple of them, or an object keyed by identity:
+            // `gather`'s coroutines).
+            (Object::Dict(cell), _) => {
                 if crate::capi_watchers::dicts_active() {
                     return 1;
                 }
@@ -3474,6 +3478,31 @@ unsafe extern "C" fn h_store_attr(
     }
 }
 
+/// `DELETE_ATTR` (the `pc`th instruction of `code`) of the instance atop a
+/// `len`-deep stack, as the core loop's arm runs it
+/// (`Interpreter::core_delete_attr`): `0` the attribute and the receiver
+/// gone (whose release may have queued a finalizer: the code checks),
+/// anything else declined untouched.
+unsafe extern "C" fn h_delete_attr(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `DELETE_ATTR`s, and its stack depth (at least one).
+    unsafe {
+        let st = &mut *st;
+        let (code, pc) = (&*code, pc as usize);
+        let interp = &mut *st.interp.cast_mut();
+        u32::from(
+            interp
+                .core_delete_attr(code, code.instructions[pc], pc, st.stack, len as usize)
+                .is_none(),
+        )
+    }
+}
+
 /// What a helper that may move the pc did.
 const PUSHED: u32 = 0;
 /// A fused shape ran: `st.pc`, `st.last` and `st.len` are past it.
@@ -3798,13 +3827,23 @@ unsafe extern "C" fn h_load_method(
                 }
                 let f = match ms.get_held(ver) {
                     Some(f) => {
+                        let f = Object::Function(f);
                         if !cache.is_null() {
                             fill_method_cache(&mut *cache, cls, ver, &f, ext, name);
                         }
-                        Object::Function(f)
+                        f
                     }
                     None => match ms.get_inst_builtin(ver) {
-                        Some(b) => Object::Builtin(b),
+                        // A native method (an asyncio future's, a deque's):
+                        // the in-line cache serves it as it serves a
+                        // function, when compiled code may take its count.
+                        Some(b) => {
+                            let b = Object::Builtin(b);
+                            if !cache.is_null() && builtin_counted() {
+                                fill_method_cache(&mut *cache, cls, ver, &b, ext, name);
+                            }
+                            b
+                        }
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
@@ -3817,7 +3856,14 @@ unsafe extern "C" fn h_load_method(
                                 ms.set(ver, &f);
                                 Object::Function(f)
                             }
-                            None => return 1,
+                            // A value the class holds (a static method's
+                            // function): the value with an empty self slot,
+                            // as the core loop's arm loads it.
+                            None => {
+                                return u32::from(!Interpreter::core_value_method(
+                                    code, name, pc, top,
+                                ))
+                            }
                         },
                     },
                 };
@@ -3853,11 +3899,57 @@ unsafe extern "C" fn h_load_method(
     }
 }
 
+/// `LOAD_SPECIAL` (the `pc`th instruction of `code`) of the receiver atop
+/// a `len`-deep stack, as the core loop's arm runs it
+/// (`Interpreter::core_load_special`): `0` the method and its self in
+/// place of the receiver (one deeper), the method remembered in `cache`
+/// for the in-line path (see `Lower::load_special`) when compiled code may
+/// take its count; anything else declined untouched.
+unsafe extern "C" fn h_load_special(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    cache: *mut MethodCache,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `LOAD_SPECIAL`s, its stack depth (at least one, with room for a
+    // push), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        let (code, pc, len) = (&*code, pc as usize, len as usize);
+        if Interpreter::core_load_special(code, code.instructions[pc], pc, st.stack, len, st.cap)
+            .is_none()
+        {
+            return 1;
+        }
+        // The method now sits under its receiver.
+        let (m, recv) = (&*st.stack.add(len - 1), &*st.stack.add(len));
+        if let Object::Instance(inst) = recv {
+            if matches!(m, Object::Function(_))
+                || (matches!(m, Object::Builtin(_)) && builtin_counted())
+            {
+                // SAFETY: an `Object` is 16 bytes; its second word is the
+                // payload. The class holds the method while the version
+                // stands.
+                let [head, word] = std::ptr::from_ref(m).cast::<[u64; 2]>().read();
+                let cache = &mut *cache;
+                cache.ver = inst.cls_raw().attr_version.get();
+                cache.head = head;
+                cache.func = word;
+            }
+        }
+        0
+    }
+}
+
 /// A method-load site's in-line cache (see `Lower::load_method`): the
-/// class version (`0` empty) whose plain function `func` (its payload
-/// word) the site loaded, and what proves an instance doesn't shadow it:
-/// the class's shared names `keys` (`0` none) and the name's position
-/// among them (an instance holding fewer values can't hold the name).
+/// class version (`0` empty) whose method `func` (its payload word: a
+/// plain function, or a native method whose count compiled code may take,
+/// see [`builtin_counted`]) the site loaded, and what proves an instance
+/// doesn't shadow it: the class's shared names `keys` (`0` none) and the
+/// name's position among them (an instance holding fewer values can't
+/// hold the name).
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct MethodCache {
@@ -3865,7 +3957,7 @@ pub(crate) struct MethodCache {
     func: u64,
     keys: u64,
     before: u32,
-    /// The function `Object`'s first word (its tag), `func` its second.
+    /// The method `Object`'s first word (its tag), `func` its second.
     head: u64,
     /// The site's other receiver classes (a polymorphic call), checked by
     /// the helper before its general path, most recent first.
@@ -3886,16 +3978,34 @@ const MC_VER: i32 = std::mem::offset_of!(MethodCache, ver) as i32;
 const MC_FUNC: i32 = std::mem::offset_of!(MethodCache, func) as i32;
 const MC_KEYS: i32 = std::mem::offset_of!(MethodCache, keys) as i32;
 const MC_BEFORE: i32 = std::mem::offset_of!(MethodCache, before) as i32;
+const MC_HEAD: i32 = std::mem::offset_of!(MethodCache, head) as i32;
+
+/// Whether compiled code takes a native method's count in line (the
+/// builtin variant is one of [`Tags::rc_counted`]'s), so a method cache
+/// may hold one.
+fn builtin_counted() -> bool {
+    static COUNTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COUNTED.get_or_init(|| {
+        tags().is_some_and(|t| {
+            let b = Object::Builtin(Rc::new(crate::object::BuiltinFn::new("sample", |_| {
+                Ok(Object::None)
+            })));
+            let tag = b.tag();
+            tag < 64 && t.rc_counted & (1i64 << tag) != 0
+        })
+    })
+}
 
 /// Record in `cache` that instances of `cls` at version `ver` load the
-/// plain function `f` for the name `co_names[name]` (the caller proved
+/// method `f` (a plain function, or a native method when
+/// [`builtin_counted`]) for the name `co_names[name]` (the caller proved
 /// this instance doesn't shadow it, and that `cls` keeps the default
-/// `__getattribute__`).
+/// `__getattribute__`). The class holds `f` while the version stands.
 fn fill_method_cache(
     cache: &mut MethodCache,
     cls: &crate::types::TypeObject,
     ver: u64,
-    f: &Rc<crate::object::PyFunction>,
+    f: &Object,
     ext: &CodeConstObjects,
     name: u32,
 ) {
@@ -3914,10 +4024,8 @@ fn fill_method_cache(
         }
         None => (0, 0),
     };
-    let obj = Object::Function(f.clone());
     // SAFETY: an `Object` is 16 bytes; its second word is the payload.
-    let [head, word] = unsafe { std::ptr::from_ref(&obj).cast::<[u64; 2]>().read() };
-    drop(obj);
+    let [head, word] = unsafe { std::ptr::from_ref(f).cast::<[u64; 2]>().read() };
     // The entry it replaces moves down the polymorphic list.
     if cache.ver != 0 && cache.ver != ver {
         cache.poly.copy_within(0..2, 1);
@@ -8053,6 +8161,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::PushNull
             | OpCode::LoadMethodAttr
             | OpCode::StoreAttr
+            | OpCode::DeleteAttr
             | OpCode::BuildTuple
             | OpCode::BuildList
             | OpCode::LoadDeref
@@ -9228,13 +9337,13 @@ impl<'a> Lower<'a> {
             OpCode::BinarySubscr if self.subscr_ref(pc) => true,
             OpCode::UnpackSequence if self.unpack_ref(pc, ins.arg as usize) => true,
             OpCode::StoreSubscr if self.store_subscr_ref(pc) => true,
+            OpCode::LoadSpecial => return self.load_special(pc),
             OpCode::BinarySubscr
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
             | OpCode::UnpackSequence
             | OpCode::UnpackEx
             | OpCode::LoadSuperAttr
-            | OpCode::LoadSpecial
             | OpCode::PushExcInfo
             | OpCode::CheckExcMatch
             | OpCode::PopExcept
@@ -9290,6 +9399,7 @@ impl<'a> Lower<'a> {
             }
             OpCode::LoadMethodAttr => return self.load_method(pc),
             OpCode::StoreAttr => return self.stack_store_attr(pc),
+            OpCode::DeleteAttr => return self.delete_attr(pc),
             OpCode::BuildTuple if (1..=3).contains(&ins.arg) => {
                 return self.build(pc, ins.arg as usize, false)
             }
@@ -12084,14 +12194,16 @@ impl<'a> Lower<'a> {
                 let ok = self.b.ins().bor(empty, held);
                 self.b.ins().brif(ok, hit, &[], helper, &[]);
                 self.b.switch_to_block(hit);
-                // The function's count, then the receiver up and the
-                // function in its place.
+                // The method's count, then the receiver up and the method
+                // (its tag word from the cache: a function or a native
+                // method) in its place.
                 let f = self.b.ins().load(types::I64, FLAGS, c, MC_FUNC);
+                let head = self.b.ins().load(types::I64, FLAGS, c, MC_HEAD);
                 let count = self.b.ins().load(types::I64, FLAGS, f, 0);
                 let count = self.b.ins().iadd_imm(count, 1);
                 self.b.ins().store(FLAGS, count, f, 0);
                 self.copy16(above, recv);
-                self.write_tag(recv, self.tags.function);
+                self.b.ins().store(FLAGS, head, recv, 0);
                 self.b.ins().store(FLAGS, f, recv, 8);
                 self.b.ins().jump(done, &[]);
             }
@@ -12101,6 +12213,93 @@ impl<'a> Lower<'a> {
         }
         self.b.switch_to_block(helper);
         self.load_method_helper(pc, cache_at, done)
+    }
+
+    /// `LOAD_SPECIAL` (`with`'s `__enter__` / `__exit__`) of the stack's
+    /// top: for an instance of the class the site last saw, the method it
+    /// cached (a type-only lookup: no instance can shadow it), the
+    /// receiver above it; anything else through [`h_load_special`], which
+    /// fills the cache.
+    fn load_special(&mut self, pc: usize) -> bool {
+        if self.depth == 0 {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let helper = self.b.create_block();
+        let done = self.b.create_block();
+        let fn_counted = self.tags.rc_counted & (1i64 << self.tags.function) != 0;
+        let cache: Box<MethodCache> = Box::default();
+        let cache_at = std::ptr::from_ref::<MethodCache>(&cache) as i64;
+        self.method_caches.push(cache);
+        let ptr = self.ptr;
+        let c = self.b.ins().iconst(ptr, cache_at);
+        match self.layout {
+            Some(l) if fn_counted => {
+                let l = *l;
+                let recv = self.slot_addr(self.depth - 1);
+                let above = self.slot_addr(self.depth);
+                let tag = self.tag_at(recv);
+                let not_inst =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+                self.branch_out(not_inst, helper);
+                let inst = self.b.ins().load(ptr, FLAGS, recv, 8);
+                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+                let ver = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, cls, l.type_attr_version);
+                let want = self.b.ins().load(types::I64, FLAGS, c, MC_VER);
+                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+                let unguarded = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+                let rflag = self.b.ins().iconst(
+                    ptr,
+                    std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+                );
+                let rshared = self.b.ins().uload8(types::I64, FLAGS, rflag, 0);
+                let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+                let other = self.b.ins().bor(unguarded, rshared);
+                let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+                let bad = self.b.ins().bor(unset, stale);
+                let bad = self.b.ins().bor(bad, other);
+                self.branch_out(bad, helper);
+                // The method's count, then the receiver up and the method in
+                // its place.
+                let f = self.b.ins().load(types::I64, FLAGS, c, MC_FUNC);
+                let head = self.b.ins().load(types::I64, FLAGS, c, MC_HEAD);
+                let count = self.b.ins().load(types::I64, FLAGS, f, 0);
+                let count = self.b.ins().iadd_imm(count, 1);
+                self.b.ins().store(FLAGS, count, f, 0);
+                self.copy16(above, recv);
+                self.b.ins().store(FLAGS, head, recv, 0);
+                self.b.ins().store(FLAGS, f, recv, 8);
+                self.b.ins().jump(done, &[]);
+            }
+            _ => {
+                self.b.ins().jump(helper, &[]);
+            }
+        }
+        self.b.switch_to_block(helper);
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let r = self
+            .call(
+                h_load_special as *const () as usize,
+                &[self.st, code, pcv, len, c],
+                true,
+            )
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        self.depth += 1;
+        self.set_last(pc);
+        true
     }
 
     /// The method load at `pc` whose site last loaded a builtin type's
@@ -12149,6 +12348,31 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
         self.depth += 1;
+        self.set_last(pc);
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// `DELETE_ATTR` of the stack's top through [`h_delete_attr`].
+    fn delete_attr(&mut self, pc: usize) -> bool {
+        if self.depth == 0 {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let r = self
+            .call(
+                h_delete_attr as *const () as usize,
+                &[self.st, code, pcv, len],
+                true,
+            )
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth -= 1;
         self.set_last(pc);
         self.check_released(pc + 1);
         true

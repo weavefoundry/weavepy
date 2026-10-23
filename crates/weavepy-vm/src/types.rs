@@ -184,6 +184,16 @@ pub(crate) enum Verdict {
     /// `AttributeError`: enum asks `hasattr(value, '__get__')` of every
     /// member value. Recorded like [`Self::TypeAttrMissing`].
     ValueAttrMissing = 7,
+    /// The class's instances finalize through the native asyncio `__del__`
+    /// `name` names (`"Future"` or `"Task"`): a Python subclass of the
+    /// native class that doesn't override it (see
+    /// `stdlib::asyncio_mod::finalizer_is_noop`).
+    NativeFinalizer = 8,
+    /// The class is a Python subclass of the native asyncio `Future` that
+    /// keeps its attribute access and the native methods a task step
+    /// awaits through (see `stdlib::asyncio_mod::behaves_native`); `name`
+    /// unused.
+    NativeFutureLike = 9,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
