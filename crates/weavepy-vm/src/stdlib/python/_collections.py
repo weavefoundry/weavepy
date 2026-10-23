@@ -207,6 +207,9 @@ class defaultdict(dict):
 
 _install_defaultdict(defaultdict)
 
+# `deque`'s default iterable (the empty tuple CPython's signature shows).
+_NO_ITEMS = ()
+
 
 class deque:
     """list-like container with fast appends and pops on either end.
@@ -238,7 +241,7 @@ class deque:
     # under).
     _abc_collection_flags = 1 << 5  # Py_TPFLAGS_SEQUENCE
 
-    def __init__(self, iterable=(), maxlen=None):
+    def __init__(self, iterable=_NO_ITEMS, maxlen=None):
         if maxlen is not None:
             if not isinstance(maxlen, int):
                 raise TypeError("an integer is required")
@@ -251,7 +254,9 @@ class deque:
         # compare against their snapshot and raise "deque mutated during
         # iteration" on mismatch.
         self._state = 0
-        self.extend(iterable)
+        # (`deque()` has nothing to extend with.)
+        if iterable is not _NO_ITEMS:
+            self.extend(iterable)
 
     @property
     def maxlen(self):

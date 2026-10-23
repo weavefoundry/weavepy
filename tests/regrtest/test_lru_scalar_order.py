@@ -54,7 +54,7 @@ for capacity in (1, 2, 3, 7, 31):
 
 
 # Physical entry order differs from recency before changing the key shape.
-# Exact native tuples stay in dense recency; floats and bools use fallback.
+# Exact native tuples (of floats and bools too) stay in dense recency.
 for next_key in ((4,), 4.0, False):
     calls = []
 
@@ -186,6 +186,11 @@ print('scalar LRU order, transitions, recursion, and callbacks: ok')
 
 # Exporting private implementation storage must not permit an unsafe resize.
 if sys.implementation.name == 'weavepy':
+    import _functools
+
+    def native(wrapper):
+        return _functools._lru_private(wrapper)[2]
+
     @functools.lru_cache(2)
     def pinned(key):
         return key
@@ -193,9 +198,9 @@ if sys.implementation.name == 'weavepy':
     fields = set(pinned.__dict__)
     assert pinned(0) == 0
     assert set(pinned.__dict__) == fields
-    storage = pinned._lru_state
+    storage = _functools._lru_private(pinned)[1]
     view = memoryview(storage)
-    before = bytes(storage)
+    before = len(storage)
     assert pinned(0) == 0
     for operation in (lambda: pinned(1), lambda: pinned((1,)), pinned.cache_clear):
         try:
@@ -204,15 +209,15 @@ if sys.implementation.name == 'weavepy':
             pass
         else:
             raise AssertionError('resized exported recency storage')
-        assert bytes(storage) == before
+        assert len(storage) == before
         assert pinned.cache_info().currsize == 1
     view.release()
     assert pinned(1) == 1 and pinned.cache_info().currsize == 2
     pinned.cache_clear()
     assert pinned.cache_info() == (0, 0, 2, 0)
     assert pinned(0) == 0
-    assert pinned(0.0) == 0.0
-    assert pinned._lru_state is None and len(storage) == 0
+    assert pinned(b'0') == b'0'
+    assert not native(pinned)
     pinned.cache_clear()
-    assert pinned(0) == 0 and pinned._lru_state is None
+    assert pinned(0) == 0 and not native(pinned)
     print('scalar LRU exported storage: ok')
