@@ -555,10 +555,13 @@ fn specialize_call_kw_by<'a>(
     names: impl ExactSizeIterator<Item = &'a str>,
 ) -> InlineCache {
     let code = f.code();
+    // (A closure binds the same way: its cells are the function's, not the
+    // call's. Cell variables of the code's own are bound by name.)
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
-        || !(code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty())
+        || !code.cellvars.is_empty()
+        || code.freevars.len() != f.closure.len()
     {
         return InlineCache::Cooldown(COOLDOWN);
     }
@@ -577,12 +580,13 @@ fn specialize_call_kw_by<'a>(
 /// The `CallPyKwNames` permutation of a keyword call of `f` (whose code is
 /// `code`) with `argc` positionals (a receiver included) and the keyword
 /// `names`, and the parameter slots the call fills: each keyword's slot in
-/// 4 bits (`KW_TO_VARKW` for one a `**kwargs` callee collects). Each name
-/// is tried first at the parameter its position gives it. `None` for any
-/// call the generic binder must take: `*args`, more than 8 keywords or 15
-/// parameter slots, replaced defaults, a keyword without a distinct
-/// keyword-bindable parameter (or `**kwargs`), a parameter left without a
-/// default.
+/// 4 bits (`KW_TO_VARKW` for one a `**kwargs` callee collects); surplus
+/// positionals go to a `*args` callee's tuple. Each name is tried first at
+/// the parameter its position gives it. `None` for any call the generic
+/// binder must take: surplus positionals without `*args`, more than 8
+/// keywords or 15 parameter slots, replaced defaults, a keyword without a
+/// distinct keyword-bindable parameter (or `**kwargs`), a parameter left
+/// without a default.
 pub fn kw_perm<'a>(
     f: &Rc<crate::object::PyFunction>,
     code: &weavepy_compiler::CodeObject,
@@ -593,24 +597,26 @@ pub fn kw_perm<'a>(
     let npos = code.arg_count as usize;
     let total = npos + code.kwonly_count as usize;
     let kwc = names.len();
-    if code.has_varargs
-        || (f.defaults_maybe_overridden()
-            && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
+    if (f.defaults_maybe_overridden()
+        && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
         // Nibble 15 is `KW_TO_VARKW`, which the binders take as "into
         // the `**kwargs` dict" for any callee: slot 15 can't be encoded.
         || total > 15
-        // A `**kwargs` callee's dict slot follows the parameters.
-        || (code.has_varkeywords && code.varnames.len() <= total)
+        // A `*args` tuple's and a `**kwargs` dict's slots follow the
+        // parameters.
+        || code.varnames.len()
+            < total + usize::from(code.has_varargs) + usize::from(code.has_varkeywords)
         || kwc == 0
         || kwc > 8
-        || argc > npos
+        || (argc > npos && !code.has_varargs)
     {
         return None;
     }
     let mut perm: u32 = 0;
-    let mut covered: u32 = (1u32 << argc) - 1;
+    let direct = argc.min(npos);
+    let mut covered: u32 = (1u32 << direct) - 1;
     for (j, name) in names.enumerate() {
-        let at = argc + j;
+        let at = direct + j;
         let bindable = if at < total && code.varnames[at] == name {
             Some(at)
         } else {

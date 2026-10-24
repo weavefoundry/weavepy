@@ -11919,6 +11919,25 @@ unsafe fn call_dyn_impl(
         // SAFETY: as above.
         return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
     }
+    // A keyword call of any other plain function (or a bound method over
+    // one) binds by name, as the interpreter's keyword calls do: no name
+    // strings.
+    // SAFETY: per the function contract — same live buffers.
+    if let Some((f, args, names_obj, kwvals)) = (kwc > 0)
+        .then(|| unsafe { dyn_kw_named_operands(jf, ctx, &callee, argc, kwc, names) })
+        .flatten()
+    {
+        let Object::Tuple(name_items) = &names_obj else {
+            unreachable!("checked by dyn_kw_named_operands")
+        };
+        // (Not charged, as above: tier-1 binds the same way.)
+        ctx.dirty = true;
+        let called = call_with_activation_shell(interp, ctx, jf, |i| {
+            i.call_python_kw_names(&f, args, name_items, kwvals)
+        });
+        // SAFETY: as above.
+        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
+    }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
     for j in 0..n {
@@ -12157,6 +12176,70 @@ fn dyn_leaf_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, int_result: 
     }
     ctx.parked = Some(v);
     CallStatus::Boxed as i64
+}
+
+/// A dynamic keyword call of a plain function (or a bound method over one)
+/// that its site's permutation doesn't bind: the function, the positional
+/// operands (the receiver first), the site's names tuple and the keyword
+/// values, unmarshaled. The site that has no specialization yet decides
+/// it here, as the interpreter's `CALL_KW` handler would, so its next call
+/// can take [`dyn_kw_site_bind`]. `None` (nothing consumed) for anything
+/// else.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`]; the call site's pc is in
+/// `jf.deopt_pc` (stored before every call helper runs).
+unsafe fn dyn_kw_named_operands(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    callee: &Object,
+    argc: u32,
+    kwc: u32,
+    names: u32,
+) -> Option<(Rc<PyFunction>, Vec<Object>, Object, Vec<Object>)> {
+    // SAFETY: per the function contract, the activation keeps its code
+    // object alive.
+    let code = unsafe { &*ctx.code_ptr };
+    let names_obj = crate::code_const_objects(code).get(names as usize)?;
+    let Object::Tuple(name_items) = names_obj else {
+        return None;
+    };
+    let (f, recv) = match callee {
+        Object::Function(f) => (f, None),
+        Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+            Object::Function(f) => (f, Some(&bm.receiver)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if name_items.len() != kwc as usize || !name_items.iter().all(|n| matches!(n, Object::Str(_))) {
+        return None;
+    }
+    let (argc, kwc) = (argc as usize, kwc as usize);
+    let mut args: Vec<Object> = Vec::with_capacity(argc + usize::from(recv.is_some()));
+    args.extend(recv.cloned());
+    let mut kwvals: Vec<Object> = Vec::with_capacity(kwc);
+    for j in 0..argc + kwc {
+        // SAFETY: native code wrote `argc + kwc` entries, and the buffers
+        // are `max_call_args` wide.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        let v = unpack_pins(bits, tag, &ctx.pins);
+        if j < argc {
+            args.push(v);
+        } else {
+            kwvals.push(v);
+        }
+    }
+    if matches!(
+        code.caches.get(jf.deopt_pc),
+        weavepy_compiler::InlineCache::Empty
+    ) {
+        let decision =
+            crate::specialize::attempt_specialize_call_kw_names(f, args.len(), name_items);
+        code.caches.set(jf.deopt_pc, decision);
+    }
+    Some((f.clone(), args, names_obj.clone(), kwvals))
 }
 
 /// Bind a dynamic keyword call's marshaled operands for a plain function
