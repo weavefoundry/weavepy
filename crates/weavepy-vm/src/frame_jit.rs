@@ -4627,7 +4627,7 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
         let Some(ext) = crate::code_vm_ext(&cframe.code) else {
             return false;
         };
-        let locals: &mut Vec<Object> = &mut *cframe.locals.as_ptr();
+        let locals: &mut Vec<Object> = cframe.locals.storage();
         let nlocals = locals.len();
         let Some(native) = ext.frame_jit.get(nlocals) else {
             return false;
@@ -5049,7 +5049,7 @@ unsafe extern "C" fn h_property(
         if matches!(&*recv, Object::Frame(_) | Object::Code(_)) && (local != 0 || droppable(&*recv))
         {
             let code = &*code;
-            let running = (Rc::as_ptr(&(*st.frame).locals).cast::<()>(), pc as u32);
+            let running = ((*st.frame).locals.identity(), pc as u32);
             let v = code
                 .names
                 .get(code.instructions[pc].arg as usize)
@@ -5521,7 +5521,7 @@ unsafe fn direct_enter(
         caller.pc = pc as u32 + 1;
         let fr: &mut crate::Frame = &mut act.frame;
         // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = &mut *fr.locals.as_ptr();
+        let locals = fr.locals.storage();
         let base = st.stack;
         match args {
             BindArgs::Positional {
@@ -5689,7 +5689,7 @@ unsafe fn run_pushed_directly(
         }
         let cframe = &*callee;
         let ext = crate::code_vm_ext(&cframe.code)?;
-        let nlocals = (*cframe.locals.as_ptr()).len();
+        let nlocals = cframe.locals.len();
         let Some(native) = ext.frame_jit.get(nlocals) else {
             ext.frame_jit.warm_switched(&cframe.code, ext, nlocals);
             return stats::declined("no body");
@@ -5750,7 +5750,7 @@ unsafe fn direct_run<const PUSHED: bool>(
             stack.reserve(native.need() - stack.len());
         }
         let mut cst = State {
-            locals: (*cframe.locals.as_ptr()).as_mut_ptr(),
+            locals: cframe.locals.as_mut_ptr(),
             stack: stack.as_mut_ptr(),
             len: stack.len(),
             cap: stack.capacity(),
@@ -5834,7 +5834,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                             || ((cframe.code.cellvars.is_empty() || a.owns_cells)
                                 && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))))
                 })
-                && Rc::strong_count(&cframe.locals) == 1
+                && !cframe.locals.is_shared()
                 && !interp.countdown_out(2)
                 && crate::hot_gates::loop_gen() == st.snap_gen;
             if clean {
@@ -5852,7 +5852,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                 } else {
                     v
                 };
-                crate::release_locals(&mut *cframe.locals.as_ptr());
+                crate::release_locals(cframe.locals.storage());
                 drop(done.guard.take());
                 // A `functools.lru_cache` miss's function returned: its
                 // result is stored before the caller takes it.

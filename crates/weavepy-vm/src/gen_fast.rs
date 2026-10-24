@@ -436,7 +436,7 @@ impl Interpreter {
             // A body that needs its native form, compiled.
             if steady == CODE_NATIVE || (first && start == CODE_NATIVE) {
                 // SAFETY: a length read with nothing running.
-                let n = unsafe { (*frame.locals.as_ptr()).len() };
+                let n = frame.locals.len();
                 return ext.frame_jit.get(n).is_some();
             }
         }
@@ -1138,7 +1138,7 @@ impl Interpreter {
         if partial {
             frame.sent_consumed = false;
         } else {
-            crate::push_fast(&mut frame.stack, sent);
+            frame.stack.push_fast(sent);
         }
         // (A partial body may have stopped with nothing on its stack.)
         debug_assert!(partial || !frame.stack.is_empty());
@@ -1146,7 +1146,7 @@ impl Interpreter {
         #[cfg(feature = "jit")]
         let handed = {
             // SAFETY: a length read with nothing running.
-            let n = unsafe { (*frame.locals.as_ptr()).len() };
+            let n = frame.locals.len();
             match ext.frame_jit.get(n) {
                 Some(native) => match self.gen_native_yield(frame, native, snap_gen, depth, dead) {
                     Ok(v) => {
