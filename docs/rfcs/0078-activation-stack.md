@@ -122,17 +122,44 @@ evaluator (`leaf_plan`) and the generator fast step (`gen_fast`).
 
 Each stage keeps the gates passing and lands on its own:
 
-1. **Frame storage behind an interface.** `Frame::locals` and
-   `Frame::stack` become types with the API their users need (no
-   behavior change), so their representation can move.
-2. **Records on a per-thread stack** for the activations the quiet loop
-   runs inline (today's `InlineAct`), linked by `prev`; the pending list
-   walks the links instead of its own vector.
+1. **Frame storage behind an interface** (done, #93). `Frame::locals`
+   and `Frame::stack` are types with the API their users need, so their
+   representation can move.
+2. **Lazy activations for direct calls.** A call between compiled
+   functions binds its callee into an ordinary `InlineAct` with a
+   persistent native state, but doesn't register it with the core loop
+   (the switch's activation vector, the running-frame handles) or the
+   spine (the caller's pending entry). It registers, outermost first,
+   when the callee's native code leaves for the core loop, or before a
+   helper that may run Python code, switch activations or walk the spine.
+   Tier 2 already runs its native calls this way (frameless activations
+   whose fallback helpers push their spine shells), at about 100
+   instructions a call against the frame JIT's 520.
 3. **The frame JIT on records**: compiled code addresses the record
-   directly, direct calls push records, `State` goes.
-4. **Generators on records**, and the general `step` loop's frames.
+   directly, binds and checks a direct call in line, and `State` goes.
+4. **Records for the core loop and generators**: inline activations,
+   resumes and the general loop's frames on one per-thread stack linked
+   by `prev`, replacing the pending list and the switch's vector.
 5. **Delete** the frameless leaf evaluator and the generator fast step,
    once calls and resumes are as cheap as what they replaced.
+
+Measured before stage 2 (callgrind, a compiled caller calling a compiled
+callee that needs an activation), the direct call retires about 520
+instructions in its helpers: 84 building the callee's `State`, running it
+and finishing the return; 66 for the site cache and admission checks; 34
+in the entry helper; about 60 binding; about 45 in reference counts; about
+100 moving values; and about 130 in the pending list, the switch, the
+recursion guard and parking. No step is large, so the stages pay off
+together rather than one at a time. Linking records by `prev` alone
+(the original stage 2) would save only the pending vector's push and pop,
+since that list already holds exactly the shell-less callers.
+
+Two findings bear on stage 5. The frameless paths are no longer cheaper
+than an activation: a pure leaf call costs about 490 instructions and an
+effect (site) leaf about 1,040. But turning them off costs 1.25 to 1.7
+times as much on workloads whose callers are native code (`sorted`'s key
+functions, `oo_patterns`), so they can go only once calls from native
+code are cheap too.
 
 ## Drawbacks
 

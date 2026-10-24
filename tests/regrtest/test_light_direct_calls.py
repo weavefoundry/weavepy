@@ -1,7 +1,8 @@
 """Direct calls between compiled functions keep every observable behavior:
 the frame chain, tracebacks, locals, finalizer timing, the recursion limit,
 and warnings' stack levels, from hot callees that never leave native code
-and from ones that do."""
+and from ones that do, and the frame chain that Python code their helpers
+run (a property, an `__eq__`, a finalizer) observes."""
 
 import gc
 import sys
@@ -165,12 +166,106 @@ def warning_levels():
     assert len(lines) == 1, lines
 
 
+def chain():
+    """The function names from the caller up, to the module."""
+    f = sys._getframe(1)
+    names = []
+    while f is not None:
+        names.append(f.f_code.co_name)
+        f = f.f_back
+    return names[: names.index("<module>") + 1]
+
+
+class Probe:
+    """Python code a callee's helpers run (a getter, an `__eq__`, a
+    finalizer), each recording the frame chain it sees."""
+
+    seen = []
+
+    @property
+    def value(self):
+        Probe.seen.append(chain())
+        return 1
+
+    @property
+    def failing(self):
+        Probe.seen.append(chain())
+        raise KeyError("probe")
+
+    def __eq__(self, other):
+        Probe.seen.append(chain())
+        return True
+
+    __hash__ = object.__hash__
+
+
+class Dying:
+    def __del__(self):
+        Probe.seen.append(chain())
+
+
+def reads_property(p):
+    return p.value + 1
+
+
+def compares(p, q):
+    return p == q
+
+
+def drops(x):
+    d = Dying()
+    del d
+    return x
+
+
+def catches(p):
+    try:
+        return p.failing
+    except KeyError:
+        return -1
+
+
+def counts(n):
+    for i in range(n):
+        yield i
+
+
+def walks_generator(n):
+    return sum(counts(n)) + len(chain())
+
+
+def via_property(p):
+    return reads_property(p)
+
+
+def python_from_helpers():
+    # Python code that a lazily running callee's helpers run sees the whole
+    # chain, the callee included, in order.
+    p, q = Probe(), Probe()
+    for _ in range(400):
+        Probe.seen.clear()
+        assert reads_property(p) == 2
+        assert compares(p, q)
+        assert drops(3) == 3
+        assert catches(p) == -1
+        assert via_property(p) == 2
+        assert Probe.seen == [
+            ["value", "reads_property", "python_from_helpers", "<module>"],
+            ["__eq__", "compares", "python_from_helpers", "<module>"],
+            ["__del__", "drops", "python_from_helpers", "<module>"],
+            ["failing", "catches", "python_from_helpers", "<module>"],
+            ["value", "reads_property", "via_property", "python_from_helpers", "<module>"],
+        ], Probe.seen
+        assert walks_generator(5) == 10 + 3
+
+
 for _ in range(3):
     hot_calls()
     introspection()
     finalizers()
     recursion()
     warning_levels()
+    python_from_helpers()
 
 gc.collect()
 print("ok")
