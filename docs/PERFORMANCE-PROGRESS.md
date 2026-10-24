@@ -20,26 +20,31 @@ CPython; below 1.00 means WeavePy is faster or smaller.
 | `-c pass` startup | 0.74 (19.2 ms against 25.9 ms) |
 | Importing `json`, `re`, `collections`, `dataclasses` | 1.11 time, 1.38 memory |
 
-With the open PRs merged together (October 22: #87 to #92 and #95 to
-#97; not yet #98 or the RFC 0078 stack #86, #93 and #94), a PGO build
-measures:
+All the work below is merged (PRs #86 to #99, October 23). A PGO build of
+`main` at `1291398f` (everything but the last three, #97, #93 and #94),
+measured head to head with the `4a2ca7f` baseline in one session:
 
-| Measure | `main` | Merged |
+| Measure | Baseline | Merged |
 | --- | ---: | ---: |
-| Warm time (geomean) | 1.276 | 1.221 |
-| Cold time | 1.506 | 1.427 |
-| Peak resident memory | 1.710 | 1.660 |
-| Instructions (quick build) | 1.318 | 1.261 |
+| Warm time against CPython (geomean) | 1.276 | 1.203 |
+| Cold time against CPython | 1.506 | 1.437 |
+| Peak memory against the baseline | 1.000 | 0.960 |
+| Instructions against CPython (quick build) | 1.318 | about 1.25 |
 
-Head to head with `main`'s PGO build the merged warm time is 0.953;
-`closures_decorators` 0.59, `coroutines` 0.81, `context_managers` 0.85,
-`exceptions` 0.87, `nqueens` 0.88. #98 alone takes `async_tree` and
-`context_managers` to 0.82 to 0.84 of `main`'s wall time (quick builds).
+The warm time is 0.951 of the baseline's: `closures_decorators` 0.62,
+`async_tree` 0.77, `coroutines` 0.81, `context_managers` 0.88,
+`exceptions` 0.88, `logging_mix` 0.91, `nqueens` 0.92, `sudoku` 0.93.
+CPython's own peak memory moves between sessions (the baseline measured
+1.71 times it on October 20 and 1.79 on October 23), so memory is compared
+with the baseline directly. #97 takes the 26 call micro-ops' geomean from
+1.41 to 1.26 times CPython, and #94 a direct call about 88 instructions
+lower (`go` 0.96).
 
-Nine workloads beat CPython's warm time (`pickle_roundtrip` 0.59 is the
-best). The worst are `context_managers` 2.44, `async_tree` 2.33, `deepcopy`
-2.08, `closures_decorators` 2.02, `stdlib_utils` 1.94, and `logging_mix`
-1.75.
+Eight workloads beat CPython's warm time (`pickle_roundtrip` 0.57,
+`json_roundtrip` 0.69, `decimal_telco` 0.71, `scimark` 0.72). The worst
+are `context_managers` 2.11, `async_tree` 1.99, `stdlib_utils` 1.95,
+`deepcopy` 1.93, `mini_interpreter` 1.65, `tomllib_loads` 1.61, and
+`logging_mix` and `go` 1.57.
 
 Commands: `tools/pybench/run.py --weavepy BIN` for time and memory; see
 `tools/pybench/README.md`.
@@ -205,12 +210,17 @@ branch and pull request.
   collections pacing the older generations. `async_tree` 0.864,
   `context_managers` 0.907.
 
-**Merge order.** The agents' PRs (#88 to #92, #95 to #98, and #87) each
-branch from `main` and merge together with two small conflicts (#92's doc
-comment against #87's, #96's never-run blocks against #91's chunk fields;
-both are additive). The RFC 0078 stack (#86, then #93, then #94) reworks
-the direct-call code they all touch; it is cheapest merged last and
-rebased then.
+**Merged** (October 23). The agents' PRs went first, then the RFC 0078
+stack (#86, #93, #94) on top of them. CI's bench gate caught two
+regressions the workload suite doesn't cover, both fixed before merging:
+`dict_ops` 1.3 to 1.4 times slower in #96 (never-run blocks pruned in code
+a loop made hot mid-call; pruning now applies only to code compiled from
+call heat) and `call_overhead` 2.2 to 2.6 times slower in #97 (charging
+keyword calls to tier 2's call budget retired mixed loops to tier 1; that
+commit was reverted). #99 pins python-dateutil in its ecosystem selftest,
+whose 3.0.0 release broke every run's shard 2 of 3. Merging #97 onto #86's
+single bind path took a port of its extended-parameter binding into
+`direct_enter`.
 
 **Checkpoint, PRs #86 to #92 merged together** (PGO, October 21, before
 #91's cost-aware cuts): against CPython, warm 1.24 to 1.27 (two runs),
@@ -287,18 +297,17 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. Merge the open PRs (order above) and rebase the RFC 0078 stack.
-2. RFC 0078 stage 3: compiled code guards a warm direct call's site, binds
+1. RFC 0078 stage 3: compiled code guards a warm direct call's site, binds
    into its persistent record and enters the callee in line.
-3. Generator expressions without a throwaway function object (about 5% on
+2. Generator expressions without a throwaway function object (about 5% on
    `nqueens`).
-4. Cheaper chunk crossings, so the compile limit can come down to about
+3. Cheaper chunk crossings, so the compile limit can come down to about
    1,200 IR instructions (about 1 MB more off the peak).
-5. Code objects: about 2 MiB for `tomllib_loads`' 2,100.
-6. Frame-compile cost in the first warm repetitions (`stdlib_utils`,
+4. Code objects: about 2 MiB for `tomllib_loads`' 2,100.
+5. Frame-compile cost in the first warm repetitions (`stdlib_utils`,
    `logging_mix`): Cranelift spends about 7,400 host instructions per IR
    instruction, and about 20% of the compiled bytecode still never ran.
-7. Immortal shared objects (one-character strings, interned names), whose
+6. Immortal shared objects (one-character strings, interned names), whose
    reference counts CPython never touches: about 100 instructions per
    string helper in `tomllib_loads` are reference counting.
 
