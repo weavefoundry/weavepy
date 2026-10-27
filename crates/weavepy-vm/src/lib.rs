@@ -60051,7 +60051,10 @@ impl Interpreter {
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
         let n = args.len() + usize::from(recv.is_some());
+        // (A surplus positional must raise, not bind a keyword-only
+        // parameter: the full binder's.)
         if n > MAX_ARGS
+            || n > code.arg_count as usize
             || !code_is_pure_leaf(code)
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
