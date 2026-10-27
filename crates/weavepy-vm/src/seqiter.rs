@@ -166,6 +166,9 @@ impl Interpreter {
         out: &mut Vec<Object>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
+        if chain_drain(l, out) {
+            return Ok(true);
+        }
         let (func, source, filter) = match &*l.state.borrow() {
             LazyIterKind::Map { func, iters, .. } if iters.len() == 1 => {
                 (func.clone(), iters[0].clone(), false)
@@ -1204,6 +1207,103 @@ fn ready_next(it: &Object) -> Option<Object> {
 /// ahead of the general one): `None` when the step needs the general
 /// path, nothing having been consumed. Exhaustion of a source is left to
 /// that path, which releases it.
+/// [`Interpreter::seq_drain`] of an `itertools.chain` whose iterables are
+/// lists and tuples, read from a list or tuple of them (`chain(xs, ys)`,
+/// `chain.from_iterable([xs, ys])`): every remaining item is copied into
+/// `out` at once, and the chain is exhausted (`true`). A chain reaching any
+/// other iterable stops before it (`false`), the items copied so far
+/// consumed, for the step-by-step drain to go on from. No Python code runs.
+fn chain_drain(l: &PyLazyIter, out: &mut Vec<Object>) -> bool {
+    // The items of a plain sequence (a list's, a tuple's) from `from`.
+    fn copy_from(v: &Object, from: usize, out: &mut Vec<Object>) -> Option<()> {
+        match v {
+            Object::List(items) => {
+                let items = items.try_borrow().ok()?;
+                out.extend_from_slice(items.get(from..).unwrap_or(&[]));
+            }
+            Object::Tuple(items) => out.extend_from_slice(items.get(from..).unwrap_or(&[])),
+            _ => return None,
+        }
+        Some(())
+    }
+    // SAFETY: nothing below runs code; the view ends with this call.
+    let Some(LazyIterKind::Chain { source, active }) = (unsafe { l.state.peek_mut() }) else {
+        return false;
+    };
+    // The iterable in progress, a list or tuple cursor, runs out first.
+    if let Some(Object::Iter(c)) = &*active {
+        let Ok(mut c) = c.try_borrow_mut() else {
+            return false;
+        };
+        match &mut *c {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                {
+                    let Ok(v) = items.try_borrow() else {
+                        return false;
+                    };
+                    out.extend_from_slice(v.get(*index..).unwrap_or(&[]));
+                }
+                // Exhausted: detached from the list, as its own last step
+                // leaves it (see `PyIterator::next_value`).
+                let old = std::mem::replace(items, Rc::new(RefCell::new(Vec::new())));
+                *index = 0;
+                drop(old);
+            }
+            PyIterator::Tuple { items, index } => {
+                out.extend_from_slice(items.get(*index..).unwrap_or(&[]));
+                *index = items.len();
+            }
+            _ => return false,
+        }
+    } else if active.is_some() {
+        return false;
+    }
+    let old_active = active.take();
+    // Then the iterables still to come, each a list or tuple.
+    let done = match source.as_ref() {
+        None => true,
+        Some(Object::Iter(c)) => {
+            let Ok(mut c) = c.try_borrow_mut() else {
+                *active = old_active;
+                return false;
+            };
+            match &mut *c {
+                PyIterator::List { items, index, .. } => match items.try_borrow() {
+                    Ok(items) => loop {
+                        match items.get(*index) {
+                            Some(v) if copy_from(v, 0, out).is_some() => *index += 1,
+                            Some(_) => break false,
+                            None => break true,
+                        }
+                    },
+                    Err(_) => false,
+                },
+                PyIterator::Tuple { items, index } => loop {
+                    match items.get(*index) {
+                        Some(v) if copy_from(v, 0, out).is_some() => *index += 1,
+                        Some(_) => break false,
+                        None => break true,
+                    }
+                },
+                _ => false,
+            }
+        }
+        Some(_) => false,
+    };
+    if done {
+        // Exhausted, as the step's own end leaves it.
+        let old_source = source.take();
+        drop((old_source, old_active));
+    } else {
+        drop(old_active);
+    }
+    done
+}
+
 pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     // SAFETY: nothing below runs code; the view ends with this call.
     let st = unsafe { l.state.peek_mut() }?;
