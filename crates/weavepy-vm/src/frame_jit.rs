@@ -5754,10 +5754,41 @@ unsafe extern "C" fn h_call_ctor(
     unsafe {
         let s = &mut *st;
         let argc = (pc_argc >> 32) as usize;
+        if argc == 1 && type_of_call(s, len as usize - 3) {
+            return 0;
+        }
         if ctor_store_init(s, &*code, pc as usize, argc, len as usize) {
             return 0;
         }
         h_call(st, code, ext, pc, len)
+    }
+}
+
+/// `type(x)` (its operands from `start`): `x`'s class in the callee's
+/// slot, as `type`'s one-argument form answers, when the callee is `type`
+/// itself and `x` leaves by a plain decrement. `false` touched nothing.
+///
+/// # Safety
+///
+/// As [`h_call`]'s, for a `CALL 1` whose callee is at `start` atop a
+/// stack `start + 3` deep.
+#[inline(always)]
+unsafe fn type_of_call(st: &mut State, start: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let base = st.stack;
+        let (Object::Type(t), Object::Unbound) = (&*base.add(start), &*base.add(start + 1)) else {
+            return false;
+        };
+        let x = &*base.add(start + 2);
+        if !Rc::ptr_eq(t, &crate::builtin_types::builtin_types().type_) || !droppable(x) {
+            return false;
+        }
+        let cls = Object::Type(crate::builtins::class_of(x));
+        crate::release_operands(&*st.interp, base.add(start), 3);
+        base.add(start).write(cls);
+        st.len = start + 1;
+        true
     }
 }
 
@@ -7668,6 +7699,9 @@ unsafe extern "C" fn h_call_type(
         let site = &*site;
         let lenu = len as usize;
         let start = lenu - site.argc - 2;
+        if site.argc == 1 && type_of_call(s, start) {
+            return 0;
+        }
         let base = s.stack;
         let hit = matches!(&*base.add(start), Object::Type(t) if Rc::ptr_eq(t, &site.cls))
             && matches!(&*base.add(start + 1), Object::Unbound);
