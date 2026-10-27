@@ -8981,10 +8981,10 @@ impl Interpreter {
             },
         };
         let result = match (done.binop.take(), result) {
-            (Some((op, inplace, cls)), Ok(v))
+            (Some((op, inplace, l, r)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
-                Err(binop_type_error(op, inplace, &cls))
+                Err(binop_type_error(op, inplace, &l, &r))
             }
             (_, result) => result,
         };
@@ -28343,27 +28343,48 @@ impl Interpreter {
     /// defines no reflected method (nor, augmented, an in-place one).
     /// Called with `(a, b)`, its `NotImplemented` is the operator's
     /// `TypeError` ([`binop_type_error`]).
+    ///
+    /// So is a plain instance's method over a built-in scalar, string or
+    /// immutable sequence (`path / "name"`): CPython's `binary_op1` calls
+    /// the instance's method first (the built-in type is no subclass of
+    /// the class), and the built-in type's own slot answers
+    /// `NotImplemented` for an operand it doesn't know, which leaves the
+    /// `TypeError`. (Not a repetition, which a sequence would try with the
+    /// instance's `__index__`, nor `**`, whose message names `pow()`.)
     fn binop_instance_dunder(
         a: &Object,
         b: &Object,
         op: BinOpKind,
         inplace: bool,
     ) -> Option<Rc<crate::object::PyFunction>> {
-        let (Object::Instance(ai), Object::Instance(bi)) = (a, b) else {
+        let Object::Instance(ai) = a else {
             return None;
         };
+        let same = match b {
+            Object::Instance(bi) => std::ptr::eq(ai.cls_raw(), bi.cls_raw()),
+            Object::Str(_) | Object::Bytes(_) | Object::Tuple(_) => {
+                !matches!(op, BinOpKind::Mult | BinOpKind::Pow)
+            }
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None => {
+                op != BinOpKind::Pow
+            }
+            _ => false,
+        };
+        let mixed = !matches!(b, Object::Instance(_));
         let cls = ai.cls_raw();
         let k = op as usize;
         let (dunder, rdunder) = binop_dunders(op);
-        if !std::ptr::eq(cls, bi.cls_raw())
+        if !same
             || ai.native.get().is_some()
+            || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
             || (inplace
                 && !Self::class_lacks(
                     cls,
                     std::ptr::addr_of!(IBINOP_KEYS[k]) as usize,
                     op.inplace_dunder(),
                 ))
-            || !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder)
+            || (!mixed
+                && !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder))
         {
             return None;
         }
@@ -69219,8 +69240,8 @@ struct InlineAct {
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
-    /// the operands' class).
-    binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
+    /// the left and right operands' classes).
+    binop: Option<(BinOpKind, bool, Rc<TypeObject>, Rc<TypeObject>)>,
     /// The caller takes no result (a property setter's activation for a
     /// `STORE_ATTR`, see `Interpreter::try_inline_setter`).
     discard: bool,
@@ -75440,13 +75461,18 @@ static IBINOP_KEYS: [u8; 16] = [0; 16];
 
 /// The `TypeError` of a `BINARY_OP` of `op` (augmented when `inplace`)
 /// whose method returned `NotImplemented` for two instances of `cls`.
-fn binop_type_error(op: BinOpKind, inplace: bool, cls: &TypeObject) -> RuntimeError {
+fn binop_type_error(
+    op: BinOpKind,
+    inplace: bool,
+    left: &TypeObject,
+    right: &TypeObject,
+) -> RuntimeError {
     type_error(format!(
         "unsupported operand type(s) for {}{}: '{}' and '{}'",
         op.as_str(),
         if inplace { "=" } else { "" },
-        cls.name,
-        cls.name
+        left.name,
+        right.name
     ))
 }
 

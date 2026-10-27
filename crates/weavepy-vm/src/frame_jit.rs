@@ -5040,10 +5040,11 @@ const CELLS_BIT: u32 = 1 << 31;
 /// or keyword-only parameters (see `Interpreter::fill_extended_raw`).
 const EXTENDED_BIT: u32 = 1 << 30;
 
-/// `BINARY_OP` (the `pc`th instruction of `code`) over the instances at
-/// stack slots `slot` and above it whose class's method runs alone (see
-/// `Interpreter::binop_instance_dunder`): the method called directly
-/// ([`direct_call`]) as `method(a, b)`, the result at `slot`. `0` done,
+/// `BINARY_OP` (the `pc`th instruction of `code`) over the instance and
+/// the operand at stack slots `slot` and above it whose class's method
+/// runs alone (see `Interpreter::binop_instance_dunder`): the method
+/// called directly ([`dunder_call`]) as `method(a, b)`, the result at
+/// `slot`. `0` done,
 /// `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
 /// [`h_call`]'s.
 unsafe extern "C" fn h_binop_dunder(
@@ -5073,7 +5074,11 @@ unsafe extern "C" fn h_binop_dunder(
             return CALL_DECLINED;
         };
         let cls = a.cls();
-        dunder_call(st, pc, slot, 2, f, site, Some((op, inplace, &cls)))
+        let right = match &*at.add(1) {
+            Object::Instance(_) => cls.clone(),
+            b => crate::builtins::class_of(b),
+        };
+        dunder_call(st, pc, slot, 2, f, site, Some((op, inplace, &cls, &right)))
     }
 }
 
@@ -5131,17 +5136,22 @@ unsafe fn dunder_call(
     n: usize,
     f: Rc<crate::object::PyFunction>,
     site: *mut DirectSite,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
 ) -> u32 {
     debug_assert!((1..=3).contains(&n));
     // SAFETY: the caller's contract.
     unsafe {
         let at = st.stack.add(slot);
         let not_implemented = |st: &mut State, v: &Object| match binop {
-            Some((op, inplace, cls)) if v.is_same(&crate::vm_singletons::not_implemented()) => {
+            Some((op, inplace, a, b)) if v.is_same(&crate::vm_singletons::not_implemented()) => {
                 st.len = slot;
                 st.pc = pc + 1;
-                st.err = Some(crate::binop_type_error(op, inplace, cls));
+                st.err = Some(crate::binop_type_error(op, inplace, a, b));
                 true
             }
             _ => false,
@@ -5565,7 +5575,12 @@ unsafe fn direct_call_out(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
     unsafe { direct_call::<false>(st, pc, start, len, site, binop, None) }
@@ -5590,7 +5605,12 @@ unsafe fn direct_call<const CALL: bool>(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
@@ -5755,7 +5775,12 @@ unsafe fn direct_enter(
     native: &Native,
     nested: u32,
     site: *mut DirectSite,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
@@ -6019,7 +6044,12 @@ unsafe fn direct_run<const PUSHED: bool>(
     native: &Native,
     saved_last: *mut usize,
     nested: u32,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
     from: usize,
     site: *mut DirectSite,
 ) -> u32 {
@@ -6083,7 +6113,12 @@ unsafe fn direct_done<const PUSHED: bool>(
     callee: *mut crate::Frame,
     depth: usize,
     saved_last: *mut usize,
-    binop: Option<(BinOpKind, bool, &Rc<crate::types::TypeObject>)>,
+    binop: Option<(
+        BinOpKind,
+        bool,
+        &Rc<crate::types::TypeObject>,
+        &Rc<crate::types::TypeObject>,
+    )>,
     site: *mut DirectSite,
     status: u32,
     cst: &mut State,
@@ -6179,8 +6214,8 @@ unsafe fn direct_done<const PUSHED: bool>(
         // The activation goes on as any other (see `InlineAct::binop`).
         let leave = |a: &mut crate::InlineAct| {
             a.direct = false;
-            if let Some((op, inplace, cls)) = binop {
-                a.binop = Some((op, inplace, cls.clone()));
+            if let Some((op, inplace, l, r)) = binop {
+                a.binop = Some((op, inplace, l.clone(), r.clone()));
             }
         };
         if status == DIRECT_RET {
