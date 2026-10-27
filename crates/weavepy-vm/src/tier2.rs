@@ -840,9 +840,9 @@ struct JitState {
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process: when start-up begins with the
-/// JIT on (see [`prewarm_at_startup`]), or failing that when the first
-/// code object is halfway to its compile threshold.
+/// [`prewarm_codegen`]), once per process: when the first code object is
+/// halfway to its frame-JIT compile (see [`prewarm_on_heat`]) or to its
+/// tier-2 threshold.
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -858,16 +858,16 @@ fn spawn_codegen_prewarm() {
     }
 }
 
-/// Start the code generator's warm-up as start-up begins, when the JIT may
-/// run. A hot loop gets from its first iterations to its compile in far
-/// less time than the warm-up takes (about 0.7 ms), so a warm-up started
-/// on the way there leaves the first compile paying most of the cold start
-/// on the thread that needs the code: short hot programs ran 6-11% slower
-/// for it. On a background thread during start-up it costs the main thread
-/// nothing; the price is the code generator's pages (about 2 MB resident)
-/// in a process that never compiles, which start-up also paid when it
-/// warmed the code generator itself.
-pub(crate) fn prewarm_at_startup() {
+/// Start the code generator's warm-up when the first code object is
+/// halfway to its frame-JIT compile (the first compile most programs
+/// make), when the JIT may run. Starting it with start-up instead spares
+/// a short hot program's first compile some of the cold start (about
+/// 0.7 ms) but keeps the code generator's pages resident in every
+/// process, about 2.4 MB for one that never compiles and 0.2 to 0.5 MB
+/// for one that does (the warm-up touches code no frame compile uses).
+#[cold]
+#[inline(never)]
+pub(crate) fn prewarm_on_heat() {
     if !jit_off_for_process() {
         spawn_codegen_prewarm();
     }
