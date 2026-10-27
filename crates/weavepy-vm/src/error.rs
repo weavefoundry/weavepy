@@ -310,6 +310,13 @@ pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
             &owned
         }
     };
+    attribute_error_typed(obj, name, type_name)
+}
+
+/// [`attribute_error_named`] whose message names the type `type_name`
+/// (a `__slots__` member's error names the class by its qualified name,
+/// as CPython's `member_get` does).
+pub fn attribute_error_typed(obj: &Object, name: &str, type_name: &str) -> RuntimeError {
     let mut message = String::with_capacity(type_name.len() + name.len() + 30);
     message.push('\'');
     message.push_str(type_name);
