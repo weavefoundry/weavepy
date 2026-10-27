@@ -8981,10 +8981,10 @@ impl Interpreter {
             },
         };
         let result = match (done.binop.take(), result) {
-            (Some((op, inplace, cls)), Ok(v))
+            (Some((op, inplace, l, r)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
-                Err(binop_type_error(op, inplace, &cls))
+                Err(binop_type_error(op, inplace, &l, &r))
             }
             (_, result) => result,
         };
@@ -10463,6 +10463,38 @@ impl Interpreter {
         self.release(key);
         self.release(container);
         true
+    }
+
+    /// `type(container).__getitem__` for the `BINARY_SUBSCR` at `pc` of
+    /// `code`, when `container` is a plain instance (no native payload, of
+    /// a class neither natively served nor an extension's) and that is a
+    /// plain Python function: the function the site remembers for the
+    /// class's version (see [`Self::try_inline_getitem`]), else the
+    /// class's own.
+    pub(crate) fn getitem_dunder(
+        code: &CodeObject,
+        pc: usize,
+        container: &Object,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        /// The class cache key for `__getitem__`.
+        static GETITEM_KEY: u8 = 0;
+        let Object::Instance(inst) = container else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if inst.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        if let Some(f) =
+            code_method_slot(code, pc as u32).and_then(|s| s.get_held(cls.attr_version.get()))
+        {
+            return Some(f);
+        }
+        Self::instance_dunder_function(
+            inst,
+            std::ptr::addr_of!(GETITEM_KEY) as usize,
+            "__getitem__",
+        )
     }
 
     fn try_inline_getitem(
@@ -16345,7 +16377,7 @@ impl Interpreter {
         {
             return false;
         }
-        if ins.op == OpCode::BinaryOp {
+        if matches!(ins.op, OpCode::BinaryOp | OpCode::CompareOp) {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
@@ -17084,9 +17116,21 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // (Compiled code calls a site's `__getitem__` itself once the site
+        // has run one.)
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        let note = |frame: &Frame, pc: usize| {
+            if let Some(ext) = code_vm_ext(&frame.code) {
+                if !instance_site(ext, pc) {
+                    instance_site_note(ext, frame.code.instructions.len(), pc);
+                }
+            }
+        };
+        let pc = unsafe { (*sw.cur).pc as usize };
         // A pure leaf `__getitem__`: evaluated in place, no activation.
         // SAFETY: see `CoreSwitch`: the running activation is synced.
         if !descr && self.try_leaf_getitem(unsafe { &mut *sw.cur }) {
+            note(unsafe { &*sw.cur }, pc);
             return true;
         }
         let mut tmp = None;
@@ -17105,6 +17149,10 @@ impl Interpreter {
         let Some(mut act) = act else {
             return false;
         };
+        if !descr {
+            // SAFETY: the caller's activation, synced past the subscript.
+            note(unsafe { &*sw.cur }, pc);
+        }
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
         unsafe { push_fast(&mut *sw.inl, act) };
@@ -17648,7 +17696,7 @@ impl Interpreter {
     /// to do, or done), `Some(false)` when the iteration raised (the
     /// operands consumed and the raise pending, as the full handler
     /// leaves them), `None` touched nothing.
-    fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
+    pub(crate) fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
@@ -18671,6 +18719,11 @@ impl Interpreter {
                 return true;
             }
         }
+        // A class with a plain Python `__new__` (`pathlib`'s paths).
+        if let Some(Object::Function(new_f)) = &plan.user_new {
+            let new_f = new_f.clone();
+            return self.core_new_user(sw, pc, argc, &ty, &plan, &new_f);
+        }
         let Some((init, code)) = plan.lean_init.as_ref() else {
             // `E(*args)` for an exception class that keeps
             // `BaseException`'s allocator and `__init__`: the allocation,
@@ -18823,6 +18876,170 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// [`Self::core_new_n`] (the `argc` arguments below the top of the
+    /// running activation's stack, called by the instruction at `pc`) for
+    /// a class `ty` whose `__new__` is the plain Python function `new_f`
+    /// (CPython's `slot_tp_new`): `new_f(ty, *args)` runs through the
+    /// ordinary call with this activation published, then the instance's
+    /// `__init__` as `type_call` runs it, inline when it is a plain
+    /// function a lean activation can run on an instance of `ty` itself
+    /// (the caller then receives the instance, as from any constructor's
+    /// activation). `false` touches nothing.
+    #[inline(never)]
+    fn core_new_user(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        argc: usize,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        new_f: &Rc<crate::object::PyFunction>,
+    ) -> bool {
+        // (The shapes `instantiate` treats before or around `__new__`.)
+        if plan.abstract_error.is_some()
+            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || plan.seeds_exception_args
+            || ty.is_type_subclass()
+            || ty.native_kind.get() != 0
+            || ty.lazy_ctor.get() != 0
+            || ty.native_ext.get().is_some()
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        // Committed: the class, its self slot and the arguments leave, the
+        // class and the arguments as `__new__`'s.
+        let mut ops: Vec<Object> = self.pooled_scratch();
+        ops.extend(frame.stack.drain(callee_slot..));
+        ops.remove(1);
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let made = self.call_python(new_f, &ops, &[]);
+        self.core_pending_exit(sw, pending);
+        let result = match made {
+            // An instance of the class itself, whose `__init__` runs.
+            Ok(inst @ Object::Instance(_))
+                if !plan.init_from_object
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(ty))) =>
+            {
+                self.core_push_init(sw, pc, plan, inst, &mut ops)
+                    .map_or(Ok(None), |r| r.map(Some))
+            }
+            Ok(inst) => self
+                .init_constructed(ty, plan, inst, &ops[1..], &[])
+                .map(Some),
+            Err(e) => Err(e),
+        };
+        for v in ops.drain(..) {
+            self.release(v);
+        }
+        self.recycle_scratch(ops);
+        match result {
+            // `__init__`'s activation runs next.
+            Ok(None) => {}
+            Ok(Some(v)) => {
+                // SAFETY: as in `core_type_lane` (the calls ran nested
+                // activations of their own, never this one).
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// [`Self::core_new_user`]'s `__init__` of `inst`, a fresh instance of
+    /// the class `plan` is the construction plan of, with the constructor
+    /// arguments `ops[1..]` (`ops[0]` the class): an inline activation of
+    /// a plain function a lean activation can run, made the running one
+    /// (`None`, the arguments moved into it), or anything else as
+    /// `type_call` runs it (`Some` the instance, or the error).
+    fn core_push_init(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        plan: &Rc<crate::types::InstancePlan>,
+        inst: Object,
+        ops: &mut Vec<Object>,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let argc = ops.len() - 1;
+        let lean = match &plan.init_fn {
+            Some(Object::Function(init)) => {
+                let code = init.code();
+                (!code.is_generator
+                    && !code.is_coroutine
+                    && !code.is_async_generator
+                    && code.cellvars.is_empty()
+                    && Self::lean_code_ok(&code)
+                    && init.lean_cells_ref(&code).is_some())
+                .then(|| Self::lean_init_missing(init, &code, argc + 1))
+                .flatten()
+                .map(|missing| (init.clone(), code, missing))
+            }
+            _ => None,
+        };
+        let guard = match lean {
+            Some(_) => match crate::recursion::enter_with(sw.depth_cell) {
+                crate::recursion::Enter::Ok(guard) => Some(guard),
+                crate::recursion::Enter::Overflow => None,
+            },
+            None => None,
+        };
+        let (Some((init, code, missing)), Some(guard)) = (lean, guard) else {
+            let cls = match &inst {
+                Object::Instance(i) => i.cls(),
+                _ => unreachable!("an instance of the class"),
+            };
+            return Some(self.init_constructed(&cls, plan, inst, &ops[1..], &[]));
+        };
+        let Some(cells) = init.lean_cells_ref(&code) else {
+            unreachable!("checked above");
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        let nlocals = code.varnames.len();
+        locals.reserve(nlocals.max(argc + 1 + missing));
+        Self::lean_init_extend(&init, &code, missing, inst.clone(), ops.drain(1..), locals);
+        fill_unbound(locals, nlocals);
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`; the caller's frame is synced, past the
+        // call (its operands gone).
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        None
     }
 
     /// [`Self::core_new`] for an `__init__` that is a pure or effect leaf
@@ -24217,41 +24434,35 @@ impl Interpreter {
                             }
                         }
                     }
-                    // `Cls.f(...)`: a plain function (or a static method's)
-                    // with an empty self slot, as the slow arm.
+                    // `Cls.f(...)`: the class attribute with an empty self
+                    // slot, as the slow arm.
                     Some(Object::Type(cls)) => {
-                        match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
-                            Some(v @ Object::Function(_)) => {
-                                let Some(top) = stack.last_mut() else {
-                                    return CoreAttr::Decline;
-                                };
-                                let cls = std::mem::replace(top, v);
-                                stack.push(Object::Unbound);
-                                drop(cls);
-                                return CoreAttr::Done;
-                            }
-                            // `Cls.cm(...)`: a class method's function with
-                            // the class in the self slot (the call the bound
-                            // method makes), a native one's (`int.from_bytes`)
-                            // as the full leaf arm takes it.
-                            Some(Object::BoundMethod(bm))
+                        let Some((f, self_obj)) =
+                            Self::type_method_pair(code, cls, pc as u32, ins.arg)
+                        else {
+                            return CoreAttr::Decline;
+                        };
+                        // A native class method bound to this class
+                        // (`int.from_bytes`): its function with the class
+                        // in the self slot, as the full leaf arm takes it.
+                        let (f, self_obj) = match (&f, &self_obj) {
+                            (Object::BoundMethod(bm), Object::Unbound)
                                 if matches!(
-                                    (&bm.function, &bm.receiver),
-                                    (Object::Function(_), Object::Type(_))
-                                ) || matches!(
                                     (&bm.function, &bm.receiver),
                                     (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
                                 ) =>
                             {
-                                let Some(top) = stack.last_mut() else {
-                                    return CoreAttr::Decline;
-                                };
-                                let cls = std::mem::replace(top, bm.function.clone());
-                                stack.push(cls);
-                                return CoreAttr::Done;
+                                (bm.function.clone(), bm.receiver.clone())
                             }
-                            _ => return CoreAttr::Decline,
-                        }
+                            _ => (f, self_obj),
+                        };
+                        let Some(top) = stack.last_mut() else {
+                            return CoreAttr::Decline;
+                        };
+                        let cls = std::mem::replace(top, f);
+                        stack.push(self_obj);
+                        drop(cls);
+                        return CoreAttr::Done;
                     }
                     // `module.f(...)`: the module attribute with an empty
                     // self slot, as the slow arm.
@@ -28306,27 +28517,48 @@ impl Interpreter {
     /// defines no reflected method (nor, augmented, an in-place one).
     /// Called with `(a, b)`, its `NotImplemented` is the operator's
     /// `TypeError` ([`binop_type_error`]).
+    ///
+    /// So is a plain instance's method over a built-in scalar, string or
+    /// immutable sequence (`path / "name"`): CPython's `binary_op1` calls
+    /// the instance's method first (the built-in type is no subclass of
+    /// the class), and the built-in type's own slot answers
+    /// `NotImplemented` for an operand it doesn't know, which leaves the
+    /// `TypeError`. (Not a repetition, which a sequence would try with the
+    /// instance's `__index__`, nor `**`, whose message names `pow()`.)
     fn binop_instance_dunder(
         a: &Object,
         b: &Object,
         op: BinOpKind,
         inplace: bool,
     ) -> Option<Rc<crate::object::PyFunction>> {
-        let (Object::Instance(ai), Object::Instance(bi)) = (a, b) else {
+        let Object::Instance(ai) = a else {
             return None;
         };
+        let same = match b {
+            Object::Instance(bi) => std::ptr::eq(ai.cls_raw(), bi.cls_raw()),
+            Object::Str(_) | Object::Bytes(_) | Object::Tuple(_) => {
+                !matches!(op, BinOpKind::Mult | BinOpKind::Pow)
+            }
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None => {
+                op != BinOpKind::Pow
+            }
+            _ => false,
+        };
+        let mixed = !matches!(b, Object::Instance(_));
         let cls = ai.cls_raw();
         let k = op as usize;
         let (dunder, rdunder) = binop_dunders(op);
-        if !std::ptr::eq(cls, bi.cls_raw())
+        if !same
             || ai.native.get().is_some()
+            || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
             || (inplace
                 && !Self::class_lacks(
                     cls,
                     std::ptr::addr_of!(IBINOP_KEYS[k]) as usize,
                     op.inplace_dunder(),
                 ))
-            || !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder)
+            || (!mixed
+                && !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder))
         {
             return None;
         }
@@ -30567,6 +30799,32 @@ impl Interpreter {
             }
         }
         Some(Object::interned_str(&cls.name))
+    }
+
+    /// The method load (`LOAD_ATTR` with the method flag) of
+    /// `co_names[name_idx]` on the class `cls`, as the full handler loads
+    /// it: the attribute [`Self::leaf_load_type_attr`] reads with an empty
+    /// self slot (a class's attribute is never bound to it), a class
+    /// method's function with the class in the self slot (the call its
+    /// bound method makes). `None` for what the full handler must load.
+    #[inline]
+    pub(crate) fn type_method_pair(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<(Object, Object)> {
+        match Self::leaf_load_type_attr(code, cls, cache_pc, name_idx)? {
+            Object::BoundMethod(bm)
+                if matches!(
+                    (&bm.function, &bm.receiver),
+                    (Object::Function(_), Object::Type(_))
+                ) =>
+            {
+                Some((bm.function.clone(), bm.receiver.clone()))
+            }
+            v => Some((v, Object::Unbound)),
+        }
     }
 
     /// [`Self::leaf_load_type_attr`] for a class whose metaclass is a
@@ -39735,8 +39993,24 @@ impl Interpreter {
             // str-subclass result keeps its type
             // (test_str.test_conversion: `str(WithStr(StrSubclass('abc')))`
             // is a `StrSubclass`).
-            if let Some(method) = instance_method(v, "__str__") {
-                let r = self.call(&method, &[], &[], globals)?;
+            // A plain Python `__str__` is called with the instance, with no
+            // bound method built for it.
+            /// The class cache key for `__str__` (see
+            /// `instance_dunder_function`).
+            static STR_FN_KEY: u8 = 0;
+            let method = match Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(STR_FN_KEY) as usize,
+                "__str__",
+            ) {
+                Some(f) => Some(Ok(f)),
+                None => instance_method(v, "__str__").map(Err),
+            };
+            if let Some(method) = method {
+                let r = match method {
+                    Ok(f) => self.call_dunder_function(f, std::slice::from_ref(v))?,
+                    Err(bound) => self.call(&bound, &[], &[], globals)?,
+                };
                 if str_like_object(&r) {
                     return Ok(r);
                 }
@@ -40186,8 +40460,22 @@ impl Interpreter {
                     return Ok(r);
                 }
             }
-            if let Some(method) = instance_method(v, "__repr__") {
-                let r = self.call(&method, &[], &[], globals)?;
+            /// The class cache key for `__repr__` (see
+            /// `instance_dunder_function`).
+            static REPR_FN_KEY: u8 = 0;
+            let method = match Self::instance_dunder_function(
+                inst,
+                std::ptr::addr_of!(REPR_FN_KEY) as usize,
+                "__repr__",
+            ) {
+                Some(f) => Some(Ok(f)),
+                None => instance_method(v, "__repr__").map(Err),
+            };
+            if let Some(method) = method {
+                let r = match method {
+                    Ok(f) => self.call_dunder_function(f, std::slice::from_ref(v))?,
+                    Err(bound) => self.call(&bound, &[], &[], globals)?,
+                };
                 if str_like_object(&r) {
                     return Ok(r);
                 }
@@ -48601,6 +48889,32 @@ impl Interpreter {
         )
     }
 
+    /// The plain Python method a `COMPARE_OP` of `op` over `a` and `b`
+    /// calls first, when `a` is a plain instance (no native payload, of a
+    /// class neither natively served nor an extension's) whose class's
+    /// method for `op` is a plain function: CPython's `do_richcompare`
+    /// tries `a`'s first unless `b`'s class is a strict subclass of `a`'s
+    /// (which may override the reflected method).
+    pub(crate) fn compare_instance_dunder(
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Option<Rc<PyFunction>> {
+        let Object::Instance(ai) = a else {
+            return None;
+        };
+        let cls = ai.cls_raw();
+        if ai.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        if let Object::Instance(bi) = b {
+            if !std::ptr::eq(cls, bi.cls_raw()) && bi.cls().is_subclass_of(&ai.cls()) {
+                return None;
+            }
+        }
+        Self::cmp_function(a, op)
+    }
+
     /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].
     /// Used everywhere a comparison feeds control flow or a native algorithm
     /// (`min`/`max`, `in`, sort merges, the `==` sentinel probes).
@@ -50090,7 +50404,7 @@ impl Interpreter {
             return None;
         }
         let recv = frame.stack.pop()?;
-        let err = crate::error::attribute_error_named(&recv, name);
+        let err = certain_miss_error(&recv, name);
         self.release(recv);
         Some(err)
     }
@@ -50356,7 +50670,7 @@ impl Interpreter {
                 // without its resolution passes.
                 if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
                     if attr_certainly_missing(&receiver, name) {
-                        let err = crate::error::attribute_error_named(&receiver, name);
+                        let err = certain_miss_error(&receiver, name);
                         self.release(receiver);
                         return Err(err);
                     }
@@ -55830,9 +56144,9 @@ impl Interpreter {
         Ok(obj)
     }
 
-    /// `list(x)`, `tuple(x)`, `set(x)` or `frozenset(x)` of the exact
-    /// builtin type: what [`Self::instantiate`] builds for it, without the
-    /// per-type checks it runs first. `None` for any other type.
+    /// `list(x)`, `tuple(x)`, `set(x)`, `frozenset(x)` or `str(x)` of the
+    /// exact builtin type: what [`Self::instantiate`] builds for it, without
+    /// the per-type checks it runs first. `None` for any other type.
     fn container_ctor1(
         &mut self,
         ty: &Rc<TypeObject>,
@@ -55842,6 +56156,11 @@ impl Interpreter {
             return None;
         }
         let bt = builtin_types();
+        // `str(x)`: `x`'s `__str__` (see `type_call_default`).
+        if Rc::ptr_eq(ty, &bt.str_) {
+            let globals = self.builtins.clone();
+            return Some(self.do_str_call(arg, &globals));
+        }
         let r = if Rc::ptr_eq(ty, &bt.list_) || Rc::ptr_eq(ty, &bt.tuple_) {
             let name = if Rc::ptr_eq(ty, &bt.list_) {
                 "list"
@@ -58584,6 +58903,12 @@ impl Interpreter {
             && matches!(native, NativeKind::Plain)
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
+        let object_new_plain = !seeds_exception_args
+            && matches!(native, NativeKind::Plain)
+            && !cls.flags.is_builtin
+            && !cls.is_type_subclass()
+            && !cls.is_subclass_of(&bt.module_)
+            && !cls.is_subclass_of(&bt.generic_alias_);
 
         crate::types::InstancePlan {
             abstract_error,
@@ -58598,6 +58923,7 @@ impl Interpreter {
             lean_init,
             tuple_new,
             bare_alloc,
+            object_new_plain,
             store_init: std::sync::atomic::AtomicU8::new(0),
             slot_members: std::sync::OnceLock::new(),
         }
@@ -59116,7 +59442,6 @@ impl Interpreter {
             )));
         }
 
-        let is_object_new = plan.is_object_new;
         let instance = match &plan.user_new {
             // User-defined `__new__` (the first MRO hit other than the
             // implicit `object.__new__`) owns instance allocation — pass
@@ -59138,12 +59463,8 @@ impl Interpreter {
                 let mut new_args: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 new_args.push(Object::Type(cls.clone()));
                 new_args.extend_from_slice(args);
-                self.call(
-                    &resolved,
-                    &new_args,
-                    kwargs,
-                    &Rc::new(RefCell::new(DictData::default())),
-                )?
+                let g = self.builtins.clone();
+                self.call(&resolved, &new_args, kwargs, &g)?
             }
             None => {
                 // Subclasses of the descriptor built-ins
@@ -59269,7 +59590,22 @@ impl Interpreter {
                 inst
             }
         };
+        self.init_constructed(&cls, &plan, instance, args, kwargs)
+    }
 
+    /// The second half of [`Self::instantiate`] (`type_call`'s): run the
+    /// `__init__` of `instance`, which `cls`'s `__new__` (the one `plan`,
+    /// `cls`'s construction plan, resolved) returned for the constructor
+    /// arguments `args` and `kwargs`, and hand back the instance.
+    fn init_constructed(
+        &mut self,
+        cls: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        instance: Object,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let is_object_new = plan.is_object_new;
         // Only run `__init__` when the returned object is an instance
         // of `cls` (*including* subclasses — CPython's `type_call`
         // checks `PyObject_TypeCheck`, so a `__new__` that allocates a
@@ -59278,7 +59614,7 @@ impl Interpreter {
         let instance_cls = match &instance {
             Object::Instance(inst) => {
                 let icls = inst.cls();
-                if icls.mro.borrow().iter().any(|t| Rc::ptr_eq(t, &cls)) {
+                if icls.mro.borrow().iter().any(|t| Rc::ptr_eq(t, cls)) {
                     Some(icls)
                 } else {
                     None
@@ -59294,7 +59630,7 @@ impl Interpreter {
             // originally-called class — reuse the plan when it is the
             // same class (the overwhelmingly common case), otherwise
             // consult that class's own memoised plan.
-            let iplan = if Rc::ptr_eq(&icls, &cls) {
+            let iplan = if Rc::ptr_eq(&icls, cls) {
                 plan.clone()
             } else {
                 self.instance_plan(&icls)
@@ -59423,12 +59759,8 @@ impl Interpreter {
                 // arguments (test_inspect test_signature_on_class_with_init
                 // [classmethod]/[staticmethod]/[MethodType]).
                 let bound = bind_method(&instance, init);
-                let result = self.call(
-                    &bound,
-                    args,
-                    init_kwargs,
-                    &Rc::new(RefCell::new(DictData::default())),
-                )?;
+                let g = self.builtins.clone();
+                let result = self.call(&bound, args, init_kwargs, &g)?;
                 if !matches!(result, Object::None) {
                     return Err(type_error(format!(
                         "__init__() should return None, not '{}'",
@@ -60254,6 +60586,17 @@ impl Interpreter {
             }
             self.recycle_scratch(positional);
             return result;
+        }
+        // A native caller's call (a special method a builtin or a
+        // constructor runs, a `key=` function) warms its callee as a
+        // compiled caller's switched call does: its nested run gains most
+        // from a native body (see `frame_jit::Slot::warm_switched`).
+        #[cfg(feature = "jit")]
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
+            if let Some(ext) = code_vm_ext(&code) {
+                ext.frame_jit
+                    .warm_switched(&code, ext, code.varnames.len().max(positional.len()));
+            }
         }
         // A cell-free, non-generator body runs as a lean activation when
         // the loop is quiet: no frame build, no eager shell, no general
@@ -69358,8 +69701,8 @@ struct InlineAct {
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
-    /// the operands' class).
-    binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
+    /// the left and right operands' classes).
+    binop: Option<(BinOpKind, bool, Rc<TypeObject>, Rc<TypeObject>)>,
     /// The caller takes no result (a property setter's activation for a
     /// `STORE_ATTR`, see `Interpreter::try_inline_setter`).
     discard: bool,
@@ -71483,7 +71826,7 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
         true
     });
     if !class_missing {
-        return false;
+        return !dunder && slot_member_unset(&cls, inst, name);
     }
     match inst.dict.published() {
         Some(d) => d
@@ -71495,6 +71838,34 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
             .try_borrow()
             .is_ok_and(|s| s.position_str(name).is_none()),
     }
+}
+
+/// The `AttributeError` a certainly missing `obj.name` (see
+/// [`attr_certainly_missing`]) raises: an unset `__slots__` member's names
+/// the class by its fully qualified name, as CPython's `member_get` does.
+fn certain_miss_error(obj: &Object, name: &str) -> RuntimeError {
+    match obj {
+        Object::Instance(inst)
+            if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
+        {
+            crate::error::attribute_error_typed(obj, name, &inst.cls().fully_qualified_name())
+        }
+        _ => crate::error::attribute_error_named(obj, name),
+    }
+}
+
+/// Whether `inst.name` is a `__slots__` member of its class (the data
+/// descriptor the default lookup finds first, under `object`'s own
+/// `__getattribute__`) that `inst` holds no value for: the member's
+/// `__get__` raises the lookup's `AttributeError` (CPython's `member_get`).
+#[inline(never)]
+fn slot_member_unset(cls: &Rc<TypeObject>, inst: &PyInstance, name: &str) -> bool {
+    use crate::types::Dunder;
+    if !cls.dunder(Dunder::GetAttribute).object_owner() || cls.is_super_proxy_type() {
+        return false;
+    }
+    matches!(cls.lookup(name), Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none())
+        && inst.slot_get(name).is_none()
 }
 
 /// Resolve a built-in slot-wrapper dunder reached via *type-level* attribute
@@ -75771,13 +76142,18 @@ static IBINOP_KEYS: [u8; 16] = [0; 16];
 
 /// The `TypeError` of a `BINARY_OP` of `op` (augmented when `inplace`)
 /// whose method returned `NotImplemented` for two instances of `cls`.
-fn binop_type_error(op: BinOpKind, inplace: bool, cls: &TypeObject) -> RuntimeError {
+fn binop_type_error(
+    op: BinOpKind,
+    inplace: bool,
+    left: &TypeObject,
+    right: &TypeObject,
+) -> RuntimeError {
     type_error(format!(
         "unsupported operand type(s) for {}{}: '{}' and '{}'",
         op.as_str(),
         if inplace { "=" } else { "" },
-        cls.name,
-        cls.name
+        left.name,
+        right.name
     ))
 }
 
@@ -78015,6 +78391,18 @@ fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Ob
 /// Marks a stamp remembered for a read through an *instance* of the
 /// class, which also needs the instance not to shadow the name.
 const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
+
+/// The class version at which the `LOAD_ATTR` at `pc` last read a class
+/// attribute through an instance of the class (its stamp, see
+/// [`class_attr_fill_via`]), if that is what it last read.
+pub(crate) fn class_attr_site(ext: &CodeConstObjects, pc: usize) -> Option<u64> {
+    let [ver, tag, _] = ext.stamp_slot(pc)?.get();
+    matches!(
+        tag ^ CLASS_ATTR_VIA_INSTANCE,
+        CLASS_ATTR_INT | CLASS_ATTR_FLOAT | CLASS_ATTR_BOOL | CLASS_ATTR_NONE | CLASS_ATTR_ENTRY
+    )
+    .then_some(ver)
+}
 
 /// A `LOAD_ATTR` site's stamp tag for a named tuple field (a
 /// `_tuplegetter` on the class at that version): the bits are the field
