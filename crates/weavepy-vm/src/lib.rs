@@ -16262,6 +16262,16 @@ impl Interpreter {
         let b: *const crate::object::BuiltinFn =
             match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
                 (Object::Builtin(b), Object::Unbound) if !b.binds_instance => Rc::as_ptr(b),
+                // A method body called through its class: the first
+                // argument is the receiver.
+                (Object::Builtin(b), Object::Unbound)
+                    if frame
+                        .stack
+                        .get(callee_at + 2)
+                        .is_some_and(|recv| lane_recv_ok(b, recv, via_call)) =>
+                {
+                    Rc::as_ptr(b)
+                }
                 (Object::Builtin(b), recv) if lane_recv_ok(b, recv, via_call) => Rc::as_ptr(b),
                 (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                     match &bm.function {
@@ -20892,12 +20902,63 @@ impl Interpreter {
         if !Self::core_droppable(recv) {
             return false;
         }
-        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx, Some(running)) else {
+        let Some(v) = self
+            .leaf_plain_attr_value(code, Some(recv), name_idx, Some(running))
+            .or_else(|| Self::value_dunder_new(code, recv, name_idx, running.1))
+        else {
             return false;
         };
         // SAFETY: the receiver (droppable) is replaced in place.
         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
         true
+    }
+
+    /// `x.__new__` of a builtin type's value (`None.__new__`, which
+    /// `enum`'s `_find_new_` reads): the builtin function `type(x).__new__`
+    /// resolves to, which the `LOAD_ATTR` site at `pc` remembers under the
+    /// type's version. `None` for anything else.
+    #[inline(never)]
+    fn value_dunder_new(
+        code: &CodeObject,
+        recv: &Object,
+        name_idx: u32,
+        pc: u32,
+    ) -> Option<Object> {
+        if matches!(recv, Object::Instance(_) | Object::Type(_))
+            || crate::capi_watchers::types_active()
+            || code.names.get(name_idx as usize)?.as_str() != "__new__"
+        {
+            return None;
+        }
+        let cls = crate::builtins::class_of(recv);
+        if !cls.flags.is_builtin {
+            return None;
+        }
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(code, pc)?;
+        match slot.class_value(ver, 0) {
+            // (A remembered decline.)
+            Some(Object::Unbound) => return None,
+            Some(v) => return Some(Self::clone_operand(v)),
+            None => {}
+        }
+        // A builtin type's `__new__` is a static builtin function on a
+        // builtin class of its MRO, which `type`'s lookup returns as it is
+        // (`type` has no data descriptor of the name).
+        let v = match cls.lookup_with_owner("__new__") {
+            Some((v @ Object::Builtin(_), owner))
+                if owner.flags.is_builtin
+                    && matches!(&v, Object::Builtin(b) if !b.binds_instance) =>
+            {
+                v
+            }
+            _ => {
+                slot.set_class_value(ver, 0, &Object::Unbound);
+                return None;
+            }
+        };
+        slot.set_class_value(ver, 0, &v);
+        Some(v)
     }
 
     /// `cls.name` at `top` (a class) for a plain value on the class's
@@ -31629,8 +31690,18 @@ impl Interpreter {
                         // An existing key takes the *indexed* shape, which
                         // the core loop's own arm serves without a hash
                         // probe (the specializer's choice, made here
-                        // because the site never reaches it).
-                        if matches!(cache, IC::Empty) {
+                        // because the site never reaches it). A site left
+                        // cooling down, or specialized for another class
+                        // (`Base.__init__` run on a subclass's instances),
+                        // is re-specialized too: the full handler that
+                        // would count the cooldown down never sees it.
+                        if matches!(
+                            cache,
+                            IC::Empty
+                                | IC::Cooldown(_)
+                                | IC::StoreAttrInstance { .. }
+                                | IC::StoreAttrNewKey { .. }
+                        ) {
                             let ver = cls.attr_version.get();
                             let indexed = inst.attr_position_str(name);
                             code.caches.set(
@@ -54835,6 +54906,24 @@ impl Interpreter {
                 // IMPORTANT: any `b.name == "..."` / `matches!(b.name, ...)`
                 // added inside this block must also be added to
                 // `builtin_needs_interp` above, or the new arm is dead code.
+                // The hottest interpreter-aware builtins by one `match` (a
+                // length switch and a compare), ahead of the gate and the
+                // chain's sequential comparisons: each arm is the chain's
+                // own for the name and shape, which no earlier arm of the
+                // chain takes.
+                match (b.name, args.len()) {
+                    ("len", 1) => return self.do_len_call(&args[0], outer_globals),
+                    ("hash", 1) => return self.do_hash_call(&args[0], outer_globals),
+                    ("isinstance", 2) => {
+                        return self.do_isinstance_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("issubclass", 2) => {
+                        return self.do_issubclass_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("repr", 1) => return self.do_repr_call(&args[0], outer_globals),
+                    ("str", 1) => return self.do_str_call(&args[0], outer_globals),
+                    _ => {}
+                }
                 if builtin_needs_interp(b.name) {
                     if b.name.starts_with(".u.") {
                         let receiver = args.first().cloned().ok_or_else(|| {
