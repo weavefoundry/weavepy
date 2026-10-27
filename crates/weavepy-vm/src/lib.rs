@@ -9870,7 +9870,7 @@ impl Interpreter {
         snap_gen: u64,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
-        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        let shape = Self::lean_call_kw_shape(frame, pc, false)?;
         // Committed.
         let code = shape.code.clone();
         let (callable, locals) = self.lean_call_kw_take(frame, shape);
@@ -9898,9 +9898,11 @@ impl Interpreter {
 
     /// The `CallPyKwNames` shape at the `CALL_KW` at `pc`, verified
     /// against the live callee (see `kw_names_bind_check`) and the lean
-    /// activation's own requirements.
+    /// activation's own requirements: with `fresh_cells`, a callee with
+    /// cell variables qualifies too (an inline activation makes its cells,
+    /// see [`Self::inline_bind`]).
     #[inline]
-    fn lean_call_kw_shape(frame: &Frame, pc: usize) -> Option<LeanKwShape> {
+    fn lean_call_kw_shape(frame: &Frame, pc: usize, fresh_cells: bool) -> Option<LeanKwShape> {
         use weavepy_compiler::InlineCache as IC;
         let IC::CallPyKwNames {
             func_id,
@@ -9936,7 +9938,13 @@ impl Interpreter {
         if !Self::lean_code_ok(&code) {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        if fresh_cells {
+            if !Self::call_cells_ok(f, &code) {
+                return None;
+            }
+        } else {
+            f.lean_cells_ref(&code)?;
+        }
         Some(LeanKwShape {
             code,
             perm,
@@ -10015,7 +10023,7 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
     ) -> Option<Box<InlineAct>> {
-        let Some(shape) = Self::lean_call_kw_shape(frame, pc) else {
+        let Some(shape) = Self::lean_call_kw_shape(frame, pc, true) else {
             return self.try_inline_call_kw_named(frame, shell, pc);
         };
         // Past the recursion limit the nested lean path raises.
@@ -10067,7 +10075,11 @@ impl Interpreter {
         {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        // (A callee with cell variables gets fresh cells, see
+        // `inline_bind`.)
+        if !Self::call_cells_ok(f, &code) {
+            return None;
+        }
         let first = if matches!(frame.stack[callee_slot + 1], Object::Unbound) {
             callee_slot + 2
         } else {
