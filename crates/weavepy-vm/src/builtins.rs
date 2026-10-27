@@ -12616,6 +12616,12 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
+    if let Some(recv @ Object::Str(_)) = args.first() {
+        // No tab: CPython answers the string itself.
+        if matches!(args.get(1), None | Some(Object::Int(_))) && !s.as_bytes().contains(&b'\t') {
+            return Ok(recv.clone());
+        }
+    }
     let tabsize = match args.get(1) {
         // A negative tabsize collapses tabs to zero columns in CPython
         // (`'x\ty'.expandtabs(-1) == 'xy'`); clamp so the `as usize` cast
@@ -12787,8 +12793,68 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let mut out = String::with_capacity(s.len());
     let receiver_bridged = matches!(args.first(), Some(Object::WStr(_)));
+    if matches!(args.first(), Some(Object::Str(r)) if crate::shared_value::SharedStr::is_ascii(r)) {
+        // CPython's `unicode_fast_translate`: an ASCII string whose
+        // characters each map to an ASCII character or to nothing is
+        // translated byte by byte, each entry looked up once. Any other
+        // entry leaves it to the general loop below.
+        const UNSEEN: u16 = 0x100;
+        const DELETE: u16 = 0x101;
+        let mut map = [UNSEEN; 128];
+        let bytes = s.as_bytes();
+        let mut out = vec![0u8; bytes.len()];
+        let mut n = 0;
+        let mut simple = true;
+        for &b in bytes {
+            // (`b` is ASCII, so the mask changes nothing.)
+            let mut m = map[usize::from(b & 0x7f)];
+            if m < UNSEEN {
+                // SAFETY: `n` trails the input position, inside `out`.
+                unsafe { *out.as_mut_ptr().add(n) = m as u8 };
+                n += 1;
+                continue;
+            }
+            if m == UNSEEN {
+                let entry = match &table {
+                    Table::Dict(Object::Dict(d)) => {
+                        d.borrow().get(&DictKey(Object::Int(i64::from(b)))).cloned()
+                    }
+                    Table::Dict(_) => None,
+                    Table::Seq(v) => v.get(b as usize).cloned(),
+                };
+                m = match entry {
+                    None => u16::from(b),
+                    Some(Object::None) => DELETE,
+                    Some(Object::Int(i)) if (0..128).contains(&i) => i as u16,
+                    Some(Object::Str(v)) if v.len() == 1 && v.is_ascii() => {
+                        u16::from(v.as_bytes()[0])
+                    }
+                    Some(_) => {
+                        simple = false;
+                        break;
+                    }
+                };
+                map[b as usize] = m;
+            }
+            if m != DELETE {
+                // SAFETY: as above.
+                unsafe { *out.as_mut_ptr().add(n) = m as u8 };
+                n += 1;
+            }
+        }
+        if simple {
+            // SAFETY: every byte written is ASCII.
+            let text = unsafe { std::str::from_utf8_unchecked(&out[..n]) };
+            // (Up to two characters, the shared small strings.)
+            return Ok(if n <= 2 {
+                Object::from_str(text)
+            } else {
+                Object::Str(crate::shared_value::SharedStr::from_ascii(text))
+            });
+        }
+    }
+    let mut out = String::with_capacity(s.len());
     let mut saw_surrogate = receiver_bridged;
     // Each ASCII character's entry, looked up once per call (CPython's
     // `unicode_fast_translate` caches its ASCII table the same way).
