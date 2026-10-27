@@ -317,12 +317,13 @@ mod attr_version_tests {
 /// spelling. In particular, a negative hit must not hide a different name
 /// whose hash and length happen to collide.
 pub(crate) mod type_cache {
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::rc::Rc;
 
     /// Entries per thread (CPython's `MCACHE_SIZE_EXP` is 12 too). The
-    /// table is allocated on first use. Names are owned by this
-    /// thread's entries and released when those entries are replaced.
+    /// table is allocated on first use and freed when the thread exits.
+    /// Names are owned by this thread's entries and released when those
+    /// entries are replaced.
     const SIZE: usize = 1 << 12;
     const MASK: usize = SIZE - 1;
     /// `mro_idx` value recording "the walk found nothing".
@@ -344,7 +345,99 @@ pub(crate) mod type_cache {
     };
 
     thread_local! {
-        static CACHE: RefCell<Option<Box<[Entry]>>> = const { RefCell::new(None) };
+        /// This thread's table (`SIZE` entries), or null before the first
+        /// fill. A plain pointer in a constant-initialized cell with no
+        /// destructor, so a probe is one thread-local load: no lazy
+        /// registration, no borrow flag. Nothing a probe or a fill does
+        /// runs code (an evicted name is only freed), so the entries are
+        /// never reached re-entrantly.
+        static TABLE: Cell<*mut Entry> = const { Cell::new(std::ptr::null_mut()) };
+        /// This thread's memo of names' Python hashes (`HASHES` entries,
+        /// see [`py_hash_of`]), or null before its first use; as `TABLE`.
+        static HASH_MEMO: Cell<*mut NameHash> = const { Cell::new(std::ptr::null_mut()) };
+        /// Frees the table when the thread exits (touched once, by the
+        /// first fill, which registers it).
+        static OWNER: TableOwner = const { TableOwner };
+    }
+
+    /// The owner of a thread's [`TABLE`] (see there).
+    struct TableOwner;
+
+    impl Drop for TableOwner {
+        fn drop(&mut self) {
+            // (`TABLE` and `HASH_MEMO` have no destructor, so they are
+            // still readable here.)
+            let table = TABLE.with(|t| t.replace(std::ptr::null_mut()));
+            if !table.is_null() {
+                // SAFETY: allocated by `alloc_table` as a boxed slice of
+                // `SIZE` entries, and no longer reachable through `TABLE`.
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table, SIZE)) });
+            }
+            let memo = HASH_MEMO.with(|t| t.replace(std::ptr::null_mut()));
+            if !memo.is_null() {
+                // SAFETY: as above, `HASHES` entries from `alloc_memo`.
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(memo, HASHES)) });
+            }
+        }
+    }
+
+    /// Entries of a thread's name-hash memo.
+    const HASHES: usize = 1 << 9;
+
+    /// A name and its Python hash (see [`py_hash_of`]).
+    #[derive(Clone)]
+    struct NameHash {
+        name: Option<Rc<str>>,
+        hash: i64,
+    }
+
+    /// This thread's name-hash memo, allocated on first use.
+    #[cold]
+    #[inline(never)]
+    fn alloc_memo() -> *mut NameHash {
+        let empty = NameHash {
+            name: None,
+            hash: 0,
+        };
+        let memo = Box::into_raw(vec![empty; HASHES].into_boxed_slice()).cast::<NameHash>();
+        HASH_MEMO.with(|t| t.set(memo));
+        let _ = OWNER.try_with(|_| ());
+        memo
+    }
+
+    /// `py_str_hash(name)`, memoised per thread by the name's slot hash
+    /// `name_hash` ([`name_hash`]): an MRO walk probes every class dict it
+    /// passes with the name's Python hash, and a class that is changing
+    /// (a class body, an enum's members being set) walks again after every
+    /// change, each time rehashing the same few names.
+    #[inline]
+    pub(crate) fn py_hash_of(name: &str, name_hash: u64) -> i64 {
+        let mut memo = HASH_MEMO.with(Cell::get);
+        if memo.is_null() {
+            memo = alloc_memo();
+        }
+        // SAFETY: a live memo of `HASHES` entries, indexed below it; no
+        // other reference to the entry is live (nothing here runs code).
+        let e = unsafe { &mut *memo.add((name_hash >> 7) as usize & (HASHES - 1)) };
+        if e.name.as_deref().is_some_and(|n| name_eq(n, name)) {
+            return e.hash;
+        }
+        let hash = crate::object::py_str_hash(name);
+        e.name = Some(Rc::from(name));
+        e.hash = hash;
+        hash
+    }
+
+    /// This thread's table, allocated on first use.
+    #[cold]
+    #[inline(never)]
+    fn alloc_table() -> *mut Entry {
+        let table = Box::into_raw(vec![EMPTY; SIZE].into_boxed_slice()).cast::<Entry>();
+        TABLE.with(|t| t.set(table));
+        // (Registers the owner's destructor; a thread already past its
+        // destructors keeps the table until the process exits.)
+        let _ = OWNER.try_with(|_| ());
+        table
     }
 
     /// Where an MRO walk for a name landed.
@@ -424,45 +517,46 @@ pub(crate) mod type_cache {
     /// Probe the cache. `ver` is the type's *current* version.
     #[inline]
     pub(crate) fn probe(ty: usize, ver: u64, name: &str, name_hash: u64) -> Option<Hit> {
-        CACHE.with(|c| {
-            let c = c.try_borrow().ok()?;
-            let table = c.as_ref()?;
-            let e = &table[slot(ty, ver, name_hash)];
-            if e.ver == ver && e.name.as_deref().is_some_and(|n| name_eq(n, name)) {
-                Some(if e.mro_idx == ABSENT {
-                    Hit::Absent
-                } else {
-                    Hit::At {
-                        mro_idx: e.mro_idx,
-                        dict_idx: e.dict_idx,
-                    }
-                })
+        let table = TABLE.with(Cell::get);
+        if table.is_null() {
+            return None;
+        }
+        // SAFETY: a live table of `SIZE` entries (see `TABLE`), indexed
+        // below `SIZE`.
+        let e = unsafe { &*table.add(slot(ty, ver, name_hash)) };
+        if e.ver == ver && e.name.as_deref().is_some_and(|n| name_eq(n, name)) {
+            Some(if e.mro_idx == ABSENT {
+                Hit::Absent
             } else {
-                None
-            }
-        })
+                Hit::At {
+                    mro_idx: e.mro_idx,
+                    dict_idx: e.dict_idx,
+                }
+            })
+        } else {
+            None
+        }
     }
 
     /// Record the outcome of a full walk.
     #[inline]
     pub(crate) fn fill(ty: usize, ver: u64, name: &str, name_hash: u64, hit: Hit) {
-        CACHE.with(|c| {
-            let Ok(mut c) = c.try_borrow_mut() else {
-                return;
-            };
-            let table = c.get_or_insert_with(|| vec![EMPTY; SIZE].into_boxed_slice());
-            let (mro_idx, dict_idx) = match hit {
-                Hit::At { mro_idx, dict_idx } => (mro_idx, dict_idx),
-                Hit::Absent => (ABSENT, 0),
-            };
-            let entry = &mut table[slot(ty, ver, name_hash)];
-            if entry.name.as_deref() != Some(name) {
-                entry.name = Some(Rc::from(name));
-            }
-            entry.ver = ver;
-            entry.mro_idx = mro_idx;
-            entry.dict_idx = dict_idx;
-        });
+        let mut table = TABLE.with(Cell::get);
+        if table.is_null() {
+            table = alloc_table();
+        }
+        let (mro_idx, dict_idx) = match hit {
+            Hit::At { mro_idx, dict_idx } => (mro_idx, dict_idx),
+            Hit::Absent => (ABSENT, 0),
+        };
+        // SAFETY: as in `probe`; no other reference to the entry is live.
+        let entry = unsafe { &mut *table.add(slot(ty, ver, name_hash)) };
+        if entry.name.as_deref() != Some(name) {
+            entry.name = Some(Rc::from(name));
+        }
+        entry.ver = ver;
+        entry.mro_idx = mro_idx;
+        entry.dict_idx = dict_idx;
     }
 
     #[cfg(test)]
@@ -2328,8 +2422,11 @@ impl TypeObject {
             }
             None => {}
         }
-        // (Hashed at most once for the whole walk.)
-        let key = crate::object::StrKeyLazy::new(name);
+        // (Hashed once for the whole walk, through the memo.)
+        let key = crate::object::StrKeyHashed {
+            s: name,
+            hash: type_cache::py_hash_of(name, h),
+        };
         let mro = self.mro.borrow();
         for (i, owner) in mro.iter().enumerate() {
             let d = owner.dict.borrow();

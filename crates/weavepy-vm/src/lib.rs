@@ -19655,6 +19655,10 @@ impl Interpreter {
             return None;
         }
         // SAFETY: `len > 0`.
+        if let Object::Type(cls) = unsafe { &*base.add(len - 1) } {
+            return unsafe { Self::core_class_delete(code, ins, cls, base, len) };
+        }
+        // SAFETY: `len > 0`.
         let Object::Instance(inst) = (unsafe { &*base.add(len - 1) }) else {
             return None;
         };
@@ -19699,6 +19703,54 @@ impl Interpreter {
         // Released at once, as CPython's decref is.
         self.release(removed);
         self.release(owner);
+        Some(len - 1)
+    }
+
+    /// `del C.name` (`DELETE_ATTR` `ins` of `code`) of the class `cls`
+    /// atop the `len` stack slots at `base`, as [`Self::del_type_attr_direct`]
+    /// runs its plain end: a non-dunder name in a heap class's own dict,
+    /// under a metaclass that keeps `type`'s attribute protocol (see
+    /// [`Self::meta_store_transparent`]), no type watcher. The value and the
+    /// class leave as the full arm releases them (a release may queue a
+    /// finalizer: the caller checks). Returns the new stack length, or
+    /// `None`, having touched nothing (a missing name raises on the full
+    /// path).
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries,
+    /// `cls` the top one's class.
+    #[inline(never)]
+    unsafe fn core_class_delete(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        cls: &Rc<TypeObject>,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
+            return None;
+        };
+        if key.starts_with("__")
+            || crate::capi_watchers::types_active()
+            || crate::capi_watchers::dicts_active()
+            || cls.flags.is_builtin
+            || cls.immutable.get()
+            || cls.c_ext_ptr.get() != 0
+            || !Self::meta_store_transparent(cls, key)
+        {
+            return None;
+        }
+        let removed = cls
+            .dict
+            .try_borrow_mut()
+            .ok()?
+            .shift_remove(&crate::object::StrKey(key))?;
+        cls.bump_attr_version();
+        // SAFETY: the class leaves its slot.
+        let owner = unsafe { base.add(len - 1).read() };
+        drop(removed);
+        drop(owner);
         Some(len - 1)
     }
 
@@ -31005,7 +31057,22 @@ impl Interpreter {
     fn type_dunder_transparent(name: &str) -> bool {
         matches!(
             name,
-            "__init__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+            "__init__"
+                | "__enter__"
+                | "__exit__"
+                | "__aenter__"
+                | "__aexit__"
+                | "__setattr__"
+                | "__delattr__"
+                | "__getattribute__"
+                | "__repr__"
+                | "__str__"
+                | "__eq__"
+                | "__ne__"
+                | "__hash__"
+                | "__reduce__"
+                | "__reduce_ex__"
+                | "__init_subclass__"
         )
     }
 
@@ -53116,14 +53183,16 @@ impl Interpreter {
                 // from the class's *own* dict only (inherited attributes can't
                 // be deleted via a subclass; `__dict__`/`__weakref__` are
                 // read-only layout getsets, test_set_dict).
-                if let Some(method) = metaclass_method(obj, "__delattr__") {
-                    if !matches!(
-                        method,
-                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
-                    ) {
-                        let g = self.builtins.clone();
-                        self.call(&method, &[Object::from_str(name)], &[], &g)?;
-                        return Ok(());
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                    match meta.lookup("__delattr__") {
+                        Some(Object::Builtin(_)) | None => {}
+                        Some(m) => {
+                            let method = bind_method(obj, m);
+                            let g = self.builtins.clone();
+                            self.call(&method, &[Object::from_str(name)], &[], &g)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.del_type_attr_direct(ty, name)
