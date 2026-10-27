@@ -40528,8 +40528,13 @@ impl Interpreter {
             // (test_str.test_conversion: `str(WithRepr(StrSubclass('<abc>')))`).
             // A built-in *value* subclass must instead use the base type's
             // `tp_str` (an int subclass keeps the digit-limit ValueError,
-            // test_int), which `stringify` below provides.
-            if inst.native.get().is_none() && instance_method(v, "__repr__").is_some() {
+            // test_int), which `stringify` below provides, unless the
+            // subclass overrides `__repr__` and the base has no `tp_str` of
+            // its own (an `int`, `float` or container subclass: CPython's
+            // `object_str` then calls the override).
+            if (inst.native.get().is_none() || native_subclass_own_repr(inst))
+                && instance_method(v, "__repr__").is_some()
+            {
                 return self.do_repr_call(v, globals);
             }
         }
@@ -44886,7 +44891,13 @@ impl Interpreter {
             // Container bases (tuple/list/dict/…) don't, so `str(x)` falls
             // through `object.__str__` to `repr(x)`, which dispatches a user
             // `__repr__` when defined (namedtuple relies on this).
+            // (An `int`, `float` or `complex` has no `tp_str` of its own
+            // either: a subclass overriding `__repr__` renders through it,
+            // as `object.__str__` makes it.)
             if let Some(native) = inst.native.get() {
+                if native_subclass_own_repr(inst) {
+                    return self.repr_of(v, globals);
+                }
                 if matches!(
                     native,
                     Object::Int(_)
@@ -55024,17 +55035,19 @@ impl Interpreter {
                     if b.name == "__init__" && is_object_init(b) {
                         return crate::builtin_types::object_init_call(args, !kwargs.is_empty());
                     }
-                    // `object.__new__(M, ...)` of `type` or a metaclass:
-                    // object's allocator can't build a class (CPython
-                    // `tp_new_wrapper`'s safety check), so this neither
-                    // takes the class-building route below nor allocates.
+                    // `object.__new__(cls, ...)` from Python code of a class
+                    // a built-in type's own `__new__` allocates (`dict`, a
+                    // `dict` subclass, `type` or a metaclass): object's
+                    // allocator can't stand in (CPython `tp_new_wrapper`'s
+                    // safety check), so this neither takes the
+                    // class-building route below nor allocates. (The
+                    // construction paths call the allocator directly.)
                     if b.name == "__new__" && is_object_new(b) {
-                        if let Some(Object::Type(mcs)) = args.first() {
-                            if mcs.is_subclass_of(&builtin_types().type_) {
+                        if let Some(Object::Type(cls)) = args.first() {
+                            if let Some(base) = object_new_unsafe(cls) {
                                 return Err(type_error(format!(
                                     "object.__new__({}) is not safe, use {}.__new__()",
-                                    mcs.name,
-                                    static_new_base(mcs)
+                                    cls.name, base
                                 )));
                             }
                         }
@@ -71709,21 +71722,67 @@ fn class_dunder_new(cls: &TypeObject) -> Option<Object> {
     None
 }
 
-/// The name of the class whose native `__new__` serves `cls` (CPython
-/// `tp_new_wrapper`'s `staticbase`): the first class on its MRO whose
-/// `__new__` doesn't resolve to Python code.
-fn static_new_base(cls: &TypeObject) -> String {
-    for t in cls.mro.borrow().iter() {
-        let python = match t.lookup("__new__") {
-            Some(Object::Function(_)) => true,
-            Some(Object::StaticMethod(sm)) => matches!(sm.func(), Object::Function(_)),
-            _ => false,
-        };
-        if !python {
-            return t.name.clone();
-        }
+/// Whether `inst`, a subclass instance of a built-in type with no `tp_str`
+/// of its own (`int`, `float`, `complex`, `list`, `dict`, `tuple`),
+/// overrides `__repr__` below the built-in base: `str(inst)` then renders
+/// through the override, as CPython's `object_str` makes it.
+fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
+    matches!(
+        inst.native.get(),
+        Some(
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Tuple(_)
+        )
+    ) && inst
+        .cls()
+        .lookup_with_owner("__repr__")
+        .is_some_and(|(_, owner)| !owner.flags.is_builtin)
+}
+
+/// Whether `object.__new__(cls)` is unsafe (CPython `tp_new_wrapper`'s
+/// check): the class whose native `__new__` serves `cls` (its
+/// `staticbase`, the first class on its MRO whose `__new__` doesn't
+/// resolve to Python code) allocates through a built-in type's own
+/// `__new__` (`dict`'s, `int`'s, `type`'s), which `object`'s can't stand
+/// in for. That class's name, for the error, or `None` when `object`'s
+/// allocator serves (or the native type is one WeavePy alone builds).
+fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
+    let mro = cls.mro.borrow();
+    let base = mro.iter().find(|t| {
+        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
+            && !matches!(
+                t.lookup("__new__"),
+                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
+            )
+    })?;
+    let (new, owner) = base.lookup_with_owner("__new__")?;
+    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
+        return None;
     }
-    cls.name.clone()
+    let bt = builtin_types();
+    let core = [
+        &bt.int_,
+        &bt.bool_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.bytearray_,
+        &bt.tuple_,
+        &bt.list_,
+        &bt.dict_,
+        &bt.set_,
+        &bt.frozenset_,
+        &bt.type_,
+    ];
+    core.iter()
+        .any(|t| Rc::ptr_eq(t, &owner))
+        .then(|| base.name.clone())
 }
 
 /// Whether `b` is `object.__init__` (the process-wide builtin), which
