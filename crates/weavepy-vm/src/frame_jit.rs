@@ -256,6 +256,8 @@ struct Caches {
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     mods: Vec<Box<ModCache>>,
+    /// The leaf method calls' sites.
+    leaf_methods: Vec<Box<LeafMethodSite>>,
 }
 
 impl Caches {
@@ -268,6 +270,7 @@ impl Caches {
         self.type_sites.append(&mut other.type_sites);
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
+        self.leaf_methods.append(&mut other.leaf_methods);
     }
 }
 
@@ -3624,6 +3627,112 @@ unsafe extern "C" fn h_local_method(
                 RAISED
             }
         }
+    }
+}
+
+/// How many receiver class versions a [`LeafMethodSite`] keeps a callee
+/// for (an expression tree's `node.eval(env)` sees several classes).
+const LEAF_METHOD_WAYS: usize = 8;
+
+/// Declined calls after which a [`LeafMethodSite`] that never ran one is
+/// skipped.
+const LEAF_METHOD_MISSES: u32 = 64;
+
+/// Where the code finds a [`LeafMethodSite`]'s skip flag.
+const LMS_OFF: i32 = std::mem::offset_of!(LeafMethodSite, off) as i32;
+
+/// Count a call `site` declined (see [`LeafMethodSite::off`]).
+#[cold]
+fn leaf_method_miss(site: &LeafMethodSite) -> u32 {
+    let m = site.misses.get().saturating_add(1);
+    site.misses.set(m);
+    if m >= LEAF_METHOD_MISSES && site.hits.get() == 0 {
+        site.off.set(1);
+    }
+    1
+}
+
+/// What an `x.m(<simple arguments>)` site whose method runs as a frameless
+/// leaf settled when it was compiled (see [`h_leaf_method`]).
+#[repr(C)]
+pub(crate) struct LeafMethodSite {
+    /// Nonzero once the site declined [`LEAF_METHOD_MISSES`] calls without
+    /// running one: the code then skips the helper (a site that calls
+    /// methods of several classes only sometimes calls a leaf).
+    off: std::cell::Cell<u8>,
+    /// The calls it declined and ran (each saturating).
+    misses: std::cell::Cell<u32>,
+    hits: std::cell::Cell<u32>,
+    ext: *const CodeConstObjects,
+    /// The method load's pc and name.
+    attr_pc: usize,
+    name: u32,
+    /// The arguments after the receiver.
+    nargs: usize,
+    /// The receiver is a stack temporary (the result of the code before the
+    /// method load), which the call releases; otherwise a local's value.
+    owned: bool,
+    /// The leaf callees its last calls ran, by receiver class version
+    /// (see `Interpreter::leaf_method_callee`), the newest first.
+    callees: [std::cell::Cell<crate::LeafCallee>; LEAF_METHOD_WAYS],
+}
+
+/// `x.m(...)` at `site` with the receiver at `recv` and up to two
+/// arguments at `a` and `b` (borrowed: locals, constants or the scalars
+/// the code wrote): `0` with the method's result written to `out` (and an
+/// owned receiver released first) when the site's leaf callee ran it in
+/// place; anything else declined untouched.
+unsafe extern "C" fn h_leaf_method(
+    st: *mut State,
+    site: *const LeafMethodSite,
+    out: *mut Object,
+    recv: *mut Object,
+    a: *const Object,
+    b: *const Object,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own site, a free stack
+    // slot (or the owned receiver's), and live operands.
+    unsafe {
+        let (st, site) = (&*st, &*site);
+        let args = [recv.cast_const(), a, b];
+        let args = args.get_unchecked(..=site.nargs);
+        let Object::Instance(inst) = &*recv else {
+            return leaf_method_miss(site);
+        };
+        let ver = inst.cls_raw().attr_version.get();
+        // The callee this site cached for the receiver's class version (read
+        // in place: only the matching entry is copied), or the one its
+        // method slot resolved, cached from here on. A version whose method
+        // is no such leaf is cached with no callee, and declined at once.
+        let c = match site.callees.iter().find(|c| (*c.as_ptr()).ver == ver) {
+            Some(c) => c.get(),
+            None => {
+                let Some(c) =
+                    Interpreter::leaf_method_callee(&*site.ext, site.attr_pc, site.name, &*recv)
+                else {
+                    return leaf_method_miss(site);
+                };
+                for k in (1..LEAF_METHOD_WAYS).rev() {
+                    site.callees[k].set(site.callees[k - 1].get());
+                }
+                site.callees[0].set(c);
+                c
+            }
+        };
+        if c.is_none() {
+            return leaf_method_miss(site);
+        }
+        let Some(v) = (*st.interp).leaf_method_run(&c, inst, args, st.depth_cell) else {
+            return leaf_method_miss(site);
+        };
+        if site.hits.get() == 0 {
+            site.hits.set(1);
+        }
+        if site.owned {
+            drop(recv.read());
+        }
+        out.write(v);
+        0
     }
 }
 
@@ -8908,6 +9017,7 @@ fn lower_range(
                 type_sites: std::mem::take(&mut lower.type_sites),
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
+                leaf_methods: std::mem::take(&mut lower.leaf_methods),
             },
         };
         if done {
@@ -9228,6 +9338,9 @@ struct Lower<'a> {
     /// The method loads' module-attribute caches.
     #[allow(clippy::vec_box)]
     mod_caches: Vec<Box<ModCache>>,
+    /// The leaf method calls' sites (see [`LeafMethodSite`]).
+    #[allow(clippy::vec_box)]
+    leaf_methods: Vec<Box<LeafMethodSite>>,
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
     /// first use.
     catch: Option<Block>,
@@ -9419,6 +9532,7 @@ impl<'a> Lower<'a> {
             type_sites: Vec::new(),
             held: Vec::new(),
             mod_caches: Vec::new(),
+            leaf_methods: Vec::new(),
             catch: None,
             leave_tail: None,
         }
@@ -10949,6 +11063,7 @@ impl<'a> Lower<'a> {
                     && crate::method_site_in_place(self.ext, pc + 1)
                     && !self.native_body_call(pc + 2) =>
             {
+                self.leaf_method(pc + 1, false);
                 self.method_kernel(pc);
                 self.method_call(pc)
             }
@@ -11109,6 +11224,127 @@ impl<'a> Lower<'a> {
         let (depth, last) = (self.depth, self.last_pc);
         self.push(Item::Mem(slot));
         self.set_last(call_pc);
+        self.goto(call_pc + 1);
+        self.depth = depth;
+        self.last_pc = last;
+        self.vs.clear();
+        self.b.switch_to_block(declined);
+    }
+
+    /// `x.m(<up to two local, constant or small-int arguments>); CALL`
+    /// (`attr_pc` the method load) of a Python method the site runs as a
+    /// frameless leaf: [`h_leaf_method`] on the operands in place,
+    /// continuing after the `CALL`. The receiver is the local the
+    /// instruction before loads, or with `owned` the stack's top, which the
+    /// call consumes. Lowering continues (at the general method call) where
+    /// the helper declines; nothing is emitted for another site.
+    fn leaf_method(&mut self, attr_pc: usize, owned: bool) {
+        let code = self.code;
+        let ins = &code.instructions;
+        if self.is_gen() || (owned && self.depth == 0) {
+            return;
+        }
+        let mut args: Vec<(OpCode, u32)> = Vec::new();
+        let mut k = attr_pc + 1;
+        let call_pc = loop {
+            let Some(i) = ins.get(k) else {
+                return;
+            };
+            match i.op {
+                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {}
+                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {}
+                OpCode::LoadSmallInt => {}
+                OpCode::Call if i.arg as usize == args.len() => break k,
+                _ => return,
+            }
+            args.push((i.op, i.arg));
+            if args.len() > 2 {
+                return;
+            }
+            k += 1;
+        };
+        if call_pc + 1 >= ins.len()
+            || !self.starts.get(call_pc + 1).copied().unwrap_or(false)
+            || !crate::method_site_py(self.ext, attr_pc)
+        {
+            return;
+        }
+        self.flush();
+        // The result's slot: the receiver's own, or the free one above.
+        let slot = self.depth - usize::from(owned);
+        let declined = self.b.create_block();
+        let recv = if owned {
+            self.slot_addr(slot)
+        } else {
+            self.local_addr(ins[attr_pc - 1].arg)
+        };
+        let null = self.b.ins().iconst(self.ptr, 0);
+        let mut addrs = [null, null];
+        for (j, &(op, arg)) in args.iter().enumerate() {
+            addrs[j] = match op {
+                OpCode::LoadConst => self.const_addr(arg),
+                // A scalar in the slot the argument would take.
+                OpCode::LoadSmallInt => {
+                    let at = self.slot_addr(slot + 2 + j);
+                    self.write_tag(at, self.tags.int);
+                    let v = self.b.ins().iconst(types::I64, i64::from(arg));
+                    self.b.ins().store(FLAGS, v, at, 8);
+                    at
+                }
+                _ => {
+                    let at = self.local_addr(arg);
+                    if self.maybe_unbound[arg as usize] && !self.bound[arg as usize] {
+                        let t = self.tag_at(at);
+                        let unbound =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
+                        self.branch_out(unbound, declined);
+                    }
+                    at
+                }
+            };
+        }
+        let site = Box::new(LeafMethodSite {
+            off: std::cell::Cell::new(0),
+            misses: std::cell::Cell::new(0),
+            hits: std::cell::Cell::new(0),
+            ext: std::ptr::from_ref(self.ext),
+            attr_pc,
+            name: ins[attr_pc].arg,
+            nargs: args.len(),
+            owned,
+            callees: [const { std::cell::Cell::new(crate::LeafCallee::EMPTY) }; LEAF_METHOD_WAYS],
+        });
+        let sv = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref::<LeafMethodSite>(&*site) as i64,
+        );
+        self.leaf_methods.push(site);
+        let off = self.b.ins().uload8(types::I64, FLAGS, sv, LMS_OFF);
+        self.branch_out(off, declined);
+        let out = self.slot_addr(slot);
+        self.store_last();
+        let r = self
+            .call(
+                h_leaf_method as *const () as usize,
+                &[self.st, sv, out, recv, addrs[0], addrs[1]],
+                true,
+            )
+            .expect("returns");
+        let ran = self.b.create_block();
+        self.b.ins().brif(r, declined, &[], ran, &[]);
+        // Ran: the result in the receiver's slot, as after the `CALL`.
+        self.b.switch_to_block(ran);
+        let (depth, last) = (self.depth, self.last_pc);
+        if owned {
+            self.pop();
+        }
+        self.push(Item::Mem(slot));
+        self.set_last(call_pc);
+        // (A temporary the leaf or the receiver's release freed may have
+        // queued a finalizer.)
+        self.check_released(call_pc + 1);
         self.goto(call_pc + 1);
         self.depth = depth;
         self.last_pc = last;
@@ -13356,6 +13592,8 @@ impl<'a> Lower<'a> {
             self.exit(INTERP, pc);
             return false;
         }
+        // A leaf method of the value on top, called in place.
+        self.leaf_method(pc, true);
         self.flush();
         let helper = self.b.create_block();
         let done = self.b.create_block();

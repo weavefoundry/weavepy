@@ -11753,8 +11753,8 @@ impl Interpreter {
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
                     if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
                         // SAFETY: the site's code is its live function's.
-                        .filter(|&(_, c, effect)| {
-                            CALLING_EFFECTS || !effect || !code_recurses(unsafe { &*c })
+                        .filter(|h| {
+                            CALLING_EFFECTS || !h.effect || !code_recurses(unsafe { &*h.code })
                         })
                     {
                         match self.core_leaf_site_call(
@@ -21770,6 +21770,15 @@ impl Interpreter {
                 .filter(|h| std::ptr::eq(Rc::as_ptr(h), fp));
             if let (Some(ext), Some(held)) = (code_vm_ext(code), held) {
                 let func = Rc::downgrade(&held);
+                let i = name_idx as usize;
+                let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
+                    (Some(k), Some(Object::Str(n))) => {
+                        ext.name_hashes.get(i).map_or((0, 0), |&h| {
+                            (std::ptr::from_ref(k) as usize, k.names_before(n, h))
+                        })
+                    }
+                    _ => (0, 0),
+                };
                 leaf_site_set(
                     ext,
                     code,
@@ -21779,6 +21788,8 @@ impl Interpreter {
                         func,
                         code: Rc::as_ptr(callee),
                         effect: !code_is_pure_leaf(callee),
+                        keys,
+                        limit,
                     }),
                 );
             }
@@ -21796,7 +21807,7 @@ impl Interpreter {
         code: &CodeObject,
         inst: &PyInstance,
         recv: &Object,
-        (fp, callee, effect): (*const crate::object::PyFunction, *const CodeObject, bool),
+        site: LeafHit,
         attr_pc: usize,
         name_idx: u32,
         lbase: *const Object,
@@ -21804,20 +21815,6 @@ impl Interpreter {
         consts: &[Object],
         depth_cell: *const std::cell::Cell<usize>,
     ) -> SiteCall {
-        // SAFETY: the class holds the function at the site's version (and
-        // the weak handle is live); nothing here runs code.
-        let f = unsafe { &*fp };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        // The ordinary call's `RecursionError` check.
-        // SAFETY: this thread's own depth cell.
-        if !std::ptr::eq(Rc::as_ptr(code_rc), callee)
-            || !Self::default_getattribute(inst.cls_raw())
-            || inst_may_shadow(inst, code, name_idx)
-            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
-        {
-            return SiteCall::Declined;
-        }
         // Scalars only (small ints): nothing to drop on the way out.
         let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
@@ -21837,22 +21834,192 @@ impl Interpreter {
         }) else {
             return SiteCall::Declined;
         };
-        let total = nargs + 1;
-        if total != code_rc.arg_count as usize {
-            return SiteCall::Declined;
-        }
-        // SAFETY: as above.
-        let depth = unsafe { (*depth_cell).get() };
-        let r = self.pure_leaf_call(code_rc, f, &args[..total], effect, depth);
-        let Some(v) = r else {
-            if let Some(ext) = code_vm_ext(code) {
-                leaf_site_set(ext, code, attr_pc, None);
+        match self.leaf_site_eval(
+            code,
+            inst,
+            site,
+            attr_pc,
+            name_idx,
+            &args[..=nargs],
+            depth_cell,
+        ) {
+            Ok(v) => {
+                #[cfg(test)]
+                note_literal_argument_call(code, attr_pc + 1, call_pc, true);
+                SiteCall::Done(v, call_pc)
             }
-            return SiteCall::Missed;
+            Err(true) => SiteCall::Missed,
+            Err(false) => SiteCall::Declined,
+        }
+    }
+
+    /// What a frame-JIT method site keeps of the leaf callee its last call
+    /// of `x.m(...)` (at the method load `attr_pc` of `code`, whose
+    /// extension is `ext`) ran on `recv`, for [`Self::leaf_method_run`]:
+    /// the site's verified callee under the receiver's class version (see
+    /// [`LeafSite`]), when nothing but the receiver's own attributes, the
+    /// callee's code cell and the recursion depth can change from call to
+    /// call; [`LeafCallee::none`] when the method resolved is no such leaf,
+    /// and `None` while the site hasn't resolved it.
+    pub(crate) fn leaf_method_callee(
+        ext: &CodeConstObjects,
+        attr_pc: usize,
+        name_idx: u32,
+        recv: &Object,
+    ) -> Option<LeafCallee> {
+        let Object::Instance(inst) = recv else {
+            return None;
         };
-        #[cfg(test)]
-        note_literal_argument_call(code, attr_pc + 1, call_pc, true);
-        SiteCall::Done(v, call_pc)
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        // The plain function the site's method slot resolved under this
+        // class version (the class holds it).
+        let fp = ext.method_sites().get(attr_pc)?.peek_fn(ver)?;
+        // SAFETY: the class holds the function at this version.
+        let f = unsafe { &*fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let callee: &CodeObject = unsafe { &*f.code.as_ptr() };
+        let effect = !code_is_pure_leaf(callee);
+        // (A recursive effect leaf runs as an ordinary call from here.)
+        if (effect && (!code_is_effect_leaf(callee) || code_recurses(callee)))
+            || !Self::leaf_code_ok(callee)
+            || callee.kwonly_count != 0
+            || callee.has_varargs
+            || callee.has_varkeywords
+            || !Self::default_getattribute(cls)
+        {
+            return Some(LeafCallee::none(ver));
+        }
+        let i = name_idx as usize;
+        let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
+            (Some(k), Some(Object::Str(n))) => ext.name_hashes.get(i).map_or((0, 0), |&h| {
+                (std::ptr::from_ref(k) as usize, k.names_before(n, h))
+            }),
+            _ => (0, 0),
+        };
+        Some(LeafCallee {
+            ver,
+            fp,
+            code: std::ptr::from_ref(callee),
+            cext: std::ptr::from_ref(code_vm_ext(callee)?),
+            keys,
+            limit,
+            effect,
+        })
+    }
+
+    /// `x.m(...)` with the leaf callee `c` a frame-JIT site cached (see
+    /// [`Self::leaf_method_callee`]) for `args[0]`'s class version: the
+    /// callee's tiny shape or compiled plan run directly. `None` (nothing
+    /// observable done) runs the call the general way.
+    ///
+    /// # Safety
+    ///
+    /// `args` are live; `args[0]` is an instance of the class `c` was
+    /// cached for, at that class version (so the class holds `c`'s
+    /// function, and the function its extension's code unless rebound).
+    #[inline(always)]
+    pub(crate) unsafe fn leaf_method_run(
+        &self,
+        c: &LeafCallee,
+        inst: &PyInstance,
+        args: &[*const Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        // SAFETY: the caller's contract.
+        let (f, cext) = unsafe { (&*c.fp, &*c.cext) };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        // (A leaf verdict withdrawn since, see `JitHint::note_leaf_miss`,
+        // sends the calls the ordinary way again.)
+        if !std::ptr::eq(Rc::as_ptr(code_rc), c.code)
+            || args.len() != code_rc.arg_count as usize
+            || depth >= crate::recursion::recursion_limit()
+            || inst.dict.published().is_some()
+            || !(code_is_pure_leaf(code_rc) || code_rc.jit_hint.effect_leaf())
+        {
+            return None;
+        }
+        // The receiver's own attributes can't shadow the method.
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let (keys, n) = unsafe { inst.dict.split_cell().peek() }?.keys_and_len();
+        if n != 0 && (keys != c.keys || keys == 0 || n > c.limit) {
+            return None;
+        }
+        let shape = cext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
+        if shape >= 3 {
+            if !Self::leaf_call_entry(code_rc) {
+                return None;
+            }
+            let r = if c.effect {
+                Self::leaf_tiny::<true>(code_rc, cext, shape, args)
+            } else {
+                Self::leaf_tiny::<false>(code_rc, cext, shape, args)
+            };
+            // (A miss is the general path's to count: it runs next.)
+            let r = r.flatten()?;
+            Self::leaf_call_exit(code_rc, true);
+            return Some(r);
+        }
+        // The plan's native code, or (not compiled yet) the shared frameless
+        // path, which compiles it once it is warm.
+        #[cfg(feature = "jit")]
+        {
+            let r = if c.effect {
+                self.leaf_site_native::<true>(code_rc, cext, f, args, depth)
+            } else {
+                self.leaf_site_native::<false>(code_rc, cext, f, args, depth)
+            };
+            if let Some(r) = r {
+                return r;
+            }
+        }
+        self.pure_leaf_call(code_rc, f, args, c.effect, depth)
+    }
+
+    /// [`Self::core_leaf_site_call`]'s evaluation, with `args` (the
+    /// receiver first) gathered: the result, or `Err` with whether the
+    /// evaluation itself declined (the site then forgotten) rather than a
+    /// check before it.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn leaf_site_eval(
+        &self,
+        code: &CodeObject,
+        inst: &PyInstance,
+        site: LeafHit,
+        attr_pc: usize,
+        name_idx: u32,
+        args: &[*const Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Result<Object, bool> {
+        // SAFETY: the class holds the function at the site's version (and
+        // the weak handle is live); nothing here runs code.
+        let f = unsafe { &*site.fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        if !std::ptr::eq(Rc::as_ptr(code_rc), site.code)
+            || args.len() != code_rc.arg_count as usize
+            || depth >= crate::recursion::recursion_limit()
+            || !Self::default_getattribute(inst.cls_raw())
+            || inst_may_shadow_bounded(inst, code, name_idx, site.keys, site.limit)
+        {
+            return Err(false);
+        }
+        match self.pure_leaf_call(code_rc, f, args, site.effect, depth) {
+            Some(v) => Ok(v),
+            None => {
+                if let Some(ext) = code_vm_ext(code) {
+                    leaf_site_set(ext, code, attr_pc, None);
+                }
+                Err(true)
+            }
+        }
     }
 
     /// The core loop's fused `LOAD_GLOBAL f; PUSH_NULL; <simple argument
@@ -22410,10 +22577,29 @@ impl Interpreter {
         if bails >= LEAF_BAIL_LIMIT && bails > done {
             return None;
         }
+        let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         let r = 'eval: {
+            // A tiny shape answers here (see `Self::leaf_tiny`).
+            if shape >= 3 && args.len() == leaf_arity(code) {
+                if !Self::leaf_call_entry(code) {
+                    break 'eval None;
+                }
+                let tiny = if effect {
+                    Self::leaf_tiny::<true>(code, ext, shape, args)
+                } else {
+                    Self::leaf_tiny::<false>(code, ext, shape, args)
+                };
+                let r = match tiny {
+                    Some(r) => r,
+                    None if effect => self.leaf_eval::<false, true>(code, f, args, 0),
+                    None => self.leaf_eval::<false, false>(code, f, args, 0),
+                };
+                Self::leaf_call_exit(code, r.is_some());
+                break 'eval r;
+            }
             // (The tiny shapes `leaf_eval` answers itself skip the probe.)
             #[cfg(feature = "jit")]
-            if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+            if shape < 3 {
                 let fast = if effect {
                     self.leaf_site_native::<true>(code, ext, f, args, depth)
                 } else {
@@ -22532,6 +22718,132 @@ impl Interpreter {
         self.leaf_run_ret::<false, false, false>(code, ext, plan, f, args, nest)
     }
 
+    /// [`Self::leaf_eval`] of a callee certified as one of the tiny
+    /// shapes (`shape`, its extension's `pure_leaf`, at least 3): the
+    /// result, or `Some(None)` declined having done nothing observable;
+    /// `None` sends the call on to the general body.
+    #[inline(always)]
+    fn leaf_tiny<const EFFECT: bool>(
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        shape: u8,
+        args: &[*const Object],
+    ) -> Option<Option<Object>> {
+        use leaf_plan::{compare, norm, V};
+        let consts: &[Object] = &ext.objects;
+        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
+        let start = usize::from(instrs.first()?.op == OpCode::Resume);
+        let load = instrs.get(start)?;
+        match shape {
+            16 if EFFECT => {
+                // The setter: store, and return `None`. A declined
+                // store touched nothing (the ordinary call runs it).
+                // SAFETY (argument reads): the arguments stay live for
+                // this evaluation.
+                let arg = |k: u32| args.get(k as usize).map(|&p| unsafe { &*p });
+                let (value, recv, store_pc) = match load.op {
+                    OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => (
+                        clone_hot(arg(load.arg >> 4)?),
+                        arg(load.arg & 15)?,
+                        start + 1,
+                    ),
+                    op => {
+                        let value = match op {
+                            OpCode::LoadConst => clone_hot(consts.get(load.arg as usize)?),
+                            OpCode::LoadSmallInt => Object::Int(i64::from(load.arg)),
+                            _ => clone_hot(arg(load.arg)?),
+                        };
+                        (value, arg(instrs.get(start + 1)?.arg)?, start + 2)
+                    }
+                };
+                let Object::Instance(inst) = recv else {
+                    return Some(None);
+                };
+                let store = instrs.get(store_pc)?;
+                let value = std::mem::ManuallyDrop::new(value);
+                // On `true` the value moved into the dict.
+                if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
+                    return Some(Some(Object::None));
+                }
+                drop(std::mem::ManuallyDrop::into_inner(value));
+                return Some(None);
+            }
+            3 => {
+                // SAFETY: the argument remains live for this evaluation.
+                return Some(Some(clone_hot(unsafe { &**args.get(load.arg as usize)? })));
+            }
+            4 => return Some(Some(clone_hot(consts.get(load.arg as usize)?))),
+            5 => return Some(Some(Object::Int(i64::from(load.arg)))),
+            6 => {
+                // SAFETY: as for the argument-return case above.
+                let recv = unsafe { &**args.get(load.arg as usize)? };
+                if let Object::Instance(inst) = recv {
+                    let pc = start + 1;
+                    let attr = instrs.get(pc)?;
+                    // SAFETY: the argument roots the receiver until the
+                    // result is retained; nothing here invokes Python.
+                    if let Some(value) = unsafe {
+                        Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
+                    } {
+                        return Some(Some(clone_hot(value)));
+                    }
+                    return Some(Self::leaf_attr_resolve_site(
+                        code, inst, recv, pc as u32, attr.arg,
+                    ));
+                }
+            }
+            7 => {
+                #[cfg(test)]
+                note_predicate_stage(code, 5);
+                // Cached field comparisons need neither the general
+                // leaf stack nor its owned-result scratch.
+                let cached_field = |load_pc: usize| -> Option<V> {
+                    let pc = load_pc + 1;
+                    let load = instrs.get(load_pc)?;
+                    // SAFETY: arguments root both field values for this
+                    // callback-free evaluation, with no owner releases.
+                    let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
+                    else {
+                        return None;
+                    };
+                    let attr = instrs.get(pc)?;
+                    // SAFETY: the same rooted, callback-free read.
+                    let value = unsafe {
+                        Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
+                    }?;
+                    #[cfg(test)]
+                    note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
+                    Some(norm(std::ptr::from_ref(value)))
+                };
+                let compare_fields = || {
+                    let a = cached_field(start)?;
+                    let b = cached_field(start + 2)?;
+                    let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
+                        x if x == CompareKind::Lt as u32 => CompareKind::Lt,
+                        x if x == CompareKind::LtE as u32 => CompareKind::LtE,
+                        x if x == CompareKind::Eq as u32 => CompareKind::Eq,
+                        x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
+                        x if x == CompareKind::Gt as u32 => CompareKind::Gt,
+                        x if x == CompareKind::GtE as u32 => CompareKind::GtE,
+                        _ => return None,
+                    };
+                    compare(a, b, kind).map(Object::Bool)
+                };
+                if let Some(result) = compare_fields() {
+                    #[cfg(test)]
+                    note_predicate_stage(code, 8);
+                    #[cfg(test)]
+                    PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
+                    return Some(Some(result));
+                }
+                // Preserve the existing general leaf evaluator on a
+                // shape miss, including its slot and polymorphic reads.
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// [`Self::pure_leaf_eval`] at call-nesting depth `nest` (a pure-leaf
     /// callee of a leaf is evaluated one level down, to a small bound).
     #[inline(never)]
@@ -22542,121 +22854,14 @@ impl Interpreter {
         args: &[*const Object],
         nest: u8,
     ) -> Option<Object> {
-        use leaf_plan::{compare, norm, V};
         let ext = code_vm_ext(code)?;
-        let consts: &[Object] = &ext.objects;
-        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
         // Tiny return bodies need no operand stack or owned-value scratch.
         // The shape is certified once, alongside the pure-leaf decision;
         // call, observer, and recursion guards still belong to the caller.
         let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         if shape >= 3 {
-            let start = usize::from(instrs.first()?.op == OpCode::Resume);
-            let load = instrs.get(start)?;
-            match shape {
-                16 if EFFECT => {
-                    // The setter: store, and return `None`. A declined
-                    // store touched nothing (the ordinary call runs it).
-                    // SAFETY (argument reads): the arguments stay live for
-                    // this evaluation.
-                    let arg = |k: u32| args.get(k as usize).map(|&p| unsafe { &*p });
-                    let (value, recv, store_pc) = match load.op {
-                        OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => (
-                            clone_hot(arg(load.arg >> 4)?),
-                            arg(load.arg & 15)?,
-                            start + 1,
-                        ),
-                        op => {
-                            let value = match op {
-                                OpCode::LoadConst => clone_hot(consts.get(load.arg as usize)?),
-                                OpCode::LoadSmallInt => Object::Int(i64::from(load.arg)),
-                                _ => clone_hot(arg(load.arg)?),
-                            };
-                            (value, arg(instrs.get(start + 1)?.arg)?, start + 2)
-                        }
-                    };
-                    let Object::Instance(inst) = recv else {
-                        return None;
-                    };
-                    let store = instrs.get(store_pc)?;
-                    let value = std::mem::ManuallyDrop::new(value);
-                    // On `true` the value moved into the dict.
-                    if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
-                        return Some(Object::None);
-                    }
-                    drop(std::mem::ManuallyDrop::into_inner(value));
-                    return None;
-                }
-                3 => {
-                    // SAFETY: the argument remains live for this evaluation.
-                    return Some(clone_hot(unsafe { &**args.get(load.arg as usize)? }));
-                }
-                4 => return Some(clone_hot(consts.get(load.arg as usize)?)),
-                5 => return Some(Object::Int(i64::from(load.arg))),
-                6 => {
-                    // SAFETY: as for the argument-return case above.
-                    let recv = unsafe { &**args.get(load.arg as usize)? };
-                    if let Object::Instance(inst) = recv {
-                        let pc = start + 1;
-                        let attr = instrs.get(pc)?;
-                        // SAFETY: the argument roots the receiver until the
-                        // result is retained; nothing here invokes Python.
-                        if let Some(value) = unsafe {
-                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
-                        } {
-                            return Some(clone_hot(value));
-                        }
-                        return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
-                    }
-                }
-                7 => {
-                    #[cfg(test)]
-                    note_predicate_stage(code, 5);
-                    // Cached field comparisons need neither the general
-                    // leaf stack nor its owned-result scratch.
-                    let cached_field = |load_pc: usize| -> Option<V> {
-                        let pc = load_pc + 1;
-                        let load = instrs.get(load_pc)?;
-                        // SAFETY: arguments root both field values for this
-                        // callback-free evaluation, with no owner releases.
-                        let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
-                        else {
-                            return None;
-                        };
-                        let attr = instrs.get(pc)?;
-                        // SAFETY: the same rooted, callback-free read.
-                        let value = unsafe {
-                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
-                        }?;
-                        #[cfg(test)]
-                        note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
-                        Some(norm(std::ptr::from_ref(value)))
-                    };
-                    let compare_fields = || {
-                        let a = cached_field(start)?;
-                        let b = cached_field(start + 2)?;
-                        let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
-                            x if x == CompareKind::Lt as u32 => CompareKind::Lt,
-                            x if x == CompareKind::LtE as u32 => CompareKind::LtE,
-                            x if x == CompareKind::Eq as u32 => CompareKind::Eq,
-                            x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
-                            x if x == CompareKind::Gt as u32 => CompareKind::Gt,
-                            x if x == CompareKind::GtE as u32 => CompareKind::GtE,
-                            _ => return None,
-                        };
-                        compare(a, b, kind).map(Object::Bool)
-                    };
-                    if let Some(result) = compare_fields() {
-                        #[cfg(test)]
-                        note_predicate_stage(code, 8);
-                        #[cfg(test)]
-                        PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
-                        return Some(result);
-                    }
-                    // Preserve the existing general leaf evaluator on a
-                    // shape miss, including its slot and polymorphic reads.
-                }
-                _ => {}
+            if let Some(r) = Self::leaf_tiny::<EFFECT>(code, ext, shape, args) {
+                return r;
             }
         }
         // The general body: its translated plan (see `leaf_plan`), built
@@ -77632,6 +77837,71 @@ struct LeafSiteData {
     func: crate::sync::Weak<crate::object::PyFunction>,
     code: *const CodeObject,
     effect: bool,
+    /// The class's shared names (`0` none) and how many of them come
+    /// before the method's name: an instance whose values are laid over
+    /// those names and hold no more than that can't shadow the method.
+    keys: usize,
+    limit: usize,
+}
+
+/// A [`LeafSite`]'s callee under a class version (see `leaf_site_hit`).
+#[derive(Clone, Copy)]
+struct LeafHit {
+    fp: *const crate::object::PyFunction,
+    code: *const CodeObject,
+    effect: bool,
+    keys: usize,
+    limit: usize,
+}
+
+/// A frame-JIT method site's cached leaf callee (see
+/// `Interpreter::leaf_method_callee`): the receiver class version it was
+/// verified under (`0` none), the function and its code, the code's
+/// extension, the shadowing bound (see [`LeafSiteData::limit`]), and
+/// whether it is an effect leaf.
+#[derive(Clone, Copy)]
+pub(crate) struct LeafCallee {
+    pub(crate) ver: u64,
+    fp: *const crate::object::PyFunction,
+    code: *const CodeObject,
+    cext: *const CodeConstObjects,
+    keys: usize,
+    limit: usize,
+    effect: bool,
+}
+
+impl LeafCallee {
+    pub(crate) const EMPTY: LeafCallee = LeafCallee {
+        ver: 0,
+        fp: std::ptr::null(),
+        code: std::ptr::null(),
+        cext: std::ptr::null(),
+        keys: 0,
+        limit: 0,
+        effect: false,
+    };
+
+    /// A version under which the site's method is no leaf to run in place.
+    pub(crate) const fn none(ver: u64) -> LeafCallee {
+        LeafCallee { ver, ..Self::EMPTY }
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.fp.is_null()
+    }
+}
+
+impl LeafSiteData {
+    #[inline(always)]
+    fn hit(&self) -> LeafHit {
+        LeafHit {
+            fp: self.func.as_ptr(),
+            code: self.code,
+            effect: self.effect,
+            keys: self.keys,
+            limit: self.limit,
+        }
+    }
 }
 
 // SAFETY: as `StampSlot`.
@@ -77649,17 +77919,14 @@ impl LeafSite {
     /// An earlier callee verified under `ver` (see `leaf_site_hit`).
     #[cold]
     #[inline(never)]
-    fn poly_hit(
-        &self,
-        ver: u64,
-    ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+    fn poly_hit(&self, ver: u64) -> Option<LeafHit> {
         // SAFETY: GIL-serialized; the borrow ends before any refill.
         let poly = unsafe { &*self.1.get() }.as_deref()?;
         poly.entries
             .iter()
             .flatten()
             .find(|d| d.ver == ver && d.func.strong_count() > 0)
-            .map(|d| (d.func.as_ptr(), d.code, d.effect))
+            .map(LeafSiteData::hit)
     }
 
     /// Record `data` as the site's callee, keeping the one it replaces
@@ -77703,17 +77970,11 @@ impl LeafSite {
 /// The site at `pc`'s verified callee under `ver`: its function, code and
 /// effect flag.
 #[inline(always)]
-fn leaf_site_hit(
-    ext: &CodeConstObjects,
-    pc: usize,
-    ver: u64,
-) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+fn leaf_site_hit(ext: &CodeConstObjects, pc: usize, ver: u64) -> Option<LeafHit> {
     let site = ext.leaf_sites.get(pc)?;
     // SAFETY: GIL-serialized; the borrow ends before any refill.
     match unsafe { &*site.0.get() } {
-        Some(d) if d.ver == ver && d.func.strong_count() > 0 => {
-            Some((d.func.as_ptr(), d.code, d.effect))
-        }
+        Some(d) if d.ver == ver && d.func.strong_count() > 0 => Some(d.hit()),
         Some(_) => site.poly_hit(ver),
         None => None,
     }
@@ -77831,6 +78092,31 @@ pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 /// without an activation of its own.
 #[cfg(feature = "jit")]
 pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
+    method_site_leaf(ext, pc)
+        || ext.method_slot(pc).is_some_and(|slot| {
+            // SAFETY: GIL-serialized; the borrow ends here.
+            matches!(
+                unsafe { &(*slot.0.get()).1 },
+                MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..)
+            )
+        })
+}
+
+/// Whether the method-load site at `pc` last resolved a plain Python
+/// function (a leaf or not: a site that sees several classes calls both).
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_py(ext: &CodeConstObjects, pc: usize) -> bool {
+    method_site_leaf(ext, pc)
+        || ext.method_slot(pc).is_some_and(|slot| {
+            // SAFETY: GIL-serialized; the borrow ends here.
+            matches!(unsafe { &(*slot.0.get()).1 }, MethodSlotFn::Py(_))
+        })
+}
+
+/// Whether the method-load site at `pc` calls a Python function that runs
+/// in place, as a frameless leaf (see [`method_site_in_place`]).
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_leaf(ext: &CodeConstObjects, pc: usize) -> bool {
     // (A recursive effect leaf runs as an ordinary call, not in place:
     // `core_local_method` declines it, so a native method-call helper
     // there would only cost every call its probes.)
@@ -77846,7 +78132,6 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
     leaf || ext
         .method_slot(pc)
         .is_some_and(|slot| match unsafe { &(*slot.0.get()).1 } {
-            MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
             MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
                 // SAFETY: the function is alive while the upgrade holds it.
                 w.upgrade().is_some_and(|f| {
@@ -80685,6 +80970,29 @@ enum NativeTruth {
     Len(Rc<crate::object::BuiltinFn>),
     /// Anything else: the full path decides.
     Decline,
+}
+
+/// [`inst_may_shadow`] first settled by a leaf site's bound (see
+/// [`LeafSiteData::limit`]): values laid over the class's names `keys`
+/// that hold no more than `limit` of them don't hold the method's.
+#[inline(always)]
+fn inst_may_shadow_bounded(
+    inst: &PyInstance,
+    code: &CodeObject,
+    name_idx: u32,
+    keys: usize,
+    limit: usize,
+) -> bool {
+    if inst.dict.published().is_none() {
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        if let Some(split) = unsafe { inst.dict.split_cell().peek() } {
+            let (k, n) = split.keys_and_len();
+            if n == 0 || (k == keys && k != 0 && n <= limit) {
+                return false;
+            }
+        }
+    }
+    inst_may_shadow(inst, code, name_idx)
 }
 
 /// Whether `inst`'s own attributes may shadow `co_names[name_idx]` (a
