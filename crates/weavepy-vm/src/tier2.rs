@@ -544,6 +544,16 @@ struct CacheEntry {
     /// Framed native entries of this code (saturating), the
     /// denominator of the generic-call retirement ratio below.
     native_entries: u32,
+    /// OSR entries this code made (saturating), and requests at its region
+    /// roots turned down as too short (see [`note_short_region`]).
+    osr_runs: u32,
+    short_regions: u32,
+    /// Interpreter activations the entry type guard turned away (a
+    /// parameter outside the lane the code compiled for).
+    guard_failures: u32,
+    /// The interpreter's calls no longer enter the compiled code at pc 0
+    /// (see [`note_entry_guard_failure`]); native callers still do.
+    no_interp_entry: bool,
     /// RFC 0076 WS7 follow-up — generic `wpjit_call_dyn` legs taken by
     /// this code's compiled activations: calls that fell through
     /// [`try_dyn_native`] into the full interpreter round-trip
@@ -593,6 +603,10 @@ impl CacheEntry {
             calls: 0,
             deopts: 0,
             native_entries: 0,
+            osr_runs: 0,
+            short_regions: 0,
+            guard_failures: 0,
+            no_interp_entry: false,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
             recompile_at_osr: false,
@@ -1329,6 +1343,7 @@ impl JitState {
             }
             match &entry.tier {
                 Tier::Cold if recompile => {}
+                Tier::Compiled(_) if entry_pc == 0 && entry.no_interp_entry => return None,
                 Tier::Compiled(a) => {
                     let out = CompiledEntry {
                         cf: a.cf.clone(),
@@ -9793,6 +9808,34 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     }
 }
 
+/// One step of a list or tuple iterator whose next element packs into
+/// the scalar lane `elem_tag` names: the element's bits, the iterator
+/// advanced. `None` (nothing consumed) at the end, for an element outside
+/// the lane, any other iterator, or one already borrowed.
+#[inline]
+fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u64> {
+    let lane = match u32::try_from(elem_tag).ok().map(SlotTag::from_raw) {
+        Some(SlotTag::Int) => JitType::Int,
+        Some(SlotTag::Float) => JitType::Float,
+        Some(SlotTag::Bool) => JitType::Bool,
+        _ => return None,
+    };
+    let mut it = cell.try_borrow_mut().ok()?;
+    match &mut *it {
+        PyIterator::Tuple { items, index } => {
+            let bits = pack(items.get(*index)?, lane)?;
+            *index += 1;
+            Some(bits)
+        }
+        PyIterator::List { items, index, .. } => {
+            let bits = pack(items.borrow().get(*index)?, lane)?;
+            *index += 1;
+            Some(bits)
+        }
+        _ => None,
+    }
+}
+
 /// The `wpjit_iter_next` helper (RFC 0071 WS4): one step of a
 /// [`weavepy_jit::TTerm`]`::ForIter` loop over a pinned identity
 /// iterable. **Runs Python code** for a generator source (the resume
@@ -9812,6 +9855,16 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // A list or tuple iterator stepping into a scalar lane, the commonest
+    // opaque loop (a tuple local, a subscript's list): the element is read
+    // in place. Its end, and an element outside the lane, take the general
+    // step below.
+    if let Some(Pin::Obj(Object::Iter(cell))) = ctx.pins.get(pin as usize) {
+        if let Some(bits) = seq_scalar_step(cell, elem_tag) {
+            jf.ret_bits = bits;
+            return 0;
+        }
+    }
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
@@ -10188,10 +10241,10 @@ unsafe extern "C" fn wpjit_str_get(frame: *mut JitFrame, pin: i64, idx: i64) -> 
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    let Some(s) = pin_str(ctx, pin) else {
+    let Some(Pin::Obj(Object::Str(s))) = ctx.pins.get(pin as usize) else {
         return -1;
     };
-    if !s.is_ascii() || ctx.pins.len() >= RUNTIME_PIN_CAP {
+    if !SharedStr::is_ascii(s) {
         return -1;
     }
     let len = s.len() as i64;
@@ -10199,11 +10252,14 @@ unsafe extern "C" fn wpjit_str_get(frame: *mut JitFrame, pin: i64, idx: i64) -> 
     if i < 0 || i >= len {
         return -1;
     }
-    let i = i as usize;
-    let ch = Object::from_str(&s[i..=i]);
-    let out = ctx.pins.len() as i64;
-    ctx.pins.push(Pin::Obj(ch));
-    out
+    // The shared one-character string (as the interpreter's subscript
+    // gives), whose pin a loop reading characters reuses: no allocation
+    // and no pin per read.
+    let ch = Object::Str(SharedStr::ascii_char(s.as_bytes()[i as usize]));
+    match pin_reusing(&ch, &mut ctx.pins, &mut ctx.pin_memo) {
+        Some(bits) => bits as i64,
+        None => -1,
+    }
 }
 
 /// The `wpjit_build_string` helper (RFC 0073 WS3): `BUILD_STRING n` —
@@ -11491,6 +11547,7 @@ fn pin_reusable(last: &Object, v: &Object) -> bool {
         (Object::Bool(a), Object::Bool(b)) => a == b,
         (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
         (Object::Str(a), Object::Str(b)) => crate::SharedStr::ptr_eq(a, b),
+        (Object::Tuple(a), Object::Tuple(b)) => crate::shared_value::ThinArc::ptr_eq(a, b),
         (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
         (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
         (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
@@ -13458,6 +13515,66 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // A list or tuple iterator (a row of `(neighbor, weight)` pairs), the
+    // commonest source, steps in place first: no Python runs, so the
+    // header's countdown poll covers the step, and the element unpacks
+    // like the generic step's below.
+    let seq_step = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => {
+            cell.try_borrow_mut()
+                .ok()
+                .and_then(|mut it| match &mut *it {
+                    // The common step inline (`next_value` is a large
+                    // function); exhaustion detaches through it.
+                    crate::object::PyIterator::List { items, index, .. } => {
+                        let next = items.borrow().get(*index).cloned();
+                        Some(match next {
+                            Some(v) => {
+                                *index += 1;
+                                Some(v)
+                            }
+                            None => it.next_value(),
+                        })
+                    }
+                    crate::object::PyIterator::Tuple { items, index } => {
+                        let next = items.get(*index).cloned();
+                        if next.is_some() {
+                            *index += 1;
+                        }
+                        Some(next)
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    if let Some(step) = seq_step {
+        let Some(v) = step else {
+            return 1;
+        };
+        if let Object::Tuple(items) = &v {
+            if let [a, b] = &items[..] {
+                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let packed2 =
+                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot
+                    // wide (`max_call_args.max(1)`).
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+            }
+        }
+        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
+        jf.ret_bits = if matches!(v, Object::None) {
+            u64::MAX
+        } else {
+            ctx.pins.push(Pin::Obj(v));
+            (ctx.pins.len() - 1) as u64
+        };
+        return 3;
+    }
     // A `dict.items()` step yields the key and value straight into the
     // two lanes, without the tuple; no Python runs, so the header's poll
     // covers it.
@@ -13560,65 +13677,6 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 2;
-    }
-    // A list or tuple iterator (a row of `(index, weight)` pairs) steps
-    // in place: no Python runs, and the element unpacks like the
-    // generic step's below.
-    let seq_step = match ctx.pins.get(pin as usize) {
-        Some(Pin::Obj(Object::Iter(cell))) => {
-            cell.try_borrow_mut()
-                .ok()
-                .and_then(|mut it| match &mut *it {
-                    // The common step inline (`next_value` is a large
-                    // function); exhaustion detaches through it.
-                    crate::object::PyIterator::List { items, index, .. } => {
-                        let next = items.borrow().get(*index).cloned();
-                        Some(match next {
-                            Some(v) => {
-                                *index += 1;
-                                Some(v)
-                            }
-                            None => it.next_value(),
-                        })
-                    }
-                    crate::object::PyIterator::Tuple { items, index } => {
-                        let next = items.get(*index).cloned();
-                        if next.is_some() {
-                            *index += 1;
-                        }
-                        Some(next)
-                    }
-                    _ => None,
-                })
-        }
-        _ => None,
-    };
-    if let Some(step) = seq_step {
-        let Some(v) = step else {
-            return 1;
-        };
-        if let Object::Tuple(items) = &v {
-            if let [a, b] = &items[..] {
-                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
-                let packed2 =
-                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
-                if let (Some(b1), Some(b2)) = (packed1, packed2) {
-                    jf.ret_bits = b1;
-                    // SAFETY: the marshal buffer is at least one slot
-                    // wide (`max_call_args.max(1)`).
-                    unsafe { *jf.call_args = b2 };
-                    return 0;
-                }
-            }
-        }
-        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
-        jf.ret_bits = if matches!(v, Object::None) {
-            u64::MAX
-        } else {
-            ctx.pins.push(Pin::Obj(v));
-            (ctx.pins.len() - 1) as u64
-        };
-        return 3;
     }
     let it = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_)))) => {
@@ -14193,13 +14251,62 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
                 .get(slot as usize)
                 .is_some_and(|o| entry_local_ok(o, ty));
             if !ok {
-                JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
+                if crate::hot_gates::env_flags::jit_trace() {
+                    eprintln!(
+                        "jit entry guard {:?} local {} {:?} holds {}",
+                        frame.code.qualname,
+                        slot,
+                        ty,
+                        locals
+                            .get(slot as usize)
+                            .map_or("?".to_owned(), |o| o.type_name_owned())
+                    );
+                }
+                drop(locals);
+                note_entry_guard_failure(&frame.code);
                 return JitEntry::Skip;
             }
         }
     }
 
     enter_compiled(interp, frame, &entry, 0, &[], None)
+}
+
+/// Entry type-guard failures of one code's interpreter activations past
+/// which, at [`GUARD_FAILURES_PER_ENTRY`] failures per native entry, its
+/// calls stop trying the compiled code.
+const GUARD_FAILURE_BUDGET: u32 = 64;
+
+/// See [`GUARD_FAILURE_BUDGET`].
+const GUARD_FAILURES_PER_ENTRY: u32 = 4;
+
+/// Count an interpreter activation of `code` its compiled code's entry
+/// type guard turned away. Each one paid for the compiled entry's lookup
+/// and guard checks, then ran interpreted anyway, and the compiled claim
+/// keeps its calls off the lean and frame-JIT paths: code whose callers
+/// mostly pass other lanes than it compiled for (a method called with
+/// ints and floats) gives the interpreter its calls back. Native callers
+/// keep entering the compiled code with their own lanes.
+fn note_entry_guard_failure(code: &Rc<CodeObject>) {
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.stats.entry_guard_failures += 1;
+        let Some(ce) = st.cache.get_mut(&key) else {
+            return;
+        };
+        ce.guard_failures = ce.guard_failures.saturating_add(1);
+        if !ce.no_interp_entry
+            && ce.guard_failures >= GUARD_FAILURE_BUDGET
+            && ce.guard_failures / ce.native_entries.max(1) >= GUARD_FAILURES_PER_ENTRY
+        {
+            ce.no_interp_entry = true;
+            code.jit_hint.unmark_compiled();
+            if crate::hot_gates::env_flags::jit_trace() {
+                eprintln!("jit entry guard retire {:?}", code.qualname);
+            }
+        }
+    });
 }
 
 /// Below this much remaining straight-line scalar work, a first activation
@@ -14379,6 +14486,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // around it is worth entering only for enough remaining iterations.
     if cf.region_roots.contains(&(pc as u32)) {
         if short_live_loop(&frame.stack) {
+            note_short_region(&frame.code);
             return JitEntry::Skip;
         }
         // A loop over a generator: each native step resumes it the way the
@@ -14478,7 +14586,14 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // The iterators are consumed by the decomposition: native code owns
     // the loops from here (a deopt reconstructs fresh iterators).
     frame.stack.clear();
-    JIT.with(|cell| cell.borrow_mut().stats.osr_entries += 1);
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.stats.osr_entries += 1;
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        if let Some(e) = st.cache.get_mut(&key) {
+            e.osr_runs = e.osr_runs.saturating_add(1);
+        }
+    });
     enter_compiled(interp, frame, &entry, pc, &synth, None)
 }
 
@@ -14534,6 +14649,32 @@ fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
         short
     });
     if short {
+        code.jit_hint.set_backedge_quiet();
+    }
+}
+
+/// Back-edge requests at short region roots (see [`short_live_loop`]) after
+/// which compiled code whose loops were never entered natively gives its
+/// back edges up.
+const SHORT_REGION_BUDGET: u32 = 64;
+
+/// Count a request to enter a region root that [`short_live_loop`] turned
+/// down. Code whose native regions are all this short (a square's few
+/// neighbors, in a loop over the board that stays interpreted for an
+/// unsupported attribute) never runs natively, while its claim on its back
+/// edges keeps the frame JIT from compiling the loop around them: past the
+/// budget, with no native loop run at all, the claim goes.
+fn note_short_region(code: &Rc<CodeObject>) {
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    let quiet = JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let Some(e) = st.cache.get_mut(&key) else {
+            return false;
+        };
+        e.short_regions = e.short_regions.saturating_add(1);
+        e.short_regions >= SHORT_REGION_BUDGET && e.osr_runs == 0
+    });
+    if quiet {
         code.jit_hint.set_backedge_quiet();
     }
 }
