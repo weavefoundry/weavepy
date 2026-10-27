@@ -486,6 +486,32 @@ impl Slot {
         }
     }
 
+    /// Count a native caller's call of this code (a builtin's or a
+    /// constructor's Python callee, whose nested run gains most from a
+    /// native body): a third of the code's length, between a compiled
+    /// caller's switched call (the whole length, see
+    /// [`Self::warm_switched`]) and the core loop's activation (a tenth).
+    /// The whole length compiled about 2,000-call callees that class
+    /// creation's fresh classes call (`class_creation` 3% more
+    /// instructions per call); a third keeps most of what `stdlib_utils`,
+    /// `chaos` and `raytrace` gain (1% to 3%) without that loss.
+    #[inline]
+    pub(crate) fn warm_native(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
+        if self.native.get().is_some() {
+            return;
+        }
+        let n = code.instructions.len() as u32;
+        let h = self
+            .heat
+            .load(Ordering::Relaxed)
+            .saturating_add((n / 3).max(1));
+        self.heat.store(h, Ordering::Relaxed);
+        if h >= hot().saturating_mul(n) {
+            self.heat.store(0, Ordering::Relaxed);
+            self.try_compile(code, ext, nlocals, Heat::Call);
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn try_compile(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {

@@ -60532,14 +60532,14 @@ impl Interpreter {
             return result;
         }
         // A native caller's call (a special method a builtin or a
-        // constructor runs, a `key=` function) warms its callee as a
-        // compiled caller's switched call does: its nested run gains most
-        // from a native body (see `frame_jit::Slot::warm_switched`).
+        // constructor runs, a `key=` function) warms its callee more than
+        // the core loop's activation does: its nested run gains most from
+        // a native body (see `frame_jit::Slot::warm_native`).
         #[cfg(feature = "jit")]
         if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
             if let Some(ext) = code_vm_ext(&code) {
                 ext.frame_jit
-                    .warm_switched(&code, ext, code.varnames.len().max(positional.len()));
+                    .warm_native(&code, ext, code.varnames.len().max(positional.len()));
             }
         }
         // A cell-free, non-generator body runs as a lean activation when
