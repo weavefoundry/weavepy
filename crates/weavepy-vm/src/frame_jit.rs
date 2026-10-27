@@ -826,6 +826,7 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
             | OpCode::ListAppend
+            | OpCode::ListExtend
             | OpCode::SetAdd
             | OpCode::MapAdd
             | OpCode::UnpackSequence
@@ -9573,6 +9574,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::BinarySlice
             | OpCode::StoreSubscr
             | OpCode::ListAppend
+            | OpCode::ListExtend
             | OpCode::SetAdd
             | OpCode::MapAdd
             | OpCode::UnpackSequence
@@ -10823,7 +10825,9 @@ impl<'a> Lower<'a> {
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
-            OpCode::ListAppend | OpCode::SetAdd | OpCode::MapAdd => return self.container(pc),
+            OpCode::ListAppend | OpCode::ListExtend | OpCode::SetAdd | OpCode::MapAdd => {
+                return self.container(pc)
+            }
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
             OpCode::LoadAttr => return self.load_attr(pc, ins.arg),
             OpCode::LoadGlobal => return self.load_global(pc),

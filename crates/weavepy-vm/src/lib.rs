@@ -20632,6 +20632,40 @@ impl Interpreter {
                 l.push(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
             }
+            // `f(*args)`'s and `[*xs]`'s staging list: an exact tuple's or
+            // another list's items (any other iterable may run Python: the
+            // full handler's), the source released by a plain decrement.
+            OpCode::ListExtend => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let (Object::List(lst), src) =
+                    (unsafe { (&*base.add(len - 1 - depth), &*base.add(len - 1)) })
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(src) {
+                    return None;
+                }
+                match src {
+                    Object::Tuple(t) => {
+                        // SAFETY: a store between two instructions; growing
+                        // the list runs no code.
+                        unsafe { lst.peek_mut() }?.extend(t.iter().cloned());
+                    }
+                    Object::List(l) if !Rc::ptr_eq(l, lst) => {
+                        // SAFETY: as above; two distinct lists.
+                        let items = unsafe { l.peek() }?.clone();
+                        unsafe { lst.peek_mut() }?.extend(items);
+                    }
+                    _ => return None,
+                }
+                // SAFETY: the source leaves the stack (droppable).
+                drop(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
             _ => None,
         }
     }
