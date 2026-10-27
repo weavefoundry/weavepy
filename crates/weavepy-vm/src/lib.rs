@@ -941,6 +941,11 @@ pub struct Interpreter {
     /// Finished generators' frame allocations, their frames retired, for
     /// the next generators' frames (see [`Self::gen_parts`]).
     gen_spares: ThreadCell<Vec<GenParts>>,
+    /// Parked frames for lazily run awaited bodies (see
+    /// [`Self::lazy_coro_bind`]), boxed as a coroutine's frame is: stale
+    /// borrowed handles but for the code, which the last body's keeps.
+    #[allow(clippy::vec_box)]
+    lazy_boxes: Vec<Box<LeanFrame>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1262,6 +1267,7 @@ impl Default for Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1396,6 +1402,7 @@ impl Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -20782,6 +20789,40 @@ impl Interpreter {
                 l.push(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
             }
+            // `f(*args)`'s and `[*xs]`'s staging list: an exact tuple's or
+            // another list's items (any other iterable may run Python: the
+            // full handler's), the source released by a plain decrement.
+            OpCode::ListExtend => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let (Object::List(lst), src) =
+                    (unsafe { (&*base.add(len - 1 - depth), &*base.add(len - 1)) })
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(src) {
+                    return None;
+                }
+                match src {
+                    Object::Tuple(t) => {
+                        // SAFETY: a store between two instructions; growing
+                        // the list runs no code.
+                        unsafe { lst.peek_mut() }?.extend(t.iter().cloned());
+                    }
+                    Object::List(l) if !Rc::ptr_eq(l, lst) => {
+                        // SAFETY: as above; two distinct lists.
+                        let items = unsafe { l.peek() }?.clone();
+                        unsafe { lst.peek_mut() }?.extend(items);
+                    }
+                    _ => return None,
+                }
+                // SAFETY: the source leaves the stack (droppable).
+                drop(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
             _ => None,
         }
     }
@@ -23166,7 +23207,7 @@ impl Interpreter {
                 let store = instrs.get(store_pc)?;
                 let value = std::mem::ManuallyDrop::new(value);
                 // On `true` the value moved into the dict.
-                if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
+                if Self::leaf_attr_store(code, inst, store_pc, store.arg, &value) {
                     return Some(Some(Object::None));
                 }
                 drop(std::mem::ManuallyDrop::into_inner(value));
@@ -26422,38 +26463,131 @@ impl Interpreter {
                 matches!(unsafe { inst.attr_peek_index(key_idx as usize) }, Some((k, old))
                     if slot_name_matches(code, name_idx, k) && Self::core_droppable(old))
             }
-            _ => {
-                let Some(dict) = inst.dict.published() else {
-                    // Split storage: the store overwrites a droppable
-                    // value or appends (or declines, touching nothing).
-                    // SAFETY: as above.
-                    let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
-                        return false;
-                    };
-                    let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
-                        return false;
-                    };
-                    return split
-                        .position(name)
-                        .is_none_or(|i| Self::core_droppable(&split.values()[i]));
-                };
-                let Some(probe) = code_name_leaf_probe(code, name_idx) else {
-                    return false;
-                };
-                // SAFETY: as above.
-                let Some(d) = (unsafe { dict.peek_mut() }) else {
-                    return false;
-                };
-                let found = d.get_index_of(&probe);
-                if probe.saw_exotic() {
-                    return false;
-                }
-                found.is_none_or(|i| {
-                    d.get_index(i)
-                        .is_some_and(|(_, old)| Self::core_droppable(old))
-                })
-            }
+            _ => Self::store_new_attr_ready(code, inst, name_idx),
         }
+    }
+
+    /// Whether [`Self::core_store_new_attr`]'s insert-or-overwrite (its
+    /// class facts checked) would perform the store right now, touching
+    /// nothing.
+    fn store_new_attr_ready(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(dict) = inst.dict.published() else {
+            // Split storage: the store overwrites a droppable value or
+            // appends (or declines, touching nothing).
+            // SAFETY: an unused view with nothing running.
+            let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                return false;
+            };
+            let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+                return false;
+            };
+            return split
+                .position(name)
+                .is_none_or(|i| Self::core_droppable(&split.values()[i]));
+        };
+        let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+            return false;
+        };
+        // SAFETY: as above.
+        let Some(d) = (unsafe { dict.peek_mut() }) else {
+            return false;
+        };
+        let found = d.get_index_of(&probe);
+        if probe.saw_exotic() {
+            return false;
+        }
+        found.is_none_or(|i| {
+            d.get_index(i)
+                .is_some_and(|(_, old)| Self::core_droppable(old))
+        })
+    }
+
+    /// Whether `inst`'s class takes `inst.<co_names[name_idx]> = v` as a
+    /// plain instance-dict store: default attribute setting and no
+    /// descriptor for the name (the facts a `STORE_ATTR` site's cache
+    /// records, kept per class version).
+    fn plain_store_class(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        !crate::object::exotic_str_keys_possible()
+            && inst.c_body.get() == 0
+            && cls.native_kind.get() == 0
+            && !crate::capi_watchers::dicts_active()
+            && Self::plain_store_verdict(cls, name)
+    }
+
+    /// The class's part of [`Self::plain_store_class`], settled per class
+    /// version.
+    fn plain_store_verdict(cls: &TypeObject, name: &str) -> bool {
+        cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
+            Self::default_getattribute(cls)
+                && !cls.flags.is_builtin
+                && cls.setattr_is_default()
+                && !cls.forbids_dict
+                && !(name.starts_with("__") && name != "__doc__")
+                // An exception's `args` is a `BaseException` descriptor.
+                && !(name == "args" && cls.is_subclass_of(&builtin_types().base_exception))
+                && matches!(
+                    cls.lookup(name),
+                    None | Some(Object::Function(_) | Object::Str(_) | Object::None)
+                )
+        })
+    }
+
+    /// [`Self::core_store_attr`] for a frameless leaf's store, which also
+    /// serves a receiver of a class the site's cache doesn't (a setter or
+    /// an `__init__` run on several classes' instances): such a store
+    /// takes the plain insert-or-overwrite when the receiver's class takes
+    /// one, where it would otherwise end the evaluation. As
+    /// `core_store_attr`: on `true` the value moved, `false` touched
+    /// nothing.
+    #[inline(always)]
+    fn leaf_attr_store(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        Self::core_store_attr(code, inst, attr_pc, name_idx, value)
+            || Self::leaf_attr_store_any(code, inst, attr_pc, name_idx, value)
+    }
+
+    /// [`Self::leaf_attr_store`]'s store whatever the site's cache.
+    #[inline(never)]
+    fn leaf_attr_store_any(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let cls = inst.cls_raw();
+        Self::plain_store_class(code, inst, name_idx)
+            && Self::core_store_new_attr(
+                code,
+                inst,
+                cls,
+                attr_pc,
+                name_idx,
+                cls.attr_version.get(),
+                value,
+            )
+    }
+
+    /// Whether [`Self::leaf_attr_store`] would perform this store right
+    /// now, touching nothing (see [`Self::core_store_attr_ready`]).
+    fn leaf_attr_store_ready(
+        code: &CodeObject,
+        inst: &PyInstance,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> bool {
+        Self::core_store_attr_ready(code, inst, attr_pc, name_idx)
+            || (Self::plain_store_class(code, inst, name_idx)
+                && Self::store_new_attr_ready(code, inst, name_idx))
     }
 
     /// The constructor shape of [`Self::core_store_attr`]: a
@@ -32080,23 +32214,7 @@ impl Interpreter {
                             || inst.c_body.get() != 0
                             || crate::capi_watchers::dicts_active()
                             // (The class's part, settled per class version.)
-                            || !cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
-                                Self::default_getattribute(cls)
-                                    && !cls.flags.is_builtin
-                                    && cls.setattr_is_default()
-                                    && !cls.forbids_dict
-                                    && !(name.starts_with("__") && name != "__doc__")
-                                    // An exception's `args` is a
-                                    // `BaseException` descriptor.
-                                    && !(name == "args"
-                                        && cls.is_subclass_of(&builtin_types().base_exception))
-                                    && matches!(
-                                        cls.lookup(name),
-                                        None | Some(
-                                            Object::Function(_) | Object::Str(_) | Object::None
-                                        )
-                                    )
-                            })
+                            || !Self::plain_store_verdict(cls, name)
                         {
                             return None;
                         }
@@ -32106,17 +32224,24 @@ impl Interpreter {
                         // the core loop's own arm serves without a hash
                         // probe (the specializer's choice, made here
                         // because the site never reaches it). A site left
-                        // cooling down, or specialized for another class
-                        // (`Base.__init__` run on a subclass's instances),
-                        // is re-specialized too: the full handler that
-                        // would count the cooldown down never sees it.
-                        if matches!(
-                            cache,
-                            IC::Empty
-                                | IC::Cooldown(_)
-                                | IC::StoreAttrInstance { .. }
-                                | IC::StoreAttrNewKey { .. }
-                        ) {
+                        // cooling down is counted down here (the full
+                        // handler that would count it never sees it), and
+                        // re-specialized when it reaches zero. A site
+                        // specialized for another class keeps its class:
+                        // a site that stores to several in turn
+                        // (`Shape.__init__` of each kind of shape) would
+                        // otherwise re-specialize on every store, and a
+                        // frameless leaf's store (a setter, an `__init__`)
+                        // serves any class anyway (see `leaf_attr_store`).
+                        let respecialize = match cache {
+                            IC::Empty | IC::Cooldown(0) => true,
+                            IC::Cooldown(n) => {
+                                code.caches.set(cache_pc, IC::Cooldown(n - 1));
+                                false
+                            }
+                            _ => false,
+                        };
+                        if respecialize {
                             let ver = cls.attr_version.get();
                             let indexed = inst.attr_position_str(name);
                             code.caches.set(
@@ -62431,6 +62556,278 @@ impl Interpreter {
         true
     }
 
+    /// The activation of `await f(...)`'s coroutine body run lazily (see
+    /// `frame_jit::lazy_await`), its checks passed: `f` (its code `code`,
+    /// without cells of its own: `cells` are the function's) called with
+    /// the `nargs` arguments at `args`, which move into the frame's locals
+    /// (the stack forgets them), the frame built just past the
+    /// `RETURN_GENERATOR` at `start` with the sent `None` pushed, as
+    /// [`Self::core_await_enter`] starts it. The caller rests at the `SEND`
+    /// at `send_pc` (its jump `jump`), whose exit takes the return.
+    ///
+    /// The frame is a parked box's (see [`Interpreter::lazy_boxes`]), bound
+    /// as a direct call's activation is: its namespaces and cells are
+    /// borrowed from `callable` (the called function, which the activation
+    /// holds), and its code handle is kept from the box's last body when
+    /// that ran the same code. A coroutine made around it owns them
+    /// ([`Self::lazy_coro_materialize`]).
+    ///
+    /// # Safety
+    ///
+    /// `args` holds `nargs` initialized values the caller's stack forgets,
+    /// no more than `code` takes; `callable` is the function `f` names.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) unsafe fn lazy_coro_bind(
+        &mut self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        cells: &Rc<Vec<Rc<RefCell<Object>>>>,
+        args: *const Object,
+        nargs: usize,
+        start: usize,
+        send_pc: usize,
+        jump: u32,
+        callable: Object,
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
+        let mut boxed = match self.lazy_boxes.pop() {
+            Some(boxed) => boxed,
+            None => self.lazy_box_new(),
+        };
+        let fr: &mut Frame = &mut boxed;
+        if !Rc::ptr_eq(&fr.code, code) {
+            fr.code = code.clone();
+        }
+        // SAFETY: a parked box's handles are stale copies, overwritten
+        // without a drop; the activation holds `callable`, which holds what
+        // they borrow.
+        unsafe {
+            std::ptr::write(&raw mut fr.globals, borrowed_rc(&f.globals));
+            std::ptr::write(&raw mut fr.builtins, borrowed_rc(&f.builtins));
+            std::ptr::write(&raw mut fr.cells, borrowed_rc(cells));
+        }
+        let nlocals = code.varnames.len();
+        {
+            // SAFETY: a parked box's locals are its own, and empty.
+            let v = unsafe { fr.locals.storage() };
+            v.reserve(nlocals);
+            // SAFETY: the caller's contract.
+            unsafe {
+                std::ptr::copy_nonoverlapping(args, v.as_mut_ptr(), nargs);
+                v.set_len(nargs);
+            }
+            let missing = (code.arg_count as usize).saturating_sub(nargs);
+            if missing > 0 {
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
+            fill_unbound(v, nlocals);
+        }
+        fr.pc = start as u32 + 1;
+        fr.gen_first_resume = true;
+        fr.stack.push_fast(Object::None);
+        let gen_frame: *mut Frame = fr;
+        let mut act = self.inline_slot();
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: each field is `None` (a pooled slot holds none of them),
+        // and a parked slot's callable is a stale copy. The box moves as
+        // the frame's: `LeanFrame` is transparent, and the box goes back to
+        // the parked ones, or its handles are made owned, before anything
+        // drops it as a frame.
+        unsafe {
+            std::ptr::write(
+                &raw mut act.gen_box,
+                Some(Box::from_raw(Box::into_raw(boxed).cast::<Frame>())),
+            );
+            std::ptr::write(&raw mut act.guard, Some(guard));
+            std::ptr::write(&raw mut act.callable, callable);
+        }
+        act.gen_frame = gen_frame;
+        act.act.frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.call_pc = send_pc;
+        act.exc_depth = self.exc_info_len();
+        act.direct = true;
+        act.lazy_coro = true;
+        act
+    }
+
+    /// A new parked box for [`Self::lazy_coro_bind`]: stale borrowed
+    /// handles, an owned code handle, and empty locals and stack, in a
+    /// finished generator's allocations when the pool has them (a body
+    /// whose coroutine was made took its box along).
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_new(&self) -> Box<LeanFrame> {
+        let spare = self.gen_spares.borrow_mut().pop();
+        let placeholder = inline_placeholder();
+        let Some(GenParts {
+            locals,
+            stack,
+            boxed,
+        }) = spare
+        else {
+            let mut boxed = Box::new(parked_lean_frame());
+            // SAFETY: the stale copy is overwritten without a drop.
+            unsafe { std::ptr::write(&raw mut boxed.code, placeholder.code.clone()) };
+            return boxed;
+        };
+        let frame = Frame {
+            code: placeholder.code.clone(),
+            locals: frame_slots::FrameLocals::from_shared(locals),
+            cells: borrowed_rc(&placeholder.cells),
+            stack,
+            globals: borrowed_rc(&placeholder.dict),
+            builtins: borrowed_rc(&placeholder.dict),
+            rare: None,
+            exc: None,
+            agen_yielded_value: true,
+            pc: 0,
+            py_frame: None,
+            gen_owner: None,
+            suppress_call_event: false,
+            gen_first_resume: false,
+            sent_consumed: false,
+            shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
+        };
+        // SAFETY: `LeanFrame` is transparent over the frame, whose borrowed
+        // handles it never drops.
+        unsafe { Box::from_raw(Box::into_raw(Box::write(boxed, frame)).cast::<LeanFrame>()) }
+    }
+
+    /// Make the coroutine of `act`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]), as it registers: from here it is the
+    /// activation [`Self::core_await_enter`] makes, its coroutine running
+    /// (tracked if it suspends) in the placeholder's slot atop the caller
+    /// `caller`'s stack, its frame owning its handles.
+    ///
+    /// # Safety
+    ///
+    /// `act` is lazy and its caller's frame synced, the placeholder `None`
+    /// atop its stack.
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn lazy_coro_materialize(&mut self, act: &mut InlineAct, caller: &mut Frame) {
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_MADE);
+        let mut boxed = act.gen_box.take().expect("a lazy coroutine's frame");
+        {
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: the borrowed handles become owned ones (overwritten
+            // without a drop by their counted clones).
+            unsafe {
+                std::ptr::write(&raw mut fr.globals, Rc::clone(&fr.globals));
+                std::ptr::write(&raw mut fr.builtins, Rc::clone(&fr.builtins));
+                std::ptr::write(&raw mut fr.cells, Rc::clone(&fr.cells));
+            }
+        }
+        // SAFETY: moved out once; the slot treats the field as stale from
+        // here (as a generator activation's).
+        let callable = unsafe { std::ptr::read(&raw const act.callable) };
+        let kind = crate::object::CoroutineKind::Coroutine;
+        let code = Object::Code(boxed.code.clone());
+        let gen = match crate::object::pooled_generator(kind, code, boxed) {
+            Ok(gen) => gen,
+            Err((code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, code, frame)
+            }),
+        };
+        gen.track_deferred.set(true);
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *gen.state().as_ptr() };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("a fresh coroutine");
+        };
+        act.gen_box = Some(boxed);
+        let n = caller.stack.len();
+        debug_assert!(n > 0 && matches!(caller.stack[n - 1], Object::None));
+        // SAFETY: the placeholder (`None`, nothing to drop) is the top slot.
+        unsafe {
+            caller
+                .stack
+                .as_mut_ptr()
+                .add(n - 1)
+                .write(Object::Coroutine(gen.clone()));
+        }
+        act.gen = Some(gen);
+        act.lazy_coro = false;
+        act.direct = false;
+        self.release(callable);
+    }
+
+    /// Finish `done`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]) that returned cleanly without registering,
+    /// its result taken, its operand stack empty and its locals its own:
+    /// they are released, its box parked again, its slot parked, and the
+    /// function it held released.
+    #[inline(always)]
+    pub(crate) fn lazy_coro_finish(&mut self, mut done: Box<InlineAct>) {
+        drop(done.guard.take());
+        if let Some(boxed) = done.gen_box.take() {
+            // SAFETY: a lazy body's box (see `lazy_coro_bind`).
+            let mut boxed = unsafe { Box::from_raw(Box::into_raw(boxed).cast::<LeanFrame>()) };
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: sole owner (the caller's contract).
+            unsafe { release_locals(fr.locals.storage()) };
+            fr.gen_first_resume = false;
+            if fr.rare.is_some()
+                || fr.exc.is_some()
+                || fr.py_frame.is_some()
+                || fr.gen_owner.is_some()
+                || fr.shell_cache.is_some()
+                || fr.sent_consumed
+                || fr.suppress_call_event
+                || !fr.agen_yielded_value
+            {
+                Self::lazy_box_reset(fr);
+            }
+            #[cfg(feature = "jit")]
+            if fr.parked_native.is_some() {
+                fr.parked_native = None;
+            }
+            if self.lazy_boxes.len() < LAZY_BOXES_CAP {
+                push_fast(&mut self.lazy_boxes, boxed);
+            }
+        }
+        // SAFETY: moved out once; the parked slot treats the field as
+        // stale.
+        let callable = unsafe { std::ptr::read(&raw const done.callable) };
+        done.gen_frame = std::ptr::null_mut();
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.direct = false;
+        done.lazy_coro = false;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, done);
+        }
+        // A function something else still holds (its module, its class)
+        // can't die here: a plain decrement.
+        match callable {
+            // SAFETY: the function is alive (held here).
+            Object::Function(f) if unsafe { crate::rc::try_release_shared(Rc::as_ptr(&f)) } => {
+                std::mem::forget(f);
+            }
+            callable => self.release(callable),
+        }
+    }
+
+    /// [`Self::lazy_coro_finish`]'s reset of the rarer frame state a body
+    /// set on the way.
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_reset(fr: &mut Frame) {
+        fr.rare = None;
+        fr.exc = None;
+        fr.py_frame = None;
+        fr.gen_owner = None;
+        fr.shell_cache = None;
+        fr.sent_consumed = false;
+        fr.suppress_call_event = false;
+        fr.agen_yielded_value = true;
+    }
+
     /// Bootstrap a generator/coroutine *code object* frame that was not
     /// entered through a `PyFunction` call — `eval(co)` / `exec(co)` of
     /// PyCF_ALLOW_TOP_LEVEL_AWAIT module code (RFC 0052). Runs the frame
@@ -70658,6 +71055,9 @@ struct LeanAct {
 /// How many parked [`InlineAct`] slots `Interpreter::inline_pool` keeps.
 const INLINE_POOL_CAP: usize = 64;
 
+/// The most parked boxes [`Interpreter::lazy_coro_bind`] keeps.
+const LAZY_BOXES_CAP: usize = 64;
+
 /// A lean activation the quiet loop runs *inline*: its frame lives in
 /// this box instead of on a nested native activation, and
 /// `Interpreter::quiet_run` switches to it at the caller's `CALL` and
@@ -70713,6 +71113,11 @@ struct InlineAct {
     /// While a direct call's activation runs lazily (see
     /// `frame_jit::register_lazy`), its caller's native state.
     lazy_caller: *mut frame_jit::State,
+    /// An awaited coroutine's body running lazily without its coroutine
+    /// (see `frame_jit::lazy_await`): its frame is in `gen_box`, `gen` is
+    /// `None`, and registering makes the coroutine
+    /// (`Interpreter::lazy_coro_materialize`).
+    lazy_coro: bool,
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
@@ -70868,6 +71273,7 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             lazy_caller: std::ptr::null_mut(),
+            lazy_coro: false,
             binop: None,
             discard: false,
             chain: None,
@@ -71441,6 +71847,7 @@ struct LeanKwShape {
 /// on drop, or recycled by [`Interpreter::retire_lean_frame`]. Anything
 /// that keeps one of these handles beyond the activation (a shell or a
 /// materialized frame) clones it, which counts normally.
+#[repr(transparent)]
 struct LeanFrame(std::mem::ManuallyDrop<Frame>);
 
 impl std::ops::Deref for LeanFrame {
@@ -71939,7 +72346,9 @@ mod burst_stats {
     pub(crate) const CALL_PURE: usize = 5;
     pub(crate) const CALL_GENERAL: usize = 6;
     pub(crate) const CALL_TIER2: usize = 7;
-    const CALL_NAMES: [&str; 8] = [
+    pub(crate) const CALL_LAZY_AWAIT: usize = 8;
+    pub(crate) const CALL_LAZY_MADE: usize = 9;
+    const CALL_NAMES: [&str; 10] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -71948,8 +72357,10 @@ mod burst_stats {
         "pure leaf evaluated in place",
         "general frame run",
         "tier-2 entry from the general run",
+        "frame-JIT lazy await",
+        "lazy await's coroutine made",
     ];
-    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
