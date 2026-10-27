@@ -4151,7 +4151,7 @@ unsafe extern "C" fn h_load_method(
                         None => match ext.name_objs.get(name as usize).and_then(|n| match n {
                             Object::Str(n) => crate::class_cached_method_held(
                                 cls,
-                                crate::SharedStr::as_ptr(n).cast::<u8>() as usize,
+                                crate::types::AttrKey::name(n),
                                 ver,
                             ),
                             _ => None,

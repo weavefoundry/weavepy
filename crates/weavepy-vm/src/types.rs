@@ -623,8 +623,8 @@ pub(crate) mod type_cache {
 /// see as `cls.__dict__`. The MRO is precomputed at construction
 /// time so attribute lookups are linear in the depth of inheritance.
 /// How a class resolves one attribute name for the leaf burst's
-/// instance-attribute paths, keyed by the *interned* name object's
-/// address and the class's attribute version. A small direct-mapped
+/// instance-attribute paths, keyed by the *interned* name (see
+/// [`AttrKey`]) and the class's attribute version. A small two-choice
 /// cache per class: polymorphic sites (one receiver class per iteration)
 /// find every class's answer here with no site cache at all. Storage is
 /// allocated on the first fill, [`LEAF_ATTRS_SMALL`] entries at first and
@@ -637,6 +637,12 @@ pub(crate) mod type_cache {
 /// side caches. A reference [`LeafAttrCache::get`] returns must not be
 /// held across a [`LeafAttrCache::set`], which may move the entries.
 pub struct LeafAttrCache(std::cell::Cell<usize>);
+
+/// [`LeafAttrCache`] fills (its misses) in the process, for the
+/// `WEAVEPY_VM_STATS` report: a count that moves with nothing but the
+/// program, since placement doesn't depend on layout (see [`AttrKey`]).
+pub(crate) static LEAF_ATTR_FILLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The entries a class's first [`LeafAttrCache`] fill allocates.
 const LEAF_ATTRS_SMALL: usize = 8;
@@ -653,10 +659,80 @@ unsafe impl Sync for LeafAttrCache {}
 
 #[derive(Clone, Debug)]
 pub struct LeafAttrEntry {
-    /// Interned name object address; `0` = empty.
+    /// The key's identity (see [`AttrKey`]); `0` = empty.
     pub name: usize,
+    /// The key's placement hash (see [`AttrKey`]).
+    pub hash: u32,
     pub ver: u64,
     pub kind: LeafAttrKind,
+}
+
+/// A [`LeafAttrCache`] key: the identity an entry is found by (an
+/// interned name's address, or a small number naming one of the VM's own
+/// keys, which no address is) and the hash that places it (the name's
+/// `str` hash, or a fixed mix of the number). Placement never depends on
+/// where the build put a static or the heap put a name, so which keys
+/// share a slot doesn't move with unrelated code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttrKey {
+    id: usize,
+    hash: u32,
+}
+
+impl AttrKey {
+    /// The key for the interned attribute name `name`.
+    #[inline]
+    pub fn name(name: &crate::shared_value::SharedStr) -> Self {
+        let h = crate::shared_value::SharedStr::hash_cached(name) as u64;
+        Self {
+            id: crate::shared_value::SharedStr::as_ptr(name).cast::<u8>() as usize,
+            hash: (h ^ (h >> 32)) as u32,
+        }
+    }
+
+    /// The VM's own key `id` (one of [`vm_key`]'s).
+    #[inline]
+    pub const fn vm(id: u32) -> Self {
+        Self {
+            id: id as usize,
+            hash: ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32,
+        }
+    }
+}
+
+/// The VM's own [`LeafAttrCache`] keys: answers a class caches under a key
+/// no interned name has (a special method's function, whether a reflected
+/// method is absent). Each is a small number (no address is one) and
+/// distinct; the per-operator ones take a block each.
+pub(crate) mod vm_key {
+    pub(crate) const LEN: u32 = 1;
+    pub(crate) const LEN_FAST: u32 = 2;
+    pub(crate) const CALL_NATIVE: u32 = 3;
+    pub(crate) const CALL: u32 = 4;
+    pub(crate) const NATIVE_GETITEM: u32 = 5;
+    pub(crate) const SETATTR: u32 = 6;
+    pub(crate) const DELATTR: u32 = 7;
+    pub(crate) const STR_FN: u32 = 8;
+    pub(crate) const REPR_FN: u32 = 9;
+    pub(crate) const LEN_FN: u32 = 10;
+    pub(crate) const HASH: u32 = 11;
+    pub(crate) const GETITEM: u32 = 12;
+    pub(crate) const GETITEM_FN: u32 = 13;
+    pub(crate) const SETITEM: u32 = 14;
+    pub(crate) const NATIVE_SETITEM: u32 = 15;
+    pub(crate) const CONTAINS: u32 = 16;
+    pub(crate) const ITER: u32 = 17;
+    pub(crate) const AWAIT: u32 = 18;
+    pub(crate) const ABC_HOOK: u32 = 19;
+    pub(crate) const ABC_CLASS: u32 = 20;
+    pub(crate) const CHAINMAP_MAPS: u32 = 21;
+    /// Per comparison (eight).
+    pub(crate) const CMP: u32 = 32;
+    /// Per binary operator (sixteen each): its method, and whether the
+    /// reflected and in-place methods are absent.
+    pub(crate) const BINOP: u32 = 48;
+    pub(crate) const RBINOP: u32 = 64;
+    pub(crate) const IBINOP: u32 = 80;
 }
 
 /// The cached answer (see [`LeafAttrCache`]).
@@ -780,7 +856,7 @@ impl LeafAttrCache {
             if e.name == 0 {
                 continue;
             }
-            let (i, j) = (Self::index(e.name), Self::alt(e.name));
+            let (i, j) = (Self::index(e.hash), Self::alt(e.hash));
             let k = if large[i].name == 0 { i } else { j };
             if large[k].name == 0 {
                 large[k] = e;
@@ -790,25 +866,23 @@ impl LeafAttrCache {
         self.0.set(Box::into_raw(large) as usize);
     }
 
-    /// (The low bits count too: the VM's own keys are the addresses of
-    /// adjacent one-byte statics, one per special method, which would
-    /// otherwise all share two slots and evict each other.)
+    /// The first slot a key with placement hash `hash` may live in.
     #[inline]
-    fn index(name: usize) -> usize {
-        (name ^ (name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
+    fn index(hash: u32) -> usize {
+        hash as usize & 31
     }
 
-    /// The second slot a name may live in (two-choice placement: two
-    /// names sharing their first slot, used alternately, would otherwise
-    /// evict each other on every lookup).
+    /// The second slot a key may live in (two-choice placement: two keys
+    /// sharing their first slot, used alternately, would otherwise evict
+    /// each other on every lookup).
     #[inline]
-    fn alt(name: usize) -> usize {
-        Self::index(name) ^ (1 + ((name >> 7) & 15))
+    fn alt(hash: u32) -> usize {
+        Self::index(hash) ^ (1 + ((hash as usize >> 5) & 15))
     }
 
-    /// The cached kind for `name` under `ver`, if present.
+    /// The cached kind for `key` under `ver`, if present.
     #[inline]
-    pub fn get(&self, name: usize, ver: u64) -> Option<&LeafAttrKind> {
+    pub fn get(&self, key: AttrKey, ver: u64) -> Option<&LeafAttrKind> {
         let t = self.0.get();
         if t == 0 {
             return None;
@@ -823,24 +897,28 @@ impl LeafAttrCache {
         // SAFETY: a nonzero address (tag removed) is a live table of
         // `mask + 1` entries, indexed below within the mask; GIL-serialized,
         // and no `&mut` escapes `set`.
-        let e = unsafe { &*base.add(Self::index(name) & mask) };
-        if e.name == name && e.ver == ver {
+        let e = unsafe { &*base.add(Self::index(key.hash) & mask) };
+        if e.name == key.id && e.ver == ver {
             return Some(&e.kind);
         }
         // SAFETY: as above.
-        let e = unsafe { &*base.add(Self::alt(name) & mask) };
-        (e.name == name && e.ver == ver).then_some(&e.kind)
+        let e = unsafe { &*base.add(Self::alt(key.hash) & mask) };
+        (e.name == key.id && e.ver == ver).then_some(&e.kind)
     }
 
     #[inline]
-    pub fn set(&self, name: usize, ver: u64, kind: LeafAttrKind) {
-        // The first slot unless it holds another name that is still
+    pub fn set(&self, key: AttrKey, ver: u64, kind: LeafAttrKind) {
+        // (A heuristic count, for the `WEAVEPY_VM_STATS` report: a plain
+        // load and store, not a read-modify-write.)
+        use std::sync::atomic::Ordering::Relaxed;
+        LEAF_ATTR_FILLS.store(LEAF_ATTR_FILLS.load(Relaxed).wrapping_add(1), Relaxed);
+        // The first slot unless it holds another key that is still
         // current; then the second, unless that one is too (evict the
         // first, or grow a small table instead).
-        let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != name && e.ver == ver;
+        let busy = |e: &LeafAttrEntry| e.name != 0 && e.name != key.id && e.ver == ver;
         let mut t = self.table_mut();
         let mut mask = t.len() - 1;
-        let (i, j) = (Self::index(name), Self::alt(name));
+        let (i, j) = (Self::index(key.hash), Self::alt(key.hash));
         if t.len() == LEAF_ATTRS_SMALL && busy(&t[i & mask]) && busy(&t[j & mask]) {
             self.grow();
             t = self.table_mut();
@@ -848,13 +926,19 @@ impl LeafAttrCache {
         }
         let (i, j) = (i & mask, j & mask);
         let k = if !busy(&t[i]) || busy(&t[j]) { i } else { j };
-        t[k] = LeafAttrEntry { name, ver, kind };
+        t[k] = LeafAttrEntry {
+            name: key.id,
+            hash: key.hash,
+            ver,
+            kind,
+        };
     }
 }
 
 impl LeafAttrEntry {
     const EMPTY: LeafAttrEntry = LeafAttrEntry {
         name: 0,
+        hash: 0,
         ver: 0,
         kind: LeafAttrKind::Other,
     };
@@ -886,32 +970,37 @@ impl std::fmt::Debug for LeafAttrCache {
 
 #[cfg(test)]
 mod leaf_attr_cache_tests {
-    use super::{LeafAttrCache, LeafAttrKind, LEAF_ATTRS_LARGE, LEAF_ATTRS_SMALL};
+    use super::{AttrKey, LeafAttrCache, LeafAttrKind, LEAF_ATTRS_LARGE, LEAF_ATTRS_SMALL};
     use crate::object::Object;
     use crate::shared_value::SharedStr;
+
+    /// A VM key numbered `n` (any number serves as a key here).
+    fn key(n: u32) -> AttrKey {
+        AttrKey::vm(n)
+    }
+
+    fn index(k: AttrKey) -> usize {
+        LeafAttrCache::index(k.hash)
+    }
+
+    fn alt(k: AttrKey) -> usize {
+        LeafAttrCache::alt(k.hash)
+    }
 
     #[test]
     fn small_table_grows_when_names_compete_and_keeps_values() {
         let cache = LeafAttrCache::new();
         let text = SharedStr::from("moved value");
-        let first = 16;
+        let first = key(16);
         cache.set(first, 1, LeafAttrKind::Value(Object::Str(text.clone())));
         assert_eq!(cache.table().map(<[_]>::len), Some(LEAF_ATTRS_SMALL));
-        // Two names sharing `first`'s slot pair in the small table, but
+        // Two keys sharing `first`'s slot pair in the small table, but
         // neither of its slot in the large one.
-        let small = |n: usize| {
-            (
-                LeafAttrCache::index(n) % LEAF_ATTRS_SMALL,
-                LeafAttrCache::alt(n) % LEAF_ATTRS_SMALL,
-            )
-        };
-        let home = LeafAttrCache::index(first);
-        let rivals: Vec<usize> = (17..1_000_000)
-            .filter(|&n| {
-                small(n) == small(first)
-                    && LeafAttrCache::index(n) != home
-                    && LeafAttrCache::alt(n) != home
-            })
+        let small = |k: AttrKey| (index(k) % LEAF_ATTRS_SMALL, alt(k) % LEAF_ATTRS_SMALL);
+        let home = index(first);
+        let rivals: Vec<AttrKey> = (17..1_000_000)
+            .map(key)
+            .filter(|&k| small(k) == small(first) && index(k) != home && alt(k) != home)
             .take(2)
             .collect();
         cache.set(rivals[0], 1, LeafAttrKind::InstanceOnly);
@@ -935,20 +1024,21 @@ mod leaf_attr_cache_tests {
     fn cold_cache_and_its_clone_do_not_allocate_entries() {
         let cache = LeafAttrCache::new();
         assert_eq!(std::mem::size_of_val(&cache), std::mem::size_of::<usize>());
-        assert!(cache.get(16, 1).is_none());
+        assert!(cache.get(key(16), 1).is_none());
         assert!(cache.table().is_none());
-        cache.set(16, 1, LeafAttrKind::InstanceOnly);
+        cache.set(key(16), 1, LeafAttrKind::InstanceOnly);
         let other = cache.clone();
-        assert!(other.get(16, 1).is_none());
+        assert!(other.get(key(16), 1).is_none());
         assert!(other.table().is_none());
     }
 
     #[test]
     fn warm_cache_preserves_versions_collisions_and_value_ownership() {
         let cache = LeafAttrCache::new();
-        let name = 16;
+        let name = key(16);
         let collision = (17..100_000)
-            .find(|&other| LeafAttrCache::index(other) == LeafAttrCache::index(name))
+            .map(key)
+            .find(|&other| index(other) == index(name))
             .unwrap();
         let text = SharedStr::from("cached value");
         cache.set(name, 1, LeafAttrKind::Value(Object::Str(text.clone())));
@@ -969,6 +1059,20 @@ mod leaf_attr_cache_tests {
         cache.set(name, 2, LeafAttrKind::Value(Object::Str(text.clone())));
         drop(cache);
         assert_eq!(SharedStr::strong_count(&text), 1);
+    }
+
+    #[test]
+    fn a_name_is_placed_by_its_hash_not_its_address() {
+        // Two distinct objects with the same text: the same placement,
+        // different identities.
+        let (a, b) = (SharedStr::from("placed"), SharedStr::from("placed"));
+        let (ka, kb) = (AttrKey::name(&a), AttrKey::name(&b));
+        assert_eq!(ka.hash, kb.hash);
+        assert_ne!(ka, kb);
+        let cache = LeafAttrCache::new();
+        cache.set(ka, 1, LeafAttrKind::InstanceOnly);
+        assert!(cache.get(kb, 1).is_none());
+        assert!(matches!(cache.get(ka, 1), Some(LeafAttrKind::InstanceOnly)));
     }
 }
 

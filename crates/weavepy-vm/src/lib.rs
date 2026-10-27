@@ -10474,8 +10474,6 @@ impl Interpreter {
         pc: usize,
         container: &Object,
     ) -> Option<Rc<crate::object::PyFunction>> {
-        /// The class cache key for `__getitem__`.
-        static GETITEM_KEY: u8 = 0;
         let Object::Instance(inst) = container else {
             return None;
         };
@@ -10490,7 +10488,7 @@ impl Interpreter {
         }
         Self::instance_dunder_function(
             inst,
-            std::ptr::addr_of!(GETITEM_KEY) as usize,
+            crate::types::AttrKey::vm(crate::types::vm_key::GETITEM),
             "__getitem__",
         )
     }
@@ -15219,7 +15217,7 @@ impl Interpreter {
                                             .and_then(|n| match n {
                                                 Object::Str(n) => class_cached_method_held(
                                                     cls,
-                                                    SharedStr::as_ptr(n).cast::<u8>() as usize,
+                                                    crate::types::AttrKey::name(n),
                                                     ver,
                                                 ),
                                                 _ => None,
@@ -28617,8 +28615,6 @@ impl Interpreter {
     /// raises whatever a missing or misbehaving `__len__` must).
     fn leaf_instance_len(&self, v: &Object) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for `__len__` (an address no interned name has).
-        static LEN_KEY: u8 = 0;
         let Object::Instance(inst) = v else {
             return None;
         };
@@ -28626,7 +28622,7 @@ impl Interpreter {
         if crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let key = std::ptr::addr_of!(LEN_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN);
         let ver = cls.attr_version.get();
         let b = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
@@ -28700,9 +28696,7 @@ impl Interpreter {
         v: &Object,
     ) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the fast half's builtin.
-        static LEN_FAST_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(LEN_FAST_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN_FAST);
         let fast = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => match self.leaf_call_kind(b)? {
                 LeafKind::Fast(f) => f,
@@ -28852,11 +28846,8 @@ impl Interpreter {
     #[inline(never)]
     fn instance_call_native(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for a native `__call__` (an address no interned
-        /// name has).
-        static CALL_NATIVE_KEY: u8 = 0;
         let cls = inst.cls_raw();
-        let key = std::ptr::addr_of!(CALL_NATIVE_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL_NATIVE);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Some(b.clone()),
@@ -28897,10 +28888,8 @@ impl Interpreter {
     #[inline(never)]
     fn instance_call_function(inst: &PyInstance) -> Option<Rc<crate::object::PyFunction>> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for `__call__` (an address no interned name has).
-        static CALL_KEY: u8 = 0;
         let cls = inst.cls_raw();
-        let key = std::ptr::addr_of!(CALL_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::Method(w)) => w.upgrade(),
@@ -28921,11 +28910,11 @@ impl Interpreter {
     }
 
     /// `type(inst).<name>` when it is a plain Python function, cached on
-    /// the class under its attribute version at `key` (an address no
-    /// interned name has; one per dunder).
+    /// the class under its attribute version at `key` (one of the VM's
+    /// own, see `types::vm_key`; one per dunder).
     fn instance_dunder_function(
         inst: &PyInstance,
-        key: usize,
+        key: crate::types::AttrKey,
         name: &str,
     ) -> Option<Rc<crate::object::PyFunction>> {
         use crate::types::LeafAttrKind as K;
@@ -28955,7 +28944,7 @@ impl Interpreter {
     /// Whether `cls` resolves `name` to nothing on its MRO, cached on the
     /// class under its attribute version at `key` (as
     /// [`Self::instance_dunder_function`]).
-    fn class_lacks(cls: &TypeObject, key: usize, name: &str) -> bool {
+    fn class_lacks(cls: &TypeObject, key: crate::types::AttrKey, name: &str) -> bool {
         use crate::types::LeafAttrKind as K;
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
@@ -29035,25 +29024,33 @@ impl Interpreter {
             || (inplace
                 && !Self::class_lacks(
                     cls,
-                    std::ptr::addr_of!(IBINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::IBINOP + k as u32),
                     op.inplace_dunder(),
                 ))
             || (!mixed
-                && !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder))
+                && !Self::class_lacks(
+                    cls,
+                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
+                    rdunder,
+                ))
         {
             return None;
         }
-        Self::instance_dunder_function(ai, std::ptr::addr_of!(BINOP_KEYS[k]) as usize, dunder)
+        Self::instance_dunder_function(
+            ai,
+            crate::types::AttrKey::vm(crate::types::vm_key::BINOP + k as u32),
+            dunder,
+        )
     }
 
     /// `type(inst).<name>` when it is a native function (`dict.__setitem__`
     /// under a `defaultdict`, `OrderedDict`'s own), one a built-in base
     /// supplies when `builtin_owner`, cached on the class under its
-    /// attribute version at `key` (an address no interned name has; one
-    /// per dunder and choice).
+    /// attribute version at `key` (one of the VM's own, see
+    /// `types::vm_key`; one per dunder and choice).
     fn instance_native_dunder(
         inst: &PyInstance,
-        key: usize,
+        key: crate::types::AttrKey,
         name: &str,
         builtin_owner: bool,
     ) -> Option<Rc<crate::object::BuiltinFn>> {
@@ -29092,13 +29089,10 @@ impl Interpreter {
     /// Whether `inst`'s `__getitem__` is a built-in base's own over its
     /// native payload (a `defaultdict`'s): the native subscript serves it.
     fn native_payload_getitem(inst: &PyInstance) -> bool {
-        /// The class cache key for a native `__getitem__` (see
-        /// `instance_native_dunder`).
-        static NATIVE_GETITEM_KEY: u8 = 0;
         inst.native.get().is_some()
             && Self::instance_native_dunder(
                 inst,
-                std::ptr::addr_of!(NATIVE_GETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::NATIVE_GETITEM),
                 "__getitem__",
                 true,
             )
@@ -29398,9 +29392,7 @@ impl Interpreter {
     /// under its attribute version.
     fn default_setattr(cls: &TypeObject) -> bool {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the answer (an address no interned name has).
-        static SETATTR_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(SETATTR_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::SETATTR);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::InstanceOnly) => true,
@@ -29430,9 +29422,7 @@ impl Interpreter {
     /// under its attribute version.
     fn default_delattr(cls: &TypeObject) -> bool {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the answer (an address no interned name has).
-        static DELATTR_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(DELATTR_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::DELATTR);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::InstanceOnly) => true,
@@ -30984,7 +30974,7 @@ impl Interpreter {
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
         };
-        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
+        let name_key = crate::types::AttrKey::name(name_obj);
         let ver = cls.attr_version.get();
         if let Some(k) = cls.leaf_attrs.get(name_key, ver) {
             return match k {
@@ -31124,7 +31114,7 @@ impl Interpreter {
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
         };
-        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
+        let name_key = crate::types::AttrKey::name(name_obj);
         let ver = cls.attr_version.get();
         if cls.leaf_attrs.get(name_key, ver).is_none() {
             // (Fills the entry.)
@@ -40602,12 +40592,9 @@ impl Interpreter {
             // is a `StrSubclass`).
             // A plain Python `__str__` is called with the instance, with no
             // bound method built for it.
-            /// The class cache key for `__str__` (see
-            /// `instance_dunder_function`).
-            static STR_FN_KEY: u8 = 0;
             let method = match Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(STR_FN_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
                 "__str__",
             ) {
                 Some(f) => Some(Ok(f)),
@@ -41072,12 +41059,9 @@ impl Interpreter {
                     return Ok(r);
                 }
             }
-            /// The class cache key for `__repr__` (see
-            /// `instance_dunder_function`).
-            static REPR_FN_KEY: u8 = 0;
             let method = match Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(REPR_FN_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::REPR_FN),
                 "__repr__",
             ) {
                 Some(f) => Some(Ok(f)),
@@ -41139,12 +41123,9 @@ impl Interpreter {
         // (`len(SomeEnum)` → `EnumType.__len__`). A plain Python method is
         // called with the instance, with no bound method built for it.
         if let Object::Instance(inst) = v {
-            /// The class cache key for `__len__` (see
-            /// `instance_dunder_function`).
-            static LEN_FN_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(LEN_FN_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::LEN_FN),
                 "__len__",
             ) {
                 let r = self.call(&Object::Function(f), std::slice::from_ref(v), &[], globals)?;
@@ -43651,12 +43632,9 @@ impl Interpreter {
                     return Ok(Object::Int(h));
                 }
             }
-            /// The class cache key for `__hash__` (see
-            /// `instance_dunder_function`).
-            static HASH_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(HASH_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::HASH),
                 "__hash__",
             ) {
                 let result = self.call_dunder_function(f, std::slice::from_ref(obj))?;
@@ -44731,14 +44709,11 @@ impl Interpreter {
             return self.subscr_get_public(&inner, i);
         }
         if let Object::Instance(inst) = v {
-            /// The class cache key for `__getitem__` (see
-            /// `instance_dunder_function`).
-            static GETITEM_KEY: u8 = 0;
             // A plain Python `__getitem__`: called with the instance, with
             // no bound method built for it.
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(GETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::GETITEM_FN),
                 "__getitem__",
             ) {
                 // A pure leaf evaluates in place, without an activation.
@@ -44850,26 +44825,20 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         let g = self.builtins.clone();
         if let Object::Instance(inst) = target {
-            /// The class cache key for `__setitem__` (see
-            /// `instance_dunder_function`).
-            static SETITEM_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(SETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::SETITEM),
                 "__setitem__",
             ) {
                 self.call_dunder_function(f, &[target.clone(), i.clone(), value])?;
                 return Ok(());
             }
-            /// The class cache key for a native `__setitem__` (see
-            /// `instance_native_dunder`).
-            static NATIVE_SETITEM_KEY: u8 = 0;
             // A built-in base's own `__setitem__` (an `OrderedDict`'s, a
             // `defaultdict`'s): its body on the instance, with no bound
             // method built for it.
             if let Some(b) = Self::instance_native_dunder(
                 inst,
-                std::ptr::addr_of!(NATIVE_SETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::NATIVE_SETITEM),
                 "__setitem__",
                 false,
             ) {
@@ -45240,12 +45209,9 @@ impl Interpreter {
             container.clone()
         };
         if let Object::Instance(inst) = &container {
-            /// The class cache key for `__contains__` (see
-            /// `instance_dunder_function`).
-            static CONTAINS_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(CONTAINS_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::CONTAINS),
                 "__contains__",
             ) {
                 let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
@@ -48983,13 +48949,13 @@ impl Interpreter {
                 && ai.native.get().is_none()
                 && Self::class_lacks(
                     ai.cls_raw(),
-                    std::ptr::addr_of!(RBINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
                     rdunder,
                 )
             {
                 if let Some(f) = Self::instance_dunder_function(
                     ai,
-                    std::ptr::addr_of!(BINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::BINOP + k as u32),
                     dunder,
                 ) {
                     let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
@@ -49522,14 +49488,12 @@ impl Interpreter {
     /// [`Self::instance_dunder_function`]): called with `x` first, it is
     /// what [`Self::cmp_method`] binds.
     fn cmp_function(x: &Object, op: CompareKind) -> Option<Rc<PyFunction>> {
-        /// Class cache keys per comparison dunder.
-        static CMP_KEYS: [u8; 8] = [0; 8];
         let Object::Instance(inst) = x else {
             return None;
         };
         Self::instance_dunder_function(
             inst,
-            std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
+            crate::types::AttrKey::vm(crate::types::vm_key::CMP + op as u32),
             cmp_dunder(op).0,
         )
     }
@@ -61477,17 +61441,15 @@ impl Interpreter {
     /// of `self` alone: the generator, made without the call machinery
     /// (`make_iter`'s instance arm). `None` when anything else applies.
     fn instance_gen_call(&self, v: &Object, name: &str) -> Option<Object> {
-        static ITER_KEY: u8 = 0;
-        static AWAIT_KEY: u8 = 0;
         let Object::Instance(inst) = v else {
             return None;
         };
         let key = match name {
-            "__iter__" => std::ptr::addr_of!(ITER_KEY),
-            "__await__" => std::ptr::addr_of!(AWAIT_KEY),
+            "__iter__" => crate::types::AttrKey::vm(crate::types::vm_key::ITER),
+            "__await__" => crate::types::AttrKey::vm(crate::types::vm_key::AWAIT),
             _ => return None,
         };
-        let f = Self::instance_dunder_function(inst, key as usize, name)?;
+        let f = Self::instance_dunder_function(inst, key, name)?;
         let code = f.code();
         if !code.is_generator {
             return None;
@@ -76914,13 +76876,6 @@ fn tsdbg() -> bool {
     *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
 }
 
-/// Class cache keys per operator (see
-/// `Interpreter::instance_dunder_function`): its method, and whether the
-/// reflected and in-place methods are absent.
-static BINOP_KEYS: [u8; 16] = [0; 16];
-static RBINOP_KEYS: [u8; 16] = [0; 16];
-static IBINOP_KEYS: [u8; 16] = [0; 16];
-
 /// The `TypeError` of a `BINARY_OP` of `op` (augmented when `inplace`)
 /// whose method returned `NotImplemented` for two instances of `cls`.
 fn binop_type_error(
@@ -80221,7 +80176,7 @@ fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
 #[inline]
 fn class_cached_method_held(
     cls: &crate::types::TypeObject,
-    name_key: usize,
+    name_key: crate::types::AttrKey,
     ver: u64,
 ) -> Option<Rc<crate::object::PyFunction>> {
     match cls.leaf_attrs.get(name_key, ver)? {
