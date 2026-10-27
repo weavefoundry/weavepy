@@ -464,9 +464,13 @@ impl Slot {
         // (A racing thread losing a count is harmless.)
         let h = self.heat.load(Ordering::Relaxed).saturating_add(add);
         self.heat.store(h, Ordering::Relaxed);
-        if h >= hot().saturating_mul(n) {
+        let at_hot = hot().saturating_mul(n);
+        if h >= at_hot {
             self.heat.store(0, Ordering::Relaxed);
             self.try_compile(code, ext, nlocals, at);
+        } else if h >= at_hot / 2 && h - add < at_hot / 2 {
+            // Halfway there: warm the code generator up (once per process).
+            crate::tier2::prewarm_on_heat();
         }
     }
 
