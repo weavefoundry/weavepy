@@ -1013,18 +1013,21 @@ fn math_intrinsic_uses_only(code: &CodeObject, name: &str) -> bool {
 /// Credit `n` activations a frameless path ran for `code` to its tier-2
 /// warm-up counter (the framed entries that count otherwise never happen
 /// for them). Returns whether the next framed or lean entry should
-/// compile it: a compile is due, or no entry exists yet to count in.
-pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> bool {
+/// compile it: `Some(true)` when a compile is due, or no entry exists yet
+/// to count in; `Some(false)` to count another interval; `None` once the
+/// count no longer matters (the code is compiled or can't be, or this
+/// tier is off), so the caller stops counting.
+pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> Option<bool> {
     JIT.with(|cell| {
         let Ok(mut st) = cell.try_borrow_mut() else {
-            return false;
+            return Some(false);
         };
         if !st.enabled {
-            return false;
+            return None;
         }
         let threshold = st.threshold;
         match st.cache.get_mut(&std::ptr::from_ref(code)) {
-            None => true,
+            None => Some(true),
             Some(entry) if matches!(entry.tier, Tier::Cold) => {
                 entry.counter = entry.counter.saturating_add(n);
                 let next = entry.counter.saturating_add(1);
@@ -1033,9 +1036,9 @@ pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> bool {
                     // The caller restarts the lean count.
                     entry.calls = entry.calls.wrapping_add(n);
                 }
-                due
+                Some(due)
             }
-            Some(_) => false,
+            Some(_) => None,
         }
     })
 }

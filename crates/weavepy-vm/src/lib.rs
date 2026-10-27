@@ -22671,10 +22671,16 @@ impl Interpreter {
                     && !hint.is_not_jitable()
                     && !crate::tier2::jit_off_for_process()
                 {
-                    if crate::tier2::note_frameless_calls(code, n + 1) {
-                        return false;
+                    match crate::tier2::note_frameless_calls(code, n + 1) {
+                        Some(true) => return false,
+                        Some(false) => hint.defer_lean_compile(),
+                        // Settled: the count passes the warm point and
+                        // stops (the frameless paths then take their
+                        // warm lanes, see `pure_leaf_warm`).
+                        None => {
+                            hint.warm_next_lean(crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP + 2)
+                        }
                     }
-                    hint.defer_lean_compile();
                 } else {
                     hint.bump_lean_entries();
                 }
