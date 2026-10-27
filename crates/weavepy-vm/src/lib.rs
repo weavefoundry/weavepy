@@ -20897,12 +20897,63 @@ impl Interpreter {
         if !Self::core_droppable(recv) {
             return false;
         }
-        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx, Some(running)) else {
+        let Some(v) = self
+            .leaf_plain_attr_value(code, Some(recv), name_idx, Some(running))
+            .or_else(|| Self::value_dunder_new(code, recv, name_idx, running.1))
+        else {
             return false;
         };
         // SAFETY: the receiver (droppable) is replaced in place.
         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
         true
+    }
+
+    /// `x.__new__` of a builtin type's value (`None.__new__`, which
+    /// `enum`'s `_find_new_` reads): the builtin function `type(x).__new__`
+    /// resolves to, which the `LOAD_ATTR` site at `pc` remembers under the
+    /// type's version. `None` for anything else.
+    #[inline(never)]
+    fn value_dunder_new(
+        code: &CodeObject,
+        recv: &Object,
+        name_idx: u32,
+        pc: u32,
+    ) -> Option<Object> {
+        if matches!(recv, Object::Instance(_) | Object::Type(_))
+            || crate::capi_watchers::types_active()
+            || code.names.get(name_idx as usize)?.as_str() != "__new__"
+        {
+            return None;
+        }
+        let cls = crate::builtins::class_of(recv);
+        if !cls.flags.is_builtin {
+            return None;
+        }
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(code, pc)?;
+        match slot.class_value(ver, 0) {
+            // (A remembered decline.)
+            Some(Object::Unbound) => return None,
+            Some(v) => return Some(Self::clone_operand(v)),
+            None => {}
+        }
+        // A builtin type's `__new__` is a static builtin function on a
+        // builtin class of its MRO, which `type`'s lookup returns as it is
+        // (`type` has no data descriptor of the name).
+        let v = match cls.lookup_with_owner("__new__") {
+            Some((v @ Object::Builtin(_), owner))
+                if owner.flags.is_builtin
+                    && matches!(&v, Object::Builtin(b) if !b.binds_instance) =>
+            {
+                v
+            }
+            _ => {
+                slot.set_class_value(ver, 0, &Object::Unbound);
+                return None;
+            }
+        };
+        slot.set_class_value(ver, 0, &v);
+        Some(v)
     }
 
     /// `cls.name` at `top` (a class) for a plain value on the class's
