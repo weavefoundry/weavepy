@@ -102,6 +102,11 @@ class AsyncContextDecorator(object):
         return inner
 
 
+# WeavePy: what `_GeneratorContextManager.__exit__` passes `next()` as its
+# default, which no generator can yield.
+_NO_ITEM = object()
+
+
 class _GeneratorContextManagerBase:
     """Shared functionality for @contextmanager and @asynccontextmanager."""
 
@@ -144,9 +149,11 @@ class _GeneratorContextManager(
 
     def __exit__(self, typ, value, traceback):
         if typ is None:
-            try:
-                next(self.gen)
-            except StopIteration:
+            # WeavePy: `next()` with a default ends the generator without
+            # the `StopIteration` CPython raises and catches here, the
+            # costliest step of a `with` in this interpreter (only a trace
+            # function sees the difference: no `exception` event).
+            if next(self.gen, _NO_ITEM) is _NO_ITEM:
                 return False
             else:
                 try:
