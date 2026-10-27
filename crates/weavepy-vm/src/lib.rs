@@ -941,6 +941,11 @@ pub struct Interpreter {
     /// Finished generators' frame allocations, their frames retired, for
     /// the next generators' frames (see [`Self::gen_parts`]).
     gen_spares: ThreadCell<Vec<GenParts>>,
+    /// Parked frames for lazily run awaited bodies (see
+    /// [`Self::lazy_coro_bind`]), boxed as a coroutine's frame is: stale
+    /// borrowed handles but for the code, which the last body's keeps.
+    #[allow(clippy::vec_box)]
+    lazy_boxes: Vec<Box<LeanFrame>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1262,6 +1267,7 @@ impl Default for Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1396,6 +1402,7 @@ impl Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -8414,6 +8421,7 @@ impl Interpreter {
         act.caller_pending = None;
         act.init_inst = None;
         act.lru = None;
+        act.new_init = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
@@ -8965,6 +8973,20 @@ impl Interpreter {
         result: Result<Object, RuntimeError>,
     ) -> QuietEntry {
         let mut done = done;
+        // A class's Python `__new__` returned (see `core_push_new`): its
+        // `__init__` runs here, nested (the core loop's return pushes it
+        // as an activation instead).
+        let result = match (done.new_init.take(), result) {
+            (Some(ni), Ok(made)) => {
+                let NewInit { ty, plan, mut ops } = *ni;
+                let r = self.init_constructed(&ty, &plan, made, &ops[1..], &[]);
+                for v in ops.drain(..) {
+                    self.release(v);
+                }
+                r
+            }
+            (_, result) => result,
+        };
         // A constructor's `__init__` result becomes the instance (the
         // `instantiate_plain_lean` epilogue).
         let result = match done.init_inst.take() {
@@ -17635,8 +17657,17 @@ impl Interpreter {
         // declines the rest (a missing key's `__missing__`).
         if let (true, Some(Object::Instance(_))) = (b.binds_instance, recv) {
             if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(b) {
-                return self.core_fast_leaf(sw, pc, callee_at, f);
+                return self.core_fast_leaf(sw, pc, callee_at, |_, views| f(views));
             }
+        }
+        // `object.__new__(cls)` of a plain class (pathlib's `__new__`): the
+        // allocation, as the core loop's leaf builtin call makes it (it
+        // declines every other class, for the full call).
+        if recv.is_none() && !b.binds_instance && is_object_new(b) {
+            let b = b.clone();
+            return self.core_fast_leaf(sw, pc, callee_at, |interp, views| {
+                interp.leaf_builtin_call(LeafKind::ObjectNew, &b, views)
+            });
         }
         let ok = match recv {
             None => !b.binds_instance,
@@ -17648,10 +17679,11 @@ impl Interpreter {
     }
 
     /// The `CALL` at `pc` of `sw`'s synced running activation, its callee
-    /// at `callee_at` a leaf method body (as `(method, receiver)` or a bound
-    /// method with an empty self slot) whose fast half `f` runs no Python
-    /// code: settled by `f` on the receiver and the arguments, the operands
-    /// then leaving as the full handler's do. `false` touches nothing (`f`
+    /// at `callee_at` a leaf builtin (a function with an empty self slot, a
+    /// method body as `(method, receiver)`, or a bound method with an empty
+    /// self slot) whose fast half `f` runs no Python code: settled by `f`
+    /// on the receiver, if any, and the arguments, the operands then
+    /// leaving as the full handler's do. `false` touches nothing (`f`
     /// declined, or an operand's release could run code).
     #[inline(never)]
     fn core_fast_leaf(
@@ -17659,7 +17691,7 @@ impl Interpreter {
         sw: &mut CoreSwitch,
         pc: usize,
         callee_at: usize,
-        f: leaf_builtins::Fast,
+        f: impl FnOnce(&Self, &[Object]) -> Option<Result<Object, RuntimeError>>,
     ) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
@@ -17667,8 +17699,9 @@ impl Interpreter {
         let len = frame.stack.len();
         let ops = &frame.stack[callee_at..];
         let (recv, args) = match (&ops[0], &ops[1]) {
-            (Object::BoundMethod(bm), Object::Unbound) => (&bm.receiver, &ops[2..]),
-            (Object::Builtin(_), recv) => (recv, &ops[2..]),
+            (Object::BoundMethod(bm), Object::Unbound) => (Some(&bm.receiver), &ops[2..]),
+            (Object::Builtin(_), Object::Unbound) => (None, &ops[2..]),
+            (Object::Builtin(_), recv) => (Some(recv), &ops[2..]),
             _ => return false,
         };
         if args.len() > 7 || !Self::core_all_droppable(ops) {
@@ -17677,16 +17710,15 @@ impl Interpreter {
         // Bitwise views of the receiver and the arguments, never dropped:
         // the fast half reads them (and clones what it keeps).
         let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-        // SAFETY: the operands on the stack keep them alive.
-        views[0].write(unsafe { std::ptr::read(recv) });
-        for (v, a) in views[1..].iter_mut().zip(args) {
-            // SAFETY: as above.
-            v.write(unsafe { std::ptr::read(a) });
+        let mut n = 0;
+        for a in recv.into_iter().chain(args) {
+            // SAFETY: the operands on the stack keep them alive.
+            views[n].write(unsafe { std::ptr::read(a) });
+            n += 1;
         }
-        // SAFETY: the first `args.len() + 1` entries were written.
-        let views =
-            unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
-        let r = match f(views) {
+        // SAFETY: the first `n` entries were written.
+        let views = unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), n) };
+        let r = match f(self, views) {
             None => return false,
             Some(r) => r,
         };
@@ -19027,6 +19059,13 @@ impl Interpreter {
         let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
             return false;
         };
+        // `__new__` as an inline activation, its result going on to
+        // `__init__` when it returns (see `InlineAct::new_init`).
+        if self.core_push_new(sw, pc, argc, ty, plan, new_f) {
+            return true;
+        }
+        // SAFETY: as above (declined untouched).
+        let frame = unsafe { &mut *sw.cur };
         // Committed: the class, its self slot and the arguments leave, the
         // class and the arguments as `__new__`'s.
         let mut ops: Vec<Object> = self.pooled_scratch();
@@ -19071,6 +19110,124 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// [`Self::core_new_user`]'s `new_f(ty, *args)` (the `argc` arguments
+    /// below the top of the running activation's stack, called by the
+    /// instruction at `pc`) as an inline activation made the running one,
+    /// which the call's operands leave for: when it returns, its result
+    /// goes on to the class's `__init__` (see [`Self::core_new_finish`]).
+    /// `false` touches nothing (a `__new__` the lean binder can't bind, or
+    /// one only the full call can run).
+    fn core_push_new(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        argc: usize,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        new_f: &Rc<crate::object::PyFunction>,
+    ) -> bool {
+        let code = new_f.code();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+            || (new_f.defaults_maybe_overridden()
+                && (new_f.slot("__defaults__").is_some() || new_f.slot("__kwdefaults__").is_some()))
+            || !Self::call_cells_ok(new_f, &code)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        // (`ty`, then the arguments above the empty self slot.)
+        let bound = Self::lean_bind_keywords(
+            new_f,
+            &code,
+            std::slice::from_ref(&frame.stack[callee_slot]),
+            &frame.stack[callee_slot + 2..],
+            std::iter::empty(),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed: the class and the arguments move into the record
+        // `__init__` takes them from; the empty self slot owns nothing.
+        fill_unbound(locals, code.varnames.len());
+        let mut ops: Vec<Object> = Vec::with_capacity(argc + 1);
+        ops.extend(frame.stack.drain(callee_slot..));
+        ops.remove(1);
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`; the caller's frame is synced, past the
+        // call (its operands gone).
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(new_f.clone()),
+                guard,
+            )
+        };
+        act.new_init = Some(Box::new(NewInit {
+            ty: ty.clone(),
+            plan: plan.clone(),
+            ops,
+        }));
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// A class's Python `__new__`, run by [`Self::core_push_new`]'s
+    /// activation for the `CALL` at `pc` of `sw`'s running activation,
+    /// returned `made`: an instance of the class itself goes on to its
+    /// `__init__` (an inline activation made the running one: `None`),
+    /// anything else as `type_call` treats it (`Some` the result).
+    fn core_new_finish(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        ni: NewInit,
+        made: Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let NewInit { ty, plan, mut ops } = ni;
+        let result = match made {
+            inst @ Object::Instance(_)
+                if !plan.init_from_object
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(&ty))) =>
+            {
+                self.core_push_init(sw, pc, &plan, inst, &mut ops)
+            }
+            made => Some(self.init_constructed(&ty, &plan, made, &ops[1..], &[])),
+        };
+        for v in ops.drain(..) {
+            self.release(v);
+        }
+        result
     }
 
     /// [`Self::core_new_user`]'s `__init__` of `inst`, a fresh instance of
@@ -24688,6 +24845,9 @@ impl Interpreter {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
             let v = done.init_inst.take().unwrap_or(v);
+            // A class's Python `__new__` returned: its result goes on to
+            // the class's `__init__` below, in the caller's place.
+            let new_init = done.new_init.take();
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -24713,8 +24873,14 @@ impl Interpreter {
             } else {
                 self.inline_park_clean(done);
             }
-            // SAFETY: as above.
-            unsafe { (*cframe).stack.push_fast(v) };
+            let made = match new_init {
+                Some(ni) => Some((ni, v)),
+                None => {
+                    // SAFETY: as above.
+                    unsafe { (*cframe).stack.push_fast(v) };
+                    None
+                }
+            };
             match callable {
                 // A function something else still holds (its class, its
                 // module) can't die here: a plain decrement.
@@ -24732,6 +24898,18 @@ impl Interpreter {
             // below.
             // SAFETY: as above.
             unsafe { *sw.last = call_pc };
+            if let Some((ni, made)) = made {
+                match self.core_new_finish(sw, call_pc, *ni, made) {
+                    // `__init__`'s activation runs next.
+                    None => return true,
+                    // SAFETY: the caller is the running activation again.
+                    Some(Ok(r)) => unsafe { (*cframe).stack.push(r) },
+                    Some(Err(e)) => {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        return true;
+                    }
+                }
+            }
             if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
@@ -24770,6 +24948,19 @@ impl Interpreter {
             )
         };
         done.clean &= !had_shell;
+        // A class's Python `__new__` returned: its result goes on to the
+        // class's `__init__` below, in the caller's place, not to the
+        // caller (which takes nothing from the delivery).
+        let mut result = result;
+        let new_step = match (&done.new_init, &result) {
+            (Some(_), Ok(_)) => {
+                done.discard = true;
+                let ni = done.new_init.take().expect("checked above");
+                let made = std::mem::replace(&mut result, Ok(Object::None));
+                Some((ni, made.expect("checked above")))
+            }
+            _ => None,
+        };
         // SAFETY: the caller is the innermost remaining activation.
         (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
         // SAFETY: as above.
@@ -24781,6 +24972,17 @@ impl Interpreter {
         } else {
             clast
         };
+        let mut entry = entry;
+        if let (Some((ni, made)), QuietEntry::Returned { cur_pc }) = (new_step, &entry) {
+            let cur_pc = *cur_pc;
+            match self.core_new_finish(sw, cur_pc, *ni, made) {
+                // `__init__`'s activation runs next.
+                None => return true,
+                // SAFETY: the caller is the running activation again.
+                Some(Ok(v)) => unsafe { (*sw.cur).stack.push(v) },
+                Some(Err(err)) => entry = QuietEntry::Raised { err, cur_pc },
+            }
+        }
         match entry {
             QuietEntry::Returned { cur_pc } => {
                 // SAFETY: as above.
@@ -30698,6 +30900,12 @@ impl Interpreter {
                 let [O::Type(cls)] = args else {
                     return None;
                 };
+                // A class its memoized plan proved plain (as `object_new`
+                // reads it): the allocation, with no checks to repeat.
+                if object_new_plain_memo(cls) {
+                    let (inst, _tracked) = self.alloc_plain_instance_obj(cls);
+                    return Some(Ok(inst));
+                }
                 if cls.flags.is_builtin || cls.is_type_subclass() {
                     return None;
                 }
@@ -31377,6 +31585,13 @@ impl Interpreter {
         if let Some(f) = slot.and_then(|s| s.get_held_unbound(ver)) {
             return Some(Object::Function(f));
         }
+        // A native function this site last read off the class under its
+        // plain metaclass (`object.__new__`, see below).
+        if let Some(v @ Object::Builtin(_)) = slot.and_then(|s| s.class_value(ver, 0)) {
+            if Self::plain_metaclass(cls) {
+                return Some(Self::clone_operand(v));
+            }
+        }
         // A plain `type` metaclass has nothing that could intercept a
         // non-dunder class attribute (the class cache never answers for
         // dunders).
@@ -31511,6 +31726,16 @@ impl Interpreter {
                     s.set_static(ver, &f);
                 }
                 Some(Object::Function(f))
+            }
+            // A non-binding native function (`object.__new__`, read by
+            // every Python `__new__`), which the site remembers under the
+            // class's version: the checks above come out the same while it
+            // stands, its metaclass staying `type`.
+            LeafAttr::Value(v @ Object::Builtin(_)) => {
+                if let Some(s) = slot {
+                    s.set_class_value(ver, 0, &v);
+                }
+                Some(v)
             }
             LeafAttr::Value(v) => Some(v),
             // A class method, bound to the class.
@@ -55272,6 +55497,19 @@ impl Interpreter {
                                     cls.name, base
                                 )));
                             }
+                            // An abstract class object's allocator refuses
+                            // (CPython `object_new`), as its construction
+                            // does.
+                            if !object_new_plain_memo(cls) {
+                                let plan = self.instance_plan(cls);
+                                if let Some(msg) = &plan.abstract_error {
+                                    if matches!(plan.native, crate::types::NativeKind::Plain)
+                                        && !plan.seeds_exception_args
+                                    {
+                                        return Err(type_error(msg.clone()));
+                                    }
+                                }
+                            }
                         }
                         if let Some(call_kw) = b.call_kw.as_ref() {
                             return call_kw(args, kwargs);
@@ -59810,6 +60048,7 @@ impl Interpreter {
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
         let object_new_plain = !seeds_exception_args
+            && abstract_error.is_none()
             && matches!(native, NativeKind::Plain)
             && !cls.flags.is_builtin
             && !cls.is_type_subclass()
@@ -62321,6 +62560,278 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// The activation of `await f(...)`'s coroutine body run lazily (see
+    /// `frame_jit::lazy_await`), its checks passed: `f` (its code `code`,
+    /// without cells of its own: `cells` are the function's) called with
+    /// the `nargs` arguments at `args`, which move into the frame's locals
+    /// (the stack forgets them), the frame built just past the
+    /// `RETURN_GENERATOR` at `start` with the sent `None` pushed, as
+    /// [`Self::core_await_enter`] starts it. The caller rests at the `SEND`
+    /// at `send_pc` (its jump `jump`), whose exit takes the return.
+    ///
+    /// The frame is a parked box's (see [`Interpreter::lazy_boxes`]), bound
+    /// as a direct call's activation is: its namespaces and cells are
+    /// borrowed from `callable` (the called function, which the activation
+    /// holds), and its code handle is kept from the box's last body when
+    /// that ran the same code. A coroutine made around it owns them
+    /// ([`Self::lazy_coro_materialize`]).
+    ///
+    /// # Safety
+    ///
+    /// `args` holds `nargs` initialized values the caller's stack forgets,
+    /// no more than `code` takes; `callable` is the function `f` names.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) unsafe fn lazy_coro_bind(
+        &mut self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        cells: &Rc<Vec<Rc<RefCell<Object>>>>,
+        args: *const Object,
+        nargs: usize,
+        start: usize,
+        send_pc: usize,
+        jump: u32,
+        callable: Object,
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
+        let mut boxed = match self.lazy_boxes.pop() {
+            Some(boxed) => boxed,
+            None => self.lazy_box_new(),
+        };
+        let fr: &mut Frame = &mut boxed;
+        if !Rc::ptr_eq(&fr.code, code) {
+            fr.code = code.clone();
+        }
+        // SAFETY: a parked box's handles are stale copies, overwritten
+        // without a drop; the activation holds `callable`, which holds what
+        // they borrow.
+        unsafe {
+            std::ptr::write(&raw mut fr.globals, borrowed_rc(&f.globals));
+            std::ptr::write(&raw mut fr.builtins, borrowed_rc(&f.builtins));
+            std::ptr::write(&raw mut fr.cells, borrowed_rc(cells));
+        }
+        let nlocals = code.varnames.len();
+        {
+            // SAFETY: a parked box's locals are its own, and empty.
+            let v = unsafe { fr.locals.storage() };
+            v.reserve(nlocals);
+            // SAFETY: the caller's contract.
+            unsafe {
+                std::ptr::copy_nonoverlapping(args, v.as_mut_ptr(), nargs);
+                v.set_len(nargs);
+            }
+            let missing = (code.arg_count as usize).saturating_sub(nargs);
+            if missing > 0 {
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
+            fill_unbound(v, nlocals);
+        }
+        fr.pc = start as u32 + 1;
+        fr.gen_first_resume = true;
+        fr.stack.push_fast(Object::None);
+        let gen_frame: *mut Frame = fr;
+        let mut act = self.inline_slot();
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: each field is `None` (a pooled slot holds none of them),
+        // and a parked slot's callable is a stale copy. The box moves as
+        // the frame's: `LeanFrame` is transparent, and the box goes back to
+        // the parked ones, or its handles are made owned, before anything
+        // drops it as a frame.
+        unsafe {
+            std::ptr::write(
+                &raw mut act.gen_box,
+                Some(Box::from_raw(Box::into_raw(boxed).cast::<Frame>())),
+            );
+            std::ptr::write(&raw mut act.guard, Some(guard));
+            std::ptr::write(&raw mut act.callable, callable);
+        }
+        act.gen_frame = gen_frame;
+        act.act.frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.call_pc = send_pc;
+        act.exc_depth = self.exc_info_len();
+        act.direct = true;
+        act.lazy_coro = true;
+        act
+    }
+
+    /// A new parked box for [`Self::lazy_coro_bind`]: stale borrowed
+    /// handles, an owned code handle, and empty locals and stack, in a
+    /// finished generator's allocations when the pool has them (a body
+    /// whose coroutine was made took its box along).
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_new(&self) -> Box<LeanFrame> {
+        let spare = self.gen_spares.borrow_mut().pop();
+        let placeholder = inline_placeholder();
+        let Some(GenParts {
+            locals,
+            stack,
+            boxed,
+        }) = spare
+        else {
+            let mut boxed = Box::new(parked_lean_frame());
+            // SAFETY: the stale copy is overwritten without a drop.
+            unsafe { std::ptr::write(&raw mut boxed.code, placeholder.code.clone()) };
+            return boxed;
+        };
+        let frame = Frame {
+            code: placeholder.code.clone(),
+            locals: frame_slots::FrameLocals::from_shared(locals),
+            cells: borrowed_rc(&placeholder.cells),
+            stack,
+            globals: borrowed_rc(&placeholder.dict),
+            builtins: borrowed_rc(&placeholder.dict),
+            rare: None,
+            exc: None,
+            agen_yielded_value: true,
+            pc: 0,
+            py_frame: None,
+            gen_owner: None,
+            suppress_call_event: false,
+            gen_first_resume: false,
+            sent_consumed: false,
+            shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
+        };
+        // SAFETY: `LeanFrame` is transparent over the frame, whose borrowed
+        // handles it never drops.
+        unsafe { Box::from_raw(Box::into_raw(Box::write(boxed, frame)).cast::<LeanFrame>()) }
+    }
+
+    /// Make the coroutine of `act`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]), as it registers: from here it is the
+    /// activation [`Self::core_await_enter`] makes, its coroutine running
+    /// (tracked if it suspends) in the placeholder's slot atop the caller
+    /// `caller`'s stack, its frame owning its handles.
+    ///
+    /// # Safety
+    ///
+    /// `act` is lazy and its caller's frame synced, the placeholder `None`
+    /// atop its stack.
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn lazy_coro_materialize(&mut self, act: &mut InlineAct, caller: &mut Frame) {
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_MADE);
+        let mut boxed = act.gen_box.take().expect("a lazy coroutine's frame");
+        {
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: the borrowed handles become owned ones (overwritten
+            // without a drop by their counted clones).
+            unsafe {
+                std::ptr::write(&raw mut fr.globals, Rc::clone(&fr.globals));
+                std::ptr::write(&raw mut fr.builtins, Rc::clone(&fr.builtins));
+                std::ptr::write(&raw mut fr.cells, Rc::clone(&fr.cells));
+            }
+        }
+        // SAFETY: moved out once; the slot treats the field as stale from
+        // here (as a generator activation's).
+        let callable = unsafe { std::ptr::read(&raw const act.callable) };
+        let kind = crate::object::CoroutineKind::Coroutine;
+        let code = Object::Code(boxed.code.clone());
+        let gen = match crate::object::pooled_generator(kind, code, boxed) {
+            Ok(gen) => gen,
+            Err((code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, code, frame)
+            }),
+        };
+        gen.track_deferred.set(true);
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *gen.state().as_ptr() };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("a fresh coroutine");
+        };
+        act.gen_box = Some(boxed);
+        let n = caller.stack.len();
+        debug_assert!(n > 0 && matches!(caller.stack[n - 1], Object::None));
+        // SAFETY: the placeholder (`None`, nothing to drop) is the top slot.
+        unsafe {
+            caller
+                .stack
+                .as_mut_ptr()
+                .add(n - 1)
+                .write(Object::Coroutine(gen.clone()));
+        }
+        act.gen = Some(gen);
+        act.lazy_coro = false;
+        act.direct = false;
+        self.release(callable);
+    }
+
+    /// Finish `done`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]) that returned cleanly without registering,
+    /// its result taken, its operand stack empty and its locals its own:
+    /// they are released, its box parked again, its slot parked, and the
+    /// function it held released.
+    #[inline(always)]
+    pub(crate) fn lazy_coro_finish(&mut self, mut done: Box<InlineAct>) {
+        drop(done.guard.take());
+        if let Some(boxed) = done.gen_box.take() {
+            // SAFETY: a lazy body's box (see `lazy_coro_bind`).
+            let mut boxed = unsafe { Box::from_raw(Box::into_raw(boxed).cast::<LeanFrame>()) };
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: sole owner (the caller's contract).
+            unsafe { release_locals(fr.locals.storage()) };
+            fr.gen_first_resume = false;
+            if fr.rare.is_some()
+                || fr.exc.is_some()
+                || fr.py_frame.is_some()
+                || fr.gen_owner.is_some()
+                || fr.shell_cache.is_some()
+                || fr.sent_consumed
+                || fr.suppress_call_event
+                || !fr.agen_yielded_value
+            {
+                Self::lazy_box_reset(fr);
+            }
+            #[cfg(feature = "jit")]
+            if fr.parked_native.is_some() {
+                fr.parked_native = None;
+            }
+            if self.lazy_boxes.len() < LAZY_BOXES_CAP {
+                push_fast(&mut self.lazy_boxes, boxed);
+            }
+        }
+        // SAFETY: moved out once; the parked slot treats the field as
+        // stale.
+        let callable = unsafe { std::ptr::read(&raw const done.callable) };
+        done.gen_frame = std::ptr::null_mut();
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.direct = false;
+        done.lazy_coro = false;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, done);
+        }
+        // A function something else still holds (its module, its class)
+        // can't die here: a plain decrement.
+        match callable {
+            // SAFETY: the function is alive (held here).
+            Object::Function(f) if unsafe { crate::rc::try_release_shared(Rc::as_ptr(&f)) } => {
+                std::mem::forget(f);
+            }
+            callable => self.release(callable),
+        }
+    }
+
+    /// [`Self::lazy_coro_finish`]'s reset of the rarer frame state a body
+    /// set on the way.
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_reset(fr: &mut Frame) {
+        fr.rare = None;
+        fr.exc = None;
+        fr.py_frame = None;
+        fr.gen_owner = None;
+        fr.shell_cache = None;
+        fr.sent_consumed = false;
+        fr.suppress_call_event = false;
+        fr.agen_yielded_value = true;
     }
 
     /// Bootstrap a generator/coroutine *code object* frame that was not
@@ -70550,6 +71061,9 @@ struct LeanAct {
 /// How many parked [`InlineAct`] slots `Interpreter::inline_pool` keeps.
 const INLINE_POOL_CAP: usize = 64;
 
+/// The most parked boxes [`Interpreter::lazy_coro_bind`] keeps.
+const LAZY_BOXES_CAP: usize = 64;
+
 /// A lean activation the quiet loop runs *inline*: its frame lives in
 /// this box instead of on a nested native activation, and
 /// `Interpreter::quiet_run` switches to it at the caller's `CALL` and
@@ -70605,6 +71119,11 @@ struct InlineAct {
     /// While a direct call's activation runs lazily (see
     /// `frame_jit::register_lazy`), its caller's native state.
     lazy_caller: *mut frame_jit::State,
+    /// An awaited coroutine's body running lazily without its coroutine
+    /// (see `frame_jit::lazy_await`): its frame is in `gen_box`, `gen` is
+    /// `None`, and registering makes the coroutine
+    /// (`Interpreter::lazy_coro_materialize`).
+    lazy_coro: bool,
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
@@ -70624,6 +71143,20 @@ struct InlineAct {
     /// the wrapper's cache when it returns, before its caller takes it
     /// (`inline_deliver`).
     lru: Option<crate::stdlib::functools_mod::LruPending>,
+    /// A class's Python `__new__` (see `Interpreter::core_new_user`): its
+    /// result goes on to the class's `__init__` as `type_call` runs it,
+    /// not straight to the caller.
+    new_init: Option<Box<NewInit>>,
+}
+
+/// The rest of a constructor call whose Python `__new__` an inline
+/// activation runs (see [`InlineAct::new_init`]): the class, its plan,
+/// and the call's operands (the class, then the arguments), which its
+/// `__init__` takes.
+struct NewInit {
+    ty: Rc<TypeObject>,
+    plan: Rc<crate::types::InstancePlan>,
+    ops: Vec<Object>,
 }
 
 /// The levels of a collapsed `yield from` chain (see
@@ -70746,10 +71279,12 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             lazy_caller: std::ptr::null_mut(),
+            lazy_coro: false,
             binop: None,
             discard: false,
             chain: None,
             lru: None,
+            new_init: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         act
@@ -71318,6 +71853,7 @@ struct LeanKwShape {
 /// on drop, or recycled by [`Interpreter::retire_lean_frame`]. Anything
 /// that keeps one of these handles beyond the activation (a shell or a
 /// materialized frame) clones it, which counts normally.
+#[repr(transparent)]
 struct LeanFrame(std::mem::ManuallyDrop<Frame>);
 
 impl std::ops::Deref for LeanFrame {
@@ -71816,7 +72352,9 @@ mod burst_stats {
     pub(crate) const CALL_PURE: usize = 5;
     pub(crate) const CALL_GENERAL: usize = 6;
     pub(crate) const CALL_TIER2: usize = 7;
-    const CALL_NAMES: [&str; 8] = [
+    pub(crate) const CALL_LAZY_AWAIT: usize = 8;
+    pub(crate) const CALL_LAZY_MADE: usize = 9;
+    const CALL_NAMES: [&str; 10] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -71825,8 +72363,10 @@ mod burst_stats {
         "pure leaf evaluated in place",
         "general frame run",
         "tier-2 entry from the general run",
+        "frame-JIT lazy await",
+        "lazy await's coroutine made",
     ];
-    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
@@ -72138,6 +72678,18 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
         .is_some_and(|(_, owner)| !owner.flags.is_builtin)
 }
 
+/// Whether `cls`'s memoized construction plan, current for its version,
+/// proved `object.__new__(cls)` the plain allocation (as `object_new`
+/// reads it): no abstract methods, built-in base or special allocator.
+#[inline]
+fn object_new_plain_memo(cls: &TypeObject) -> bool {
+    // SAFETY: a guard-free read of the memoized plan; nothing runs before
+    // its last use.
+    unsafe { cls.instance_plan.peek() }
+        .and_then(Option::as_ref)
+        .is_some_and(|(v, plan)| *v == cls.attr_version.get() && plan.object_new_plain)
+}
+
 /// Whether `object.__new__(cls)` is unsafe (CPython `tp_new_wrapper`'s
 /// check): the class whose native `__new__` serves `cls` (its
 /// `staticbase`, the first class on its MRO whose `__new__` doesn't
@@ -72146,6 +72698,11 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
 /// in for. That class's name, for the error, or `None` when `object`'s
 /// allocator serves (or the native type is one WeavePy alone builds).
 fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
+    // A class whose memoized plan is `object.__new__`'s plain allocation
+    // has no built-in base.
+    if object_new_plain_memo(cls) {
+        return None;
+    }
     let bt = builtin_types();
     let core = [
         &bt.int_,

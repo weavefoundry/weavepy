@@ -1336,8 +1336,9 @@ pub struct InstancePlan {
     /// differ).
     pub bare_alloc: bool,
     /// `object.__new__(cls)` (just the class) is a plain allocation: no
-    /// native payload, not an exception, built-in, `type`, module or
-    /// generic-alias class (see `builtin_types::object_new`).
+    /// native payload or abstract methods, not an exception, built-in,
+    /// `type`, module or generic-alias class (see
+    /// `builtin_types::object_new`).
     pub object_new_plain: bool,
     /// Whether construction is the stores of a store-only `__init__` (see
     /// `Interpreter::core_store_init`): `0` not yet proven, `1` proven

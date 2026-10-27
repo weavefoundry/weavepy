@@ -2112,9 +2112,11 @@ impl JitState {
                 let init = {
                     let cached = t.instance_plan.borrow();
                     let (ver, plan) = cached.as_ref()?.clone();
-                    // (An exception's `args` is seeded by its allocator,
-                    // which the native construction doesn't run.)
-                    if ver != t.attr_version.get() || plan.seeds_exception_args {
+                    // (Only the default pipeline: a Python or native
+                    // `__new__` anywhere on the MRO, or an exception's
+                    // seeded `args`, is the allocation the native
+                    // construction doesn't run.)
+                    if ver != t.attr_version.get() || !plan_constructs_natively(t, &plan) {
                         return None;
                     }
                     match plan.init_fn.as_ref() {
@@ -2413,6 +2415,24 @@ fn probe_class_ctor(interp: &super::Interpreter, cls: &Rc<TypeObject>) -> Option
     })
 }
 
+/// Whether `plan`, the memoised construction plan of class `t`, is the
+/// default pipeline a native construction ([`try_native_ctor`]) stands in
+/// for: `object.__new__`'s plain allocation (no other `__new__` anywhere
+/// on the class's MRO, Python or native, no abstract methods, no native
+/// payload, no exception `args` to seed) and then a plain `__init__` that
+/// isn't `object`'s. A class with a Python `__new__` must run it: its
+/// result is the instance (or isn't one at all).
+fn plan_constructs_natively(t: &TypeObject, plan: &crate::types::InstancePlan) -> bool {
+    !t.flags.is_builtin
+        && !t.is_type_subclass()
+        && plan.abstract_error.is_none()
+        && plan.user_new.is_none()
+        && plan.is_object_new
+        && matches!(plan.native, crate::types::NativeKind::Plain)
+        && !plan.init_from_object
+        && !plan.seeds_exception_args
+}
+
 /// [`probe_class_ctor`] without the field plan (the guard predicate only
 /// needs the constructor's `__init__` code): `(init code, arg_count,
 /// min_args)`.
@@ -2427,13 +2447,7 @@ fn probe_class_ctor_shape(
         return None;
     }
     let plan = interp.instance_plan(cls);
-    if plan.abstract_error.is_some()
-        || plan.user_new.is_some()
-        || !plan.is_object_new
-        || !matches!(plan.native, crate::types::NativeKind::Plain)
-        || plan.init_from_object
-        || plan.seeds_exception_args
-    {
+    if !plan_constructs_natively(cls, &plan) {
         return None;
     }
     let Some(Object::Function(init)) = plan.init_fn.as_ref() else {
@@ -5096,14 +5110,16 @@ fn ctor_still_inits_with(t: &TypeObject, ver: u64, code: &Rc<CodeObject>) -> boo
         return false;
     };
     match plan.as_ref() {
-        Some((v, plan)) if *v == ver => match plan.init_fn.as_ref() {
-            // SAFETY: GIL-serialized raw read of the code cell; only the
-            // pointer is compared.
-            Some(Object::Function(f)) => {
-                std::ptr::eq(unsafe { Rc::as_ptr(&*f.code.as_ptr()) }, Rc::as_ptr(code))
+        Some((v, plan)) if *v == ver && plan_constructs_natively(t, plan) => {
+            match plan.init_fn.as_ref() {
+                // SAFETY: GIL-serialized raw read of the code cell; only the
+                // pointer is compared.
+                Some(Object::Function(f)) => {
+                    std::ptr::eq(unsafe { Rc::as_ptr(&*f.code.as_ptr()) }, Rc::as_ptr(code))
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
         _ => false,
     }
 }
@@ -6805,6 +6821,15 @@ unsafe fn try_native_ctor(
     expect_tag: u32,
 ) -> Option<i64> {
     let cls = nc.ctor.as_ref()?;
+    // The class must still construct through the default pipeline its
+    // resolution checked (a `__new__` added since bumps its version).
+    {
+        let plan = cls.instance_plan.try_borrow().ok()?;
+        let (ver, plan) = plan.as_ref()?;
+        if *ver != cls.attr_version.get() || !plan_constructs_natively(cls, plan) {
+            return None;
+        }
+    }
     // A native construction is a framed call plus allocation and
     // tracking: charged like any other heavy round-trip, and past the
     // budget left to the interpreter (see `charge_roundtrip`).
@@ -11630,7 +11655,10 @@ unsafe fn try_dyn_native(
             let init = {
                 let cached = t.instance_plan.borrow();
                 let (ver, plan) = cached.as_ref()?.clone();
-                if ver != t.attr_version.get() || plan.seeds_exception_args {
+                // (Only the default pipeline: a class whose `__new__` is
+                // Python code allocates through it, see
+                // `plan_constructs_natively`.)
+                if ver != t.attr_version.get() || !plan_constructs_natively(t, &plan) {
                     return None;
                 }
                 match plan.init_fn.as_ref() {

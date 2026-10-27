@@ -5072,6 +5072,241 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
     }
 }
 
+/// `await f(...)` at the `CALL` at `pc` (its operands from `start` up a
+/// `len`-deep stack) of a plain coroutine function whose body has native
+/// code: the body runs as a direct call's does, lazily (see
+/// [`register_lazy`]), from just past its `RETURN_GENERATOR`, its frame in
+/// a pooled generator box but no coroutine made
+/// (`Interpreter::lazy_coro_bind`). A clean return leaves `[None, result]`
+/// from `start` (`AWAITED`), as the coroutine made, awaited and finished
+/// would; anything that registers the body (a suspension, a raise, a
+/// stack walk, a return the core loop finishes) makes the coroutine first
+/// (`Interpreter::lazy_coro_materialize`), in the state the eager path
+/// (`Interpreter::core_gen_call`, [`gen_call_done`]) leaves. `None`
+/// touched nothing.
+///
+/// # Safety
+///
+/// As `h_call`'s, with a non-null switch.
+#[inline(never)]
+unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let base = st.stack;
+        let Object::Function(f) = &*base.add(start) else {
+            return None;
+        };
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        if !code_rc.is_coroutine || code_rc.is_async_generator {
+            return None;
+        }
+        let interp = &mut *st.interp.cast_mut();
+        let sw = &mut *st.sw;
+        let caller = &mut *st.frame;
+        let send_pc = crate::await_send_after(&caller.code, pc)?;
+        let has_self = !matches!(&*base.add(start + 1), Object::Unbound);
+        let nargs = len - start - 2 + usize::from(has_self);
+        let nested = interp.direct_calls.get();
+        if nested >= DIRECT_CALL_DEPTH
+            || !sw.calls_ok
+            || (*st.maybe_dead).get()
+            || crate::hot_gates::loop_gen() != st.snap_gen
+        {
+            return None;
+        }
+        let gen_start = interp.generator_start(f, code_rc, nargs)?;
+        let cells = f.lean_cells_ref(code_rc)?;
+        let ext = crate::code_vm_ext(code_rc)?;
+        let nlocals = code_rc.varnames.len();
+        let Some(native) = ext.frame_jit.get(nlocals) else {
+            // A compiled caller's await of a body without one: its round
+            // trip costs about what a switched call's does (see
+            // `Slot::warm_switched`).
+            ext.frame_jit.warm_switched(code_rc, ext, nlocals);
+            return None;
+        };
+        let from = gen_start + 1;
+        if from >= ext.dispatch_len
+            || !native.enters_at(from)
+            || !Interpreter::lean_gen_code_ok(code_rc)
+            || !f.code_names_kept(|| crate::code_gen_names(code_rc))
+        {
+            return None;
+        }
+        let dc = &*sw.depth_cell;
+        let depth = dc.get() + 1;
+        if depth > crate::recursion::recursion_limit() {
+            return None;
+        }
+        // Committed: the arguments move into the body's frame, the callee
+        // into its activation, a placeholder takes its slot, and the caller
+        // rests at the `SEND` as `Interpreter::core_gen_call` leaves it.
+        dc.set(depth);
+        let jump = caller.code.instructions[send_pc].arg;
+        let first = if has_self { start + 1 } else { start + 2 };
+        let act = interp.lazy_coro_bind(
+            f,
+            code_rc,
+            cells,
+            base.add(first),
+            nargs,
+            gen_start,
+            send_pc,
+            jump,
+            base.add(start).read(),
+            crate::recursion::Guard::adopt(dc),
+        );
+        base.add(start).write(Object::None);
+        caller.stack.set_len(start + 1);
+        caller.pc = send_pc as u32 + 1;
+        st.last = send_pc - 1;
+        let callee = act.gen_frame;
+        let act = Box::into_raw(act);
+        (*act).lazy_caller = st;
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_AWAIT);
+        let cframe = &mut *callee;
+        let stack = &mut cframe.stack;
+        if stack.capacity() < native.need() {
+            stack.reserve(native.need() - stack.len());
+        }
+        let mut cst = State {
+            locals: cframe.locals.as_mut_ptr(),
+            stack: stack.as_mut_ptr(),
+            len: stack.len(),
+            cap: stack.capacity(),
+            pc: from,
+            last: usize::MAX,
+            countdown: st.countdown,
+            snap_gen: st.snap_gen,
+            maybe_dead: st.maybe_dead,
+            interp: st.interp,
+            out: 0,
+            depth_cell: st.depth_cell,
+            err: None,
+            frame: callee,
+            sw: st.sw,
+            gen_depth: 0,
+            direct: true,
+            lazy: act,
+            lazy_depth: 0,
+            lazy_last: std::ptr::null_mut(),
+        };
+        interp.direct_calls.set(nested + 1);
+        let outer = interp.lazy_top.get();
+        interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
+        let status = native.run_direct(&mut cst, from);
+        interp.lazy_top.set(outer);
+        interp.direct_calls.set(nested);
+        Some(lazy_await_done(
+            st, start, send_pc, callee, status, &mut cst,
+        ))
+    }
+}
+
+/// The end of [`lazy_await`]'s run of the awaited body `callee`, which
+/// returned `status` with its state `cst`: a clean return finished here
+/// (`AWAITED`, `[None, result]` from `start`), or, the coroutine made, as
+/// [`gen_call_done`] finishes the eager path's run.
+///
+/// # Safety
+///
+/// As [`lazy_await`]'s, with the body's native code just returned.
+#[inline(always)]
+unsafe fn lazy_await_done(
+    st: &mut State,
+    start: usize,
+    send_pc: usize,
+    callee: *mut crate::Frame,
+    status: u32,
+    cst: &mut State,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let caller = &mut *st.frame;
+        let cframe = &mut *callee;
+        let exit = send_pc + 1 + caller.code.instructions[send_pc].arg as usize;
+        if !cst.lazy.is_null() {
+            if status == DIRECT_RET
+                && cst.len == 1
+                && !cframe.locals.is_shared()
+                && !interp.countdown_out(2)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+            {
+                // A clean return of a body that never registered: the
+                // caller is still the running activation, and nothing saw
+                // the body or needed its coroutine.
+                let v = cst.stack.read();
+                cframe.stack.set_len(0);
+                interp.lazy_coro_finish(Box::from_raw(cst.lazy));
+                st.stack.add(start + 1).write(v);
+                caller.stack.set_len(start + 2);
+                caller.pc = exit as u32;
+                interp.gil_countdown -= 1;
+                if (*(*st.sw).maybe_dead).get() {
+                    // (The finalizers may run Python code: the caller's
+                    // view first.)
+                    settle(st);
+                    let sw = &mut *st.sw;
+                    *sw.last = send_pc;
+                    let mut tmp = None;
+                    let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+                    interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+                    if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+                    }
+                }
+                let sw = &mut *st.sw;
+                if sw.pending.is_some() {
+                    *sw.last = send_pc;
+                    return RELOAD;
+                }
+                st.len = start + 2;
+                return AWAITED;
+            }
+            // Anything else is the core loop's to finish: the body
+            // registers first, its coroutine made.
+            register_lazy(cst);
+        }
+        let sw = &mut *st.sw;
+        if status == DIRECT_RET {
+            // A return that wasn't clean (the body registered only now):
+            // the core loop's arm's (as `h_gen_return`'s).
+            cframe.stack.set_len(cst.len);
+            cframe.pc = cst.pc as u32;
+            *sw.last = cst.last;
+            if !interp.core_return(sw, st.snap_gen) {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+        }
+        if status == RELOAD || status == DIRECT_RET {
+            // Returned into the caller's `END_SEND`, nothing pending: done.
+            // Otherwise whoever switched last synced what runs next.
+            if sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && caller.pc as usize == exit
+                && caller.stack.len() == start + 2
+            {
+                st.len = start + 2;
+                return AWAITED;
+            }
+            return RELOAD;
+        }
+        // The body stopped partway: its state, synced as the core loop
+        // syncs it after a native run, for the core loop to go on with.
+        let cframe = &mut *cst.frame;
+        cframe.stack.set_len(cst.len);
+        cframe.pc = cst.pc as u32;
+        *sw.last = cst.last;
+        if status == MARKED {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+        } else if let Some(e) = cst.err.take() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+        }
+        RELOAD
+    }
+}
+
 /// The end of `h_call`'s generator-function call at `pc` (its operands
 /// from `start`), made by `Interpreter::core_gen_call`: the generator in
 /// place (`0`), or an `await` whose coroutine that call started (the
@@ -5137,8 +5372,9 @@ unsafe fn gen_call(st: &mut State, pc: usize, start: usize, len: usize) -> u32 {
 }
 
 /// `CALL` at an `await f(...)`'s site (see [`Lower::call_op`]): a
-/// coroutine function's call goes straight to [`gen_call`], which starts
-/// the coroutine; any other callee goes on as [`h_call_site`] takes it.
+/// coroutine function's call runs its body lazily ([`lazy_await`]) or goes
+/// straight to [`gen_call`], which starts the coroutine; any other callee
+/// goes on as [`h_call_site`] takes it.
 /// (The general `h_call` saves and restores many registers around the
 /// shapes it tries first.)
 unsafe extern "C" fn h_call_await(
@@ -5157,6 +5393,9 @@ unsafe extern "C" fn h_call_await(
         if let Object::Function(f) = &*s.stack.add(start) {
             if (&*f.code.as_ptr()).is_coroutine && !s.sw.is_null() {
                 let pc = (pc_argc & u64::from(u32::MAX)) as usize;
+                if let Some(r) = lazy_await(s, pc, start, len as usize) {
+                    return r;
+                }
                 return gen_call(s, pc, start, len as usize);
             }
         }
@@ -5624,6 +5863,33 @@ unsafe extern "C" fn h_property(
                 return 0;
             }
         }
+        // A builtin container's method read as a value (`string.split` in
+        // `urllib.parse.unquote`): the bound method, built in place as the
+        // core loop's plain-attribute lane builds it (no code runs).
+        if matches!(
+            &*recv,
+            Object::Str(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Bytes(_)
+                | Object::Tuple(_)
+        ) && (local != 0 || droppable(&*recv))
+        {
+            let code = &*code;
+            let interp = &*st.interp;
+            if let Some(v) =
+                interp.leaf_plain_attr_value(code, Some(&*recv), code.instructions[pc].arg, None)
+            {
+                let at = st.stack.add(slot);
+                if local == 0 {
+                    crate::drop_hot(at.read());
+                }
+                at.write(v);
+                return 0;
+            }
+        }
         let Object::Instance(inst) = &*recv else {
             return lane(st);
         };
@@ -6041,6 +6307,12 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         let caller = &mut *(*act).lazy_caller;
         if !caller.lazy.is_null() {
             register_lazy(caller);
+        }
+        // A lazily awaited coroutine's body gets its coroutine (see
+        // [`lazy_await`]); its return is the core loop's from here.
+        if (*act).lazy_coro {
+            interp.lazy_coro_materialize(&mut *act, &mut *caller.frame);
+            st.direct = false;
         }
         let sw = &mut *st.sw;
         *sw.last = caller.last;
@@ -6750,7 +7022,8 @@ unsafe fn direct_done<const PUSHED: bool>(
                     a.act.shell.is_none()
                         && (!PUSHED
                             || ((cframe.code.cellvars.is_empty() || a.owns_cells)
-                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))))
+                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
+                                && a.new_init.is_none()))
                 })
                 && !cframe.locals.is_shared()
                 && !interp.countdown_out(2)
@@ -6849,6 +7122,22 @@ unsafe fn direct_done<const PUSHED: bool>(
             {
                 st.len = start + 1;
                 return 0;
+            }
+            // A class's Python `__new__` returned and its return pushed the
+            // class's `__init__` for the same call in its place (see
+            // `Interpreter::core_new_finish`): that runs through its native
+            // code from here too.
+            if PUSHED
+                && status == DIRECT_RET
+                && sw.pending.is_none()
+                && (*sw.inl).len() == depth
+                && (*sw.inl)
+                    .last()
+                    .is_some_and(|a| a.call_pc == pc && a.init_inst.is_some())
+            {
+                if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                    return r;
+                }
             }
             return RELOAD;
         }
@@ -7093,6 +7382,11 @@ unsafe extern "C" fn h_call(
         if let Object::Function(f) = &*base.add(start) {
             let c = &*f.code.as_ptr();
             if (c.is_generator || c.is_coroutine || c.is_async_generator) && !st.sw.is_null() {
+                if c.is_coroutine {
+                    if let Some(r) = lazy_await(st, pc, start, len) {
+                        return r;
+                    }
+                }
                 return gen_call(st, pc, start, len);
             }
         }
@@ -11192,6 +11486,20 @@ impl<'a> Lower<'a> {
                 self.store_last();
                 let pcv = self.b.ins().iconst(types::I64, pc as i64);
                 let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                if ins.op == OpCode::ReturnValue {
+                    // A lazily awaited body (see `lazy_await`) hands its
+                    // return to the awaiting caller as it stands.
+                    let direct = self.b.ins().uload8(types::I32, FLAGS, self.st, S_DIRECT);
+                    let handed = self.b.create_block();
+                    let other = self.b.create_block();
+                    self.b.ins().brif(direct, handed, &[], other, &[]);
+                    self.b.switch_to_block(handed);
+                    self.b.ins().store(FLAGS, len, self.st, S_LEN);
+                    self.b.ins().store(FLAGS, pcv, self.st, S_PC);
+                    let r = self.b.ins().iconst(types::I32, i64::from(DIRECT_RET));
+                    self.b.ins().return_(&[r]);
+                    self.b.switch_to_block(other);
+                }
                 let helper = if ins.op == OpCode::YieldValue {
                     h_gen_yield as *const () as usize
                 } else {
