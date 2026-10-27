@@ -18885,7 +18885,7 @@ impl Interpreter {
             // An instance of the class itself, whose `__init__` runs.
             Ok(inst @ Object::Instance(_))
                 if !plan.init_from_object
-                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), &**ty)) =>
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(ty))) =>
             {
                 self.core_push_init(sw, pc, plan, inst, &mut ops)
                     .map_or(Ok(None), |r| r.map(Some))
