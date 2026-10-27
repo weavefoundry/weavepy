@@ -14583,6 +14583,15 @@ impl Interpreter {
                             let (callee, self_slot) =
                                 unsafe { (&*base.add(len - argc - 2), &*base.add(len - argc - 1)) };
                             let body = match (callee, self_slot) {
+                                // A method body called through its class,
+                                // the receiver the first argument
+                                // (`C.__init__(o)` reaching `object.__init__`).
+                                (Object::Builtin(b), Object::Unbound)
+                                    if b.binds_instance && argc >= 1 =>
+                                {
+                                    // SAFETY: `len >= argc + 2`.
+                                    Some((b, Some(unsafe { &*base.add(len - argc) })))
+                                }
                                 (Object::Builtin(b), Object::Unbound) => Some((b, None)),
                                 (Object::Builtin(b), recv) => Some((b, Some(recv))),
                                 (Object::BoundMethod(bm), Object::Unbound)
@@ -16248,6 +16257,16 @@ impl Interpreter {
         let b: *const crate::object::BuiltinFn =
             match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
                 (Object::Builtin(b), Object::Unbound) if !b.binds_instance => Rc::as_ptr(b),
+                // A method body called through its class: the first
+                // argument is the receiver.
+                (Object::Builtin(b), Object::Unbound)
+                    if frame
+                        .stack
+                        .get(callee_at + 2)
+                        .is_some_and(|recv| lane_recv_ok(b, recv, via_call)) =>
+                {
+                    Rc::as_ptr(b)
+                }
                 (Object::Builtin(b), recv) if lane_recv_ok(b, recv, via_call) => Rc::as_ptr(b),
                 (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                     match &bm.function {
