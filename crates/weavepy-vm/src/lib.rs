@@ -22931,7 +22931,7 @@ impl Interpreter {
                 let store = instrs.get(store_pc)?;
                 let value = std::mem::ManuallyDrop::new(value);
                 // On `true` the value moved into the dict.
-                if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
+                if Self::leaf_attr_store(code, inst, store_pc, store.arg, &value) {
                     return Some(Some(Object::None));
                 }
                 drop(std::mem::ManuallyDrop::into_inner(value));
@@ -26142,38 +26142,131 @@ impl Interpreter {
                 matches!(unsafe { inst.attr_peek_index(key_idx as usize) }, Some((k, old))
                     if slot_name_matches(code, name_idx, k) && Self::core_droppable(old))
             }
-            _ => {
-                let Some(dict) = inst.dict.published() else {
-                    // Split storage: the store overwrites a droppable
-                    // value or appends (or declines, touching nothing).
-                    // SAFETY: as above.
-                    let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
-                        return false;
-                    };
-                    let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
-                        return false;
-                    };
-                    return split
-                        .position(name)
-                        .is_none_or(|i| Self::core_droppable(&split.values()[i]));
-                };
-                let Some(probe) = code_name_leaf_probe(code, name_idx) else {
-                    return false;
-                };
-                // SAFETY: as above.
-                let Some(d) = (unsafe { dict.peek_mut() }) else {
-                    return false;
-                };
-                let found = d.get_index_of(&probe);
-                if probe.saw_exotic() {
-                    return false;
-                }
-                found.is_none_or(|i| {
-                    d.get_index(i)
-                        .is_some_and(|(_, old)| Self::core_droppable(old))
-                })
-            }
+            _ => Self::store_new_attr_ready(code, inst, name_idx),
         }
+    }
+
+    /// Whether [`Self::core_store_new_attr`]'s insert-or-overwrite (its
+    /// class facts checked) would perform the store right now, touching
+    /// nothing.
+    fn store_new_attr_ready(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(dict) = inst.dict.published() else {
+            // Split storage: the store overwrites a droppable value or
+            // appends (or declines, touching nothing).
+            // SAFETY: an unused view with nothing running.
+            let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                return false;
+            };
+            let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+                return false;
+            };
+            return split
+                .position(name)
+                .is_none_or(|i| Self::core_droppable(&split.values()[i]));
+        };
+        let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+            return false;
+        };
+        // SAFETY: as above.
+        let Some(d) = (unsafe { dict.peek_mut() }) else {
+            return false;
+        };
+        let found = d.get_index_of(&probe);
+        if probe.saw_exotic() {
+            return false;
+        }
+        found.is_none_or(|i| {
+            d.get_index(i)
+                .is_some_and(|(_, old)| Self::core_droppable(old))
+        })
+    }
+
+    /// Whether `inst`'s class takes `inst.<co_names[name_idx]> = v` as a
+    /// plain instance-dict store: default attribute setting and no
+    /// descriptor for the name (the facts a `STORE_ATTR` site's cache
+    /// records, kept per class version).
+    fn plain_store_class(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        !crate::object::exotic_str_keys_possible()
+            && inst.c_body.get() == 0
+            && cls.native_kind.get() == 0
+            && !crate::capi_watchers::dicts_active()
+            && Self::plain_store_verdict(cls, name)
+    }
+
+    /// The class's part of [`Self::plain_store_class`], settled per class
+    /// version.
+    fn plain_store_verdict(cls: &TypeObject, name: &str) -> bool {
+        cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
+            Self::default_getattribute(cls)
+                && !cls.flags.is_builtin
+                && cls.setattr_is_default()
+                && !cls.forbids_dict
+                && !(name.starts_with("__") && name != "__doc__")
+                // An exception's `args` is a `BaseException` descriptor.
+                && !(name == "args" && cls.is_subclass_of(&builtin_types().base_exception))
+                && matches!(
+                    cls.lookup(name),
+                    None | Some(Object::Function(_) | Object::Str(_) | Object::None)
+                )
+        })
+    }
+
+    /// [`Self::core_store_attr`] for a frameless leaf's store, which also
+    /// serves a receiver of a class the site's cache doesn't (a setter or
+    /// an `__init__` run on several classes' instances): such a store
+    /// takes the plain insert-or-overwrite when the receiver's class takes
+    /// one, where it would otherwise end the evaluation. As
+    /// `core_store_attr`: on `true` the value moved, `false` touched
+    /// nothing.
+    #[inline(always)]
+    fn leaf_attr_store(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        Self::core_store_attr(code, inst, attr_pc, name_idx, value)
+            || Self::leaf_attr_store_any(code, inst, attr_pc, name_idx, value)
+    }
+
+    /// [`Self::leaf_attr_store`]'s store whatever the site's cache.
+    #[inline(never)]
+    fn leaf_attr_store_any(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let cls = inst.cls_raw();
+        Self::plain_store_class(code, inst, name_idx)
+            && Self::core_store_new_attr(
+                code,
+                inst,
+                cls,
+                attr_pc,
+                name_idx,
+                cls.attr_version.get(),
+                value,
+            )
+    }
+
+    /// Whether [`Self::leaf_attr_store`] would perform this store right
+    /// now, touching nothing (see [`Self::core_store_attr_ready`]).
+    fn leaf_attr_store_ready(
+        code: &CodeObject,
+        inst: &PyInstance,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> bool {
+        Self::core_store_attr_ready(code, inst, attr_pc, name_idx)
+            || (Self::plain_store_class(code, inst, name_idx)
+                && Self::store_new_attr_ready(code, inst, name_idx))
     }
 
     /// The constructor shape of [`Self::core_store_attr`]: a
@@ -31767,23 +31860,7 @@ impl Interpreter {
                             || inst.c_body.get() != 0
                             || crate::capi_watchers::dicts_active()
                             // (The class's part, settled per class version.)
-                            || !cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
-                                Self::default_getattribute(cls)
-                                    && !cls.flags.is_builtin
-                                    && cls.setattr_is_default()
-                                    && !cls.forbids_dict
-                                    && !(name.starts_with("__") && name != "__doc__")
-                                    // An exception's `args` is a
-                                    // `BaseException` descriptor.
-                                    && !(name == "args"
-                                        && cls.is_subclass_of(&builtin_types().base_exception))
-                                    && matches!(
-                                        cls.lookup(name),
-                                        None | Some(
-                                            Object::Function(_) | Object::Str(_) | Object::None
-                                        )
-                                    )
-                            })
+                            || !Self::plain_store_verdict(cls, name)
                         {
                             return None;
                         }
@@ -31793,17 +31870,24 @@ impl Interpreter {
                         // the core loop's own arm serves without a hash
                         // probe (the specializer's choice, made here
                         // because the site never reaches it). A site left
-                        // cooling down, or specialized for another class
-                        // (`Base.__init__` run on a subclass's instances),
-                        // is re-specialized too: the full handler that
-                        // would count the cooldown down never sees it.
-                        if matches!(
-                            cache,
-                            IC::Empty
-                                | IC::Cooldown(_)
-                                | IC::StoreAttrInstance { .. }
-                                | IC::StoreAttrNewKey { .. }
-                        ) {
+                        // cooling down is counted down here (the full
+                        // handler that would count it never sees it), and
+                        // re-specialized when it reaches zero. A site
+                        // specialized for another class keeps its class:
+                        // a site that stores to several in turn
+                        // (`Shape.__init__` of each kind of shape) would
+                        // otherwise re-specialize on every store, and a
+                        // frameless leaf's store (a setter, an `__init__`)
+                        // serves any class anyway (see `leaf_attr_store`).
+                        let respecialize = match cache {
+                            IC::Empty | IC::Cooldown(0) => true,
+                            IC::Cooldown(n) => {
+                                code.caches.set(cache_pc, IC::Cooldown(n - 1));
+                                false
+                            }
+                            _ => false,
+                        };
+                        if respecialize {
                             let ver = cls.attr_version.get();
                             let indexed = inst.attr_position_str(name);
                             code.caches.set(

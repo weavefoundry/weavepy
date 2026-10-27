@@ -772,7 +772,7 @@ unsafe extern "C" fn h_store(
         // On `true` the value moved into the instance; a declined store
         // touched nothing, and the evaluation declines whole.
         let v = std::mem::ManuallyDrop::new(v);
-        if Interpreter::core_store_attr(code, &inst, usize::from(pc), u32::from(name), &v) {
+        if Interpreter::leaf_attr_store(code, &inst, usize::from(pc), u32::from(name), &v) {
             return 0;
         }
         drop(std::mem::ManuallyDrop::into_inner(v));
