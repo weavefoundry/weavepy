@@ -9870,7 +9870,7 @@ impl Interpreter {
         snap_gen: u64,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
-        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        let shape = Self::lean_call_kw_shape(frame, pc, false)?;
         // Committed.
         let code = shape.code.clone();
         let (callable, locals) = self.lean_call_kw_take(frame, shape);
@@ -9898,9 +9898,11 @@ impl Interpreter {
 
     /// The `CallPyKwNames` shape at the `CALL_KW` at `pc`, verified
     /// against the live callee (see `kw_names_bind_check`) and the lean
-    /// activation's own requirements.
+    /// activation's own requirements: with `fresh_cells`, a callee with
+    /// cell variables qualifies too (an inline activation makes its cells,
+    /// see [`Self::inline_bind`]).
     #[inline]
-    fn lean_call_kw_shape(frame: &Frame, pc: usize) -> Option<LeanKwShape> {
+    fn lean_call_kw_shape(frame: &Frame, pc: usize, fresh_cells: bool) -> Option<LeanKwShape> {
         use weavepy_compiler::InlineCache as IC;
         let IC::CallPyKwNames {
             func_id,
@@ -9936,7 +9938,13 @@ impl Interpreter {
         if !Self::lean_code_ok(&code) {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        if fresh_cells {
+            if !Self::call_cells_ok(f, &code) {
+                return None;
+            }
+        } else {
+            f.lean_cells_ref(&code)?;
+        }
         Some(LeanKwShape {
             code,
             perm,
@@ -10015,7 +10023,7 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
     ) -> Option<Box<InlineAct>> {
-        let Some(shape) = Self::lean_call_kw_shape(frame, pc) else {
+        let Some(shape) = Self::lean_call_kw_shape(frame, pc, true) else {
             return self.try_inline_call_kw_named(frame, shell, pc);
         };
         // Past the recursion limit the nested lean path raises.
@@ -10067,7 +10075,11 @@ impl Interpreter {
         {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        // (A callee with cell variables gets fresh cells, see
+        // `inline_bind`.)
+        if !Self::call_cells_ok(f, &code) {
+            return None;
+        }
         let first = if matches!(frame.stack[callee_slot + 1], Object::Unbound) {
             callee_slot + 2
         } else {
@@ -16236,7 +16248,10 @@ impl Interpreter {
                 builtins::method_memo_tag(recv)?;
                 builtin_method_via_call(b.name).then_some(true)
             }
-            None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
+            // (One the dispatch doesn't know by name runs its body
+            // directly, as the dispatch ends up running it.)
+            None => (!b.binds_instance && builtin_fn_lane_ok(b.name))
+                .then(|| builtin_needs_interp(b.name)),
         }
     }
 
@@ -17608,6 +17623,15 @@ impl Interpreter {
         {
             return self.core_builtin_lane(sw, pc, true);
         }
+        // A leaf method's fast half on an instance of a built-in subclass
+        // (`_Quoter(dict).__getitem__`, mapped over bytes by
+        // `urllib.parse.quote`): it settles what it can natively and
+        // declines the rest (a missing key's `__missing__`).
+        if let (true, Some(Object::Instance(_))) = (b.binds_instance, recv) {
+            if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(b) {
+                return self.core_fast_leaf(sw, pc, callee_at, f);
+            }
+        }
         let ok = match recv {
             None => !b.binds_instance,
             Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
@@ -17615,6 +17639,67 @@ impl Interpreter {
         // A method body safe to call directly runs as such.
         let via_call = recv.is_none() || !native_call_ic_safe(b.name);
         ok && self.core_builtin_lane(sw, pc, via_call)
+    }
+
+    /// The `CALL` at `pc` of `sw`'s synced running activation, its callee
+    /// at `callee_at` a leaf method body (as `(method, receiver)` or a bound
+    /// method with an empty self slot) whose fast half `f` runs no Python
+    /// code: settled by `f` on the receiver and the arguments, the operands
+    /// then leaving as the full handler's do. `false` touches nothing (`f`
+    /// declined, or an operand's release could run code).
+    #[inline(never)]
+    fn core_fast_leaf(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        callee_at: usize,
+        f: leaf_builtins::Fast,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let len = frame.stack.len();
+        let ops = &frame.stack[callee_at..];
+        let (recv, args) = match (&ops[0], &ops[1]) {
+            (Object::BoundMethod(bm), Object::Unbound) => (&bm.receiver, &ops[2..]),
+            (Object::Builtin(_), recv) => (recv, &ops[2..]),
+            _ => return false,
+        };
+        if args.len() > 7 || !Self::core_all_droppable(ops) {
+            return false;
+        }
+        // Bitwise views of the receiver and the arguments, never dropped:
+        // the fast half reads them (and clones what it keeps).
+        let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        // SAFETY: the operands on the stack keep them alive.
+        views[0].write(unsafe { std::ptr::read(recv) });
+        for (v, a) in views[1..].iter_mut().zip(args) {
+            // SAFETY: as above.
+            v.write(unsafe { std::ptr::read(a) });
+        }
+        // SAFETY: the first `args.len() + 1` entries were written.
+        let views =
+            unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
+        let r = match f(views) {
+            None => return false,
+            Some(r) => r,
+        };
+        // SAFETY: every operand was checked to leave by a plain decrement.
+        unsafe {
+            frame.stack.set_len(callee_at);
+            let base = frame.stack.as_mut_ptr();
+            release_operands(self, base.add(callee_at), len - callee_at);
+        }
+        frame.pc = pc as u32 + 1;
+        match r {
+            Ok(v) => {
+                frame.stack.push(v);
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        true
     }
 
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
@@ -31081,6 +31166,7 @@ impl Interpreter {
                 K::ValueType(w) => Some(LeafAttr::Value(Object::Type(w.upgrade()?))),
                 K::ValueDict(w) => Some(LeafAttr::Value(Object::Dict(w.upgrade()?))),
                 K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
+                K::ValueModule(w) => Some(LeafAttr::Value(Object::Module(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
                 K::DataDescr { .. } | K::Other => None,
@@ -31141,6 +31227,14 @@ impl Interpreter {
                 Some(Object::Type(t)) => K::ValueType(Rc::downgrade(&t)),
                 Some(Object::Dict(d)) => K::ValueDict(Rc::downgrade(&d)),
                 Some(Object::List(l)) => K::ValueList(Rc::downgrade(&l)),
+                // A module of the plain module type (which has no
+                // `__get__`).
+                Some(m @ Object::Module(_))
+                    if Rc::ptr_eq(&crate::builtins::class_of(&m), &builtin_types().module_) =>
+                {
+                    let Object::Module(m) = m else { unreachable!() };
+                    K::ValueModule(Rc::downgrade(&m))
+                }
                 // A plain instance stored on the class (`timezone.utc`):
                 // a value unless its class makes it a descriptor.
                 Some(Object::Instance(i)) => {
@@ -31168,6 +31262,7 @@ impl Interpreter {
             K::ValueType(w) => w.upgrade().map(|t| LeafAttr::Value(Object::Type(t))),
             K::ValueDict(w) => w.upgrade().map(|d| LeafAttr::Value(Object::Dict(d))),
             K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
+            K::ValueModule(w) => w.upgrade().map(|m| LeafAttr::Value(Object::Module(m))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
             K::DataDescr { .. } | K::Other => None,
@@ -51034,6 +51129,35 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        // A builtin container's method read as a value (`string.split` in
+        // `urllib.parse.unquote`, a duck-typing probe): the bound method,
+        // as the core loop's plain-attribute lane builds it.
+        if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(
+                frame.stack.last(),
+                Some(
+                    Object::Str(_)
+                        | Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::FrozenSet(_)
+                        | Object::Bytes(_)
+                        | Object::Tuple(_)
+                )
+            )
+        {
+            let name_idx = frame.code.instructions[pc].arg;
+            if let Some(v) =
+                self.leaf_plain_attr_value(&frame.code, frame.stack.last(), name_idx, None)
+            {
+                frame.pc = pc as u32 + 1;
+                if let Some(top) = frame.stack.last_mut() {
+                    let recv = std::mem::replace(top, v);
+                    self.release(recv);
+                }
+                return Ok(());
+            }
+        }
         let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
             && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
         // A site cooling down after a failed load (an odd count; see
@@ -55093,6 +55217,29 @@ impl Interpreter {
                     }
                     ("repr", 1) => return self.do_repr_call(&args[0], outer_globals),
                     ("str", 1) => return self.do_str_call(&args[0], outer_globals),
+                    // `object.__new__(cls, ...)`, object's allocator (the
+                    // chain's `__new__` arms are `type.__new__`'s). From
+                    // Python code it refuses a class that a built-in type's
+                    // own `__new__` allocates (`dict`, a `dict` subclass,
+                    // `type` or a metaclass): object's allocator can't stand
+                    // in (CPython `tp_new_wrapper`'s safety check). (The
+                    // construction paths call the allocator directly.)
+                    ("__new__", _) if is_object_new(b) => {
+                        if let Some(Object::Type(cls)) = args.first() {
+                            if let Some(base) = object_new_unsafe(cls) {
+                                return Err(type_error(format!(
+                                    "object.__new__({}) is not safe, use {}.__new__()",
+                                    cls.name, base
+                                )));
+                            }
+                        }
+                        if let Some(call_kw) = b.call_kw.as_ref() {
+                            return call_kw(args, kwargs);
+                        }
+                        if kwargs.is_empty() {
+                            return (b.call)(args);
+                        }
+                    }
                     _ => {}
                 }
                 if builtin_needs_interp(b.name) {
@@ -55194,23 +55341,6 @@ impl Interpreter {
                     // whose merge below must not take it.
                     if b.name == "__init__" && is_object_init(b) {
                         return crate::builtin_types::object_init_call(args, !kwargs.is_empty());
-                    }
-                    // `object.__new__(cls, ...)` from Python code of a class
-                    // a built-in type's own `__new__` allocates (`dict`, a
-                    // `dict` subclass, `type` or a metaclass): object's
-                    // allocator can't stand in (CPython `tp_new_wrapper`'s
-                    // safety check), so this neither takes the
-                    // class-building route below nor allocates. (The
-                    // construction paths call the allocator directly.)
-                    if b.name == "__new__" && is_object_new(b) {
-                        if let Some(Object::Type(cls)) = args.first() {
-                            if let Some(base) = object_new_unsafe(cls) {
-                                return Err(type_error(format!(
-                                    "object.__new__({}) is not safe, use {}.__new__()",
-                                    cls.name, base
-                                )));
-                            }
-                        }
                     }
                     // `type.__new__(mcs, name, bases, ns)` — invoked from
                     // user metaclasses via `super().__new__(...)`. Route
@@ -71910,18 +72040,6 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
 /// in for. That class's name, for the error, or `None` when `object`'s
 /// allocator serves (or the native type is one WeavePy alone builds).
 fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
-    let mro = cls.mro.borrow();
-    let base = mro.iter().find(|t| {
-        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
-            && !matches!(
-                t.lookup("__new__"),
-                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
-            )
-    })?;
-    let (new, owner) = base.lookup_with_owner("__new__")?;
-    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
-        return None;
-    }
     let bt = builtin_types();
     let core = [
         &bt.int_,
@@ -71938,9 +72056,25 @@ fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
         &bt.frozenset_,
         &bt.type_,
     ];
-    core.iter()
-        .any(|t| Rc::ptr_eq(t, &owner))
-        .then(|| base.name.clone())
+    let is_core = |t: &TypeObject| core.iter().any(|c| std::ptr::eq(Rc::as_ptr(c), t));
+    let mro = cls.mro.borrow();
+    // (A class with no core built-in on its MRO, the common case, is
+    // decided without a lookup.)
+    if !mro.iter().any(|t| is_core(t)) {
+        return None;
+    }
+    let base = mro.iter().find(|t| {
+        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
+            && !matches!(
+                t.lookup("__new__"),
+                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
+            )
+    })?;
+    let (new, owner) = base.lookup_with_owner("__new__")?;
+    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
+        return None;
+    }
+    is_core(&owner).then(|| base.name.clone())
 }
 
 /// Whether `b` is `object.__init__` (the process-wide builtin), which
