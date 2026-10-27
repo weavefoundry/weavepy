@@ -17629,8 +17629,17 @@ impl Interpreter {
         // declines the rest (a missing key's `__missing__`).
         if let (true, Some(Object::Instance(_))) = (b.binds_instance, recv) {
             if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(b) {
-                return self.core_fast_leaf(sw, pc, callee_at, f);
+                return self.core_fast_leaf(sw, pc, callee_at, |_, views| f(views));
             }
+        }
+        // `object.__new__(cls)` of a plain class (pathlib's `__new__`): the
+        // allocation, as the core loop's leaf builtin call makes it (it
+        // declines every other class, for the full call).
+        if recv.is_none() && !b.binds_instance && is_object_new(b) {
+            let b = b.clone();
+            return self.core_fast_leaf(sw, pc, callee_at, |interp, views| {
+                interp.leaf_builtin_call(LeafKind::ObjectNew, &b, views)
+            });
         }
         let ok = match recv {
             None => !b.binds_instance,
@@ -17642,10 +17651,11 @@ impl Interpreter {
     }
 
     /// The `CALL` at `pc` of `sw`'s synced running activation, its callee
-    /// at `callee_at` a leaf method body (as `(method, receiver)` or a bound
-    /// method with an empty self slot) whose fast half `f` runs no Python
-    /// code: settled by `f` on the receiver and the arguments, the operands
-    /// then leaving as the full handler's do. `false` touches nothing (`f`
+    /// at `callee_at` a leaf builtin (a function with an empty self slot, a
+    /// method body as `(method, receiver)`, or a bound method with an empty
+    /// self slot) whose fast half `f` runs no Python code: settled by `f`
+    /// on the receiver, if any, and the arguments, the operands then
+    /// leaving as the full handler's do. `false` touches nothing (`f`
     /// declined, or an operand's release could run code).
     #[inline(never)]
     fn core_fast_leaf(
@@ -17653,7 +17663,7 @@ impl Interpreter {
         sw: &mut CoreSwitch,
         pc: usize,
         callee_at: usize,
-        f: leaf_builtins::Fast,
+        f: impl FnOnce(&Self, &[Object]) -> Option<Result<Object, RuntimeError>>,
     ) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
@@ -17661,8 +17671,9 @@ impl Interpreter {
         let len = frame.stack.len();
         let ops = &frame.stack[callee_at..];
         let (recv, args) = match (&ops[0], &ops[1]) {
-            (Object::BoundMethod(bm), Object::Unbound) => (&bm.receiver, &ops[2..]),
-            (Object::Builtin(_), recv) => (recv, &ops[2..]),
+            (Object::BoundMethod(bm), Object::Unbound) => (Some(&bm.receiver), &ops[2..]),
+            (Object::Builtin(_), Object::Unbound) => (None, &ops[2..]),
+            (Object::Builtin(_), recv) => (Some(recv), &ops[2..]),
             _ => return false,
         };
         if args.len() > 7 || !Self::core_all_droppable(ops) {
@@ -17671,16 +17682,15 @@ impl Interpreter {
         // Bitwise views of the receiver and the arguments, never dropped:
         // the fast half reads them (and clones what it keeps).
         let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-        // SAFETY: the operands on the stack keep them alive.
-        views[0].write(unsafe { std::ptr::read(recv) });
-        for (v, a) in views[1..].iter_mut().zip(args) {
-            // SAFETY: as above.
-            v.write(unsafe { std::ptr::read(a) });
+        let mut n = 0;
+        for a in recv.into_iter().chain(args) {
+            // SAFETY: the operands on the stack keep them alive.
+            views[n].write(unsafe { std::ptr::read(a) });
+            n += 1;
         }
-        // SAFETY: the first `args.len() + 1` entries were written.
-        let views =
-            unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
-        let r = match f(views) {
+        // SAFETY: the first `n` entries were written.
+        let views = unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), n) };
+        let r = match f(self, views) {
             None => return false,
             Some(r) => r,
         };
@@ -30565,6 +30575,12 @@ impl Interpreter {
                 let [O::Type(cls)] = args else {
                     return None;
                 };
+                // A class its memoized plan proved plain (as `object_new`
+                // reads it): the allocation, with no checks to repeat.
+                if object_new_plain_memo(cls) {
+                    let (inst, _tracked) = self.alloc_plain_instance_obj(cls);
+                    return Some(Ok(inst));
+                }
                 if cls.flags.is_builtin || cls.is_type_subclass() {
                     return None;
                 }
@@ -31244,6 +31260,13 @@ impl Interpreter {
         if let Some(f) = slot.and_then(|s| s.get_held_unbound(ver)) {
             return Some(Object::Function(f));
         }
+        // A native function this site last read off the class under its
+        // plain metaclass (`object.__new__`, see below).
+        if let Some(v @ Object::Builtin(_)) = slot.and_then(|s| s.class_value(ver, 0)) {
+            if Self::plain_metaclass(cls) {
+                return Some(Self::clone_operand(v));
+            }
+        }
         // A plain `type` metaclass has nothing that could intercept a
         // non-dunder class attribute (the class cache never answers for
         // dunders).
@@ -31378,6 +31401,16 @@ impl Interpreter {
                     s.set_static(ver, &f);
                 }
                 Some(Object::Function(f))
+            }
+            // A non-binding native function (`object.__new__`, read by
+            // every Python `__new__`), which the site remembers under the
+            // class's version: the checks above come out the same while it
+            // stands, its metaclass staying `type`.
+            LeafAttr::Value(v @ Object::Builtin(_)) => {
+                if let Some(s) = slot {
+                    s.set_class_value(ver, 0, &v);
+                }
+                Some(v)
             }
             LeafAttr::Value(v) => Some(v),
             // A class method, bound to the class.
@@ -55148,6 +55181,19 @@ impl Interpreter {
                                     cls.name, base
                                 )));
                             }
+                            // An abstract class object's allocator refuses
+                            // (CPython `object_new`), as its construction
+                            // does.
+                            if !object_new_plain_memo(cls) {
+                                let plan = self.instance_plan(cls);
+                                if let Some(msg) = &plan.abstract_error {
+                                    if matches!(plan.native, crate::types::NativeKind::Plain)
+                                        && !plan.seeds_exception_args
+                                    {
+                                        return Err(type_error(msg.clone()));
+                                    }
+                                }
+                            }
                         }
                         if let Some(call_kw) = b.call_kw.as_ref() {
                             return call_kw(args, kwargs);
@@ -59686,6 +59732,7 @@ impl Interpreter {
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
         let object_new_plain = !seeds_exception_args
+            && abstract_error.is_none()
             && matches!(native, NativeKind::Plain)
             && !cls.flags.is_builtin
             && !cls.is_type_subclass()
@@ -71948,6 +71995,18 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
         .is_some_and(|(_, owner)| !owner.flags.is_builtin)
 }
 
+/// Whether `cls`'s memoized construction plan, current for its version,
+/// proved `object.__new__(cls)` the plain allocation (as `object_new`
+/// reads it): no abstract methods, built-in base or special allocator.
+#[inline]
+fn object_new_plain_memo(cls: &TypeObject) -> bool {
+    // SAFETY: a guard-free read of the memoized plan; nothing runs before
+    // its last use.
+    unsafe { cls.instance_plan.peek() }
+        .and_then(Option::as_ref)
+        .is_some_and(|(v, plan)| *v == cls.attr_version.get() && plan.object_new_plain)
+}
+
 /// Whether `object.__new__(cls)` is unsafe (CPython `tp_new_wrapper`'s
 /// check): the class whose native `__new__` serves `cls` (its
 /// `staticbase`, the first class on its MRO whose `__new__` doesn't
@@ -71956,6 +72015,11 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
 /// in for. That class's name, for the error, or `None` when `object`'s
 /// allocator serves (or the native type is one WeavePy alone builds).
 fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
+    // A class whose memoized plan is `object.__new__`'s plain allocation
+    // has no built-in base.
+    if object_new_plain_memo(cls) {
+        return None;
+    }
     let bt = builtin_types();
     let core = [
         &bt.int_,

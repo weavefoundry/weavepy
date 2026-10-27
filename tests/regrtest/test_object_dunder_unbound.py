@@ -196,6 +196,43 @@ class ObjectNewTests(unittest.TestCase):
                 f"object.__new__({cls.__name__}) is not safe, use dict.__new__()",
             )
 
+    def test_abstract_class_refused(self):
+        import abc
+
+        class A(abc.ABC):
+            @abc.abstractmethod
+            def f(self):
+                pass
+
+        class Done(A):
+            def f(self):
+                return 1
+
+        for _ in range(N):
+            with self.assertRaises(TypeError) as cm:
+                object.__new__(A)
+            self.assertIn("abstract", str(cm.exception))
+            self.assertIs(type(object.__new__(Done)), Done)
+
+    def test_python_new_calls_object_new(self):
+        class Path:
+            __slots__ = ("parts",)
+
+            def __new__(cls, *args, **kwargs):
+                return object.__new__(cls)
+
+            def __init__(self, *args):
+                self.parts = args
+
+        class Sub(Path):
+            __slots__ = ()
+
+        for i in range(N):
+            p = Sub("a", i)
+            self.assertIs(type(p), Sub)
+            self.assertEqual(p.parts, ("a", i))
+            self.assertEqual(type(p)("b").parts, ("b",))
+
     def test_builtin_construction_unchanged(self):
         for _ in range(N // 10):
             self.assertEqual(dict.__new__(dict), {})
