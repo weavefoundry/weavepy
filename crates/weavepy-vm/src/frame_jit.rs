@@ -4994,13 +4994,10 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
         let has_self = !matches!(&*base.add(start + 1), Object::Unbound);
         let nargs = len - start - 2 + usize::from(has_self);
         let nested = interp.direct_calls.get();
-        // (A function only the stack holds would die here: its release is
-        // the eager path's.)
         if nested >= DIRECT_CALL_DEPTH
             || !sw.calls_ok
             || (*st.maybe_dead).get()
             || crate::hot_gates::loop_gen() != st.snap_gen
-            || Rc::strong_count(f) < 2
         {
             return None;
         }
@@ -5022,9 +5019,8 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             return None;
         }
         // Committed: the arguments move into the body's frame, the callee
-        // leaves the stack (by a plain decrement: something else holds
-        // it), a placeholder takes its slot, and the caller rests at the
-        // `SEND` as `Interpreter::core_gen_call` leaves it.
+        // into its activation, a placeholder takes its slot, and the caller
+        // rests at the `SEND` as `Interpreter::core_gen_call` leaves it.
         dc.set(depth);
         let jump = caller.code.instructions[send_pc].arg;
         let first = if has_self { start + 1 } else { start + 2 };
@@ -5037,9 +5033,9 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             gen_start,
             send_pc,
             jump,
+            base.add(start).read(),
             crate::recursion::Guard::adopt(dc),
         );
-        drop(base.add(start).read());
         base.add(start).write(Object::None);
         caller.stack.set_len(start + 1);
         caller.pc = send_pc as u32 + 1;
@@ -6067,7 +6063,7 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         // A lazily awaited coroutine's body gets its coroutine (see
         // [`lazy_await`]); its return is the core loop's from here.
         if (*act).lazy_coro {
-            Interpreter::lazy_coro_materialize(&mut *act, &mut *caller.frame);
+            interp.lazy_coro_materialize(&mut *act, &mut *caller.frame);
             st.direct = false;
         }
         let sw = &mut *st.sw;

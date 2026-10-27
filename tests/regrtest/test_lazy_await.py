@@ -228,6 +228,15 @@ async def nameprobe(probe):
     return None
 
 
+def make_adder(k):
+    async def add(a, probe):
+        if probe:
+            await suspend("adder")
+        return a + k
+
+    return add
+
+
 # -- Callers (each runs hot) ---------------------------------------------
 
 
@@ -260,6 +269,22 @@ class LazyAwaitTest(unittest.TestCase):
         expect = sum(i + 10 + i + 1 + 5 + i for i in range(WARM))
         self.assertEqual(drive(warm_calls()), expect)
         self.assertEqual(drive(fib(18)), 2584)
+
+    def test_fresh_closures(self):
+        # Each call's function is held only by the call (its closure cell
+        # too), and the last one's coroutine outlives it.
+        async def run():
+            t = 0
+            for i in range(WARM):
+                t += await make_adder(i)(1, i == WARM - 1)
+            return t
+
+        c = run()
+        self.assertEqual(c.send(None), "adder")
+        gc.collect()
+        with self.assertRaises(StopIteration) as cm:
+            c.send(None)
+        self.assertEqual(cm.exception.value, sum(range(WARM)) + WARM)
 
     def test_returns_in_blocks(self):
         async def run():
