@@ -30293,6 +30293,9 @@ impl Interpreter {
                 Some(_) => None,
             };
         }
+        if let Some(v) = Self::leaf_type_name(code, cls, name_idx) {
+            return Some(v);
+        }
         if !Self::plain_metaclass(cls) {
             return Self::leaf_load_meta_class_attr(code, cls, name_idx);
         }
@@ -30359,13 +30362,51 @@ impl Interpreter {
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            // A native method read through the class stays on the full
-            // path (it reports as a method descriptor, not a function).
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            // A native method or a property read off the class is the
+            // descriptor itself (`descriptor_get` with no instance).
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
+    }
+
+    /// `cls.__name__` / `cls.__qualname__` as `type`'s getsets answer
+    /// them (the full path's first case): a `str` the class's own dict
+    /// holds, else the class's interned name, when the metaclass keeps the
+    /// default attribute access and doesn't define the name itself.
+    /// `None` for any other name or shape.
+    #[inline(never)]
+    fn leaf_type_name(code: &CodeObject, cls: &Rc<TypeObject>, name_idx: u32) -> Option<Object> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if !matches!(name, "__name__" | "__qualname__") || crate::capi_watchers::types_active() {
+            return None;
+        }
+        if !Self::plain_metaclass(cls) {
+            // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            if meta.c_ext_ptr.get() != 0
+                || !Self::default_getattribute(meta)
+                || meta
+                    .lookup_with_owner(name)
+                    .is_some_and(|(_, owner)| !Rc::ptr_eq(&owner, &builtin_types().type_))
+            {
+                return None;
+            }
+        }
+        if let Some(v @ Object::Str(_)) = cls
+            .dict
+            .try_borrow()
+            .ok()?
+            .get(&code_name_key(code, name_idx)?)
+        {
+            return Some(v.clone());
+        }
+        if name == "__qualname__" {
+            if let Some(q) = cls.qualname.borrow().as_ref() {
+                return Some(Object::interned_str(q));
+            }
+        }
+        Some(Object::interned_str(&cls.name))
     }
 
     /// [`Self::leaf_load_type_attr`] for a class whose metaclass is a
@@ -30390,13 +30431,24 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
             return None;
         }
-        // The metaclass's MRO has no entry for the name (its own leaf
+        // The metaclass's MRO has no entry for the name, or one that is no
+        // data descriptor, which yields to the class's own (CPython's
+        // `type_getattro`) when the class's MRO has the name (its own leaf
         // attribute cache remembers the walk per version).
-        if !matches!(
-            Self::leaf_class_attr(code, meta, name_idx),
-            Some(LeafAttr::InstanceOnly)
-        ) {
-            return None;
+        match Self::leaf_class_attr(code, meta, name_idx)? {
+            LeafAttr::InstanceOnly
+            | LeafAttr::Method(_)
+            | LeafAttr::ClassMethod(_)
+            | LeafAttr::BuiltinMethod(_)
+            | LeafAttr::Value(
+                Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Function(_),
+            ) => {}
+            _ => return None,
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => Some(Object::Function(f)),
@@ -30405,10 +30457,11 @@ impl Interpreter {
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            // (A metaclass entry then binds to the class: the full path's
+            // to build.)
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
     }
 
