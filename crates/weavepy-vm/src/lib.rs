@@ -50166,16 +50166,7 @@ impl Interpreter {
             return None;
         }
         let recv = frame.stack.pop()?;
-        // (An unset `__slots__` member's error names the class by its
-        // qualified name, as its descriptor's does.)
-        let err = match &recv {
-            Object::Instance(inst)
-                if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
-            {
-                crate::error::attribute_error_typed(&recv, name, &inst.cls().fully_qualified_name())
-            }
-            _ => crate::error::attribute_error_named(&recv, name),
-        };
+        let err = certain_miss_error(&recv, name);
         self.release(recv);
         Some(err)
     }
@@ -50441,7 +50432,7 @@ impl Interpreter {
                 // without its resolution passes.
                 if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
                     if attr_certainly_missing(&receiver, name) {
-                        let err = crate::error::attribute_error_named(&receiver, name);
+                        let err = certain_miss_error(&receiver, name);
                         self.release(receiver);
                         return Err(err);
                     }
@@ -71388,6 +71379,20 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
             .split_cell()
             .try_borrow()
             .is_ok_and(|s| s.position_str(name).is_none()),
+    }
+}
+
+/// The `AttributeError` a certainly missing `obj.name` (see
+/// [`attr_certainly_missing`]) raises: an unset `__slots__` member's names
+/// the class by its fully qualified name, as CPython's `member_get` does.
+fn certain_miss_error(obj: &Object, name: &str) -> RuntimeError {
+    match obj {
+        Object::Instance(inst)
+            if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
+        {
+            crate::error::attribute_error_typed(obj, name, &inst.cls().fully_qualified_name())
+        }
+        _ => crate::error::attribute_error_named(obj, name),
     }
 }
 
