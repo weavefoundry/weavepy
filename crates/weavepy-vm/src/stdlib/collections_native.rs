@@ -1172,10 +1172,6 @@ fn chainmap_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     interp.call_object(missing, std::slice::from_ref(key), &[])
 }
 
-/// The class cache key for "the class has no `maps` attribute" (see
-/// `Interpreter::class_lacks`).
-static MAPS_CLASS_KEY: u8 = 0;
-
 /// A ChainMap instance's own `maps` list, read without running code: the
 /// name's hash computed once, and its position in a split layout
 /// remembered (see [`crate::inst_dict::PosMemo`]).
@@ -1225,7 +1221,7 @@ fn chainmap_getitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>
     if crate::object::exotic_str_keys_possible()
         || !crate::Interpreter::class_lacks(
             inst.cls_raw(),
-            std::ptr::addr_of!(MAPS_CLASS_KEY) as usize,
+            crate::types::AttrKey::vm(crate::types::vm_key::CHAINMAP_MAPS),
             "maps",
         )
     {
