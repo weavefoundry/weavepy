@@ -30998,6 +30998,7 @@ impl Interpreter {
                 K::ValueType(w) => Some(LeafAttr::Value(Object::Type(w.upgrade()?))),
                 K::ValueDict(w) => Some(LeafAttr::Value(Object::Dict(w.upgrade()?))),
                 K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
+                K::ValueModule(w) => Some(LeafAttr::Value(Object::Module(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
                 K::DataDescr { .. } | K::Other => None,
@@ -31058,6 +31059,14 @@ impl Interpreter {
                 Some(Object::Type(t)) => K::ValueType(Rc::downgrade(&t)),
                 Some(Object::Dict(d)) => K::ValueDict(Rc::downgrade(&d)),
                 Some(Object::List(l)) => K::ValueList(Rc::downgrade(&l)),
+                // A module of the plain module type (which has no
+                // `__get__`).
+                Some(m @ Object::Module(_))
+                    if Rc::ptr_eq(&crate::builtins::class_of(&m), &builtin_types().module_) =>
+                {
+                    let Object::Module(m) = m else { unreachable!() };
+                    K::ValueModule(Rc::downgrade(&m))
+                }
                 // A plain instance stored on the class (`timezone.utc`):
                 // a value unless its class makes it a descriptor.
                 Some(Object::Instance(i)) => {
@@ -31085,6 +31094,7 @@ impl Interpreter {
             K::ValueType(w) => w.upgrade().map(|t| LeafAttr::Value(Object::Type(t))),
             K::ValueDict(w) => w.upgrade().map(|d| LeafAttr::Value(Object::Dict(d))),
             K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
+            K::ValueModule(w) => w.upgrade().map(|m| LeafAttr::Value(Object::Module(m))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
             K::DataDescr { .. } | K::Other => None,
