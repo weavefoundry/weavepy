@@ -2043,6 +2043,21 @@ impl Interpreter {
                     };
                     self.leaf_builtin_call(kind, b, &call)?.ok()
                 }
+                // A leaf method's fast half bound to an instance of a
+                // built-in subclass (`map(_Quoter(dict).__getitem__, bs)` in
+                // `urllib.parse.quote`), which settles what it can natively.
+                Object::Builtin(b)
+                    if b.binds_instance && matches!(bm.receiver, Object::Instance(_)) =>
+                {
+                    let LeafKind::Fast(f) = admit(self.leaf_call_kind(b)?)? else {
+                        return None;
+                    };
+                    let call = match args {
+                        [a] => [bm.receiver.clone(), a.clone()],
+                        _ => return None,
+                    };
+                    f(&call)?.ok()
+                }
                 _ => None,
             },
             _ => None,

@@ -17610,6 +17610,15 @@ impl Interpreter {
         {
             return self.core_builtin_lane(sw, pc, true);
         }
+        // A leaf method's fast half on an instance of a built-in subclass
+        // (`_Quoter(dict).__getitem__`, mapped over bytes by
+        // `urllib.parse.quote`): it settles what it can natively and
+        // declines the rest (a missing key's `__missing__`).
+        if let (true, Some(Object::Instance(_))) = (b.binds_instance, recv) {
+            if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(b) {
+                return self.core_fast_leaf(sw, pc, callee_at, f);
+            }
+        }
         let ok = match recv {
             None => !b.binds_instance,
             Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
@@ -17617,6 +17626,67 @@ impl Interpreter {
         // A method body safe to call directly runs as such.
         let via_call = recv.is_none() || !native_call_ic_safe(b.name);
         ok && self.core_builtin_lane(sw, pc, via_call)
+    }
+
+    /// The `CALL` at `pc` of `sw`'s synced running activation, its callee
+    /// at `callee_at` a leaf method body (as `(method, receiver)` or a bound
+    /// method with an empty self slot) whose fast half `f` runs no Python
+    /// code: settled by `f` on the receiver and the arguments, the operands
+    /// then leaving as the full handler's do. `false` touches nothing (`f`
+    /// declined, or an operand's release could run code).
+    #[inline(never)]
+    fn core_fast_leaf(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        callee_at: usize,
+        f: leaf_builtins::Fast,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let len = frame.stack.len();
+        let ops = &frame.stack[callee_at..];
+        let (recv, args) = match (&ops[0], &ops[1]) {
+            (Object::BoundMethod(bm), Object::Unbound) => (&bm.receiver, &ops[2..]),
+            (Object::Builtin(_), recv) => (recv, &ops[2..]),
+            _ => return false,
+        };
+        if args.len() > 7 || !Self::core_all_droppable(ops) {
+            return false;
+        }
+        // Bitwise views of the receiver and the arguments, never dropped:
+        // the fast half reads them (and clones what it keeps).
+        let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        // SAFETY: the operands on the stack keep them alive.
+        views[0].write(unsafe { std::ptr::read(recv) });
+        for (v, a) in views[1..].iter_mut().zip(args) {
+            // SAFETY: as above.
+            v.write(unsafe { std::ptr::read(a) });
+        }
+        // SAFETY: the first `args.len() + 1` entries were written.
+        let views =
+            unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
+        let r = match f(views) {
+            None => return false,
+            Some(r) => r,
+        };
+        // SAFETY: every operand was checked to leave by a plain decrement.
+        unsafe {
+            frame.stack.set_len(callee_at);
+            let base = frame.stack.as_mut_ptr();
+            release_operands(self, base.add(callee_at), len - callee_at);
+        }
+        frame.pc = pc as u32 + 1;
+        match r {
+            Ok(v) => {
+                frame.stack.push(v);
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        true
     }
 
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
