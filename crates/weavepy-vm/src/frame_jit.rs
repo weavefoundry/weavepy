@@ -4797,6 +4797,10 @@ pub(crate) struct DirectSite {
     alt_leaf_missing: u32,
     alt_leaf_code: usize,
     alt_leaf_key: usize,
+    /// A `CALL_FUNCTION_EX` site's: one more than the length of the
+    /// spread its cache was filled for (its defaults taken depend on it),
+    /// `0` before its first call (see [`spread_direct`]).
+    spread: u32,
     /// Nonzero while the site has a body or a leaf to take: the native
     /// code tries the direct helper first then.
     hot: usize,
@@ -7442,9 +7446,104 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
 /// its lane), the frame synced first: `0` the result in place (a compiled
 /// callee run from here, as for `CALL`, or a call finished in place),
 /// `RELOAD` the core loop goes on.
-unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64, len: u64) -> u32 {
+/// The `CALL_FUNCTION_EX` at `pc` (its operands from `start`) of a plain
+/// function over a tuple, a list or a generator, with no `**` mapping:
+/// the items spread over the call's operands and it runs as a `CALL` of
+/// them would, through [`direct_call`] (a generator is drained first, as
+/// the core loop's arm drains it). `None`, with the operands as they were,
+/// when the call doesn't qualify; a site keeps to the spread length its
+/// cache was filled for.
+///
+/// # Safety
+///
+/// As [`h_call_ex`]'s, `site` the instruction's own cache.
+#[inline(never)]
+unsafe fn spread_direct(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    site: &mut DirectSite,
+) -> Option<u32> {
+    // SAFETY: the caller's contract: four initialized operand slots.
+    unsafe {
+        let base = st.stack;
+        // (A frameless leaf's call stays the core loop's, evaluated in
+        // place.)
+        if !matches!(&*base.add(start), Object::Function(f) if !crate::fn_is_leaf(f))
+            || !matches!(&*base.add(start + 3), Object::Unbound)
+        {
+            return None;
+        }
+        // A site whose callee had no native body rechecks after `retry`
+        // more calls (as `h_call_site`'s).
+        if site.hot == 0 && site.retry != 0 {
+            site.retry -= 1;
+            return None;
+        }
+        if matches!(&*base.add(start + 2), Object::Generator(_)) {
+            // `f(*(g(a) for a in args))`: the generator drained into the
+            // tuple CPython's handler makes of it.
+            let frame = &mut *st.frame;
+            frame.stack.set_len(start + 4);
+            frame.pc = pc as u32;
+            settle(st);
+            let sw = &mut *st.sw;
+            *sw.last = st.last;
+            let interp = &mut *st.interp.cast_mut();
+            match interp.core_spread_tuple(sw, pc) {
+                Some(true) => {}
+                // It raised: the operands are gone, the raise pending.
+                Some(false) => return Some(RELOAD),
+                None => return None,
+            }
+        }
+        let n = match &*base.add(start + 2) {
+            Object::Tuple(t) => t.len(),
+            Object::List(l) => l.try_borrow().ok()?.len(),
+            _ => return None,
+        };
+        let len = start + 2 + n;
+        let want = u32::try_from(n + 1).ok()?;
+        if len > st.cap || (site.spread != 0 && site.spread != want) {
+            return None;
+        }
+        site.spread = want;
+        let spread = base.add(start + 2).read();
+        let items: &[Object] = match &spread {
+            Object::Tuple(t) => t,
+            Object::List(l) => &(*l.as_ptr()),
+            _ => unreachable!("checked above"),
+        };
+        for (k, v) in items.iter().enumerate() {
+            base.add(start + 2 + k).write(crate::clone_hot(v));
+        }
+        match direct_call_out(st, pc, start, len, site, None) {
+            Some(r) => {
+                // (Its items live on in the callee: it dies empty-handed.)
+                drop(spread);
+                Some(r)
+            }
+            None => {
+                for k in 0..n {
+                    drop(base.add(start + 2 + k).read());
+                }
+                base.add(start + 2).write(spread);
+                base.add(start + 3).write(Object::Unbound);
+                None
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn h_call_ex(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
     // SAFETY: the code passes its live state, its own code, one of its
-    // `CALL_FUNCTION_EX`s and its stack depth.
+    // `CALL_FUNCTION_EX`s, its stack depth and the site's own cache.
     unsafe {
         let _ = code;
         let st = &mut *st;
@@ -7453,6 +7552,10 @@ unsafe extern "C" fn h_call_ex(st: *mut State, code: *const CodeObject, pc: u64,
             return CALL_DECLINED;
         }
         let start = len - 4;
+        // A plain function's call over a tuple or list: a direct call.
+        if let Some(r) = spread_direct(st, pc, start, &mut *site) {
+            return r;
+        }
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
@@ -13446,12 +13549,12 @@ impl<'a> Lower<'a> {
     /// `CALL_KW` through [`h_call_kw`] (as [`Self::call_op`]; the depth
     /// after is the static one).
     fn call_kw(&mut self, pc: usize) -> bool {
-        self.call_with(pc, h_call_kw as *const () as usize)
+        self.call_with(pc, h_call_kw as *const () as usize, false)
     }
 
     /// `CALL_FUNCTION_EX` through [`h_call_ex`] (as [`Self::call_kw`]).
     fn call_ex(&mut self, pc: usize) -> bool {
-        self.call_with(pc, h_call_ex as *const () as usize)
+        self.call_with(pc, h_call_ex as *const () as usize, true)
     }
 
     /// `f(*args, **kwargs)`'s forwarding run, `BUILD_MAP 0` at `pc` through
@@ -13496,9 +13599,10 @@ impl<'a> Lower<'a> {
         false
     }
 
-    /// A call instruction through `helper` (`h_call_kw`'s signature): the
-    /// result in place when it ran, anything else the core loop's.
-    fn call_with(&mut self, pc: usize, helper: usize) -> bool {
+    /// A call instruction through `helper` (`h_call_kw`'s signature, with
+    /// the site's own [`DirectSite`] last when `with_site`): the result in
+    /// place when it ran, anything else the core loop's.
+    fn call_with(&mut self, pc: usize, helper: usize, with_site: bool) -> bool {
         let after = self.depths.get(pc + 1).copied().unwrap_or(-1);
         if after < 0 || self.depth == 0 {
             self.exit(INTERP, pc);
@@ -13509,9 +13613,18 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
-        let r = self
-            .call(helper, &[self.st, code, pcv, len], true)
-            .expect("returns");
+        let r = if with_site {
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            self.call(helper, &[self.st, code, pcv, len, site_at], true)
+        } else {
+            self.call(helper, &[self.st, code, pcv, len], true)
+        }
+        .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         let ran = self.b.create_block();
         let other = self.b.create_block();

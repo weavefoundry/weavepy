@@ -17621,7 +17621,7 @@ impl Interpreter {
     /// to do, or done), `Some(false)` when the iteration raised (the
     /// operands consumed and the raise pending, as the full handler
     /// leaves them), `None` touched nothing.
-    fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
+    pub(crate) fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
