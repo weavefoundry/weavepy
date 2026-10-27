@@ -54531,6 +54531,24 @@ impl Interpreter {
                 // IMPORTANT: any `b.name == "..."` / `matches!(b.name, ...)`
                 // added inside this block must also be added to
                 // `builtin_needs_interp` above, or the new arm is dead code.
+                // The hottest interpreter-aware builtins by one `match` (a
+                // length switch and a compare), ahead of the gate and the
+                // chain's sequential comparisons: each arm is the chain's
+                // own for the name and shape, which no earlier arm of the
+                // chain takes.
+                match (b.name, args.len()) {
+                    ("len", 1) => return self.do_len_call(&args[0], outer_globals),
+                    ("hash", 1) => return self.do_hash_call(&args[0], outer_globals),
+                    ("isinstance", 2) => {
+                        return self.do_isinstance_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("issubclass", 2) => {
+                        return self.do_issubclass_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("repr", 1) => return self.do_repr_call(&args[0], outer_globals),
+                    ("str", 1) => return self.do_str_call(&args[0], outer_globals),
+                    _ => {}
+                }
                 if builtin_needs_interp(b.name) {
                     if b.name.starts_with(".u.") {
                         let receiver = args.first().cloned().ok_or_else(|| {
