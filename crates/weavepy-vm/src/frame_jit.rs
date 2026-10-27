@@ -4212,6 +4212,12 @@ impl ModCache {
 /// when the site last read it (`0` empty: no dict has that stamp) and
 /// the address of the entry's value, which compiled code reads in line
 /// while the stamp stands (as [`GlobalCache`] does a global's).
+///
+/// A class attribute read through an instance keeps the class version it
+/// was read at (`cver`, `0` empty), the value's two words (`cobj`, which
+/// the class holds while that version stands), and the class's shared
+/// keys and the name's position among them (as [`MethodCache`] does), for
+/// compiled code's in-line read while the instance holds no such name.
 #[derive(Default)]
 #[repr(C)]
 pub(crate) struct SlotCache {
@@ -4219,10 +4225,59 @@ pub(crate) struct SlotCache {
     idx: std::cell::Cell<u32>,
     mstamp: std::cell::Cell<u64>,
     mvalue: std::cell::Cell<u64>,
+    cver: std::cell::Cell<u64>,
+    ckeys: std::cell::Cell<u64>,
+    cbefore: std::cell::Cell<u32>,
+    cobj: std::cell::Cell<[u64; 2]>,
 }
 
 const SC_MSTAMP: i32 = std::mem::offset_of!(SlotCache, mstamp) as i32;
 const SC_MVALUE: i32 = std::mem::offset_of!(SlotCache, mvalue) as i32;
+const SC_CVER: i32 = std::mem::offset_of!(SlotCache, cver) as i32;
+const SC_CKEYS: i32 = std::mem::offset_of!(SlotCache, ckeys) as i32;
+const SC_CBEFORE: i32 = std::mem::offset_of!(SlotCache, cbefore) as i32;
+const SC_COBJ: i32 = std::mem::offset_of!(SlotCache, cobj) as i32;
+
+/// Remember in the `LOAD_ATTR` site's `cache` the class attribute `v`
+/// that `inst`'s read at `pc` just took through the site's stamp for a
+/// class attribute read through an instance (see `crate::class_attr_site`),
+/// for compiled code's in-line read (see `Lower::load_attr`).
+#[cold]
+fn class_attr_note(
+    ext: &CodeConstObjects,
+    inst: &crate::types::PyInstance,
+    pc: usize,
+    name: u32,
+    cache: &SlotCache,
+    v: &Object,
+) {
+    let cls = inst.cls_raw();
+    let ver = cls.attr_version.get();
+    if cache.cver.get() == ver || crate::class_attr_site(ext, pc) != Some(ver) {
+        return;
+    }
+    let (keys, before) = match cls.shared_keys.get() {
+        Some(keys) => {
+            let (Some(Object::Str(n)), Some(&hash)) = (
+                ext.name_objs.get(name as usize),
+                ext.name_hashes.get(name as usize),
+            ) else {
+                return;
+            };
+            (
+                std::ptr::from_ref(keys) as u64,
+                u32::try_from(keys.names_before(n, hash)).unwrap_or(u32::MAX),
+            )
+        }
+        None => (0, 0),
+    };
+    // SAFETY: an `Object` is 16 bytes, read as its two words.
+    let words = unsafe { std::ptr::from_ref(v).cast::<[u64; 2]>().read() };
+    cache.ckeys.set(keys);
+    cache.cbefore.set(before);
+    cache.cobj.set(words);
+    cache.cver.set(ver);
+}
 
 /// Remember in the `LOAD_ATTR` site's `cache` the entry of `m`'s dict the
 /// site's stamp (see `MODULE_ENTRY`) just proved, for compiled code's
@@ -4388,6 +4443,11 @@ unsafe extern "C" fn h_stack_attr(
             return 1;
         };
         slot_note(code, recv, pc, cache);
+        if let Object::Instance(inst) = recv {
+            if crate::class_attr_site(ext, pc).is_some() {
+                class_attr_note(ext, inst, pc, arg, &*cache, &v);
+            }
+        }
         crate::drop_hot(std::mem::replace(&mut *at, v));
         0
     }
@@ -4482,6 +4542,11 @@ unsafe extern "C" fn h_local_attr(
         match v {
             Some(v) => {
                 slot_note(code, recv, pc, cache);
+                if let Object::Instance(inst) = recv {
+                    if crate::class_attr_site(ext, pc).is_some() {
+                        class_attr_note(ext, inst, pc, arg, &*cache, &v);
+                    }
+                }
                 dst.write(v);
                 0
             }
@@ -12579,6 +12644,61 @@ impl<'a> Lower<'a> {
                     let v = self.b.ins().iadd(block, off);
                     self.b.ins().iadd_imm(v, i64::from(l.split_values))
                 };
+                self.attr_value_out(item, dst, slot, v, exit, done);
+            }
+            // A class attribute read through an instance of the class the
+            // site last read it for (CPython's
+            // `LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES`): the value the site's
+            // helper remembered, while the instance holds no dictionary
+            // and fewer values than the name's position among its class's
+            // names (see `Self::load_method`).
+            (Some(l), _) if !self.cold && crate::class_attr_site(self.ext, pc).is_some() => {
+                let l = *l;
+                let ptr = self.ptr;
+                let c = self.b.ins().iconst(ptr, cache_at);
+                let otag = self.tag_at(at);
+                let not_inst =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
+                self.branch_out(not_inst, miss);
+                let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+                let ver = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, cls, l.type_attr_version);
+                let want = self.b.ins().load(types::I64, FLAGS, c, SC_CVER);
+                let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+                let unguarded = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+                let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+                let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+                let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                let other = self.b.ins().bor(lazy, unguarded);
+                let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+                let bad = self.b.ins().bor(unset, stale);
+                let bad = self.b.ins().bor(bad, busy);
+                let bad = self.b.ins().bor(bad, other);
+                self.branch_out(bad, miss);
+                let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+                let check = self.b.create_block();
+                let hit = self.b.create_block();
+                self.b.ins().brif(block, check, &[], hit, &[]);
+                self.b.switch_to_block(check);
+                let n = self.b.ins().uload32(FLAGS, block, l.split_len);
+                let keys = self.b.ins().load(types::I64, FLAGS, block, l.split_keys);
+                let ckeys = self.b.ins().load(types::I64, FLAGS, c, SC_CKEYS);
+                let before = self.b.ins().uload32(FLAGS, c, SC_CBEFORE);
+                let empty = self.b.ins().icmp_imm(IntCC::Equal, n, 0);
+                let same = self.b.ins().icmp(IntCC::Equal, keys, ckeys);
+                let short = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, n, before);
+                let held = self.b.ins().band(same, short);
+                let ok = self.b.ins().bor(empty, held);
+                self.b.ins().brif(ok, hit, &[], miss, &[]);
+                self.b.switch_to_block(hit);
+                let v = self.b.ins().iadd_imm(c, i64::from(SC_COBJ));
                 self.attr_value_out(item, dst, slot, v, exit, done);
             }
             _ => {

@@ -77685,6 +77685,18 @@ fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Ob
 /// class, which also needs the instance not to shadow the name.
 const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
 
+/// The class version at which the `LOAD_ATTR` at `pc` last read a class
+/// attribute through an instance of the class (its stamp, see
+/// [`class_attr_fill_via`]), if that is what it last read.
+pub(crate) fn class_attr_site(ext: &CodeConstObjects, pc: usize) -> Option<u64> {
+    let [ver, tag, _] = ext.stamp_slot(pc)?.get();
+    matches!(
+        tag ^ CLASS_ATTR_VIA_INSTANCE,
+        CLASS_ATTR_INT | CLASS_ATTR_FLOAT | CLASS_ATTR_BOOL | CLASS_ATTR_NONE | CLASS_ATTR_ENTRY
+    )
+    .then_some(ver)
+}
+
 /// A `LOAD_ATTR` site's stamp tag for a named tuple field (a
 /// `_tuplegetter` on the class at that version): the bits are the field
 /// index. The descriptor is a data descriptor, so no instance shadows it.
