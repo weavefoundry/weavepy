@@ -16337,7 +16337,7 @@ impl Interpreter {
         {
             return false;
         }
-        if ins.op == OpCode::BinaryOp {
+        if matches!(ins.op, OpCode::BinaryOp | OpCode::CompareOp) {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
@@ -48649,6 +48649,32 @@ impl Interpreter {
             std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
             cmp_dunder(op).0,
         )
+    }
+
+    /// The plain Python method a `COMPARE_OP` of `op` over `a` and `b`
+    /// calls first, when `a` is a plain instance (no native payload, of a
+    /// class neither natively served nor an extension's) whose class's
+    /// method for `op` is a plain function: CPython's `do_richcompare`
+    /// tries `a`'s first unless `b`'s class is a strict subclass of `a`'s
+    /// (which may override the reflected method).
+    pub(crate) fn compare_instance_dunder(
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Option<Rc<PyFunction>> {
+        let Object::Instance(ai) = a else {
+            return None;
+        };
+        let cls = ai.cls_raw();
+        if ai.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        if let Object::Instance(bi) = b {
+            if !std::ptr::eq(cls, bi.cls_raw()) && bi.cls().is_subclass_of(&ai.cls()) {
+                return None;
+            }
+        }
+        Self::cmp_function(a, op)
     }
 
     /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].

@@ -3453,6 +3453,50 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
     }
 }
 
+/// `COMPARE_OP` with oparg `arg` over the plain instance and the operand
+/// at `at` and above it, whose class's comparison method (see
+/// `Interpreter::compare_instance_dunder`) is a warm pure leaf: evaluated
+/// in place, `0` or `1` its `bool` answer (the operands released), anything
+/// else declined untouched (another answer, `NotImplemented` among them,
+/// leaves the comparison to the core loop, which may run the method again:
+/// a pure leaf has no effects).
+unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u32) -> u32 {
+    // SAFETY: the code passes its live state, two initialized stack slots,
+    // and the oparg the compiler emitted (as `compare_op_step` reads it).
+    unsafe {
+        let (a, b) = (&*at, &*at.add(1));
+        if !droppable(a) || !droppable(b) {
+            return 2;
+        }
+        let kind: CompareKind = std::mem::transmute((arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+        let Some(f) = Interpreter::compare_instance_dunder(a, b, kind) else {
+            return 2;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code = &*f.code.as_ptr();
+        if code.arg_count != 2
+            || !crate::code_is_pure_leaf(code)
+            || !crate::pure_leaf_warm(code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return 2;
+        }
+        let ptrs = [at.cast_const(), at.add(1).cast_const()];
+        match (*(*st).interp).pure_leaf_eval::<false, false>(code, &f, &ptrs) {
+            Some(Object::Bool(r)) => {
+                crate::drop_hot(at.add(1).read());
+                crate::drop_hot(at.read());
+                u32::from(r)
+            }
+            Some(v) => {
+                drop(v);
+                2
+            }
+            None => 2,
+        }
+    }
+}
+
 /// `TO_BOOL` of the value at `at`, for the shapes the leaf arm runs
 /// (scalars, strings, lists, tuples, dicts, an instance with a native or
 /// no `__bool__` / `__len__`): `0` or `1` the truth (the operand
@@ -12254,8 +12298,31 @@ impl<'a> Lower<'a> {
             .expect("returns");
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.branch_out(declined, out);
-        // (The helper releases only numbers and strings: no finalizer.)
+        // An instance's comparison method that is a warm pure leaf, at a
+        // site that has compared one: evaluated in place.
+        let r = if !self.cold && crate::instance_site(self.ext, pc) {
+            let dunder = self.b.create_block();
+            let join = self.b.create_block();
+            self.b.append_block_param(join, types::I32);
+            self.b.ins().brif(declined, dunder, &[], join, &[r.into()]);
+            self.b.switch_to_block(dunder);
+            let d = self
+                .call(
+                    h_compare_dunder as *const () as usize,
+                    &[self.st, at, k],
+                    true,
+                )
+                .expect("returns");
+            let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, d, 1);
+            self.b.ins().brif(declined, out, &[], join, &[d.into()]);
+            self.b.switch_to_block(join);
+            self.b.block_params(join)[0]
+        } else {
+            self.branch_out(declined, out);
+            r
+        };
+        // (The helpers release only numbers and strings, or operands
+        // another owner holds: no finalizer.)
         let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
         self.b.ins().jump(done, &[t.into()]);
     }
