@@ -13941,10 +13941,14 @@ pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeE
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
+    let ascii = crate::shared_value::SharedStr::is_ascii(s);
     let s: &str = s;
+    // (The text's own bytes are copied once, straight into the result.)
     let bytes = match plain_codec(rest.first())? {
-        PlainCodec::Utf8 => s.as_bytes().to_vec(),
-        PlainCodec::Ascii if s.is_ascii() => s.as_bytes().to_vec(),
+        PlainCodec::Utf8 => return Some(Ok(bytes_from_slice(s.as_bytes()))),
+        PlainCodec::Ascii | PlainCodec::Latin1 if ascii => {
+            return Some(Ok(bytes_from_slice(s.as_bytes())))
+        }
         PlainCodec::Latin1 => s
             .chars()
             .map(|c| u8::try_from(u32::from(c)).ok())
@@ -13952,6 +13956,14 @@ pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeE
         PlainCodec::Ascii => return None,
     };
     Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// A `bytes` object holding a copy of `data`.
+fn bytes_from_slice(data: &[u8]) -> Object {
+    if data.is_empty() {
+        return Object::new_bytes(Vec::new());
+    }
+    Object::Bytes(crate::shared_value::SharedSlice::from(data))
 }
 
 /// `b.decode([encoding])` with a plain codec, when the bytes decode (an
@@ -13963,10 +13975,24 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
+    // (ASCII text is copied once, straight into the result, which is born
+    // knowing its length in characters.)
+    let ascii = |b: &[u8]| {
+        // SAFETY: ASCII is UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(b) };
+        if text.len() <= 2 {
+            Object::Str(crate::shared_value::SharedStr::from(text))
+        } else {
+            Object::Str(crate::shared_value::SharedStr::from_ascii(text))
+        }
+    };
     let text = match plain_codec(rest.first())? {
-        PlainCodec::Utf8 => std::str::from_utf8(b).ok()?.to_owned(),
-        PlainCodec::Ascii if b.is_ascii() => std::str::from_utf8(b).ok()?.to_owned(),
-        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect(),
+        _ if b.is_ascii() => return Some(Ok(ascii(b))),
+        PlainCodec::Utf8 => {
+            let text = std::str::from_utf8(b).ok()?;
+            return Some(Ok(Object::Str(crate::shared_value::SharedStr::from(text))));
+        }
+        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect::<String>(),
         PlainCodec::Ascii => return None,
     };
     Some(Ok(Object::from_str(text)))
@@ -13974,6 +14000,33 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 
 /// `i.to_bytes([length[, byteorder]])` over plain arguments.
 pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // A non-negative machine int that fits a length of one to eight
+    // bytes, in either order: its bytes, with no byte order string or
+    // staging vector built.
+    if let [Object::Int(v), Object::Int(len), rest @ ..] = args {
+        let little = match rest {
+            [] => Some(false),
+            [Object::Str(order)] => match order.as_bytes() {
+                b"big" => Some(false),
+                b"little" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(little), 1..=8) = (little, *len) {
+            let len = *len as usize;
+            if *v >= 0 && (len == 8 || (*v as u64) >> (8 * len) == 0) {
+                let bytes = if little {
+                    (*v as u64).to_le_bytes()
+                } else {
+                    ((*v as u64) << (8 * (8 - len) as u32 % 64)).to_be_bytes()
+                };
+                return Some(Ok(Object::Bytes(crate::shared_value::SharedSlice::from(
+                    &bytes[..len],
+                ))));
+            }
+        }
+    }
     match args {
         [Object::Int(_)]
         | [Object::Int(_), Object::Int(_)]
@@ -13985,6 +14038,31 @@ pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 /// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
 /// `bytes` buffer.
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // One to seven bytes in either order: the machine int, with no byte
+    // order string or copy of the data built.
+    if let [Object::Type(t), Object::Bytes(data), rest @ ..] = args {
+        let little = match rest {
+            [] => Some(false),
+            [Object::Str(order)] => match order.as_bytes() {
+                b"big" => Some(false),
+                b"little" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(little), 1..=7) = (little, data.len()) {
+            if crate::sync::Rc::ptr_eq(t, &builtin_types().int_) {
+                let v = data.iter().enumerate().fold(0u64, |v, (i, &b)| {
+                    if little {
+                        v | u64::from(b) << (8 * i)
+                    } else {
+                        v << 8 | u64::from(b)
+                    }
+                });
+                return Some(Ok(Object::Int(v as i64)));
+            }
+        }
+    }
     match args {
         [Object::Type(t), Object::Bytes(_)]
         | [Object::Type(t), Object::Bytes(_), Object::Str(_)]
