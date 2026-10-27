@@ -43296,7 +43296,11 @@ impl Interpreter {
                 // compared with `<` (CPython `unsafe_tuple_compare`).
                 let mut i = 0;
                 while i < x.len() && i < y.len() {
-                    if !x[i].is_same(&y[i]) && !self.vm_eq(&x[i], &y[i], globals)? {
+                    let eq = match SortKind::item_eq(&x[i], &y[i]) {
+                        Some(eq) => eq,
+                        None => x[i].is_same(&y[i]) || self.vm_eq(&x[i], &y[i], globals)?,
+                    };
+                    if !eq {
                         break;
                     }
                     i += 1;
@@ -43309,7 +43313,10 @@ impl Interpreter {
                     (0, SortKindScalar::Int) => Ok(SortKind::int_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Float) => Ok(SortKind::float_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Numeric) => compare_op(&x[0], &y[0], CompareKind::Lt),
-                    _ => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    _ => match native_scalar_compare(&x[i], &y[i], CompareKind::Lt) {
+                        Some(lt) => Ok(lt),
+                        None => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    },
                 }
             }),
             SortKind::General => crate::timsort::sort(v, |a, b| {
@@ -71847,6 +71854,22 @@ impl SortKind {
     #[inline]
     fn float_lt(a: &Object, b: &Object) -> bool {
         matches!((a, b), (Object::Float(x), Object::Float(y)) if x < y)
+    }
+
+    /// Whether two tuple items are equal as `PyObject_RichCompareBool`
+    /// would find them (identity first, then `==`), for a pair of native
+    /// `int`s, `float`s or `str`s; `None` for anything else.
+    #[inline(always)]
+    fn item_eq(a: &Object, b: &Object) -> Option<bool> {
+        match (a, b) {
+            (Object::Int(x), Object::Int(y)) => Some(x == y),
+            // (`is_same` compares a float's bits, so a NaN equals itself.)
+            (Object::Float(x), Object::Float(y)) => Some(x.to_bits() == y.to_bits() || x == y),
+            (Object::Str(x), Object::Str(y)) => {
+                Some(SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes())
+            }
+            _ => None,
+        }
     }
 }
 
