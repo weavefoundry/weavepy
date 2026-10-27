@@ -6321,6 +6321,15 @@ unsafe extern "C" fn h_call(
         }
         let base = st.stack;
         let start = len - argc - 2;
+        // A generator expression's `CALL 0`: its pending generator takes
+        // the iterator, and is the result (see `Interpreter::make_genexp`).
+        if argc == 0
+            && matches!(&*base.add(start), Object::Generator(_))
+            && Interpreter::finish_genexp_at(base.add(start))
+        {
+            st.len = start + 1;
+            return 0;
+        }
         // The frame synced for a switch, as the core loop's arm syncs it.
         let sync = |st: &mut State| {
             let frame = &mut *st.frame;
@@ -7902,6 +7911,19 @@ unsafe extern "C" fn h_make_function(st: *mut State, at: *mut Object, flags: u64
         if crate::capi_watchers::funcs_active() || !matches!(&*at.add(n - 1), Object::Code(_)) {
             return 1;
         }
+        // A generator expression's (one without a closure): its generator,
+        // pending (see `Interpreter::make_genexp`).
+        if let (1, Object::Code(c)) = (n, &*at) {
+            if c.is_generator {
+                if let Some(gen) =
+                    (*(*st).interp).make_genexp(c, &[], &frame.globals, &frame.builtins)
+                {
+                    drop(at.read());
+                    at.write(gen);
+                    return 0;
+                }
+            }
+        }
         let mut k = n;
         let f = crate::make_function(
             flags as u32,
@@ -7958,6 +7980,26 @@ unsafe extern "C" fn h_make_function_attrs(
         let (code, pc, k) = (&*code, pc as usize, k as usize);
         if crate::capi_watchers::funcs_active() || !matches!(&*at.add(k), Object::Code(_)) {
             return 1;
+        }
+        // A generator expression's: its generator, pending (see
+        // `Interpreter::make_genexp`).
+        let frame = &*(*st).frame;
+        let ops = std::slice::from_raw_parts(at, k + 1);
+        if let Some((gen, covered)) = (*(*st).interp).genexp_make_at(
+            &code.instructions,
+            pc,
+            ops,
+            &frame.globals,
+            &frame.builtins,
+        ) {
+            if covered == k {
+                for j in 0..=k {
+                    drop(at.add(j).read());
+                }
+                at.write(gen);
+                return 0;
+            }
+            drop(gen);
         }
         let mut defaults = Vec::new();
         let mut closure = Vec::new();
