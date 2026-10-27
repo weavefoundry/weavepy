@@ -3799,7 +3799,7 @@ const CALL_DECLINED: u32 = 3;
 
 /// `LOAD_GLOBAL` (the `pc`th instruction of `code`) on a stack `len`
 /// deep, as the core loop's arm runs it: the stamped cache hit, with the
-/// arm's fused shapes (`len(local)`, a pure leaf global's call, a class's
+/// arm's fused shapes (`len(local)`, a class's
 /// pure leaf method's call, a plain class's scalar attribute). `PUSHED`
 /// the value written to the free slot at `len`, `FUSED` a fused shape
 /// ran, `DECLINED` untouched.
@@ -3893,26 +3893,9 @@ unsafe extern "C" fn h_load_global(
                     return fused(st, Object::Int(n), pc + 3);
                 }
             }
-            // `f(...)` of a pure leaf global function with simple
-            // arguments.
-            Object::Function(f)
-                if fusing
-                    && op_at(pc + 1) == Some(OpCode::PushNull)
-                    && crate::simple_args_prefix(ins, pc + 2)
-                    && crate::fn_is_pure_leaf(f) =>
-            {
-                if let Some((r, call_pc)) = interp.core_pure_global_call(
-                    code,
-                    Rc::as_ptr(f),
-                    pc + 2,
-                    st.locals,
-                    nlocals as usize,
-                    &ext.objects,
-                    st.depth_cell,
-                ) {
-                    return fused(st, r, call_pc);
-                }
-            }
+            // (`f(...)` of a pure leaf global function: the value, which the
+            // native code then reads in line, and the `CALL`'s site
+            // evaluates the leaf, see `leaf_site_call`.)
             // `C.m(...)` of a class's pure leaf plain or static function,
             // called unbound.
             Object::Type(cls)
