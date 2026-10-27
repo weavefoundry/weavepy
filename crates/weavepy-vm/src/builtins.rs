@@ -2370,6 +2370,25 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
 
+/// `object.__repr__(self)` (CPython `object_repr`): `<module.qualname
+/// object at 0x…>` of the receiver's type for any receiver, a dict or an
+/// int as much as an instance, with neither the type's own `__repr__` nor
+/// a built-in subclass's payload consulted. (`super().__repr__()` reaching
+/// `object` takes its own path, `object_base_repr_string`.)
+fn slot_object_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__repr__() takes exactly one argument (0 given)"))?;
+    let addr = match o {
+        Object::Instance(inst) => Rc::as_ptr(inst) as usize,
+        other => object_identity(other) as usize,
+    };
+    Ok(Object::from_str(format!(
+        "<{} object at 0x{addr:x}>",
+        class_of(o).qualified_display_name()
+    )))
+}
+
 /// `str.__str__(self)` / `object.__str__(self)` — `str()` of `self`. Mirrors
 /// CPython: for a value that doesn't define its own `__str__`, this is the
 /// `repr`-derived default; for `str`/`bytes` it returns the payload.
@@ -2592,6 +2611,7 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
     }
     let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) = match name
     {
+        "__repr__" if base_name == "object" => ("__repr__", slot_object_repr),
         "__repr__" => ("__repr__", slot_repr),
         "__format__" => ("__format__", slot_format),
         // `object`'s default rich comparisons: `==`/`!=` compare by
