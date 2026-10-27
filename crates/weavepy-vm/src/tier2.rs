@@ -11992,13 +11992,14 @@ unsafe fn call_dyn_impl(
             // SAFETY: as above.
             return unsafe { dyn_call_result(jf, ctx, Ok(v), false, false, int_result) };
         }
-        // Not charged against the native driver: the interpreter's own
-        // `CALL_KW` binds through this same permutation and activation,
-        // so tier-1 would not run the call any cheaper.
+        // Charged against the native driver, as a positional call to the
+        // interpreter is: the frame JIT binds the same permutation into a
+        // direct call (`direct_call_kw`) at about half this round trip's
+        // cost, so a loop dense in them runs better there.
         ctx.dirty = true;
         let called = call_with_activation_shell(interp, ctx, jf, |i| i.run_py_bound(&f, locals));
         // SAFETY: as above.
-        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
+        return unsafe { dyn_call_result(jf, ctx, called, false, true, int_result) };
     }
     // A keyword call of any other plain function (or a bound method over
     // one) binds by name, as the interpreter's keyword calls do: no name
@@ -12011,13 +12012,41 @@ unsafe fn call_dyn_impl(
         let Object::Tuple(name_items) = &names_obj else {
             unreachable!("checked by dyn_kw_named_operands")
         };
-        // (Not charged, as above: tier-1 binds the same way.)
+        // (Charged, as above.)
         ctx.dirty = true;
         let called = call_with_activation_shell(interp, ctx, jf, |i| {
             i.call_python_kw_names(&f, args, name_items, kwvals)
         });
         // SAFETY: as above.
-        return unsafe { dyn_call_result(jf, ctx, called, false, false, int_result) };
+        return unsafe { dyn_call_result(jf, ctx, called, false, true, int_result) };
+    }
+    // `dict(k=v, ...)`: the keywords' own name objects are the keys.
+    if kwc > 0 && argc == 0 {
+        if let Object::Type(t) = &callee {
+            if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().dict_) {
+                // SAFETY: per the function contract, the activation keeps
+                // its code object alive.
+                let code = unsafe { &*ctx.code_ptr };
+                if let Some(Object::Tuple(name_items)) =
+                    crate::code_const_objects(code).get(names as usize)
+                {
+                    let mut vals = [const { Object::None }; 8];
+                    if name_items.len() == kwc as usize && kwc as usize <= vals.len() {
+                        for (j, slot) in vals.iter_mut().enumerate().take(kwc as usize) {
+                            // SAFETY: native code wrote `kwc` entries.
+                            let (bits, tag) =
+                                unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+                            *slot = unpack_pins(bits, tag, &ctx.pins);
+                        }
+                        if let Some(d) =
+                            crate::Interpreter::dict_of_keywords(name_items, &vals[..kwc as usize])
+                        {
+                            return dyn_leaf_result(jf, ctx, d, int_result);
+                        }
+                    }
+                }
+            }
+        }
     }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);
@@ -12091,16 +12120,16 @@ unsafe fn call_dyn_impl(
         }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
-    // WS1's dirtiness discipline). A keyword call pays the generic
-    // binder in tier-1 too, so only positional calls count against the
-    // native driver.
-    let charged = kwc == 0;
+    // WS1's dirtiness discipline). A keyword call of a builtin or a class
+    // pays the same generic binder in tier-1, so it doesn't count against
+    // the native driver; every other call does.
+    let native_callee = matches!(&callee, Object::Builtin(_))
+        || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
+    let charged = kwc == 0 || !(native_callee || matches!(&callee, Object::Type(_)));
     if charged {
         note_generic_dyn_call(ctx);
     }
     ctx.dirty = true;
-    let native_callee = matches!(&callee, Object::Builtin(_))
-        || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
     });

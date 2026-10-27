@@ -14099,6 +14099,13 @@ impl Interpreter {
                             Object::BoundMethod(_) | Object::Builtin(_) => {
                                 Self::core_native_kw_call(ops, argc)
                             }
+                            // `dict(k=v, ...)`: the keywords' own names are
+                            // the keys (see `core_dict_kw`).
+                            Object::Type(ty)
+                                if argc == 0 && Rc::ptr_eq(ty, &builtin_types().dict_) =>
+                            {
+                                Self::core_dict_kw(ops)
+                            }
                             _ => self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell),
                         };
                         let Some(r) = r else {
@@ -24883,6 +24890,43 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::decimal_native::method_kw(ops, argc)
+    }
+
+    /// `dict(k=v, ...)` (exact `dict`, keywords only): the dictionary of
+    /// the keywords, keyed by the call's own name objects, as the full
+    /// handler builds it from their strings. `ops` is the core loop's
+    /// `CALL_KW` operands; `None` (nothing touched) for the full handler.
+    #[inline(never)]
+    fn core_dict_kw(ops: &[Object]) -> Option<Object> {
+        let (Object::Unbound, Some(Object::Tuple(names))) = (ops.get(1)?, ops.last()) else {
+            return None;
+        };
+        if ops.len() != names.len() + 3 {
+            return None;
+        }
+        Self::dict_of_keywords(names, &ops[2..2 + names.len()])
+    }
+
+    /// The dictionary `dict(**{n: v ...})` makes of a call's keyword
+    /// `names` (its `str` objects, which become the keys) and `values`:
+    /// `None` for a name that isn't a `str`, or while an allocation
+    /// observer or a due collection wants the full handler.
+    pub(crate) fn dict_of_keywords(names: &[Object], values: &[Object]) -> Option<Object> {
+        if names.len() != values.len()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || gc_trace::auto_collect_due()
+            || !names.iter().all(|n| matches!(n, Object::Str(_)))
+        {
+            return None;
+        }
+        let mut d = DictData::with_capacity_and_hasher(names.len(), crate::fasthash::FxBuildHasher);
+        for (name, v) in names.iter().zip(values) {
+            d.insert(DictKey(name.clone()), v.clone());
+        }
+        let obj = Object::Dict(Rc::new(RefCell::new(d)));
+        gc_trace::track(&obj);
+        Some(obj)
     }
 
     /// A keyword call of a native method registered with
