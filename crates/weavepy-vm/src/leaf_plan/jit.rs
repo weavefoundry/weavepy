@@ -705,6 +705,27 @@ unsafe extern "C" fn h_new(ctx: *mut Ctx<'static>, dict: u32) -> u32 {
 unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64, pb: u64) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
+    // A dict read by a `str` key (`env[name]`), the commonest shape, as
+    // `subscr` reads it.
+    if ta == T_R && tb == T_R {
+        // SAFETY: as `norm`; the borrows end before anything could change
+        // the dict (no Python runs during an evaluation).
+        let (a, k) = unsafe { (&*(pa as *const Object), &*(pb as *const Object)) };
+        if let (Object::Dict(d), Object::Str(s)) = (a, k) {
+            let probe = crate::object::LeafProbe::with_hash(
+                k,
+                crate::shared_value::SharedStr::hash_cached(s),
+            );
+            // SAFETY: as above.
+            return match unsafe { d.peek() }.and_then(|m| m.get(&probe)) {
+                Some(v) => {
+                    c.put(norm(v));
+                    0
+                }
+                None => 1,
+            };
+        }
+    }
     match subscr(&mut c.owned, value(ta, pa), value(tb, pb)) {
         Some(v) => {
             c.put(v);
