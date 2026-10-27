@@ -1189,10 +1189,28 @@ fn analyze_admitted(
     if mostly_generic(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
     }
+    if unpacks_pairs(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
+    }
     for site in &mut tfunc.attr_sites {
         site.slot_member = slot_member(site);
     }
     Ok(tfunc)
+}
+
+/// Whether `tfunc` runs a tuple-target loop (`for a, b in pairs`) natively.
+/// Its step goes through a helper that pins each unpacked object, three
+/// times the frame JIT's step, and loops that iterate pairs (a graph's
+/// `(neighbor, weight)` edges, a sparse row's `(column, value)` entries)
+/// do little typed work per pair to make up for it: compiling them cost
+/// `graph_search` a tenth and `scimark`'s sparse product a twentieth. The
+/// frame JIT runs such code instead.
+fn unpacks_pairs(tfunc: &TFunc) -> bool {
+    !GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        && tfunc
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, crate::ir::TTerm::ForIterPair { .. }))
 }
 
 fn mostly_generic(tfunc: &TFunc) -> bool {

@@ -5202,6 +5202,113 @@ unsafe extern "C" fn h_countdown(countdown: *mut u32) -> u32 {
     0
 }
 
+/// `CALL` of a Python class: a class whose memoized plan proved its
+/// construction to be a store-only `__init__`'s stores runs them straight
+/// from here (`Interpreter::core_store_init`, as the core loop's
+/// `core_new_n` runs a proven one), without `h_call`'s shape checks or the
+/// switch's constructor protocol. Anything else goes on to [`h_call`].
+unsafe extern "C" fn h_call_ctor(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc_argc: u64,
+    len: u64,
+) -> u32 {
+    let pc = pc_argc & u64::from(u32::MAX);
+    // SAFETY: as `h_call`'s; the operands are the `CALL`'s own.
+    unsafe {
+        let s = &mut *st;
+        let argc = (pc_argc >> 32) as usize;
+        if ctor_store_init(s, &*code, pc as usize, argc, len as usize) {
+            return 0;
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// [`h_call_ctor`]'s construction: `true` with the instance in the class's
+/// slot (`st.len` past it), `false` touched nothing.
+///
+/// # Safety
+///
+/// As `h_call`'s, for the `CALL` at `pc` of `argc` arguments atop a
+/// `len`-deep stack.
+#[inline(always)]
+unsafe fn ctor_store_init(
+    st: &mut State,
+    code: &CodeObject,
+    pc: usize,
+    argc: usize,
+    len: usize,
+) -> bool {
+    use weavepy_compiler::InlineCache as IC;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let start = len - argc - 2;
+        let base = st.stack;
+        let (Object::Type(ty), Object::Unbound) = (&*base.add(start), &*base.add(start + 1)) else {
+            return false;
+        };
+        let interp = &*st.interp;
+        // (The checks `core_new_n` makes first.)
+        if st.sw.is_null()
+            || ty.flags.is_builtin
+            || matches!(code.caches.get(pc as u32), IC::Empty)
+            || interp.lean_snapshot() != Some(st.snap_gen)
+            || !interp.inline_calls_ok()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || !Interpreter::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        // SAFETY: a guard-free read of the memoized plan; nothing runs
+        // before its last use.
+        let Some((ver, plan)) = ty.instance_plan.peek().and_then(Option::as_ref) else {
+            return false;
+        };
+        if *ver != ty.attr_version.get()
+            || plan.store_init.load(std::sync::atomic::Ordering::Relaxed) != 1
+        {
+            return false;
+        }
+        let Some((init, init_code)) = plan.lean_init.as_ref() else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell; only
+        // the pointer is compared.
+        if !std::ptr::eq(Rc::as_ptr(&*init.code.as_ptr()), Rc::as_ptr(init_code)) {
+            return false;
+        }
+        let Some(missing) = Interpreter::missing_defaults(init, init_code, argc + 1) else {
+            return false;
+        };
+        let (ty, plan) = (ty.clone(), plan.clone());
+        let (init, init_code) = plan.lean_init.as_ref().expect("checked above");
+        // The frame as the core loop's arm has it at the call.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        let done = interp.core_store_init(
+            frame,
+            &ty,
+            &plan,
+            init,
+            init_code,
+            false,
+            argc,
+            missing,
+            start + 1,
+            start,
+            st.depth_cell,
+        );
+        if done {
+            st.len = start + 1;
+        }
+        done
+    }
+}
+
 /// [`h_call`] with a direct call ([`direct_call`]) of the plain Python
 /// function `site` caches tried first. (The native code calls `h_call`
 /// itself for any other callee, and while a site without a body waits
@@ -5261,6 +5368,8 @@ unsafe extern "C" fn h_call_site(
                 return h_call_direct(st, code, ext, pc_argc, len, site);
             }
             site.retry -= 1;
+        } else if matches!(callee, Object::Type(_)) {
+            return h_call_ctor(st, code, ext, pc_argc, len);
         } else if crate::stdlib::functools_mod::is_lru_wrapper(callee) {
             return h_call_instance(st, code, ext, pc_argc, len, site);
         }
@@ -13176,6 +13285,28 @@ impl<'a> Lower<'a> {
             .expect("returns");
         self.b.ins().jump(called, &[r.into()]);
         self.b.switch_to_block(general);
+        // A Python class's construction tries [`h_call_ctor`].
+        let is_class = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.class));
+        let ctor = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(is_class, ctor, &[], other, &[]);
+        self.b.switch_to_block(ctor);
+        let pc_argc = self
+            .b
+            .ins()
+            .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+        let r = self
+            .call(
+                h_call_ctor as *const () as usize,
+                &[self.st, code, ext, pc_argc, len],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().jump(called, &[r.into()]);
+        self.b.switch_to_block(other);
         // An instance (a `functools.lru_cache` wrapper's call) takes the
         // site's cache too.
         let is_inst = self
