@@ -14583,6 +14583,15 @@ impl Interpreter {
                             let (callee, self_slot) =
                                 unsafe { (&*base.add(len - argc - 2), &*base.add(len - argc - 1)) };
                             let body = match (callee, self_slot) {
+                                // A native method called unbound
+                                // (`object.__setattr__(self, n, v)`): its
+                                // receiver is the first argument.
+                                (Object::Builtin(b), Object::Unbound)
+                                    if b.binds_instance && argc > 0 =>
+                                {
+                                    // SAFETY: as above, with an argument.
+                                    Some((b, Some(unsafe { &*base.add(len - argc) })))
+                                }
                                 (Object::Builtin(b), Object::Unbound) => Some((b, None)),
                                 (Object::Builtin(b), recv) => Some((b, Some(recv))),
                                 (Object::BoundMethod(bm), Object::Unbound)
@@ -30627,7 +30636,10 @@ impl Interpreter {
         cache_pc: u32,
         name_idx: u32,
     ) -> Option<(Object, Object)> {
-        match Self::leaf_load_type_attr(code, cls, cache_pc, name_idx)? {
+        let Some(v) = Self::leaf_load_type_attr(code, cls, cache_pc, name_idx) else {
+            return Self::type_setattr_pair(code, cls, name_idx);
+        };
+        match v {
             // (A native one's, `int.from_bytes`, as the full leaf arm takes
             // it.)
             Object::BoundMethod(bm)
@@ -30642,6 +30654,34 @@ impl Interpreter {
                 Some((bm.function.clone(), bm.receiver.clone()))
             }
             v => Some((v, Object::Unbound)),
+        }
+    }
+
+    /// [`Self::type_method_pair`] for the attribute protocol's own dunders
+    /// (`object.__setattr__(self, name, value)`, a frozen dataclass's
+    /// stores), which `type` defines only as non-data slot wrappers, so the
+    /// class's MRO answers (CPython's `type_getattro`): its native method
+    /// or Python function, with an empty self slot, as the class's dict
+    /// holds it. `None` for anything else.
+    #[inline(never)]
+    fn type_setattr_pair(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        name_idx: u32,
+    ) -> Option<(Object, Object)> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if !matches!(name, "__setattr__" | "__delattr__" | "__getattribute__")
+            || !Self::plain_metaclass(cls)
+            || cls.native_kind.get() != 0
+            || (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin)
+            || crate::object::exotic_str_keys_possible()
+        {
+            return None;
+        }
+        match cls.lookup(name)? {
+            f @ Object::Function(_) => Some((f, Object::Unbound)),
+            b @ Object::Builtin(_) => Some((b, Object::Unbound)),
+            _ => None,
         }
     }
 
@@ -30667,11 +30707,19 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
             return None;
         }
-        // The metaclass's MRO has no entry for the name (its own leaf
-        // attribute cache remembers the walk per version).
+        // The metaclass's MRO has no entry for the name, or a non-data one
+        // the class's own entry outranks (`EnumType.__new__` under
+        // `Color.__new__`; its own leaf attribute cache remembers the walk
+        // per version). A class without an entry of its own declines below.
         if !matches!(
             Self::leaf_class_attr(code, meta, name_idx),
-            Some(LeafAttr::InstanceOnly)
+            Some(
+                LeafAttr::InstanceOnly
+                    | LeafAttr::Method(_)
+                    | LeafAttr::Value(_)
+                    | LeafAttr::ClassMethod(_)
+                    | LeafAttr::BuiltinMethod(_)
+            )
         ) {
             return None;
         }

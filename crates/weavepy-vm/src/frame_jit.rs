@@ -7002,6 +7002,11 @@ unsafe extern "C" fn h_call(
         // builtin type's method, a common builtin function), whose body may
         // run Python code: through the lane, which reloads after.
         let body = match (&ops[0], &ops[1]) {
+            // A native method called unbound (`object.__setattr__(self, n,
+            // v)`): its receiver is the first argument.
+            (Object::Builtin(b), Object::Unbound) if b.binds_instance && ops.len() > 2 => {
+                Some((b, Some(&ops[2])))
+            }
             (Object::Builtin(b), Object::Unbound) => Some((b, None)),
             (Object::Builtin(b), recv) => Some((b, Some(recv))),
             (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
