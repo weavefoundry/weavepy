@@ -24085,11 +24085,15 @@ impl Interpreter {
                             }
                             // `Cls.cm(...)`: a class method's function with
                             // the class in the self slot (the call the bound
-                            // method makes).
+                            // method makes), a native one's (`int.from_bytes`)
+                            // as the full leaf arm takes it.
                             Some(Object::BoundMethod(bm))
                                 if matches!(
                                     (&bm.function, &bm.receiver),
                                     (Object::Function(_), Object::Type(_))
+                                ) || matches!(
+                                    (&bm.function, &bm.receiver),
+                                    (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
                                 ) =>
                             {
                                 let Some(top) = stack.last_mut() else {
