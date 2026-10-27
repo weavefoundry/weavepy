@@ -16250,7 +16250,10 @@ impl Interpreter {
                 builtins::method_memo_tag(recv)?;
                 builtin_method_via_call(b.name).then_some(true)
             }
-            None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
+            // (One the dispatch doesn't know by name runs its body
+            // directly, as the dispatch ends up running it.)
+            None => (!b.binds_instance && builtin_fn_lane_ok(b.name))
+                .then(|| builtin_needs_interp(b.name)),
         }
     }
 
