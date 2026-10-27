@@ -5606,6 +5606,33 @@ unsafe extern "C" fn h_property(
                 return 0;
             }
         }
+        // A builtin container's method read as a value (`string.split` in
+        // `urllib.parse.unquote`): the bound method, built in place as the
+        // core loop's plain-attribute lane builds it (no code runs).
+        if matches!(
+            &*recv,
+            Object::Str(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Bytes(_)
+                | Object::Tuple(_)
+        ) && (local != 0 || droppable(&*recv))
+        {
+            let code = &*code;
+            let interp = &*st.interp;
+            if let Some(v) =
+                interp.leaf_plain_attr_value(code, Some(&*recv), code.instructions[pc].arg, None)
+            {
+                let at = st.stack.add(slot);
+                if local == 0 {
+                    crate::drop_hot(at.read());
+                }
+                at.write(v);
+                return 0;
+            }
+        }
         let Object::Instance(inst) = &*recv else {
             return lane(st);
         };
