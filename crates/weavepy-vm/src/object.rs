@@ -11759,6 +11759,15 @@ impl Object {
                 let quote = if has_single && !has_double { '"' } else { '\'' };
                 let mut out = String::with_capacity(s.len() + 2);
                 out.push(quote);
+                // Printable ASCII other than the backslash and the quote,
+                // the usual string, is copied whole.
+                if s.bytes()
+                    .all(|b| (0x20..0x7f).contains(&b) && b != b'\\' && b != quote as u8)
+                {
+                    out.push_str(s);
+                    out.push(quote);
+                    return out;
+                }
                 for c in s.chars() {
                     match c {
                         '\\' => out.push_str("\\\\"),
