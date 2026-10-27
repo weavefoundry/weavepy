@@ -21700,7 +21700,12 @@ impl Interpreter {
         leaf_kwonly_defaults(f, code_rc, args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -22180,7 +22185,12 @@ impl Interpreter {
         leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL` site of the frame JIT that
@@ -22189,6 +22199,7 @@ impl Interpreter {
     /// parameters, the last `missing` positional ones and every
     /// keyword-only one from the defaults), so only the checks that can
     /// change from call to call remain.
+    #[inline(always)]
     pub(crate) fn site_leaf_eval(
         &self,
         ops: &[Object],
@@ -22204,7 +22215,10 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let pure = code_is_pure_leaf(code_rc);
         let effect = !pure && code_is_effect_leaf(code_rc);
-        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+        // (Unlike the core loop's, no warm-up gate: the evaluation's own
+        // bookkeeping sends the call that makes the callee due to the
+        // framed path, see `Self::leaf_call_entry`.)
+        if !(pure || effect) {
             return None;
         }
         if missing > 0
@@ -22240,7 +22254,49 @@ impl Interpreter {
             leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
         }
         let arity = nargs + missing + code_rc.kwonly_count as usize;
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
+    }
+
+    /// [`Self::pure_leaf_call`]'s lane for a warm general leaf whose plan
+    /// has native code, entered from here: `None` when the lane doesn't
+    /// apply (the caller takes the shared path), otherwise the
+    /// evaluation's result (`None` within: declined, and counted as
+    /// `pure_leaf_call` counts it).
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    fn leaf_native_lane(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        effect: bool,
+        depth: usize,
+    ) -> Option<Option<Object>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ext = code_vm_ext_existing(code)?;
+        if ext.pure_leaf.load(Relaxed) >= 3 {
+            return None;
+        }
+        let tries = ext.leaf_tries.load(Relaxed);
+        let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
+        if bails >= LEAF_BAIL_LIMIT && bails > done {
+            return Some(None);
+        }
+        let r = if effect {
+            self.leaf_site_native::<true>(code, ext, f, args, depth)
+        } else {
+            self.leaf_site_native::<false>(code, ext, f, args, depth)
+        }?;
+        let bump = if r.is_some() { 1 } else { 1 << 32 };
+        if bails < u64::from(u32::MAX) && done < u64::from(u32::MAX) {
+            ext.leaf_tries.store(tries + bump, Relaxed);
+        }
+        Some(r)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the

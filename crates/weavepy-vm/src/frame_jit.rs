@@ -5933,25 +5933,39 @@ unsafe fn direct_call<const CALL: bool>(
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
-            let leaf = CALL && (site.leaf_key == key || site.alt_leaf_key == key);
-            if leaf {
-                // The site's frameless leaf, evaluated in place.
-                let missing = if site.leaf_key == key {
-                    site.leaf_missing
+            // A frameless leaf evaluates in place, which costs less than an
+            // activation (even one with a body): the site's two leaves,
+            // or any other (a site that calls several, as an operator
+            // table's lambdas, takes them all, caching the first two).
+            let cached = CALL && (site.leaf_key == key || site.alt_leaf_key == key);
+            let leaf = if cached {
+                Some(if site.leaf_key == key {
+                    site.leaf_missing as usize
                 } else {
-                    site.alt_leaf_missing
-                };
-                if leaf_site_call(st, start, len, missing as usize) {
+                    site.alt_leaf_missing as usize
+                })
+            } else if CALL {
+                site_leaf_fits(f, code_rc, nargs).inspect(|&missing| {
+                    if site.alt_leaf_key == 0 {
+                        site.fill_leaf(code_rc, has_self, missing);
+                        site.retry = 64;
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(missing) = leaf {
+                if leaf_site_call(st, start, len, missing) {
                     return Some(0);
                 }
-                // Declined (a leaf that keeps bailing, or one not warm
-                // yet): an ordinary call, unless a body compiled since,
-                // which every few declines check for.
+                // Declined (a leaf that keeps bailing, or a check that
+                // failed): its body, if it has one, from then on (see
+                // below); otherwise an ordinary call, the body looked for
+                // again every few declines.
                 if site.retry != 0 {
                     site.retry -= 1;
                     return Some(call_activation_out(st, pc, start, len));
                 }
-                site.retry = 64;
             }
             let (native, missing) = direct_body(f, code_rc, nargs).map_or((0, 0), |(n, m)| {
                 (std::ptr::from_ref::<Native>(n) as usize, m)
@@ -5962,17 +5976,9 @@ unsafe fn direct_call<const CALL: bool>(
                 if site.native == 0 {
                     site.fill(code_rc, has_self, 0, 0);
                 }
-                if leaf {
+                if leaf.is_some() {
+                    site.retry = 64;
                     return Some(call_activation_out(st, pc, start, len));
-                }
-                if CALL {
-                    if let Some(missing) = site_leaf_fits(f, code_rc, nargs) {
-                        site.fill_leaf(code_rc, has_self, missing);
-                        if leaf_site_call(st, start, len, missing) {
-                            return Some(0);
-                        }
-                        return Some(call_activation_out(st, pc, start, len));
-                    }
                 }
                 return None;
             }

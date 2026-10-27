@@ -353,11 +353,10 @@ fn enter<const EFFECT: bool>(
     {
         return None;
     }
-    let mut aw = [0u64; 16];
-    for (k, &a) in args.iter().enumerate() {
-        let [t, p] = words(norm(a));
-        aw[2 * k] = t;
-        aw[2 * k + 1] = p;
+    // (Only the arguments' words are written: the code reads no others.)
+    let mut aw = [const { std::mem::MaybeUninit::<[u64; 2]>::uninit() }; 8];
+    for (w, &a) in aw.iter_mut().zip(args) {
+        w.write(words(norm(a)));
     }
     let mut ctx = Ctx {
         out: [0; 4],
@@ -374,7 +373,7 @@ fn enter<const EFFECT: bool>(
     let status = unsafe {
         (native.func)(
             std::ptr::from_mut(&mut ctx).cast::<Ctx<'static>>(),
-            aw.as_ptr(),
+            aw.as_ptr().cast::<u64>(),
         )
     };
     if status != 0 {
