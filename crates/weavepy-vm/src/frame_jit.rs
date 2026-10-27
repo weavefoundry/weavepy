@@ -487,16 +487,21 @@ impl Slot {
 
     /// Count a compiled caller's call into an activation of this code that
     /// had to switch to the core loop for want of a native body: the round
-    /// trip costs about what interpreting the whole body does, so it
-    /// counts the code's length (a call the core loop makes counts a
-    /// tenth of it), and a callee of compiled code compiles sooner.
+    /// trip costs more than interpreting the whole body does, so it counts
+    /// four times the code's length (a call the core loop makes counts a
+    /// tenth of it), and a callee of compiled code compiles after about
+    /// 500 such calls. (Once, a whole length kept `logging`'s and
+    /// `pathlib`'s callees switching for most of a benchmark run.)
     #[inline]
     pub(crate) fn warm_switched(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
         if self.native.get().is_some() {
             return;
         }
         let n = code.instructions.len() as u32;
-        let h = self.heat.load(Ordering::Relaxed).saturating_add(n);
+        let h = self
+            .heat
+            .load(Ordering::Relaxed)
+            .saturating_add(n.saturating_mul(tuning().switch_mul));
         self.heat.store(h, Ordering::Relaxed);
         if h >= hot().saturating_mul(n) {
             self.heat.store(0, Ordering::Relaxed);
@@ -950,12 +955,15 @@ struct Tuning {
     body_min: usize,
     /// An activation's heat: the code's length over this.
     call_div: u32,
+    /// What a compiled caller's switched call of code without a native
+    /// body counts, in lengths of the code (see `Slot::warm_switched`).
+    switch_mul: u32,
 }
 
 fn tuning() -> Tuning {
     static T: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        let mut v = [9usize, 1, 3, 0, 10];
+        let mut v = [9usize, 1, 3, 0, 10, 4];
         if let Ok(s) = std::env::var("WEAVEPY_FRAME_JIT_TUNE") {
             for (slot, x) in v.iter_mut().zip(s.split(',')) {
                 if let Ok(x) = x.trim().parse() {
@@ -969,6 +977,7 @@ fn tuning() -> Tuning {
             exit: v[2],
             body_min: v[3],
             call_div: (v[4] as u32).max(1),
+            switch_mul: (v[5] as u32).max(1),
         }
     })
 }
@@ -5651,6 +5660,15 @@ unsafe extern "C" fn h_property(
         match direct_call_out(st, pc, slot, slot + 2, &mut *site, None) {
             None => {
                 let f = at.read();
+                // The getter of compiled code runs as a switched call: it
+                // warms as one (see `Slot::warm_switched`).
+                if let Object::Function(f) = &f {
+                    let code = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&code) {
+                        ext.frame_jit
+                            .warm_switched(&code, ext, code.varnames.len().max(1));
+                    }
+                }
                 if local != 0 {
                     crate::drop_hot(at.add(1).read());
                 } else {
