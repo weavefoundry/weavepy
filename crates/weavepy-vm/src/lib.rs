@@ -55045,6 +55045,29 @@ impl Interpreter {
                     }
                     ("repr", 1) => return self.do_repr_call(&args[0], outer_globals),
                     ("str", 1) => return self.do_str_call(&args[0], outer_globals),
+                    // `object.__new__(cls, ...)`, object's allocator (the
+                    // chain's `__new__` arms are `type.__new__`'s). From
+                    // Python code it refuses a class that a built-in type's
+                    // own `__new__` allocates (`dict`, a `dict` subclass,
+                    // `type` or a metaclass): object's allocator can't stand
+                    // in (CPython `tp_new_wrapper`'s safety check). (The
+                    // construction paths call the allocator directly.)
+                    ("__new__", _) if is_object_new(b) => {
+                        if let Some(Object::Type(cls)) = args.first() {
+                            if let Some(base) = object_new_unsafe(cls) {
+                                return Err(type_error(format!(
+                                    "object.__new__({}) is not safe, use {}.__new__()",
+                                    cls.name, base
+                                )));
+                            }
+                        }
+                        if let Some(call_kw) = b.call_kw.as_ref() {
+                            return call_kw(args, kwargs);
+                        }
+                        if kwargs.is_empty() {
+                            return (b.call)(args);
+                        }
+                    }
                     _ => {}
                 }
                 if builtin_needs_interp(b.name) {
@@ -55146,23 +55169,6 @@ impl Interpreter {
                     // whose merge below must not take it.
                     if b.name == "__init__" && is_object_init(b) {
                         return crate::builtin_types::object_init_call(args, !kwargs.is_empty());
-                    }
-                    // `object.__new__(cls, ...)` from Python code of a class
-                    // a built-in type's own `__new__` allocates (`dict`, a
-                    // `dict` subclass, `type` or a metaclass): object's
-                    // allocator can't stand in (CPython `tp_new_wrapper`'s
-                    // safety check), so this neither takes the
-                    // class-building route below nor allocates. (The
-                    // construction paths call the allocator directly.)
-                    if b.name == "__new__" && is_object_new(b) {
-                        if let Some(Object::Type(cls)) = args.first() {
-                            if let Some(base) = object_new_unsafe(cls) {
-                                return Err(type_error(format!(
-                                    "object.__new__({}) is not safe, use {}.__new__()",
-                                    cls.name, base
-                                )));
-                            }
-                        }
                     }
                     // `type.__new__(mcs, name, bases, ns)` — invoked from
                     // user metaclasses via `super().__new__(...)`. Route
@@ -71864,18 +71870,6 @@ fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
 /// in for. That class's name, for the error, or `None` when `object`'s
 /// allocator serves (or the native type is one WeavePy alone builds).
 fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
-    let mro = cls.mro.borrow();
-    let base = mro.iter().find(|t| {
-        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
-            && !matches!(
-                t.lookup("__new__"),
-                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
-            )
-    })?;
-    let (new, owner) = base.lookup_with_owner("__new__")?;
-    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
-        return None;
-    }
     let bt = builtin_types();
     let core = [
         &bt.int_,
@@ -71892,9 +71886,25 @@ fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
         &bt.frozenset_,
         &bt.type_,
     ];
-    core.iter()
-        .any(|t| Rc::ptr_eq(t, &owner))
-        .then(|| base.name.clone())
+    let is_core = |t: &TypeObject| core.iter().any(|c| std::ptr::eq(Rc::as_ptr(c), t));
+    let mro = cls.mro.borrow();
+    // (A class with no core built-in on its MRO, the common case, is
+    // decided without a lookup.)
+    if !mro.iter().any(|t| is_core(t)) {
+        return None;
+    }
+    let base = mro.iter().find(|t| {
+        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
+            && !matches!(
+                t.lookup("__new__"),
+                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
+            )
+    })?;
+    let (new, owner) = base.lookup_with_owner("__new__")?;
+    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
+        return None;
+    }
+    is_core(&owner).then(|| base.name.clone())
 }
 
 /// Whether `b` is `object.__init__` (the process-wide builtin), which
