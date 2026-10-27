@@ -7867,17 +7867,31 @@ unsafe extern "C" fn h_call_forward(
     code: *const CodeObject,
     pc: u64,
     len: u64,
+    site: *mut DirectSite,
 ) -> u32 {
     // SAFETY: the code passes its live state, its own code, one of its
-    // forwarding `BUILD_MAP`s and its stack depth.
+    // forwarding `BUILD_MAP`s, its stack depth and the call's own cache.
     unsafe {
-        let _ = code;
         let st = &mut *st;
         let (pc, len) = (pc as usize, len as usize);
         if st.sw.is_null() || len < 3 {
             return CALL_DECLINED;
         }
         let start = len - 3;
+        // No keywords to forward (`**kwargs` empty): the spread's direct
+        // call (see `spread_direct`), the call's own `CALL_FUNCTION_EX`
+        // three on.
+        let kw = (&*code).instructions.get(pc + 1).map(|i| i.arg as usize);
+        if len < st.cap
+            && kw.is_some_and(|k| {
+                matches!(&*st.locals.add(k), Object::Dict(d) if d.try_borrow().is_ok_and(|d| d.is_empty()))
+            })
+        {
+            st.stack.add(len).write(Object::Unbound);
+            if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
+                return r;
+            }
+        }
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
@@ -13956,10 +13970,17 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        // The call's direct-call cache (see `spread_direct`).
+        let site: Box<DirectSite> = Box::default();
+        let site_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+        self.direct_sites.push(site);
         let r = self
             .call(
                 h_call_forward as *const () as usize,
-                &[self.st, code, pcv, len],
+                &[self.st, code, pcv, len, site_at],
                 true,
             )
             .expect("returns");

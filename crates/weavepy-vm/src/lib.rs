@@ -30814,6 +30814,32 @@ impl Interpreter {
         }
     }
 
+    /// The method load (`LOAD_ATTR` with the method flag) of
+    /// `co_names[name_idx]` on the class `cls`, as the full handler loads
+    /// it: the attribute [`Self::leaf_load_type_attr`] reads with an empty
+    /// self slot (a class's attribute is never bound to it), a class
+    /// method's function with the class in the self slot (the call its
+    /// bound method makes). `None` for what the full handler must load.
+    #[inline]
+    pub(crate) fn type_method_pair(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<(Object, Object)> {
+        match Self::leaf_load_type_attr(code, cls, cache_pc, name_idx)? {
+            Object::BoundMethod(bm)
+                if matches!(
+                    (&bm.function, &bm.receiver),
+                    (Object::Function(_), Object::Type(_))
+                ) =>
+            {
+                Some((bm.function.clone(), bm.receiver.clone()))
+            }
+            v => Some((v, Object::Unbound)),
+        }
+    }
+
     /// `cls.__name__` / `cls.__qualname__` as `type`'s getsets answer
     /// them (the full path's first case): a `str` the class's own dict
     /// holds, else the class's interned name, when the metaclass keeps the
@@ -30851,32 +30877,6 @@ impl Interpreter {
             }
         }
         Some(Object::interned_str(&cls.name))
-    }
-
-    /// The method load (`LOAD_ATTR` with the method flag) of
-    /// `co_names[name_idx]` on the class `cls`, as the full handler loads
-    /// it: the attribute [`Self::leaf_load_type_attr`] reads with an empty
-    /// self slot (a class's attribute is never bound to it), a class
-    /// method's function with the class in the self slot (the call its
-    /// bound method makes). `None` for what the full handler must load.
-    #[inline]
-    pub(crate) fn type_method_pair(
-        code: &CodeObject,
-        cls: &Rc<TypeObject>,
-        cache_pc: u32,
-        name_idx: u32,
-    ) -> Option<(Object, Object)> {
-        match Self::leaf_load_type_attr(code, cls, cache_pc, name_idx)? {
-            Object::BoundMethod(bm)
-                if matches!(
-                    (&bm.function, &bm.receiver),
-                    (Object::Function(_), Object::Type(_))
-                ) =>
-            {
-                Some((bm.function.clone(), bm.receiver.clone()))
-            }
-            v => Some((v, Object::Unbound)),
-        }
     }
 
     /// [`Self::leaf_load_type_attr`] for a class whose metaclass is a
@@ -60120,7 +60120,10 @@ impl Interpreter {
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
         let n = args.len() + usize::from(recv.is_some());
+        // (A surplus positional must raise, not bind a keyword-only
+        // parameter: the full binder's.)
         if n > MAX_ARGS
+            || n > code.arg_count as usize
             || !code_is_pure_leaf(code)
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
