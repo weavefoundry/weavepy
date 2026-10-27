@@ -9982,6 +9982,17 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
 /// `wpjit_build_list` and `wpjit_build_tuple`). `None` on a tag the
 /// literal lanes never produce (a compiler invariant break — the
 /// caller deopts defensively).
+/// Whether [`boxed_element`] gives an object for this entry.
+#[inline]
+fn boxable_element(ctx: &CallCtx, bits: u64, tag: u32) -> bool {
+    match SlotTag::from_raw(tag) {
+        SlotTag::Int | SlotTag::Float | SlotTag::Bool => true,
+        SlotTag::ObjPin if bits == u64::MAX => true,
+        SlotTag::ObjPin | SlotTag::ListPin => (bits as usize) < ctx.pins.len(),
+        _ => false,
+    }
+}
+
 fn boxed_element(ctx: &CallCtx, bits: u64, tag: u32) -> Option<Object> {
     Some(match SlotTag::from_raw(tag) {
         SlotTag::Int => Object::Int(bits as i64),
@@ -10099,18 +10110,29 @@ unsafe extern "C" fn wpjit_build_tuple(frame: *mut JitFrame, n: i64) -> i64 {
         return -1;
     }
     let n = n as usize;
-    let mut items = Vec::with_capacity(n);
-    for j in 0..n {
-        // SAFETY: per the function contract, `n` marshaled entries
-        // and tags are live.
-        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
-        match boxed_element(ctx, bits, tag) {
-            Some(o) => items.push(o),
-            None => return -1,
-        }
+    // SAFETY: per the function contract, `n` marshaled entries and tags
+    // are live.
+    let entry = |j: usize| unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+    // Every element checked first, so the tuple is built in its own
+    // allocation with no staging vector.
+    if (0..n).any(|j| {
+        let (bits, tag) = entry(j);
+        !boxable_element(ctx, bits, tag)
+    }) {
+        return -1;
     }
+    let tuple = if n == 0 {
+        Object::new_tuple(Vec::new())
+    } else {
+        Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
+            (0..n).map(|j| {
+                let (bits, tag) = entry(j);
+                boxed_element(ctx, bits, tag).unwrap_or(Object::None)
+            }),
+        ))
+    };
     let idx = ctx.pins.len() as i64;
-    ctx.pins.push(Pin::Obj(Object::new_tuple(items)));
+    ctx.pins.push(Pin::Obj(tuple));
     idx
 }
 
