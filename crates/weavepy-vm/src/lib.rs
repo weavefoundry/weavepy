@@ -28428,6 +28428,65 @@ impl Interpreter {
         Self::instance_dunder_function(ai, std::ptr::addr_of!(BINOP_KEYS[k]) as usize, dunder)
     }
 
+    /// `type(inst).<name>` when it is a native function (`dict.__setitem__`
+    /// under a `defaultdict`, `OrderedDict`'s own), one a built-in base
+    /// supplies when `builtin_owner`, cached on the class under its
+    /// attribute version at `key` (an address no interned name has; one
+    /// per dunder and choice).
+    fn instance_native_dunder(
+        inst: &PyInstance,
+        key: usize,
+        name: &str,
+        builtin_owner: bool,
+    ) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => Some(b.clone()),
+            Some(_) => None,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return None;
+                }
+                let kind = match cls.lookup_with_owner(name) {
+                    Some((Object::Builtin(b), owner))
+                        if if builtin_owner {
+                            owner.flags.is_builtin && b.binds_instance
+                        } else {
+                            true
+                        } =>
+                    {
+                        K::BuiltinMethod(b)
+                    }
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::BuiltinMethod(b) => Some(b.clone()),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
+        }
+    }
+
+    /// Whether `inst`'s `__getitem__` is a built-in base's own over its
+    /// native payload (a `defaultdict`'s): the native subscript serves it.
+    fn native_payload_getitem(inst: &PyInstance) -> bool {
+        /// The class cache key for a native `__getitem__` (see
+        /// `instance_native_dunder`).
+        static NATIVE_GETITEM_KEY: u8 = 0;
+        inst.native.get().is_some()
+            && Self::instance_native_dunder(
+                inst,
+                std::ptr::addr_of!(NATIVE_GETITEM_KEY) as usize,
+                "__getitem__",
+                true,
+            )
+            .is_some()
+    }
+
     /// Call a class's dunder `f` (see [`Self::instance_dunder_function`])
     /// with `args` (the instance first): a warm pure or effect leaf
     /// evaluates in place, anything else runs as an ordinary call.
@@ -30549,7 +30608,13 @@ impl Interpreter {
             };
         }
         if !Self::plain_metaclass(cls) {
-            return Self::leaf_load_meta_class_attr(code, cls, name_idx);
+            // (The site remembers an object's entry under both versions.)
+            if let Some(v) = meta_entry_hit(code, cls, cache_pc as usize) {
+                return Some(v);
+            }
+            let v = Self::leaf_load_meta_class_attr(code, cls, name_idx)?;
+            meta_entry_fill(code, cls, cache_pc as usize, &v);
+            return Some(v);
         }
         // A natively served class method (`datetime.fromisoformat`; see
         // `stdlib::datetime_native`), bound as `classmethod.__get__`
@@ -31434,9 +31499,9 @@ impl Interpreter {
             // types (`os.stat_result`) whose `__getitem__` is a genuine
             // custom method: with no native payload the native subscript
             // has nothing to index, so honour the method instead.
-            let user_getitem = inst
-                .cls()
-                .lookup_with_owner("__getitem__")
+            let user_getitem = (!Self::native_payload_getitem(inst))
+                .then(|| inst.cls().lookup_with_owner("__getitem__"))
+                .flatten()
                 .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.get().is_none())
                 .map(|(m, _)| m);
             if let Some(m) = user_getitem {
@@ -43997,9 +44062,9 @@ impl Interpreter {
                 }
                 return self.call(&Object::Function(f), &[v.clone(), i.clone()], &[], &g);
             }
-            let user_getitem = inst
-                .cls()
-                .lookup_with_owner("__getitem__")
+            let user_getitem = (!Self::native_payload_getitem(inst))
+                .then(|| inst.cls().lookup_with_owner("__getitem__"))
+                .flatten()
                 .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.get().is_none())
                 .map(|(m, _)| m);
             if let Some(m) = user_getitem {
@@ -44102,6 +44167,33 @@ impl Interpreter {
             ) {
                 self.call_dunder_function(f, &[target.clone(), i.clone(), value])?;
                 return Ok(());
+            }
+            /// The class cache key for a native `__setitem__` (see
+            /// `instance_native_dunder`).
+            static NATIVE_SETITEM_KEY: u8 = 0;
+            // A built-in base's own `__setitem__` (an `OrderedDict`'s, a
+            // `defaultdict`'s): its body on the instance, with no bound
+            // method built for it.
+            if let Some(b) = Self::instance_native_dunder(
+                inst,
+                std::ptr::addr_of!(NATIVE_SETITEM_KEY) as usize,
+                "__setitem__",
+                false,
+            ) {
+                if matches!(i, Object::Slice(_))
+                    && inst.native.get().is_some()
+                    && b.name == "__setitem__"
+                {
+                    return self.store_subscr(target, i, value, &g);
+                }
+                if native_call_ic_safe(b.name) && !matches!(i, Object::Slice(_)) {
+                    let args = [target.clone(), i.clone(), value];
+                    match b.call_kw.as_ref() {
+                        Some(call_kw) => call_kw(&args, &[])?,
+                        None => (b.call)(&args)?,
+                    };
+                    return Ok(());
+                }
             }
             if let Some(method) = instance_method(target, "__setitem__") {
                 // Slice assignment detours to `store_subscr` only for a VM
@@ -78445,6 +78537,75 @@ fn class_entry_fill(
         slot.set([cls.attr_version.get(), CLASS_ATTR_ENTRY ^ via, bits]);
         slot.1.set(owner);
     }
+}
+
+/// A `LOAD_ATTR` site's stamp tag for an attribute of a class under a
+/// Python metaclass that doesn't intercept the name (see
+/// `Interpreter::leaf_load_meta_class_attr`; an enum's members): the bits
+/// locate the class's entry as [`CLASS_ATTR_ENTRY`]'s do, and the slot's
+/// value word is the metaclass's version, which the class's doesn't follow.
+const META_CLASS_ENTRY: u64 = 0x5ca1_a770_0000_000b;
+
+/// The metaclass-class attribute the `LOAD_ATTR` site at `pc` remembers
+/// for `cls` (see [`META_CLASS_ENTRY`]), while both versions stand.
+#[inline]
+fn meta_entry_hit(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize) -> Option<Object> {
+    let slot = code_stamp_slot(code, pc as u32)?;
+    let [ver, tag, bits] = slot.get();
+    if tag != META_CLASS_ENTRY || ver != cls.attr_version.get() {
+        return None;
+    }
+    // SAFETY: GIL-serialized raw read; the reference ends with the compare.
+    let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+    if slot.value() != meta.attr_version.get() {
+        return None;
+    }
+    // SAFETY: reads between two instructions, running no code; the view
+    // ends with the value's clone.
+    let mro = unsafe { cls.mro.peek() }?;
+    // SAFETY: as above.
+    let d = unsafe { mro.get((bits >> 32) as usize)?.dict.peek() }?;
+    let (k, v) = d.get_index(bits as u32 as usize)?;
+    slot_name_matches(code, code.instructions.get(pc)?.arg, k).then(|| clone_hot(v))
+}
+
+/// Remember at the `LOAD_ATTR` site at `pc` that `cls`, under its Python
+/// metaclass, answered `v` (see [`META_CLASS_ENTRY`]): a value no access
+/// can bind or call `__get__` on, or an instance of `cls` itself (an
+/// enum's member), whose class's changes move `cls`'s version.
+#[cold]
+fn meta_entry_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) {
+    let plain = match v {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_)
+        | Object::Long(_)
+        | Object::Tuple(_)
+        | Object::FrozenSet(_)
+        | Object::Module(_) => true,
+        Object::Instance(i) => std::ptr::eq(i.cls_raw(), cls),
+        _ => false,
+    };
+    if !plain {
+        return;
+    }
+    // SAFETY: GIL-serialized raw read.
+    let Some(meta_ver) =
+        (unsafe { (*cls.metaclass.as_ptr()).as_ref() }).map(|m| m.attr_version.get())
+    else {
+        return;
+    };
+    let (Some(slot), Some(bits)) = (
+        code_stamp_slot(code, pc as u32),
+        class_entry_of(code, cls, pc, v),
+    ) else {
+        return;
+    };
+    slot.set([cls.attr_version.get(), META_CLASS_ENTRY, bits]);
+    slot.1.set(meta_ver);
 }
 
 /// A `LOAD_ATTR` site's stamp tag for a class attribute that is an object

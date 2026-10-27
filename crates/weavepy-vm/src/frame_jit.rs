@@ -3961,6 +3961,15 @@ unsafe extern "C" fn h_load_method(
             }
         }
         let Some(ms) = ext.method_slot(pc) else {
+            // An attribute the instance holds itself (a stored callable,
+            // `self.fget(x)`), at a site that never needed a method slot.
+            if let Object::Instance(inst) = &*top {
+                if Interpreter::default_getattribute(inst.cls_raw())
+                    && crate::inst_may_shadow(inst, code, name)
+                {
+                    return u32::from(!Interpreter::core_value_method(code, name, pc, top));
+                }
+            }
             return 1;
         };
         let f = match &*top {
