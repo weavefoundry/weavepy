@@ -14373,6 +14373,19 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // A generator expression's `CALL 0`: its pending
+                        // generator takes the iterator, and is the result
+                        // (see `Self::make_genexp`).
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        if argc == 0
+                            && matches!(unsafe { &*base.add(len - 2) }, Object::Generator(_))
+                            && unsafe { Self::finish_genexp_at(base.add(len - 2)) }
+                        {
+                            len -= 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         // A `functools.lru_cache` wrapper's call: a cache hit
                         // in place, a miss's function in the wrapper's place.
                         // SAFETY: `len >= argc + 2`: the call's operands.
@@ -17628,8 +17641,10 @@ impl Interpreter {
                 let globals = frame.globals.clone();
                 frame.pc = pc as u32 + 1;
                 let pending = self.core_pending_enter(sw, frame, pc);
-                let tuple_ty = Object::Type(builtin_types().tuple_.clone());
-                let r = self.call(&tuple_ty, std::slice::from_ref(&spread), &[], &globals);
+                // `tuple(gen)`'s drain, without the type call around it.
+                let r = self
+                    .collect_iterable(&spread, &globals)
+                    .map(Object::new_tuple);
                 self.lean_pending_exit(pending);
                 drop(spread);
                 // SAFETY: as in `core_type_lane` (the iteration ran nested
@@ -25687,6 +25702,19 @@ impl Interpreter {
                         || !matches!(stack.last(), Some(Object::Code(_)))
                     {
                         break;
+                    }
+                    // A generator expression's: its generator, pending.
+                    if let Some((gen, k)) =
+                        self.genexp_make_at(instrs, pc, stack, globals, builtins)
+                    {
+                        for _ in 0..=k {
+                            let v = stack.pop().expect("checked above");
+                            self.release(v);
+                        }
+                        stack.push(gen);
+                        last = pc + k;
+                        pc += 1 + k;
+                        continue;
                     }
                     let mut defaults: Option<Vec<Object>> = None;
                     let mut closure: Option<Vec<Object>> = None;
@@ -55543,6 +55571,15 @@ impl Interpreter {
             // repr'd by `m.def` while rendering a default argument)
             // reaches this dispatch as a plain foreign value.
             Object::Foreign(s) => crate::foreign::call(s, args, kwargs),
+            // A generator expression's `CALL 0` (its iterator the self
+            // slot's argument) the fast paths left here (see
+            // `Self::make_genexp`).
+            Object::Generator(_)
+                if args.len() == 1 && kwargs.is_empty() && Self::is_pending_genexp(callable) =>
+            {
+                Self::finish_genexp(callable, args[0].clone());
+                Ok(callable.clone())
+            }
             _ => {
                 if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
                     eprintln!(
@@ -60450,13 +60487,27 @@ impl Interpreter {
         cells: Rc<Vec<Rc<RefCell<Object>>>>,
         start: usize,
     ) -> Frame {
+        Self::gen_frame_in(&f.globals, &f.builtins, code, locals, stack, cells, start)
+    }
+
+    /// [`Self::gen_frame_lean`] with the `globals` and `builtins` given.
+    #[inline]
+    fn gen_frame_in(
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        stack: frame_slots::FrameStack,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        start: usize,
+    ) -> Frame {
         Frame {
             code,
             locals: frame_slots::FrameLocals::from_shared(locals),
             cells,
             stack,
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
+            globals: globals.clone(),
+            builtins: builtins.clone(),
             rare: None,
             exc: None,
             agen_yielded_value: true,
@@ -60470,6 +60521,167 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             parked_native: None,
         }
+    }
+
+    /// A generator expression's generator, made by its `MAKE_FUNCTION` (the
+    /// closure's cells `closure`, the running frame's `globals` and
+    /// `builtins`) in place of the function its `CALL 0` would make it from
+    /// and drop at once: nothing can reach that function but the call, so
+    /// the generator stands in for it on the operand stack, pending (see
+    /// [`PyGenerator::genexp_pending`]) until the call hands it its
+    /// iterator ([`Self::finish_genexp`]). `None`, with nothing made, for
+    /// any other code, or where a call wouldn't take the fast start (see
+    /// [`Self::generator_start`]).
+    pub(crate) fn make_genexp(
+        &self,
+        code: &Rc<CodeObject>,
+        closure: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<Object> {
+        // The compiler's `<genexpr>` (only a comprehension has a `.0`): a
+        // plain generator of its iterator alone, without cells of its own.
+        if !code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.arg_count != 1
+            || !code.cellvars.is_empty()
+            || closure.len() != code.freevars.len()
+            || code.varnames.first().is_none_or(|n| &**n != ".0")
+        {
+            return None;
+        }
+        let ext = code_vm_ext(code)?;
+        let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext)?,
+            u32::MAX => return None,
+            at => (at & !GEN_DELEGATES) as usize - 1,
+        };
+        if crate::trace::eval_frame_record_active()
+            || crate::trace::any_observers_active()
+            || gc_trace::auto_collect_due()
+        {
+            return None;
+        }
+        let cells = if closure.is_empty() {
+            crate::object::empty_cells_ref().clone()
+        } else {
+            let mut cells = Vec::with_capacity(closure.len());
+            for c in closure {
+                let Object::Cell(c) = c else {
+                    return None;
+                };
+                cells.push(c.clone());
+            }
+            Rc::new(cells)
+        };
+        let nlocals = code.varnames.len();
+        let GenParts {
+            locals,
+            stack,
+            boxed,
+        } = self.gen_parts(nlocals);
+        // SAFETY: sole owner (see `gen_parts`). (`.0` stays unbound until
+        // the call.)
+        unsafe { (*locals.as_ptr()).resize(nlocals, Object::Unbound) };
+        let frame =
+            Self::gen_frame_in(globals, builtins, code.clone(), locals, stack, cells, start);
+        let frame = Box::write(boxed, frame);
+        let kind = crate::object::CoroutineKind::Generator;
+        let gen = match crate::object::pooled_generator(kind, Object::Code(code.clone()), frame) {
+            Ok(gen) => gen,
+            Err((gen_code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, gen_code, frame)
+            }),
+        };
+        gen.genexp_pending.set(true);
+        Some(Object::Generator(gen))
+    }
+
+    /// [`Self::make_genexp`] for the bare `MAKE_FUNCTION` at `pc` of
+    /// `instrs` whose operands end `ops`: the code atop them, and the
+    /// closure tuple below it when a `SET_FUNCTION_ATTRIBUTE` right after
+    /// attaches one. The pending generator, and how many of those
+    /// instructions it covers (the operands it replaces, but for the code).
+    pub(crate) fn genexp_make_at(
+        &self,
+        instrs: &[weavepy_compiler::Instruction],
+        pc: usize,
+        ops: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<(Object, usize)> {
+        let n = ops.len();
+        let Some(Object::Code(code)) = ops.last() else {
+            return None;
+        };
+        if !code.is_generator {
+            return None;
+        }
+        let attr = |at: usize| {
+            instrs
+                .get(at)
+                .filter(|i| i.op == OpCode::SetFunctionAttribute)
+        };
+        let (closure, k): (&[Object], usize) = match attr(pc + 1) {
+            None => (&[], 0),
+            Some(i) if i.arg == 0x08 && attr(pc + 2).is_none() => {
+                match ops.get(n.wrapping_sub(2)) {
+                    Some(Object::Tuple(items)) => (&items[..], 1),
+                    _ => return None,
+                }
+            }
+            Some(_) => return None,
+        };
+        Some((self.make_genexp(code, closure, globals, builtins)?, k))
+    }
+
+    /// Whether `obj` is a generator expression's pending generator (see
+    /// [`Self::make_genexp`]).
+    #[inline(always)]
+    pub(crate) fn is_pending_genexp(obj: &Object) -> bool {
+        matches!(obj, Object::Generator(g) if g.genexp_pending.get())
+    }
+
+    /// The `CALL 0` of `obj`, a generator expression's pending generator
+    /// (see [`Self::is_pending_genexp`]), with `iter` its iterator: the
+    /// generator takes it as its `.0`, and is an ordinary one from here
+    /// (handed to the collector).
+    pub(crate) fn finish_genexp(obj: &Object, iter: Object) {
+        let Object::Generator(g) = obj else {
+            unreachable!("checked by the caller");
+        };
+        // SAFETY: only the call's operands hold a pending generator, so
+        // nothing has borrowed its state.
+        let GeneratorState::Created(frame) = (unsafe { &mut *g.state_raw().as_ptr() }) else {
+            unreachable!("a pending generator expression is unstarted");
+        };
+        g.genexp_pending.set(false);
+        // SAFETY: the frame's sole owner; `.0`, its first local, holds
+        // `Unbound` (nothing to release).
+        unsafe { frame.locals.as_mut_ptr().write(iter) };
+        gc_trace::track_generator(obj);
+    }
+
+    /// [`Self::finish_genexp`] for the `CALL 0` whose callee is at stack
+    /// slot `at`, the iterator above it: `true` with the iterator moved
+    /// out of its slot (the generator stays in its own, the call's
+    /// result), `false`, touching nothing, for any other callee.
+    ///
+    /// # Safety
+    ///
+    /// `at` and the slot above it are initialized.
+    #[inline(never)]
+    pub(crate) unsafe fn finish_genexp_at(at: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if !Self::is_pending_genexp(&*at) {
+                return false;
+            }
+            Self::finish_genexp(&*at, at.add(1).read());
+        }
+        true
     }
 
     /// The plain generator a call [`Self::gen_send_call`] matched resumes

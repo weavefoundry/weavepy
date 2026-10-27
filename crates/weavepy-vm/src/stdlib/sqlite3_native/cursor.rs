@@ -344,10 +344,6 @@ fn execute_one(
         return Err(e);
     }
 
-    let detect_types = conn.borrow().detect_types;
-    let description = build_description(&stmt, detect_types);
-    let converters = resolve_converters(&stmt, detect_types);
-
     // First step happens eagerly (CPython's `_pysqlite_query_execute`).
     let stepped = stmt.step(db);
     let has_row = match stepped {
@@ -364,6 +360,12 @@ fn execute_one(
             return Err(e);
         }
     };
+    // The columns as the step left them: a cached statement that the
+    // schema changed under was prepared again by that step (a new column
+    // shows in `description`).
+    let detect_types = conn.borrow().detect_types;
+    let description = build_description(&stmt, detect_types);
+    let converters = resolve_converters(&stmt, detect_types);
 
     {
         let mut s = st.borrow_mut();
