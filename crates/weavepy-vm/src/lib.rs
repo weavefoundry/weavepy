@@ -15690,6 +15690,33 @@ impl Interpreter {
                         pc += 1;
                         after_release!();
                     }
+                    // A re-raise this frame's own handler catches (an
+                    // `except` clause that didn't match, a handler's cleanup
+                    // tail): straight to that handler (see `core_reraise`).
+                    OpCode::Reraise => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack, with room to `cap`.
+                        match unsafe {
+                            Self::core_reraise(
+                                code,
+                                &mut frame.exc,
+                                frame.py_frame.is_none(),
+                                ins,
+                                pc,
+                                base,
+                                len,
+                                cap,
+                            )
+                        } {
+                            Some((n, to)) => {
+                                len = n;
+                                last = pc;
+                                pc = to;
+                            }
+                            None => break None,
+                        }
+                        after_release!();
+                    }
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
@@ -19217,6 +19244,90 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// `RERAISE` (`ins` at `pc`) of the exception atop the `len` stack
+    /// slots at `base` (room to `cap`) when a handler of this frame covers
+    /// it, as the `RERAISE` arm, `quiet_catch` and `handle_exception_with`
+    /// together run it: a re-raise records no traceback entry and settles
+    /// no chaining, so the stack unwinds to the handler's depth, its lasti
+    /// slot (the original raise site a cleanup tail carries) and the
+    /// exception go on, and the handler runs next. Returns the new stack
+    /// length and the handler's pc, or `None`, having touched nothing:
+    /// no covering handler, an observer that must see the unwind, or a
+    /// frame object whose line the full path keeps current.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are the frame's initialized operand stack
+    /// entries.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_reraise(
+        code: &CodeObject,
+        exc_state: &mut Option<Box<FrameExc>>,
+        py_frame_free: bool,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<(usize, usize)> {
+        if !py_frame_free || len == 0 || crate::trace::any_observers_active() {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        if !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_)) {
+            return None;
+        }
+        let handler = *find_handler(&code.exception_table, u32::try_from(pc).ok()?)?;
+        let depth = handler.depth as usize;
+        // (The exception and, for a cleanup handler, its lasti slot go on
+        // above the handler's depth.)
+        if depth + 2 > cap || depth > len - 1 {
+            return None;
+        }
+        // `RERAISE k>0`: the original raise offset sits `k` slots below
+        // the exception.
+        let k = ins.arg as usize;
+        let restored = if k != 0 {
+            if k > len - 1 {
+                return None;
+            }
+            // SAFETY: `len - 1 - k < len`.
+            match unsafe { &*base.add(len - 1 - k) } {
+                Object::Int(l) => Some(u32::try_from(*l).unwrap_or(0)),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+        // The offset an earlier cleanup handler recorded, or this one's
+        // (the RERAISE arm's `cleanup_lasti`, `handle_exception_with`'s
+        // `pending_lasti`).
+        let carried = exc_state.as_mut().and_then(|e| {
+            e.pending_lasti = None;
+            e.cleanup_lasti.take()
+        });
+        let lasti = restored.or(carried).unwrap_or(pc as u32);
+        // SAFETY: the exception leaves its slot; the slots above the
+        // handler's depth are released (a release may queue a finalizer:
+        // the caller checks).
+        let exc = unsafe { base.add(len - 1).read() };
+        let mut n = len - 1;
+        while n > depth {
+            n -= 1;
+            drop(unsafe { base.add(n).read() });
+        }
+        if handler.push_lasti {
+            exc_state.get_or_insert_with(Box::default).cleanup_lasti = Some(lasti);
+            // SAFETY: `depth + 2 <= cap`.
+            unsafe { base.add(n).write(Object::Int(i64::from(lasti))) };
+            n += 1;
+        }
+        // SAFETY: as above.
+        unsafe { base.add(n).write(exc) };
+        Some((n + 1, handler.handler as usize))
     }
 
     /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
