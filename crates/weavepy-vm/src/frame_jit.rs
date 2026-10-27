@@ -5004,7 +5004,14 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
         let gen_start = interp.generator_start(f, code_rc, nargs)?;
         let cells = f.lean_cells_ref(code_rc)?;
         let ext = crate::code_vm_ext(code_rc)?;
-        let native = ext.frame_jit.get(code_rc.varnames.len())?;
+        let nlocals = code_rc.varnames.len();
+        let Some(native) = ext.frame_jit.get(nlocals) else {
+            // A compiled caller's await of a body without one: its round
+            // trip costs about what a switched call's does (see
+            // `Slot::warm_switched`).
+            ext.frame_jit.warm_switched(code_rc, ext, nlocals);
+            return None;
+        };
         let from = gen_start + 1;
         if from >= ext.dispatch_len
             || !native.enters_at(from)
