@@ -15722,6 +15722,33 @@ impl Interpreter {
                         pc += 1;
                         after_release!();
                     }
+                    // A re-raise this frame's own handler catches (an
+                    // `except` clause that didn't match, a handler's cleanup
+                    // tail): straight to that handler (see `core_reraise`).
+                    OpCode::Reraise => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack, with room to `cap`.
+                        match unsafe {
+                            Self::core_reraise(
+                                code,
+                                &mut frame.exc,
+                                frame.py_frame.is_none(),
+                                ins,
+                                pc,
+                                base,
+                                len,
+                                cap,
+                            )
+                        } {
+                            Some((n, to)) => {
+                                len = n;
+                                last = pc;
+                                pc = to;
+                            }
+                            None => break None,
+                        }
+                        after_release!();
+                    }
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
@@ -19436,6 +19463,90 @@ impl Interpreter {
         }
     }
 
+    /// `RERAISE` (`ins` at `pc`) of the exception atop the `len` stack
+    /// slots at `base` (room to `cap`) when a handler of this frame covers
+    /// it, as the `RERAISE` arm, `quiet_catch` and `handle_exception_with`
+    /// together run it: a re-raise records no traceback entry and settles
+    /// no chaining, so the stack unwinds to the handler's depth, its lasti
+    /// slot (the original raise site a cleanup tail carries) and the
+    /// exception go on, and the handler runs next. Returns the new stack
+    /// length and the handler's pc, or `None`, having touched nothing:
+    /// no covering handler, an observer that must see the unwind, or a
+    /// frame object whose line the full path keeps current.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are the frame's initialized operand stack
+    /// entries.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_reraise(
+        code: &CodeObject,
+        exc_state: &mut Option<Box<FrameExc>>,
+        py_frame_free: bool,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<(usize, usize)> {
+        if !py_frame_free || len == 0 || crate::trace::any_observers_active() {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        if !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_)) {
+            return None;
+        }
+        let handler = *find_handler(&code.exception_table, u32::try_from(pc).ok()?)?;
+        let depth = handler.depth as usize;
+        // (The exception and, for a cleanup handler, its lasti slot go on
+        // above the handler's depth.)
+        if depth + 2 > cap || depth > len - 1 {
+            return None;
+        }
+        // `RERAISE k>0`: the original raise offset sits `k` slots below
+        // the exception.
+        let k = ins.arg as usize;
+        let restored = if k != 0 {
+            if k > len - 1 {
+                return None;
+            }
+            // SAFETY: `len - 1 - k < len`.
+            match unsafe { &*base.add(len - 1 - k) } {
+                Object::Int(l) => Some(u32::try_from(*l).unwrap_or(0)),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+        // The offset an earlier cleanup handler recorded, or this one's
+        // (the RERAISE arm's `cleanup_lasti`, `handle_exception_with`'s
+        // `pending_lasti`).
+        let carried = exc_state.as_mut().and_then(|e| {
+            e.pending_lasti = None;
+            e.cleanup_lasti.take()
+        });
+        let lasti = restored.or(carried).unwrap_or(pc as u32);
+        // SAFETY: the exception leaves its slot; the slots above the
+        // handler's depth are released (a release may queue a finalizer:
+        // the caller checks).
+        let exc = unsafe { base.add(len - 1).read() };
+        let mut n = len - 1;
+        while n > depth {
+            n -= 1;
+            drop(unsafe { base.add(n).read() });
+        }
+        if handler.push_lasti {
+            exc_state.get_or_insert_with(Box::default).cleanup_lasti = Some(lasti);
+            // SAFETY: `depth + 2 <= cap`.
+            unsafe { base.add(n).write(Object::Int(i64::from(lasti))) };
+            n += 1;
+        }
+        // SAFETY: as above.
+        unsafe { base.add(n).write(exc) };
+        Some((n + 1, handler.handler as usize))
+    }
+
     /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
     /// `POP_EXCEPT` (`ins`) over the `len` stack slots at `base` (room to
     /// `cap`), as the full handlers run their common shapes: an
@@ -20933,9 +21044,9 @@ impl Interpreter {
     /// `C.name = v` with the class at `recv` and the value below it: a
     /// non-dunder name written to a heap class's own dict under `type`'s
     /// default `__setattr__` (the plain end of [`Self::set_type_attr_direct`];
-    /// a custom metaclass or a type watcher keeps the full path), the
-    /// class's version advanced, both operands leaving the stack. `false`
-    /// touches nothing.
+    /// a metaclass that intercepts the store, or a type watcher, keeps the
+    /// full path), the class's version advanced, both operands leaving the
+    /// stack. `false` touches nothing.
     ///
     /// # Safety
     ///
@@ -20952,14 +21063,13 @@ impl Interpreter {
             || cls.flags.is_builtin
             || cls.immutable.get()
             || cls.c_ext_ptr.get() != 0
-            || !Self::plain_metaclass(cls)
         {
             return false;
         }
         let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
             return false;
         };
-        if n.starts_with("__") {
+        if n.starts_with("__") || !Self::meta_store_transparent(cls, n) {
             return false;
         }
         let old = {
@@ -20985,6 +21095,28 @@ impl Interpreter {
         unsafe { drop_hot(recv.read()) };
         drop(old);
         true
+    }
+
+    /// Whether `cls.name = v` (or `del cls.name`) under `cls`'s metaclass
+    /// is `type.__setattr__`'s plain dict store: the metaclass is `type`,
+    /// or a Python subclass of it that keeps `type`'s `__setattr__` and
+    /// `__delattr__` and has no attribute of that name (a data descriptor
+    /// there would intercept the store).
+    fn meta_store_transparent(cls: &TypeObject, name: &str) -> bool {
+        if Self::plain_metaclass(cls) {
+            return true;
+        }
+        // SAFETY: GIL-serialized raw read, as in `plain_metaclass`; the
+        // reference does not outlive the checks.
+        let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+            return true;
+        };
+        let native = |dunder: &str| matches!(meta.lookup_with_owner(dunder), Some((Object::Builtin(_), owner)) if owner.flags.is_builtin);
+        !meta.flags.is_builtin
+            && meta.c_ext_ptr.get() == 0
+            && native("__setattr__")
+            && native("__delattr__")
+            && meta.lookup(name).is_none()
     }
 
     /// Whether a release reports to nothing (no dict or function watcher,
@@ -30553,6 +30685,9 @@ impl Interpreter {
                 Some(_) => None,
             };
         }
+        if let Some(v) = Self::leaf_type_name(code, cls, name_idx) {
+            return Some(v);
+        }
         if !Self::plain_metaclass(cls) {
             return Self::leaf_load_meta_class_attr(code, cls, name_idx);
         }
@@ -30619,12 +30754,11 @@ impl Interpreter {
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            // A native method read through the class stays on the full
-            // path (it reports as a method descriptor, not a function).
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            // A native method or a property read off the class is the
+            // descriptor itself (`descriptor_get` with no instance).
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -30654,6 +30788,45 @@ impl Interpreter {
         }
     }
 
+    /// `cls.__name__` / `cls.__qualname__` as `type`'s getsets answer
+    /// them (the full path's first case): a `str` the class's own dict
+    /// holds, else the class's interned name, when the metaclass keeps the
+    /// default attribute access and doesn't define the name itself.
+    /// `None` for any other name or shape.
+    #[inline(never)]
+    fn leaf_type_name(code: &CodeObject, cls: &Rc<TypeObject>, name_idx: u32) -> Option<Object> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if !matches!(name, "__name__" | "__qualname__") || crate::capi_watchers::types_active() {
+            return None;
+        }
+        if !Self::plain_metaclass(cls) {
+            // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            if meta.c_ext_ptr.get() != 0
+                || !Self::default_getattribute(meta)
+                || meta
+                    .lookup_with_owner(name)
+                    .is_some_and(|(_, owner)| !Rc::ptr_eq(&owner, &builtin_types().type_))
+            {
+                return None;
+            }
+        }
+        if let Some(v @ Object::Str(_)) = cls
+            .dict
+            .try_borrow()
+            .ok()?
+            .get(&code_name_key(code, name_idx)?)
+        {
+            return Some(v.clone());
+        }
+        if name == "__qualname__" {
+            if let Some(q) = cls.qualname.borrow().as_ref() {
+                return Some(Object::interned_str(q));
+            }
+        }
+        Some(Object::interned_str(&cls.name))
+    }
+
     /// [`Self::leaf_load_type_attr`] for a class whose metaclass is a
     /// Python subclass of `type` (`EnumType`, `ABCMeta`) that keeps the
     /// default attribute access. CPython's `type_getattro` lets only a
@@ -30676,13 +30849,24 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
             return None;
         }
-        // The metaclass's MRO has no entry for the name (its own leaf
+        // The metaclass's MRO has no entry for the name, or one that is no
+        // data descriptor, which yields to the class's own (CPython's
+        // `type_getattro`) when the class's MRO has the name (its own leaf
         // attribute cache remembers the walk per version).
-        if !matches!(
-            Self::leaf_class_attr(code, meta, name_idx),
-            Some(LeafAttr::InstanceOnly)
-        ) {
-            return None;
+        match Self::leaf_class_attr(code, meta, name_idx)? {
+            LeafAttr::InstanceOnly
+            | LeafAttr::Method(_)
+            | LeafAttr::ClassMethod(_)
+            | LeafAttr::BuiltinMethod(_)
+            | LeafAttr::Value(
+                Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Function(_),
+            ) => {}
+            _ => return None,
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => Some(Object::Function(f)),
@@ -30691,10 +30875,11 @@ impl Interpreter {
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            // (A metaclass entry then binds to the class: the full path's
+            // to build.)
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -51803,14 +51988,16 @@ impl Interpreter {
                 // `EnumType.__setattr__` raises on member reassignment). The
                 // builtin `type.__setattr__` is *not* a user override, so it
                 // falls through to the direct setter below.
-                if let Some(method) = metaclass_method(obj, "__setattr__") {
-                    if !matches!(
-                        method,
-                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
-                    ) {
-                        let g = self.builtins.clone();
-                        self.call(&method, &[Object::from_str(name), value], &[], &g)?;
-                        return Ok(());
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                    match meta.lookup("__setattr__") {
+                        Some(Object::Builtin(_)) | None => {}
+                        Some(m) => {
+                            let method = bind_method(obj, m);
+                            let g = self.builtins.clone();
+                            self.call(&method, &[Object::from_str(name), value], &[], &g)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.set_type_attr_direct(ty, name, value)
