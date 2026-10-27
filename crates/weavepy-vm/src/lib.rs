@@ -55018,11 +55018,32 @@ impl Interpreter {
                     if b.name == builtins::BUILD_CLASS_NAME {
                         return self.build_class(args, kwargs);
                     }
+                    // `object.__init__` runs object's own check on any
+                    // receiver: the name is shared with `dict.__init__`,
+                    // whose merge below must not take it.
+                    if b.name == "__init__" && is_object_init(b) {
+                        return crate::builtin_types::object_init_call(args, !kwargs.is_empty());
+                    }
+                    // `object.__new__(M, ...)` of `type` or a metaclass:
+                    // object's allocator can't build a class (CPython
+                    // `tp_new_wrapper`'s safety check), so this neither
+                    // takes the class-building route below nor allocates.
+                    if b.name == "__new__" && is_object_new(b) {
+                        if let Some(Object::Type(mcs)) = args.first() {
+                            if mcs.is_subclass_of(&builtin_types().type_) {
+                                return Err(type_error(format!(
+                                    "object.__new__({}) is not safe, use {}.__new__()",
+                                    mcs.name,
+                                    static_new_base(mcs)
+                                )));
+                            }
+                        }
+                    }
                     // `type.__new__(mcs, name, bases, ns)` — invoked from
                     // user metaclasses via `super().__new__(...)`. Route
                     // to the actual type-construction path so the class
                     // ends up wired with the right metaclass.
-                    if b.name == "__new__" && args.len() == 4 {
+                    if b.name == "__new__" && args.len() == 4 && !is_object_new(b) {
                         if let Object::Type(mcs) = &args[0] {
                             if mcs.is_subclass_of(&builtin_types().type_) {
                                 // Bare `type.__new__`: build the class but do
@@ -71686,6 +71707,50 @@ fn class_dunder_new(cls: &TypeObject) -> Option<Object> {
         }
     }
     None
+}
+
+/// The name of the class whose native `__new__` serves `cls` (CPython
+/// `tp_new_wrapper`'s `staticbase`): the first class on its MRO whose
+/// `__new__` doesn't resolve to Python code.
+fn static_new_base(cls: &TypeObject) -> String {
+    for t in cls.mro.borrow().iter() {
+        let python = match t.lookup("__new__") {
+            Some(Object::Function(_)) => true,
+            Some(Object::StaticMethod(sm)) => matches!(sm.func(), Object::Function(_)),
+            _ => false,
+        };
+        if !python {
+            return t.name.clone();
+        }
+    }
+    cls.name.clone()
+}
+
+/// Whether `b` is `object.__init__` (the process-wide builtin), which
+/// shares its name with the built-in types' own `__init__`s.
+fn is_object_init(b: &crate::object::BuiltinFn) -> bool {
+    thread_local! {
+        static OBJECT_INIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let want = OBJECT_INIT.with(|c| {
+        let p = c.get();
+        if p != 0 {
+            return p;
+        }
+        let p = match builtin_types()
+            .object_
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__init__"))
+        {
+            Some(Object::Builtin(f)) => Rc::as_ptr(f) as usize,
+            // (Not installed yet: nothing is object's.)
+            _ => return usize::MAX,
+        };
+        c.set(p);
+        p
+    });
+    std::ptr::from_ref(b) as usize == want
 }
 
 /// Whether `b` is `object.__new__` (the process-wide builtin).

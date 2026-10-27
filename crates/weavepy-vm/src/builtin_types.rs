@@ -2817,51 +2817,52 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
     );
 }
 
+/// `object.__init__(self, *args, **kwargs)` (CPython `object_init`),
+/// `has_kwargs` when keyword arguments came too: a no-op that honours
+/// `super().__init__()` chains, on any receiver (a dict's own `__init__`
+/// never runs here). Excess arguments are an error when the receiver's
+/// type overrides `__init__`, or overrides neither `__init__` nor
+/// `__new__` (bpo-31506).
+pub(crate) fn object_init_call(args: &[Object], has_kwargs: bool) -> Result<Object, RuntimeError> {
+    // Unbound use (`object.__init__()`) still needs the instance:
+    // CPython's method descriptor rejects the empty call.
+    let Some(recv) = args.first() else {
+        return Err(crate::error::type_error(
+            "descriptor '__init__' of 'object' object needs an argument".to_owned(),
+        ));
+    };
+    if args.len() > 1 || has_kwargs {
+        let cls = crate::builtins::class_of(recv);
+        if overrides_dunder_init(&cls) {
+            // An overriding `__init__` (a user class's, or a built-in
+            // type's such as `dict.__init__`) delegated or was bypassed
+            // here: blame object.__init__.
+            return Err(crate::error::type_error(
+                "object.__init__() takes exactly one argument (the instance to initialize)"
+                    .to_owned(),
+            ));
+        }
+        // A native payload means a built-in base's constructor (`int_new`,
+        // …) owns the signature: CPython's tp_new for those types isn't
+        // `object_new`, so the lenient side of the policy applies.
+        let native = matches!(recv, Object::Instance(i) if i.native.get().is_some());
+        if !native && !overrides_dunder_new(&cls) {
+            return Err(crate::error::type_error(format!(
+                "{}.__init__() takes exactly one argument (the instance to initialize)",
+                cls.name
+            )));
+        }
+    }
+    Ok(Object::None)
+}
+
 /// Install `object.__new__`, `object.__init__`, `object.__setattr__`
 /// and `object.__delattr__` on the root class. These are the implicit
 /// base methods every user class inherits.
 fn install_object_dunders(object_: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn object_init(args: &[Object]) -> Result<Object, RuntimeError> {
-        // Unbound use (`object.__init__()`) still needs the instance —
-        // CPython's method descriptor rejects the empty call.
-        if args.is_empty() {
-            return Err(crate::error::type_error(
-                "descriptor '__init__' of 'object' object needs an argument".to_owned(),
-            ));
-        }
-        // CPython `object_init` arity policy (bpo-31506): excess
-        // arguments are an error unless `__new__` is overridden while
-        // `__init__` is not (then `__new__` owns the signature and the
-        // default `__init__` stays lenient).
-        if args.len() > 1 {
-            if let Some(Object::Instance(inst)) = args.first() {
-                let cls = &inst.cls();
-                // A native payload means a built-in base's constructor
-                // (`int_new`, `property_init`, …) owns the signature —
-                // CPython's tp_new/tp_init for those types aren't
-                // `object_new`/`object_init`, so the strict arity
-                // policy doesn't apply.
-                if inst.native.get().is_none() {
-                    if overrides_dunder_init(cls) {
-                        // An overriding `__init__` delegated here
-                        // (`super().__init__(*args)`) — blame object.__init__.
-                        return Err(crate::error::type_error(
-                            "object.__init__() takes exactly one argument (the instance to initialize)"
-                                .to_owned(),
-                        ));
-                    }
-                    if !overrides_dunder_new(cls) {
-                        return Err(crate::error::type_error(format!(
-                            "{}.__init__() takes exactly one argument (the instance to initialize)",
-                            cls.name
-                        )));
-                    }
-                }
-            }
-        }
-        // No-op; honours `super().__init__()` chains.
-        Ok(Object::None)
+        object_init_call(args, false)
     }
     fn object_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
         // `object.__setattr__(self, name, value)` — CPython's
