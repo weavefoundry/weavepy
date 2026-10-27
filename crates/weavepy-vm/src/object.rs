@@ -5642,6 +5642,10 @@ pub struct PyGenerator {
     /// [`Self::state`] puts the chain back as running it would have left
     /// it before anything sees the state.
     pub(crate) chain: crate::sync::Cell<usize>,
+    /// A generator expression's generator its `MAKE_FUNCTION` made, whose
+    /// `CALL 0` hasn't yet handed it its iterator (its `.0`): only that
+    /// call's operand stack holds it (see `Interpreter::make_genexp`).
+    pub(crate) genexp_pending: crate::sync::Cell<bool>,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5785,6 +5789,7 @@ impl PyGenerator {
             gc_slot: crate::gc_trace::GcSlot::new(),
             track_deferred: crate::sync::Cell::new(false),
             chain: crate::sync::Cell::new(0),
+            genexp_pending: crate::sync::Cell::new(false),
         }
     }
 
@@ -5925,6 +5930,7 @@ pub(crate) fn pooled_generator(
     m.hooks_inited.set(false);
     m.finalize_ran.set(false);
     m.track_deferred.set(false);
+    m.genexp_pending.set(false);
     Ok(g)
 }
 
@@ -11753,6 +11759,15 @@ impl Object {
                 let quote = if has_single && !has_double { '"' } else { '\'' };
                 let mut out = String::with_capacity(s.len() + 2);
                 out.push(quote);
+                // Printable ASCII other than the backslash and the quote,
+                // the usual string, is copied whole.
+                if s.bytes()
+                    .all(|b| (0x20..0x7f).contains(&b) && b != b'\\' && b != quote as u8)
+                {
+                    out.push_str(s);
+                    out.push(quote);
+                    return out;
+                }
                 for c in s.chars() {
                     match c {
                         '\\' => out.push_str("\\\\"),

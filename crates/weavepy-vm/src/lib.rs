@@ -14405,6 +14405,19 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // A generator expression's `CALL 0`: its pending
+                        // generator takes the iterator, and is the result
+                        // (see `Self::make_genexp`).
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        if argc == 0
+                            && matches!(unsafe { &*base.add(len - 2) }, Object::Generator(_))
+                            && unsafe { Self::finish_genexp_at(base.add(len - 2)) }
+                        {
+                            len -= 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         // A `functools.lru_cache` wrapper's call: a cache hit
                         // in place, a miss's function in the wrapper's place.
                         // SAFETY: `len >= argc + 2`: the call's operands.
@@ -17676,8 +17689,10 @@ impl Interpreter {
                 let globals = frame.globals.clone();
                 frame.pc = pc as u32 + 1;
                 let pending = self.core_pending_enter(sw, frame, pc);
-                let tuple_ty = Object::Type(builtin_types().tuple_.clone());
-                let r = self.call(&tuple_ty, std::slice::from_ref(&spread), &[], &globals);
+                // `tuple(gen)`'s drain, without the type call around it.
+                let r = self
+                    .collect_iterable(&spread, &globals)
+                    .map(Object::new_tuple);
                 self.lean_pending_exit(pending);
                 drop(spread);
                 // SAFETY: as in `core_type_lane` (the iteration ran nested
@@ -25885,6 +25900,19 @@ impl Interpreter {
                     {
                         break;
                     }
+                    // A generator expression's: its generator, pending.
+                    if let Some((gen, k)) =
+                        self.genexp_make_at(instrs, pc, stack, globals, builtins)
+                    {
+                        for _ in 0..=k {
+                            let v = stack.pop().expect("checked above");
+                            self.release(v);
+                        }
+                        stack.push(gen);
+                        last = pc + k;
+                        pc += 1 + k;
+                        continue;
+                    }
                     let mut defaults: Option<Vec<Object>> = None;
                     let mut closure: Option<Vec<Object>> = None;
                     let mut k = 0;
@@ -30600,10 +30628,15 @@ impl Interpreter {
         name_idx: u32,
     ) -> Option<(Object, Object)> {
         match Self::leaf_load_type_attr(code, cls, cache_pc, name_idx)? {
+            // (A native one's, `int.from_bytes`, as the full leaf arm takes
+            // it.)
             Object::BoundMethod(bm)
                 if matches!(
                     (&bm.function, &bm.receiver),
                     (Object::Function(_), Object::Type(_))
+                ) || matches!(
+                    (&bm.function, &bm.receiver),
+                    (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
                 ) =>
             {
                 Some((bm.function.clone(), bm.receiver.clone()))
@@ -43018,7 +43051,9 @@ impl Interpreter {
         if args.len() < 3 {
             return self.load_attr(&args[0], &name);
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(args[2].clone());
         }
         let value_class = builtin_value_class(&args[0]);
@@ -43062,7 +43097,9 @@ impl Interpreter {
                 crate::builtins::wstr_attr_get(&args[0], &args[1]).is_some(),
             ));
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(Object::Bool(false));
         }
         // A builtin class's miss, remembered per class version (a
@@ -43574,7 +43611,11 @@ impl Interpreter {
                 // compared with `<` (CPython `unsafe_tuple_compare`).
                 let mut i = 0;
                 while i < x.len() && i < y.len() {
-                    if !x[i].is_same(&y[i]) && !self.vm_eq(&x[i], &y[i], globals)? {
+                    let eq = match SortKind::item_eq(&x[i], &y[i]) {
+                        Some(eq) => eq,
+                        None => x[i].is_same(&y[i]) || self.vm_eq(&x[i], &y[i], globals)?,
+                    };
+                    if !eq {
                         break;
                     }
                     i += 1;
@@ -43587,7 +43628,10 @@ impl Interpreter {
                     (0, SortKindScalar::Int) => Ok(SortKind::int_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Float) => Ok(SortKind::float_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Numeric) => compare_op(&x[0], &y[0], CompareKind::Lt),
-                    _ => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    _ => match native_scalar_compare(&x[i], &y[i], CompareKind::Lt) {
+                        Some(lt) => Ok(lt),
+                        None => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    },
                 }
             }),
             SortKind::General => crate::timsort::sort(v, |a, b| {
@@ -55779,6 +55823,15 @@ impl Interpreter {
             // repr'd by `m.def` while rendering a default argument)
             // reaches this dispatch as a plain foreign value.
             Object::Foreign(s) => crate::foreign::call(s, args, kwargs),
+            // A generator expression's `CALL 0` (its iterator the self
+            // slot's argument) the fast paths left here (see
+            // `Self::make_genexp`).
+            Object::Generator(_)
+                if args.len() == 1 && kwargs.is_empty() && Self::is_pending_genexp(callable) =>
+            {
+                Self::finish_genexp(callable, args[0].clone());
+                Ok(callable.clone())
+            }
             _ => {
                 if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
                     eprintln!(
@@ -60715,13 +60768,27 @@ impl Interpreter {
         cells: Rc<Vec<Rc<RefCell<Object>>>>,
         start: usize,
     ) -> Frame {
+        Self::gen_frame_in(&f.globals, &f.builtins, code, locals, stack, cells, start)
+    }
+
+    /// [`Self::gen_frame_lean`] with the `globals` and `builtins` given.
+    #[inline]
+    fn gen_frame_in(
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        stack: frame_slots::FrameStack,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        start: usize,
+    ) -> Frame {
         Frame {
             code,
             locals: frame_slots::FrameLocals::from_shared(locals),
             cells,
             stack,
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
+            globals: globals.clone(),
+            builtins: builtins.clone(),
             rare: None,
             exc: None,
             agen_yielded_value: true,
@@ -60735,6 +60802,167 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             parked_native: None,
         }
+    }
+
+    /// A generator expression's generator, made by its `MAKE_FUNCTION` (the
+    /// closure's cells `closure`, the running frame's `globals` and
+    /// `builtins`) in place of the function its `CALL 0` would make it from
+    /// and drop at once: nothing can reach that function but the call, so
+    /// the generator stands in for it on the operand stack, pending (see
+    /// [`PyGenerator::genexp_pending`]) until the call hands it its
+    /// iterator ([`Self::finish_genexp`]). `None`, with nothing made, for
+    /// any other code, or where a call wouldn't take the fast start (see
+    /// [`Self::generator_start`]).
+    pub(crate) fn make_genexp(
+        &self,
+        code: &Rc<CodeObject>,
+        closure: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<Object> {
+        // The compiler's `<genexpr>` (only a comprehension has a `.0`): a
+        // plain generator of its iterator alone, without cells of its own.
+        if !code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.arg_count != 1
+            || !code.cellvars.is_empty()
+            || closure.len() != code.freevars.len()
+            || code.varnames.first().is_none_or(|n| &**n != ".0")
+        {
+            return None;
+        }
+        let ext = code_vm_ext(code)?;
+        let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext)?,
+            u32::MAX => return None,
+            at => (at & !GEN_DELEGATES) as usize - 1,
+        };
+        if crate::trace::eval_frame_record_active()
+            || crate::trace::any_observers_active()
+            || gc_trace::auto_collect_due()
+        {
+            return None;
+        }
+        let cells = if closure.is_empty() {
+            crate::object::empty_cells_ref().clone()
+        } else {
+            let mut cells = Vec::with_capacity(closure.len());
+            for c in closure {
+                let Object::Cell(c) = c else {
+                    return None;
+                };
+                cells.push(c.clone());
+            }
+            Rc::new(cells)
+        };
+        let nlocals = code.varnames.len();
+        let GenParts {
+            locals,
+            stack,
+            boxed,
+        } = self.gen_parts(nlocals);
+        // SAFETY: sole owner (see `gen_parts`). (`.0` stays unbound until
+        // the call.)
+        unsafe { (*locals.as_ptr()).resize(nlocals, Object::Unbound) };
+        let frame =
+            Self::gen_frame_in(globals, builtins, code.clone(), locals, stack, cells, start);
+        let frame = Box::write(boxed, frame);
+        let kind = crate::object::CoroutineKind::Generator;
+        let gen = match crate::object::pooled_generator(kind, Object::Code(code.clone()), frame) {
+            Ok(gen) => gen,
+            Err((gen_code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, gen_code, frame)
+            }),
+        };
+        gen.genexp_pending.set(true);
+        Some(Object::Generator(gen))
+    }
+
+    /// [`Self::make_genexp`] for the bare `MAKE_FUNCTION` at `pc` of
+    /// `instrs` whose operands end `ops`: the code atop them, and the
+    /// closure tuple below it when a `SET_FUNCTION_ATTRIBUTE` right after
+    /// attaches one. The pending generator, and how many of those
+    /// instructions it covers (the operands it replaces, but for the code).
+    pub(crate) fn genexp_make_at(
+        &self,
+        instrs: &[weavepy_compiler::Instruction],
+        pc: usize,
+        ops: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<(Object, usize)> {
+        let n = ops.len();
+        let Some(Object::Code(code)) = ops.last() else {
+            return None;
+        };
+        if !code.is_generator {
+            return None;
+        }
+        let attr = |at: usize| {
+            instrs
+                .get(at)
+                .filter(|i| i.op == OpCode::SetFunctionAttribute)
+        };
+        let (closure, k): (&[Object], usize) = match attr(pc + 1) {
+            None => (&[], 0),
+            Some(i) if i.arg == 0x08 && attr(pc + 2).is_none() => {
+                match ops.get(n.wrapping_sub(2)) {
+                    Some(Object::Tuple(items)) => (&items[..], 1),
+                    _ => return None,
+                }
+            }
+            Some(_) => return None,
+        };
+        Some((self.make_genexp(code, closure, globals, builtins)?, k))
+    }
+
+    /// Whether `obj` is a generator expression's pending generator (see
+    /// [`Self::make_genexp`]).
+    #[inline(always)]
+    pub(crate) fn is_pending_genexp(obj: &Object) -> bool {
+        matches!(obj, Object::Generator(g) if g.genexp_pending.get())
+    }
+
+    /// The `CALL 0` of `obj`, a generator expression's pending generator
+    /// (see [`Self::is_pending_genexp`]), with `iter` its iterator: the
+    /// generator takes it as its `.0`, and is an ordinary one from here
+    /// (handed to the collector).
+    pub(crate) fn finish_genexp(obj: &Object, iter: Object) {
+        let Object::Generator(g) = obj else {
+            unreachable!("checked by the caller");
+        };
+        // SAFETY: only the call's operands hold a pending generator, so
+        // nothing has borrowed its state.
+        let GeneratorState::Created(frame) = (unsafe { &mut *g.state_raw().as_ptr() }) else {
+            unreachable!("a pending generator expression is unstarted");
+        };
+        g.genexp_pending.set(false);
+        // SAFETY: the frame's sole owner; `.0`, its first local, holds
+        // `Unbound` (nothing to release).
+        unsafe { frame.locals.as_mut_ptr().write(iter) };
+        gc_trace::track_generator(obj);
+    }
+
+    /// [`Self::finish_genexp`] for the `CALL 0` whose callee is at stack
+    /// slot `at`, the iterator above it: `true` with the iterator moved
+    /// out of its slot (the generator stays in its own, the call's
+    /// result), `false`, touching nothing, for any other callee.
+    ///
+    /// # Safety
+    ///
+    /// `at` and the slot above it are initialized.
+    #[inline(never)]
+    pub(crate) unsafe fn finish_genexp_at(at: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if !Self::is_pending_genexp(&*at) {
+                return false;
+            }
+            Self::finish_genexp(&*at, at.add(1).read());
+        }
+        true
     }
 
     /// The plain generator a call [`Self::gen_send_call`] matched resumes
@@ -71282,6 +71510,40 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
 }
 
+/// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
+/// in its `AttributeError` without running any code: a name that is no
+/// dunder (those have special and synthesized forms) and not `mro`, that
+/// neither the class's MRO nor its metaclass's supplies, on a class with
+/// no builtin base but `object` (whose methods and class methods are
+/// synthesized) and a metaclass with the default lookup and no
+/// `__getattr__`. `getattr(cls, name, default)` and `hasattr` then answer
+/// without building the error (enum's class creation probes a few dozen
+/// such names).
+fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
+    use crate::types::Dunder;
+    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    let object = &builtin_types().object_;
+    if t.flags.is_builtin
+        || t.native_kind.get() != 0
+        || t.mro
+            .borrow()
+            .iter()
+            .any(|b| b.flags.is_builtin && !Rc::ptr_eq(b, object))
+    {
+        return false;
+    }
+    let meta = t.metaclass_or_type();
+    let getattribute = meta.dunder(Dunder::GetAttribute);
+    if !(getattribute.type_owner() || getattribute.object_owner())
+        || meta.dunder(Dunder::GetAttr).present()
+    {
+        return false;
+    }
+    t.lookup(name).is_none() && meta.lookup(name).is_none()
+}
+
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
 /// (`exc`) with `.name` and `.obj`, for one built natively, whose storage
 /// lays both fields out (see `error::attribute_error`): stored in place
@@ -72209,6 +72471,22 @@ impl SortKind {
     fn float_lt(a: &Object, b: &Object) -> bool {
         matches!((a, b), (Object::Float(x), Object::Float(y)) if x < y)
     }
+
+    /// Whether two tuple items are equal as `PyObject_RichCompareBool`
+    /// would find them (identity first, then `==`), for a pair of native
+    /// `int`s, `float`s or `str`s; `None` for anything else.
+    #[inline(always)]
+    fn item_eq(a: &Object, b: &Object) -> Option<bool> {
+        match (a, b) {
+            (Object::Int(x), Object::Int(y)) => Some(x == y),
+            // (`is_same` compares a float's bits, so a NaN equals itself.)
+            (Object::Float(x), Object::Float(y)) => Some(x.to_bits() == y.to_bits() || x == y),
+            (Object::Str(x), Object::Str(y)) => {
+                Some(SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl SortKindScalar {
@@ -73114,9 +73392,10 @@ enum PercentArgs<'a> {
 /// `template % args` in one pass when every conversion is a plain `%s`,
 /// `%d` or `%i` (no flags, width or precision; a mapping key for a
 /// mapping, none for positional arguments) of an exact `str`, `int`,
-/// `bool` or `None` (`%s` only for `str`, `None`), and every positional
-/// argument is consumed: the text `percent_format_with` renders for that
-/// shape. `None` for anything else (the general path then renders it, or
+/// `bool` or `None` (`%s` only for `str`, `None`), or one of the specs
+/// [`percent_render_spec`] renders, and every positional argument is
+/// consumed: the text `percent_format_with` renders for that shape.
+/// `None` for anything else (the general path then renders it, or
 /// raises), including a mapping key the dictionary lacks.
 fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String> {
     use std::fmt::Write as _;
@@ -73150,6 +73429,12 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
             }
             _ => return None,
         };
+        if !matches!(bytes.get(k)?, b's' | b'd' | b'i') {
+            k = percent_render_spec(&mut out, bytes, k, v)?;
+            i = k + 1;
+            lit = i;
+            continue;
+        }
         match (bytes.get(k)?, v) {
             (b's', Object::Str(s)) => out.push_str(s),
             (b's' | b'd' | b'i', Object::Int(n)) => {
@@ -73172,13 +73457,148 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
     Some(out)
 }
 
+/// One conversion with flags (`-`, `0`, `+`, space), a width and a
+/// precision, or a `%f` or `%r`, of an exact `str`, `int`, `bool`,
+/// `float` or `None`, whose spec starts at `bytes[k]`, rendered onto
+/// `out` as CPython's `unicode_format_arg` does: the position of the
+/// conversion character, or `None` (`out` then abandoned) for anything
+/// else: `#`, `*`, a length modifier, a non-finite `float`, another
+/// conversion or operand.
+fn percent_render_spec(out: &mut String, bytes: &[u8], mut k: usize, v: &Object) -> Option<usize> {
+    use std::fmt::Write as _;
+    let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+    loop {
+        match *bytes.get(k)? {
+            b'-' => left = true,
+            b'0' => zero = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            _ => break,
+        }
+        k += 1;
+    }
+    let digits = |k: &mut usize| -> Option<usize> {
+        let mut n = 0usize;
+        while let Some(d @ b'0'..=b'9') = bytes.get(*k) {
+            n = n * 10 + usize::from(d - b'0');
+            // (A huge width or precision is the general path's to judge.)
+            if n > 4096 {
+                return None;
+            }
+            *k += 1;
+        }
+        Some(n)
+    };
+    let width = digits(&mut k)?;
+    let prec = if bytes.get(k) == Some(&b'.') {
+        k += 1;
+        Some(digits(&mut k)?)
+    } else {
+        None
+    };
+    let conv = *bytes.get(k)?;
+    // The sign (numbers only) and the text.
+    let mut num = String::new();
+    let (sign, text, numeric): (&str, &str, bool) = match (conv, v) {
+        (b's' | b'r', _) => {
+            let text: &str = match (conv, v) {
+                (b's', Object::Str(s)) => s,
+                (b's', Object::Bool(b)) => {
+                    if *b {
+                        "True"
+                    } else {
+                        "False"
+                    }
+                }
+                (b's', Object::None) => "None",
+                (b's', Object::Int(n)) => {
+                    let _ = write!(num, "{n}");
+                    &num
+                }
+                (b'r', Object::Str(_)) => {
+                    num = v.repr();
+                    &num
+                }
+                _ => return None,
+            };
+            // A precision keeps that many characters.
+            let text = match prec {
+                Some(p) => text
+                    .char_indices()
+                    .nth(p)
+                    .map_or(text, |(at, _)| &text[..at]),
+                None => text,
+            };
+            ("", text, false)
+        }
+        (b'd' | b'i', Object::Int(_) | Object::Bool(_)) => {
+            let n = match v {
+                Object::Int(n) => *n,
+                _ => i64::from(matches!(v, Object::Bool(true))),
+            };
+            let _ = write!(num, "{}", n.unsigned_abs());
+            // A precision is the least number of digits.
+            if let Some(p) = prec {
+                if num.len() < p {
+                    num.insert_str(0, &"0".repeat(p - num.len()));
+                }
+            }
+            (if n < 0 { "-" } else { "" }, num.as_str(), true)
+        }
+        (b'f' | b'F', Object::Float(_) | Object::Int(_)) => {
+            let x = match v {
+                Object::Float(x) => *x,
+                // (Exactly representable: converted as CPython does.)
+                Object::Int(n) if n.unsigned_abs() <= 1 << 53 => *n as f64,
+                _ => return None,
+            };
+            if !x.is_finite() {
+                return None;
+            }
+            let _ = write!(num, "{:.*}", prec.unwrap_or(6), x.abs());
+            (
+                if x.is_sign_negative() { "-" } else { "" },
+                num.as_str(),
+                true,
+            )
+        }
+        _ => return None,
+    };
+    let sign = match (sign, numeric) {
+        ("", true) if plus => "+",
+        ("", true) if space => " ",
+        (sign, _) => sign,
+    };
+    let len = sign.len()
+        + if text.is_ascii() {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+    let pad = width.saturating_sub(len);
+    if left {
+        out.push_str(sign);
+        out.push_str(text);
+        out.extend(std::iter::repeat_n(' ', pad));
+    } else if zero && numeric {
+        out.push_str(sign);
+        out.extend(std::iter::repeat_n('0', pad));
+        out.push_str(text);
+    } else {
+        out.extend(std::iter::repeat_n(' ', pad));
+        out.push_str(sign);
+        out.push_str(text);
+    }
+    Some(k)
+}
+
 /// [`percent_render_plain`] of `template % value` for an argument tuple,
 /// a lone scalar argument or an exact dict.
 fn percent_render_plain_value(template: &str, value: &Object) -> Option<String> {
     let one;
     let items: &[Object] = match value {
         Object::Tuple(items) if !items.is_empty() => items,
-        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None => {
+        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None | Object::Float(_) => {
             one = [value.clone()];
             &one
         }

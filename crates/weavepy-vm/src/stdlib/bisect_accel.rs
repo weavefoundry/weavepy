@@ -170,11 +170,35 @@ fn resolve_bounds(
     if args.lo < 0 {
         return Err(value_error("lo must be non-negative"));
     }
-    let hi = match args.hi {
-        Some(h) => h,
-        None => interp.accel_len(&args.a)?,
+    let hi = match (args.hi, &args.a) {
+        (Some(h), _) => h,
+        (None, Object::List(l)) => l.borrow().len() as i64,
+        (None, a) => interp.accel_len(a)?,
     };
     Ok((args.lo, hi))
+}
+
+/// `a[i]` (`PySequence_GetItem`): read in place from an exact list, the
+/// usual operand, else through the subscript protocol.
+#[inline]
+fn item_at(interp: &mut crate::Interpreter, a: &Object, i: i64) -> Result<Object, RuntimeError> {
+    if let Object::List(l) = a {
+        // (Re-read each time: a comparison may have changed the list.)
+        return match l.borrow().get(i as usize) {
+            Some(v) => Ok(v.clone()),
+            None => Err(crate::error::index_error("list index out of range")),
+        };
+    }
+    interp.accel_subscript(a, &Object::Int(i))
+}
+
+/// `a < b`, natively for a pair of `int`s, `float`s or `str`s.
+#[inline]
+fn less(interp: &mut crate::Interpreter, a: &Object, b: &Object) -> Result<bool, RuntimeError> {
+    match crate::native_scalar_compare(a, b, CompareKind::Lt) {
+        Some(lt) => Ok(lt),
+        None => interp.op_compare(a, b, CompareKind::Lt),
+    }
 }
 
 /// `internal_bisect_right`: leftmost index where `item` could be inserted to
@@ -193,12 +217,12 @@ fn internal_bisect_right(
         // `sys.maxsize` (CPython's C code uses `(size_t)lo + hi`; see
         // `test_bisect.test_large_range`).
         let mid = lo + (hi - lo) / 2;
-        let mut litem = interp.accel_subscript(a, &Object::Int(mid))?;
+        let mut litem = item_at(interp, a, mid)?;
         if let Some(k) = key {
             litem = interp.call_object(k.clone(), &[litem], &[])?;
         }
         // `item < litem` → search left half.
-        if interp.op_compare(item, &litem, CompareKind::Lt)? {
+        if less(interp, item, &litem)? {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -220,12 +244,12 @@ fn internal_bisect_left(
     while lo < hi {
         // See `internal_bisect_right`: overflow-safe midpoint for huge `hi`.
         let mid = lo + (hi - lo) / 2;
-        let mut litem = interp.accel_subscript(a, &Object::Int(mid))?;
+        let mut litem = item_at(interp, a, mid)?;
         if let Some(k) = key {
             litem = interp.call_object(k.clone(), &[litem], &[])?;
         }
         // `litem < item` → search right half.
-        if interp.op_compare(&litem, item, CompareKind::Lt)? {
+        if less(interp, &litem, item)? {
             lo = mid + 1;
         } else {
             hi = mid;
