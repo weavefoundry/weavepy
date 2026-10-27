@@ -3628,8 +3628,8 @@ impl<'a> LeafProbe<'a> {
     /// `None` unless `key` is a `str`, a machine `int`, a plain instance
     /// hashed by identity (its `__hash__` is `object`'s), a class whose
     /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
-    /// generator-family object or module, or a tuple of machine ints and
-    /// strings.
+    /// generator-family object or module, a `bytes`, or a tuple of machine
+    /// ints, strings and `bytes`.
     #[inline(always)]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3682,14 +3682,15 @@ impl<'a> LeafProbe<'a> {
                 identity_hash(key)
             }
             Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
-            // A tuple of machine ints and strings: its (cached) hash, with
-            // no item's `__hash__` to run.
+            // A tuple of machine ints, strings and bytes: its (cached)
+            // hash, with no item's `__hash__` to run. (A bytes key too.)
             Object::Tuple(t)
                 if t.iter()
-                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_))) =>
+                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_) | Object::Bytes(_))) =>
             {
                 py_hash_value(key)?
             }
+            Object::Bytes(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
             | Object::Generator(_)
@@ -3775,6 +3776,7 @@ impl LeafProbe<'_> {
             | (Object::Coroutine(a), Object::Coroutine(b))
             | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
@@ -3783,6 +3785,7 @@ impl LeafProbe<'_> {
                     match (x, y) {
                         (Object::Int(p), Object::Int(q)) => equal &= p == q,
                         (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
+                        (Object::Bytes(p), Object::Bytes(q)) => equal &= p[..] == q[..],
                         _ => {
                             self.foreign.set(true);
                             return false;
