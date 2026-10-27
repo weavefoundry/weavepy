@@ -20827,9 +20827,9 @@ impl Interpreter {
     /// `C.name = v` with the class at `recv` and the value below it: a
     /// non-dunder name written to a heap class's own dict under `type`'s
     /// default `__setattr__` (the plain end of [`Self::set_type_attr_direct`];
-    /// a custom metaclass or a type watcher keeps the full path), the
-    /// class's version advanced, both operands leaving the stack. `false`
-    /// touches nothing.
+    /// a metaclass that intercepts the store, or a type watcher, keeps the
+    /// full path), the class's version advanced, both operands leaving the
+    /// stack. `false` touches nothing.
     ///
     /// # Safety
     ///
@@ -20846,14 +20846,13 @@ impl Interpreter {
             || cls.flags.is_builtin
             || cls.immutable.get()
             || cls.c_ext_ptr.get() != 0
-            || !Self::plain_metaclass(cls)
         {
             return false;
         }
         let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
             return false;
         };
-        if n.starts_with("__") {
+        if n.starts_with("__") || !Self::meta_store_transparent(cls, n) {
             return false;
         }
         let old = {
@@ -20879,6 +20878,28 @@ impl Interpreter {
         unsafe { drop_hot(recv.read()) };
         drop(old);
         true
+    }
+
+    /// Whether `cls.name = v` (or `del cls.name`) under `cls`'s metaclass
+    /// is `type.__setattr__`'s plain dict store: the metaclass is `type`,
+    /// or a Python subclass of it that keeps `type`'s `__setattr__` and
+    /// `__delattr__` and has no attribute of that name (a data descriptor
+    /// there would intercept the store).
+    fn meta_store_transparent(cls: &TypeObject, name: &str) -> bool {
+        if Self::plain_metaclass(cls) {
+            return true;
+        }
+        // SAFETY: GIL-serialized raw read, as in `plain_metaclass`; the
+        // reference does not outlive the checks.
+        let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+            return true;
+        };
+        let native = |dunder: &str| matches!(meta.lookup_with_owner(dunder), Some((Object::Builtin(_), owner)) if owner.flags.is_builtin);
+        !meta.flags.is_builtin
+            && meta.c_ext_ptr.get() == 0
+            && native("__setattr__")
+            && native("__delattr__")
+            && meta.lookup(name).is_none()
     }
 
     /// Whether a release reports to nothing (no dict or function watcher,
@@ -51653,14 +51674,16 @@ impl Interpreter {
                 // `EnumType.__setattr__` raises on member reassignment). The
                 // builtin `type.__setattr__` is *not* a user override, so it
                 // falls through to the direct setter below.
-                if let Some(method) = metaclass_method(obj, "__setattr__") {
-                    if !matches!(
-                        method,
-                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
-                    ) {
-                        let g = self.builtins.clone();
-                        self.call(&method, &[Object::from_str(name), value], &[], &g)?;
-                        return Ok(());
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                    match meta.lookup("__setattr__") {
+                        Some(Object::Builtin(_)) | None => {}
+                        Some(m) => {
+                            let method = bind_method(obj, m);
+                            let g = self.builtins.clone();
+                            self.call(&method, &[Object::from_str(name), value], &[], &g)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.set_type_attr_direct(ty, name, value)
