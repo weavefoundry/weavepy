@@ -12197,6 +12197,25 @@ impl Object {
                         }
                     }
                     format!("<{} object>", inst.cls().name)
+                } else if let Some(
+                    payload @ (Object::List(_)
+                    | Object::Dict(_)
+                    | Object::Tuple(_)
+                    | Object::Str(_)
+                    | Object::WStr(_)
+                    | Object::Int(_)
+                    | Object::Long(_)
+                    | Object::Float(_)
+                    | Object::Complex(_)
+                    | Object::Bytes(_)),
+                ) = inst.native.get()
+                {
+                    // A subclass of a value or container built-in that
+                    // doesn't override `__repr__` renders as its base does
+                    // (CPython's `list_repr`, `dict_repr`, … ignore the
+                    // exact type): `[9]` inside `(None, L([9]))`, not the
+                    // identity repr. (`set` subclasses are handled above.)
+                    payload.repr()
                 } else {
                     // CPython's `object.__repr__`: `<module.qualname object
                     // at 0x…>` (module omitted for builtins).

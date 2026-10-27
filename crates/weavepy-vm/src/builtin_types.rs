@@ -2817,6 +2817,25 @@ fn install_module_methods(module_: &Rc<TypeObject>) {
     );
 }
 
+/// The error `object.__setattr__` / `object.__delattr__` raise on a
+/// value of a built-in type that keeps no instance `__dict__` (a dict, an
+/// int, …), as CPython's `PyObject_GenericSetAttr` words it: a name the
+/// type defines is read-only, any other has nowhere to go.
+fn dictless_setattr_error(recv: &Object, name: &str) -> RuntimeError {
+    let cls = crate::builtins::class_of(recv);
+    if cls.lookup(name).is_some() {
+        crate::error::attribute_error(format!(
+            "'{}' object attribute '{}' is read-only",
+            cls.name, name
+        ))
+    } else {
+        crate::error::attribute_error(format!(
+            "'{}' object has no attribute '{}' and no __dict__ for setting new attributes",
+            cls.name, name
+        ))
+    }
+}
+
 /// `object.__init__(self, *args, **kwargs)` (CPython `object_init`),
 /// `has_kwargs` when keyword arguments came too: a no-op that honours
 /// `super().__init__()` chains, on any receiver (a dict's own `__init__`
@@ -2921,10 +2940,18 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 "can't apply this __setattr__ to {} object",
                 crate::builtins::class_of(&args[0]).name
             ))),
-            other => Err(crate::error::type_error(format!(
+            // Kinds that keep a `__dict__` of their own, which this
+            // default doesn't write.
+            other @ (Object::Function(_)
+            | Object::Foreign(_)
+            | Object::SimpleNamespace(_)
+            | Object::StaticMethod(_)
+            | Object::ClassMethod(_)
+            | Object::File(_)) => Err(crate::error::type_error(format!(
                 "object.__setattr__() requires an instance, got '{}'",
                 other.type_name()
             ))),
+            other => Err(dictless_setattr_error(other, &name)),
         }
     }
     fn object_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2972,10 +2999,16 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 "can't apply this __delattr__ to {} object",
                 crate::builtins::class_of(&args[0]).name
             ))),
-            other => Err(crate::error::type_error(format!(
+            other @ (Object::Function(_)
+            | Object::Foreign(_)
+            | Object::SimpleNamespace(_)
+            | Object::StaticMethod(_)
+            | Object::ClassMethod(_)
+            | Object::File(_)) => Err(crate::error::type_error(format!(
                 "object.__delattr__() requires an instance, got '{}'",
                 other.type_name()
             ))),
+            other => Err(dictless_setattr_error(other, &name)),
         }
     }
     fn object_hash(args: &[Object]) -> Result<Object, RuntimeError> {
