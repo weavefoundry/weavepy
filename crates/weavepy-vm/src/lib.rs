@@ -51078,6 +51078,35 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        // A builtin container's method read as a value (`string.split` in
+        // `urllib.parse.unquote`, a duck-typing probe): the bound method,
+        // as the core loop's plain-attribute lane builds it.
+        if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(
+                frame.stack.last(),
+                Some(
+                    Object::Str(_)
+                        | Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::FrozenSet(_)
+                        | Object::Bytes(_)
+                        | Object::Tuple(_)
+                )
+            )
+        {
+            let name_idx = frame.code.instructions[pc].arg;
+            if let Some(v) =
+                self.leaf_plain_attr_value(&frame.code, frame.stack.last(), name_idx, None)
+            {
+                frame.pc = pc as u32 + 1;
+                if let Some(top) = frame.stack.last_mut() {
+                    let recv = std::mem::replace(top, v);
+                    self.release(recv);
+                }
+                return Ok(());
+            }
+        }
         let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
             && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
         // A site cooling down after a failed load (an odd count; see
