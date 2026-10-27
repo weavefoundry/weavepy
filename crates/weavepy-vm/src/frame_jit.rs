@@ -11942,6 +11942,12 @@ impl<'a> Lower<'a> {
             (Ok(x), Ok(y), Ok(p), Ok(q)) if (x || p) && (y || q)
         );
         if static_int {
+            if is(BinOpKind::Div) {
+                let r = self.int_true_div(a.word, b.word, slow);
+                self.push(Item::Float(r));
+                self.set_last(pc);
+                return true;
+            }
             let Some(r) = self.int_op(kind, a.word, b.word, slow) else {
                 self.b.ins().jump(slow, &[]);
                 return false;
@@ -11995,6 +12001,13 @@ impl<'a> Lower<'a> {
                     self.b.ins().jump(other, &[]);
                 }
             }
+        } else if is(BinOpKind::Div) {
+            let r = self.int_true_div(a.word, b.word, other);
+            let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
+            let t = self.b.ins().iconst(types::I64, i64::from(self.tags.float));
+            self.b
+                .ins()
+                .jump(done, &[t.into(), bits.into(), zero.into()]);
         } else {
             self.b.ins().jump(other, &[]);
         }
@@ -12067,17 +12080,25 @@ impl<'a> Lower<'a> {
         let not_int = self.b.create_block();
         self.b.ins().brif(both_int, int_b, &[], not_int, &[]);
         self.b.switch_to_block(int_b);
-        match int_kind
-            .then(|| self.int_op(kind, a.word, b.word, other))
-            .flatten()
-        {
-            Some(r) => {
-                self.write_tag(dst, int_t);
-                self.b.ins().store(FLAGS, r, dst, 8);
-                self.b.ins().jump(done, &[]);
-            }
-            None => {
-                self.b.ins().jump(other, &[]);
+        if is(BinOpKind::Div) {
+            let r = self.int_true_div(a.word, b.word, other);
+            let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
+            self.write_tag(dst, float_t);
+            self.b.ins().store(FLAGS, bits, dst, 8);
+            self.b.ins().jump(done, &[]);
+        } else {
+            match int_kind
+                .then(|| self.int_op(kind, a.word, b.word, other))
+                .flatten()
+            {
+                Some(r) => {
+                    self.write_tag(dst, int_t);
+                    self.b.ins().store(FLAGS, r, dst, 8);
+                    self.b.ins().jump(done, &[]);
+                }
+                None => {
+                    self.b.ins().jump(other, &[]);
+                }
             }
         }
         self.b.switch_to_block(not_int);
@@ -12919,6 +12940,27 @@ impl<'a> Lower<'a> {
     /// Two floats, by `kind` (one of add, subtract, multiply, divide); a
     /// zero divisor or a NaN result branches to `slow` (the core loop
     /// raises, or tags the NaN).
+    /// `x / y` of two ints, as a float: in line when both have at most 53
+    /// significant bits (each converts exactly, and the one division
+    /// rounds once, as CPython's `long_true_divide` does for them) and `y`
+    /// isn't zero; anything else branches to `slow`.
+    fn int_true_div(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        const LIM: i64 = 1 << 53;
+        let zero = self.b.ins().icmp_imm(IntCC::Equal, y, 0);
+        self.branch_out(zero, slow);
+        for v in [x, y] {
+            let shifted = self.b.ins().iadd_imm(v, LIM);
+            let wide = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, shifted, 2 * LIM);
+            self.branch_out(wide, slow);
+        }
+        let fx = self.b.ins().fcvt_from_sint(types::F64, x);
+        let fy = self.b.ins().fcvt_from_sint(types::F64, y);
+        self.b.ins().fdiv(fx, fy)
+    }
+
     fn float_op(&mut self, kind: u8, x: Value, y: Value, slow: Block) -> Value {
         let is = |k: BinOpKind| kind == k as u8;
         let r = if is(BinOpKind::Add) {
