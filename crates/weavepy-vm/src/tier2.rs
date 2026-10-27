@@ -9808,6 +9808,34 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     }
 }
 
+/// One step of a list or tuple iterator whose next element packs into
+/// the scalar lane `elem_tag` names: the element's bits, the iterator
+/// advanced. `None` (nothing consumed) at the end, for an element outside
+/// the lane, any other iterator, or one already borrowed.
+#[inline]
+fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u64> {
+    let lane = match u32::try_from(elem_tag).ok().map(SlotTag::from_raw) {
+        Some(SlotTag::Int) => JitType::Int,
+        Some(SlotTag::Float) => JitType::Float,
+        Some(SlotTag::Bool) => JitType::Bool,
+        _ => return None,
+    };
+    let mut it = cell.try_borrow_mut().ok()?;
+    match &mut *it {
+        PyIterator::Tuple { items, index } => {
+            let bits = pack(items.get(*index)?, lane)?;
+            *index += 1;
+            Some(bits)
+        }
+        PyIterator::List { items, index, .. } => {
+            let bits = pack(items.borrow().get(*index)?, lane)?;
+            *index += 1;
+            Some(bits)
+        }
+        _ => None,
+    }
+}
+
 /// The `wpjit_iter_next` helper (RFC 0071 WS4): one step of a
 /// [`weavepy_jit::TTerm`]`::ForIter` loop over a pinned identity
 /// iterable. **Runs Python code** for a generator source (the resume
@@ -9827,6 +9855,16 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    // A list or tuple iterator stepping into a scalar lane, the commonest
+    // opaque loop (a tuple local, a subscript's list): the element is read
+    // in place. Its end, and an element outside the lane, take the general
+    // step below.
+    if let Some(Pin::Obj(Object::Iter(cell))) = ctx.pins.get(pin as usize) {
+        if let Some(bits) = seq_scalar_step(cell, elem_tag) {
+            jf.ret_bits = bits;
+            return 0;
+        }
+    }
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
@@ -10114,18 +10152,27 @@ unsafe extern "C" fn wpjit_build_tuple(frame: *mut JitFrame, n: i64) -> i64 {
         return -1;
     }
     let n = n as usize;
-    let mut items = Vec::with_capacity(n);
-    for j in 0..n {
-        // SAFETY: per the function contract, `n` marshaled entries
-        // and tags are live.
+    if n == 0 {
+        let idx = ctx.pins.len() as i64;
+        ctx.pins.push(Pin::Obj(Object::new_tuple(Vec::new())));
+        return idx;
+    }
+    // The elements move straight into the tuple's own allocation.
+    let mut ok = true;
+    let tuple = crate::tuple_storage::TupleStorage::from_exact_iter((0..n).map(|j| {
+        // SAFETY: per the function contract, `n` marshaled entries and
+        // tags are live.
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
-        match boxed_element(ctx, bits, tag) {
-            Some(o) => items.push(o),
-            None => return -1,
-        }
+        boxed_element(ctx, bits, tag).unwrap_or_else(|| {
+            ok = false;
+            Object::None
+        })
+    }));
+    if !ok {
+        return -1;
     }
     let idx = ctx.pins.len() as i64;
-    ctx.pins.push(Pin::Obj(Object::new_tuple(items)));
+    ctx.pins.push(Pin::Obj(Object::Tuple(tuple)));
     idx
 }
 
@@ -10181,10 +10228,10 @@ unsafe extern "C" fn wpjit_str_get(frame: *mut JitFrame, pin: i64, idx: i64) -> 
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
-    let Some(s) = pin_str(ctx, pin) else {
+    let Some(Pin::Obj(Object::Str(s))) = ctx.pins.get(pin as usize) else {
         return -1;
     };
-    if !s.is_ascii() || ctx.pins.len() >= RUNTIME_PIN_CAP {
+    if !SharedStr::is_ascii(s) {
         return -1;
     }
     let len = s.len() as i64;
@@ -10192,11 +10239,14 @@ unsafe extern "C" fn wpjit_str_get(frame: *mut JitFrame, pin: i64, idx: i64) -> 
     if i < 0 || i >= len {
         return -1;
     }
-    let i = i as usize;
-    let ch = Object::from_str(&s[i..=i]);
-    let out = ctx.pins.len() as i64;
-    ctx.pins.push(Pin::Obj(ch));
-    out
+    // The shared one-character string (as the interpreter's subscript
+    // gives), whose pin a loop reading characters reuses: no allocation
+    // and no pin per read.
+    let ch = Object::Str(SharedStr::ascii_char(s.as_bytes()[i as usize]));
+    match pin_reusing(&ch, &mut ctx.pins, &mut ctx.pin_memo) {
+        Some(bits) => bits as i64,
+        None => -1,
+    }
 }
 
 /// The `wpjit_build_string` helper (RFC 0073 WS3): `BUILD_STRING n` —
@@ -11484,6 +11534,7 @@ fn pin_reusable(last: &Object, v: &Object) -> bool {
         (Object::Bool(a), Object::Bool(b)) => a == b,
         (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
         (Object::Str(a), Object::Str(b)) => crate::SharedStr::ptr_eq(a, b),
+        (Object::Tuple(a), Object::Tuple(b)) => crate::shared_value::ThinArc::ptr_eq(a, b),
         (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
         (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
         (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
@@ -13451,6 +13502,66 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // A list or tuple iterator (a row of `(neighbor, weight)` pairs), the
+    // commonest source, steps in place first: no Python runs, so the
+    // header's countdown poll covers the step, and the element unpacks
+    // like the generic step's below.
+    let seq_step = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => {
+            cell.try_borrow_mut()
+                .ok()
+                .and_then(|mut it| match &mut *it {
+                    // The common step inline (`next_value` is a large
+                    // function); exhaustion detaches through it.
+                    crate::object::PyIterator::List { items, index, .. } => {
+                        let next = items.borrow().get(*index).cloned();
+                        Some(match next {
+                            Some(v) => {
+                                *index += 1;
+                                Some(v)
+                            }
+                            None => it.next_value(),
+                        })
+                    }
+                    crate::object::PyIterator::Tuple { items, index } => {
+                        let next = items.get(*index).cloned();
+                        if next.is_some() {
+                            *index += 1;
+                        }
+                        Some(next)
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    if let Some(step) = seq_step {
+        let Some(v) = step else {
+            return 1;
+        };
+        if let Object::Tuple(items) = &v {
+            if let [a, b] = &items[..] {
+                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let packed2 =
+                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot
+                    // wide (`max_call_args.max(1)`).
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+            }
+        }
+        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
+        jf.ret_bits = if matches!(v, Object::None) {
+            u64::MAX
+        } else {
+            ctx.pins.push(Pin::Obj(v));
+            (ctx.pins.len() - 1) as u64
+        };
+        return 3;
+    }
     // A `dict.items()` step yields the key and value straight into the
     // two lanes, without the tuple; no Python runs, so the header's poll
     // covers it.
@@ -13553,65 +13664,6 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     crate::gil::yield_checkpoint();
     if crate::hot_gates::load() != 0 || crate::trace::any_observers_active() {
         return 2;
-    }
-    // A list or tuple iterator (a row of `(index, weight)` pairs) steps
-    // in place: no Python runs, and the element unpacks like the
-    // generic step's below.
-    let seq_step = match ctx.pins.get(pin as usize) {
-        Some(Pin::Obj(Object::Iter(cell))) => {
-            cell.try_borrow_mut()
-                .ok()
-                .and_then(|mut it| match &mut *it {
-                    // The common step inline (`next_value` is a large
-                    // function); exhaustion detaches through it.
-                    crate::object::PyIterator::List { items, index, .. } => {
-                        let next = items.borrow().get(*index).cloned();
-                        Some(match next {
-                            Some(v) => {
-                                *index += 1;
-                                Some(v)
-                            }
-                            None => it.next_value(),
-                        })
-                    }
-                    crate::object::PyIterator::Tuple { items, index } => {
-                        let next = items.get(*index).cloned();
-                        if next.is_some() {
-                            *index += 1;
-                        }
-                        Some(next)
-                    }
-                    _ => None,
-                })
-        }
-        _ => None,
-    };
-    if let Some(step) = seq_step {
-        let Some(v) = step else {
-            return 1;
-        };
-        if let Object::Tuple(items) = &v {
-            if let [a, b] = &items[..] {
-                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
-                let packed2 =
-                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
-                if let (Some(b1), Some(b2)) = (packed1, packed2) {
-                    jf.ret_bits = b1;
-                    // SAFETY: the marshal buffer is at least one slot
-                    // wide (`max_call_args.max(1)`).
-                    unsafe { *jf.call_args = b2 };
-                    return 0;
-                }
-            }
-        }
-        // Not in the lanes: the erased `UNPACK_SEQUENCE` consumes it.
-        jf.ret_bits = if matches!(v, Object::None) {
-            u64::MAX
-        } else {
-            ctx.pins.push(Pin::Obj(v));
-            (ctx.pins.len() - 1) as u64
-        };
-        return 3;
     }
     let it = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(o @ (Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_)))) => {
