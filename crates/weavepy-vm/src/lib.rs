@@ -17641,8 +17641,10 @@ impl Interpreter {
                 let globals = frame.globals.clone();
                 frame.pc = pc as u32 + 1;
                 let pending = self.core_pending_enter(sw, frame, pc);
-                let tuple_ty = Object::Type(builtin_types().tuple_.clone());
-                let r = self.call(&tuple_ty, std::slice::from_ref(&spread), &[], &globals);
+                // `tuple(gen)`'s drain, without the type call around it.
+                let r = self
+                    .collect_iterable(&spread, &globals)
+                    .map(Object::new_tuple);
                 self.lean_pending_exit(pending);
                 drop(spread);
                 // SAFETY: as in `core_type_lane` (the iteration ran nested
