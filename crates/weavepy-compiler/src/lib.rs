@@ -445,6 +445,13 @@ impl JitHint {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Withdraw [`Self::mark_compiled`]: the interpreter's calls run the
+    /// code themselves again (its native entry kept failing them).
+    pub fn unmark_compiled(&self) {
+        self.compiled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn mark_not_jitable(&self) {
         self.not_jitable
             .store(true, std::sync::atomic::Ordering::Relaxed);

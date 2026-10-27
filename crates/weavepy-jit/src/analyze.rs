@@ -1603,6 +1603,27 @@ fn analyze_once(
             return Err(JitVerdict::Trivial);
         }
     }
+    // A fresh activation whose entry block is only a cold exit (the code
+    // before the loops is cut) leaves native code at once, paying an entry
+    // and a frame rebuild for nothing; with no loop or resume entry either,
+    // nothing would run natively at all (`textwrap`'s `_split`, whose one
+    // loop is a comprehension, entered on every call).
+    let entry_cold = {
+        let mut b = entry_block;
+        for _ in 0..8 {
+            match blocks[b].term {
+                TTerm::Jump(t) if blocks[b].stmts.is_empty() => b = t,
+                _ => break,
+            }
+        }
+        blocks[b].stmts.is_empty()
+            && matches!(blocks[b].term,
+                TTerm::Deopt { pc } if plan.cold.contains(&(pc as usize)))
+    };
+    if entry_cold && osr_entries.is_empty() && resume_entries.is_empty() {
+        return Err(JitVerdict::Trivial);
+    }
+    let pc0_entry = pc0_entry && !entry_cold;
 
     // Parameters flow in from the caller, so every *typed* parameter
     // slot must be entry-guarded even though the definite-assignment
