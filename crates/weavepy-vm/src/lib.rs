@@ -50140,7 +50140,16 @@ impl Interpreter {
             return None;
         }
         let recv = frame.stack.pop()?;
-        let err = crate::error::attribute_error_named(&recv, name);
+        // (An unset `__slots__` member's error names the class by its
+        // qualified name, as its descriptor's does.)
+        let err = match &recv {
+            Object::Instance(inst)
+                if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
+            {
+                crate::error::attribute_error_typed(&recv, name, &inst.cls().fully_qualified_name())
+            }
+            _ => crate::error::attribute_error_named(&recv, name),
+        };
         self.release(recv);
         Some(err)
     }
@@ -60311,6 +60320,17 @@ impl Interpreter {
             }
             self.recycle_scratch(positional);
             return result;
+        }
+        // A native caller's call (a special method a builtin or a
+        // constructor runs, a `key=` function) warms its callee as a
+        // compiled caller's switched call does: its nested run gains most
+        // from a native body (see `frame_jit::Slot::warm_switched`).
+        #[cfg(feature = "jit")]
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
+            if let Some(ext) = code_vm_ext(&code) {
+                ext.frame_jit
+                    .warm_switched(&code, ext, code.varnames.len().max(positional.len()));
+            }
         }
         // A cell-free, non-generator body runs as a lean activation when
         // the loop is quiet: no frame build, no eager shell, no general
@@ -71331,7 +71351,7 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
         true
     });
     if !class_missing {
-        return false;
+        return !dunder && slot_member_unset(&cls, inst, name);
     }
     match inst.dict.published() {
         Some(d) => d
@@ -71343,6 +71363,20 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
             .try_borrow()
             .is_ok_and(|s| s.position_str(name).is_none()),
     }
+}
+
+/// Whether `inst.name` is a `__slots__` member of its class (the data
+/// descriptor the default lookup finds first, under `object`'s own
+/// `__getattribute__`) that `inst` holds no value for: the member's
+/// `__get__` raises the lookup's `AttributeError` (CPython's `member_get`).
+#[inline(never)]
+fn slot_member_unset(cls: &Rc<TypeObject>, inst: &PyInstance, name: &str) -> bool {
+    use crate::types::Dunder;
+    if !cls.dunder(Dunder::GetAttribute).object_owner() || cls.is_super_proxy_type() {
+        return false;
+    }
+    matches!(cls.lookup(name), Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none())
+        && inst.slot_get(name).is_none()
 }
 
 /// Resolve a built-in slot-wrapper dunder reached via *type-level* attribute
