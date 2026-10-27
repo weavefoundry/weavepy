@@ -133,11 +133,11 @@ class PythonNewConstructionTests(unittest.TestCase):
             self.assertEqual(ReturnsOther(i), i)
 
     def test_new_returns_subclass_instance(self):
-        seen = []
         for i in range(N):
             c = ReturnsSubclass(1)
-            seen.append((type(c), c.ran, ReturnsSubclass(0).ran))
-        self.assertEqual(set(seen), {(Child, 1, 0)})
+            self.assertIs(type(c), Child)
+            self.assertEqual(c.ran, 1)
+            self.assertEqual(ReturnsSubclass(0).ran, 0)
 
     def test_errors(self):
         for i in range(N):
@@ -178,8 +178,9 @@ class PythonNewConstructionTests(unittest.TestCase):
             Defaults()
 
     def test_closure(self):
-        seen = [(c.v, c.w) for c in map(Closure, range(N))]
-        self.assertEqual(seen, [(2 * i, i) for i in range(N)])
+        for i in range(N):
+            c = Closure(i)
+            self.assertEqual((c.v, c.w), (2 * i, i))
 
     def test_pathlib(self):
         base = pathlib.PurePosixPath("/srv/app")
