@@ -544,6 +544,16 @@ struct CacheEntry {
     /// Framed native entries of this code (saturating), the
     /// denominator of the generic-call retirement ratio below.
     native_entries: u32,
+    /// OSR entries this code made (saturating), and requests at its region
+    /// roots turned down as too short (see [`note_short_region`]).
+    osr_runs: u32,
+    short_regions: u32,
+    /// Interpreter activations the entry type guard turned away (a
+    /// parameter outside the lane the code compiled for).
+    guard_failures: u32,
+    /// The interpreter's calls no longer enter the compiled code at pc 0
+    /// (see [`note_entry_guard_failure`]); native callers still do.
+    no_interp_entry: bool,
     /// RFC 0076 WS7 follow-up — generic `wpjit_call_dyn` legs taken by
     /// this code's compiled activations: calls that fell through
     /// [`try_dyn_native`] into the full interpreter round-trip
@@ -593,6 +603,10 @@ impl CacheEntry {
             calls: 0,
             deopts: 0,
             native_entries: 0,
+            osr_runs: 0,
+            short_regions: 0,
+            guard_failures: 0,
+            no_interp_entry: false,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
             recompile_at_osr: false,
@@ -1329,6 +1343,7 @@ impl JitState {
             }
             match &entry.tier {
                 Tier::Cold if recompile => {}
+                Tier::Compiled(_) if entry_pc == 0 && entry.no_interp_entry => return None,
                 Tier::Compiled(a) => {
                     let out = CompiledEntry {
                         cf: a.cf.clone(),
@@ -14171,13 +14186,62 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
                 .get(slot as usize)
                 .is_some_and(|o| entry_local_ok(o, ty));
             if !ok {
-                JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
+                if crate::hot_gates::env_flags::jit_trace() {
+                    eprintln!(
+                        "jit entry guard {:?} local {} {:?} holds {}",
+                        frame.code.qualname,
+                        slot,
+                        ty,
+                        locals
+                            .get(slot as usize)
+                            .map_or("?".to_owned(), |o| o.type_name_owned())
+                    );
+                }
+                drop(locals);
+                note_entry_guard_failure(&frame.code);
                 return JitEntry::Skip;
             }
         }
     }
 
     enter_compiled(interp, frame, &entry, 0, &[], None)
+}
+
+/// Entry type-guard failures of one code's interpreter activations past
+/// which, at [`GUARD_FAILURES_PER_ENTRY`] failures per native entry, its
+/// calls stop trying the compiled code.
+const GUARD_FAILURE_BUDGET: u32 = 64;
+
+/// See [`GUARD_FAILURE_BUDGET`].
+const GUARD_FAILURES_PER_ENTRY: u32 = 4;
+
+/// Count an interpreter activation of `code` its compiled code's entry
+/// type guard turned away. Each one paid for the compiled entry's lookup
+/// and guard checks, then ran interpreted anyway, and the compiled claim
+/// keeps its calls off the lean and frame-JIT paths: code whose callers
+/// mostly pass other lanes than it compiled for (a method called with
+/// ints and floats) gives the interpreter its calls back. Native callers
+/// keep entering the compiled code with their own lanes.
+fn note_entry_guard_failure(code: &Rc<CodeObject>) {
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.stats.entry_guard_failures += 1;
+        let Some(ce) = st.cache.get_mut(&key) else {
+            return;
+        };
+        ce.guard_failures = ce.guard_failures.saturating_add(1);
+        if !ce.no_interp_entry
+            && ce.guard_failures >= GUARD_FAILURE_BUDGET
+            && ce.guard_failures / ce.native_entries.max(1) >= GUARD_FAILURES_PER_ENTRY
+        {
+            ce.no_interp_entry = true;
+            code.jit_hint.unmark_compiled();
+            if crate::hot_gates::env_flags::jit_trace() {
+                eprintln!("jit entry guard retire {:?}", code.qualname);
+            }
+        }
+    });
 }
 
 /// Below this much remaining straight-line scalar work, a first activation
@@ -14357,6 +14421,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // around it is worth entering only for enough remaining iterations.
     if cf.region_roots.contains(&(pc as u32)) {
         if short_live_loop(&frame.stack) {
+            note_short_region(&frame.code);
             return JitEntry::Skip;
         }
         // A loop over a generator: each native step resumes it the way the
@@ -14456,7 +14521,14 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
     // The iterators are consumed by the decomposition: native code owns
     // the loops from here (a deopt reconstructs fresh iterators).
     frame.stack.clear();
-    JIT.with(|cell| cell.borrow_mut().stats.osr_entries += 1);
+    JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.stats.osr_entries += 1;
+        let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
+        if let Some(e) = st.cache.get_mut(&key) {
+            e.osr_runs = e.osr_runs.saturating_add(1);
+        }
+    });
     enter_compiled(interp, frame, &entry, pc, &synth, None)
 }
 
@@ -14512,6 +14584,32 @@ fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
         short
     });
     if short {
+        code.jit_hint.set_backedge_quiet();
+    }
+}
+
+/// Back-edge requests at short region roots (see [`short_live_loop`]) after
+/// which compiled code whose loops were never entered natively gives its
+/// back edges up.
+const SHORT_REGION_BUDGET: u32 = 64;
+
+/// Count a request to enter a region root that [`short_live_loop`] turned
+/// down. Code whose native regions are all this short (a square's few
+/// neighbors, in a loop over the board that stays interpreted for an
+/// unsupported attribute) never runs natively, while its claim on its back
+/// edges keeps the frame JIT from compiling the loop around them: past the
+/// budget, with no native loop run at all, the claim goes.
+fn note_short_region(code: &Rc<CodeObject>) {
+    let key = Rc::as_ptr(code).cast::<CodeObject>();
+    let quiet = JIT.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let Some(e) = st.cache.get_mut(&key) else {
+            return false;
+        };
+        e.short_regions = e.short_regions.saturating_add(1);
+        e.short_regions >= SHORT_REGION_BUDGET && e.osr_runs == 0
+    });
+    if quiet {
         code.jit_hint.set_backedge_quiet();
     }
 }
