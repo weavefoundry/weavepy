@@ -1832,6 +1832,18 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
+    // `object.__new__(cls)` of a class its memoized construction plan
+    // proved plain: the allocation every check below would reach.
+    if args.len() == 1 {
+        let plain = cls
+            .instance_plan
+            .borrow()
+            .as_ref()
+            .is_some_and(|(v, plan)| *v == cls.attr_version.get() && plan.object_new_plain);
+        if plain {
+            return Ok(plain_instance(cls));
+        }
+    }
     // Exception classes: `BaseException.__new__` allocates and seeds
     // `.args` but never runs `__init__` (CPython `BaseException_new`).
     // `UnicodeDecodeError.__new__(UnicodeDecodeError)` must succeed
@@ -2001,6 +2013,23 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::gc_trace::track(&inst);
     }
     Ok(inst)
+}
+
+/// A fresh plain instance of the non-built-in class `cls`, as a plain
+/// class's construction allocates one: a natively served class's never
+/// tracked, any other's tracked once it could hold a non-atomic value
+/// (eagerly when its instances need finalizing).
+fn plain_instance(cls: Rc<TypeObject>) -> Object {
+    use crate::types::PyInstance;
+    if cls.native_kind.get() != 0 {
+        return Object::Instance(Rc::new(PyInstance::new(cls)));
+    }
+    if cls.instances_need_finalize() {
+        let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
+        crate::gc_trace::track(&inst);
+        return inst;
+    }
+    Object::Instance(PyInstance::new_deferred(cls))
 }
 
 /// Does `cls` inherit `__new__` from somewhere other than `object`?
