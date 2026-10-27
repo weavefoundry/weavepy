@@ -62069,6 +62069,142 @@ impl Interpreter {
         true
     }
 
+    /// The activation of `await f(...)`'s coroutine body run lazily (see
+    /// `frame_jit::lazy_await`), its checks passed: `f` (its code `code`,
+    /// without cells of its own: `cells` are the function's) called with
+    /// the `nargs` arguments at `args`, which move into the frame's locals
+    /// (the stack forgets them), the frame built in a pooled generator box
+    /// just past the `RETURN_GENERATOR` at `start` with the sent `None`
+    /// pushed, as [`Self::core_await_enter`] starts it. The caller rests at
+    /// the `SEND` at `send_pc`, whose exit takes the return.
+    ///
+    /// # Safety
+    ///
+    /// `args` holds `nargs` initialized values the caller's stack forgets,
+    /// no more than `code` takes.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) unsafe fn lazy_coro_bind(
+        &mut self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        cells: &Rc<Vec<Rc<RefCell<Object>>>>,
+        args: *const Object,
+        nargs: usize,
+        start: usize,
+        send_pc: usize,
+        jump: u32,
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
+        let nlocals = code.varnames.len();
+        let GenParts {
+            locals,
+            stack,
+            boxed,
+        } = self.gen_parts(nlocals);
+        {
+            // SAFETY: sole owner (see `gen_parts`); the caller's contract.
+            let v = unsafe { &mut *locals.as_ptr() };
+            v.reserve(nlocals);
+            unsafe {
+                std::ptr::copy_nonoverlapping(args, v.as_mut_ptr(), nargs);
+                v.set_len(nargs);
+            }
+            let missing = (code.arg_count as usize).saturating_sub(nargs);
+            if missing > 0 {
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
+            v.resize(nlocals, Object::Unbound);
+        }
+        let mut frame = Self::gen_frame_lean(f, code.clone(), locals, stack, cells.clone(), start);
+        frame.gen_first_resume = true;
+        frame.push(Object::None);
+        let mut boxed = Box::write(boxed, frame);
+        let gen_frame: *mut Frame = &mut *boxed;
+        let mut act = self.inline_slot();
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: each field is `None` (a pooled slot holds none of them).
+        unsafe {
+            std::ptr::write(&raw mut act.gen_box, Some(boxed));
+            std::ptr::write(&raw mut act.guard, Some(guard));
+        }
+        act.gen_frame = gen_frame;
+        act.act.frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.call_pc = send_pc;
+        act.exc_depth = self.exc_info_len();
+        act.direct = true;
+        act.lazy_coro = true;
+        act
+    }
+
+    /// Make the coroutine of `act`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]), as it registers: from here it is the
+    /// activation [`Self::core_await_enter`] makes, its coroutine running
+    /// (tracked if it suspends) in the placeholder's slot atop the caller
+    /// `caller`'s stack.
+    ///
+    /// # Safety
+    ///
+    /// `act` is lazy and its caller's frame synced, the placeholder `None`
+    /// atop its stack.
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn lazy_coro_materialize(act: &mut InlineAct, caller: &mut Frame) {
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_MADE);
+        let boxed = act.gen_box.take().expect("a lazy coroutine's frame");
+        let kind = crate::object::CoroutineKind::Coroutine;
+        let code = Object::Code(boxed.code.clone());
+        let gen = match crate::object::pooled_generator(kind, code, boxed) {
+            Ok(gen) => gen,
+            Err((code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, code, frame)
+            }),
+        };
+        gen.track_deferred.set(true);
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *gen.state().as_ptr() };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("a fresh coroutine");
+        };
+        act.gen_box = Some(boxed);
+        let n = caller.stack.len();
+        debug_assert!(n > 0 && matches!(caller.stack[n - 1], Object::None));
+        // SAFETY: the placeholder (`None`, nothing to drop) is the top slot.
+        unsafe {
+            caller
+                .stack
+                .as_mut_ptr()
+                .add(n - 1)
+                .write(Object::Coroutine(gen.clone()));
+        }
+        act.gen = Some(gen);
+        act.lazy_coro = false;
+        act.direct = false;
+    }
+
+    /// Finish `done`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]) that returned cleanly without registering,
+    /// its result taken and its operand stack empty: its frame retired as a
+    /// finished generator's (see [`Self::retire_gen_frame`]) and its slot
+    /// parked.
+    #[inline(always)]
+    pub(crate) fn lazy_coro_finish(&mut self, mut done: Box<InlineAct>) {
+        drop(done.guard.take());
+        if let Some(boxed) = done.gen_box.take() {
+            self.retire_gen_frame(boxed);
+        }
+        done.gen_frame = std::ptr::null_mut();
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.direct = false;
+        done.lazy_coro = false;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, done);
+        }
+    }
+
     /// Bootstrap a generator/coroutine *code object* frame that was not
     /// entered through a `PyFunction` call — `eval(co)` / `exec(co)` of
     /// PyCF_ALLOW_TOP_LEVEL_AWAIT module code (RFC 0052). Runs the frame
@@ -70351,6 +70487,11 @@ struct InlineAct {
     /// While a direct call's activation runs lazily (see
     /// `frame_jit::register_lazy`), its caller's native state.
     lazy_caller: *mut frame_jit::State,
+    /// An awaited coroutine's body running lazily without its coroutine
+    /// (see `frame_jit::lazy_await`): its frame is in `gen_box`, `gen` is
+    /// `None`, and registering makes the coroutine
+    /// (`Interpreter::lazy_coro_materialize`).
+    lazy_coro: bool,
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
@@ -70492,6 +70633,7 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             lazy_caller: std::ptr::null_mut(),
+            lazy_coro: false,
             binop: None,
             discard: false,
             chain: None,
@@ -71562,7 +71704,9 @@ mod burst_stats {
     pub(crate) const CALL_PURE: usize = 5;
     pub(crate) const CALL_GENERAL: usize = 6;
     pub(crate) const CALL_TIER2: usize = 7;
-    const CALL_NAMES: [&str; 8] = [
+    pub(crate) const CALL_LAZY_AWAIT: usize = 8;
+    pub(crate) const CALL_LAZY_MADE: usize = 9;
+    const CALL_NAMES: [&str; 10] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -71571,8 +71715,10 @@ mod burst_stats {
         "pure leaf evaluated in place",
         "general frame run",
         "tier-2 entry from the general run",
+        "frame-JIT lazy await",
+        "lazy await's coroutine made",
     ];
-    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
