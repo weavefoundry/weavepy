@@ -12251,26 +12251,35 @@ unsafe fn dyn_kw_pure_leaf(
     if n + usize::from(recv.is_some()) > MAX || name_items.len() != kwc as usize {
         return None;
     }
-    let mut vals: [Object; MAX] = std::array::from_fn(|_| Object::None);
+    // (Only the operands are written, and released.)
+    let mut buf = [const { std::mem::MaybeUninit::<Object>::uninit() }; MAX];
     let offset = usize::from(recv.is_some());
     if let Some(r) = recv {
-        vals[0] = r.clone();
+        buf[0].write(r.clone());
     }
     for j in 0..n {
         // SAFETY: native code wrote `argc + kwc` entries, and the buffers
         // are `max_call_args` wide.
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
-        vals[offset + j] = unpack_pins(bits, tag, &ctx.pins);
+        buf[offset + j].write(unpack_pins(bits, tag, &ctx.pins));
     }
-    interp.kw_pure_leaf_call(
+    let total = offset + n;
+    // SAFETY: the first `total` entries are initialized.
+    let vals = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<Object>(), total) };
+    let r = interp.kw_pure_leaf_call(
         code,
         jf.deopt_pc as usize,
         f,
         name_items,
-        &vals[..offset + n],
+        vals,
         eff_argc,
         ctx.depth_cell,
-    )
+    );
+    for v in &mut buf[..total] {
+        // SAFETY: as above; each is dropped once.
+        unsafe { v.assume_init_drop() };
+    }
+    r
 }
 
 /// Deliver a pure leaf's result at a dynamic call site: it ran no Python,

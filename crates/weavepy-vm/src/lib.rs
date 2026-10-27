@@ -22529,6 +22529,16 @@ impl Interpreter {
         if let Some(d) = &varkw {
             args[total] = d;
         }
+        // A warm plan's native code straight away (no `**kwargs` dictionary
+        // to recycle after it).
+        #[cfg(feature = "jit")]
+        if varkw.is_none() {
+            // SAFETY: this thread's own depth cell.
+            let depth = unsafe { (*depth_cell).get() };
+            if let Some(r) = self.leaf_native_lane(code_rc, f, &args[..arity], false, depth) {
+                return r;
+            }
+        }
         let result = self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity]);
         if let Some(Object::Dict(d)) = varkw {
             recycle_kw_dict(d);
