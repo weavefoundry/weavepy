@@ -31272,8 +31272,18 @@ impl Interpreter {
                         // An existing key takes the *indexed* shape, which
                         // the core loop's own arm serves without a hash
                         // probe (the specializer's choice, made here
-                        // because the site never reaches it).
-                        if matches!(cache, IC::Empty) {
+                        // because the site never reaches it). A site left
+                        // cooling down, or specialized for another class
+                        // (`Base.__init__` run on a subclass's instances),
+                        // is re-specialized too: the full handler that
+                        // would count the cooldown down never sees it.
+                        if matches!(
+                            cache,
+                            IC::Empty
+                                | IC::Cooldown(_)
+                                | IC::StoreAttrInstance { .. }
+                                | IC::StoreAttrNewKey { .. }
+                        ) {
                             let ver = cls.attr_version.get();
                             let indexed = inst.attr_position_str(name);
                             code.caches.set(
