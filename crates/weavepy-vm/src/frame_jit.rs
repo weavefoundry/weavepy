@@ -4078,6 +4078,12 @@ unsafe extern "C" fn h_load_method(
                 }
             }
         }
+        // An attribute the instance holds itself at the position the site
+        // recorded for its class version (a stored callable): the value
+        // with an empty self slot, ahead of the probes.
+        if Interpreter::core_value_method_hit(ext, pc, top) {
+            return 0;
+        }
         let Some(ms) = ext.method_slot(pc) else {
             // An attribute the instance holds itself (a stored callable,
             // `self.fget(x)`), at a site that never needed a method slot.

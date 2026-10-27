@@ -20748,6 +20748,46 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_value_method`]'s cached lane: the value at the
+    /// position the method load at `pc` (of the code whose extension is
+    /// `ext`) recorded for the receiver's class version (see
+    /// [`field_slot_note`]), which the instance holds and which shadows
+    /// any method of its class. `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_value_method`]'s.
+    #[inline(always)]
+    pub(crate) unsafe fn core_value_method_hit(
+        ext: &CodeConstObjects,
+        pc: usize,
+        top: *mut Object,
+    ) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return false;
+        };
+        if !Self::default_getattribute(inst.cls_raw()) {
+            return false;
+        }
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let Some(v) = (unsafe { field_slot_hit(ext, pc, inst) }) else {
+            return false;
+        };
+        // SAFETY: as above.
+        if !Self::core_droppable(unsafe { &*top }) {
+            return false;
+        }
+        let v = Self::clone_operand(v);
+        // SAFETY: the receiver (droppable) is replaced in place; the slot
+        // above is free.
+        unsafe {
+            drop_hot(std::mem::replace(&mut *top, v));
+            top.add(1).write(Object::Unbound);
+        }
+        true
+    }
+
     /// The call at `base[callee_at..len]` (the callee, its self slot,
     /// the arguments) of an exact builtin type whose native constructor
     /// builds without running Python code (see [`Self::leaf_type_call`]
