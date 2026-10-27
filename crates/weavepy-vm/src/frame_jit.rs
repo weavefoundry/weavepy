@@ -6703,7 +6703,8 @@ unsafe fn direct_done<const PUSHED: bool>(
                     a.act.shell.is_none()
                         && (!PUSHED
                             || ((cframe.code.cellvars.is_empty() || a.owns_cells)
-                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))))
+                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
+                                && a.new_init.is_none()))
                 })
                 && !cframe.locals.is_shared()
                 && !interp.countdown_out(2)
@@ -6802,6 +6803,22 @@ unsafe fn direct_done<const PUSHED: bool>(
             {
                 st.len = start + 1;
                 return 0;
+            }
+            // A class's Python `__new__` returned and its return pushed the
+            // class's `__init__` for the same call in its place (see
+            // `Interpreter::core_new_finish`): that runs through its native
+            // code from here too.
+            if PUSHED
+                && status == DIRECT_RET
+                && sw.pending.is_none()
+                && (*sw.inl).len() == depth
+                && (*sw.inl)
+                    .last()
+                    .is_some_and(|a| a.call_pc == pc && a.init_inst.is_some())
+            {
+                if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
+                    return r;
+                }
             }
             return RELOAD;
         }

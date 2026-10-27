@@ -8414,6 +8414,7 @@ impl Interpreter {
         act.caller_pending = None;
         act.init_inst = None;
         act.lru = None;
+        act.new_init = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
@@ -8965,6 +8966,20 @@ impl Interpreter {
         result: Result<Object, RuntimeError>,
     ) -> QuietEntry {
         let mut done = done;
+        // A class's Python `__new__` returned (see `core_push_new`): its
+        // `__init__` runs here, nested (the core loop's return pushes it
+        // as an activation instead).
+        let result = match (done.new_init.take(), result) {
+            (Some(ni), Ok(made)) => {
+                let NewInit { ty, plan, mut ops } = *ni;
+                let r = self.init_constructed(&ty, &plan, made, &ops[1..], &[]);
+                for v in ops.drain(..) {
+                    self.release(v);
+                }
+                r
+            }
+            (_, result) => result,
+        };
         // A constructor's `__init__` result becomes the instance (the
         // `instantiate_plain_lean` epilogue).
         let result = match done.init_inst.take() {
@@ -19031,6 +19046,13 @@ impl Interpreter {
         let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
             return false;
         };
+        // `__new__` as an inline activation, its result going on to
+        // `__init__` when it returns (see `InlineAct::new_init`).
+        if self.core_push_new(sw, pc, argc, ty, plan, new_f) {
+            return true;
+        }
+        // SAFETY: as above (declined untouched).
+        let frame = unsafe { &mut *sw.cur };
         // Committed: the class, its self slot and the arguments leave, the
         // class and the arguments as `__new__`'s.
         let mut ops: Vec<Object> = self.pooled_scratch();
@@ -19075,6 +19097,124 @@ impl Interpreter {
             sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
         }
         true
+    }
+
+    /// [`Self::core_new_user`]'s `new_f(ty, *args)` (the `argc` arguments
+    /// below the top of the running activation's stack, called by the
+    /// instruction at `pc`) as an inline activation made the running one,
+    /// which the call's operands leave for: when it returns, its result
+    /// goes on to the class's `__init__` (see [`Self::core_new_finish`]).
+    /// `false` touches nothing (a `__new__` the lean binder can't bind, or
+    /// one only the full call can run).
+    fn core_push_new(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        argc: usize,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        new_f: &Rc<crate::object::PyFunction>,
+    ) -> bool {
+        let code = new_f.code();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+            || (new_f.defaults_maybe_overridden()
+                && (new_f.slot("__defaults__").is_some() || new_f.slot("__kwdefaults__").is_some()))
+            || !Self::call_cells_ok(new_f, &code)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        // (`ty`, then the arguments above the empty self slot.)
+        let bound = Self::lean_bind_keywords(
+            new_f,
+            &code,
+            std::slice::from_ref(&frame.stack[callee_slot]),
+            &frame.stack[callee_slot + 2..],
+            std::iter::empty(),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed: the class and the arguments move into the record
+        // `__init__` takes them from; the empty self slot owns nothing.
+        fill_unbound(locals, code.varnames.len());
+        let mut ops: Vec<Object> = Vec::with_capacity(argc + 1);
+        ops.extend(frame.stack.drain(callee_slot..));
+        ops.remove(1);
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`; the caller's frame is synced, past the
+        // call (its operands gone).
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(new_f.clone()),
+                guard,
+            )
+        };
+        act.new_init = Some(Box::new(NewInit {
+            ty: ty.clone(),
+            plan: plan.clone(),
+            ops,
+        }));
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// A class's Python `__new__`, run by [`Self::core_push_new`]'s
+    /// activation for the `CALL` at `pc` of `sw`'s running activation,
+    /// returned `made`: an instance of the class itself goes on to its
+    /// `__init__` (an inline activation made the running one: `None`),
+    /// anything else as `type_call` treats it (`Some` the result).
+    fn core_new_finish(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        ni: NewInit,
+        made: Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let NewInit { ty, plan, mut ops } = ni;
+        let result = match made {
+            inst @ Object::Instance(_)
+                if !plan.init_from_object
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(&ty))) =>
+            {
+                self.core_push_init(sw, pc, &plan, inst, &mut ops)
+            }
+            made => Some(self.init_constructed(&ty, &plan, made, &ops[1..], &[])),
+        };
+        for v in ops.drain(..) {
+            self.release(v);
+        }
+        result
     }
 
     /// [`Self::core_new_user`]'s `__init__` of `inst`, a fresh instance of
@@ -24658,6 +24798,9 @@ impl Interpreter {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
             let v = done.init_inst.take().unwrap_or(v);
+            // A class's Python `__new__` returned: its result goes on to
+            // the class's `__init__` below, in the caller's place.
+            let new_init = done.new_init.take();
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -24683,8 +24826,14 @@ impl Interpreter {
             } else {
                 self.inline_park_clean(done);
             }
-            // SAFETY: as above.
-            unsafe { (*cframe).stack.push_fast(v) };
+            let made = match new_init {
+                Some(ni) => Some((ni, v)),
+                None => {
+                    // SAFETY: as above.
+                    unsafe { (*cframe).stack.push_fast(v) };
+                    None
+                }
+            };
             match callable {
                 // A function something else still holds (its class, its
                 // module) can't die here: a plain decrement.
@@ -24702,6 +24851,18 @@ impl Interpreter {
             // below.
             // SAFETY: as above.
             unsafe { *sw.last = call_pc };
+            if let Some((ni, made)) = made {
+                match self.core_new_finish(sw, call_pc, *ni, made) {
+                    // `__init__`'s activation runs next.
+                    None => return true,
+                    // SAFETY: the caller is the running activation again.
+                    Some(Ok(r)) => unsafe { (*cframe).stack.push(r) },
+                    Some(Err(e)) => {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        return true;
+                    }
+                }
+            }
             if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
@@ -24740,6 +24901,19 @@ impl Interpreter {
             )
         };
         done.clean &= !had_shell;
+        // A class's Python `__new__` returned: its result goes on to the
+        // class's `__init__` below, in the caller's place, not to the
+        // caller (which takes nothing from the delivery).
+        let mut result = result;
+        let new_step = match (&done.new_init, &result) {
+            (Some(_), Ok(_)) => {
+                done.discard = true;
+                let ni = done.new_init.take().expect("checked above");
+                let made = std::mem::replace(&mut result, Ok(Object::None));
+                Some((ni, made.expect("checked above")))
+            }
+            _ => None,
+        };
         // SAFETY: the caller is the innermost remaining activation.
         (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
         // SAFETY: as above.
@@ -24751,6 +24925,17 @@ impl Interpreter {
         } else {
             clast
         };
+        let mut entry = entry;
+        if let (Some((ni, made)), QuietEntry::Returned { cur_pc }) = (new_step, &entry) {
+            let cur_pc = *cur_pc;
+            match self.core_new_finish(sw, cur_pc, *ni, made) {
+                // `__init__`'s activation runs next.
+                None => return true,
+                // SAFETY: the caller is the running activation again.
+                Some(Ok(v)) => unsafe { (*sw.cur).stack.push(v) },
+                Some(Err(err)) => entry = QuietEntry::Raised { err, cur_pc },
+            }
+        }
         match entry {
             QuietEntry::Returned { cur_pc } => {
                 // SAFETY: as above.
@@ -70547,6 +70732,20 @@ struct InlineAct {
     /// the wrapper's cache when it returns, before its caller takes it
     /// (`inline_deliver`).
     lru: Option<crate::stdlib::functools_mod::LruPending>,
+    /// A class's Python `__new__` (see `Interpreter::core_new_user`): its
+    /// result goes on to the class's `__init__` as `type_call` runs it,
+    /// not straight to the caller.
+    new_init: Option<Box<NewInit>>,
+}
+
+/// The rest of a constructor call whose Python `__new__` an inline
+/// activation runs (see [`InlineAct::new_init`]): the class, its plan,
+/// and the call's operands (the class, then the arguments), which its
+/// `__init__` takes.
+struct NewInit {
+    ty: Rc<TypeObject>,
+    plan: Rc<crate::types::InstancePlan>,
+    ops: Vec<Object>,
 }
 
 /// The levels of a collapsed `yield from` chain (see
@@ -70673,6 +70872,7 @@ impl InlineAct {
             discard: false,
             chain: None,
             lru: None,
+            new_init: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         act
