@@ -696,9 +696,12 @@ impl LeafAttrCache {
         self.0.set(Box::into_raw(large) as usize);
     }
 
+    /// (The low bits count too: the VM's own keys are the addresses of
+    /// adjacent one-byte statics, one per special method, which would
+    /// otherwise all share two slots and evict each other.)
     #[inline]
     fn index(name: usize) -> usize {
-        ((name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
+        (name ^ (name >> 4) ^ (name >> 9) ^ (name >> 14)) & 31
     }
 
     /// The second slot a name may live in (two-choice placement: two
