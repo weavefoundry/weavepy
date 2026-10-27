@@ -1355,7 +1355,7 @@ impl Interpreter {
                         };
                         let value = std::mem::ManuallyDrop::new(to_object(get!(val))?);
                         // On `true` the value moved into the instance.
-                        if !Self::core_store_attr(
+                        if !Self::leaf_attr_store(
                             code,
                             inst,
                             usize::from(pc),
@@ -1818,7 +1818,7 @@ impl Interpreter {
                         None
                     };
                     split_ok &= ready.is_some();
-                    if !ready.unwrap_or_else(|| Self::core_store_attr_ready(code, inst, spc, name))
+                    if !ready.unwrap_or_else(|| Self::leaf_attr_store_ready(code, inst, spc, name))
                     {
                         return None;
                     }
@@ -1835,7 +1835,7 @@ impl Interpreter {
                     return None;
                 };
                 // On `true` the value moved into the dict.
-                if Self::core_store_attr(code, inst, *spc as usize, *name, value) {
+                if Self::leaf_attr_store(code, inst, *spc as usize, *name, value) {
                     pend.moved |= 1 << k;
                 } else if n == 1 {
                     // The lone store declined, untouched.

@@ -253,6 +253,8 @@ struct Caches {
     /// The `CALL` sites' settled builtins.
     builtin_sites: Vec<Box<BuiltinSite>>,
     type_sites: Vec<Box<TypeSite>>,
+    /// The `super().name` sites' caches.
+    supers: Vec<Box<SuperSite>>,
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     mods: Vec<Box<ModCache>>,
@@ -268,6 +270,7 @@ impl Caches {
         self.direct.append(&mut other.direct);
         self.builtin_sites.append(&mut other.builtin_sites);
         self.type_sites.append(&mut other.type_sites);
+        self.supers.append(&mut other.supers);
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
         self.leaf_methods.append(&mut other.leaf_methods);
@@ -2763,6 +2766,102 @@ const CONTAINER_RAISED: u64 = u64::MAX - 1;
 /// `code`) on the top of a `len`-deep stack, as the core loop's arm runs
 /// it: the new depth, [`CONTAINER_RAISED`] (only when `can_raise`: the
 /// whole stack is on the frame's), or `u64::MAX` declined untouched.
+/// A `super().name` site's cache (see [`h_super_attr`]): the plain
+/// function the name resolved to, for the class `super()` started past
+/// (`cls`, by address) and the receiver's class (`recv`, by address) at
+/// attribute version `ver`. Versions are unique across classes, and the
+/// receiver's class keeps the classes on its MRO alive, so the addresses
+/// can't be reused while the version matches.
+#[derive(Default)]
+pub(crate) struct SuperSite {
+    cls: usize,
+    recv: usize,
+    ver: u64,
+    f: Option<Rc<crate::object::PyFunction>>,
+}
+
+/// `LOAD_SUPER_ATTR` `ins` at `pc` over the `len`-deep stack: a hit in
+/// `site` (an instance receiver whose class is the cached one at its
+/// version, `super` the builtin) moves the function and the receiver in
+/// place as `Interpreter::core_super_attr` does; anything else goes
+/// through `core_super_attr`, whose plain-function result refills the
+/// site. The new stack length, or `u64::MAX` declined untouched.
+unsafe extern "C" fn h_super_attr(
+    st: *mut State,
+    ins: *const weavepy_compiler::Instruction,
+    code: *const CodeObject,
+    pc: u64,
+    len: u64,
+    site: *mut SuperSite,
+) -> u64 {
+    // SAFETY: the code passes its live state, one of its own
+    // instructions, its code, its stack depth and the site's own cache.
+    unsafe {
+        let (ins, len, site) = (*ins, len as usize, &mut *site);
+        let base = (*st).stack;
+        if len < 3 {
+            return u64::MAX;
+        }
+        let key = match (&*base.add(len - 2), &*base.add(len - 1)) {
+            (Object::Type(cls), Object::Instance(inst)) => {
+                let recv = inst.cls_raw();
+                Some((
+                    Rc::as_ptr(cls) as usize,
+                    std::ptr::from_ref(recv) as usize,
+                    recv.attr_version.get(),
+                ))
+            }
+            _ => None,
+        };
+        if let (Some((cls, recv, ver)), Some(f)) = (key, &site.f) {
+            if cls == site.cls
+                && recv == site.recv
+                && ver == site.ver
+                && crate::is_super_callable(&*base.add(len - 3))
+                && Interpreter::core_drops_plain()
+            {
+                // The builtin `super` and the class leave (each held
+                // elsewhere too: the builtins, the class cell); `self`
+                // moves into the shape the `CALL` expects, or binds.
+                let f = Object::Function(f.clone());
+                let self_v = base.add(len - 1).read();
+                crate::drop_hot(base.add(len - 2).read());
+                crate::drop_hot(base.add(len - 3).read());
+                if ins.arg & 1 != 0 {
+                    base.add(len - 3).write(f);
+                    base.add(len - 2).write(self_v);
+                    return (len - 1) as u64;
+                }
+                base.add(len - 3).write(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(self_v, f),
+                )));
+                return (len - 2) as u64;
+            }
+        }
+        let Some(n) = Interpreter::core_super_attr(&*code, ins, pc as usize, base, len) else {
+            return u64::MAX;
+        };
+        if let Some((cls, recv, ver)) = key {
+            let f = if ins.arg & 1 != 0 {
+                match &*base.add(len - 3) {
+                    Object::Function(f) => Some(f.clone()),
+                    _ => None,
+                }
+            } else {
+                match &*base.add(len - 3) {
+                    Object::BoundMethod(bm) => match &bm.function {
+                        Object::Function(f) => Some(f.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            *site = SuperSite { cls, recv, ver, f };
+        }
+        n as u64
+    }
+}
+
 unsafe extern "C" fn h_container(
     st: *mut State,
     ins: *const weavepy_compiler::Instruction,
@@ -2776,10 +2875,6 @@ unsafe extern "C" fn h_container(
     unsafe {
         let st = &mut *st;
         let (ins, len) = (*ins, len as usize);
-        if ins.op == OpCode::LoadSuperAttr {
-            return Interpreter::core_super_attr(&*code, ins, pc as usize, st.stack, len)
-                .map_or(u64::MAX, |n| n as u64);
-        }
         if ins.op == OpCode::LoadSpecial {
             return Interpreter::core_load_special(&*code, ins, pc as usize, st.stack, len, st.cap)
                 .map_or(u64::MAX, |n| n as u64);
@@ -5229,6 +5324,67 @@ unsafe fn gen_call_done(st: &mut State, pc: usize, start: usize) -> u32 {
     }
 }
 
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
+/// a generator-family function, made in place by
+/// `Interpreter::core_gen_call` with the frame synced first (an awaited
+/// coroutine also started), and finished by [`gen_call_done`].
+///
+/// # Safety
+///
+/// As `h_call`'s, with a non-null switch.
+#[inline(never)]
+unsafe fn gen_call(st: &mut State, pc: usize, start: usize, len: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        settle(st);
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_gen_call(sw, pc) {
+            if sw.pending.is_none() {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
+            }
+            return RELOAD;
+        }
+        gen_call_done(st, pc, start)
+    }
+}
+
+/// `CALL` at an `await f(...)`'s site (see [`Lower::call_op`]): a
+/// coroutine function's call runs its body lazily ([`lazy_await`]) or goes
+/// straight to [`gen_call`], which starts the coroutine; any other callee
+/// goes on as [`h_call_site`] takes it.
+/// (The general `h_call` saves and restores many registers around the
+/// shapes it tries first.)
+unsafe extern "C" fn h_call_await(
+    st: *mut State,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc_argc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: as `h_call_site`'s.
+    unsafe {
+        let s = &mut *st;
+        let argc = (pc_argc >> 32) as usize;
+        let start = len as usize - argc - 2;
+        if let Object::Function(f) = &*s.stack.add(start) {
+            if (&*f.code.as_ptr()).is_coroutine && !s.sw.is_null() {
+                let pc = (pc_argc & u64::from(u32::MAX)) as usize;
+                if let Some(r) = lazy_await(s, pc, start, len as usize) {
+                    return r;
+                }
+                return gen_call(s, pc, start, len as usize);
+            }
+        }
+        h_call_site(st, code, ext, pc_argc, len, site)
+    }
+}
+
 /// Whether the call whose operands started at `start` finished in place
 /// (a frameless `__init__`, a builtin's lane): nothing pending, the same
 /// activation running, its result alone in their place. Then the native
@@ -7113,17 +7269,7 @@ unsafe extern "C" fn h_call(
                         return r;
                     }
                 }
-                sync(st);
-                settle(st);
-                let sw = &mut *st.sw;
-                let interp = &mut *st.interp.cast_mut();
-                if !interp.core_gen_call(sw, pc) {
-                    if sw.pending.is_none() {
-                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
-                    }
-                    return RELOAD;
-                }
-                return gen_call_done(st, pc, start);
+                return gen_call(st, pc, start, len);
             }
         }
         // `gen.send(v)`: likewise, with the value sent in.
@@ -9260,6 +9406,7 @@ fn lower_range(
                 direct: std::mem::take(&mut lower.direct_sites),
                 builtin_sites: std::mem::take(&mut lower.builtin_sites),
                 type_sites: std::mem::take(&mut lower.type_sites),
+                supers: std::mem::take(&mut lower.supers),
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
                 leaf_methods: std::mem::take(&mut lower.leaf_methods),
@@ -9578,6 +9725,9 @@ struct Lower<'a> {
     /// The `CALL` sites' settled builtin types (see [`TypeSite`]).
     #[allow(clippy::vec_box)]
     type_sites: Vec<Box<TypeSite>>,
+    /// The `super().name` sites' caches (see [`SuperSite`]).
+    #[allow(clippy::vec_box)]
+    supers: Vec<Box<SuperSite>>,
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     /// The method loads' module-attribute caches.
@@ -9775,6 +9925,7 @@ impl<'a> Lower<'a> {
             direct_sites: Vec::new(),
             builtin_sites: Vec::new(),
             type_sites: Vec::new(),
+            supers: Vec::new(),
             held: Vec::new(),
             mod_caches: Vec::new(),
             leaf_methods: Vec::new(),
@@ -12333,14 +12484,29 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
-        let can_raise = self.b.ins().iconst(types::I64, 1);
-        let n = self
-            .call_typed(
+        let n = if self.code.instructions[pc].op == OpCode::LoadSuperAttr {
+            // `super().name`, through its site's cache.
+            let site: Box<SuperSite> = Box::default();
+            let at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<SuperSite>(&site) as i64);
+            self.supers.push(site);
+            self.call_typed(
+                h_super_attr as *const () as usize,
+                &[self.st, ins, code, pcv, len, at],
+                Some(types::I64),
+            )
+            .expect("returns")
+        } else {
+            let can_raise = self.b.ins().iconst(types::I64, 1);
+            self.call_typed(
                 h_container as *const () as usize,
                 &[self.st, ins, code, pcv, len, can_raise],
                 Some(types::I64),
             )
-            .expect("returns");
+            .expect("returns")
+        };
         let declined = self.b.ins().icmp_imm(IntCC::Equal, n, -1);
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(declined, out);
@@ -14252,7 +14418,19 @@ impl<'a> Lower<'a> {
             .ins()
             .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
         self.direct_sites.push(site);
-        let r = if self.cold {
+        let r = if crate::await_send_after(self.code, pc).is_some() {
+            // `await f(...)`: a coroutine function's call starts it.
+            let pc_argc = self
+                .b
+                .ins()
+                .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+            self.call(
+                h_call_await as *const () as usize,
+                &[self.st, code, ext, pc_argc, len, site_at],
+                true,
+            )
+            .expect("returns")
+        } else if self.cold {
             // A lean body makes [`Self::call_choice`]'s choice in a helper.
             let pc_argc = self
                 .b
