@@ -431,6 +431,14 @@ impl Slot {
     /// The native code for an activation with `nlocals` locals, if
     /// compiled.
     #[inline(always)]
+    /// The locals count the native code was compiled for, if compiled.
+    pub(crate) fn compiled_nlocals(&self) -> Option<usize> {
+        match self.native.get() {
+            Some(Some(n)) => Some(n.nlocals),
+            _ => None,
+        }
+    }
+
     pub(crate) fn get(&self, nlocals: usize) -> Option<&Native> {
         match self.native.get() {
             Some(Some(n)) if n.nlocals == nlocals => Some(n),
@@ -1091,7 +1099,7 @@ mod stats {
         bail: &str,
     ) {
         let op = match (status, ops.get(at)) {
-            (0, Some(op)) => format!("{op:?}{bail}"),
+            (0, Some(op)) => format!("{op:?}@{at}{bail}"),
             (0, None) => "<end>".to_owned(),
             // (Where it switched: the last instruction it ran, and the
             // activation it switched to.)
@@ -6148,6 +6156,7 @@ unsafe fn direct_call<const CALL: bool>(
                 (std::ptr::from_ref::<Native>(n) as usize, m)
             });
             if native == 0 {
+                crate::burst_stats::note_decline("no body", &code_rc.qualname);
                 // A callee with no body (a frameless leaf) leaves the site's
                 // compiled callees alone.
                 if site.native == 0 {
@@ -6174,6 +6183,7 @@ unsafe fn direct_call<const CALL: bool>(
                 || (cells && code_rc.cellvars.is_empty() && f.lean_cells_ref(code_rc).is_none())
                 || (extended && !Interpreter::kwonly_defaults_cover(f, code_rc)))
         {
+            crate::burst_stats::note_decline("binding", &code_rc.qualname);
             return None;
         }
         let native = &*(native as *const Native);
@@ -6191,6 +6201,20 @@ unsafe fn direct_call<const CALL: bool>(
                 && !code.jit_hint.is_not_jitable()
                 && !crate::tier2::jit_off_for_process())
         {
+            crate::burst_stats::note_decline(
+                if nested >= DIRECT_CALL_DEPTH {
+                    "nesting"
+                } else if crate::hot_gates::loop_gen() != st.snap_gen {
+                    "loop gen"
+                } else if !native.enters_at(0) {
+                    "no entry at 0"
+                } else if !(*st.sw).calls_ok {
+                    "calls not ok"
+                } else {
+                    "tier 2 compiled"
+                },
+                &code.qualname,
+            );
             return None;
         }
         direct_enter(

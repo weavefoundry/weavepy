@@ -15980,8 +15980,14 @@ impl Interpreter {
                 _ => {}
             }
         }
+        let caller = sw.cur;
         if self.core_call_plain(sw, pc) {
             burst_stats::note_call(burst_stats::CALL_CORE);
+            if burst_stats::enabled() {
+                // SAFETY: see `CoreSwitch`: the callee is the running
+                // activation now, and its caller lives below it.
+                unsafe { burst_stats::note_core_call(&*caller, &*sw.cur) };
+            }
             return true;
         }
         let mut tmp = None;
@@ -71890,6 +71896,50 @@ mod burst_stats {
     static SLOW_SITES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
         std::sync::Mutex::new(None);
 
+    static CORE_CALLS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    static DECLINES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// Why a compiled caller's call of `callee` left the direct-call path.
+    pub(crate) fn note_decline(why: &str, callee: &str) {
+        if !enabled() {
+            return;
+        }
+        let mut a = DECLINES.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(format!("{why}: {callee}"))
+            .or_insert(0) += 1;
+    }
+
+    /// A core-loop inline call's caller and callee, each marked when it
+    /// has frame-JIT code for its activation.
+    pub(crate) fn note_core_call(caller: &crate::Frame, callee: &crate::Frame) {
+        #[cfg(feature = "jit")]
+        let native = |f: &crate::Frame| {
+            let n = f.locals.len();
+            match crate::code_vm_ext(&f.code).and_then(|e| e.frame_jit.compiled_nlocals()) {
+                Some(m) if m == n => " [native]".to_owned(),
+                Some(m) => format!(" [native for {m} locals, not {n}]"),
+                None => String::new(),
+            }
+        };
+        #[cfg(not(feature = "jit"))]
+        let native = |_: &crate::Frame| String::new();
+        let key = format!(
+            "{}{} -> {}{}",
+            caller.code.qualname,
+            native(caller),
+            callee.code.qualname,
+            native(callee),
+        );
+        let mut a = CORE_CALLS.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert(0) += 1;
+    }
+
     /// A slow step's site: the code, pc and opcode, and the operand that
     /// decides the step's shape (a call's callee, otherwise the top of
     /// the stack).
@@ -71996,6 +72046,28 @@ mod burst_stats {
         out.push_str("\n## Call paths\n\n");
         for (name, c) in CALL_NAMES.iter().zip(CALLS.iter()) {
             let _ = writeln!(out, "- {name}: {}", c.load(Ordering::Relaxed));
+        }
+        let mut calls: Vec<(String, u64)> = CORE_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        calls.sort_by_key(|a| std::cmp::Reverse(a.1));
+        for (k, c) in calls.iter().take(40) {
+            let _ = writeln!(out, "  core call {k}: {c}");
+        }
+        let mut why: Vec<(String, u64)> = DECLINES
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        why.sort_by_key(|a| std::cmp::Reverse(a.1));
+        for (k, c) in why.iter().take(40) {
+            let _ = writeln!(out, "  direct declined {k}: {c}");
         }
         out.push_str("\n## Slow-step sites\n\n");
         for (k, c) in sites.iter().take(40) {
