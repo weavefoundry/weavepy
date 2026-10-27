@@ -42740,7 +42740,9 @@ impl Interpreter {
         if args.len() < 3 {
             return self.load_attr(&args[0], &name);
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(args[2].clone());
         }
         let value_class = builtin_value_class(&args[0]);
@@ -42784,7 +42786,9 @@ impl Interpreter {
                 crate::builtins::wstr_attr_get(&args[0], &args[1]).is_some(),
             ));
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(Object::Bool(false));
         }
         // A builtin class's miss, remembered per class version (a
@@ -70954,6 +70958,40 @@ fn builtin_value_class(obj: &Object) -> Option<Rc<TypeObject>> {
 /// names, which the lookup special-cases, never qualify.
 fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
+}
+
+/// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
+/// in its `AttributeError` without running any code: a name that is no
+/// dunder (those have special and synthesized forms) and not `mro`, that
+/// neither the class's MRO nor its metaclass's supplies, on a class with
+/// no builtin base but `object` (whose methods and class methods are
+/// synthesized) and a metaclass with the default lookup and no
+/// `__getattr__`. `getattr(cls, name, default)` and `hasattr` then answer
+/// without building the error (enum's class creation probes a few dozen
+/// such names).
+fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
+    use crate::types::Dunder;
+    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    let object = &builtin_types().object_;
+    if t.flags.is_builtin
+        || t.native_kind.get() != 0
+        || t.mro
+            .borrow()
+            .iter()
+            .any(|b| b.flags.is_builtin && !Rc::ptr_eq(b, object))
+    {
+        return false;
+    }
+    let meta = t.metaclass_or_type();
+    let getattribute = meta.dunder(Dunder::GetAttribute);
+    if !(getattribute.type_owner() || getattribute.object_owner())
+        || meta.dunder(Dunder::GetAttr).present()
+    {
+        return false;
+    }
+    t.lookup(name).is_none() && meta.lookup(name).is_none()
 }
 
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
