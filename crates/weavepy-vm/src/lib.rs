@@ -24085,11 +24085,15 @@ impl Interpreter {
                             }
                             // `Cls.cm(...)`: a class method's function with
                             // the class in the self slot (the call the bound
-                            // method makes).
+                            // method makes), a native one's (`int.from_bytes`)
+                            // as the full leaf arm takes it.
                             Some(Object::BoundMethod(bm))
                                 if matches!(
                                     (&bm.function, &bm.receiver),
                                     (Object::Function(_), Object::Type(_))
+                                ) || matches!(
+                                    (&bm.function, &bm.receiver),
+                                    (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
                                 ) =>
                             {
                                 let Some(top) = stack.last_mut() else {
@@ -42740,7 +42744,9 @@ impl Interpreter {
         if args.len() < 3 {
             return self.load_attr(&args[0], &name);
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(args[2].clone());
         }
         let value_class = builtin_value_class(&args[0]);
@@ -42784,7 +42790,9 @@ impl Interpreter {
                 crate::builtins::wstr_attr_get(&args[0], &args[1]).is_some(),
             ));
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(Object::Bool(false));
         }
         // A builtin class's miss, remembered per class version (a
@@ -43296,7 +43304,11 @@ impl Interpreter {
                 // compared with `<` (CPython `unsafe_tuple_compare`).
                 let mut i = 0;
                 while i < x.len() && i < y.len() {
-                    if !x[i].is_same(&y[i]) && !self.vm_eq(&x[i], &y[i], globals)? {
+                    let eq = match SortKind::item_eq(&x[i], &y[i]) {
+                        Some(eq) => eq,
+                        None => x[i].is_same(&y[i]) || self.vm_eq(&x[i], &y[i], globals)?,
+                    };
+                    if !eq {
                         break;
                     }
                     i += 1;
@@ -43309,7 +43321,10 @@ impl Interpreter {
                     (0, SortKindScalar::Int) => Ok(SortKind::int_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Float) => Ok(SortKind::float_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Numeric) => compare_op(&x[0], &y[0], CompareKind::Lt),
-                    _ => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    _ => match native_scalar_compare(&x[i], &y[i], CompareKind::Lt) {
+                        Some(lt) => Ok(lt),
+                        None => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    },
                 }
             }),
             SortKind::General => crate::timsort::sort(v, |a, b| {
@@ -70949,6 +70964,40 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
 }
 
+/// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
+/// in its `AttributeError` without running any code: a name that is no
+/// dunder (those have special and synthesized forms) and not `mro`, that
+/// neither the class's MRO nor its metaclass's supplies, on a class with
+/// no builtin base but `object` (whose methods and class methods are
+/// synthesized) and a metaclass with the default lookup and no
+/// `__getattr__`. `getattr(cls, name, default)` and `hasattr` then answer
+/// without building the error (enum's class creation probes a few dozen
+/// such names).
+fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
+    use crate::types::Dunder;
+    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    let object = &builtin_types().object_;
+    if t.flags.is_builtin
+        || t.native_kind.get() != 0
+        || t.mro
+            .borrow()
+            .iter()
+            .any(|b| b.flags.is_builtin && !Rc::ptr_eq(b, object))
+    {
+        return false;
+    }
+    let meta = t.metaclass_or_type();
+    let getattribute = meta.dunder(Dunder::GetAttribute);
+    if !(getattribute.type_owner() || getattribute.object_owner())
+        || meta.dunder(Dunder::GetAttr).present()
+    {
+        return false;
+    }
+    t.lookup(name).is_none() && meta.lookup(name).is_none()
+}
+
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
 /// (`exc`) with `.name` and `.obj`, for one built natively, whose storage
 /// lays both fields out (see `error::attribute_error`): stored in place
@@ -71847,6 +71896,22 @@ impl SortKind {
     #[inline]
     fn float_lt(a: &Object, b: &Object) -> bool {
         matches!((a, b), (Object::Float(x), Object::Float(y)) if x < y)
+    }
+
+    /// Whether two tuple items are equal as `PyObject_RichCompareBool`
+    /// would find them (identity first, then `==`), for a pair of native
+    /// `int`s, `float`s or `str`s; `None` for anything else.
+    #[inline(always)]
+    fn item_eq(a: &Object, b: &Object) -> Option<bool> {
+        match (a, b) {
+            (Object::Int(x), Object::Int(y)) => Some(x == y),
+            // (`is_same` compares a float's bits, so a NaN equals itself.)
+            (Object::Float(x), Object::Float(y)) => Some(x.to_bits() == y.to_bits() || x == y),
+            (Object::Str(x), Object::Str(y)) => {
+                Some(SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -72753,9 +72818,10 @@ enum PercentArgs<'a> {
 /// `template % args` in one pass when every conversion is a plain `%s`,
 /// `%d` or `%i` (no flags, width or precision; a mapping key for a
 /// mapping, none for positional arguments) of an exact `str`, `int`,
-/// `bool` or `None` (`%s` only for `str`, `None`), and every positional
-/// argument is consumed: the text `percent_format_with` renders for that
-/// shape. `None` for anything else (the general path then renders it, or
+/// `bool` or `None` (`%s` only for `str`, `None`), or one of the specs
+/// [`percent_render_spec`] renders, and every positional argument is
+/// consumed: the text `percent_format_with` renders for that shape.
+/// `None` for anything else (the general path then renders it, or
 /// raises), including a mapping key the dictionary lacks.
 fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String> {
     use std::fmt::Write as _;
@@ -72789,6 +72855,12 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
             }
             _ => return None,
         };
+        if !matches!(bytes.get(k)?, b's' | b'd' | b'i') {
+            k = percent_render_spec(&mut out, bytes, k, v)?;
+            i = k + 1;
+            lit = i;
+            continue;
+        }
         match (bytes.get(k)?, v) {
             (b's', Object::Str(s)) => out.push_str(s),
             (b's' | b'd' | b'i', Object::Int(n)) => {
@@ -72811,13 +72883,148 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
     Some(out)
 }
 
+/// One conversion with flags (`-`, `0`, `+`, space), a width and a
+/// precision, or a `%f` or `%r`, of an exact `str`, `int`, `bool`,
+/// `float` or `None`, whose spec starts at `bytes[k]`, rendered onto
+/// `out` as CPython's `unicode_format_arg` does: the position of the
+/// conversion character, or `None` (`out` then abandoned) for anything
+/// else: `#`, `*`, a length modifier, a non-finite `float`, another
+/// conversion or operand.
+fn percent_render_spec(out: &mut String, bytes: &[u8], mut k: usize, v: &Object) -> Option<usize> {
+    use std::fmt::Write as _;
+    let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+    loop {
+        match *bytes.get(k)? {
+            b'-' => left = true,
+            b'0' => zero = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            _ => break,
+        }
+        k += 1;
+    }
+    let digits = |k: &mut usize| -> Option<usize> {
+        let mut n = 0usize;
+        while let Some(d @ b'0'..=b'9') = bytes.get(*k) {
+            n = n * 10 + usize::from(d - b'0');
+            // (A huge width or precision is the general path's to judge.)
+            if n > 4096 {
+                return None;
+            }
+            *k += 1;
+        }
+        Some(n)
+    };
+    let width = digits(&mut k)?;
+    let prec = if bytes.get(k) == Some(&b'.') {
+        k += 1;
+        Some(digits(&mut k)?)
+    } else {
+        None
+    };
+    let conv = *bytes.get(k)?;
+    // The sign (numbers only) and the text.
+    let mut num = String::new();
+    let (sign, text, numeric): (&str, &str, bool) = match (conv, v) {
+        (b's' | b'r', _) => {
+            let text: &str = match (conv, v) {
+                (b's', Object::Str(s)) => s,
+                (b's', Object::Bool(b)) => {
+                    if *b {
+                        "True"
+                    } else {
+                        "False"
+                    }
+                }
+                (b's', Object::None) => "None",
+                (b's', Object::Int(n)) => {
+                    let _ = write!(num, "{n}");
+                    &num
+                }
+                (b'r', Object::Str(_)) => {
+                    num = v.repr();
+                    &num
+                }
+                _ => return None,
+            };
+            // A precision keeps that many characters.
+            let text = match prec {
+                Some(p) => text
+                    .char_indices()
+                    .nth(p)
+                    .map_or(text, |(at, _)| &text[..at]),
+                None => text,
+            };
+            ("", text, false)
+        }
+        (b'd' | b'i', Object::Int(_) | Object::Bool(_)) => {
+            let n = match v {
+                Object::Int(n) => *n,
+                _ => i64::from(matches!(v, Object::Bool(true))),
+            };
+            let _ = write!(num, "{}", n.unsigned_abs());
+            // A precision is the least number of digits.
+            if let Some(p) = prec {
+                if num.len() < p {
+                    num.insert_str(0, &"0".repeat(p - num.len()));
+                }
+            }
+            (if n < 0 { "-" } else { "" }, num.as_str(), true)
+        }
+        (b'f' | b'F', Object::Float(_) | Object::Int(_)) => {
+            let x = match v {
+                Object::Float(x) => *x,
+                // (Exactly representable: converted as CPython does.)
+                Object::Int(n) if n.unsigned_abs() <= 1 << 53 => *n as f64,
+                _ => return None,
+            };
+            if !x.is_finite() {
+                return None;
+            }
+            let _ = write!(num, "{:.*}", prec.unwrap_or(6), x.abs());
+            (
+                if x.is_sign_negative() { "-" } else { "" },
+                num.as_str(),
+                true,
+            )
+        }
+        _ => return None,
+    };
+    let sign = match (sign, numeric) {
+        ("", true) if plus => "+",
+        ("", true) if space => " ",
+        (sign, _) => sign,
+    };
+    let len = sign.len()
+        + if text.is_ascii() {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+    let pad = width.saturating_sub(len);
+    if left {
+        out.push_str(sign);
+        out.push_str(text);
+        out.extend(std::iter::repeat_n(' ', pad));
+    } else if zero && numeric {
+        out.push_str(sign);
+        out.extend(std::iter::repeat_n('0', pad));
+        out.push_str(text);
+    } else {
+        out.extend(std::iter::repeat_n(' ', pad));
+        out.push_str(sign);
+        out.push_str(text);
+    }
+    Some(k)
+}
+
 /// [`percent_render_plain`] of `template % value` for an argument tuple,
 /// a lone scalar argument or an exact dict.
 fn percent_render_plain_value(template: &str, value: &Object) -> Option<String> {
     let one;
     let items: &[Object] = match value {
         Object::Tuple(items) if !items.is_empty() => items,
-        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None => {
+        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None | Object::Float(_) => {
             one = [value.clone()];
             &one
         }

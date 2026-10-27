@@ -209,20 +209,23 @@ impl CompiledFormat {
                 's' => {
                     let v = &values[idx];
                     idx += 1;
-                    let data = match v {
-                        Object::Bytes(b) => b.to_vec(),
-                        Object::ByteArray(b) => b.borrow().clone(),
-                        Object::Str(s) => s.as_bytes().to_vec(),
+                    // The data's first `count` bytes, zero-padded to `count`,
+                    // written straight from the operand.
+                    let mut put = |data: &[u8]| {
+                        let take = data.len().min(f.count);
+                        out.extend_from_slice(&data[..take]);
+                        out.resize(out.len() + (f.count - take), 0);
+                    };
+                    match v {
+                        Object::Bytes(b) => put(b),
+                        Object::ByteArray(b) => put(&b.borrow()),
+                        Object::Str(s) => put(s.as_bytes()),
                         _ => {
                             return Err(struct_error(
                                 "argument for 's' must be a bytes-like or str".to_owned(),
                             ))
                         }
-                    };
-                    let mut buf = vec![0u8; f.count];
-                    let take = data.len().min(f.count);
-                    buf[..take].copy_from_slice(&data[..take]);
-                    out.extend_from_slice(&buf);
+                    }
                 }
                 'p' => {
                     // Pascal-style: first byte is length, up to count-1 bytes follow.
@@ -297,7 +300,16 @@ impl CompiledFormat {
         buf: &[u8],
         start: usize,
     ) -> Result<(Vec<Object>, usize), RuntimeError> {
-        let mut out = Vec::new();
+        let values = self
+            .fields
+            .iter()
+            .map(|f| match f.code {
+                'x' => 0,
+                's' | 'p' => 1,
+                _ => f.count,
+            })
+            .sum();
+        let mut out = Vec::with_capacity(values);
         let mut pos = start;
         for f in &self.fields {
             match f.code {

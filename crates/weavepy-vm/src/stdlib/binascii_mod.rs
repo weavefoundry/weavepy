@@ -311,18 +311,20 @@ fn hex_value(c: u8) -> Result<u8, RuntimeError> {
 
 // ---- base64 ----
 
-/// Standard base64 alphabet decode table: maps a byte to its 6-bit value,
-/// or -1 if it is not a base64 digit. `=` (pad) is handled separately.
-fn b64_decode_value(c: u8) -> i16 {
-    match c {
-        b'A'..=b'Z' => i16::from(c - b'A'),
-        b'a'..=b'z' => i16::from(c - b'a') + 26,
-        b'0'..=b'9' => i16::from(c - b'0') + 52,
-        b'+' => 62,
-        b'/' => 63,
-        _ => -1,
+/// The standard base64 alphabet's decode table: a byte's 6-bit value, or
+/// [`B64_INVALID`] for a byte that isn't a base64 digit (`=`, the pad,
+/// included: it's handled separately).
+const B64_DECODE: [u8; 256] = {
+    let mut t = [B64_INVALID; 256];
+    let mut i = 0;
+    while i < 64 {
+        t[B64_ENCODE[i] as usize] = i as u8;
+        i += 1;
     }
-}
+    t
+};
+
+const B64_INVALID: u8 = 0xFF;
 
 const B64_ENCODE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -331,26 +333,38 @@ fn b2a_base64_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // CPython: `b2a_base64(data, /, *, newline=True)`.
     let newline = truthy_kw(kwargs, "newline").unwrap_or(true);
 
-    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4 + 1);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(B64_ENCODE[(b0 >> 2) as usize]);
-        out.push(B64_ENCODE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
-        if chunk.len() > 1 {
-            out.push(B64_ENCODE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]);
+    // Whole groups of three bytes first, each written as one quad in
+    // place, then the padded remainder.
+    let groups = data.len() / 3;
+    let mut out = vec![0u8; data.len().div_ceil(3) * 4 + usize::from(newline)];
+    for (src, dst) in data
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
+        let n = u32::from(src[0]) << 16 | u32::from(src[1]) << 8 | u32::from(src[2]);
+        dst[0] = B64_ENCODE[(n >> 18) as usize];
+        dst[1] = B64_ENCODE[(n >> 12 & 0x3f) as usize];
+        dst[2] = B64_ENCODE[(n >> 6 & 0x3f) as usize];
+        dst[3] = B64_ENCODE[(n & 0x3f) as usize];
+    }
+    let rest = &data[groups * 3..];
+    if !rest.is_empty() {
+        let b0 = rest[0];
+        let b1 = rest.get(1).copied().unwrap_or(0);
+        let dst = &mut out[groups * 4..groups * 4 + 4];
+        dst[0] = B64_ENCODE[(b0 >> 2) as usize];
+        dst[1] = B64_ENCODE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        dst[2] = if rest.len() > 1 {
+            B64_ENCODE[((b1 & 0x0f) << 2) as usize]
         } else {
-            out.push(b'=');
-        }
-        if chunk.len() > 2 {
-            out.push(B64_ENCODE[(b2 & 0x3f) as usize]);
-        } else {
-            out.push(b'=');
-        }
+            b'='
+        };
+        dst[3] = b'=';
     }
     if newline {
-        out.push(b'\n');
+        *out.last_mut().expect("room for the newline") = b'\n';
     }
     Ok(Object::new_bytes(out))
 }
@@ -367,7 +381,22 @@ fn a2b_base64_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     let mut leftchar: u8 = 0;
     let mut pads: i32 = 0;
 
-    for (i, &this_ch) in data.iter().enumerate() {
+    // The leading run of whole quads of base64 digits, the bulk of any
+    // well-formed input, three bytes at a time; the state machine below
+    // takes over at the first quad holding anything else.
+    let mut done = 0;
+    for quad in data.as_chunks::<4>().0 {
+        let v = [0, 1, 2, 3].map(|k| B64_DECODE[quad[k] as usize]);
+        if (v[0] | v[1] | v[2] | v[3]) & 0xC0 != 0 {
+            break;
+        }
+        let n =
+            u32::from(v[0]) << 18 | u32::from(v[1]) << 12 | u32::from(v[2]) << 6 | u32::from(v[3]);
+        out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+        done += 4;
+    }
+
+    for (i, &this_ch) in data.iter().enumerate().skip(done) {
         if this_ch == b'=' {
             // Pad handling (RFC 4648 §3.3). A *valid* pad — one that closes
             // a quad that already holds ≥ 2 data chars — is consumed and we
@@ -391,8 +420,8 @@ fn a2b_base64_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
             }));
         }
 
-        let val = b64_decode_value(this_ch);
-        if val < 0 {
+        let val = B64_DECODE[this_ch as usize];
+        if val == B64_INVALID {
             if strict {
                 return Err(value_error("Only base64 data is allowed"));
             }
@@ -409,7 +438,6 @@ fn a2b_base64_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
             }));
         }
         pads = 0;
-        let val = val as u8;
         match quad_pos {
             0 => {
                 quad_pos = 1;

@@ -27,8 +27,6 @@ pub(crate) struct CursorState {
     pub connection: Object,
     /// Live statement being iterated, if any.
     pub stmt: Option<Statement>,
-    /// Whether the live statement came from the per-connection cache.
-    pub from_cache: bool,
     /// True when the live statement is positioned on an unread row.
     /// Conversion (converters, text factory, row factory) happens
     /// lazily at fetch time, like CPython's `cursor_iternext` — the
@@ -245,7 +243,6 @@ fn cur_init(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = Rc::new(RefCell::new(CursorState {
         connection: conn_obj,
         stmt: None,
-        from_cache: false,
         has_row: false,
         description: Object::None,
         converters: Vec::new(),
@@ -270,19 +267,15 @@ fn cur_init(args: &[Object]) -> Result<Object, RuntimeError> {
 // ---------------------------------------------------------------
 
 /// Release the cursor's live statement back to the connection cache
-/// (or finalize an uncached one).
+/// (`cache_put` finalizes it when the cache can't take it).
 fn release_statement(st: &Rc<RefCell<CursorState>>, conn: &Rc<RefCell<ConnState>>) {
-    let (stmt, from_cache) = {
+    let stmt = {
         let mut s = st.borrow_mut();
         s.has_row = false;
-        (s.stmt.take(), s.from_cache)
+        s.stmt.take()
     };
-    if let Some(mut stmt) = stmt {
-        if from_cache {
-            cache_put(conn, stmt);
-        } else {
-            stmt.finalize();
-        }
+    if let Some(stmt) = stmt {
+        cache_put(conn, stmt);
     }
 }
 
@@ -316,10 +309,13 @@ fn execute_one(
 ) -> Result<(), RuntimeError> {
     let db = conn.borrow().db_ptr();
 
-    // Take from the statement cache or prepare fresh.
-    let (stmt, from_cache) = match cache_take(conn, sql) {
-        Some(s) => (s, true),
-        None => (Statement::prepare(db, sql)?, false),
+    // Take from the statement cache or prepare fresh. Either way the
+    // statement goes back to the cache when the cursor is done with it,
+    // as in CPython (`get_statement_from_cache`), so `executemany` and
+    // repeated queries prepare once.
+    let stmt = match cache_take(conn, sql) {
+        Some(s) => s,
+        None => Statement::prepare(db, sql)?,
     };
     if stmt.ptr == 0 {
         // Comment/whitespace-only query: nothing to do.
@@ -333,12 +329,7 @@ fn execute_one(
         // SAFETY: live statement.
         let readonly = unsafe { ffi::sqlite3_stmt_readonly(stmt.stmt()) } != 0;
         if readonly {
-            let mut dead = stmt;
-            if from_cache {
-                cache_put(conn, dead);
-            } else {
-                dead.finalize();
-            }
+            cache_put(conn, stmt);
             return Err(raise(
                 programming_error_class(),
                 "executemany() can only execute DML statements.",
@@ -349,12 +340,7 @@ fn execute_one(
     maybe_begin_transaction(conn, &stmt)?;
 
     if let Err(e) = bind_parameters(ip, db, &stmt, params) {
-        let mut dead = stmt;
-        if from_cache {
-            cache_put(conn, dead);
-        } else {
-            dead.finalize();
-        }
+        cache_put(conn, stmt);
         return Err(e);
     }
 
@@ -412,15 +398,9 @@ fn execute_one(
         let mut s = st.borrow_mut();
         s.has_row = true;
         s.stmt = Some(stmt);
-        s.from_cache = from_cache;
     } else {
         // Statement completed on the first step.
-        let mut dead = stmt;
-        if from_cache {
-            cache_put(conn, dead);
-        } else {
-            dead.finalize();
-        }
+        cache_put(conn, stmt);
         let mut s = st.borrow_mut();
         s.has_row = false;
         s.stmt = None;

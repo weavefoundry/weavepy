@@ -154,6 +154,13 @@ pub(crate) struct CompiledCode {
     /// Each quick assertion body's slice of `quick_tests`.
     quick_ranges: Vec<(u32, u32)>,
     quick_tests: Vec<QuickTest>,
+    /// Per code position, the index in `alt_ranges` of the requirements
+    /// of the `BRANCH` alternative whose body starts there ([`NO_TABLE`]
+    /// for none; see [`alternative_reqs`]).
+    alt_of: Vec<u32>,
+    /// Each alternative's slice of `alt_reqs`.
+    alt_ranges: Vec<(u32, u32)>,
+    alt_reqs: Vec<Req>,
     /// Whether the pattern was a `str` (`Some(true)`) or a bytes-like
     /// object (`Some(false)`); `None` for a pattern compiled from a parsed
     /// tree (`re.Scanner`), which, like CPython's, accepts either subject.
@@ -209,6 +216,7 @@ fn publish(idx: usize, cc: &'static CompiledCode) {
 pub(crate) fn register_code(code: Vec<u32>, groups: usize, is_str: Option<bool>) -> i64 {
     let (table_of, tables) = set_tables(&code);
     let (quick_of, quick_ranges, quick_tests) = quick_asserts(&code);
+    let (alt_of, alt_ranges, alt_reqs) = alternative_reqs(&code, &quick_of);
     let cc: &'static CompiledCode = Box::leak(Box::new(CompiledCode {
         code,
         groups,
@@ -217,6 +225,9 @@ pub(crate) fn register_code(code: Vec<u32>, groups: usize, is_str: Option<bool>)
         quick_of,
         quick_ranges,
         quick_tests,
+        alt_of,
+        alt_ranges,
+        alt_reqs,
         is_str,
     }));
     let mut reg = registry().lock();
@@ -311,6 +322,121 @@ fn quick_asserts(code: &[u32]) -> (Vec<u32>, Vec<(u32, u32)>, Vec<QuickTest>) {
 }
 
 const NO_TABLE: u32 = u32::MAX;
+
+/// One condition a `BRANCH` alternative needs at the position it would
+/// start at (see [`alternative_reqs`]).
+#[derive(Clone, Copy)]
+enum Req {
+    /// The character there meets this requirement.
+    Char(TailFirst),
+    /// The quick assertion whose body starts at `body` holds `back`
+    /// characters before the position (or, `negate`d, an `ASSERT_NOT`
+    /// one doesn't).
+    Assert { body: u32, back: u32, negate: bool },
+    /// Some alternative of the nested `BRANCH` at this code position can
+    /// start there.
+    Branch(u32),
+}
+
+/// [`Matcher::simple_first`] over possibly malformed code: `None` when
+/// the walk leaves it.
+fn simple_first_checked(code: &[u32], mut op: usize) -> Option<TailFirst> {
+    while *code.get(op)? == OP_MARK {
+        op += 2;
+    }
+    let item = match *code.get(op)? {
+        OP_REPEAT_ONE | OP_MIN_REPEAT_ONE | OP_POSSESSIVE_REPEAT_ONE if *code.get(op + 2)? >= 1 => {
+            op + 4
+        }
+        _ => op,
+    };
+    code.get(item + 1)?;
+    Some(Matcher::<u8>::item_first(code, item))
+}
+
+/// The conditions each `BRANCH` alternative in `code` needs at the
+/// position it would start at, so the matcher skips an alternative that
+/// can't match there without entering it: the first character its first
+/// consuming op needs, after any number of zero-width assertions, each of
+/// which adds its own condition (a quick one's test, or the first
+/// character a lookahead's body needs). textwrap's word splitter tries
+/// three such alternatives after every character of a word, and all
+/// three usually fail on their first assertion or character. As for
+/// [`set_tables`], every word equal to `BRANCH` is tried; the matcher
+/// only consults real alternatives.
+fn alternative_reqs(code: &[u32], quick_of: &[u32]) -> (Vec<u32>, Vec<(u32, u32)>, Vec<Req>) {
+    // The conditions of the alternative whose body starts at `op`.
+    let reqs_at = |mut op: usize| -> Option<Vec<Req>> {
+        let mut reqs = Vec::new();
+        // (Bounded: an assertion's skip always moves forward, and real
+        // code chains only a few assertions.)
+        for _ in 0..8 {
+            while *code.get(op)? == OP_MARK {
+                op += 2;
+            }
+            match *code.get(op)? {
+                kind @ (OP_ASSERT | OP_ASSERT_NOT) => {
+                    let skip = *code.get(op + 1)? as usize;
+                    let back = *code.get(op + 2)?;
+                    let body = op + 3;
+                    if skip < 2 {
+                        return None;
+                    }
+                    if quick_of.get(body).is_some_and(|&q| q != NO_TABLE) {
+                        reqs.push(Req::Assert {
+                            body: body as u32,
+                            back,
+                            negate: kind == OP_ASSERT_NOT,
+                        });
+                    } else if kind == OP_ASSERT && back == 0 {
+                        let first = simple_first_checked(code, body)?;
+                        if !matches!(first, TailFirst::Any) {
+                            reqs.push(Req::Char(first));
+                        }
+                    }
+                    op += 1 + skip;
+                }
+                OP_BRANCH => {
+                    reqs.push(Req::Branch(op as u32));
+                    break;
+                }
+                _ => {
+                    let first = simple_first_checked(code, op)?;
+                    if !matches!(first, TailFirst::Any) {
+                        reqs.push(Req::Char(first));
+                    }
+                    break;
+                }
+            }
+        }
+        Some(reqs)
+    };
+    let mut alt_of = vec![NO_TABLE; code.len()];
+    let mut ranges = Vec::new();
+    let mut reqs = Vec::new();
+    for (i, &op) in code.iter().enumerate() {
+        // <BRANCH> (<skip> <alternative>)* <0>
+        if op != OP_BRANCH {
+            continue;
+        }
+        let mut alt = i + 1;
+        while let Some(&skip) = code.get(alt) {
+            if skip == 0 {
+                break;
+            }
+            let body = alt + 1;
+            if body < code.len() && alt_of[body] == NO_TABLE {
+                if let Some(list) = reqs_at(body) {
+                    alt_of[body] = ranges.len() as u32;
+                    ranges.push((reqs.len() as u32, (reqs.len() + list.len()) as u32));
+                    reqs.extend(list);
+                }
+            }
+            alt += skip as usize;
+        }
+    }
+    (alt_of, ranges, reqs)
+}
 
 /// Membership tables over the first 256 code points for the character
 /// sets in `code`, so the matcher tests a Latin-1 character with one bit
@@ -1303,7 +1429,11 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         let mut alt = op + 1;
         while code[alt] != 0 {
             // (A nested branch counts as no requirement.)
-            if matches!(Self::simple_first(code, alt + 1).0, TailFirst::Any) {
+            let has_req = match self.alt_reqs(alt + 1) {
+                Some(reqs) => reqs.iter().any(|r| !matches!(r, Req::Branch(_))),
+                None => !matches!(Self::simple_first(code, alt + 1).0, TailFirst::Any),
+            };
+            if !has_req {
                 return TailFirst::Any;
             }
             alt += code[alt] as usize;
@@ -1317,7 +1447,11 @@ impl<'a, C: SreChar> Matcher<'a, C> {
         let code = self.code;
         let mut alt = op + 1;
         while code[alt] != 0 {
-            if self.simple_can_start(Self::simple_first(code, alt + 1).0, pos) {
+            let can = match self.alt_reqs(alt + 1) {
+                Some(reqs) => reqs.iter().all(|&r| self.req_holds(r, pos)),
+                None => self.simple_can_start(Self::simple_first(code, alt + 1).0, pos),
+            };
+            if can {
                 return true;
             }
             alt += code[alt] as usize;
@@ -1330,7 +1464,40 @@ impl<'a, C: SreChar> Matcher<'a, C> {
     /// loop).
     #[inline(never)]
     fn alternative_can_start(&self, body: usize, pos: usize) -> bool {
-        self.can_start(self.tail_first(body), pos)
+        match self.alt_reqs(body) {
+            Some(reqs) => reqs.iter().all(|&r| self.req_holds(r, pos)),
+            None => self.can_start(self.tail_first(body), pos),
+        }
+    }
+
+    /// The conditions of the alternative whose body starts at `body` (see
+    /// [`alternative_reqs`]).
+    #[inline(always)]
+    fn alt_reqs(&self, body: usize) -> Option<&'a [Req]> {
+        let cc = self.cc;
+        let at = *cc.alt_of.get(body)?;
+        if at == NO_TABLE {
+            return None;
+        }
+        let (from, to) = cc.alt_ranges[at as usize];
+        Some(&cc.alt_reqs[from as usize..to as usize])
+    }
+
+    /// Whether the condition `r` holds at `pos`.
+    #[inline]
+    fn req_holds(&self, r: Req, pos: usize) -> bool {
+        match r {
+            Req::Char(first) => self.simple_can_start(first, pos),
+            Req::Assert { body, back, negate } => {
+                // (As the `ASSERT` and `ASSERT_NOT` arms test it.)
+                let back = back as usize;
+                if pos - self.beginning < back {
+                    return negate;
+                }
+                self.quick_assert(body as usize, pos - back) != Some(negate)
+            }
+            Req::Branch(op) => self.branch_can_start(op as usize, pos),
+        }
     }
 
     /// The verdict at `pos` of the assertion body at `body` when it is a
