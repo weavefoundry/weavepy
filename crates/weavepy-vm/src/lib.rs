@@ -73774,6 +73774,11 @@ fn init_is_from_object(cls: &Rc<TypeObject>) -> bool {
             if crate::descr_registry::is_surface_only(init) {
                 continue;
             }
+            // (`object.__init__` itself stored on a subclass is object's:
+            // see `builtin_types::overrides_dunder_init`.)
+            if matches!(init, Object::Builtin(b) if is_object_init(b)) {
+                return true;
+            }
             return ty.name == "object";
         }
     }

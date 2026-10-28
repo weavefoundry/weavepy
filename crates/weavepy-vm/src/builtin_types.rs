@@ -2063,6 +2063,12 @@ pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
             if crate::descr_registry::is_surface_only(init) {
                 continue;
             }
+            // `object.__init__` itself stored on a subclass (`typing`'s
+            // protocol init does `cls.__init__ = object.__init__`) leaves
+            // CPython's `tp_init` at `object_init`: not an override.
+            if matches!(init, Object::Builtin(b) if crate::is_object_init(b)) {
+                return false;
+            }
             return ty.name != "object";
         }
     }
