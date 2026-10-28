@@ -1603,6 +1603,46 @@ def make(i):
 r.run(N, 0, 0, 0)
 ''')
 
+WHOLE["t2_weakref_callbacks"] = r'''
+import weakref
+
+fired = []
+
+
+class P:
+    def __init__(self, i):
+        self.i = i
+
+
+def cb(r):
+    fired.append(1)
+
+
+class Runner:
+    def run(self, n):
+        acc = 0
+        bad = 0
+        for i in range(n):
+            acc = acc + i
+            acc = acc * 3
+            acc = acc % 1000003
+            acc = acc - 7
+            acc = acc + 11
+            acc = acc ^ 5
+            o = P(i)
+            w = weakref.ref(o, cb)
+            o = None
+            dead = w() is None
+            got = len(fired) == i + 1
+            if not dead:
+                bad = bad + 1
+            if not got:
+                bad = bad + 1
+        return bad
+
+
+print(Runner().run(400), len(fired))
+'''
 
 
 ENVS = [
@@ -1615,6 +1655,7 @@ ENVS = [
 
 # CPython 3.14's output for each case.
 EXPECTED = {
+    't2_weakref_callbacks': '0 400\n',
     'metaclass_call': "[((('meta', 'A', (1,)), ('meta', 'B', (0,)), (True, 'wrapped')), 1), ((('meta', 'A', (1,)), ('meta', 'B', (1,)), (True, 'wrapped')), 1), ((('meta', 'A', (1,)), ('meta', 'B', (0,)), (True, 'wrapped')), 1), ((('meta', 'A', (1,)), ('meta', 'B', (1,)), (True, 'wrapped')), 1), ((('meta', 'A', (1,)), ('meta', 'B', (0,)), (True, 'wrapped')), 1), ((('meta', 'A', (1,)), ('meta', 'B', (1,)), (True, 'wrapped')), 1)]\n[(('late-meta',), 300)]\n",
     'class_hooks': "[(((True, ('class', 'd')), ('cgi', 0), ('cgi', <class 'int'>)), 1), (((True, ('class', 'd')), ('cgi', 1), ('cgi', <class 'int'>)), 1), (((True, ('class', 'd')), ('cgi', 0), ('cgi', <class 'int'>)), 1), (((True, ('class', 'd')), ('cgi', 1), ('cgi', <class 'int'>)), 1), (((True, ('class', 'd')), ('cgi', 0), ('cgi', <class 'int'>)), 1), (((True, ('class', 'd')), ('cgi', 1), ('cgi', <class 'int'>)), 1)] [0, 1, 2, 0, 1, 2] 300\n",
     'getattribute_getattr': "[((('intercepted', 'method', 5, 7, 'missing:q'), 'AttributeError'), 300), ((('intercepted', 'method', 5, 7, 'missing:q'), 'late:b'), 300), ((('replaced', 'method', 5, 7, 'missing:q'), 'late:b'), 5)]\n",
