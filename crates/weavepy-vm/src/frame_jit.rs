@@ -3681,6 +3681,22 @@ unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
     }
 }
 
+/// [`h_truth`] at a `TO_BOOL` site with its cache `cache` (see
+/// `Lower::truth_of`): an instance of a class whose instances are always
+/// true fills the cache with the class's attribute version first, for the
+/// site's code to answer it in line from then on.
+unsafe extern "C" fn h_truth_site(st: *mut State, at: *mut Object, cache: *mut MethodCache) -> u32 {
+    // SAFETY: as `h_truth`'s; `cache` is the site's own.
+    unsafe {
+        if let Object::Instance(inst) = &*at {
+            if let Some(ver) = (*(*st).interp).instance_always_true_version(inst) {
+                (*cache).ver = ver;
+            }
+        }
+        h_truth(st, at)
+    }
+}
+
 /// `IS_OP` with oparg `arg` over the values at `at` and above it, as the
 /// core loop's arm runs it: `0` or `1` the answer (both released),
 /// anything else declined untouched.
@@ -14493,8 +14509,9 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// `TO_BOOL`: a scalar's truth in line, any other value's through
-    /// [`h_truth`].
+    /// `TO_BOOL`: a scalar's truth in line, and an instance's of a class
+    /// the site found always true (see [`h_truth_site`]); any other value's
+    /// through the helper.
     fn truth_of(&mut self, pc: usize) -> bool {
         let item = self.pop();
         let o = self.operand(item);
@@ -14522,9 +14539,47 @@ impl<'a> Lower<'a> {
         self.materialize(item, slot);
         self.cold = cold;
         let at = self.slot_addr(slot);
-        let r = self
-            .call(h_truth as *const () as usize, &[self.st, at], true)
-            .expect("returns");
+        // An instance of a class the site found always true (no `__bool__`
+        // or `__len__`), while the class keeps that version: true, the
+        // instance released by a plain decrement.
+        let r = match self.layout {
+            Some(l) if !self.cold => {
+                let l = *l;
+                let ptr = self.ptr;
+                let cache: Box<MethodCache> = Box::default();
+                let cache_at = std::ptr::from_ref::<MethodCache>(&cache) as i64;
+                self.method_caches.push(cache);
+                let helper = self.b.create_block();
+                let tag = self.tag_at(at);
+                let not_inst =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+                self.branch_out(not_inst, helper);
+                let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+                let ver = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, cls, l.type_attr_version);
+                let c = self.b.ins().iconst(ptr, cache_at);
+                let want = self.b.ins().load(types::I64, FLAGS, c, MC_VER);
+                let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, ver, want);
+                let bad = self.b.ins().bor(unset, stale);
+                self.branch_out(bad, helper);
+                self.shared_dec(at, tag, helper);
+                let t = self.b.ins().iconst(types::I8, 1);
+                self.b.ins().jump(done, &[t.into()]);
+                self.b.switch_to_block(helper);
+                let c = self.b.ins().iconst(ptr, cache_at);
+                self.call(h_truth_site as *const () as usize, &[self.st, at, c], true)
+                    .expect("returns")
+            }
+            _ => self
+                .call(h_truth as *const () as usize, &[self.st, at], true)
+                .expect("returns"),
+        };
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
         self.branch_out(declined, out);
