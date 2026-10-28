@@ -1204,13 +1204,51 @@ fn analyze_admitted(
 /// `(neighbor, weight)` edges, a sparse row's `(column, value)` entries)
 /// do little typed work per pair to make up for it: compiling them cost
 /// `graph_search` a tenth and `scimark`'s sparse product a twentieth. The
-/// frame JIT runs such code instead.
+/// frame JIT runs such code instead. A pair of scalars (`enumerate`'s index
+/// and a byte) steps without pins, and a function with enough typed
+/// arithmetic repays the step (an n-body pair loop): tier 2 runs those
+/// several times faster than the frame JIT, so it keeps them.
 fn unpacks_pairs(tfunc: &TFunc) -> bool {
-    !GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
-        && tfunc
-            .blocks
-            .iter()
-            .any(|b| matches!(b.term, crate::ir::TTerm::ForIterPair { .. }))
+    use crate::value::JitType;
+    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    // (A pair of scalars, `enumerate`'s index and a byte or a number,
+    // steps without pins.)
+    let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
+    let pins = tfunc.blocks.iter().any(|b| {
+        matches!(b.term, crate::ir::TTerm::ForIterPair { elem1, elem2, .. }
+            if !scalar(elem1) || !scalar(elem2))
+    });
+    pins && typed_arith(tfunc) < PAIR_LOOP_TYPED_WORK
+}
+
+/// The typed arithmetic statements a function with a tuple-target loop
+/// needs before tier 2 takes it (see [`unpacks_pairs`]).
+const PAIR_LOOP_TYPED_WORK: usize = 12;
+
+/// How many of `tfunc`'s statements are typed int or float arithmetic and
+/// compares.
+fn typed_arith(tfunc: &TFunc) -> usize {
+    use crate::ir::TOp;
+    tfunc
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| {
+            matches!(
+                s.op,
+                TOp::IntArith(_)
+                    | TOp::FloatArith(_)
+                    | TOp::IntTrueDiv
+                    | TOp::IntCmp(_)
+                    | TOp::FloatCmp(_)
+                    | TOp::IntNeg
+                    | TOp::FloatNeg
+                    | TOp::IntInvert
+            )
+        })
+        .count()
 }
 
 fn mostly_generic(tfunc: &TFunc) -> bool {
