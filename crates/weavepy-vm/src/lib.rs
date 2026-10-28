@@ -29544,10 +29544,16 @@ impl Interpreter {
             return None;
         };
         let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        // A class with neither `__bool__` nor `__len__` (its version unique
+        // to it as it stands): true, without a look at anything else (as
+        // CPython's always-true `TO_BOOL`).
+        if matches!(&*self.core_truth.borrow(), Some((v, NativeTruth::AlwaysTrue)) if *v == ver) {
+            return Some(true);
+        }
         if crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let ver = cls.attr_version.get();
         // The cache (and the class) keep the builtin alive through the
         // call, whose body runs no Python.
         let lookup =
@@ -29592,6 +29598,21 @@ impl Interpreter {
         match r.ok()? {
             Object::Bool(b) => Some(b),
             Object::Int(n) if is_len && n >= 0 => Some(n != 0),
+            _ => None,
+        }
+    }
+
+    /// The attribute version of `inst`'s class, when its instances are
+    /// always true in a boolean context (the cached verdict for that
+    /// version, see [`Self::leaf_instance_truth`]): a compiled `TO_BOOL`
+    /// site answers them in line while the class keeps the version.
+    pub(crate) fn instance_always_true_version(
+        &self,
+        inst: &crate::types::PyInstance,
+    ) -> Option<u64> {
+        let ver = inst.cls_raw().attr_version.get();
+        match &*self.core_truth.borrow() {
+            Some((v, NativeTruth::AlwaysTrue)) if *v == ver && ver != 0 => Some(ver),
             _ => None,
         }
     }
