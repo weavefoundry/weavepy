@@ -3423,9 +3423,11 @@ unsafe extern "C" fn h_store_subscr_ref(
     }
 }
 
-/// `BINARY_OP` of `kind` over the values at `at` and above it, for the
-/// shapes the core loop's arm runs (two numbers; strings' concatenation,
-/// repetition and `%` formatting; two tuples' or lists' concatenation; a
+/// `BINARY_OP` with oparg `kind` (the operator, and
+/// `BINARY_OP_INPLACE_FLAG` for an augmented assignment) over the values
+/// at `at` and above it, for the shapes the core loop's arm runs (two
+/// numbers; strings' concatenation, repetition and `%` formatting; two
+/// tuples' or lists' concatenation, and a list's in-place `+=`; a
 /// natively served instance's operator):
 /// `0` the result at `at` (the operands released), anything else declined
 /// untouched.
@@ -3449,13 +3451,35 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             at.write(r);
             return 0;
         }
+        let inplace = kind & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let kind: BinOpKind = std::mem::transmute(kind as u8);
         let r = match (a, b) {
             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
                 Interpreter::core_str_binop(a, b, kind)
             }
+            // A list's `+=` extends it in place (`list.__iadd__`), and is
+            // the list itself (`a += a` too: the items are copied first).
+            (Object::List(x), Object::List(y))
+                if inplace && kind == BinOpKind::Add && droppable(a) && droppable(b) =>
+            {
+                let items = y.try_borrow().ok().map(|y| y.clone());
+                match (items, x.try_borrow_mut().ok()) {
+                    (Some(items), Some(mut x)) => {
+                        x.extend(items);
+                        drop(x);
+                        Some(a.clone())
+                    }
+                    _ => None,
+                }
+            }
             // Two exact tuples' or lists' concatenation.
             (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_))
+                if kind == BinOpKind::Add && !inplace && droppable(a) && droppable(b) =>
+            {
+                Interpreter::core_seq_concat(a, b)
+            }
+            // (A tuple's `+=` is its `+`.)
+            (Object::Tuple(_), Object::Tuple(_))
                 if kind == BinOpKind::Add && droppable(a) && droppable(b) =>
             {
                 Interpreter::core_seq_concat(a, b)
@@ -12458,7 +12482,7 @@ impl<'a> Lower<'a> {
             self.materialize(bi, slot + 1);
         }
         self.cold = cold;
-        let k = self.b.ins().iconst(types::I32, i64::from(kind));
+        let k = self.binop_arg(pc, kind);
         let r = self
             .call(h_binop as *const () as usize, &[dst, k], true)
             .expect("returns");
@@ -12491,7 +12515,7 @@ impl<'a> Lower<'a> {
         self.materialize(bi, slot + 1);
         self.cold = cold;
         let at = self.slot_addr(slot);
-        let k = self.b.ins().iconst(types::I32, i64::from(kind));
+        let k = self.binop_arg(pc, kind);
         let r = self
             .call(h_binop as *const () as usize, &[at, k], true)
             .expect("returns");
@@ -12563,6 +12587,15 @@ impl<'a> Lower<'a> {
         self.leave(r);
     }
 
+    /// [`h_binop`]'s oparg for the `BINARY_OP` at `pc` of `kind`: the
+    /// kind and the instruction's in-place flag.
+    fn binop_arg(&mut self, pc: usize, kind: u8) -> Value {
+        let flag = self.code.instructions[pc].arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG;
+        self.b
+            .ins()
+            .iconst(types::I32, i64::from(u32::from(kind) | flag))
+    }
+
     /// `BINARY_OP` through [`h_binop`]: the operands onto the stack, and
     /// the result in the lower one's slot.
     fn binary_helper(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> bool {
@@ -12570,7 +12603,7 @@ impl<'a> Lower<'a> {
         self.materialize(ai, slot);
         self.materialize(bi, slot + 1);
         let at = self.slot_addr(slot);
-        let k = self.b.ins().iconst(types::I32, i64::from(kind));
+        let k = self.binop_arg(pc, kind);
         let r = self
             .call(h_binop as *const () as usize, &[at, k], true)
             .expect("returns");
