@@ -4950,7 +4950,7 @@ fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> O
     if let Some(bits) = pin_memo_hit(v, pins, memo) {
         return Some(bits);
     }
-    if pins.len() >= RUNTIME_PIN_CAP {
+    if pins.len() >= RUNTIME_PIN_CAP || finalizes_on_release(v) {
         return None;
     }
     let p = Pin::Obj(v.clone());
@@ -7130,6 +7130,19 @@ unsafe extern "C" fn wpjit_call_py(
     argc: u32,
     expect_tag: u32,
 ) -> i64 {
+    let epoch = crate::stdlib::weakref_real::weakref_epoch();
+    // SAFETY: the wrapper passes its own contract on.
+    let status = unsafe { wpjit_call_py_inner(frame, token, argc, expect_tag) };
+    // SAFETY: as above.
+    unsafe { deopt_after_weakrefs(frame, epoch, status) }
+}
+
+/// [`wpjit_call_py`]'s body.
+///
+/// # Safety
+///
+/// As [`wpjit_call_py`]'s.
+unsafe fn wpjit_call_py_inner(frame: *mut JitFrame, token: u32, argc: u32, expect_tag: u32) -> i64 {
     // SAFETY: per the function contract, `frame` and `ctx` are the live,
     // exclusively-owned buffers of the current native activation. The
     // `ctx` pointer was produced from a `&mut CallCtx` in `enter_compiled`
@@ -7890,6 +7903,25 @@ unsafe extern "C" fn wpjit_call_method(
     argc: u32,
     expect_tag: u32,
 ) -> i64 {
+    let epoch = crate::stdlib::weakref_real::weakref_epoch();
+    // SAFETY: the wrapper passes its own contract on.
+    let status = unsafe { wpjit_call_method_inner(frame, token, recv_pin, argc, expect_tag) };
+    // SAFETY: as above.
+    unsafe { deopt_after_weakrefs(frame, epoch, status) }
+}
+
+/// [`wpjit_call_method`]'s body.
+///
+/// # Safety
+///
+/// As [`wpjit_call_method`]'s.
+unsafe fn wpjit_call_method_inner(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
@@ -8350,6 +8382,26 @@ unsafe fn call_native_body(
 ///
 /// Same contract as [`wpjit_call_method`].
 unsafe extern "C" fn wpjit_call_native_method(
+    frame: *mut JitFrame,
+    token: u32,
+    recv_pin: i64,
+    argc: u32,
+    expect_tag: u32,
+) -> i64 {
+    let epoch = crate::stdlib::weakref_real::weakref_epoch();
+    // SAFETY: the wrapper passes its own contract on.
+    let status =
+        unsafe { wpjit_call_native_method_inner(frame, token, recv_pin, argc, expect_tag) };
+    // SAFETY: as above.
+    unsafe { deopt_after_weakrefs(frame, epoch, status) }
+}
+
+/// [`wpjit_call_native_method`]'s body.
+///
+/// # Safety
+///
+/// As [`wpjit_call_native_method`]'s.
+unsafe fn wpjit_call_native_method_inner(
     frame: *mut JitFrame,
     token: u32,
     recv_pin: i64,
@@ -11559,11 +11611,21 @@ fn pin_any(v: Object, pins: &mut PinTable) -> Option<u64> {
             return Some((pins.len() - 1) as u64);
         }
     }
-    if pins.len() >= RUNTIME_PIN_CAP {
+    if pins.len() >= RUNTIME_PIN_CAP || finalizes_on_release(&v) {
         return None;
     }
     pins.push(Pin::Obj(v));
     Some((pins.len() - 1) as u64)
+}
+
+/// Whether releasing `v` runs a finalizer (an instance of a class with
+/// `__del__`): a pin keeps its object alive until the activation retires
+/// its table, so such a value (a call's fresh result above all, `D(i)`)
+/// never rides one: its holder pays the deopt, and the interpreter
+/// releases it when its last reference goes, as CPython does.
+#[inline]
+fn finalizes_on_release(v: &Object) -> bool {
+    matches!(v, Object::Instance(i) if i.cls_raw().instances_need_finalize())
 }
 
 /// Whether a pin holding `last` can stand for `v`: the same object (or an
@@ -11904,8 +11966,11 @@ unsafe extern "C" fn wpjit_call_dyn(
     kwc: u32,
     names: u32,
 ) -> i64 {
+    let epoch = crate::stdlib::weakref_real::weakref_epoch();
     // SAFETY: the wrapper preserves the live-buffer contract above.
-    unsafe { call_dyn_impl(frame, callee_pin, argc, kwc, names, false) }
+    let status = unsafe { call_dyn_impl(frame, callee_pin, argc, kwc, names, false) };
+    // SAFETY: as above.
+    unsafe { deopt_after_weakrefs(frame, epoch, status) }
 }
 
 /// Generic call with an immediately consumed exact-integer result.
@@ -11920,8 +11985,36 @@ unsafe extern "C" fn wpjit_call_dyn_int(
     kwc: u32,
     names: u32,
 ) -> i64 {
+    let epoch = crate::stdlib::weakref_real::weakref_epoch();
     // SAFETY: the wrapper preserves the same live-buffer contract.
-    unsafe { call_dyn_impl(frame, callee_pin, argc, kwc, names, true) }
+    let status = unsafe { call_dyn_impl(frame, callee_pin, argc, kwc, names, true) };
+    // SAFETY: as above.
+    unsafe { deopt_after_weakrefs(frame, epoch, status) }
+}
+
+/// A call helper's `status`, turned into `Boxed` (the completed result
+/// parked, the activation deopting after the call) when the call made a
+/// weak reference (the weakref epoch moved from `epoch`): an object a pin
+/// keeps alive past its last other reference must die when that goes,
+/// so its weak references clear and their callbacks run when CPython
+/// runs them, which only the interpreter's release of the activation's
+/// pins can do.
+///
+/// # Safety
+///
+/// As the call helpers': `frame` and its context are the live native
+/// activation's, its result in `ret_bits`/`ret_tag` when `status` is `Ok`.
+#[inline(always)]
+unsafe fn deopt_after_weakrefs(frame: *mut JitFrame, epoch: u64, status: i64) -> i64 {
+    if status != CallStatus::Ok as i64 || crate::stdlib::weakref_real::weakref_epoch() == epoch {
+        return status;
+    }
+    // SAFETY: the caller's contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    ctx.parked = Some(unpack_pins(jf.ret_bits, jf.ret_tag, &ctx.pins));
+    CallStatus::Boxed as i64
 }
 
 #[inline(always)]

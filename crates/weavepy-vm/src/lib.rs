@@ -15428,6 +15428,10 @@ impl Interpreter {
                                     unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                     last = pc;
                                     pc += 1;
+                                    // (A temporary receiver that died there,
+                                    // `D(i).x`, finalizes before the next
+                                    // instruction.)
+                                    after_release!();
                                     continue;
                                 }
                                 _ => offload!(OFFLOAD_HELPER),
@@ -15443,6 +15447,8 @@ impl Interpreter {
                                 unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                 last = pc;
                                 pc += 1;
+                                // (As above.)
+                                after_release!();
                                 continue;
                             }
                         }
@@ -15456,6 +15462,8 @@ impl Interpreter {
                                 if unsafe { Self::core_laid_out_attr(code, ins.arg, pc, top) } {
                                     last = pc;
                                     pc += 1;
+                                    // (As above.)
+                                    after_release!();
                                     continue;
                                 }
                                 offload!(OFFLOAD_HELPER);
@@ -15485,6 +15493,8 @@ impl Interpreter {
                         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                         last = pc;
                         pc += 1;
+                        // (As above.)
+                        after_release!();
                     }
                     // An instance-dict cache hit storing an atomic value over a
                     // droppable one (the helper's `leaf_store_attr` first case).
