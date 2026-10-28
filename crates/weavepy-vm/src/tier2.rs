@@ -4950,7 +4950,7 @@ fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> O
     if let Some(bits) = pin_memo_hit(v, pins, memo) {
         return Some(bits);
     }
-    if pins.len() >= RUNTIME_PIN_CAP {
+    if pins.len() >= RUNTIME_PIN_CAP || finalizes_on_release(v) {
         return None;
     }
     let p = Pin::Obj(v.clone());
@@ -11559,11 +11559,21 @@ fn pin_any(v: Object, pins: &mut PinTable) -> Option<u64> {
             return Some((pins.len() - 1) as u64);
         }
     }
-    if pins.len() >= RUNTIME_PIN_CAP {
+    if pins.len() >= RUNTIME_PIN_CAP || finalizes_on_release(&v) {
         return None;
     }
     pins.push(Pin::Obj(v));
     Some((pins.len() - 1) as u64)
+}
+
+/// Whether releasing `v` runs a finalizer (an instance of a class with
+/// `__del__`): a pin keeps its object alive until the activation retires
+/// its table, so such a value (a call's fresh result above all, `D(i)`)
+/// never rides one: its holder pays the deopt, and the interpreter
+/// releases it when its last reference goes, as CPython does.
+#[inline]
+fn finalizes_on_release(v: &Object) -> bool {
+    matches!(v, Object::Instance(i) if i.cls_raw().instances_need_finalize())
 }
 
 /// Whether a pin holding `last` can stand for `v`: the same object (or an
