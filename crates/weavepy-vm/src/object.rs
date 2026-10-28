@@ -10658,6 +10658,20 @@ impl Object {
         )
     }
 
+    /// Whether this value's truth needs the interpreter
+    /// (`Interpreter::obj_truthy`): an instance (its `__bool__` or
+    /// `__len__`), an object-backed mapping proxy (its mapping's length),
+    /// or a class whose metaclass isn't `type` (the metaclass's `__bool__`
+    /// or `__len__`). Anything else's is [`Self::is_truthy`].
+    #[inline]
+    pub fn truth_dispatches(&self) -> bool {
+        match self {
+            Object::Instance(_) | Object::MappingProxyObj(_) => true,
+            Object::Type(t) => !t.metaclass_is_type(),
+            _ => false,
+        }
+    }
+
     /// Python truthiness.
     pub fn is_truthy(&self) -> bool {
         match self {
