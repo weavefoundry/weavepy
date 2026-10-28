@@ -7358,12 +7358,11 @@ impl Interpreter {
             // as BINARY_OP above.
             let r = r_res?;
             let r = if to_bool && !matches!(r, Object::Bool(_)) {
-                let truthy = match &r {
-                    Object::Instance(_) | Object::MappingProxyObj(_) => {
-                        let g = frame.globals.clone();
-                        self.obj_truthy(&r, &g)?
-                    }
-                    _ => r.is_truthy(),
+                let truthy = if r.truth_dispatches() {
+                    let g = frame.globals.clone();
+                    self.obj_truthy(&r, &g)?
+                } else {
+                    r.is_truthy()
                 };
                 Object::Bool(truthy)
             } else {
@@ -7580,12 +7579,11 @@ impl Interpreter {
         // Object-backed mappingproxies delegate truthiness to the
         // wrapped mapping (CPython mp_length), so they take the
         // dispatching path alongside instances.
-        let truthy = match &v {
-            Object::Instance(_) | Object::MappingProxyObj(_) => {
-                let g = frame.globals.clone();
-                self.obj_truthy(&v, &g)?
-            }
-            _ => v.is_truthy(),
+        let truthy = if v.truth_dispatches() {
+            let g = frame.globals.clone();
+            self.obj_truthy(&v, &g)?
+        } else {
+            v.is_truthy()
         };
         // RFC 0077 (WS2): the POP_JUMP family audits its one
         // discarded operand (exempt from the coarse stack-shrink
@@ -12609,16 +12607,26 @@ impl Interpreter {
                                 None => break None,
                             },
                             // A foreign object's truth is its extension's,
-                            // a proxy's its mapping's `__len__`.
+                            // a proxy's its mapping's `__len__`, a class's
+                            // with a metaclass the metaclass's.
                             Object::Foreign(_) | Object::MappingProxyObj(_) => break None,
+                            Object::Type(t) if !Self::plain_metaclass(t) => break None,
                             // Every other kind's is native (the full arm's
                             // `is_truthy`: a file, bytes, a set, a function).
                             _ => v.is_truthy(),
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
-                        unsafe { drop(std::mem::replace(&mut *top, bool_hot(b))) };
+                        let old = unsafe { std::mem::replace(&mut *top, bool_hot(b)) };
                         last = pc;
                         pc += 1;
+                        // (The test may hold an instance's last reference:
+                        // its finalizer runs before the next instruction.)
+                        if matches!(old, Object::Instance(_)) {
+                            drop(old);
+                            after_release!();
+                        } else {
+                            drop(old);
+                        }
                     }
                     // `not x`, `-x` and `~x` of a scalar, replaced in place
                     // (nothing to release); any other shape is the full
@@ -28647,9 +28655,24 @@ impl Interpreter {
                         },
                         _ => break,
                     };
-                    *stack.last_mut().expect("operand checked above") = Object::Bool(b);
+                    let old = std::mem::replace(
+                        stack.last_mut().expect("operand checked above"),
+                        Object::Bool(b),
+                    );
                     last = pc;
                     pc += 1;
+                    // (The test may hold an instance's last reference: its
+                    // finalizer runs before the next instruction.)
+                    if matches!(old, Object::Instance(_)) {
+                        drop(old);
+                        // SAFETY: the running thread's own flag.
+                        if unsafe { (*gc_trace::maybe_dead_flag()).get() } {
+                            stop = LeafStop::Marked;
+                            break;
+                        }
+                    } else {
+                        drop(old);
+                    }
                 }
                 OpCode::IsOp => {
                     let n = stack.len();
@@ -33598,7 +33621,8 @@ impl Interpreter {
                         Err(_) => unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?,
                     }
                 } else if matches!(kind, UnaryKind::Not)
-                    && matches!(v, Object::MappingProxyObj(_) | Object::Foreign(_))
+                    && (matches!(v, Object::MappingProxyObj(_) | Object::Foreign(_))
+                        || matches!(&v, Object::Type(t) if !t.metaclass_is_type()))
                 {
                     // Delegating wrappers size/ask the wrapped value for
                     // truthiness (an object-backed `mappingproxy` measures as
@@ -35754,13 +35778,15 @@ impl Interpreter {
                 // CPython 3.13's TO_BOOL: replace TOS with its exact-bool
                 // truthiness (dispatches `__bool__`/`__len__`, may raise).
                 let v = frame.pop()?;
-                let truthy = match &v {
-                    Object::Instance(_) | Object::MappingProxyObj(_) => {
-                        let g = frame.globals.clone();
-                        self.obj_truthy(&v, &g)?
-                    }
-                    _ => v.is_truthy(),
+                let truthy = if v.truth_dispatches() {
+                    let g = frame.globals.clone();
+                    self.obj_truthy(&v, &g)?
+                } else {
+                    v.is_truthy()
                 };
+                // The operand dies here, finalizers and all (its last
+                // reference may be the test's).
+                self.release(v);
                 frame.push(Object::Bool(truthy));
             }
             OpCode::ConvertValue => {
@@ -42549,6 +42575,24 @@ impl Interpreter {
                 let r = self.call(&method, &[], &[], globals)?;
                 // `PyObject_Size` semantics; errors must match `len()`'s
                 // exactly (test_bool `test_sane_len` compares the strings).
+                return coerce_len_result(r).map(|n| n != 0);
+            }
+        }
+        // A class is an instance of its metaclass: a metaclass's `__bool__`
+        // (then `__len__`) decides its truth (`bool(cls)` is False for a
+        // metaclass whose `__bool__` says so).
+        if let Object::Type(_) = v {
+            if let Some(method) = metaclass_method(v, "__bool__") {
+                return match self.call(&method, &[], &[], globals)? {
+                    Object::Bool(b) => Ok(b),
+                    other => Err(type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        other.type_name()
+                    ))),
+                };
+            }
+            if let Some(method) = metaclass_method(v, "__len__") {
+                let r = self.call(&method, &[], &[], globals)?;
                 return coerce_len_result(r).map(|n| n != 0);
             }
         }

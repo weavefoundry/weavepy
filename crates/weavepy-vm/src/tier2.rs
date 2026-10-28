@@ -12898,6 +12898,8 @@ unsafe extern "C" fn wpjit_truth(frame: *mut JitFrame, pin: i64, _reserved: i64)
     };
     let pure = match &v {
         Object::Foreign(_) | Object::MappingProxyObj(_) => false,
+        // A metaclass's `__bool__`/`__len__` decides a class's truth.
+        Object::Type(t) => t.metaclass_is_type(),
         Object::Instance(_) => {
             // `NotImplemented` in a boolean context warns (arbitrary
             // Python through the warnings machinery).
@@ -12914,7 +12916,7 @@ unsafe extern "C" fn wpjit_truth(frame: *mut JitFrame, pin: i64, _reserved: i64)
     // A Python `__bool__`/`__len__` may inspect its caller's frame, whose
     // locals live lane-packed in the native activation: the interpreter
     // re-executes the test with a materialized frame.
-    if matches!(v, Object::Instance(_)) {
+    if matches!(v, Object::Instance(_)) || matches!(&v, Object::Type(t) if !t.metaclass_is_type()) {
         return 3;
     }
     ctx.dirty = true;
@@ -13329,7 +13331,7 @@ unsafe extern "C" fn wpjit_dyn_compare(frame: *mut JitFrame, arg: i64, _unused: 
     let r = match r {
         Ok(v) if to_bool => match v {
             Object::Bool(t) => Ok(t),
-            Object::Instance(_) | Object::MappingProxyObj(_) => interp.obj_truthy(&v, &globals),
+            v if v.truth_dispatches() => interp.obj_truthy(&v, &globals),
             other => Ok(other.is_truthy()),
         }
         .map(Object::Bool),
