@@ -4550,19 +4550,24 @@ fn class_attr_note(
     if cache.cver.get() == ver || crate::class_attr_site(ext, pc) != Some(ver) {
         return;
     }
+    let (Some(Object::Str(n)), Some(&hash)) = (
+        ext.name_objs.get(name as usize),
+        ext.name_hashes.get(name as usize),
+    ) else {
+        return;
+    };
+    // The site's stamp says the class's attribute is a plain value, not
+    // that this read took it: an instance holding the name reads its own
+    // value, which the cache mustn't serve the class's other instances.
+    // (The lookup compares no exotic key, so runs no code.)
+    if crate::object::exotic_str_keys_possible() || !cls.lookup(n).is_some_and(|c| c.is_same(v)) {
+        return;
+    }
     let (keys, before) = match cls.shared_keys.get() {
-        Some(keys) => {
-            let (Some(Object::Str(n)), Some(&hash)) = (
-                ext.name_objs.get(name as usize),
-                ext.name_hashes.get(name as usize),
-            ) else {
-                return;
-            };
-            (
-                std::ptr::from_ref(keys) as u64,
-                u32::try_from(keys.names_before(n, hash)).unwrap_or(u32::MAX),
-            )
-        }
+        Some(keys) => (
+            std::ptr::from_ref(keys) as u64,
+            u32::try_from(keys.names_before(n, hash)).unwrap_or(u32::MAX),
+        ),
         None => (0, 0),
     };
     // SAFETY: an `Object` is 16 bytes, read as its two words.
