@@ -840,9 +840,10 @@ struct JitState {
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process: when the first code object is
-/// halfway to its frame-JIT compile (see [`prewarm_on_heat`]) or to its
-/// tier-2 threshold.
+/// [`prewarm_codegen`]), once per process: as start-up begins for a script
+/// or module (see [`prewarm_at_startup`]), or else when the first code
+/// object is halfway to its frame-JIT compile (see [`prewarm_on_heat`]) or
+/// to its tier-2 threshold.
 fn spawn_codegen_prewarm() {
     static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -869,6 +870,31 @@ fn spawn_codegen_prewarm() {
 #[inline(never)]
 pub(crate) fn prewarm_on_heat() {
     if !jit_off_for_process() {
+        spawn_codegen_prewarm();
+    }
+}
+
+/// Whether [`prewarm_at_startup`] should start the warm-up as start-up
+/// begins (see [`warm_codegen_at_startup`]).
+static PREWARM_AT_STARTUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ask for the code generator's warm-up to start with start-up, for a
+/// program (a script or `-m` module) likely to compile. A hot loop gets
+/// from its first iterations to its compile in far less time than the
+/// warm-up takes (about 0.7 ms), so a warm-up started on the way there
+/// leaves the first compile paying most of the cold start: short hot
+/// programs ran 6% to 18% slower. `-c` code and the REPL keep the warm-up
+/// for when code gets halfway hot, sparing a process that never compiles
+/// the code generator's pages.
+pub(crate) fn warm_codegen_at_startup() {
+    PREWARM_AT_STARTUP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Start the code generator's warm-up as start-up begins, when
+/// [`warm_codegen_at_startup`] asked for it and the JIT may run.
+pub(crate) fn prewarm_at_startup() {
+    if PREWARM_AT_STARTUP.load(std::sync::atomic::Ordering::Relaxed) && !jit_off_for_process() {
         spawn_codegen_prewarm();
     }
 }

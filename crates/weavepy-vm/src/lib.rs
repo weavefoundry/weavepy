@@ -1902,6 +1902,14 @@ impl Interpreter {
         }
     }
 
+    /// Start the JIT's code generator warming up with start-up (the next
+    /// [`Interpreter::run_site`]), for a program likely to compile: a
+    /// script or module rather than `-c` code or the REPL.
+    pub fn warm_jit_at_startup() {
+        #[cfg(feature = "jit")]
+        crate::tier2::warm_codegen_at_startup();
+    }
+
     /// Report that interpreter start-up is over: user code runs next
     /// (the JIT then uses its normal counter thresholds).
     pub fn note_startup_finished(&self) {
@@ -1916,6 +1924,8 @@ impl Interpreter {
     /// `-S` is active; another explicit call would repeat `.pth` processing.
     /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "jit")]
+        crate::tier2::prewarm_at_startup();
         #[cfg(feature = "jit")]
         let _compile_guard = crate::tier2::startup_compilation_scope();
         // Startup runs bytecode too (site/.pth imports can allocate enough
