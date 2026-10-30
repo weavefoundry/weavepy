@@ -36,10 +36,9 @@ pub(super) struct Unit {
     pub id: FuncId,
     pub func: Function,
     /// For `WEAVEPY_FRAME_JIT_STATS` and `WEAVEPY_FRAME_JIT_VERIFY`: the
-    /// code's name (and the chunk's range), whether it was lowered lean,
-    /// and how long the lowering took (with stats on).
+    /// code's name (and the chunk's range), and how long the lowering took
+    /// (with stats on).
     pub label: String,
-    pub lean: bool,
     pub lowered: Option<Duration>,
 }
 
@@ -81,7 +80,6 @@ fn generate_one(isa: &dyn TargetIsa, unit: Unit) -> Option<Machine> {
         id,
         func,
         label,
-        lean,
         lowered,
     } = unit;
     let insts = func.dfg.num_insts();
@@ -110,9 +108,9 @@ fn generate_one(isa: &dyn TargetIsa, unit: Unit) -> Option<Machine> {
         .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
         .collect();
     if let (Some(lowered), Some(t1)) = (lowered, t1) {
+        super::stats::take_passes();
         eprintln!(
-            "frame jit: {label} lowered in {lowered:?} ({insts} IR instructions, {blocks} blocks{}, {} bytes), compiled in {:?}",
-            if lean { ", lean" } else { "" },
+            "frame jit: {label} lowered in {lowered:?} ({insts} IR instructions, {blocks} blocks, {} bytes), compiled in {:?}",
             bytes.len(),
             t1.elapsed()
         );

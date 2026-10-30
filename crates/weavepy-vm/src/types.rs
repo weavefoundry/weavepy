@@ -52,10 +52,11 @@ pub enum Dunder {
     Set,
     Delete,
     Class,
+    Ne,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -71,6 +72,7 @@ impl Dunder {
             Self::Set => "__set__",
             Self::Delete => "__delete__",
             Self::Class => "__class__",
+            Self::Ne => "__ne__",
         }
     }
 }
@@ -4626,7 +4628,7 @@ impl Drop for PyInstance {
         // allocation until its generation is next collected.
         let slot = self.gc_slot.get();
         if slot != crate::gc_trace::NO_SLOT {
-            crate::gc_trace::forget_instance(slot, id as usize);
+            crate::gc_trace::forget_instance(self, slot);
         }
     }
 }

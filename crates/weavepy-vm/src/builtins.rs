@@ -1321,7 +1321,7 @@ fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
                 Some(recv @ (Object::Instance(_) | Object::LazyIter(_))) => {
                     let interp = reentrant_interp()?;
                     let globals = interp.builtins_dict();
-                    match interp.iter_next(recv, &globals)? {
+                    match interp.iter_step(recv, &globals)? {
                         Some(v) => Ok(v),
                         None => Err(crate::error::stop_iteration()),
                     }
@@ -9070,7 +9070,7 @@ pub fn class_matches_classinfo_named(
             Ok(false)
         }
         _ => Err(type_error(
-            "issubclass() arg 2 must be a class or tuple of classes",
+            "issubclass() arg 2 must be a class, a tuple of classes, or a union",
         )),
     }
 }
@@ -15421,7 +15421,9 @@ fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 }
             }
         }
-        out.push_str(&format!("{b:02x}"));
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 15)] as char);
     }
     Ok(Object::from_str(out))
 }

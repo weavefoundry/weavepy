@@ -46,14 +46,35 @@ impl FrameStack {
         self.buf.pop()
     }
 
+    /// Release the values above `len`, the top first, as CPython closes a
+    /// frame's operands (finalizers see the order).
     #[inline(always)]
     pub(crate) fn truncate(&mut self, len: usize) {
-        self.buf.truncate(len);
+        if len < self.buf.len() {
+            self.release_above(len);
+        }
+    }
+
+    /// [`Self::truncate`]'s release (out of line: there are many callers).
+    #[inline(never)]
+    fn release_above(&mut self, len: usize) {
+        let n = self.buf.len();
+        // SAFETY: the vector forgets the values first; each is released
+        // exactly once.
+        unsafe {
+            self.buf.set_len(len);
+            let base = self.buf.as_mut_ptr();
+            let mut k = n;
+            while k > len {
+                k -= 1;
+                std::ptr::drop_in_place(base.add(k));
+            }
+        }
     }
 
     #[inline]
     pub(crate) fn clear(&mut self) {
-        self.buf.clear();
+        self.truncate(0);
     }
 
     /// Set the depth, the values above `len` forgotten (not released) or
@@ -141,6 +162,13 @@ impl FrameStack {
     }
 }
 
+impl Drop for FrameStack {
+    #[inline]
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 /// A run of operands whose top values move off it: a frame's stack, or a
 /// staging vector.
 pub(crate) trait Operands {
@@ -208,7 +236,9 @@ impl FrameLocals {
 
     #[inline]
     pub(crate) fn into_shared(self) -> SharedLocals {
-        self.rc
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: moved out once; `this` is never dropped.
+        unsafe { std::ptr::read(&raw const this.rc) }
     }
 
     /// The handle a frame object or shell holds, to read the live values.
@@ -301,5 +331,100 @@ impl FrameLocals {
     pub(crate) unsafe fn peek_mut(&self) -> Option<&mut Vec<Object>> {
         // SAFETY: the caller's contract.
         unsafe { self.rc.peek_mut() }
+    }
+}
+
+impl Drop for FrameLocals {
+    /// A frame dropped with its locals still in it (one that didn't finish
+    /// through a retiring path) releases them as those paths do.
+    #[inline]
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.rc) == 1 {
+            // SAFETY: the last handle: nothing else reaches the vector.
+            release_values(unsafe { &mut *self.rc.as_ptr() });
+        }
+    }
+}
+
+/// A frame's cells: its cell variables, then its free variables.
+pub(crate) type FrameCells = Rc<Vec<Rc<RefCell<Object>>>>;
+
+/// Empty `values`, the last value first (the order CPython's
+/// `_PyFrame_ClearLocals` releases a frame's locals in).
+#[inline]
+pub(crate) fn release_values(values: &mut Vec<Object>) {
+    // SAFETY: nothing else borrows the vector.
+    unsafe { crate::release_locals(values) }
+}
+
+/// Release the cells a finished frame owns and its locals, as
+/// `_PyFrame_ClearLocals` walks CPython's `localsplus` from the top down: the
+/// free variables, then the cell variables that aren't arguments, then the
+/// locals, an argument's cell in its argument's slot. Cells something else
+/// also holds through this vector (a frame object) stay, to go with it.
+///
+/// `cells` must hold a count of its own: a lean activation's borrowed handle
+/// looks unique when its function is the only owner.
+#[inline]
+pub(crate) fn release_cells_and_locals(
+    code: &weavepy_compiler::CodeObject,
+    cells: &mut FrameCells,
+    locals: &mut Vec<Object>,
+) {
+    if cells.is_empty() {
+        release_values(locals);
+    } else {
+        release_held_cells_and_locals(code, cells, locals);
+    }
+}
+
+/// [`release_cells_and_locals`] with cells.
+#[inline(never)]
+fn release_held_cells_and_locals(
+    code: &weavepy_compiler::CodeObject,
+    cells: &mut FrameCells,
+    locals: &mut Vec<Object>,
+) {
+    let Some(held) = Rc::get_mut(cells) else {
+        return release_values(locals);
+    };
+    // The slot of each cell variable that is an argument (its value moved
+    // out of the slot into the cell).
+    let args: &[u32] = crate::code_vm_ext(code).map_or(&[], |ext| &ext.cell_args);
+    let args = &args[..args.len().min(held.len())];
+    let Some(top_arg) = args.iter().copied().filter(|&s| s != u32::MAX).max() else {
+        while let Some(cell) = held.pop() {
+            drop(cell);
+        }
+        return release_values(locals);
+    };
+    let ncells = held.len();
+    let cell_base = held.as_mut_ptr();
+    let nlocals = locals.len();
+    let local_base = locals.as_mut_ptr();
+    // SAFETY: both vectors forget their values first, and each value is
+    // released exactly once: a cell that isn't an argument's in the first
+    // loop, an argument's at its slot or, past the locals, in the last.
+    unsafe {
+        held.set_len(0);
+        locals.set_len(0);
+        for i in (0..ncells).rev() {
+            if args.get(i).is_none_or(|&s| s == u32::MAX) {
+                std::ptr::drop_in_place(cell_base.add(i));
+            }
+        }
+        for k in (0..nlocals).rev() {
+            std::ptr::drop_in_place(local_base.add(k));
+            if k <= top_arg as usize {
+                if let Some(i) = args.iter().position(|&s| s as usize == k) {
+                    std::ptr::drop_in_place(cell_base.add(i));
+                }
+            }
+        }
+        for (i, &s) in args.iter().enumerate() {
+            if s != u32::MAX && s as usize >= nlocals {
+                std::ptr::drop_in_place(cell_base.add(i));
+            }
+        }
     }
 }
