@@ -30646,6 +30646,7 @@ impl Interpreter {
             // A function's stored attribute (`__doc__` once read,
             // `__wrapped__`).
             Object::Function(f) => return function_stored_attr(f, name_obj),
+            Object::Type(cls) => return Self::leaf_type_getattr(cls, name, default),
             // A plain module's global (`hasattr(os, 'getpid')`): its
             // dictionary's value (`ModuleType`'s descriptors are dunders;
             // a missing name may reach a module `__getattr__`).
@@ -30713,6 +30714,74 @@ impl Interpreter {
             }
             None => return None,
         })
+    }
+
+    /// `getattr(cls, name[, default])` as [`Self::leaf_load_type_attr`]
+    /// resolves a site's read, by name: a function, a plain value or a
+    /// native method on the class's MRO, which no metaclass attribute
+    /// intercepts, or the default for a name nothing supplies. `None` for
+    /// anything the full path must decide (descriptors to run, a metaclass
+    /// attribute that binds, a missing attribute's `AttributeError`).
+    fn leaf_type_getattr(
+        cls: &Rc<TypeObject>,
+        name: &str,
+        default: Option<&Object>,
+    ) -> Option<Object> {
+        if cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || crate::capi_watchers::types_active()
+            || (name.starts_with("__") && !Self::type_dunder_transparent(name))
+        {
+            return None;
+        }
+        if !Self::plain_metaclass(cls) {
+            // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
+                return None;
+            }
+            // (What `leaf_load_meta_class_attr` lets the class answer.)
+            if !matches!(
+                meta.lookup(name),
+                None | Some(
+                    Object::None
+                        | Object::Bool(_)
+                        | Object::Int(_)
+                        | Object::Float(_)
+                        | Object::Str(_)
+                        | Object::Function(_)
+                        | Object::Builtin(_)
+                )
+            ) {
+                return None;
+            }
+        }
+        match cls.lookup(name) {
+            None => default
+                .filter(|_| type_attr_certainly_missing(cls, name))
+                .cloned(),
+            Some(
+                v @ (Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::Tuple(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Type(_)
+                | Object::Function(_)
+                | Object::Builtin(_)
+                | Object::Property(_)),
+            ) => Some(v),
+            // A plain instance stored on the class, unless its class makes
+            // it a descriptor.
+            Some(Object::Instance(i)) if i.cls_raw().lookup("__get__").is_none() => {
+                Some(Object::Instance(i))
+            }
+            Some(_) => None,
+        }
     }
 
     /// A dunder a plain instance gets from a builtin method on its class
@@ -31488,6 +31557,16 @@ impl Interpreter {
             && name.starts_with("__")
             && (name != "__new__" || cls.is_super_proxy_type())
         {
+            // `inst.__class__`, as `load_attr_instance` answers it: `object`'s
+            // descriptor, which the instance dict can't shadow, when nothing
+            // on the MRO overrides it.
+            if name == "__class__"
+                && inst.c_body.get() == 0
+                && !cls.flags.is_builtin
+                && cls.class_attr_is_plain()
+            {
+                return Some((LeafAttr::Value(Object::Type(inst.cls())), None));
+            }
             return None;
         }
         let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
@@ -31931,7 +32010,11 @@ impl Interpreter {
     #[inline(never)]
     fn leaf_type_name(code: &CodeObject, cls: &Rc<TypeObject>, name_idx: u32) -> Option<Object> {
         let name = code.names.get(name_idx as usize)?.as_str();
-        if !matches!(name, "__name__" | "__qualname__") || crate::capi_watchers::types_active() {
+        if !matches!(
+            name,
+            "__name__" | "__qualname__" | "__mro__" | "__bases__" | "__module__"
+        ) || crate::capi_watchers::types_active()
+        {
             return None;
         }
         if !Self::plain_metaclass(cls) {
@@ -31945,6 +32028,46 @@ impl Interpreter {
             {
                 return None;
             }
+        }
+        match name {
+            // (`type_mro_get`: a class still being made has none, which the
+            // full path answers.)
+            "__mro__" => {
+                let mro = cls.mro.try_borrow().ok()?;
+                if mro.is_empty() {
+                    return None;
+                }
+                return Some(Object::new_tuple(
+                    mro.iter().map(|b| Object::Type(b.clone())).collect(),
+                ));
+            }
+            // (A class made with a tuple subclass of bases keeps that object;
+            // its dict says so.)
+            "__bases__" => {
+                let d = cls.dict.try_borrow().ok()?;
+                if d.get(&crate::object::StrKey("__weavepy_bases_obj__"))
+                    .is_some()
+                {
+                    return None;
+                }
+                let bases = cls.bases.try_borrow().ok()?;
+                return Some(Object::new_tuple(
+                    bases.iter().map(|b| Object::Type(b.clone())).collect(),
+                ));
+            }
+            // The class's own entry, when it's a string.
+            "__module__" => {
+                return match cls
+                    .dict
+                    .try_borrow()
+                    .ok()?
+                    .get(&code_name_key(code, name_idx)?)
+                {
+                    Some(v @ Object::Str(_)) => Some(v.clone()),
+                    _ => None,
+                };
+            }
+            _ => {}
         }
         if let Some(v @ Object::Str(_)) = cls
             .dict
@@ -43795,7 +43918,7 @@ impl Interpreter {
             // Only dispatch to a *user-defined* __instancecheck__.
             // The built-in `type.__instancecheck__` is already what
             // we'd compute by default, so skip it to avoid recursion.
-            if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+            if !Rc::ptr_eq(&meta, &builtin_types().type_) && !meta_check_is_type(&meta, false) {
                 if let Some(hook) = meta.lookup("__instancecheck__") {
                     // `abc.ABCMeta.__instancecheck__` only forwards to the
                     // native `_abc_instancecheck`: called directly.
@@ -43962,7 +44085,7 @@ impl Interpreter {
         }
         if let Object::Type(info_cls) = classinfo {
             let meta = info_cls.metaclass_or_type();
-            if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+            if !Rc::ptr_eq(&meta, &builtin_types().type_) && !meta_check_is_type(&meta, true) {
                 if let Some(hook) = meta.lookup("__subclasscheck__") {
                     // `abc.ABCMeta.__subclasscheck__` only forwards to the
                     // native `_abc_subclasscheck`: called directly.
@@ -45822,6 +45945,26 @@ impl Interpreter {
             ) {
                 let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
                 return Ok(r.is_truthy());
+            }
+            // A dict subclass inheriting `dict.__contains__`, of a key that
+            // settles by native equality.
+            if let Some(Object::Dict(d)) = inst.native.get() {
+                if let Some(probe) = crate::object::LeafProbe::new(item) {
+                    let inherited = inst
+                        .cls_raw()
+                        .lookup_with_owner("__contains__")
+                        .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().dict_));
+                    if inherited {
+                        if let Ok(m) = d.try_borrow() {
+                            if m.get(&probe).is_some() {
+                                return Ok(true);
+                            }
+                            if probe.miss_is_exact() {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
             }
         }
         let found = if let Some(method) = instance_method(&container, "__contains__")
@@ -84731,6 +84874,18 @@ fn native_scalar_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool
         CompareKind::Gt => ord == Some(Ordering::Greater),
         CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
     })
+}
+
+/// Whether `meta`, a metaclass, inherits `type.__subclasscheck__` (or
+/// `type.__instancecheck__`), which the default check computes without a call.
+fn meta_check_is_type(meta: &TypeObject, subclass: bool) -> bool {
+    let name = if subclass {
+        "__subclasscheck__"
+    } else {
+        "__instancecheck__"
+    };
+    meta.lookup_with_owner(name)
+        .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_))
 }
 
 /// [`plain_compare`] of the operands at `at` and above it, when releasing
