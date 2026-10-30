@@ -82,6 +82,15 @@ unsafe impl GlobalAlloc for Mimalloc {
 
 extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
+    #[cfg(target_os = "linux")]
+    fn mi_manage_os_memory(
+        start: *mut libc::c_void,
+        size: libc::size_t,
+        is_committed: bool,
+        is_pinned: bool,
+        is_zero: bool,
+        numa_node: c_int,
+    ) -> bool;
 }
 
 /// mimalloc 3's `mi_option_arena_reserve` (its position in `mi_option_t`).
@@ -127,6 +136,54 @@ const MI_OPTION_ARENA_MAX_OBJECT_SIZE: c_int = 45;
 #[cfg(not(target_os = "linux"))]
 const ARENA_MAX_OBJECT_KIB: c_long = 2 * 1024;
 
+/// The size of the first arena on Linux: mimalloc's smallest (see
+/// [`reserve_lean_arena`]).
+#[cfg(target_os = "linux")]
+const LEAN_ARENA: libc::size_t = 32 << 20;
+
+/// Give mimalloc a first arena on Linux that doesn't use transparent huge
+/// pages, unless the environment sets `MIMALLOC_ALLOW_THP`.
+///
+/// mimalloc advises huge pages for its arenas, and the kernel then backs
+/// the first touch of each aligned 2 MiB range with a whole page, though
+/// the heap uses a fraction of it. Without them a small program's peak
+/// halves (`deltablue` 62 to 33 MB, `str_methods` 50 to 25 MB, `startup` 30
+/// to 20 MB) at the same speed. Large heaps do gain from huge pages (a
+/// program growing large deques ran 11% slower without them, with ten
+/// times the page faults), and they keep them: once this arena is full,
+/// mimalloc reserves its own arenas, with its usual advice.
+///
+/// `madvise` applies to this mapping alone, where `prctl`'s
+/// `PR_SET_THP_DISABLE`, which is how mimalloc's `allow_thp` option turns
+/// them off, would be inherited by every child process.
+#[cfg(target_os = "linux")]
+fn reserve_lean_arena() {
+    // (One slice more, as mimalloc aligns the start to its 64 KiB slices.)
+    let size = LEAN_ARENA + (64 << 10);
+    // SAFETY: an anonymous mapping of our own, handed over to mimalloc for
+    // the rest of the process; `getenv` with a NUL-terminated name.
+    unsafe {
+        if !libc::getenv(c"MIMALLOC_ALLOW_THP".as_ptr()).is_null() {
+            return;
+        }
+        let start = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        if start == libc::MAP_FAILED {
+            return;
+        }
+        libc::madvise(start, size, libc::MADV_NOHUGEPAGE);
+        if !mi_manage_os_memory(start, size, true, false, true, -1) {
+            libc::munmap(start, size);
+        }
+    }
+}
+
 /// Configure the allocator before its first allocation (mimalloc reads an
 /// option when it first needs it; the first arena is reserved by the first
 /// allocation). Runs from the executable's initializer list, before
@@ -143,4 +200,6 @@ pub extern "C" fn configure() {
             mi_option_set(MI_OPTION_ARENA_MAX_OBJECT_SIZE, ARENA_MAX_OBJECT_KIB);
         }
     }
+    #[cfg(target_os = "linux")]
+    reserve_lean_arena();
 }
