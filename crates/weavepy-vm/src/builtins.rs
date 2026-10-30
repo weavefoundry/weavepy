@@ -4751,7 +4751,11 @@ pub fn foreign_code_object(
         name: name.into(),
         qualname: qualname.into(),
         filename: filename.into(),
-        varnames: names_of(varnames),
+        body: weavepy_compiler::CodeBody {
+            varnames: names_of(varnames),
+            ..Default::default()
+        }
+        .into(),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -4950,11 +4954,15 @@ pub(crate) fn code_type_call(
         name: name.into(),
         qualname: qualname.into(),
         filename: filename.into(),
-        constants,
-        names: names_of(names),
-        varnames: names_of(varnames),
-        freevars: names_of(freevars),
-        cellvars: names_of(cellvars),
+        body: weavepy_compiler::CodeBody {
+            constants,
+            names: names_of(names),
+            varnames: names_of(varnames),
+            freevars: names_of(freevars),
+            cellvars: names_of(cellvars),
+            ..Default::default()
+        }
+        .into(),
         arg_count,
         posonly_count,
         kwonly_count,

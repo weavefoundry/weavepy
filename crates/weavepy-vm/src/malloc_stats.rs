@@ -14,7 +14,7 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// What the VM asks of the process's allocator, set by the host program
 /// that chose it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct AllocatorHooks {
     /// Return the calling thread's free memory to the OS.
     pub release_free_memory: fn(),
@@ -48,6 +48,7 @@ pub fn release_free_memory() {
 /// in the large size classes the interpreter barely uses. From the
 /// interpreter's heap, those blocks would stay resident as free blocks in
 /// partly used pages for the rest of the process.
+#[derive(Debug)]
 pub struct CompileHeap {
     previous: *mut std::ffi::c_void,
 }

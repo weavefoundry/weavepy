@@ -102,7 +102,7 @@ pub fn insert(name: &str, code: &CodeObject) {
 // so warm process starts skip parse + compile entirely.
 //
 // Artifact layout: `<cache_dir>/weavepy/frozen-<CACHE_TAG>-n<VERSION>/<name>`
-// with a 20-byte header — magic `WPYN`, reserved flags word, source
+// with a 20-byte header — magic `WPYN`, payload length, source
 // length, and a 64-bit source hash — followed by the code in
 // `weavepy_compiler::native_code` form, which loads without the CPython
 // bytecode transcoding a `marshal` payload needs. The `CACHE_TAG` and
@@ -166,9 +166,7 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     use weavepy_compiler::native_code;
     let mut file = std::fs::File::open(disk_path(name)?).ok()?;
     let size = usize::try_from(file.metadata().ok()?.len()).ok()?;
-    // The header and the payload's first bytes, which say where its table
-    // section starts.
-    let mut head = [0u8; FROZEN_HEADER_LEN + 5];
+    let mut head = [0u8; FROZEN_HEADER_LEN];
     file.read_exact(&mut head).ok()?;
     if &head[0..4] != FROZEN_MAGIC {
         return None;
@@ -180,45 +178,207 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     if len as usize != source.len() || hash != crate::stdlib::frozen_source_hash(name, source) {
         return None;
     }
+    // The reserved word holds the payload's length: only a complete artifact
+    // of this format may be decoded lazily.
+    let payload_len = u32::from_le_bytes(head[4..8].try_into().ok()?) as usize;
+    if size.checked_sub(FROZEN_HEADER_LEN)? != payload_len {
+        return None;
+    }
     // Not mirrored into the in-memory cache: a later interpreter reads the
     // same artifact again, and a resident clone of every loaded module's
     // code would double its footprint in the (usual) single-interpreter
     // process.
-    let at = native_code::tables_at(&head[FROZEN_HEADER_LEN..])?;
-    let tables_start = FROZEN_HEADER_LEN.checked_add(at).filter(|&t| t <= size)?;
-    let mut payload = Vec::with_capacity(size - FROZEN_HEADER_LEN);
-    payload.extend_from_slice(&head[FROZEN_HEADER_LEN..]);
-    if size - tables_start < MAP_TABLES_FROM {
-        file.read_to_end(&mut payload).ok()?;
-        return native_code::decode(&payload, filename);
-    }
-    // A large table section is mapped rather than read: most of its
-    // tables (column spans, wire marks) are never read, and pages never
-    // touched take no memory.
-    (&mut file)
-        .take((at - payload.len()) as u64)
-        .read_to_end(&mut payload)
-        .ok()?;
+    //
+    // The file is mapped rather than read: most of what it holds (the bodies
+    // of functions that never run, column spans, wire marks) is never read,
+    // and pages never touched take no memory.
+    //
     // SAFETY: the cache's writers replace an artifact by renaming a new
     // file over it, never by changing it in place, so the mapped bytes
     // keep the contents just validated (a replaced or removed file keeps
     // them while mapped).
-    let tables = unsafe {
-        memmap2::MmapOptions::new()
-            .offset(tables_start as u64)
-            .len(size - tables_start)
-            .map(&file)
-    }
-    .ok()?;
-    native_code::decode_split(
-        &payload,
-        weavepy_compiler::TableBuffer::new(tables),
+    let map = unsafe { memmap2::MmapOptions::new().map(&file) }.ok()?;
+    native_code::decode_lazily(
+        weavepy_compiler::TableBuffer::new(Payload::new(map)),
         filename,
     )
 }
 
-/// The shortest table section [`get_disk`] maps rather than reads.
-const MAP_TABLES_FROM: usize = 8 * 1024;
+/// An artifact's mapping, read as the payload after its header.
+struct Payload {
+    map: memmap2::Mmap,
+    /// Tells this artifact's views apart (see [`view`]).
+    #[cfg(target_os = "macos")]
+    id: u64,
+}
+
+impl Payload {
+    fn new(map: memmap2::Mmap) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            Payload {
+                map,
+                id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Payload { map }
+    }
+}
+
+impl weavepy_compiler::CodeBytes for Payload {
+    fn bytes(&self) -> &[u8] {
+        &self.map[FROZEN_HEADER_LEN..]
+    }
+
+    /// Reading part of a mapped file leaves its pages in the resident set,
+    /// and over a run most of the file's pages hold something that gets read
+    /// (a page holds several functions, and a module's identifiers are all
+    /// in one place). What's read is copied out, so the pages can go.
+    fn read(&self, read: &mut dyn FnMut(&[u8])) {
+        #[cfg(target_os = "macos")]
+        if view::read(self, read) {
+            return;
+        }
+        read(weavepy_compiler::CodeBytes::bytes(self));
+        #[cfg(target_os = "linux")]
+        // SAFETY: a read-only file mapping: dropping its page table entries
+        // loses nothing, and the next read faults the pages back in.
+        unsafe {
+            libc::madvise(
+                self.map.as_ptr().cast_mut().cast(),
+                self.map.len(),
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Payload {
+    fn drop(&mut self) {
+        view::close(self.id);
+    }
+}
+
+/// `madvise` doesn't take a file's clean pages out of the resident set on
+/// macOS, so reads go through a second mapping of the same pages, and
+/// removing that does. Making one takes two system calls, and a run reads
+/// most bodies in bursts from one module (its class bodies as it's imported),
+/// so the last one stays open for the next read, up to [`MAX_READS`] of them.
+#[cfg(target_os = "macos")]
+mod view {
+    #![allow(deprecated)] // (`libc::mach_task_self`)
+
+    use super::{Payload, FROZEN_HEADER_LEN};
+    use std::sync::{Mutex, PoisonError};
+
+    /// The reads a view serves before its pages are let go.
+    const MAX_READS: u32 = 64;
+
+    struct Open {
+        id: u64,
+        address: u64,
+        size: u64,
+        reads: u32,
+    }
+
+    /// One at a time, since a read that decodes a body may not need another
+    /// (nested bodies stay encoded), and only under the GIL in practice.
+    static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+
+    extern "C" {
+        fn mach_vm_remap(
+            target_task: libc::mach_port_t,
+            target_address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: libc::c_int,
+            src_task: libc::mach_port_t,
+            src_address: u64,
+            copy: libc::c_int,
+            cur_protection: *mut libc::c_int,
+            max_protection: *mut libc::c_int,
+            inheritance: libc::c_uint,
+        ) -> libc::c_int;
+        fn mach_vm_deallocate(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+        ) -> libc::c_int;
+    }
+    const VM_FLAGS_ANYWHERE: libc::c_int = 1;
+    // (A forked child keeps the open view, as it does the rest of the state.)
+    const VM_INHERIT_COPY: libc::c_uint = 1;
+
+    fn remove(open: &Open) {
+        // SAFETY: the view is ours, and the lock is held by the caller, so no
+        // read is using it.
+        unsafe { mach_vm_deallocate(libc::mach_task_self(), open.address, open.size) };
+    }
+
+    /// Run `read` on a view of `payload`; `false` if it couldn't have one.
+    pub(super) fn read(payload: &Payload, read: &mut dyn FnMut(&[u8])) -> bool {
+        let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(current) = open.as_mut() {
+            if current.id == payload.id && current.reads < MAX_READS {
+                current.reads += 1;
+            } else {
+                remove(current);
+                *open = None;
+            }
+        }
+        if open.is_none() {
+            let (mut address, mut current, mut max) = (0u64, 0, 0);
+            let size = payload.map.len() as u64;
+            // SAFETY: the source range is a live mapping; the view is ours.
+            let mapped = unsafe {
+                mach_vm_remap(
+                    libc::mach_task_self(),
+                    &raw mut address,
+                    size,
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    libc::mach_task_self(),
+                    payload.map.as_ptr() as u64,
+                    0,
+                    &raw mut current,
+                    &raw mut max,
+                    VM_INHERIT_COPY,
+                )
+            } == 0;
+            if !mapped {
+                return false;
+            }
+            *open = Some(Open {
+                id: payload.id,
+                address,
+                size,
+                reads: 1,
+            });
+        }
+        let current = open.as_ref().expect("opened above");
+        // SAFETY: the view maps `size` readable bytes while the lock is held
+        // (only `remove`, under it, unmaps it). Nothing reads a nested code
+        // object's body during this read, so the lock isn't taken again.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(current.address as *const u8, current.size as usize)
+        };
+        read(&bytes[FROZEN_HEADER_LEN..]);
+        true
+    }
+
+    /// Remove the view of the artifact `id`, if it's the open one.
+    pub(super) fn close(id: u64) {
+        let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+        if open.as_ref().is_some_and(|current| current.id == id) {
+            if let Some(current) = open.take() {
+                remove(&current);
+            }
+        }
+    }
+}
 
 /// Persist a freshly-compiled frozen module to the disk cache.
 /// Best-effort: any I/O or marshal failure is silently ignored (a
@@ -236,7 +396,7 @@ pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
     };
     let mut bytes = Vec::with_capacity(FROZEN_HEADER_LEN + payload.len());
     bytes.extend_from_slice(FROZEN_MAGIC);
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&crate::stdlib::frozen_source_hash(name, source).to_le_bytes());
     bytes.extend_from_slice(&payload);

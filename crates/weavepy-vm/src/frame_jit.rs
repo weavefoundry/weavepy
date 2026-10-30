@@ -7181,7 +7181,7 @@ unsafe extern "C" fn h_binop_dunder(
             return CALL_DECLINED;
         }
         let (pc, slot) = (pc as usize, slot as usize);
-        let arg = (&(*code).instructions)[pc].arg;
+        let arg = (&(&*code).instructions)[pc].arg;
         let op: BinOpKind = std::mem::transmute(arg as u8);
         let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let at = st.stack.add(slot);

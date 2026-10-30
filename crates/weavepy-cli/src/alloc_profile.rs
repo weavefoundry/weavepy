@@ -17,6 +17,8 @@
 //! set's high-water mark, as seen from a watcher thread: one line per
 //! region, with its tag, resident and dirty pages and mapped file.
 
+#![allow(deprecated)] // (`libc::mach_task_self`)
+
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

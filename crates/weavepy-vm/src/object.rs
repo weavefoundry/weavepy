@@ -13288,15 +13288,57 @@ struct SipMemoEntry {
 
 const SIP_MEMO_SLOTS: usize = 512;
 
+/// A thread's SipHash memo, allocated when first used: every thread gets a
+/// copy of every thread-local's storage, whether it runs Python or not.
+struct SipMemo(std::cell::Cell<*mut SipMemoEntry>);
+
+impl SipMemo {
+    /// The memo's `SIP_MEMO_SLOTS` entries, or null when out of memory.
+    #[inline]
+    fn entries(&self) -> *mut SipMemoEntry {
+        let entries = self.0.get();
+        if entries.is_null() {
+            return self.allocate();
+        }
+        entries
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn allocate(&self) -> *mut SipMemoEntry {
+        // SAFETY: the layout has a non-zero size, and zeroed bytes are empty
+        // entries (`len` is `0`).
+        let entries = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<[SipMemoEntry; SIP_MEMO_SLOTS]>())
+        }
+        .cast::<SipMemoEntry>();
+        self.0.set(entries);
+        entries
+    }
+}
+
+impl Drop for SipMemo {
+    fn drop(&mut self) {
+        let entries = self.0.get();
+        if !entries.is_null() {
+            // SAFETY: allocated in `allocate` with this layout.
+            unsafe {
+                std::alloc::dealloc(
+                    entries.cast(),
+                    std::alloc::Layout::new::<[SipMemoEntry; SIP_MEMO_SLOTS]>(),
+                );
+            }
+        }
+    }
+}
+
 thread_local! {
     /// A direct-mapped memo of the SipHash of short byte strings, by
     /// content. With the seed pinned, a name hashed from a `&str` (a
     /// probe of a large dict by `StrKey`, a fresh string's first hash)
     /// costs a short compare instead of a SipHash run on a repeat; CPython
     /// gets the same effect from the hash cached in each interned name.
-    static SIP_MEMO: std::cell::UnsafeCell<[SipMemoEntry; SIP_MEMO_SLOTS]> = const {
-        std::cell::UnsafeCell::new([SipMemoEntry { len: 0, hash: 0, bytes: [0; SIP_MEMO_MAX] }; SIP_MEMO_SLOTS])
-    };
+    static SIP_MEMO: SipMemo = const { SipMemo(std::cell::Cell::new(std::ptr::null_mut())) };
 }
 
 /// `compute(bytes)`, remembered per thread for `bytes` of 1 to
@@ -13321,21 +13363,20 @@ fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
     let slot = ((fold ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize;
     // SAFETY (both accesses): this thread's memo, borrowed only for the
     // statement (nothing inside runs code that could reach it).
-    let hit = SIP_MEMO.try_with(|memo| {
-        let e = unsafe { &(*memo.get())[slot] };
-        (usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]))
-            .then_some(e.hash)
-    });
-    if let Ok(Some(h)) = hit {
-        return h;
+    let entries = SIP_MEMO
+        .try_with(SipMemo::entries)
+        .unwrap_or(std::ptr::null_mut());
+    if entries.is_null() {
+        return compute(bytes);
+    }
+    let e = unsafe { &mut *entries.add(slot) };
+    if usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]) {
+        return e.hash;
     }
     let h = compute(bytes);
-    let _ = SIP_MEMO.try_with(|memo| {
-        let e = unsafe { &mut (*memo.get())[slot] };
-        e.len = n as u8;
-        e.hash = h;
-        e.bytes[..n].copy_from_slice(bytes);
-    });
+    e.len = n as u8;
+    e.hash = h;
+    e.bytes[..n].copy_from_slice(bytes);
     h
 }
 
