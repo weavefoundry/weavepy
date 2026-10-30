@@ -563,6 +563,10 @@ impl Interpreter {
                         lazy_depth: 0,
                         lazy_last: std::ptr::null_mut(),
                         gen_lazy: false,
+                        no_direct: true,
+                        in_rec: false,
+                        at_start: false,
+                        clean: false,
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -906,6 +910,10 @@ impl Interpreter {
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            no_direct: true,
+            in_rec: false,
+            at_start: false,
+            clean: false,
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };

@@ -1023,10 +1023,6 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
-    /// Compiled callees the frame JIT is running from inside a compiled
-    /// caller's `CALL` (see `frame_jit::run_callee_directly`), bounding
-    /// the native stack those nested runs take.
-    pub(crate) direct_calls: std::cell::Cell<u32>,
     /// While a lean resume runs on behalf of a consumer that drains the
     /// generator (`sum()`, `list()`, see [`FoldSink`]): the generator's
     /// frame (its address) and the consumer's sink. The core loop folds
@@ -1059,6 +1055,9 @@ pub struct Interpreter {
     /// the spine or reads it; `0` when none runs lazily. (An address, as
     /// for `lean_pending`.)
     pub(crate) lazy_top: std::cell::Cell<usize>,
+    /// The records direct calls between compiled functions run on (see
+    /// `frame_jit::DirectRecs`).
+    pub(crate) recs: frame_jit::DirectRecs,
     /// Spare [`ChainRec`]s (empty), boxed: a parked chain's levels point
     /// at their record.
     #[allow(clippy::vec_box)]
@@ -1312,7 +1311,6 @@ impl Default for Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
@@ -1321,6 +1319,7 @@ impl Default for Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             lazy_top: std::cell::Cell::new(0),
+            recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -1447,7 +1446,6 @@ impl Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
@@ -1456,6 +1454,7 @@ impl Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             lazy_top: std::cell::Cell::new(0),
+            recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -7921,6 +7920,7 @@ impl Interpreter {
                 true,
                 snap_gen,
             );
+            self.sync_recs(&sw);
             let pc = frame.pc as usize;
             let mut st = frame_jit::State {
                 locals: frame.locals.as_mut_ptr(),
@@ -7944,6 +7944,10 @@ impl Interpreter {
                 lazy_depth: 0,
                 lazy_last: std::ptr::null_mut(),
                 gen_lazy: true,
+                no_direct: false,
+                in_rec: false,
+                at_start: false,
+                clean: false,
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -8097,6 +8101,7 @@ impl Interpreter {
                         let calls_ok = self.inline_calls_ok();
                         let mut sw =
                             CoreSwitch::enter(roots, frame, shell, last, calls_ok, snap_gen);
+                        self.sync_recs(&sw);
                         let stop = self.leaf_burst(&mut sw, snap_gen);
                         if sw.switched() {
                             return FrameEv::Switched(stop);
@@ -8653,28 +8658,6 @@ impl Interpreter {
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
-    }
-
-    /// [`Self::inline_park_direct`] for a slot that stays with its direct
-    /// call's site (`frame_jit::DirectSite`) instead of the pool: parked,
-    /// but still holding its code's count, so the site's next call of the
-    /// same code binds it without one.
-    #[inline(always)]
-    pub(crate) fn inline_park_warm(&mut self, mut act: Box<InlineAct>) -> Box<InlineAct> {
-        debug_assert!(
-            act.frame.stack.is_empty()
-                && !act.owns_cells
-                && act.binop.is_none()
-                && !act.discard
-                && act.guard.is_none()
-                && act.init_inst.is_none()
-                && act.lru.is_none()
-                && act.act.shell.is_none()
-        );
-        act.parked = true;
-        act.direct = false;
-        act.caller_pending = None;
-        act
     }
 
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
@@ -11009,6 +10992,16 @@ impl Interpreter {
         }
     }
 
+    /// Point the direct-call records at this thread (see
+    /// `frame_jit::DirectRecs::sync`), as a burst starts.
+    #[inline]
+    fn sync_recs(&mut self, sw: &CoreSwitch) {
+        let interp = std::ptr::from_ref(&*self);
+        let countdown = std::ptr::addr_of_mut!(self.gil_countdown);
+        self.recs
+            .sync(interp, countdown, sw.maybe_dead, sw.depth_cell);
+    }
+
     /// Register the lazily running direct callees (see
     /// `frame_jit::register_lazy`) before anything links onto the spine or
     /// reads it: they are older than whatever comes next, and a stack walk
@@ -12312,6 +12305,10 @@ impl Interpreter {
                             lazy_depth: 0,
                             lazy_last: std::ptr::null_mut(),
                             gen_lazy: false,
+                            no_direct: !sw.calls_ok,
+                            in_rec: false,
+                            at_start: false,
+                            clean: false,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -49244,7 +49241,7 @@ impl Interpreter {
         (!folding
             && pc < ext.dispatch_len
             && native.enters_at(pc)
-            && self.direct_calls.get() < frame_jit::DIRECT_CALL_DEPTH)
+            && !self.recs.full())
         // SAFETY: the frame, which the step holds while the body runs, holds
         // the code and with it its native code.
         .then(|| unsafe { &*std::ptr::from_ref(native) })
@@ -53845,7 +53842,10 @@ impl Interpreter {
                         // The slots keep the names of the code the function
                         // was made from.
                         f.slots();
-                        *f.code.borrow_mut() = c;
+                        // (A lazily running callee's frame borrows its
+                        // function's code until it registers.)
+                        self.settle_lazy();
+                        crate::frame_jit::retire_code(f.code.replace(c));
                         f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {
@@ -73025,7 +73025,8 @@ mod burst_stats {
     pub(crate) const CALL_LAZY_GEN: usize = 10;
     pub(crate) const CALL_LAZY_GEN_REG: usize = 11;
     pub(crate) const CALL_INLINE_GEN: usize = 12;
-    const CALL_NAMES: [&str; 13] = [
+    pub(crate) const CALL_DIRECT_REG: usize = 13;
+    const CALL_NAMES: [&str; 14] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -73039,8 +73040,9 @@ mod burst_stats {
         "lazy generator resume",
         "lazy generator resume registered",
         "switched generator resume",
+        "frame-JIT direct call registered",
     ];
-    static CALLS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+    static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
