@@ -1565,6 +1565,270 @@ def loops(n):
 print(loops(N))
 '''
 
+CASES["lifetimes_of_classes"] = r'''
+import gc
+import sys
+import weakref
+
+N = 600
+
+
+def hot(o, n):
+    t = 0
+    for i in range(n):
+        t += o.m(i) + (o + o)
+    return t
+
+
+def make():
+    class C:
+        def m(self, x):
+            return x + 1
+
+        def __add__(self, o):
+            return 2
+
+    return C
+
+
+C = make()
+print(hot(C(), N))
+wc = weakref.ref(C)
+del C
+gc.collect()
+print(wc() is None)
+C2 = make()
+print(hot(C2(), N))
+
+
+class Self:
+    def m(self, x):
+        Self.m = other
+        gc.collect()
+        return x + 1
+
+    def __add__(self, o):
+        return 0
+
+
+def other(self, x):
+    return x + 100
+
+
+print(hot(Self(), 3))
+
+
+class Late:
+    def m(self, x):
+        if x == N - 10:
+            replace_method()
+        return x
+
+    def __add__(self, o):
+        return 0
+
+
+def replace_method():
+    Late.m = other
+    gc.collect()
+    return 1
+
+
+print(hot(Late(), N))
+
+
+class Plain:
+    def m(self, x):
+        return x
+
+    def __add__(self, o):
+        return 0
+
+
+def set_on_class(o, k):
+    type(o).K = k
+    return k
+
+
+def set_many(n):
+    o = Plain()
+    for i in range(n):
+        set_on_class(o, i)
+    return Plain.K
+
+
+print(set_many(N))
+print(hot(Plain(), N))
+
+
+class Mutates:
+    def m(self, x):
+        self.__class__ = Other
+        return self.who()
+
+    def __add__(self, o):
+        return 0
+
+    def who(self):
+        return 1
+
+
+class Other(Mutates):
+    def who(self):
+        return 2
+
+    def m(self, x):
+        self.__class__ = Mutates
+        return self.who() * 10
+
+
+def flip(n):
+    o = Mutates()
+    t = 0
+    for i in range(n):
+        t += o.m(i)
+    return t
+
+
+print(flip(N))
+
+
+class Del:
+    def go(self):
+        del self.v
+        return hasattr(self, "v")
+
+
+def dels(n):
+    o = Del()
+    r = None
+    for i in range(n):
+        o.v = 1
+        r = o.go()
+    return r
+
+
+print(dels(N))
+'''
+
+CASES["properties"] = r'''
+import sys
+import traceback
+
+N = 600
+
+
+class P:
+    def __init__(self, x):
+        self._x = x
+
+    @property
+    def x(self):
+        return self._x
+
+    @property
+    def doubled(self):
+        return self.x * 2
+
+    @property
+    def raises(self):
+        return self.missing
+
+    @property
+    def frame(self):
+        f = sys._getframe()
+        return f.f_code.co_name, f.f_back.f_code.co_name
+
+    @property
+    def fallback(self):
+        raise AttributeError("from getter")
+
+    def __getattr__(self, name):
+        return "getattr:" + name
+
+
+class Q:
+    def __init__(self, x):
+        self._x = x
+
+    @property
+    def x(self):
+        if self._x < 0:
+            raise ValueError("negative")
+        return self._x
+
+    @x.setter
+    def x(self, v):
+        self._x = v
+
+
+def read(o, n):
+    t = 0
+    for i in range(n):
+        t += o.x
+    return t
+
+
+def doubled(o, n):
+    t = 0
+    for i in range(n):
+        t += o.doubled
+    return t
+
+
+def frame(o, n):
+    r = None
+    for i in range(n):
+        r = o.frame
+    return r
+
+
+def odd(o, n):
+    r = None
+    for i in range(n):
+        r = o.raises, o.fallback
+    return r
+
+
+print(read(P(1), N), doubled(P(2), N), frame(P(3), N), odd(P(4), N))
+q = Q(1)
+print(read(q, N))
+q.x = -1
+try:
+    read(q, N)
+except ValueError as e:
+    print([(f.name, f.lineno) for f in traceback.extract_tb(e.__traceback__)])
+q.x = 1
+Q.x = 5
+print(read(q, N))
+del Q.x
+q.x = 7
+print(read(q, N))
+
+
+class R:
+    @property
+    def x(self):
+        return 1
+
+
+class S:
+    x = 2
+
+
+def read2(o, n):
+    t = 0
+    for i in range(n):
+        t += o.x
+    return t
+
+
+print(read2(R(), N), read2(S(), N), read2(R(), N))
+r = R()
+r.__dict__["x"] = 50
+print(read2(r, N))
+'''
+
 ENVS = [
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1"},
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1", "WEAVEPY_TIER2": "0"},
@@ -1585,6 +1849,8 @@ EXPECTED = {
     'deep_exits': "3006\n([('c', 26), ('b', 18), ('a', 14), ('run', 41), ('<module>', 48)], ['f', 'names', 'q', 'r', 'self'])\ntb 57\nd 32\n1200\n'NoneType' object is not subscriptable\n(<class 'KeyError'>, None)\n",
     'operators': 'V(3) V(3) V(6) V(3.0)\nW.radd V(3) None\nZ.rsub\nunsupported operand type(s) for -: \'V\' and \'V\'\n(V(3), "unsupported operand type(s) for -: \'V\' and \'V\'")\n[(\'<module>\', 96), (\'div\', 69), (\'__truediv__\', 24)]\n(0.5, [(\'div_hot\', 108), (\'__truediv__\', 24)])\n(V(3), \'patched\', "unsupported operand type(s) for +: \'V\' and \'V\'")\n(\'__add__\', \'frames\', 3)\n600\n[2, 3, \'after\']\n(1800, \'KeyError(1)\', [\'slots\', \'__sub__\'])\n',
     'handlers_and_containers': '(2700, [-601, 1, (\'KeyError\', \'99\'), 3, (\'no 77\', [\'outer\', \'reraises\'])], 2)\n(600, [\'enter\', (\'exit\', None)], None, [\'enter\', (\'exit\', \'KeyError\')])\n(([590, 591], 10, [0, 2, 4], {\'k\': 599, \'x\': 1}, "cannot access local variable \'b\' where it is not associated with a value", (1, [2, 3]), (2, [1, 2])), [590, 591, 592], False, [], \'bc\', (1, []))\n("\'int\' object is not subscriptable", [\'run_bad\', \'bad_slice\'])\n((6, \'negative\', 3), 3, 1, 0)\n',
+    'lifetimes_of_classes': '181500\nTrue\n181500\n204\n180600\n599\n179700\n3600\nFalse\n',
+    'properties': "600 2400 ('frame', 'frame') ('getattr:missing', 'getattr:fallback')\n600\n[('<module>', 85), ('read', 55), ('x', 44)]\n3000\n4200\n600 1200 600\n600\n",
 }
 
 

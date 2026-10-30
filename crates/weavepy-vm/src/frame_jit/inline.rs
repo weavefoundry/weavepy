@@ -49,12 +49,13 @@
 
 use super::{
     block_starts, call_kernel_in_place, call_leaf_in_place, ctor_store_init, direct_call,
-    h_call_kw, h_call_site, h_for_iter, kernel_for, maybe_unbound_locals, never_ran_blocks, settle,
-    stats, type_of_call, type_slot_layout, BinOpKind, Block, BuiltinSite, Cell, CodeConstObjects,
-    CodeObject, DirectSite, FieldSlot, GlobalCache, InstBuilder, IntCC, Interpreter, Item, Lower,
-    Object, OpCode, PyIterator, Rc, State, Value, CALL_DECLINED, DICT_STAMP, EXIT_LAST_SHIFT,
-    EXIT_PC_SHIFT, FLAGS, GC_BDATA, GC_BSTAMP, GC_BUILTINS, GC_GDATA, GC_GLOBALS, GC_GSTAMP,
-    GC_VALUE, INTERP, I_MISSING, MARKED, RAISED, RELOAD, S_INTERP, S_SNAP, S_SW,
+    h_call_kw, h_call_site, h_for_iter, h_stack_store_attr, kernel_for, maybe_unbound_locals,
+    never_ran_blocks, settle, stats, type_of_call, type_slot_layout, BinOpKind, Block, BuiltinSite,
+    Cell, CodeConstObjects, CodeObject, DirectSite, FieldSlot, GlobalCache, InstBuilder, IntCC,
+    Interpreter, Item, Lower, Object, OpCode, PyIterator, Rc, State, Value, CALL_DECLINED,
+    DICT_STAMP, EXIT_LAST_SHIFT, EXIT_PC_SHIFT, FLAGS, GC_BDATA, GC_BSTAMP, GC_BUILTINS, GC_GDATA,
+    GC_GLOBALS, GC_GSTAMP, GC_VALUE, INTERP, I_MISSING, MARKED, RAISED, RELOAD, S_INTERP, S_SNAP,
+    S_SW,
 };
 use super::{fill_method_cache, MethodCache, MC_BEFORE, MC_KEYS, MC_VER};
 use cranelift_codegen::ir::types;
@@ -122,8 +123,12 @@ pub(crate) struct InlineSite {
     /// value lies, for the activation to take a reference.
     borrowed: Vec<(usize, Place)>,
     /// A function no stack slot holds (an operator's or a fused method
-    /// call's), and for an operator, its `BINARY_OP`'s argument.
-    method: Option<(Object, Option<u32>)>,
+    /// call's), and for an operator, its `BINARY_OP`'s argument. No count
+    /// taken, so the code keeps no class alive: while the receiver's class
+    /// stands at the version its guard read, the class holds the function,
+    /// and a body changes no class (see [`h_inline_store_attr`]) but through
+    /// a Python call, around which [`h_inline_call`] holds it.
+    method: Option<(std::mem::ManuallyDrop<Object>, Option<u32>)>,
 }
 
 /// What a fused method call's slow path remembers for its guards: for each
@@ -194,6 +199,9 @@ pub(super) struct Plan {
     /// method.
     func: Rc<crate::object::PyFunction>,
     dunder: Option<Dunder>,
+    /// A `LOAD_ATTR` site's `property` getter: the class version it was
+    /// resolved under, and where the property holds it.
+    getter: Option<(u64, i64)>,
     /// How many receiver classes the site recorded for it.
     classes: usize,
 }
@@ -204,6 +212,25 @@ struct Dunder {
     ver: u64,
     right: Option<u8>,
     arg: u32,
+}
+
+/// The `property` getter of the `LOAD_ATTR` at `pc`, to lower in line.
+fn getter_plan(
+    ext: &CodeConstObjects,
+    pc: usize,
+    path: &mut Vec<usize>,
+    budget: &mut usize,
+) -> Result<Plan, &'static str> {
+    let Some((f, ver, cell)) = crate::property_site_getter(ext, pc) else {
+        return Err("no getter known");
+    };
+    let callee = f.code();
+    let mut p = admit(&f, &callee, false, 1, None, path, budget)?;
+    if p.missing != 0 {
+        return Err("defaults");
+    }
+    p.getter = Some((ver, cell as i64));
+    Ok(p)
 }
 
 /// The method of the `BINARY_OP` at `pc`, to lower in line.
@@ -316,7 +343,6 @@ fn inline_op(op: OpCode) -> bool {
             | OpCode::BuildMap
             | OpCode::DeleteFast
             | OpCode::LoadFastAndClear
-            | OpCode::DeleteAttr
             | OpCode::LoadSpecial
             | OpCode::LoadSuperAttr
     )
@@ -455,6 +481,7 @@ pub(super) fn plan(
         .enumerate()
         .filter(|&(pc, i)| {
             (i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
+                || (i.op == OpCode::LoadAttr && depths[pc] >= 1 && crate::property_site(ext, pc))
                 || (matches!(i.op, OpCode::Call | OpCode::CallKw)
                     && call_start(code, ext, pc, depths[pc]) >= 0
                     && crate::await_send_after(code, pc).is_none())
@@ -475,6 +502,17 @@ pub(super) fn plan(
     let mut path = vec![std::ptr::from_ref(code) as usize];
     for (_, pc) in sites {
         let i = ins[pc];
+        if i.op == OpCode::LoadAttr {
+            match getter_plan(ext, pc, &mut path, &mut left) {
+                Ok(p) => {
+                    note(code, pc, "inlined", &p.code.qualname);
+                    plans.need = plans.need.max(depths[pc] as usize - 1 + p.need);
+                    plans.calls.push((pc, vec![p]));
+                }
+                Err(why) => note(code, pc, why, "getter"),
+            }
+            continue;
+        }
         if i.op == OpCode::BinaryOp {
             match dunder_plan(code, ext, pc, &mut path, &mut left) {
                 Ok(p) => {
@@ -704,7 +742,16 @@ fn admit(
                     *s = true;
                 }
             }
-            OpCode::LoadAttr if crate::property_site(ext, pc) => leaves = true,
+            OpCode::LoadAttr if crate::property_site(ext, pc) => {
+                match getter_plan(ext, pc, path, budget) {
+                    Ok(p) => {
+                        let start = nlocals + depths[pc] as usize - 1;
+                        inner_need = inner_need.max(start + p.need);
+                        inner.push((pc, vec![p]));
+                    }
+                    Err(_) => leaves = true,
+                }
+            }
             OpCode::BinaryOp if crate::instance_site(ext, pc) => {
                 match dunder_plan(code, ext, pc, path, budget) {
                     Ok(p) => {
@@ -814,6 +861,7 @@ fn admit(
         layout: FnLayout::of(f),
         func: f.clone(),
         dunder: None,
+        getter: None,
         classes: 1,
     })
 }
@@ -1138,7 +1186,9 @@ impl<'a> Lower<'a> {
         let next = self.code.instructions.get(pc + 1).map(|i| i.op);
         let fused = matches!(op, OpCode::LoadFast | OpCode::LoadFastBorrow)
             && matches!(next, Some(OpCode::StoreAttr | OpCode::LoadMethodAttr));
-        if !pure_op(op) || fused || (op == OpCode::BinaryOp && self.plan_at(pc).is_some()) {
+        let in_line =
+            matches!(op, OpCode::BinaryOp | OpCode::LoadAttr) && self.plan_at(pc).is_some();
+        if !pure_op(op) || fused || in_line {
             self.inline_settle_fields();
         }
         None
@@ -1469,7 +1519,8 @@ impl<'a> Lower<'a> {
         let code: &'a CodeObject = &plan.code;
         // (A fused method call's arguments start with its receiver.)
         let self_slot = usize::from(plan.has_self && method.is_none());
-        let first = match (plan.dunder.is_some() || method.is_some(), plan.has_self) {
+        let no_callable = plan.dunder.is_some() || plan.getter.is_some() || method.is_some();
+        let first = match (no_callable, plan.has_self) {
             (true, _) => start,
             (false, true) => start + 1,
             (false, false) => start + 2,
@@ -1481,7 +1532,12 @@ impl<'a> Lower<'a> {
             unsafe { std::ptr::from_ref(&plan.code).cast::<u64>().read() }
         };
         let mut site = Box::new(InlineSite {
-            key: Cell::new(plan.dunder.map_or(handle, |d| d.ver)),
+            key: Cell::new(
+                plan.dunder
+                    .map(|d| d.ver)
+                    .or(plan.getter.map(|g| g.0))
+                    .unwrap_or(handle),
+            ),
             entries: Cell::new(0),
             exits: Cell::new(0),
             parent: self
@@ -1495,27 +1551,35 @@ impl<'a> Lower<'a> {
             base,
             nlocals,
             borrowed: Vec::new(),
-            method: (plan.dunder.is_some() || method.is_some()).then(|| {
-                (
-                    Object::Function(plan.func.clone()),
-                    plan.dunder.map(|d| d.arg),
-                )
-            }),
+            method: no_callable
+                .then(|| (borrowed_function(&plan.func), plan.dunder.map(|d| d.arg))),
         });
         let site_at = std::ptr::from_ref::<InlineSite>(&site) as i64;
         let method_at = site
             .method
             .as_ref()
-            .map(|(f, _)| std::ptr::from_ref(f) as i64);
+            .map(|(f, _)| std::ptr::from_ref::<Object>(f) as i64);
 
         // The guards: nothing has happened yet when one fails.
         let ptr = self.ptr;
         let sv = self.b.ins().iconst(ptr, site_at);
         let (other, wrong) = match (plan.dunder, method) {
-            (Some(d), _) => {
-                let (other, wrong) = self.dunder_guards(d, args, sv, slow);
+            _ if plan.getter.is_some() => {
+                let (other, wrong) = self.getter_guards(plan, args[0], sv, slow);
+                let stale = self.b.ins().bor(other, wrong);
+                self.branch_out(stale, slow);
                 let swapped = self.code_swapped(plan, handle);
-                (other, self.b.ins().bor(wrong, swapped))
+                let no = self.b.ins().iconst(types::I8, 0);
+                (no, swapped)
+            }
+            (Some(d), _) => {
+                // (The function's fields only under the class's version.)
+                let (other, wrong) = self.dunder_guards(d, args, sv, slow);
+                let stale = self.b.ins().bor(other, wrong);
+                self.branch_out(stale, slow);
+                let swapped = self.code_swapped(plan, handle);
+                let no = self.b.ins().iconst(types::I8, 0);
+                (no, swapped)
             }
             (None, Some(caches)) => {
                 let (other, wrong) = self.method_guards(args[0], caches, sv, slow);
@@ -1776,15 +1840,90 @@ impl<'a> Lower<'a> {
     /// Whether a function a body's guards found by its class no longer runs
     /// the body's code (`__code__` was reassigned, which moves no version).
     fn code_swapped(&mut self, plan: &Plan, handle: u64) -> Value {
-        let obj = std::mem::ManuallyDrop::new(Object::Function(plan.func.clone()));
-        // SAFETY: an `Object` is 16 bytes, its second word the payload (the
-        // site keeps the function alive; this copy's count is released).
-        let word = unsafe { std::ptr::from_ref(&*obj).cast::<[u64; 2]>().read() }[1];
-        drop(std::mem::ManuallyDrop::into_inner(obj));
+        let obj = borrowed_function(&plan.func);
+        // SAFETY: an `Object` is 16 bytes, its second word the payload.
+        let word = unsafe { std::ptr::from_ref::<Object>(&obj).cast::<[u64; 2]>().read() }[1];
         let at = self.b.ins().iconst(self.ptr, word as i64);
         let current = self.b.ins().load(types::I64, FLAGS, at, plan.layout.code);
         let want = self.b.ins().iconst(types::I64, handle as i64);
         self.b.ins().icmp(IntCC::NotEqual, current, want)
+    }
+
+    /// The guards of a `property` getter: the receiver an instance of the
+    /// class at the site's version, whose property holds the getter still.
+    fn getter_guards(&mut self, plan: &Plan, recv: Item, sv: Value, slow: Block) -> (Value, Value) {
+        let l = *self.layout.expect("checked by the caller");
+        let ptr = self.ptr;
+        let at = self
+            .operand_addr(recv)
+            .expect("checked by the caller: a local or on the stack");
+        let tag = self.tag_at(at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, slow);
+        let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let ver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
+        let other = self.b.ins().icmp(IntCC::NotEqual, ver, key);
+        self.branch_out(other, slow);
+        // (The class holds the property under this version.)
+        let (_, cell) = plan.getter.expect("checked by the caller");
+        let obj = borrowed_function(&plan.func);
+        // SAFETY: an `Object` is 16 bytes, its second word the payload.
+        let word = unsafe { std::ptr::from_ref::<Object>(&obj).cast::<[u64; 2]>().read() }[1];
+        let at = self.b.ins().iconst(ptr, cell);
+        let current = self.b.ins().load(types::I64, FLAGS, at, 8);
+        let wrong = self.b.ins().icmp_imm(IntCC::NotEqual, current, word as i64);
+        let no = self.b.ins().iconst(types::I8, 0);
+        (no, wrong)
+    }
+
+    /// `LOAD_ATTR` at `pc` of the `property` getter `plans` lowers in line:
+    /// its guards and body, with the instruction's other shapes for anything
+    /// the guards don't take. The result on the stack where the receiver was.
+    pub(super) fn inline_getter(&mut self, pc: usize, arg: u32, plans: &'a [Plan]) -> bool {
+        let top = self.vs.last().copied();
+        if self.layout.is_none() || !matches!(top, None | Some(Item::Local(_) | Item::Mem(_))) {
+            if self.inlining() {
+                self.exit(INTERP, pc);
+                return false;
+            }
+            return self.load_attr_plain(pc, arg);
+        }
+        let before = self.b.func.dfg.num_insts();
+        let nested = self.inlining();
+        let recv = self.pop();
+        self.flush();
+        let start = self.depth;
+        let call_last = self.last_pc;
+        let join = self.b.create_block();
+        let slow = self.b.create_block();
+        self.inline_body(pc, &plans[0], &[recv], start, slow, join, None);
+        self.b.switch_to_block(slow);
+        self.b.set_cold_block(slow);
+        self.vs = vec![recv];
+        self.depth = start + 1;
+        self.last_pc = call_last;
+        if nested {
+            self.exit(INTERP, pc);
+        } else if self.load_attr_plain(pc, arg) {
+            self.flush();
+            self.b.ins().jump(join, &[]);
+        }
+        self.b.switch_to_block(join);
+        self.vs.clear();
+        self.depth = start + 1;
+        self.set_last(pc);
+        if !nested {
+            self.inline_ir += self.b.func.dfg.num_insts() - before;
+        }
+        true
     }
 
     /// The guards of a `BINARY_OP`'s method: the left operand an instance of
@@ -2158,6 +2297,15 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// `f`'s `Object`, as a copy of its bits that holds no count.
+fn borrowed_function(f: &Rc<crate::object::PyFunction>) -> std::mem::ManuallyDrop<Object> {
+    let held = Object::Function(f.clone());
+    // SAFETY: a bitwise copy, which is never dropped, of a live value.
+    let bits = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(&raw const held) });
+    drop(held);
+    bits
+}
+
 /// The rest of `Lower`'s inlined calls.
 impl Lower<'_> {
     /// `CALL` in an inlined body of what may be a compiled Python function:
@@ -2256,12 +2404,31 @@ unsafe extern "C" fn h_inline_call(
             }
             _ => return CALL_DECLINED,
         };
+        // A Python call can change the classes the bodies' functions came
+        // from: it holds them.
+        let mut at = (*call).site;
+        while !at.is_null() {
+            if let Some((held, _)) = &(*at).method {
+                std::mem::forget(Object::clone(held));
+            }
+            at = (*at).parent;
+        }
         dc.set(depth + (*call).levels);
         s.inl_call = call;
         // What the frame holds while the callee runs: the bodies' values
         // aren't its yet.
         (*s.frame).stack.set_len(root_site((*call).site).start);
         let r = direct_call::<false>(s, pc, start, len, &mut *site, None, None);
+        let mut at = (*call).site;
+        while !at.is_null() {
+            if let Some((held, _)) = &(*at).method {
+                match &**held {
+                    Object::Function(f) if crate::rc::try_release_shared(Rc::as_ptr(f)) => {}
+                    other => drop(std::ptr::read(other)),
+                }
+            }
+            at = (*at).parent;
+        }
         if s.inl_gone {
             return r.unwrap_or(RELOAD);
         }
@@ -2365,6 +2532,24 @@ pub(super) unsafe extern "C" fn h_inline_for_iter(
             }
         }
         3
+    }
+}
+
+/// `STORE_ATTR` (the `pc`th instruction of `code`) in an inlined body: as
+/// [`h_stack_store_attr`], of an instance only: a body's function must stay
+/// its class's (see [`InlineSite::method`]), and storing to a class leaves
+/// for the core loop.
+pub(super) unsafe extern "C" fn h_inline_store_attr(
+    code: *const CodeObject,
+    pc: u64,
+    at: *mut Object,
+) -> u32 {
+    // SAFETY: as `h_stack_store_attr`'s.
+    unsafe {
+        if !matches!(&*at.add(1), Object::Instance(_)) {
+            return 1;
+        }
+        h_stack_store_attr(code, pc, at)
     }
 }
 
@@ -2593,7 +2778,7 @@ unsafe fn bind_levels(
             let caller_frame = &mut *caller;
             caller_frame.pc = s.call_pc as u32 + 1;
             let callable: *const Object = match &s.method {
-                Some((f, _)) => f,
+                Some((f, _)) => &raw const **f,
                 None => base.add(s.start),
             };
             let Object::Function(f) = &*callable else {
@@ -2619,7 +2804,7 @@ unsafe fn bind_levels(
             std::ptr::write(
                 &raw mut act.callable,
                 match &s.method {
-                    Some((f, _)) => f.clone(),
+                    Some((f, _)) => Object::clone(f),
                     None => base.add(s.start).read(),
                 },
             );

@@ -15755,12 +15755,20 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
+    fn load_attr(&mut self, pc: usize, arg: u32) -> bool {
+        if let Some(plans) = self.plan_at(pc) {
+            return self.inline_getter(pc, arg, plans);
+        }
         if self.inlining() {
             if let Some(r) = self.inline_field(pc) {
                 return r;
             }
         }
+        self.load_attr_plain(pc, arg)
+    }
+
+    /// [`Self::load_attr`] without a body in line.
+    pub(crate) fn load_attr_plain(&mut self, pc: usize, _arg: u32) -> bool {
         // A property's getter may run here (see `h_property`), which needs
         // the whole stack on the frame's.
         if crate::property_site(self.ext, pc) {
@@ -16511,13 +16519,12 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let at = self.slot_addr(self.depth - 2);
-        let r = self
-            .call(
-                h_stack_store_attr as *const () as usize,
-                &[code, pcv, at],
-                true,
-            )
-            .expect("returns");
+        let helper = if self.inlining() {
+            inline::h_inline_store_attr as *const () as usize
+        } else {
+            h_stack_store_attr as *const () as usize
+        };
+        let r = self.call(helper, &[code, pcv, at], true).expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
         self.depth -= 2;

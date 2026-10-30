@@ -79544,6 +79544,27 @@ pub(crate) fn callee_warm(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         || ext.leaf_tries.load(Relaxed) & u64::from(u32::MAX) >= 24
 }
 
+/// The `property` getter the `LOAD_ATTR` at `pc` last ran: the function, the
+/// receiver's class version it was resolved under, and where the property
+/// holds its getter, if all of it is alive.
+#[cfg(feature = "jit")]
+pub(crate) fn property_site_getter(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::PyFunction>, u64, *const Object)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrows end here. The class holds the
+    // property while its version stands.
+    unsafe {
+        let (ver, MethodSlotFn::Getter { prop, .. }) = &*slot.0.get() else {
+            return None;
+        };
+        let (f, _) = slot.getter(*ver)?;
+        let cell = (*prop.as_ptr()).fget.as_ptr().cast_const();
+        Some((f, *ver, cell))
+    }
+}
+
 /// Whether the attribute or global site at `pc` has resolved anything
 /// beyond its inline cache.
 #[cfg(feature = "jit")]
