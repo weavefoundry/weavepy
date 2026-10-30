@@ -99,6 +99,34 @@ const MI_OPTION_ARENA_RESERVE: c_int = 23;
 /// large heap doesn't need many.)
 const ARENA_RESERVE_KIB: c_long = 64 * 1024;
 
+/// mimalloc 3's `mi_option_arena_max_object_size` (its position in
+/// `mi_option_t`).
+#[cfg(not(target_os = "linux"))]
+const MI_OPTION_ARENA_MAX_OBJECT_SIZE: c_int = 45;
+
+/// The largest page or object mimalloc places in its arenas, in KiB,
+/// unless the environment sets `MIMALLOC_ARENA_MAX_OBJECT_SIZE`: larger
+/// ones (the 4 MiB pages that hold blocks of 84 to 512 KiB, and objects
+/// over 2 MiB) are mapped from the OS and unmapped when freed.
+///
+/// An arena places a 4 MiB page only in a fully free, aligned 4 MiB range.
+/// Once small pages are scattered through the arena, freed ranges rarely
+/// qualify, so each new such page (a compile's register-allocator tables,
+/// a growing list's buffer) took never-touched space while the ranges
+/// freed before stayed resident: a program that rebuilds a large list of
+/// objects (`float_points`) peaked at 59 MB against a 30 MB heap. Mapped
+/// from the OS, a freed page leaves the resident set at once: peak RSS
+/// fell about 2.7% over the workload suite (`float_points` 20%, `go` 6%), though
+/// `async_tree`, which keeps many such pages partly used, rose 10%.
+///
+/// Not on Linux: there mimalloc's arenas are backed by transparent huge
+/// pages (`madvise` mode, the distributions' default), but memory mapped
+/// for one object isn't, so a large buffer faults in 4 KiB at a time: a
+/// program growing and dropping large deques took eight times the page
+/// faults and ran 6% to 25% slower (the bench gate's `deque_ops`).
+#[cfg(not(target_os = "linux"))]
+const ARENA_MAX_OBJECT_KIB: c_long = 2 * 1024;
+
 /// Configure the allocator before its first allocation (mimalloc reads an
 /// option when it first needs it; the first arena is reserved by the first
 /// allocation). Runs from the executable's initializer list, before
@@ -109,6 +137,10 @@ pub extern "C" fn configure() {
     unsafe {
         if libc::getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
             mi_option_set(MI_OPTION_ARENA_RESERVE, ARENA_RESERVE_KIB);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if libc::getenv(c"MIMALLOC_ARENA_MAX_OBJECT_SIZE".as_ptr()).is_null() {
+            mi_option_set(MI_OPTION_ARENA_MAX_OBJECT_SIZE, ARENA_MAX_OBJECT_KIB);
         }
     }
 }

@@ -209,8 +209,16 @@ proptest    = "1.5"
 # patch only flips on the already-compiled coders; the crate is otherwise byte-
 # for-byte lzma-sys 0.1.20 (heavy non-compiled trees like docs/po/tests/cli are
 # trimmed). The override applies transitively, so `xz2` picks it up too.
+#
+# It also vendors `regalloc2` 0.15.1, Cranelift's register allocator (see
+# `vendor/regalloc2`), with smaller capacity hints for its per-compile
+# tables. Upstream reserves four live ranges and three block-parameter
+# entries an instruction, about four times what the frame JIT's bodies use,
+# and that reserved memory set the process's peak during a compile. The
+# hints are the only change (each marked `WeavePy:` in `src/ion`).
 [patch.crates-io]
 lzma-sys = { path = "vendor/lzma-sys" }
+regalloc2 = { path = "vendor/regalloc2" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

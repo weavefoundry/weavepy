@@ -941,6 +941,11 @@ pub struct Interpreter {
     /// Finished generators' frame allocations, their frames retired, for
     /// the next generators' frames (see [`Self::gen_parts`]).
     gen_spares: ThreadCell<Vec<GenParts>>,
+    /// Parked frames for lazily run awaited bodies (see
+    /// [`Self::lazy_coro_bind`]), boxed as a coroutine's frame is: stale
+    /// borrowed handles but for the code, which the last body's keeps.
+    #[allow(clippy::vec_box)]
+    lazy_boxes: Vec<Box<LeanFrame>>,
     /// RFC 0068 (WS9) — recycled tuple allocations, CPython's tuple
     /// freelist analogue (one LIFO bucket per length 1..=16, like
     /// CPython's per-size freelists). A refcount-dead, untracked,
@@ -1262,6 +1267,7 @@ impl Default for Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1396,6 +1402,7 @@ impl Interpreter {
             inline_pool: Vec::new(),
             inl_spares: Vec::new(),
             gen_spares: ThreadCell::new(Vec::new()),
+            lazy_boxes: Vec::new(),
             tuple_pool: ThreadCell::new(std::array::from_fn(|_| Vec::new())),
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
@@ -1893,6 +1900,14 @@ impl Interpreter {
             let _ = self.import_path("warnings");
             drop(guard);
         }
+    }
+
+    /// Start the JIT's code generator warming up with start-up (the next
+    /// [`Interpreter::run_site`]), for a program likely to compile: a
+    /// script or module rather than `-c` code or the REPL.
+    pub fn warm_jit_at_startup() {
+        #[cfg(feature = "jit")]
+        crate::tier2::warm_codegen_at_startup();
     }
 
     /// Report that interpreter start-up is over: user code runs next
@@ -7353,12 +7368,11 @@ impl Interpreter {
             // as BINARY_OP above.
             let r = r_res?;
             let r = if to_bool && !matches!(r, Object::Bool(_)) {
-                let truthy = match &r {
-                    Object::Instance(_) | Object::MappingProxyObj(_) => {
-                        let g = frame.globals.clone();
-                        self.obj_truthy(&r, &g)?
-                    }
-                    _ => r.is_truthy(),
+                let truthy = if r.truth_dispatches() {
+                    let g = frame.globals.clone();
+                    self.obj_truthy(&r, &g)?
+                } else {
+                    r.is_truthy()
                 };
                 Object::Bool(truthy)
             } else {
@@ -7575,12 +7589,11 @@ impl Interpreter {
         // Object-backed mappingproxies delegate truthiness to the
         // wrapped mapping (CPython mp_length), so they take the
         // dispatching path alongside instances.
-        let truthy = match &v {
-            Object::Instance(_) | Object::MappingProxyObj(_) => {
-                let g = frame.globals.clone();
-                self.obj_truthy(&v, &g)?
-            }
-            _ => v.is_truthy(),
+        let truthy = if v.truth_dispatches() {
+            let g = frame.globals.clone();
+            self.obj_truthy(&v, &g)?
+        } else {
+            v.is_truthy()
         };
         // RFC 0077 (WS2): the POP_JUMP family audits its one
         // discarded operand (exempt from the coarse stack-shrink
@@ -8416,6 +8429,7 @@ impl Interpreter {
         act.caller_pending = None;
         act.init_inst = None;
         act.lru = None;
+        act.new_init = None;
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
@@ -8967,6 +8981,20 @@ impl Interpreter {
         result: Result<Object, RuntimeError>,
     ) -> QuietEntry {
         let mut done = done;
+        // A class's Python `__new__` returned (see `core_push_new`): its
+        // `__init__` runs here, nested (the core loop's return pushes it
+        // as an activation instead).
+        let result = match (done.new_init.take(), result) {
+            (Some(ni), Ok(made)) => {
+                let NewInit { ty, plan, mut ops } = *ni;
+                let r = self.init_constructed(&ty, &plan, made, &ops[1..], &[]);
+                for v in ops.drain(..) {
+                    self.release(v);
+                }
+                r
+            }
+            (_, result) => result,
+        };
         // A constructor's `__init__` result becomes the instance (the
         // `instantiate_plain_lean` epilogue).
         let result = match done.init_inst.take() {
@@ -8981,10 +9009,10 @@ impl Interpreter {
             },
         };
         let result = match (done.binop.take(), result) {
-            (Some((op, inplace, cls)), Ok(v))
+            (Some((op, inplace, l, r)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
-                Err(binop_type_error(op, inplace, &cls))
+                Err(binop_type_error(op, inplace, &l, &r))
             }
             (_, result) => result,
         };
@@ -9872,7 +9900,7 @@ impl Interpreter {
         snap_gen: u64,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
-        let shape = Self::lean_call_kw_shape(frame, pc)?;
+        let shape = Self::lean_call_kw_shape(frame, pc, false)?;
         // Committed.
         let code = shape.code.clone();
         let (callable, locals) = self.lean_call_kw_take(frame, shape);
@@ -9900,9 +9928,11 @@ impl Interpreter {
 
     /// The `CallPyKwNames` shape at the `CALL_KW` at `pc`, verified
     /// against the live callee (see `kw_names_bind_check`) and the lean
-    /// activation's own requirements.
+    /// activation's own requirements: with `fresh_cells`, a callee with
+    /// cell variables qualifies too (an inline activation makes its cells,
+    /// see [`Self::inline_bind`]).
     #[inline]
-    fn lean_call_kw_shape(frame: &Frame, pc: usize) -> Option<LeanKwShape> {
+    fn lean_call_kw_shape(frame: &Frame, pc: usize, fresh_cells: bool) -> Option<LeanKwShape> {
         use weavepy_compiler::InlineCache as IC;
         let IC::CallPyKwNames {
             func_id,
@@ -9938,7 +9968,13 @@ impl Interpreter {
         if !Self::lean_code_ok(&code) {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        if fresh_cells {
+            if !Self::call_cells_ok(f, &code) {
+                return None;
+            }
+        } else {
+            f.lean_cells_ref(&code)?;
+        }
         Some(LeanKwShape {
             code,
             perm,
@@ -10017,7 +10053,7 @@ impl Interpreter {
         shell: &mut QuietShell<'_>,
         pc: usize,
     ) -> Option<Box<InlineAct>> {
-        let Some(shape) = Self::lean_call_kw_shape(frame, pc) else {
+        let Some(shape) = Self::lean_call_kw_shape(frame, pc, true) else {
             return self.try_inline_call_kw_named(frame, shell, pc);
         };
         // Past the recursion limit the nested lean path raises.
@@ -10069,7 +10105,11 @@ impl Interpreter {
         {
             return None;
         }
-        f.lean_cells_ref(&code)?;
+        // (A callee with cell variables gets fresh cells, see
+        // `inline_bind`.)
+        if !Self::call_cells_ok(f, &code) {
+            return None;
+        }
         let first = if matches!(frame.stack[callee_slot + 1], Object::Unbound) {
             callee_slot + 2
         } else {
@@ -10463,6 +10503,36 @@ impl Interpreter {
         self.release(key);
         self.release(container);
         true
+    }
+
+    /// `type(container).__getitem__` for the `BINARY_SUBSCR` at `pc` of
+    /// `code`, when `container` is a plain instance (no native payload, of
+    /// a class neither natively served nor an extension's) and that is a
+    /// plain Python function: the function the site remembers for the
+    /// class's version (see [`Self::try_inline_getitem`]), else the
+    /// class's own.
+    pub(crate) fn getitem_dunder(
+        code: &CodeObject,
+        pc: usize,
+        container: &Object,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let Object::Instance(inst) = container else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if inst.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        if let Some(f) =
+            code_method_slot(code, pc as u32).and_then(|s| s.get_held(cls.attr_version.get()))
+        {
+            return Some(f);
+        }
+        Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::GETITEM),
+            "__getitem__",
+        )
     }
 
     fn try_inline_getitem(
@@ -11721,8 +11791,8 @@ impl Interpreter {
                 if let (Object::Instance(i), Some(ext)) = (other, ext) {
                     if let Some(site) = leaf_site_hit(ext, pc + 1, i.cls_raw().attr_version.get())
                         // SAFETY: the site's code is its live function's.
-                        .filter(|&(_, c, effect)| {
-                            CALLING_EFFECTS || !effect || !code_recurses(unsafe { &*c })
+                        .filter(|h| {
+                            CALLING_EFFECTS || !h.effect || !code_recurses(unsafe { &*h.code })
                         })
                     {
                         match self.core_leaf_site_call(
@@ -12547,16 +12617,26 @@ impl Interpreter {
                                 None => break None,
                             },
                             // A foreign object's truth is its extension's,
-                            // a proxy's its mapping's `__len__`.
+                            // a proxy's its mapping's `__len__`, a class's
+                            // with a metaclass the metaclass's.
                             Object::Foreign(_) | Object::MappingProxyObj(_) => break None,
+                            Object::Type(t) if !Self::plain_metaclass(t) => break None,
                             // Every other kind's is native (the full arm's
                             // `is_truthy`: a file, bytes, a set, a function).
                             _ => v.is_truthy(),
                         };
                         // SAFETY: the operand (droppable) is replaced in place.
-                        unsafe { drop(std::mem::replace(&mut *top, bool_hot(b))) };
+                        let old = unsafe { std::mem::replace(&mut *top, bool_hot(b)) };
                         last = pc;
                         pc += 1;
+                        // (The test may hold an instance's last reference:
+                        // its finalizer runs before the next instruction.)
+                        if matches!(old, Object::Instance(_)) {
+                            drop(old);
+                            after_release!();
+                        } else {
+                            drop(old);
+                        }
                     }
                     // `not x`, `-x` and `~x` of a scalar, replaced in place
                     // (nothing to release); any other shape is the full
@@ -14067,6 +14147,13 @@ impl Interpreter {
                             Object::BoundMethod(_) | Object::Builtin(_) => {
                                 Self::core_native_kw_call(ops, argc)
                             }
+                            // `dict(k=v, ...)`: the keywords' own names are
+                            // the keys (see `core_dict_kw`).
+                            Object::Type(ty)
+                                if argc == 0 && Rc::ptr_eq(ty, &builtin_types().dict_) =>
+                            {
+                                Self::core_dict_kw(ops)
+                            }
                             _ => self.core_pure_kw_call(code, pc, ops, argc, sw.depth_cell),
                         };
                         let Some(r) = r else {
@@ -14373,6 +14460,19 @@ impl Interpreter {
                             }
                             break Some(CoreExit::Reload);
                         }
+                        // A generator expression's `CALL 0`: its pending
+                        // generator takes the iterator, and is the result
+                        // (see `Self::make_genexp`).
+                        // SAFETY: `len >= argc + 2`: the call's operands.
+                        if argc == 0
+                            && matches!(unsafe { &*base.add(len - 2) }, Object::Generator(_))
+                            && unsafe { Self::finish_genexp_at(base.add(len - 2)) }
+                        {
+                            len -= 1;
+                            last = pc;
+                            pc += 1;
+                            continue;
+                        }
                         // A `functools.lru_cache` wrapper's call: a cache hit
                         // in place, a miss's function in the wrapper's place.
                         // SAFETY: `len >= argc + 2`: the call's operands.
@@ -14538,6 +14638,15 @@ impl Interpreter {
                             let (callee, self_slot) =
                                 unsafe { (&*base.add(len - argc - 2), &*base.add(len - argc - 1)) };
                             let body = match (callee, self_slot) {
+                                // A native method called unbound
+                                // (`object.__setattr__(self, n, v)`): its
+                                // receiver is the first argument.
+                                (Object::Builtin(b), Object::Unbound)
+                                    if b.binds_instance && argc > 0 =>
+                                {
+                                    // SAFETY: as above, with an argument.
+                                    Some((b, Some(unsafe { &*base.add(len - argc) })))
+                                }
                                 (Object::Builtin(b), Object::Unbound) => Some((b, None)),
                                 (Object::Builtin(b), recv) => Some((b, Some(recv))),
                                 (Object::BoundMethod(bm), Object::Unbound)
@@ -15160,7 +15269,7 @@ impl Interpreter {
                                             .and_then(|n| match n {
                                                 Object::Str(n) => class_cached_method_held(
                                                     cls,
-                                                    SharedStr::as_ptr(n).cast::<u8>() as usize,
+                                                    crate::types::AttrKey::name(n),
                                                     ver,
                                                 ),
                                                 _ => None,
@@ -15337,6 +15446,10 @@ impl Interpreter {
                                     unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                     last = pc;
                                     pc += 1;
+                                    // (A temporary receiver that died there,
+                                    // `D(i).x`, finalizes before the next
+                                    // instruction.)
+                                    after_release!();
                                     continue;
                                 }
                                 _ => offload!(OFFLOAD_HELPER),
@@ -15352,6 +15465,8 @@ impl Interpreter {
                                 unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                                 last = pc;
                                 pc += 1;
+                                // (As above.)
+                                after_release!();
                                 continue;
                             }
                         }
@@ -15365,6 +15480,8 @@ impl Interpreter {
                                 if unsafe { Self::core_laid_out_attr(code, ins.arg, pc, top) } {
                                     last = pc;
                                     pc += 1;
+                                    // (As above.)
+                                    after_release!();
                                     continue;
                                 }
                                 offload!(OFFLOAD_HELPER);
@@ -15394,6 +15511,8 @@ impl Interpreter {
                         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
                         last = pc;
                         pc += 1;
+                        // (As above.)
+                        after_release!();
                     }
                     // An instance-dict cache hit storing an atomic value over a
                     // droppable one (the helper's `leaf_store_attr` first case).
@@ -15677,6 +15796,33 @@ impl Interpreter {
                         pc += 1;
                         after_release!();
                     }
+                    // A re-raise this frame's own handler catches (an
+                    // `except` clause that didn't match, a handler's cleanup
+                    // tail): straight to that handler (see `core_reraise`).
+                    OpCode::Reraise => {
+                        // SAFETY: the `len` slots at `base` are the core
+                        // loop's initialized stack, with room to `cap`.
+                        match unsafe {
+                            Self::core_reraise(
+                                code,
+                                &mut frame.exc,
+                                frame.py_frame.is_none(),
+                                ins,
+                                pc,
+                                base,
+                                len,
+                                cap,
+                            )
+                        } {
+                            Some((n, to)) => {
+                                len = n;
+                                last = pc;
+                                pc = to;
+                            }
+                            None => break None,
+                        }
+                        after_release!();
+                    }
                     OpCode::PushExcInfo | OpCode::CheckExcMatch | OpCode::PopExcept => {
                         // SAFETY: the `len` slots at `base` are the core
                         // loop's initialized stack, with room to `cap`.
@@ -15884,8 +16030,14 @@ impl Interpreter {
                 _ => {}
             }
         }
+        let caller = sw.cur;
         if self.core_call_plain(sw, pc) {
             burst_stats::note_call(burst_stats::CALL_CORE);
+            if burst_stats::enabled() {
+                // SAFETY: see `CoreSwitch`: the callee is the running
+                // activation now, and its caller lives below it.
+                unsafe { burst_stats::note_core_call(&*caller, &*sw.cur) };
+            }
             return true;
         }
         let mut tmp = None;
@@ -16152,7 +16304,10 @@ impl Interpreter {
                 builtins::method_memo_tag(recv)?;
                 builtin_method_via_call(b.name).then_some(true)
             }
-            None => (!b.binds_instance && builtin_fn_lane_ok(b.name)).then_some(true),
+            // (One the dispatch doesn't know by name runs its body
+            // directly, as the dispatch ends up running it.)
+            None => (!b.binds_instance && builtin_fn_lane_ok(b.name))
+                .then(|| builtin_needs_interp(b.name)),
         }
     }
 
@@ -16176,6 +16331,16 @@ impl Interpreter {
         let b: *const crate::object::BuiltinFn =
             match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
                 (Object::Builtin(b), Object::Unbound) if !b.binds_instance => Rc::as_ptr(b),
+                // A method body called through its class: the first
+                // argument is the receiver.
+                (Object::Builtin(b), Object::Unbound)
+                    if frame
+                        .stack
+                        .get(callee_at + 2)
+                        .is_some_and(|recv| lane_recv_ok(b, recv, via_call)) =>
+                {
+                    Rc::as_ptr(b)
+                }
                 (Object::Builtin(b), recv) if lane_recv_ok(b, recv, via_call) => Rc::as_ptr(b),
                 (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                     match &bm.function {
@@ -16305,7 +16470,7 @@ impl Interpreter {
         {
             return false;
         }
-        if ins.op == OpCode::BinaryOp {
+        if matches!(ins.op, OpCode::BinaryOp | OpCode::CompareOp) {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
@@ -17044,9 +17209,21 @@ impl Interpreter {
         if !self.inline_calls_ok() {
             return false;
         }
+        // (Compiled code calls a site's `__getitem__` itself once the site
+        // has run one.)
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        let note = |frame: &Frame, pc: usize| {
+            if let Some(ext) = code_vm_ext(&frame.code) {
+                if !instance_site(ext, pc) {
+                    instance_site_note(ext, frame.code.instructions.len(), pc);
+                }
+            }
+        };
+        let pc = unsafe { (*sw.cur).pc as usize };
         // A pure leaf `__getitem__`: evaluated in place, no activation.
         // SAFETY: see `CoreSwitch`: the running activation is synced.
         if !descr && self.try_leaf_getitem(unsafe { &mut *sw.cur }) {
+            note(unsafe { &*sw.cur }, pc);
             return true;
         }
         let mut tmp = None;
@@ -17065,6 +17242,10 @@ impl Interpreter {
         let Some(mut act) = act else {
             return false;
         };
+        if !descr {
+            // SAFETY: the caller's activation, synced past the subscript.
+            note(unsafe { &*sw.cur }, pc);
+        }
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
         unsafe { push_fast(&mut *sw.inl, act) };
@@ -17498,6 +17679,24 @@ impl Interpreter {
         {
             return self.core_builtin_lane(sw, pc, true);
         }
+        // A leaf method's fast half on an instance of a built-in subclass
+        // (`_Quoter(dict).__getitem__`, mapped over bytes by
+        // `urllib.parse.quote`): it settles what it can natively and
+        // declines the rest (a missing key's `__missing__`).
+        if let (true, Some(Object::Instance(_))) = (b.binds_instance, recv) {
+            if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(b) {
+                return self.core_fast_leaf(sw, pc, callee_at, |_, views| f(views));
+            }
+        }
+        // `object.__new__(cls)` of a plain class (pathlib's `__new__`): the
+        // allocation, as the core loop's leaf builtin call makes it (it
+        // declines every other class, for the full call).
+        if recv.is_none() && !b.binds_instance && is_object_new(b) {
+            let b = b.clone();
+            return self.core_fast_leaf(sw, pc, callee_at, |interp, views| {
+                interp.leaf_builtin_call(LeafKind::ObjectNew, &b, views)
+            });
+        }
         let ok = match recv {
             None => !b.binds_instance,
             Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
@@ -17505,6 +17704,68 @@ impl Interpreter {
         // A method body safe to call directly runs as such.
         let via_call = recv.is_none() || !native_call_ic_safe(b.name);
         ok && self.core_builtin_lane(sw, pc, via_call)
+    }
+
+    /// The `CALL` at `pc` of `sw`'s synced running activation, its callee
+    /// at `callee_at` a leaf builtin (a function with an empty self slot, a
+    /// method body as `(method, receiver)`, or a bound method with an empty
+    /// self slot) whose fast half `f` runs no Python code: settled by `f`
+    /// on the receiver, if any, and the arguments, the operands then
+    /// leaving as the full handler's do. `false` touches nothing (`f`
+    /// declined, or an operand's release could run code).
+    #[inline(never)]
+    fn core_fast_leaf(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        callee_at: usize,
+        f: impl FnOnce(&Self, &[Object]) -> Option<Result<Object, RuntimeError>>,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let len = frame.stack.len();
+        let ops = &frame.stack[callee_at..];
+        let (recv, args) = match (&ops[0], &ops[1]) {
+            (Object::BoundMethod(bm), Object::Unbound) => (Some(&bm.receiver), &ops[2..]),
+            (Object::Builtin(_), Object::Unbound) => (None, &ops[2..]),
+            (Object::Builtin(_), recv) => (Some(recv), &ops[2..]),
+            _ => return false,
+        };
+        if args.len() > 7 || !Self::core_all_droppable(ops) {
+            return false;
+        }
+        // Bitwise views of the receiver and the arguments, never dropped:
+        // the fast half reads them (and clones what it keeps).
+        let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+        let mut n = 0;
+        for a in recv.into_iter().chain(args) {
+            // SAFETY: the operands on the stack keep them alive.
+            views[n].write(unsafe { std::ptr::read(a) });
+            n += 1;
+        }
+        // SAFETY: the first `n` entries were written.
+        let views = unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), n) };
+        let r = match f(self, views) {
+            None => return false,
+            Some(r) => r,
+        };
+        // SAFETY: every operand was checked to leave by a plain decrement.
+        unsafe {
+            frame.stack.set_len(callee_at);
+            let base = frame.stack.as_mut_ptr();
+            release_operands(self, base.add(callee_at), len - callee_at);
+        }
+        frame.pc = pc as u32 + 1;
+        match r {
+            Ok(v) => {
+                frame.stack.push(v);
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        true
     }
 
     /// [`Self::core_call`] for the `CALL_KW` at `pc`: the quiet loop's
@@ -17608,7 +17869,7 @@ impl Interpreter {
     /// to do, or done), `Some(false)` when the iteration raised (the
     /// operands consumed and the raise pending, as the full handler
     /// leaves them), `None` touched nothing.
-    fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
+    pub(crate) fn core_spread_tuple(&mut self, sw: &mut CoreSwitch, pc: usize) -> Option<bool> {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
@@ -17628,8 +17889,10 @@ impl Interpreter {
                 let globals = frame.globals.clone();
                 frame.pc = pc as u32 + 1;
                 let pending = self.core_pending_enter(sw, frame, pc);
-                let tuple_ty = Object::Type(builtin_types().tuple_.clone());
-                let r = self.call(&tuple_ty, std::slice::from_ref(&spread), &[], &globals);
+                // `tuple(gen)`'s drain, without the type call around it.
+                let r = self
+                    .collect_iterable(&spread, &globals)
+                    .map(Object::new_tuple);
                 self.lean_pending_exit(pending);
                 drop(spread);
                 // SAFETY: as in `core_type_lane` (the iteration ran nested
@@ -18629,6 +18892,11 @@ impl Interpreter {
                 return true;
             }
         }
+        // A class with a plain Python `__new__` (`pathlib`'s paths).
+        if let Some(Object::Function(new_f)) = &plan.user_new {
+            let new_f = new_f.clone();
+            return self.core_new_user(sw, pc, argc, &ty, &plan, &new_f);
+        }
         let Some((init, code)) = plan.lean_init.as_ref() else {
             // `E(*args)` for an exception class that keeps
             // `BaseException`'s allocator and `__init__`: the allocation,
@@ -18781,6 +19049,295 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// [`Self::core_new_n`] (the `argc` arguments below the top of the
+    /// running activation's stack, called by the instruction at `pc`) for
+    /// a class `ty` whose `__new__` is the plain Python function `new_f`
+    /// (CPython's `slot_tp_new`): `new_f(ty, *args)` runs through the
+    /// ordinary call with this activation published, then the instance's
+    /// `__init__` as `type_call` runs it, inline when it is a plain
+    /// function a lean activation can run on an instance of `ty` itself
+    /// (the caller then receives the instance, as from any constructor's
+    /// activation). `false` touches nothing.
+    #[inline(never)]
+    fn core_new_user(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        argc: usize,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        new_f: &Rc<crate::object::PyFunction>,
+    ) -> bool {
+        // (The shapes `instantiate` treats before or around `__new__`.)
+        if plan.abstract_error.is_some()
+            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || plan.seeds_exception_args
+            || ty.is_type_subclass()
+            || ty.native_kind.get() != 0
+            || ty.lazy_ctor.get() != 0
+            || ty.native_ext.get().is_some()
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        // `__new__` as an inline activation, its result going on to
+        // `__init__` when it returns (see `InlineAct::new_init`).
+        if self.core_push_new(sw, pc, argc, ty, plan, new_f) {
+            return true;
+        }
+        // SAFETY: as above (declined untouched).
+        let frame = unsafe { &mut *sw.cur };
+        // Committed: the class, its self slot and the arguments leave, the
+        // class and the arguments as `__new__`'s.
+        let mut ops: Vec<Object> = self.pooled_scratch();
+        ops.extend(frame.stack.drain(callee_slot..));
+        ops.remove(1);
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let made = self.call_python(new_f, &ops, &[]);
+        self.core_pending_exit(sw, pending);
+        let result = match made {
+            // An instance of the class itself, whose `__init__` runs.
+            Ok(inst @ Object::Instance(_))
+                if !plan.init_from_object
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(ty))) =>
+            {
+                self.core_push_init(sw, pc, plan, inst, &mut ops)
+                    .map_or(Ok(None), |r| r.map(Some))
+            }
+            Ok(inst) => self
+                .init_constructed(ty, plan, inst, &ops[1..], &[])
+                .map(Some),
+            Err(e) => Err(e),
+        };
+        for v in ops.drain(..) {
+            self.release(v);
+        }
+        self.recycle_scratch(ops);
+        match result {
+            // `__init__`'s activation runs next.
+            Ok(None) => {}
+            Ok(Some(v)) => {
+                // SAFETY: as in `core_type_lane` (the calls ran nested
+                // activations of their own, never this one).
+                unsafe { (*sw.cur).stack.push(v) };
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+            }
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// [`Self::core_new_user`]'s `new_f(ty, *args)` (the `argc` arguments
+    /// below the top of the running activation's stack, called by the
+    /// instruction at `pc`) as an inline activation made the running one,
+    /// which the call's operands leave for: when it returns, its result
+    /// goes on to the class's `__init__` (see [`Self::core_new_finish`]).
+    /// `false` touches nothing (a `__new__` the lean binder can't bind, or
+    /// one only the full call can run).
+    fn core_push_new(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        argc: usize,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        new_f: &Rc<crate::object::PyFunction>,
+    ) -> bool {
+        let code = new_f.code();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+            || (new_f.defaults_maybe_overridden()
+                && (new_f.slot("__defaults__").is_some() || new_f.slot("__kwdefaults__").is_some()))
+            || !Self::call_cells_ok(new_f, &code)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(argc + 2) else {
+            return false;
+        };
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        // (`ty`, then the arguments above the empty self slot.)
+        let bound = Self::lean_bind_keywords(
+            new_f,
+            &code,
+            std::slice::from_ref(&frame.stack[callee_slot]),
+            &frame.stack[callee_slot + 2..],
+            std::iter::empty(),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed: the class and the arguments move into the record
+        // `__init__` takes them from; the empty self slot owns nothing.
+        fill_unbound(locals, code.varnames.len());
+        let mut ops: Vec<Object> = Vec::with_capacity(argc + 1);
+        ops.extend(frame.stack.drain(callee_slot..));
+        ops.remove(1);
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`; the caller's frame is synced, past the
+        // call (its operands gone).
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(new_f.clone()),
+                guard,
+            )
+        };
+        act.new_init = Some(Box::new(NewInit {
+            ty: ty.clone(),
+            plan: plan.clone(),
+            ops,
+        }));
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// A class's Python `__new__`, run by [`Self::core_push_new`]'s
+    /// activation for the `CALL` at `pc` of `sw`'s running activation,
+    /// returned `made`: an instance of the class itself goes on to its
+    /// `__init__` (an inline activation made the running one: `None`),
+    /// anything else as `type_call` treats it (`Some` the result).
+    fn core_new_finish(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        ni: NewInit,
+        made: Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let NewInit { ty, plan, mut ops } = ni;
+        let result = match made {
+            inst @ Object::Instance(_)
+                if !plan.init_from_object
+                    && matches!(&inst, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(&ty))) =>
+            {
+                self.core_push_init(sw, pc, &plan, inst, &mut ops)
+            }
+            made => Some(self.init_constructed(&ty, &plan, made, &ops[1..], &[])),
+        };
+        for v in ops.drain(..) {
+            self.release(v);
+        }
+        result
+    }
+
+    /// [`Self::core_new_user`]'s `__init__` of `inst`, a fresh instance of
+    /// the class `plan` is the construction plan of, with the constructor
+    /// arguments `ops[1..]` (`ops[0]` the class): an inline activation of
+    /// a plain function a lean activation can run, made the running one
+    /// (`None`, the arguments moved into it), or anything else as
+    /// `type_call` runs it (`Some` the instance, or the error).
+    fn core_push_init(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        plan: &Rc<crate::types::InstancePlan>,
+        inst: Object,
+        ops: &mut Vec<Object>,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let argc = ops.len() - 1;
+        let lean = match &plan.init_fn {
+            Some(Object::Function(init)) => {
+                let code = init.code();
+                (!code.is_generator
+                    && !code.is_coroutine
+                    && !code.is_async_generator
+                    && code.cellvars.is_empty()
+                    && Self::lean_code_ok(&code)
+                    && init.lean_cells_ref(&code).is_some())
+                .then(|| Self::lean_init_missing(init, &code, argc + 1))
+                .flatten()
+                .map(|missing| (init.clone(), code, missing))
+            }
+            _ => None,
+        };
+        let guard = match lean {
+            Some(_) => match crate::recursion::enter_with(sw.depth_cell) {
+                crate::recursion::Enter::Ok(guard) => Some(guard),
+                crate::recursion::Enter::Overflow => None,
+            },
+            None => None,
+        };
+        let (Some((init, code, missing)), Some(guard)) = (lean, guard) else {
+            let cls = match &inst {
+                Object::Instance(i) => i.cls(),
+                _ => unreachable!("an instance of the class"),
+            };
+            return Some(self.init_constructed(&cls, plan, inst, &ops[1..], &[]));
+        };
+        let Some(cells) = init.lean_cells_ref(&code) else {
+            unreachable!("checked above");
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        let nlocals = code.varnames.len();
+        locals.reserve(nlocals.max(argc + 1 + missing));
+        Self::lean_init_extend(&init, &code, missing, inst.clone(), ops.drain(1..), locals);
+        fill_unbound(locals, nlocals);
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`; the caller's frame is synced, past the
+        // call (its operands gone).
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        None
     }
 
     /// [`Self::core_new`] for an `__init__` that is a pure or effect leaf
@@ -19204,6 +19761,90 @@ impl Interpreter {
         }
     }
 
+    /// `RERAISE` (`ins` at `pc`) of the exception atop the `len` stack
+    /// slots at `base` (room to `cap`) when a handler of this frame covers
+    /// it, as the `RERAISE` arm, `quiet_catch` and `handle_exception_with`
+    /// together run it: a re-raise records no traceback entry and settles
+    /// no chaining, so the stack unwinds to the handler's depth, its lasti
+    /// slot (the original raise site a cleanup tail carries) and the
+    /// exception go on, and the handler runs next. Returns the new stack
+    /// length and the handler's pc, or `None`, having touched nothing:
+    /// no covering handler, an observer that must see the unwind, or a
+    /// frame object whose line the full path keeps current.
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are the frame's initialized operand stack
+    /// entries.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn core_reraise(
+        code: &CodeObject,
+        exc_state: &mut Option<Box<FrameExc>>,
+        py_frame_free: bool,
+        ins: weavepy_compiler::Instruction,
+        pc: usize,
+        base: *mut Object,
+        len: usize,
+        cap: usize,
+    ) -> Option<(usize, usize)> {
+        if !py_frame_free || len == 0 || crate::trace::any_observers_active() {
+            return None;
+        }
+        // SAFETY: `len > 0`.
+        if !matches!(unsafe { &*base.add(len - 1) }, Object::Instance(_)) {
+            return None;
+        }
+        let handler = *find_handler(&code.exception_table, u32::try_from(pc).ok()?)?;
+        let depth = handler.depth as usize;
+        // (The exception and, for a cleanup handler, its lasti slot go on
+        // above the handler's depth.)
+        if depth + 2 > cap || depth > len - 1 {
+            return None;
+        }
+        // `RERAISE k>0`: the original raise offset sits `k` slots below
+        // the exception.
+        let k = ins.arg as usize;
+        let restored = if k != 0 {
+            if k > len - 1 {
+                return None;
+            }
+            // SAFETY: `len - 1 - k < len`.
+            match unsafe { &*base.add(len - 1 - k) } {
+                Object::Int(l) => Some(u32::try_from(*l).unwrap_or(0)),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+        // The offset an earlier cleanup handler recorded, or this one's
+        // (the RERAISE arm's `cleanup_lasti`, `handle_exception_with`'s
+        // `pending_lasti`).
+        let carried = exc_state.as_mut().and_then(|e| {
+            e.pending_lasti = None;
+            e.cleanup_lasti.take()
+        });
+        let lasti = restored.or(carried).unwrap_or(pc as u32);
+        // SAFETY: the exception leaves its slot; the slots above the
+        // handler's depth are released (a release may queue a finalizer:
+        // the caller checks).
+        let exc = unsafe { base.add(len - 1).read() };
+        let mut n = len - 1;
+        while n > depth {
+            n -= 1;
+            drop(unsafe { base.add(n).read() });
+        }
+        if handler.push_lasti {
+            exc_state.get_or_insert_with(Box::default).cleanup_lasti = Some(lasti);
+            // SAFETY: `depth + 2 <= cap`.
+            unsafe { base.add(n).write(Object::Int(i64::from(lasti))) };
+            n += 1;
+        }
+        // SAFETY: as above.
+        unsafe { base.add(n).write(exc) };
+        Some((n + 1, handler.handler as usize))
+    }
+
     /// An `except` clause's `PUSH_EXC_INFO`, `CHECK_EXC_MATCH` or
     /// `POP_EXCEPT` (`ins`) over the `len` stack slots at `base` (room to
     /// `cap`), as the full handlers run their common shapes: an
@@ -19303,6 +19944,10 @@ impl Interpreter {
             return None;
         }
         // SAFETY: `len > 0`.
+        if let Object::Type(cls) = unsafe { &*base.add(len - 1) } {
+            return unsafe { Self::core_class_delete(code, ins, cls, base, len) };
+        }
+        // SAFETY: `len > 0`.
         let Object::Instance(inst) = (unsafe { &*base.add(len - 1) }) else {
             return None;
         };
@@ -19347,6 +19992,54 @@ impl Interpreter {
         // Released at once, as CPython's decref is.
         self.release(removed);
         self.release(owner);
+        Some(len - 1)
+    }
+
+    /// `del C.name` (`DELETE_ATTR` `ins` of `code`) of the class `cls`
+    /// atop the `len` stack slots at `base`, as [`Self::del_type_attr_direct`]
+    /// runs its plain end: a non-dunder name in a heap class's own dict,
+    /// under a metaclass that keeps `type`'s attribute protocol (see
+    /// [`Self::meta_store_transparent`]), no type watcher. The value and the
+    /// class leave as the full arm releases them (a release may queue a
+    /// finalizer: the caller checks). Returns the new stack length, or
+    /// `None`, having touched nothing (a missing name raises on the full
+    /// path).
+    ///
+    /// # Safety
+    ///
+    /// The `len` slots at `base` are initialized operand stack entries,
+    /// `cls` the top one's class.
+    #[inline(never)]
+    unsafe fn core_class_delete(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        cls: &Rc<TypeObject>,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        let Some(Object::Str(key)) = code_name_obj(code, ins.arg) else {
+            return None;
+        };
+        if key.starts_with("__")
+            || crate::capi_watchers::types_active()
+            || crate::capi_watchers::dicts_active()
+            || cls.flags.is_builtin
+            || cls.immutable.get()
+            || cls.c_ext_ptr.get() != 0
+            || !Self::meta_store_transparent(cls, key)
+        {
+            return None;
+        }
+        let removed = cls
+            .dict
+            .try_borrow_mut()
+            .ok()?
+            .shift_remove(&crate::object::StrKey(key))?;
+        cls.bump_attr_version();
+        // SAFETY: the class leaves its slot.
+        let owner = unsafe { base.add(len - 1).read() };
+        drop(removed);
+        drop(owner);
         Some(len - 1)
     }
 
@@ -20130,6 +20823,40 @@ impl Interpreter {
                 l.push(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
             }
+            // `f(*args)`'s and `[*xs]`'s staging list: an exact tuple's or
+            // another list's items (any other iterable may run Python: the
+            // full handler's), the source released by a plain decrement.
+            OpCode::ListExtend => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let (Object::List(lst), src) =
+                    (unsafe { (&*base.add(len - 1 - depth), &*base.add(len - 1)) })
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(src) {
+                    return None;
+                }
+                match src {
+                    Object::Tuple(t) => {
+                        // SAFETY: a store between two instructions; growing
+                        // the list runs no code.
+                        unsafe { lst.peek_mut() }?.extend(t.iter().cloned());
+                    }
+                    Object::List(l) if !Rc::ptr_eq(l, lst) => {
+                        // SAFETY: as above; two distinct lists.
+                        let items = unsafe { l.peek() }?.clone();
+                        unsafe { lst.peek_mut() }?.extend(items);
+                    }
+                    _ => return None,
+                }
+                // SAFETY: the source leaves the stack (droppable).
+                drop(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
             _ => None,
         }
     }
@@ -20337,6 +21064,46 @@ impl Interpreter {
         true
     }
 
+    /// [`Self::core_value_method`]'s cached lane: the value at the
+    /// position the method load at `pc` (of the code whose extension is
+    /// `ext`) recorded for the receiver's class version (see
+    /// [`field_slot_note`]), which the instance holds and which shadows
+    /// any method of its class. `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_value_method`]'s.
+    #[inline(always)]
+    pub(crate) unsafe fn core_value_method_hit(
+        ext: &CodeConstObjects,
+        pc: usize,
+        top: *mut Object,
+    ) -> bool {
+        // SAFETY: the caller's contract.
+        let Object::Instance(inst) = (unsafe { &*top }) else {
+            return false;
+        };
+        if !Self::default_getattribute(inst.cls_raw()) {
+            return false;
+        }
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let Some(v) = (unsafe { field_slot_hit(ext, pc, inst) }) else {
+            return false;
+        };
+        // SAFETY: as above.
+        if !Self::core_droppable(unsafe { &*top }) {
+            return false;
+        }
+        let v = Self::clone_operand(v);
+        // SAFETY: the receiver (droppable) is replaced in place; the slot
+        // above is free.
+        unsafe {
+            drop_hot(std::mem::replace(&mut *top, v));
+            top.add(1).write(Object::Unbound);
+        }
+        true
+    }
+
     /// The call at `base[callee_at..len]` (the callee, its self slot,
     /// the arguments) of an exact builtin type whose native constructor
     /// builds without running Python code (see [`Self::leaf_type_call`]
@@ -20483,12 +21250,63 @@ impl Interpreter {
         if !Self::core_droppable(recv) {
             return false;
         }
-        let Some(v) = self.leaf_plain_attr_value(code, Some(recv), name_idx, Some(running)) else {
+        let Some(v) = self
+            .leaf_plain_attr_value(code, Some(recv), name_idx, Some(running))
+            .or_else(|| Self::value_dunder_new(code, recv, name_idx, running.1))
+        else {
             return false;
         };
         // SAFETY: the receiver (droppable) is replaced in place.
         unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
         true
+    }
+
+    /// `x.__new__` of a builtin type's value (`None.__new__`, which
+    /// `enum`'s `_find_new_` reads): the builtin function `type(x).__new__`
+    /// resolves to, which the `LOAD_ATTR` site at `pc` remembers under the
+    /// type's version. `None` for anything else.
+    #[inline(never)]
+    fn value_dunder_new(
+        code: &CodeObject,
+        recv: &Object,
+        name_idx: u32,
+        pc: u32,
+    ) -> Option<Object> {
+        if matches!(recv, Object::Instance(_) | Object::Type(_))
+            || crate::capi_watchers::types_active()
+            || code.names.get(name_idx as usize)?.as_str() != "__new__"
+        {
+            return None;
+        }
+        let cls = crate::builtins::class_of(recv);
+        if !cls.flags.is_builtin {
+            return None;
+        }
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(code, pc)?;
+        match slot.class_value(ver, 0) {
+            // (A remembered decline.)
+            Some(Object::Unbound) => return None,
+            Some(v) => return Some(Self::clone_operand(v)),
+            None => {}
+        }
+        // A builtin type's `__new__` is a static builtin function on a
+        // builtin class of its MRO, which `type`'s lookup returns as it is
+        // (`type` has no data descriptor of the name).
+        let v = match cls.lookup_with_owner("__new__") {
+            Some((v @ Object::Builtin(_), owner))
+                if owner.flags.is_builtin
+                    && matches!(&v, Object::Builtin(b) if !b.binds_instance) =>
+            {
+                v
+            }
+            _ => {
+                slot.set_class_value(ver, 0, &Object::Unbound);
+                return None;
+            }
+        };
+        slot.set_class_value(ver, 0, &v);
+        Some(v)
     }
 
     /// `cls.name` at `top` (a class) for a plain value on the class's
@@ -20701,9 +21519,9 @@ impl Interpreter {
     /// `C.name = v` with the class at `recv` and the value below it: a
     /// non-dunder name written to a heap class's own dict under `type`'s
     /// default `__setattr__` (the plain end of [`Self::set_type_attr_direct`];
-    /// a custom metaclass or a type watcher keeps the full path), the
-    /// class's version advanced, both operands leaving the stack. `false`
-    /// touches nothing.
+    /// a metaclass that intercepts the store, or a type watcher, keeps the
+    /// full path), the class's version advanced, both operands leaving the
+    /// stack. `false` touches nothing.
     ///
     /// # Safety
     ///
@@ -20720,14 +21538,13 @@ impl Interpreter {
             || cls.flags.is_builtin
             || cls.immutable.get()
             || cls.c_ext_ptr.get() != 0
-            || !Self::plain_metaclass(cls)
         {
             return false;
         }
         let Some(name @ Object::Str(n)) = code_name_obj(code, name_idx) else {
             return false;
         };
-        if n.starts_with("__") {
+        if n.starts_with("__") || !Self::meta_store_transparent(cls, n) {
             return false;
         }
         let old = {
@@ -20753,6 +21570,28 @@ impl Interpreter {
         unsafe { drop_hot(recv.read()) };
         drop(old);
         true
+    }
+
+    /// Whether `cls.name = v` (or `del cls.name`) under `cls`'s metaclass
+    /// is `type.__setattr__`'s plain dict store: the metaclass is `type`,
+    /// or a Python subclass of it that keeps `type`'s `__setattr__` and
+    /// `__delattr__` and has no attribute of that name (a data descriptor
+    /// there would intercept the store).
+    fn meta_store_transparent(cls: &TypeObject, name: &str) -> bool {
+        if Self::plain_metaclass(cls) {
+            return true;
+        }
+        // SAFETY: GIL-serialized raw read, as in `plain_metaclass`; the
+        // reference does not outlive the checks.
+        let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+            return true;
+        };
+        let native = |dunder: &str| matches!(meta.lookup_with_owner(dunder), Some((Object::Builtin(_), owner)) if owner.flags.is_builtin);
+        !meta.flags.is_builtin
+            && meta.c_ext_ptr.get() == 0
+            && native("__setattr__")
+            && native("__delattr__")
+            && meta.lookup(name).is_none()
     }
 
     /// Whether a release reports to nothing (no dict or function watcher,
@@ -21268,7 +22107,12 @@ impl Interpreter {
         leaf_kwonly_defaults(f, code_rc, args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
     }
 
     /// The core loop's fused `LOAD_FAST x; LOAD_ATTR m (method); <simple
@@ -21338,6 +22182,15 @@ impl Interpreter {
                 .filter(|h| std::ptr::eq(Rc::as_ptr(h), fp));
             if let (Some(ext), Some(held)) = (code_vm_ext(code), held) {
                 let func = Rc::downgrade(&held);
+                let i = name_idx as usize;
+                let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
+                    (Some(k), Some(Object::Str(n))) => {
+                        ext.name_hashes.get(i).map_or((0, 0), |&h| {
+                            (std::ptr::from_ref(k) as usize, k.names_before(n, h))
+                        })
+                    }
+                    _ => (0, 0),
+                };
                 leaf_site_set(
                     ext,
                     code,
@@ -21347,6 +22200,8 @@ impl Interpreter {
                         func,
                         code: Rc::as_ptr(callee),
                         effect: !code_is_pure_leaf(callee),
+                        keys,
+                        limit,
                     }),
                 );
             }
@@ -21364,7 +22219,7 @@ impl Interpreter {
         code: &CodeObject,
         inst: &PyInstance,
         recv: &Object,
-        (fp, callee, effect): (*const crate::object::PyFunction, *const CodeObject, bool),
+        site: LeafHit,
         attr_pc: usize,
         name_idx: u32,
         lbase: *const Object,
@@ -21372,20 +22227,6 @@ impl Interpreter {
         consts: &[Object],
         depth_cell: *const std::cell::Cell<usize>,
     ) -> SiteCall {
-        // SAFETY: the class holds the function at the site's version (and
-        // the weak handle is live); nothing here runs code.
-        let f = unsafe { &*fp };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        // The ordinary call's `RecursionError` check.
-        // SAFETY: this thread's own depth cell.
-        if !std::ptr::eq(Rc::as_ptr(code_rc), callee)
-            || !Self::default_getattribute(inst.cls_raw())
-            || inst_may_shadow(inst, code, name_idx)
-            || unsafe { (*depth_cell).get() } >= crate::recursion::recursion_limit()
-        {
-            return SiteCall::Declined;
-        }
         // Scalars only (small ints): nothing to drop on the way out.
         let mut scratch = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
         let mut args: [*const Object; 8] = [std::ptr::null(); 8];
@@ -21405,22 +22246,192 @@ impl Interpreter {
         }) else {
             return SiteCall::Declined;
         };
-        let total = nargs + 1;
-        if total != code_rc.arg_count as usize {
-            return SiteCall::Declined;
-        }
-        // SAFETY: as above.
-        let depth = unsafe { (*depth_cell).get() };
-        let r = self.pure_leaf_call(code_rc, f, &args[..total], effect, depth);
-        let Some(v) = r else {
-            if let Some(ext) = code_vm_ext(code) {
-                leaf_site_set(ext, code, attr_pc, None);
+        match self.leaf_site_eval(
+            code,
+            inst,
+            site,
+            attr_pc,
+            name_idx,
+            &args[..=nargs],
+            depth_cell,
+        ) {
+            Ok(v) => {
+                #[cfg(test)]
+                note_literal_argument_call(code, attr_pc + 1, call_pc, true);
+                SiteCall::Done(v, call_pc)
             }
-            return SiteCall::Missed;
+            Err(true) => SiteCall::Missed,
+            Err(false) => SiteCall::Declined,
+        }
+    }
+
+    /// What a frame-JIT method site keeps of the leaf callee its last call
+    /// of `x.m(...)` (at the method load `attr_pc` of `code`, whose
+    /// extension is `ext`) ran on `recv`, for [`Self::leaf_method_run`]:
+    /// the site's verified callee under the receiver's class version (see
+    /// [`LeafSite`]), when nothing but the receiver's own attributes, the
+    /// callee's code cell and the recursion depth can change from call to
+    /// call; [`LeafCallee::none`] when the method resolved is no such leaf,
+    /// and `None` while the site hasn't resolved it.
+    pub(crate) fn leaf_method_callee(
+        ext: &CodeConstObjects,
+        attr_pc: usize,
+        name_idx: u32,
+        recv: &Object,
+    ) -> Option<LeafCallee> {
+        let Object::Instance(inst) = recv else {
+            return None;
         };
-        #[cfg(test)]
-        note_literal_argument_call(code, attr_pc + 1, call_pc, true);
-        SiteCall::Done(v, call_pc)
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        // The plain function the site's method slot resolved under this
+        // class version (the class holds it).
+        let fp = ext.method_sites().get(attr_pc)?.peek_fn(ver)?;
+        // SAFETY: the class holds the function at this version.
+        let f = unsafe { &*fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let callee: &CodeObject = unsafe { &*f.code.as_ptr() };
+        let effect = !code_is_pure_leaf(callee);
+        // (A recursive effect leaf runs as an ordinary call from here.)
+        if (effect && (!code_is_effect_leaf(callee) || code_recurses(callee)))
+            || !Self::leaf_code_ok(callee)
+            || callee.kwonly_count != 0
+            || callee.has_varargs
+            || callee.has_varkeywords
+            || !Self::default_getattribute(cls)
+        {
+            return Some(LeafCallee::none(ver));
+        }
+        let i = name_idx as usize;
+        let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
+            (Some(k), Some(Object::Str(n))) => ext.name_hashes.get(i).map_or((0, 0), |&h| {
+                (std::ptr::from_ref(k) as usize, k.names_before(n, h))
+            }),
+            _ => (0, 0),
+        };
+        Some(LeafCallee {
+            ver,
+            fp,
+            code: std::ptr::from_ref(callee),
+            cext: std::ptr::from_ref(code_vm_ext(callee)?),
+            keys,
+            limit,
+            effect,
+        })
+    }
+
+    /// `x.m(...)` with the leaf callee `c` a frame-JIT site cached (see
+    /// [`Self::leaf_method_callee`]) for `args[0]`'s class version: the
+    /// callee's tiny shape or compiled plan run directly. `None` (nothing
+    /// observable done) runs the call the general way.
+    ///
+    /// # Safety
+    ///
+    /// `args` are live; `args[0]` is an instance of the class `c` was
+    /// cached for, at that class version (so the class holds `c`'s
+    /// function, and the function its extension's code unless rebound).
+    #[inline(always)]
+    pub(crate) unsafe fn leaf_method_run(
+        &self,
+        c: &LeafCallee,
+        inst: &PyInstance,
+        args: &[*const Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        // SAFETY: the caller's contract.
+        let (f, cext) = unsafe { (&*c.fp, &*c.cext) };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        // (A leaf verdict withdrawn since, see `JitHint::note_leaf_miss`,
+        // sends the calls the ordinary way again.)
+        if !std::ptr::eq(Rc::as_ptr(code_rc), c.code)
+            || args.len() != code_rc.arg_count as usize
+            || depth >= crate::recursion::recursion_limit()
+            || inst.dict.published().is_some()
+            || !(code_is_pure_leaf(code_rc) || code_rc.jit_hint.effect_leaf())
+        {
+            return None;
+        }
+        // The receiver's own attributes can't shadow the method.
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        let (keys, n) = unsafe { inst.dict.split_cell().peek() }?.keys_and_len();
+        if n != 0 && (keys != c.keys || keys == 0 || n > c.limit) {
+            return None;
+        }
+        let shape = cext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
+        if shape >= 3 {
+            if !Self::leaf_call_entry(code_rc) {
+                return None;
+            }
+            let r = if c.effect {
+                Self::leaf_tiny::<true>(code_rc, cext, shape, args)
+            } else {
+                Self::leaf_tiny::<false>(code_rc, cext, shape, args)
+            };
+            // (A miss is the general path's to count: it runs next.)
+            let r = r.flatten()?;
+            Self::leaf_call_exit(code_rc, true);
+            return Some(r);
+        }
+        // The plan's native code, or (not compiled yet) the shared frameless
+        // path, which compiles it once it is warm.
+        #[cfg(feature = "jit")]
+        {
+            let r = if c.effect {
+                self.leaf_site_native::<true>(code_rc, cext, f, args, depth)
+            } else {
+                self.leaf_site_native::<false>(code_rc, cext, f, args, depth)
+            };
+            if let Some(r) = r {
+                return r;
+            }
+        }
+        self.pure_leaf_call(code_rc, f, args, c.effect, depth)
+    }
+
+    /// [`Self::core_leaf_site_call`]'s evaluation, with `args` (the
+    /// receiver first) gathered: the result, or `Err` with whether the
+    /// evaluation itself declined (the site then forgotten) rather than a
+    /// check before it.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn leaf_site_eval(
+        &self,
+        code: &CodeObject,
+        inst: &PyInstance,
+        site: LeafHit,
+        attr_pc: usize,
+        name_idx: u32,
+        args: &[*const Object],
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Result<Object, bool> {
+        // SAFETY: the class holds the function at the site's version (and
+        // the weak handle is live); nothing here runs code.
+        let f = unsafe { &*site.fp };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        // The ordinary call's `RecursionError` check.
+        // SAFETY: this thread's own depth cell.
+        let depth = unsafe { (*depth_cell).get() };
+        if !std::ptr::eq(Rc::as_ptr(code_rc), site.code)
+            || args.len() != code_rc.arg_count as usize
+            || depth >= crate::recursion::recursion_limit()
+            || !Self::default_getattribute(inst.cls_raw())
+            || inst_may_shadow_bounded(inst, code, name_idx, site.keys, site.limit)
+        {
+            return Err(false);
+        }
+        match self.pure_leaf_call(code_rc, f, args, site.effect, depth) {
+            Some(v) => Ok(v),
+            None => {
+                if let Some(ext) = code_vm_ext(code) {
+                    leaf_site_set(ext, code, attr_pc, None);
+                }
+                Err(true)
+            }
+        }
     }
 
     /// The core loop's fused `LOAD_GLOBAL f; PUSH_NULL; <simple argument
@@ -21581,7 +22592,12 @@ impl Interpreter {
         leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
         // SAFETY: this thread's own depth cell.
         let depth = unsafe { (*depth_cell).get() };
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
     }
 
     /// [`Self::core_pure_call`] for a `CALL` site of the frame JIT that
@@ -21590,6 +22606,7 @@ impl Interpreter {
     /// parameters, the last `missing` positional ones and every
     /// keyword-only one from the defaults), so only the checks that can
     /// change from call to call remain.
+    #[inline(always)]
     pub(crate) fn site_leaf_eval(
         &self,
         ops: &[Object],
@@ -21605,7 +22622,10 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let pure = code_is_pure_leaf(code_rc);
         let effect = !pure && code_is_effect_leaf(code_rc);
-        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+        // (Unlike the core loop's, no warm-up gate: the evaluation's own
+        // bookkeeping sends the call that makes the callee due to the
+        // framed path, see `Self::leaf_call_entry`.)
+        if !(pure || effect) {
             return None;
         }
         if missing > 0
@@ -21641,7 +22661,49 @@ impl Interpreter {
             leaf_kwonly_defaults(f, code_rc, &mut args, 0)?;
         }
         let arity = nargs + missing + code_rc.kwonly_count as usize;
-        self.pure_leaf_call(code_rc, f, &args[..arity], effect, depth)
+        let args = &args[..arity];
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.leaf_native_lane(code_rc, f, args, effect, depth) {
+            return r;
+        }
+        self.pure_leaf_call(code_rc, f, args, effect, depth)
+    }
+
+    /// [`Self::pure_leaf_call`]'s lane for a warm general leaf whose plan
+    /// has native code, entered from here: `None` when the lane doesn't
+    /// apply (the caller takes the shared path), otherwise the
+    /// evaluation's result (`None` within: declined, and counted as
+    /// `pure_leaf_call` counts it).
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    fn leaf_native_lane(
+        &self,
+        code: &CodeObject,
+        f: &crate::object::PyFunction,
+        args: &[*const Object],
+        effect: bool,
+        depth: usize,
+    ) -> Option<Option<Object>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ext = code_vm_ext_existing(code)?;
+        if ext.pure_leaf.load(Relaxed) >= 3 {
+            return None;
+        }
+        let tries = ext.leaf_tries.load(Relaxed);
+        let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
+        if bails >= LEAF_BAIL_LIMIT && bails > done {
+            return Some(None);
+        }
+        let r = if effect {
+            self.leaf_site_native::<true>(code, ext, f, args, depth)
+        } else {
+            self.leaf_site_native::<false>(code, ext, f, args, depth)
+        }?;
+        let bump = if r.is_some() { 1 } else { 1 << 32 };
+        if bails < u64::from(u32::MAX) && done < u64::from(u32::MAX) {
+            ext.leaf_tries.store(tries + bump, Relaxed);
+        }
+        Some(r)
     }
 
     /// [`Self::core_pure_call`] for a `CALL_KW` at `pc`: `ops` is the
@@ -21834,6 +22896,16 @@ impl Interpreter {
         if let Some(d) = &varkw {
             args[total] = d;
         }
+        // A warm plan's native code straight away (no `**kwargs` dictionary
+        // to recycle after it).
+        #[cfg(feature = "jit")]
+        if varkw.is_none() {
+            // SAFETY: this thread's own depth cell.
+            let depth = unsafe { (*depth_cell).get() };
+            if let Some(r) = self.leaf_native_lane(code_rc, f, &args[..arity], false, depth) {
+                return r;
+            }
+        }
         let result = self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity]);
         if let Some(Object::Dict(d)) = varkw {
             recycle_kw_dict(d);
@@ -21978,10 +23050,29 @@ impl Interpreter {
         if bails >= LEAF_BAIL_LIMIT && bails > done {
             return None;
         }
+        let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         let r = 'eval: {
+            // A tiny shape answers here (see `Self::leaf_tiny`).
+            if shape >= 3 && args.len() == leaf_arity(code) {
+                if !Self::leaf_call_entry(code) {
+                    break 'eval None;
+                }
+                let tiny = if effect {
+                    Self::leaf_tiny::<true>(code, ext, shape, args)
+                } else {
+                    Self::leaf_tiny::<false>(code, ext, shape, args)
+                };
+                let r = match tiny {
+                    Some(r) => r,
+                    None if effect => self.leaf_eval::<false, true>(code, f, args, 0),
+                    None => self.leaf_eval::<false, false>(code, f, args, 0),
+                };
+                Self::leaf_call_exit(code, r.is_some());
+                break 'eval r;
+            }
             // (The tiny shapes `leaf_eval` answers itself skip the probe.)
             #[cfg(feature = "jit")]
-            if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+            if shape < 3 {
                 let fast = if effect {
                     self.leaf_site_native::<true>(code, ext, f, args, depth)
                 } else {
@@ -22053,10 +23144,16 @@ impl Interpreter {
                     && !hint.is_not_jitable()
                     && !crate::tier2::jit_off_for_process()
                 {
-                    if crate::tier2::note_frameless_calls(code, n + 1) {
-                        return false;
+                    match crate::tier2::note_frameless_calls(code, n + 1) {
+                        Some(true) => return false,
+                        Some(false) => hint.defer_lean_compile(),
+                        // Settled: the count passes the warm point and
+                        // stops (the frameless paths then take their
+                        // warm lanes, see `pure_leaf_warm`).
+                        None => {
+                            hint.warm_next_lean(crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP + 2)
+                        }
                     }
-                    hint.defer_lean_compile();
                 } else {
                     hint.bump_lean_entries();
                 }
@@ -22100,6 +23197,132 @@ impl Interpreter {
         self.leaf_run_ret::<false, false, false>(code, ext, plan, f, args, nest)
     }
 
+    /// [`Self::leaf_eval`] of a callee certified as one of the tiny
+    /// shapes (`shape`, its extension's `pure_leaf`, at least 3): the
+    /// result, or `Some(None)` declined having done nothing observable;
+    /// `None` sends the call on to the general body.
+    #[inline(always)]
+    fn leaf_tiny<const EFFECT: bool>(
+        code: &CodeObject,
+        ext: &CodeConstObjects,
+        shape: u8,
+        args: &[*const Object],
+    ) -> Option<Option<Object>> {
+        use leaf_plan::{compare, norm, V};
+        let consts: &[Object] = &ext.objects;
+        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
+        let start = usize::from(instrs.first()?.op == OpCode::Resume);
+        let load = instrs.get(start)?;
+        match shape {
+            16 if EFFECT => {
+                // The setter: store, and return `None`. A declined
+                // store touched nothing (the ordinary call runs it).
+                // SAFETY (argument reads): the arguments stay live for
+                // this evaluation.
+                let arg = |k: u32| args.get(k as usize).map(|&p| unsafe { &*p });
+                let (value, recv, store_pc) = match load.op {
+                    OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => (
+                        clone_hot(arg(load.arg >> 4)?),
+                        arg(load.arg & 15)?,
+                        start + 1,
+                    ),
+                    op => {
+                        let value = match op {
+                            OpCode::LoadConst => clone_hot(consts.get(load.arg as usize)?),
+                            OpCode::LoadSmallInt => Object::Int(i64::from(load.arg)),
+                            _ => clone_hot(arg(load.arg)?),
+                        };
+                        (value, arg(instrs.get(start + 1)?.arg)?, start + 2)
+                    }
+                };
+                let Object::Instance(inst) = recv else {
+                    return Some(None);
+                };
+                let store = instrs.get(store_pc)?;
+                let value = std::mem::ManuallyDrop::new(value);
+                // On `true` the value moved into the dict.
+                if Self::leaf_attr_store(code, inst, store_pc, store.arg, &value) {
+                    return Some(Some(Object::None));
+                }
+                drop(std::mem::ManuallyDrop::into_inner(value));
+                return Some(None);
+            }
+            3 => {
+                // SAFETY: the argument remains live for this evaluation.
+                return Some(Some(clone_hot(unsafe { &**args.get(load.arg as usize)? })));
+            }
+            4 => return Some(Some(clone_hot(consts.get(load.arg as usize)?))),
+            5 => return Some(Some(Object::Int(i64::from(load.arg)))),
+            6 => {
+                // SAFETY: as for the argument-return case above.
+                let recv = unsafe { &**args.get(load.arg as usize)? };
+                if let Object::Instance(inst) = recv {
+                    let pc = start + 1;
+                    let attr = instrs.get(pc)?;
+                    // SAFETY: the argument roots the receiver until the
+                    // result is retained; nothing here invokes Python.
+                    if let Some(value) = unsafe {
+                        Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
+                    } {
+                        return Some(Some(clone_hot(value)));
+                    }
+                    return Some(Self::leaf_attr_resolve_site(
+                        code, inst, recv, pc as u32, attr.arg,
+                    ));
+                }
+            }
+            7 => {
+                #[cfg(test)]
+                note_predicate_stage(code, 5);
+                // Cached field comparisons need neither the general
+                // leaf stack nor its owned-result scratch.
+                let cached_field = |load_pc: usize| -> Option<V> {
+                    let pc = load_pc + 1;
+                    let load = instrs.get(load_pc)?;
+                    // SAFETY: arguments root both field values for this
+                    // callback-free evaluation, with no owner releases.
+                    let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
+                    else {
+                        return None;
+                    };
+                    let attr = instrs.get(pc)?;
+                    // SAFETY: the same rooted, callback-free read.
+                    let value = unsafe {
+                        Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
+                    }?;
+                    #[cfg(test)]
+                    note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
+                    Some(norm(std::ptr::from_ref(value)))
+                };
+                let compare_fields = || {
+                    let a = cached_field(start)?;
+                    let b = cached_field(start + 2)?;
+                    let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
+                        x if x == CompareKind::Lt as u32 => CompareKind::Lt,
+                        x if x == CompareKind::LtE as u32 => CompareKind::LtE,
+                        x if x == CompareKind::Eq as u32 => CompareKind::Eq,
+                        x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
+                        x if x == CompareKind::Gt as u32 => CompareKind::Gt,
+                        x if x == CompareKind::GtE as u32 => CompareKind::GtE,
+                        _ => return None,
+                    };
+                    compare(a, b, kind).map(Object::Bool)
+                };
+                if let Some(result) = compare_fields() {
+                    #[cfg(test)]
+                    note_predicate_stage(code, 8);
+                    #[cfg(test)]
+                    PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
+                    return Some(Some(result));
+                }
+                // Preserve the existing general leaf evaluator on a
+                // shape miss, including its slot and polymorphic reads.
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// [`Self::pure_leaf_eval`] at call-nesting depth `nest` (a pure-leaf
     /// callee of a leaf is evaluated one level down, to a small bound).
     #[inline(never)]
@@ -22110,121 +23333,14 @@ impl Interpreter {
         args: &[*const Object],
         nest: u8,
     ) -> Option<Object> {
-        use leaf_plan::{compare, norm, V};
         let ext = code_vm_ext(code)?;
-        let consts: &[Object] = &ext.objects;
-        let instrs: &[weavepy_compiler::Instruction] = &code.instructions;
         // Tiny return bodies need no operand stack or owned-value scratch.
         // The shape is certified once, alongside the pure-leaf decision;
         // call, observer, and recursion guards still belong to the caller.
         let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         if shape >= 3 {
-            let start = usize::from(instrs.first()?.op == OpCode::Resume);
-            let load = instrs.get(start)?;
-            match shape {
-                16 if EFFECT => {
-                    // The setter: store, and return `None`. A declined
-                    // store touched nothing (the ordinary call runs it).
-                    // SAFETY (argument reads): the arguments stay live for
-                    // this evaluation.
-                    let arg = |k: u32| args.get(k as usize).map(|&p| unsafe { &*p });
-                    let (value, recv, store_pc) = match load.op {
-                        OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow => (
-                            clone_hot(arg(load.arg >> 4)?),
-                            arg(load.arg & 15)?,
-                            start + 1,
-                        ),
-                        op => {
-                            let value = match op {
-                                OpCode::LoadConst => clone_hot(consts.get(load.arg as usize)?),
-                                OpCode::LoadSmallInt => Object::Int(i64::from(load.arg)),
-                                _ => clone_hot(arg(load.arg)?),
-                            };
-                            (value, arg(instrs.get(start + 1)?.arg)?, start + 2)
-                        }
-                    };
-                    let Object::Instance(inst) = recv else {
-                        return None;
-                    };
-                    let store = instrs.get(store_pc)?;
-                    let value = std::mem::ManuallyDrop::new(value);
-                    // On `true` the value moved into the dict.
-                    if Self::core_store_attr(code, inst, store_pc, store.arg, &value) {
-                        return Some(Object::None);
-                    }
-                    drop(std::mem::ManuallyDrop::into_inner(value));
-                    return None;
-                }
-                3 => {
-                    // SAFETY: the argument remains live for this evaluation.
-                    return Some(clone_hot(unsafe { &**args.get(load.arg as usize)? }));
-                }
-                4 => return Some(clone_hot(consts.get(load.arg as usize)?)),
-                5 => return Some(Object::Int(i64::from(load.arg))),
-                6 => {
-                    // SAFETY: as for the argument-return case above.
-                    let recv = unsafe { &**args.get(load.arg as usize)? };
-                    if let Object::Instance(inst) = recv {
-                        let pc = start + 1;
-                        let attr = instrs.get(pc)?;
-                        // SAFETY: the argument roots the receiver until the
-                        // result is retained; nothing here invokes Python.
-                        if let Some(value) = unsafe {
-                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
-                        } {
-                            return Some(clone_hot(value));
-                        }
-                        return Self::leaf_attr_resolve_site(code, inst, recv, pc as u32, attr.arg);
-                    }
-                }
-                7 => {
-                    #[cfg(test)]
-                    note_predicate_stage(code, 5);
-                    // Cached field comparisons need neither the general
-                    // leaf stack nor its owned-result scratch.
-                    let cached_field = |load_pc: usize| -> Option<V> {
-                        let pc = load_pc + 1;
-                        let load = instrs.get(load_pc)?;
-                        // SAFETY: arguments root both field values for this
-                        // callback-free evaluation, with no owner releases.
-                        let Object::Instance(inst) = (unsafe { &**args.get(load.arg as usize)? })
-                        else {
-                            return None;
-                        };
-                        let attr = instrs.get(pc)?;
-                        // SAFETY: the same rooted, callback-free read.
-                        let value = unsafe {
-                            Self::leaf_cached_instance_field(ext, code, inst, pc as u32, attr.arg)
-                        }?;
-                        #[cfg(test)]
-                        note_predicate_stage(code, if load_pc == start { 6 } else { 7 });
-                        Some(norm(std::ptr::from_ref(value)))
-                    };
-                    let compare_fields = || {
-                        let a = cached_field(start)?;
-                        let b = cached_field(start + 2)?;
-                        let kind = match instrs.get(start + 4)?.arg & !COMPARE_OP_TO_BOOL_FLAG {
-                            x if x == CompareKind::Lt as u32 => CompareKind::Lt,
-                            x if x == CompareKind::LtE as u32 => CompareKind::LtE,
-                            x if x == CompareKind::Eq as u32 => CompareKind::Eq,
-                            x if x == CompareKind::NotEq as u32 => CompareKind::NotEq,
-                            x if x == CompareKind::Gt as u32 => CompareKind::Gt,
-                            x if x == CompareKind::GtE as u32 => CompareKind::GtE,
-                            _ => return None,
-                        };
-                        compare(a, b, kind).map(Object::Bool)
-                    };
-                    if let Some(result) = compare_fields() {
-                        #[cfg(test)]
-                        note_predicate_stage(code, 8);
-                        #[cfg(test)]
-                        PURE_CACHED_FIELD_PREDICATES.with(|hits| hits.set(hits.get() + 1));
-                        return Some(result);
-                    }
-                    // Preserve the existing general leaf evaluator on a
-                    // shape miss, including its slot and polymorphic reads.
-                }
-                _ => {}
+            if let Some(r) = Self::leaf_tiny::<EFFECT>(code, ext, shape, args) {
+                return r;
             }
         }
         // The general body: its translated plan (see `leaf_plan`), built
@@ -23757,6 +24873,9 @@ impl Interpreter {
             // A constructor's `__init__` returned `None`: the caller takes
             // the instance (`inline_deliver`'s epilogue).
             let v = done.init_inst.take().unwrap_or(v);
+            // A class's Python `__new__` returned: its result goes on to
+            // the class's `__init__` below, in the caller's place.
+            let new_init = done.new_init.take();
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
@@ -23782,8 +24901,14 @@ impl Interpreter {
             } else {
                 self.inline_park_clean(done);
             }
-            // SAFETY: as above.
-            unsafe { (*cframe).stack.push_fast(v) };
+            let made = match new_init {
+                Some(ni) => Some((ni, v)),
+                None => {
+                    // SAFETY: as above.
+                    unsafe { (*cframe).stack.push_fast(v) };
+                    None
+                }
+            };
             match callable {
                 // A function something else still holds (its class, its
                 // module) can't die here: a plain decrement.
@@ -23801,6 +24926,18 @@ impl Interpreter {
             // below.
             // SAFETY: as above.
             unsafe { *sw.last = call_pc };
+            if let Some((ni, made)) = made {
+                match self.core_new_finish(sw, call_pc, *ni, made) {
+                    // `__init__`'s activation runs next.
+                    None => return true,
+                    // SAFETY: the caller is the running activation again.
+                    Some(Ok(r)) => unsafe { (*cframe).stack.push(r) },
+                    Some(Err(e)) => {
+                        sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        return true;
+                    }
+                }
+            }
             if self.countdown_out(2) {
                 sw.pending = Some(CoreExit::Stop(LeafStop::Breaker));
                 return true;
@@ -23839,6 +24976,19 @@ impl Interpreter {
             )
         };
         done.clean &= !had_shell;
+        // A class's Python `__new__` returned: its result goes on to the
+        // class's `__init__` below, in the caller's place, not to the
+        // caller (which takes nothing from the delivery).
+        let mut result = result;
+        let new_step = match (&done.new_init, &result) {
+            (Some(_), Ok(_)) => {
+                done.discard = true;
+                let ni = done.new_init.take().expect("checked above");
+                let made = std::mem::replace(&mut result, Ok(Object::None));
+                Some((ni, made.expect("checked above")))
+            }
+            _ => None,
+        };
         // SAFETY: the caller is the innermost remaining activation.
         (cframe, clast, cshell) = unsafe { sw.activation(depth - 1, &mut tmp) };
         // SAFETY: as above.
@@ -23850,6 +25000,17 @@ impl Interpreter {
         } else {
             clast
         };
+        let mut entry = entry;
+        if let (Some((ni, made)), QuietEntry::Returned { cur_pc }) = (new_step, &entry) {
+            let cur_pc = *cur_pc;
+            match self.core_new_finish(sw, cur_pc, *ni, made) {
+                // `__init__`'s activation runs next.
+                None => return true,
+                // SAFETY: the caller is the running activation again.
+                Some(Ok(v)) => unsafe { (*sw.cur).stack.push(v) },
+                Some(Err(err)) => entry = QuietEntry::Raised { err, cur_pc },
+            }
+        }
         match entry {
             QuietEntry::Returned { cur_pc } => {
                 // SAFETY: as above.
@@ -24070,37 +25231,35 @@ impl Interpreter {
                             }
                         }
                     }
-                    // `Cls.f(...)`: a plain function (or a static method's)
-                    // with an empty self slot, as the slow arm.
+                    // `Cls.f(...)`: the class attribute with an empty self
+                    // slot, as the slow arm.
                     Some(Object::Type(cls)) => {
-                        match Self::leaf_load_type_attr(code, cls, pc as u32, ins.arg) {
-                            Some(v @ Object::Function(_)) => {
-                                let Some(top) = stack.last_mut() else {
-                                    return CoreAttr::Decline;
-                                };
-                                let cls = std::mem::replace(top, v);
-                                stack.push(Object::Unbound);
-                                drop(cls);
-                                return CoreAttr::Done;
-                            }
-                            // `Cls.cm(...)`: a class method's function with
-                            // the class in the self slot (the call the bound
-                            // method makes).
-                            Some(Object::BoundMethod(bm))
+                        let Some((f, self_obj)) =
+                            Self::type_method_pair(code, cls, pc as u32, ins.arg)
+                        else {
+                            return CoreAttr::Decline;
+                        };
+                        // A native class method bound to this class
+                        // (`int.from_bytes`): its function with the class
+                        // in the self slot, as the full leaf arm takes it.
+                        let (f, self_obj) = match (&f, &self_obj) {
+                            (Object::BoundMethod(bm), Object::Unbound)
                                 if matches!(
                                     (&bm.function, &bm.receiver),
-                                    (Object::Function(_), Object::Type(_))
+                                    (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
                                 ) =>
                             {
-                                let Some(top) = stack.last_mut() else {
-                                    return CoreAttr::Decline;
-                                };
-                                let cls = std::mem::replace(top, bm.function.clone());
-                                stack.push(cls);
-                                return CoreAttr::Done;
+                                (bm.function.clone(), bm.receiver.clone())
                             }
-                            _ => return CoreAttr::Decline,
-                        }
+                            _ => (f, self_obj),
+                        };
+                        let Some(top) = stack.last_mut() else {
+                            return CoreAttr::Decline;
+                        };
+                        let cls = std::mem::replace(top, f);
+                        stack.push(self_obj);
+                        drop(cls);
+                        return CoreAttr::Done;
                     }
                     // `module.f(...)`: the module attribute with an empty
                     // self slot, as the slow arm.
@@ -24521,6 +25680,43 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::decimal_native::method_kw(ops, argc)
+    }
+
+    /// `dict(k=v, ...)` (exact `dict`, keywords only): the dictionary of
+    /// the keywords, keyed by the call's own name objects, as the full
+    /// handler builds it from their strings. `ops` is the core loop's
+    /// `CALL_KW` operands; `None` (nothing touched) for the full handler.
+    #[inline(never)]
+    fn core_dict_kw(ops: &[Object]) -> Option<Object> {
+        let (Object::Unbound, Some(Object::Tuple(names))) = (ops.get(1)?, ops.last()) else {
+            return None;
+        };
+        if ops.len() != names.len() + 3 {
+            return None;
+        }
+        Self::dict_of_keywords(names, &ops[2..2 + names.len()])
+    }
+
+    /// The dictionary `dict(**{n: v ...})` makes of a call's keyword
+    /// `names` (its `str` objects, which become the keys) and `values`:
+    /// `None` for a name that isn't a `str`, or while an allocation
+    /// observer or a due collection wants the full handler.
+    pub(crate) fn dict_of_keywords(names: &[Object], values: &[Object]) -> Option<Object> {
+        if names.len() != values.len()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || gc_trace::auto_collect_due()
+            || !names.iter().all(|n| matches!(n, Object::Str(_)))
+        {
+            return None;
+        }
+        let mut d = DictData::with_capacity_and_hasher(names.len(), crate::fasthash::FxBuildHasher);
+        for (name, v) in names.iter().zip(values) {
+            d.insert(DictKey(name.clone()), v.clone());
+        }
+        let obj = Object::Dict(Rc::new(RefCell::new(d)));
+        gc_trace::track(&obj);
+        Some(obj)
     }
 
     /// A keyword call of a native method registered with
@@ -25301,38 +26497,131 @@ impl Interpreter {
                 matches!(unsafe { inst.attr_peek_index(key_idx as usize) }, Some((k, old))
                     if slot_name_matches(code, name_idx, k) && Self::core_droppable(old))
             }
-            _ => {
-                let Some(dict) = inst.dict.published() else {
-                    // Split storage: the store overwrites a droppable
-                    // value or appends (or declines, touching nothing).
-                    // SAFETY: as above.
-                    let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
-                        return false;
-                    };
-                    let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
-                        return false;
-                    };
-                    return split
-                        .position(name)
-                        .is_none_or(|i| Self::core_droppable(&split.values()[i]));
-                };
-                let Some(probe) = code_name_leaf_probe(code, name_idx) else {
-                    return false;
-                };
-                // SAFETY: as above.
-                let Some(d) = (unsafe { dict.peek_mut() }) else {
-                    return false;
-                };
-                let found = d.get_index_of(&probe);
-                if probe.saw_exotic() {
-                    return false;
-                }
-                found.is_none_or(|i| {
-                    d.get_index(i)
-                        .is_some_and(|(_, old)| Self::core_droppable(old))
-                })
-            }
+            _ => Self::store_new_attr_ready(code, inst, name_idx),
         }
+    }
+
+    /// Whether [`Self::core_store_new_attr`]'s insert-or-overwrite (its
+    /// class facts checked) would perform the store right now, touching
+    /// nothing.
+    fn store_new_attr_ready(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(dict) = inst.dict.published() else {
+            // Split storage: the store overwrites a droppable value or
+            // appends (or declines, touching nothing).
+            // SAFETY: an unused view with nothing running.
+            let Some(split) = (unsafe { inst.dict.split_cell().peek() }) else {
+                return false;
+            };
+            let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+                return false;
+            };
+            return split
+                .position(name)
+                .is_none_or(|i| Self::core_droppable(&split.values()[i]));
+        };
+        let Some(probe) = code_name_leaf_probe(code, name_idx) else {
+            return false;
+        };
+        // SAFETY: as above.
+        let Some(d) = (unsafe { dict.peek_mut() }) else {
+            return false;
+        };
+        let found = d.get_index_of(&probe);
+        if probe.saw_exotic() {
+            return false;
+        }
+        found.is_none_or(|i| {
+            d.get_index(i)
+                .is_some_and(|(_, old)| Self::core_droppable(old))
+        })
+    }
+
+    /// Whether `inst`'s class takes `inst.<co_names[name_idx]> = v` as a
+    /// plain instance-dict store: default attribute setting and no
+    /// descriptor for the name (the facts a `STORE_ATTR` site's cache
+    /// records, kept per class version).
+    fn plain_store_class(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        !crate::object::exotic_str_keys_possible()
+            && inst.c_body.get() == 0
+            && cls.native_kind.get() == 0
+            && !crate::capi_watchers::dicts_active()
+            && Self::plain_store_verdict(cls, name)
+    }
+
+    /// The class's part of [`Self::plain_store_class`], settled per class
+    /// version.
+    fn plain_store_verdict(cls: &TypeObject, name: &str) -> bool {
+        cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
+            Self::default_getattribute(cls)
+                && !cls.flags.is_builtin
+                && cls.setattr_is_default()
+                && !cls.forbids_dict
+                && !(name.starts_with("__") && name != "__doc__")
+                // An exception's `args` is a `BaseException` descriptor.
+                && !(name == "args" && cls.is_subclass_of(&builtin_types().base_exception))
+                && matches!(
+                    cls.lookup(name),
+                    None | Some(Object::Function(_) | Object::Str(_) | Object::None)
+                )
+        })
+    }
+
+    /// [`Self::core_store_attr`] for a frameless leaf's store, which also
+    /// serves a receiver of a class the site's cache doesn't (a setter or
+    /// an `__init__` run on several classes' instances): such a store
+    /// takes the plain insert-or-overwrite when the receiver's class takes
+    /// one, where it would otherwise end the evaluation. As
+    /// `core_store_attr`: on `true` the value moved, `false` touched
+    /// nothing.
+    #[inline(always)]
+    fn leaf_attr_store(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        Self::core_store_attr(code, inst, attr_pc, name_idx, value)
+            || Self::leaf_attr_store_any(code, inst, attr_pc, name_idx, value)
+    }
+
+    /// [`Self::leaf_attr_store`]'s store whatever the site's cache.
+    #[inline(never)]
+    fn leaf_attr_store_any(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        attr_pc: usize,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let cls = inst.cls_raw();
+        Self::plain_store_class(code, inst, name_idx)
+            && Self::core_store_new_attr(
+                code,
+                inst,
+                cls,
+                attr_pc,
+                name_idx,
+                cls.attr_version.get(),
+                value,
+            )
+    }
+
+    /// Whether [`Self::leaf_attr_store`] would perform this store right
+    /// now, touching nothing (see [`Self::core_store_attr_ready`]).
+    fn leaf_attr_store_ready(
+        code: &CodeObject,
+        inst: &PyInstance,
+        attr_pc: usize,
+        name_idx: u32,
+    ) -> bool {
+        Self::core_store_attr_ready(code, inst, attr_pc, name_idx)
+            || (Self::plain_store_class(code, inst, name_idx)
+                && Self::store_new_attr_ready(code, inst, name_idx))
     }
 
     /// The constructor shape of [`Self::core_store_attr`]: a
@@ -25683,6 +26972,19 @@ impl Interpreter {
                         || !matches!(stack.last(), Some(Object::Code(_)))
                     {
                         break;
+                    }
+                    // A generator expression's: its generator, pending.
+                    if let Some((gen, k)) =
+                        self.genexp_make_at(instrs, pc, stack, globals, builtins)
+                    {
+                        for _ in 0..=k {
+                            let v = stack.pop().expect("checked above");
+                            self.release(v);
+                        }
+                        stack.push(gen);
+                        last = pc + k;
+                        pc += 1 + k;
+                        continue;
                     }
                     let mut defaults: Option<Vec<Object>> = None;
                     let mut closure: Option<Vec<Object>> = None;
@@ -27363,9 +28665,24 @@ impl Interpreter {
                         },
                         _ => break,
                     };
-                    *stack.last_mut().expect("operand checked above") = Object::Bool(b);
+                    let old = std::mem::replace(
+                        stack.last_mut().expect("operand checked above"),
+                        Object::Bool(b),
+                    );
                     last = pc;
                     pc += 1;
+                    // (The test may hold an instance's last reference: its
+                    // finalizer runs before the next instruction.)
+                    if matches!(old, Object::Instance(_)) {
+                        drop(old);
+                        // SAFETY: the running thread's own flag.
+                        if unsafe { (*gc_trace::maybe_dead_flag()).get() } {
+                            stop = LeafStop::Marked;
+                            break;
+                        }
+                    } else {
+                        drop(old);
+                    }
                 }
                 OpCode::IsOp => {
                     let n = stack.len();
@@ -27761,8 +29078,6 @@ impl Interpreter {
     /// raises whatever a missing or misbehaving `__len__` must).
     fn leaf_instance_len(&self, v: &Object) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for `__len__` (an address no interned name has).
-        static LEN_KEY: u8 = 0;
         let Object::Instance(inst) = v else {
             return None;
         };
@@ -27770,7 +29085,7 @@ impl Interpreter {
         if crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let key = std::ptr::addr_of!(LEN_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN);
         let ver = cls.attr_version.get();
         let b = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Rc::as_ptr(b),
@@ -27844,9 +29159,7 @@ impl Interpreter {
         v: &Object,
     ) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the fast half's builtin.
-        static LEN_FAST_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(LEN_FAST_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN_FAST);
         let fast = match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => match self.leaf_call_kind(b)? {
                 LeafKind::Fast(f) => f,
@@ -27996,11 +29309,8 @@ impl Interpreter {
     #[inline(never)]
     fn instance_call_native(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for a native `__call__` (an address no interned
-        /// name has).
-        static CALL_NATIVE_KEY: u8 = 0;
         let cls = inst.cls_raw();
-        let key = std::ptr::addr_of!(CALL_NATIVE_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL_NATIVE);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::BuiltinMethod(b)) => Some(b.clone()),
@@ -28041,10 +29351,8 @@ impl Interpreter {
     #[inline(never)]
     fn instance_call_function(inst: &PyInstance) -> Option<Rc<crate::object::PyFunction>> {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for `__call__` (an address no interned name has).
-        static CALL_KEY: u8 = 0;
         let cls = inst.cls_raw();
-        let key = std::ptr::addr_of!(CALL_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::Method(w)) => w.upgrade(),
@@ -28065,11 +29373,11 @@ impl Interpreter {
     }
 
     /// `type(inst).<name>` when it is a plain Python function, cached on
-    /// the class under its attribute version at `key` (an address no
-    /// interned name has; one per dunder).
+    /// the class under its attribute version at `key` (one of the VM's
+    /// own, see `types::vm_key`; one per dunder).
     fn instance_dunder_function(
         inst: &PyInstance,
-        key: usize,
+        key: crate::types::AttrKey,
         name: &str,
     ) -> Option<Rc<crate::object::PyFunction>> {
         use crate::types::LeafAttrKind as K;
@@ -28099,7 +29407,7 @@ impl Interpreter {
     /// Whether `cls` resolves `name` to nothing on its MRO, cached on the
     /// class under its attribute version at `key` (as
     /// [`Self::instance_dunder_function`]).
-    fn class_lacks(cls: &TypeObject, key: usize, name: &str) -> bool {
+    fn class_lacks(cls: &TypeObject, key: crate::types::AttrKey, name: &str) -> bool {
         use crate::types::LeafAttrKind as K;
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
@@ -28142,31 +29450,116 @@ impl Interpreter {
     /// defines no reflected method (nor, augmented, an in-place one).
     /// Called with `(a, b)`, its `NotImplemented` is the operator's
     /// `TypeError` ([`binop_type_error`]).
+    ///
+    /// So is a plain instance's method over a built-in scalar, string or
+    /// immutable sequence (`path / "name"`): CPython's `binary_op1` calls
+    /// the instance's method first (the built-in type is no subclass of
+    /// the class), and the built-in type's own slot answers
+    /// `NotImplemented` for an operand it doesn't know, which leaves the
+    /// `TypeError`. (Not a repetition, which a sequence would try with the
+    /// instance's `__index__`, nor `**`, whose message names `pow()`.)
     fn binop_instance_dunder(
         a: &Object,
         b: &Object,
         op: BinOpKind,
         inplace: bool,
     ) -> Option<Rc<crate::object::PyFunction>> {
-        let (Object::Instance(ai), Object::Instance(bi)) = (a, b) else {
+        let Object::Instance(ai) = a else {
             return None;
         };
+        let same = match b {
+            Object::Instance(bi) => std::ptr::eq(ai.cls_raw(), bi.cls_raw()),
+            Object::Str(_) | Object::Bytes(_) | Object::Tuple(_) => {
+                !matches!(op, BinOpKind::Mult | BinOpKind::Pow)
+            }
+            Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None => {
+                op != BinOpKind::Pow
+            }
+            _ => false,
+        };
+        let mixed = !matches!(b, Object::Instance(_));
         let cls = ai.cls_raw();
         let k = op as usize;
         let (dunder, rdunder) = binop_dunders(op);
-        if !std::ptr::eq(cls, bi.cls_raw())
+        if !same
             || ai.native.get().is_some()
+            || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
             || (inplace
                 && !Self::class_lacks(
                     cls,
-                    std::ptr::addr_of!(IBINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::IBINOP + k as u32),
                     op.inplace_dunder(),
                 ))
-            || !Self::class_lacks(cls, std::ptr::addr_of!(RBINOP_KEYS[k]) as usize, rdunder)
+            || (!mixed
+                && !Self::class_lacks(
+                    cls,
+                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
+                    rdunder,
+                ))
         {
             return None;
         }
-        Self::instance_dunder_function(ai, std::ptr::addr_of!(BINOP_KEYS[k]) as usize, dunder)
+        Self::instance_dunder_function(
+            ai,
+            crate::types::AttrKey::vm(crate::types::vm_key::BINOP + k as u32),
+            dunder,
+        )
+    }
+
+    /// `type(inst).<name>` when it is a native function (`dict.__setitem__`
+    /// under a `defaultdict`, `OrderedDict`'s own), one a built-in base
+    /// supplies when `builtin_owner`, cached on the class under its
+    /// attribute version at `key` (one of the VM's own, see
+    /// `types::vm_key`; one per dunder and choice).
+    fn instance_native_dunder(
+        inst: &PyInstance,
+        key: crate::types::AttrKey,
+        name: &str,
+        builtin_owner: bool,
+    ) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => Some(b.clone()),
+            Some(_) => None,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return None;
+                }
+                let kind = match cls.lookup_with_owner(name) {
+                    Some((Object::Builtin(b), owner))
+                        if if builtin_owner {
+                            owner.flags.is_builtin && b.binds_instance
+                        } else {
+                            true
+                        } =>
+                    {
+                        K::BuiltinMethod(b)
+                    }
+                    _ => K::Other,
+                };
+                let found = match &kind {
+                    K::BuiltinMethod(b) => Some(b.clone()),
+                    _ => None,
+                };
+                cls.leaf_attrs.set(key, ver, kind);
+                found
+            }
+        }
+    }
+
+    /// Whether `inst`'s `__getitem__` is a built-in base's own over its
+    /// native payload (a `defaultdict`'s): the native subscript serves it.
+    fn native_payload_getitem(inst: &PyInstance) -> bool {
+        inst.native.get().is_some()
+            && Self::instance_native_dunder(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::NATIVE_GETITEM),
+                "__getitem__",
+                true,
+            )
+            .is_some()
     }
 
     /// Call a class's dunder `f` (see [`Self::instance_dunder_function`])
@@ -28200,10 +29593,16 @@ impl Interpreter {
             return None;
         };
         let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        // A class with neither `__bool__` nor `__len__` (its version unique
+        // to it as it stands): true, without a look at anything else (as
+        // CPython's always-true `TO_BOOL`).
+        if matches!(&*self.core_truth.borrow(), Some((v, NativeTruth::AlwaysTrue)) if *v == ver) {
+            return Some(true);
+        }
         if crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let ver = cls.attr_version.get();
         // The cache (and the class) keep the builtin alive through the
         // call, whose body runs no Python.
         let lookup =
@@ -28248,6 +29647,21 @@ impl Interpreter {
         match r.ok()? {
             Object::Bool(b) => Some(b),
             Object::Int(n) if is_len && n >= 0 => Some(n != 0),
+            _ => None,
+        }
+    }
+
+    /// The attribute version of `inst`'s class, when its instances are
+    /// always true in a boolean context (the cached verdict for that
+    /// version, see [`Self::leaf_instance_truth`]): a compiled `TO_BOOL`
+    /// site answers them in line while the class keeps the version.
+    pub(crate) fn instance_always_true_version(
+        &self,
+        inst: &crate::types::PyInstance,
+    ) -> Option<u64> {
+        let ver = inst.cls_raw().attr_version.get();
+        match &*self.core_truth.borrow() {
+            Some((v, NativeTruth::AlwaysTrue)) if *v == ver && ver != 0 => Some(ver),
             _ => None,
         }
     }
@@ -28462,9 +29876,7 @@ impl Interpreter {
     /// under its attribute version.
     fn default_setattr(cls: &TypeObject) -> bool {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the answer (an address no interned name has).
-        static SETATTR_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(SETATTR_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::SETATTR);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::InstanceOnly) => true,
@@ -28494,9 +29906,7 @@ impl Interpreter {
     /// under its attribute version.
     fn default_delattr(cls: &TypeObject) -> bool {
         use crate::types::LeafAttrKind as K;
-        /// The cache key for the answer (an address no interned name has).
-        static DELATTR_KEY: u8 = 0;
-        let key = std::ptr::addr_of!(DELATTR_KEY) as usize;
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::DELATTR);
         let ver = cls.attr_version.get();
         match cls.leaf_attrs.get(key, ver) {
             Some(K::InstanceOnly) => true,
@@ -29554,6 +30964,12 @@ impl Interpreter {
                 let [O::Type(cls)] = args else {
                     return None;
                 };
+                // A class its memoized plan proved plain (as `object_new`
+                // reads it): the allocation, with no checks to repeat.
+                if object_new_plain_memo(cls) {
+                    let (inst, _tracked) = self.alloc_plain_instance_obj(cls);
+                    return Some(Ok(inst));
+                }
                 if cls.flags.is_builtin || cls.is_type_subclass() {
                     return None;
                 }
@@ -30048,7 +31464,7 @@ impl Interpreter {
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
         };
-        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
+        let name_key = crate::types::AttrKey::name(name_obj);
         let ver = cls.attr_version.get();
         if let Some(k) = cls.leaf_attrs.get(name_key, ver) {
             return match k {
@@ -30062,6 +31478,7 @@ impl Interpreter {
                 K::ValueType(w) => Some(LeafAttr::Value(Object::Type(w.upgrade()?))),
                 K::ValueDict(w) => Some(LeafAttr::Value(Object::Dict(w.upgrade()?))),
                 K::ValueList(w) => Some(LeafAttr::Value(Object::List(w.upgrade()?))),
+                K::ValueModule(w) => Some(LeafAttr::Value(Object::Module(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
                 K::DataDescr { .. } | K::Other => None,
@@ -30122,6 +31539,14 @@ impl Interpreter {
                 Some(Object::Type(t)) => K::ValueType(Rc::downgrade(&t)),
                 Some(Object::Dict(d)) => K::ValueDict(Rc::downgrade(&d)),
                 Some(Object::List(l)) => K::ValueList(Rc::downgrade(&l)),
+                // A module of the plain module type (which has no
+                // `__get__`).
+                Some(m @ Object::Module(_))
+                    if Rc::ptr_eq(&crate::builtins::class_of(&m), &builtin_types().module_) =>
+                {
+                    let Object::Module(m) = m else { unreachable!() };
+                    K::ValueModule(Rc::downgrade(&m))
+                }
                 // A plain instance stored on the class (`timezone.utc`):
                 // a value unless its class makes it a descriptor.
                 Some(Object::Instance(i)) => {
@@ -30149,6 +31574,7 @@ impl Interpreter {
             K::ValueType(w) => w.upgrade().map(|t| LeafAttr::Value(Object::Type(t))),
             K::ValueDict(w) => w.upgrade().map(|d| LeafAttr::Value(Object::Dict(d))),
             K::ValueList(w) => w.upgrade().map(|l| LeafAttr::Value(Object::List(l))),
+            K::ValueModule(w) => w.upgrade().map(|m| LeafAttr::Value(Object::Module(m))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
             K::DataDescr { .. } | K::Other => None,
@@ -30188,7 +31614,7 @@ impl Interpreter {
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
         };
-        let name_key = SharedStr::as_ptr(name_obj).cast::<u8>() as usize;
+        let name_key = crate::types::AttrKey::name(name_obj);
         let ver = cls.attr_version.get();
         if cls.leaf_attrs.get(name_key, ver).is_none() {
             // (Fills the entry.)
@@ -30222,6 +31648,13 @@ impl Interpreter {
         let slot = code_method_slot(code, cache_pc);
         if let Some(f) = slot.and_then(|s| s.get_held_unbound(ver)) {
             return Some(Object::Function(f));
+        }
+        // A native function this site last read off the class under its
+        // plain metaclass (`object.__new__`, see below).
+        if let Some(v @ Object::Builtin(_)) = slot.and_then(|s| s.class_value(ver, 0)) {
+            if Self::plain_metaclass(cls) {
+                return Some(Self::clone_operand(v));
+            }
         }
         // A plain `type` metaclass has nothing that could intercept a
         // non-dunder class attribute (the class cache never answers for
@@ -30289,8 +31722,17 @@ impl Interpreter {
                 Some(_) => None,
             };
         }
+        if let Some(v) = Self::leaf_type_name(code, cls, name_idx) {
+            return Some(v);
+        }
         if !Self::plain_metaclass(cls) {
-            return Self::leaf_load_meta_class_attr(code, cls, name_idx);
+            // (The site remembers an object's entry under both versions.)
+            if let Some(v) = meta_entry_hit(code, cls, cache_pc as usize) {
+                return Some(v);
+            }
+            let v = Self::leaf_load_meta_class_attr(code, cls, name_idx)?;
+            meta_entry_fill(code, cls, cache_pc as usize, &v);
+            return Some(v);
         }
         // A natively served class method (`datetime.fromisoformat`; see
         // `stdlib::datetime_native`), bound as `classmethod.__get__`
@@ -30349,18 +31791,128 @@ impl Interpreter {
                 }
                 Some(Object::Function(f))
             }
+            // A non-binding native function (`object.__new__`, read by
+            // every Python `__new__`), which the site remembers under the
+            // class's version: the checks above come out the same while it
+            // stands, its metaclass staying `type`.
+            LeafAttr::Value(v @ Object::Builtin(_)) => {
+                if let Some(s) = slot {
+                    s.set_class_value(ver, 0, &v);
+                }
+                Some(v)
+            }
             LeafAttr::Value(v) => Some(v),
             // A class method, bound to the class.
             LeafAttr::ClassMethod(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            // A native method read through the class stays on the full
-            // path (it reports as a method descriptor, not a function).
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            // A native method or a property read off the class is the
+            // descriptor itself (`descriptor_get` with no instance).
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
+        }
+    }
+
+    /// The method load (`LOAD_ATTR` with the method flag) of
+    /// `co_names[name_idx]` on the class `cls`, as the full handler loads
+    /// it: the attribute [`Self::leaf_load_type_attr`] reads with an empty
+    /// self slot (a class's attribute is never bound to it), a class
+    /// method's function with the class in the self slot (the call its
+    /// bound method makes). `None` for what the full handler must load.
+    #[inline]
+    pub(crate) fn type_method_pair(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<(Object, Object)> {
+        let Some(v) = Self::leaf_load_type_attr(code, cls, cache_pc, name_idx) else {
+            return Self::type_setattr_pair(code, cls, name_idx);
+        };
+        match v {
+            // (A native one's, `int.from_bytes`, as the full leaf arm takes
+            // it.)
+            Object::BoundMethod(bm)
+                if matches!(
+                    (&bm.function, &bm.receiver),
+                    (Object::Function(_), Object::Type(_))
+                ) || matches!(
+                    (&bm.function, &bm.receiver),
+                    (Object::Builtin(_), Object::Type(r)) if Rc::ptr_eq(r, cls)
+                ) =>
+            {
+                Some((bm.function.clone(), bm.receiver.clone()))
+            }
+            v => Some((v, Object::Unbound)),
+        }
+    }
+
+    /// `cls.__name__` / `cls.__qualname__` as `type`'s getsets answer
+    /// them (the full path's first case): a `str` the class's own dict
+    /// holds, else the class's interned name, when the metaclass keeps the
+    /// default attribute access and doesn't define the name itself.
+    /// `None` for any other name or shape.
+    #[inline(never)]
+    fn leaf_type_name(code: &CodeObject, cls: &Rc<TypeObject>, name_idx: u32) -> Option<Object> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if !matches!(name, "__name__" | "__qualname__") || crate::capi_watchers::types_active() {
+            return None;
+        }
+        if !Self::plain_metaclass(cls) {
+            // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            if meta.c_ext_ptr.get() != 0
+                || !Self::default_getattribute(meta)
+                || meta
+                    .lookup_with_owner(name)
+                    .is_some_and(|(_, owner)| !Rc::ptr_eq(&owner, &builtin_types().type_))
+            {
+                return None;
+            }
+        }
+        if let Some(v @ Object::Str(_)) = cls
+            .dict
+            .try_borrow()
+            .ok()?
+            .get(&code_name_key(code, name_idx)?)
+        {
+            return Some(v.clone());
+        }
+        if name == "__qualname__" {
+            if let Some(q) = cls.qualname.borrow().as_ref() {
+                return Some(Object::interned_str(q));
+            }
+        }
+        Some(Object::interned_str(&cls.name))
+    }
+
+    /// [`Self::type_method_pair`] for the attribute protocol's own dunders
+    /// (`object.__setattr__(self, name, value)`, a frozen dataclass's
+    /// stores), which `type` defines only as non-data slot wrappers, so the
+    /// class's MRO answers (CPython's `type_getattro`): its native method
+    /// or Python function, with an empty self slot, as the class's dict
+    /// holds it. `None` for anything else.
+    #[inline(never)]
+    fn type_setattr_pair(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        name_idx: u32,
+    ) -> Option<(Object, Object)> {
+        let name = code.names.get(name_idx as usize)?.as_str();
+        if !matches!(name, "__setattr__" | "__delattr__" | "__getattribute__")
+            || !Self::plain_metaclass(cls)
+            || cls.native_kind.get() != 0
+            || (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin)
+            || crate::object::exotic_str_keys_possible()
+        {
+            return None;
+        }
+        match cls.lookup(name)? {
+            f @ Object::Function(_) => Some((f, Object::Unbound)),
+            b @ Object::Builtin(_) => Some((b, Object::Unbound)),
+            _ => None,
         }
     }
 
@@ -30386,13 +31938,24 @@ impl Interpreter {
         if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
             return None;
         }
-        // The metaclass's MRO has no entry for the name (its own leaf
+        // The metaclass's MRO has no entry for the name, or one that is no
+        // data descriptor, which yields to the class's own (CPython's
+        // `type_getattro`) when the class's MRO has the name (its own leaf
         // attribute cache remembers the walk per version).
-        if !matches!(
-            Self::leaf_class_attr(code, meta, name_idx),
-            Some(LeafAttr::InstanceOnly)
-        ) {
-            return None;
+        match Self::leaf_class_attr(code, meta, name_idx)? {
+            LeafAttr::InstanceOnly
+            | LeafAttr::Method(_)
+            | LeafAttr::ClassMethod(_)
+            | LeafAttr::BuiltinMethod(_)
+            | LeafAttr::Value(
+                Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Function(_),
+            ) => {}
+            _ => return None,
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::Method(f) => Some(Object::Function(f)),
@@ -30401,10 +31964,11 @@ impl Interpreter {
                 Object::Type(cls.clone()),
                 Object::Function(f),
             )))),
-            LeafAttr::InstanceOnly
-            | LeafAttr::BuiltinMethod(_)
-            | LeafAttr::Property(_)
-            | LeafAttr::TupleField(_) => None,
+            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            LeafAttr::Property(p) => Some(Object::Property(p)),
+            // (A metaclass entry then binds to the class: the full path's
+            // to build.)
+            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -30420,7 +31984,22 @@ impl Interpreter {
     fn type_dunder_transparent(name: &str) -> bool {
         matches!(
             name,
-            "__init__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+            "__init__"
+                | "__enter__"
+                | "__exit__"
+                | "__aenter__"
+                | "__aexit__"
+                | "__setattr__"
+                | "__delattr__"
+                | "__getattribute__"
+                | "__repr__"
+                | "__str__"
+                | "__eq__"
+                | "__ne__"
+                | "__hash__"
+                | "__reduce__"
+                | "__reduce_ex__"
+                | "__init_subclass__"
         )
     }
 
@@ -30705,23 +32284,7 @@ impl Interpreter {
                             || inst.c_body.get() != 0
                             || crate::capi_watchers::dicts_active()
                             // (The class's part, settled per class version.)
-                            || !cls.memo_verdict(crate::types::Verdict::PlainStore, name, || {
-                                Self::default_getattribute(cls)
-                                    && !cls.flags.is_builtin
-                                    && cls.setattr_is_default()
-                                    && !cls.forbids_dict
-                                    && !(name.starts_with("__") && name != "__doc__")
-                                    // An exception's `args` is a
-                                    // `BaseException` descriptor.
-                                    && !(name == "args"
-                                        && cls.is_subclass_of(&builtin_types().base_exception))
-                                    && matches!(
-                                        cls.lookup(name),
-                                        None | Some(
-                                            Object::Function(_) | Object::Str(_) | Object::None
-                                        )
-                                    )
-                            })
+                            || !Self::plain_store_verdict(cls, name)
                         {
                             return None;
                         }
@@ -30730,8 +32293,25 @@ impl Interpreter {
                         // An existing key takes the *indexed* shape, which
                         // the core loop's own arm serves without a hash
                         // probe (the specializer's choice, made here
-                        // because the site never reaches it).
-                        if matches!(cache, IC::Empty) {
+                        // because the site never reaches it). A site left
+                        // cooling down is counted down here (the full
+                        // handler that would count it never sees it), and
+                        // re-specialized when it reaches zero. A site
+                        // specialized for another class keeps its class:
+                        // a site that stores to several in turn
+                        // (`Shape.__init__` of each kind of shape) would
+                        // otherwise re-specialize on every store, and a
+                        // frameless leaf's store (a setter, an `__init__`)
+                        // serves any class anyway (see `leaf_attr_store`).
+                        let respecialize = match cache {
+                            IC::Empty | IC::Cooldown(0) => true,
+                            IC::Cooldown(n) => {
+                                code.caches.set(cache_pc, IC::Cooldown(n - 1));
+                                false
+                            }
+                            _ => false,
+                        };
+                        if respecialize {
                             let ver = cls.attr_version.get();
                             let indexed = inst.attr_position_str(name);
                             code.caches.set(
@@ -31105,9 +32685,9 @@ impl Interpreter {
             // types (`os.stat_result`) whose `__getitem__` is a genuine
             // custom method: with no native payload the native subscript
             // has nothing to index, so honour the method instead.
-            let user_getitem = inst
-                .cls()
-                .lookup_with_owner("__getitem__")
+            let user_getitem = (!Self::native_payload_getitem(inst))
+                .then(|| inst.cls().lookup_with_owner("__getitem__"))
+                .flatten()
                 .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.get().is_none())
                 .map(|(m, _)| m);
             if let Some(m) = user_getitem {
@@ -32051,7 +33631,8 @@ impl Interpreter {
                         Err(_) => unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?,
                     }
                 } else if matches!(kind, UnaryKind::Not)
-                    && matches!(v, Object::MappingProxyObj(_) | Object::Foreign(_))
+                    && (matches!(v, Object::MappingProxyObj(_) | Object::Foreign(_))
+                        || matches!(&v, Object::Type(t) if !t.metaclass_is_type()))
                 {
                     // Delegating wrappers size/ask the wrapped value for
                     // truthiness (an object-backed `mappingproxy` measures as
@@ -34207,13 +35788,15 @@ impl Interpreter {
                 // CPython 3.13's TO_BOOL: replace TOS with its exact-bool
                 // truthiness (dispatches `__bool__`/`__len__`, may raise).
                 let v = frame.pop()?;
-                let truthy = match &v {
-                    Object::Instance(_) | Object::MappingProxyObj(_) => {
-                        let g = frame.globals.clone();
-                        self.obj_truthy(&v, &g)?
-                    }
-                    _ => v.is_truthy(),
+                let truthy = if v.truth_dispatches() {
+                    let g = frame.globals.clone();
+                    self.obj_truthy(&v, &g)?
+                } else {
+                    v.is_truthy()
                 };
+                // The operand dies here, finalizers and all (its last
+                // reference may be the test's).
+                self.release(v);
                 frame.push(Object::Bool(truthy));
             }
             OpCode::ConvertValue => {
@@ -39518,8 +41101,21 @@ impl Interpreter {
             // str-subclass result keeps its type
             // (test_str.test_conversion: `str(WithStr(StrSubclass('abc')))`
             // is a `StrSubclass`).
-            if let Some(method) = instance_method(v, "__str__") {
-                let r = self.call(&method, &[], &[], globals)?;
+            // A plain Python `__str__` is called with the instance, with no
+            // bound method built for it.
+            let method = match Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+                "__str__",
+            ) {
+                Some(f) => Some(Ok(f)),
+                None => instance_method(v, "__str__").map(Err),
+            };
+            if let Some(method) = method {
+                let r = match method {
+                    Ok(f) => self.call_dunder_function(f, std::slice::from_ref(v))?,
+                    Err(bound) => self.call(&bound, &[], &[], globals)?,
+                };
                 if str_like_object(&r) {
                     return Ok(r);
                 }
@@ -39542,8 +41138,13 @@ impl Interpreter {
             // (test_str.test_conversion: `str(WithRepr(StrSubclass('<abc>')))`).
             // A built-in *value* subclass must instead use the base type's
             // `tp_str` (an int subclass keeps the digit-limit ValueError,
-            // test_int), which `stringify` below provides.
-            if inst.native.get().is_none() && instance_method(v, "__repr__").is_some() {
+            // test_int), which `stringify` below provides, unless the
+            // subclass overrides `__repr__` and the base has no `tp_str` of
+            // its own (an `int`, `float` or container subclass: CPython's
+            // `object_str` then calls the override).
+            if (inst.native.get().is_none() || native_subclass_own_repr(inst))
+                && instance_method(v, "__repr__").is_some()
+            {
                 return self.do_repr_call(v, globals);
             }
         }
@@ -39969,8 +41570,19 @@ impl Interpreter {
                     return Ok(r);
                 }
             }
-            if let Some(method) = instance_method(v, "__repr__") {
-                let r = self.call(&method, &[], &[], globals)?;
+            let method = match Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::REPR_FN),
+                "__repr__",
+            ) {
+                Some(f) => Some(Ok(f)),
+                None => instance_method(v, "__repr__").map(Err),
+            };
+            if let Some(method) = method {
+                let r = match method {
+                    Ok(f) => self.call_dunder_function(f, std::slice::from_ref(v))?,
+                    Err(bound) => self.call(&bound, &[], &[], globals)?,
+                };
                 if str_like_object(&r) {
                     return Ok(r);
                 }
@@ -40022,12 +41634,9 @@ impl Interpreter {
         // (`len(SomeEnum)` → `EnumType.__len__`). A plain Python method is
         // called with the instance, with no bound method built for it.
         if let Object::Instance(inst) = v {
-            /// The class cache key for `__len__` (see
-            /// `instance_dunder_function`).
-            static LEN_FN_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(LEN_FN_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::LEN_FN),
                 "__len__",
             ) {
                 let r = self.call(&Object::Function(f), std::slice::from_ref(v), &[], globals)?;
@@ -40976,6 +42585,24 @@ impl Interpreter {
                 let r = self.call(&method, &[], &[], globals)?;
                 // `PyObject_Size` semantics; errors must match `len()`'s
                 // exactly (test_bool `test_sane_len` compares the strings).
+                return coerce_len_result(r).map(|n| n != 0);
+            }
+        }
+        // A class is an instance of its metaclass: a metaclass's `__bool__`
+        // (then `__len__`) decides its truth (`bool(cls)` is False for a
+        // metaclass whose `__bool__` says so).
+        if let Object::Type(_) = v {
+            if let Some(method) = metaclass_method(v, "__bool__") {
+                return match self.call(&method, &[], &[], globals)? {
+                    Object::Bool(b) => Ok(b),
+                    other => Err(type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        other.type_name()
+                    ))),
+                };
+            }
+            if let Some(method) = metaclass_method(v, "__len__") {
+                let r = self.call(&method, &[], &[], globals)?;
                 return coerce_len_result(r).map(|n| n != 0);
             }
         }
@@ -42534,12 +44161,9 @@ impl Interpreter {
                     return Ok(Object::Int(h));
                 }
             }
-            /// The class cache key for `__hash__` (see
-            /// `instance_dunder_function`).
-            static HASH_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(HASH_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::HASH),
                 "__hash__",
             ) {
                 let result = self.call_dunder_function(f, std::slice::from_ref(obj))?;
@@ -42740,7 +44364,9 @@ impl Interpreter {
         if args.len() < 3 {
             return self.load_attr(&args[0], &name);
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(args[2].clone());
         }
         let value_class = builtin_value_class(&args[0]);
@@ -42784,7 +44410,9 @@ impl Interpreter {
                 crate::builtins::wstr_attr_get(&args[0], &args[1]).is_some(),
             ));
         }
-        if attr_certainly_missing(&args[0], &name) {
+        if attr_certainly_missing(&args[0], &name)
+            || matches!(&args[0], Object::Type(t) if type_attr_certainly_missing(t, &name))
+        {
             return Ok(Object::Bool(false));
         }
         // A builtin class's miss, remembered per class version (a
@@ -43296,7 +44924,11 @@ impl Interpreter {
                 // compared with `<` (CPython `unsafe_tuple_compare`).
                 let mut i = 0;
                 while i < x.len() && i < y.len() {
-                    if !x[i].is_same(&y[i]) && !self.vm_eq(&x[i], &y[i], globals)? {
+                    let eq = match SortKind::item_eq(&x[i], &y[i]) {
+                        Some(eq) => eq,
+                        None => x[i].is_same(&y[i]) || self.vm_eq(&x[i], &y[i], globals)?,
+                    };
+                    if !eq {
                         break;
                     }
                     i += 1;
@@ -43309,7 +44941,10 @@ impl Interpreter {
                     (0, SortKindScalar::Int) => Ok(SortKind::int_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Float) => Ok(SortKind::float_lt(&x[0], &y[0])),
                     (0, SortKindScalar::Numeric) => compare_op(&x[0], &y[0], CompareKind::Lt),
-                    _ => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    _ => match native_scalar_compare(&x[i], &y[i], CompareKind::Lt) {
+                        Some(lt) => Ok(lt),
+                        None => self.dispatch_compare_op(&x[i], &y[i], CompareKind::Lt, globals),
+                    },
                 }
             }),
             SortKind::General => crate::timsort::sort(v, |a, b| {
@@ -43603,14 +45238,11 @@ impl Interpreter {
             return self.subscr_get_public(&inner, i);
         }
         if let Object::Instance(inst) = v {
-            /// The class cache key for `__getitem__` (see
-            /// `instance_dunder_function`).
-            static GETITEM_KEY: u8 = 0;
             // A plain Python `__getitem__`: called with the instance, with
             // no bound method built for it.
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(GETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::GETITEM_FN),
                 "__getitem__",
             ) {
                 // A pure leaf evaluates in place, without an activation.
@@ -43627,9 +45259,9 @@ impl Interpreter {
                 }
                 return self.call(&Object::Function(f), &[v.clone(), i.clone()], &[], &g);
             }
-            let user_getitem = inst
-                .cls()
-                .lookup_with_owner("__getitem__")
+            let user_getitem = (!Self::native_payload_getitem(inst))
+                .then(|| inst.cls().lookup_with_owner("__getitem__"))
+                .flatten()
                 .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.get().is_none())
                 .map(|(m, _)| m);
             if let Some(m) = user_getitem {
@@ -43722,16 +45354,37 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         let g = self.builtins.clone();
         if let Object::Instance(inst) = target {
-            /// The class cache key for `__setitem__` (see
-            /// `instance_dunder_function`).
-            static SETITEM_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(SETITEM_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::SETITEM),
                 "__setitem__",
             ) {
                 self.call_dunder_function(f, &[target.clone(), i.clone(), value])?;
                 return Ok(());
+            }
+            // A built-in base's own `__setitem__` (an `OrderedDict`'s, a
+            // `defaultdict`'s): its body on the instance, with no bound
+            // method built for it.
+            if let Some(b) = Self::instance_native_dunder(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::NATIVE_SETITEM),
+                "__setitem__",
+                false,
+            ) {
+                if matches!(i, Object::Slice(_))
+                    && inst.native.get().is_some()
+                    && b.name == "__setitem__"
+                {
+                    return self.store_subscr(target, i, value, &g);
+                }
+                if native_call_ic_safe(b.name) && !matches!(i, Object::Slice(_)) {
+                    let args = [target.clone(), i.clone(), value];
+                    match b.call_kw.as_ref() {
+                        Some(call_kw) => call_kw(&args, &[])?,
+                        None => (b.call)(&args)?,
+                    };
+                    return Ok(());
+                }
             }
             if let Some(method) = instance_method(target, "__setitem__") {
                 // Slice assignment detours to `store_subscr` only for a VM
@@ -43848,7 +45501,13 @@ impl Interpreter {
             // Container bases (tuple/list/dict/…) don't, so `str(x)` falls
             // through `object.__str__` to `repr(x)`, which dispatches a user
             // `__repr__` when defined (namedtuple relies on this).
+            // (An `int`, `float` or `complex` has no `tp_str` of its own
+            // either: a subclass overriding `__repr__` renders through it,
+            // as `object.__str__` makes it.)
             if let Some(native) = inst.native.get() {
+                if native_subclass_own_repr(inst) {
+                    return self.repr_of(v, globals);
+                }
                 if matches!(
                     native,
                     Object::Int(_)
@@ -44079,12 +45738,9 @@ impl Interpreter {
             container.clone()
         };
         if let Object::Instance(inst) = &container {
-            /// The class cache key for `__contains__` (see
-            /// `instance_dunder_function`).
-            static CONTAINS_KEY: u8 = 0;
             if let Some(f) = Self::instance_dunder_function(
                 inst,
-                std::ptr::addr_of!(CONTAINS_KEY) as usize,
+                crate::types::AttrKey::vm(crate::types::vm_key::CONTAINS),
                 "__contains__",
             ) {
                 let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
@@ -47822,13 +49478,13 @@ impl Interpreter {
                 && ai.native.get().is_none()
                 && Self::class_lacks(
                     ai.cls_raw(),
-                    std::ptr::addr_of!(RBINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
                     rdunder,
                 )
             {
                 if let Some(f) = Self::instance_dunder_function(
                     ai,
-                    std::ptr::addr_of!(BINOP_KEYS[k]) as usize,
+                    crate::types::AttrKey::vm(crate::types::vm_key::BINOP + k as u32),
                     dunder,
                 ) {
                     let r = self.call_dunder_function(f, &[a.clone(), b.clone()])?;
@@ -48361,16 +50017,40 @@ impl Interpreter {
     /// [`Self::instance_dunder_function`]): called with `x` first, it is
     /// what [`Self::cmp_method`] binds.
     fn cmp_function(x: &Object, op: CompareKind) -> Option<Rc<PyFunction>> {
-        /// Class cache keys per comparison dunder.
-        static CMP_KEYS: [u8; 8] = [0; 8];
         let Object::Instance(inst) = x else {
             return None;
         };
         Self::instance_dunder_function(
             inst,
-            std::ptr::addr_of!(CMP_KEYS[op as usize]) as usize,
+            crate::types::AttrKey::vm(crate::types::vm_key::CMP + op as u32),
             cmp_dunder(op).0,
         )
+    }
+
+    /// The plain Python method a `COMPARE_OP` of `op` over `a` and `b`
+    /// calls first, when `a` is a plain instance (no native payload, of a
+    /// class neither natively served nor an extension's) whose class's
+    /// method for `op` is a plain function: CPython's `do_richcompare`
+    /// tries `a`'s first unless `b`'s class is a strict subclass of `a`'s
+    /// (which may override the reflected method).
+    pub(crate) fn compare_instance_dunder(
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Option<Rc<PyFunction>> {
+        let Object::Instance(ai) = a else {
+            return None;
+        };
+        let cls = ai.cls_raw();
+        if ai.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        if let Object::Instance(bi) = b {
+            if !std::ptr::eq(cls, bi.cls_raw()) && bi.cls().is_subclass_of(&ai.cls()) {
+                return None;
+            }
+        }
+        Self::cmp_function(a, op)
     }
 
     /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].
@@ -49799,6 +51479,35 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        // A builtin container's method read as a value (`string.split` in
+        // `urllib.parse.unquote`, a duck-typing probe): the bound method,
+        // as the core loop's plain-attribute lane builds it.
+        if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(
+                frame.stack.last(),
+                Some(
+                    Object::Str(_)
+                        | Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::FrozenSet(_)
+                        | Object::Bytes(_)
+                        | Object::Tuple(_)
+                )
+            )
+        {
+            let name_idx = frame.code.instructions[pc].arg;
+            if let Some(v) =
+                self.leaf_plain_attr_value(&frame.code, frame.stack.last(), name_idx, None)
+            {
+                frame.pc = pc as u32 + 1;
+                if let Some(top) = frame.stack.last_mut() {
+                    let recv = std::mem::replace(top, v);
+                    self.release(recv);
+                }
+                return Ok(());
+            }
+        }
         let frame_field = frame.code.instructions[pc].op == OpCode::LoadAttr
             && matches!(frame.stack.last(), Some(Object::Frame(_) | Object::Code(_)));
         // A site cooling down after a failed load (an odd count; see
@@ -49862,7 +51571,7 @@ impl Interpreter {
             return None;
         }
         let recv = frame.stack.pop()?;
-        let err = crate::error::attribute_error_named(&recv, name);
+        let err = certain_miss_error(&recv, name);
         self.release(recv);
         Some(err)
     }
@@ -50128,7 +51837,7 @@ impl Interpreter {
                 // without its resolution passes.
                 if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
                     if attr_certainly_missing(&receiver, name) {
-                        let err = crate::error::attribute_error_named(&receiver, name);
+                        let err = certain_miss_error(&receiver, name);
                         self.release(receiver);
                         return Err(err);
                     }
@@ -51446,14 +53155,16 @@ impl Interpreter {
                 // `EnumType.__setattr__` raises on member reassignment). The
                 // builtin `type.__setattr__` is *not* a user override, so it
                 // falls through to the direct setter below.
-                if let Some(method) = metaclass_method(obj, "__setattr__") {
-                    if !matches!(
-                        method,
-                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
-                    ) {
-                        let g = self.builtins.clone();
-                        self.call(&method, &[Object::from_str(name), value], &[], &g)?;
-                        return Ok(());
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                    match meta.lookup("__setattr__") {
+                        Some(Object::Builtin(_)) | None => {}
+                        Some(m) => {
+                            let method = bind_method(obj, m);
+                            let g = self.builtins.clone();
+                            self.call(&method, &[Object::from_str(name), value], &[], &g)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.set_type_attr_direct(ty, name, value)
@@ -52435,14 +54146,16 @@ impl Interpreter {
                 // from the class's *own* dict only (inherited attributes can't
                 // be deleted via a subclass; `__dict__`/`__weakref__` are
                 // read-only layout getsets, test_set_dict).
-                if let Some(method) = metaclass_method(obj, "__delattr__") {
-                    if !matches!(
-                        method,
-                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
-                    ) {
-                        let g = self.builtins.clone();
-                        self.call(&method, &[Object::from_str(name)], &[], &g)?;
-                        return Ok(());
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                    match meta.lookup("__delattr__") {
+                        Some(Object::Builtin(_)) | None => {}
+                        Some(m) => {
+                            let method = bind_method(obj, m);
+                            let g = self.builtins.clone();
+                            self.call(&method, &[Object::from_str(name)], &[], &g)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.del_type_attr_direct(ty, name)
@@ -53838,6 +55551,60 @@ impl Interpreter {
                 // IMPORTANT: any `b.name == "..."` / `matches!(b.name, ...)`
                 // added inside this block must also be added to
                 // `builtin_needs_interp` above, or the new arm is dead code.
+                // The hottest interpreter-aware builtins by one `match` (a
+                // length switch and a compare), ahead of the gate and the
+                // chain's sequential comparisons: each arm is the chain's
+                // own for the name and shape, which no earlier arm of the
+                // chain takes.
+                match (b.name, args.len()) {
+                    ("len", 1) => return self.do_len_call(&args[0], outer_globals),
+                    ("hash", 1) => return self.do_hash_call(&args[0], outer_globals),
+                    ("isinstance", 2) => {
+                        return self.do_isinstance_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("issubclass", 2) => {
+                        return self.do_issubclass_call(&args[0], &args[1], outer_globals)
+                    }
+                    ("repr", 1) => return self.do_repr_call(&args[0], outer_globals),
+                    ("str", 1) => return self.do_str_call(&args[0], outer_globals),
+                    // `object.__new__(cls, ...)`, object's allocator (the
+                    // chain's `__new__` arms are `type.__new__`'s). From
+                    // Python code it refuses a class that a built-in type's
+                    // own `__new__` allocates (`dict`, a `dict` subclass,
+                    // `type` or a metaclass): object's allocator can't stand
+                    // in (CPython `tp_new_wrapper`'s safety check). (The
+                    // construction paths call the allocator directly.)
+                    ("__new__", _) if is_object_new(b) => {
+                        if let Some(Object::Type(cls)) = args.first() {
+                            if let Some(base) = object_new_unsafe(cls) {
+                                return Err(type_error(format!(
+                                    "object.__new__({}) is not safe, use {}.__new__()",
+                                    cls.name, base
+                                )));
+                            }
+                            // An abstract class object's allocator refuses
+                            // (CPython `object_new`), as its construction
+                            // does.
+                            if !object_new_plain_memo(cls) {
+                                let plan = self.instance_plan(cls);
+                                if let Some(msg) = &plan.abstract_error {
+                                    if matches!(plan.native, crate::types::NativeKind::Plain)
+                                        && !plan.seeds_exception_args
+                                    {
+                                        return Err(type_error(msg.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(call_kw) = b.call_kw.as_ref() {
+                            return call_kw(args, kwargs);
+                        }
+                        if kwargs.is_empty() {
+                            return (b.call)(args);
+                        }
+                    }
+                    _ => {}
+                }
                 if builtin_needs_interp(b.name) {
                     if b.name.starts_with(".u.") {
                         let receiver = args.first().cloned().ok_or_else(|| {
@@ -53932,11 +55699,17 @@ impl Interpreter {
                     if b.name == builtins::BUILD_CLASS_NAME {
                         return self.build_class(args, kwargs);
                     }
+                    // `object.__init__` runs object's own check on any
+                    // receiver: the name is shared with `dict.__init__`,
+                    // whose merge below must not take it.
+                    if b.name == "__init__" && is_object_init(b) {
+                        return crate::builtin_types::object_init_call(args, !kwargs.is_empty());
+                    }
                     // `type.__new__(mcs, name, bases, ns)` — invoked from
                     // user metaclasses via `super().__new__(...)`. Route
                     // to the actual type-construction path so the class
                     // ends up wired with the right metaclass.
-                    if b.name == "__new__" && args.len() == 4 {
+                    if b.name == "__new__" && args.len() == 4 && !is_object_new(b) {
                         if let Object::Type(mcs) = &args[0] {
                             if mcs.is_subclass_of(&builtin_types().type_) {
                                 // Bare `type.__new__`: build the class but do
@@ -55475,6 +57248,15 @@ impl Interpreter {
             // repr'd by `m.def` while rendering a default argument)
             // reaches this dispatch as a plain foreign value.
             Object::Foreign(s) => crate::foreign::call(s, args, kwargs),
+            // A generator expression's `CALL 0` (its iterator the self
+            // slot's argument) the fast paths left here (see
+            // `Self::make_genexp`).
+            Object::Generator(_)
+                if args.len() == 1 && kwargs.is_empty() && Self::is_pending_genexp(callable) =>
+            {
+                Self::finish_genexp(callable, args[0].clone());
+                Ok(callable.clone())
+            }
             _ => {
                 if std::env::var_os("WEAVEPY_TRACE_NOTCALL").is_some() {
                     eprintln!(
@@ -55591,9 +57373,9 @@ impl Interpreter {
         Ok(obj)
     }
 
-    /// `list(x)`, `tuple(x)`, `set(x)` or `frozenset(x)` of the exact
-    /// builtin type: what [`Self::instantiate`] builds for it, without the
-    /// per-type checks it runs first. `None` for any other type.
+    /// `list(x)`, `tuple(x)`, `set(x)`, `frozenset(x)` or `str(x)` of the
+    /// exact builtin type: what [`Self::instantiate`] builds for it, without
+    /// the per-type checks it runs first. `None` for any other type.
     fn container_ctor1(
         &mut self,
         ty: &Rc<TypeObject>,
@@ -55603,6 +57385,11 @@ impl Interpreter {
             return None;
         }
         let bt = builtin_types();
+        // `str(x)`: `x`'s `__str__` (see `type_call_default`).
+        if Rc::ptr_eq(ty, &bt.str_) {
+            let globals = self.builtins.clone();
+            return Some(self.do_str_call(arg, &globals));
+        }
         let r = if Rc::ptr_eq(ty, &bt.list_) || Rc::ptr_eq(ty, &bt.tuple_) {
             let name = if Rc::ptr_eq(ty, &bt.list_) {
                 "list"
@@ -58345,6 +60132,13 @@ impl Interpreter {
             && matches!(native, NativeKind::Plain)
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
+        let object_new_plain = !seeds_exception_args
+            && abstract_error.is_none()
+            && matches!(native, NativeKind::Plain)
+            && !cls.flags.is_builtin
+            && !cls.is_type_subclass()
+            && !cls.is_subclass_of(&bt.module_)
+            && !cls.is_subclass_of(&bt.generic_alias_);
 
         crate::types::InstancePlan {
             abstract_error,
@@ -58359,6 +60153,7 @@ impl Interpreter {
             lean_init,
             tuple_new,
             bare_alloc,
+            object_new_plain,
             store_init: std::sync::atomic::AtomicU8::new(0),
             slot_members: std::sync::OnceLock::new(),
         }
@@ -58877,7 +60672,6 @@ impl Interpreter {
             )));
         }
 
-        let is_object_new = plan.is_object_new;
         let instance = match &plan.user_new {
             // User-defined `__new__` (the first MRO hit other than the
             // implicit `object.__new__`) owns instance allocation — pass
@@ -58899,12 +60693,8 @@ impl Interpreter {
                 let mut new_args: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 new_args.push(Object::Type(cls.clone()));
                 new_args.extend_from_slice(args);
-                self.call(
-                    &resolved,
-                    &new_args,
-                    kwargs,
-                    &Rc::new(RefCell::new(DictData::default())),
-                )?
+                let g = self.builtins.clone();
+                self.call(&resolved, &new_args, kwargs, &g)?
             }
             None => {
                 // Subclasses of the descriptor built-ins
@@ -59030,7 +60820,22 @@ impl Interpreter {
                 inst
             }
         };
+        self.init_constructed(&cls, &plan, instance, args, kwargs)
+    }
 
+    /// The second half of [`Self::instantiate`] (`type_call`'s): run the
+    /// `__init__` of `instance`, which `cls`'s `__new__` (the one `plan`,
+    /// `cls`'s construction plan, resolved) returned for the constructor
+    /// arguments `args` and `kwargs`, and hand back the instance.
+    fn init_constructed(
+        &mut self,
+        cls: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        instance: Object,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let is_object_new = plan.is_object_new;
         // Only run `__init__` when the returned object is an instance
         // of `cls` (*including* subclasses — CPython's `type_call`
         // checks `PyObject_TypeCheck`, so a `__new__` that allocates a
@@ -59039,7 +60844,7 @@ impl Interpreter {
         let instance_cls = match &instance {
             Object::Instance(inst) => {
                 let icls = inst.cls();
-                if icls.mro.borrow().iter().any(|t| Rc::ptr_eq(t, &cls)) {
+                if icls.mro.borrow().iter().any(|t| Rc::ptr_eq(t, cls)) {
                     Some(icls)
                 } else {
                     None
@@ -59055,7 +60860,7 @@ impl Interpreter {
             // originally-called class — reuse the plan when it is the
             // same class (the overwhelmingly common case), otherwise
             // consult that class's own memoised plan.
-            let iplan = if Rc::ptr_eq(&icls, &cls) {
+            let iplan = if Rc::ptr_eq(&icls, cls) {
                 plan.clone()
             } else {
                 self.instance_plan(&icls)
@@ -59184,12 +60989,8 @@ impl Interpreter {
                 // arguments (test_inspect test_signature_on_class_with_init
                 // [classmethod]/[staticmethod]/[MethodType]).
                 let bound = bind_method(&instance, init);
-                let result = self.call(
-                    &bound,
-                    args,
-                    init_kwargs,
-                    &Rc::new(RefCell::new(DictData::default())),
-                )?;
+                let g = self.builtins.clone();
+                let result = self.call(&bound, args, init_kwargs, &g)?;
                 if !matches!(result, Object::None) {
                     return Err(type_error(format!(
                         "__init__() should return None, not '{}'",
@@ -59480,7 +61281,10 @@ impl Interpreter {
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
         let n = args.len() + usize::from(recv.is_some());
+        // (A surplus positional must raise, not bind a keyword-only
+        // parameter: the full binder's.)
         if n > MAX_ARGS
+            || n > code.arg_count as usize
             || !code_is_pure_leaf(code)
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
@@ -60016,6 +61820,17 @@ impl Interpreter {
             self.recycle_scratch(positional);
             return result;
         }
+        // A native caller's call (a special method a builtin or a
+        // constructor runs, a `key=` function) warms its callee more than
+        // the core loop's activation does: its nested run gains most from
+        // a native body (see `frame_jit::Slot::warm_native`).
+        #[cfg(feature = "jit")]
+        if !(code.is_generator || code.is_coroutine || code.is_async_generator) {
+            if let Some(ext) = code_vm_ext(&code) {
+                ext.frame_jit
+                    .warm_native(&code, ext, code.varnames.len().max(positional.len()));
+            }
+        }
         // A cell-free, non-generator body runs as a lean activation when
         // the loop is quiet: no frame build, no eager shell, no general
         // prologue (see `run_frame_lean`).
@@ -60204,17 +62019,15 @@ impl Interpreter {
     /// of `self` alone: the generator, made without the call machinery
     /// (`make_iter`'s instance arm). `None` when anything else applies.
     fn instance_gen_call(&self, v: &Object, name: &str) -> Option<Object> {
-        static ITER_KEY: u8 = 0;
-        static AWAIT_KEY: u8 = 0;
         let Object::Instance(inst) = v else {
             return None;
         };
         let key = match name {
-            "__iter__" => std::ptr::addr_of!(ITER_KEY),
-            "__await__" => std::ptr::addr_of!(AWAIT_KEY),
+            "__iter__" => crate::types::AttrKey::vm(crate::types::vm_key::ITER),
+            "__await__" => crate::types::AttrKey::vm(crate::types::vm_key::AWAIT),
             _ => return None,
         };
-        let f = Self::instance_dunder_function(inst, key as usize, name)?;
+        let f = Self::instance_dunder_function(inst, key, name)?;
         let code = f.code();
         if !code.is_generator {
             return None;
@@ -60382,13 +62195,27 @@ impl Interpreter {
         cells: Rc<Vec<Rc<RefCell<Object>>>>,
         start: usize,
     ) -> Frame {
+        Self::gen_frame_in(&f.globals, &f.builtins, code, locals, stack, cells, start)
+    }
+
+    /// [`Self::gen_frame_lean`] with the `globals` and `builtins` given.
+    #[inline]
+    fn gen_frame_in(
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+        code: Rc<CodeObject>,
+        locals: Rc<RefCell<Vec<Object>>>,
+        stack: frame_slots::FrameStack,
+        cells: Rc<Vec<Rc<RefCell<Object>>>>,
+        start: usize,
+    ) -> Frame {
         Frame {
             code,
             locals: frame_slots::FrameLocals::from_shared(locals),
             cells,
             stack,
-            globals: f.globals.clone(),
-            builtins: f.builtins.clone(),
+            globals: globals.clone(),
+            builtins: builtins.clone(),
             rare: None,
             exc: None,
             agen_yielded_value: true,
@@ -60402,6 +62229,167 @@ impl Interpreter {
             #[cfg(feature = "jit")]
             parked_native: None,
         }
+    }
+
+    /// A generator expression's generator, made by its `MAKE_FUNCTION` (the
+    /// closure's cells `closure`, the running frame's `globals` and
+    /// `builtins`) in place of the function its `CALL 0` would make it from
+    /// and drop at once: nothing can reach that function but the call, so
+    /// the generator stands in for it on the operand stack, pending (see
+    /// [`PyGenerator::genexp_pending`]) until the call hands it its
+    /// iterator ([`Self::finish_genexp`]). `None`, with nothing made, for
+    /// any other code, or where a call wouldn't take the fast start (see
+    /// [`Self::generator_start`]).
+    pub(crate) fn make_genexp(
+        &self,
+        code: &Rc<CodeObject>,
+        closure: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<Object> {
+        // The compiler's `<genexpr>` (only a comprehension has a `.0`): a
+        // plain generator of its iterator alone, without cells of its own.
+        if !code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || code.arg_count != 1
+            || !code.cellvars.is_empty()
+            || closure.len() != code.freevars.len()
+            || code.varnames.first().is_none_or(|n| &**n != ".0")
+        {
+            return None;
+        }
+        let ext = code_vm_ext(code)?;
+        let start = match ext.gen_start.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Self::generator_start_scan(code, ext)?,
+            u32::MAX => return None,
+            at => (at & !GEN_DELEGATES) as usize - 1,
+        };
+        if crate::trace::eval_frame_record_active()
+            || crate::trace::any_observers_active()
+            || gc_trace::auto_collect_due()
+        {
+            return None;
+        }
+        let cells = if closure.is_empty() {
+            crate::object::empty_cells_ref().clone()
+        } else {
+            let mut cells = Vec::with_capacity(closure.len());
+            for c in closure {
+                let Object::Cell(c) = c else {
+                    return None;
+                };
+                cells.push(c.clone());
+            }
+            Rc::new(cells)
+        };
+        let nlocals = code.varnames.len();
+        let GenParts {
+            locals,
+            stack,
+            boxed,
+        } = self.gen_parts(nlocals);
+        // SAFETY: sole owner (see `gen_parts`). (`.0` stays unbound until
+        // the call.)
+        unsafe { (*locals.as_ptr()).resize(nlocals, Object::Unbound) };
+        let frame =
+            Self::gen_frame_in(globals, builtins, code.clone(), locals, stack, cells, start);
+        let frame = Box::write(boxed, frame);
+        let kind = crate::object::CoroutineKind::Generator;
+        let gen = match crate::object::pooled_generator(kind, Object::Code(code.clone()), frame) {
+            Ok(gen) => gen,
+            Err((gen_code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, gen_code, frame)
+            }),
+        };
+        gen.genexp_pending.set(true);
+        Some(Object::Generator(gen))
+    }
+
+    /// [`Self::make_genexp`] for the bare `MAKE_FUNCTION` at `pc` of
+    /// `instrs` whose operands end `ops`: the code atop them, and the
+    /// closure tuple below it when a `SET_FUNCTION_ATTRIBUTE` right after
+    /// attaches one. The pending generator, and how many of those
+    /// instructions it covers (the operands it replaces, but for the code).
+    pub(crate) fn genexp_make_at(
+        &self,
+        instrs: &[weavepy_compiler::Instruction],
+        pc: usize,
+        ops: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+        builtins: &Rc<RefCell<DictData>>,
+    ) -> Option<(Object, usize)> {
+        let n = ops.len();
+        let Some(Object::Code(code)) = ops.last() else {
+            return None;
+        };
+        if !code.is_generator {
+            return None;
+        }
+        let attr = |at: usize| {
+            instrs
+                .get(at)
+                .filter(|i| i.op == OpCode::SetFunctionAttribute)
+        };
+        let (closure, k): (&[Object], usize) = match attr(pc + 1) {
+            None => (&[], 0),
+            Some(i) if i.arg == 0x08 && attr(pc + 2).is_none() => {
+                match ops.get(n.wrapping_sub(2)) {
+                    Some(Object::Tuple(items)) => (&items[..], 1),
+                    _ => return None,
+                }
+            }
+            Some(_) => return None,
+        };
+        Some((self.make_genexp(code, closure, globals, builtins)?, k))
+    }
+
+    /// Whether `obj` is a generator expression's pending generator (see
+    /// [`Self::make_genexp`]).
+    #[inline(always)]
+    pub(crate) fn is_pending_genexp(obj: &Object) -> bool {
+        matches!(obj, Object::Generator(g) if g.genexp_pending.get())
+    }
+
+    /// The `CALL 0` of `obj`, a generator expression's pending generator
+    /// (see [`Self::is_pending_genexp`]), with `iter` its iterator: the
+    /// generator takes it as its `.0`, and is an ordinary one from here
+    /// (handed to the collector).
+    pub(crate) fn finish_genexp(obj: &Object, iter: Object) {
+        let Object::Generator(g) = obj else {
+            unreachable!("checked by the caller");
+        };
+        // SAFETY: only the call's operands hold a pending generator, so
+        // nothing has borrowed its state.
+        let GeneratorState::Created(frame) = (unsafe { &mut *g.state_raw().as_ptr() }) else {
+            unreachable!("a pending generator expression is unstarted");
+        };
+        g.genexp_pending.set(false);
+        // SAFETY: the frame's sole owner; `.0`, its first local, holds
+        // `Unbound` (nothing to release).
+        unsafe { frame.locals.as_mut_ptr().write(iter) };
+        gc_trace::track_generator(obj);
+    }
+
+    /// [`Self::finish_genexp`] for the `CALL 0` whose callee is at stack
+    /// slot `at`, the iterator above it: `true` with the iterator moved
+    /// out of its slot (the generator stays in its own, the call's
+    /// result), `false`, touching nothing, for any other callee.
+    ///
+    /// # Safety
+    ///
+    /// `at` and the slot above it are initialized.
+    #[inline(never)]
+    pub(crate) unsafe fn finish_genexp_at(at: *mut Object) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if !Self::is_pending_genexp(&*at) {
+                return false;
+            }
+            Self::finish_genexp(&*at, at.add(1).read());
+        }
+        true
     }
 
     /// The plain generator a call [`Self::gen_send_call`] matched resumes
@@ -60657,6 +62645,278 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// The activation of `await f(...)`'s coroutine body run lazily (see
+    /// `frame_jit::lazy_await`), its checks passed: `f` (its code `code`,
+    /// without cells of its own: `cells` are the function's) called with
+    /// the `nargs` arguments at `args`, which move into the frame's locals
+    /// (the stack forgets them), the frame built just past the
+    /// `RETURN_GENERATOR` at `start` with the sent `None` pushed, as
+    /// [`Self::core_await_enter`] starts it. The caller rests at the `SEND`
+    /// at `send_pc` (its jump `jump`), whose exit takes the return.
+    ///
+    /// The frame is a parked box's (see [`Interpreter::lazy_boxes`]), bound
+    /// as a direct call's activation is: its namespaces and cells are
+    /// borrowed from `callable` (the called function, which the activation
+    /// holds), and its code handle is kept from the box's last body when
+    /// that ran the same code. A coroutine made around it owns them
+    /// ([`Self::lazy_coro_materialize`]).
+    ///
+    /// # Safety
+    ///
+    /// `args` holds `nargs` initialized values the caller's stack forgets,
+    /// no more than `code` takes; `callable` is the function `f` names.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) unsafe fn lazy_coro_bind(
+        &mut self,
+        f: &PyFunction,
+        code: &Rc<CodeObject>,
+        cells: &Rc<Vec<Rc<RefCell<Object>>>>,
+        args: *const Object,
+        nargs: usize,
+        start: usize,
+        send_pc: usize,
+        jump: u32,
+        callable: Object,
+        guard: crate::recursion::Guard,
+    ) -> Box<InlineAct> {
+        let mut boxed = match self.lazy_boxes.pop() {
+            Some(boxed) => boxed,
+            None => self.lazy_box_new(),
+        };
+        let fr: &mut Frame = &mut boxed;
+        if !Rc::ptr_eq(&fr.code, code) {
+            fr.code = code.clone();
+        }
+        // SAFETY: a parked box's handles are stale copies, overwritten
+        // without a drop; the activation holds `callable`, which holds what
+        // they borrow.
+        unsafe {
+            std::ptr::write(&raw mut fr.globals, borrowed_rc(&f.globals));
+            std::ptr::write(&raw mut fr.builtins, borrowed_rc(&f.builtins));
+            std::ptr::write(&raw mut fr.cells, borrowed_rc(cells));
+        }
+        let nlocals = code.varnames.len();
+        {
+            // SAFETY: a parked box's locals are its own, and empty.
+            let v = unsafe { fr.locals.storage() };
+            v.reserve(nlocals);
+            // SAFETY: the caller's contract.
+            unsafe {
+                std::ptr::copy_nonoverlapping(args, v.as_mut_ptr(), nargs);
+                v.set_len(nargs);
+            }
+            let missing = (code.arg_count as usize).saturating_sub(nargs);
+            if missing > 0 {
+                v.extend(f.defaults[f.defaults.len() - missing..].iter().cloned());
+            }
+            fill_unbound(v, nlocals);
+        }
+        fr.pc = start as u32 + 1;
+        fr.gen_first_resume = true;
+        fr.stack.push_fast(Object::None);
+        let gen_frame: *mut Frame = fr;
+        let mut act = self.inline_slot();
+        debug_assert!(act.gen.is_none() && act.gen_box.is_none() && act.guard.is_none());
+        // SAFETY: each field is `None` (a pooled slot holds none of them),
+        // and a parked slot's callable is a stale copy. The box moves as
+        // the frame's: `LeanFrame` is transparent, and the box goes back to
+        // the parked ones, or its handles are made owned, before anything
+        // drops it as a frame.
+        unsafe {
+            std::ptr::write(
+                &raw mut act.gen_box,
+                Some(Box::from_raw(Box::into_raw(boxed).cast::<Frame>())),
+            );
+            std::ptr::write(&raw mut act.guard, Some(guard));
+            std::ptr::write(&raw mut act.callable, callable);
+        }
+        act.gen_frame = gen_frame;
+        act.act.frame = gen_frame;
+        act.exhaust_arg = jump | GEN_SEND;
+        act.call_pc = send_pc;
+        act.exc_depth = self.exc_info_len();
+        act.direct = true;
+        act.lazy_coro = true;
+        act
+    }
+
+    /// A new parked box for [`Self::lazy_coro_bind`]: stale borrowed
+    /// handles, an owned code handle, and empty locals and stack, in a
+    /// finished generator's allocations when the pool has them (a body
+    /// whose coroutine was made took its box along).
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_new(&self) -> Box<LeanFrame> {
+        let spare = self.gen_spares.borrow_mut().pop();
+        let placeholder = inline_placeholder();
+        let Some(GenParts {
+            locals,
+            stack,
+            boxed,
+        }) = spare
+        else {
+            let mut boxed = Box::new(parked_lean_frame());
+            // SAFETY: the stale copy is overwritten without a drop.
+            unsafe { std::ptr::write(&raw mut boxed.code, placeholder.code.clone()) };
+            return boxed;
+        };
+        let frame = Frame {
+            code: placeholder.code.clone(),
+            locals: frame_slots::FrameLocals::from_shared(locals),
+            cells: borrowed_rc(&placeholder.cells),
+            stack,
+            globals: borrowed_rc(&placeholder.dict),
+            builtins: borrowed_rc(&placeholder.dict),
+            rare: None,
+            exc: None,
+            agen_yielded_value: true,
+            pc: 0,
+            py_frame: None,
+            gen_owner: None,
+            suppress_call_event: false,
+            gen_first_resume: false,
+            sent_consumed: false,
+            shell_cache: None,
+            #[cfg(feature = "jit")]
+            parked_native: None,
+        };
+        // SAFETY: `LeanFrame` is transparent over the frame, whose borrowed
+        // handles it never drops.
+        unsafe { Box::from_raw(Box::into_raw(Box::write(boxed, frame)).cast::<LeanFrame>()) }
+    }
+
+    /// Make the coroutine of `act`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]), as it registers: from here it is the
+    /// activation [`Self::core_await_enter`] makes, its coroutine running
+    /// (tracked if it suspends) in the placeholder's slot atop the caller
+    /// `caller`'s stack, its frame owning its handles.
+    ///
+    /// # Safety
+    ///
+    /// `act` is lazy and its caller's frame synced, the placeholder `None`
+    /// atop its stack.
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn lazy_coro_materialize(&mut self, act: &mut InlineAct, caller: &mut Frame) {
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_MADE);
+        let mut boxed = act.gen_box.take().expect("a lazy coroutine's frame");
+        {
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: the borrowed handles become owned ones (overwritten
+            // without a drop by their counted clones).
+            unsafe {
+                std::ptr::write(&raw mut fr.globals, Rc::clone(&fr.globals));
+                std::ptr::write(&raw mut fr.builtins, Rc::clone(&fr.builtins));
+                std::ptr::write(&raw mut fr.cells, Rc::clone(&fr.cells));
+            }
+        }
+        // SAFETY: moved out once; the slot treats the field as stale from
+        // here (as a generator activation's).
+        let callable = unsafe { std::ptr::read(&raw const act.callable) };
+        let kind = crate::object::CoroutineKind::Coroutine;
+        let code = Object::Code(boxed.code.clone());
+        let gen = match crate::object::pooled_generator(kind, code, boxed) {
+            Ok(gen) => gen,
+            Err((code, mut frame)) => Rc::new_cyclic(|owner| {
+                frame.gen_owner = Some(owner.clone());
+                PyGenerator::new(kind, code, frame)
+            }),
+        };
+        gen.track_deferred.set(true);
+        // SAFETY: just made; nothing else reaches its state yet.
+        let state = unsafe { &mut *gen.state().as_ptr() };
+        let GeneratorState::Created(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("a fresh coroutine");
+        };
+        act.gen_box = Some(boxed);
+        let n = caller.stack.len();
+        debug_assert!(n > 0 && matches!(caller.stack[n - 1], Object::None));
+        // SAFETY: the placeholder (`None`, nothing to drop) is the top slot.
+        unsafe {
+            caller
+                .stack
+                .as_mut_ptr()
+                .add(n - 1)
+                .write(Object::Coroutine(gen.clone()));
+        }
+        act.gen = Some(gen);
+        act.lazy_coro = false;
+        act.direct = false;
+        self.release(callable);
+    }
+
+    /// Finish `done`, a lazily running awaited body (see
+    /// [`Self::lazy_coro_bind`]) that returned cleanly without registering,
+    /// its result taken, its operand stack empty and its locals its own:
+    /// they are released, its box parked again, its slot parked, and the
+    /// function it held released.
+    #[inline(always)]
+    pub(crate) fn lazy_coro_finish(&mut self, mut done: Box<InlineAct>) {
+        drop(done.guard.take());
+        if let Some(boxed) = done.gen_box.take() {
+            // SAFETY: a lazy body's box (see `lazy_coro_bind`).
+            let mut boxed = unsafe { Box::from_raw(Box::into_raw(boxed).cast::<LeanFrame>()) };
+            let fr: &mut Frame = &mut boxed;
+            // SAFETY: sole owner (the caller's contract).
+            unsafe { release_locals(fr.locals.storage()) };
+            fr.gen_first_resume = false;
+            if fr.rare.is_some()
+                || fr.exc.is_some()
+                || fr.py_frame.is_some()
+                || fr.gen_owner.is_some()
+                || fr.shell_cache.is_some()
+                || fr.sent_consumed
+                || fr.suppress_call_event
+                || !fr.agen_yielded_value
+            {
+                Self::lazy_box_reset(fr);
+            }
+            #[cfg(feature = "jit")]
+            if fr.parked_native.is_some() {
+                fr.parked_native = None;
+            }
+            if self.lazy_boxes.len() < LAZY_BOXES_CAP {
+                push_fast(&mut self.lazy_boxes, boxed);
+            }
+        }
+        // SAFETY: moved out once; the parked slot treats the field as
+        // stale.
+        let callable = unsafe { std::ptr::read(&raw const done.callable) };
+        done.gen_frame = std::ptr::null_mut();
+        done.act.frame = std::ptr::from_mut::<Frame>(&mut done.frame);
+        done.direct = false;
+        done.lazy_coro = false;
+        if self.inline_pool.len() < INLINE_POOL_CAP {
+            push_fast(&mut self.inline_pool, done);
+        }
+        // A function something else still holds (its module, its class)
+        // can't die here: a plain decrement.
+        match callable {
+            // SAFETY: the function is alive (held here).
+            Object::Function(f) if unsafe { crate::rc::try_release_shared(Rc::as_ptr(&f)) } => {
+                std::mem::forget(f);
+            }
+            callable => self.release(callable),
+        }
+    }
+
+    /// [`Self::lazy_coro_finish`]'s reset of the rarer frame state a body
+    /// set on the way.
+    #[cold]
+    #[inline(never)]
+    fn lazy_box_reset(fr: &mut Frame) {
+        fr.rare = None;
+        fr.exc = None;
+        fr.py_frame = None;
+        fr.gen_owner = None;
+        fr.shell_cache = None;
+        fr.sent_consumed = false;
+        fr.suppress_call_event = false;
+        fr.agen_yielded_value = true;
     }
 
     /// Bootstrap a generator/coroutine *code object* frame that was not
@@ -68886,6 +71146,9 @@ struct LeanAct {
 /// How many parked [`InlineAct`] slots `Interpreter::inline_pool` keeps.
 const INLINE_POOL_CAP: usize = 64;
 
+/// The most parked boxes [`Interpreter::lazy_coro_bind`] keeps.
+const LAZY_BOXES_CAP: usize = 64;
+
 /// A lean activation the quiet loop runs *inline*: its frame lives in
 /// this box instead of on a nested native activation, and
 /// `Interpreter::quiet_run` switches to it at the caller's `CALL` and
@@ -68941,11 +71204,16 @@ struct InlineAct {
     /// While a direct call's activation runs lazily (see
     /// `frame_jit::register_lazy`), its caller's native state.
     lazy_caller: *mut frame_jit::State,
+    /// An awaited coroutine's body running lazily without its coroutine
+    /// (see `frame_jit::lazy_await`): its frame is in `gen_box`, `gen` is
+    /// `None`, and registering makes the coroutine
+    /// (`Interpreter::lazy_coro_materialize`).
+    lazy_coro: bool,
     /// An instance operator's method (see
     /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
     /// the operator's `TypeError` (the operator, whether augmented, and
-    /// the operands' class).
-    binop: Option<(BinOpKind, bool, Rc<TypeObject>)>,
+    /// the left and right operands' classes).
+    binop: Option<(BinOpKind, bool, Rc<TypeObject>, Rc<TypeObject>)>,
     /// The caller takes no result (a property setter's activation for a
     /// `STORE_ATTR`, see `Interpreter::try_inline_setter`).
     discard: bool,
@@ -68960,6 +71228,20 @@ struct InlineAct {
     /// the wrapper's cache when it returns, before its caller takes it
     /// (`inline_deliver`).
     lru: Option<crate::stdlib::functools_mod::LruPending>,
+    /// A class's Python `__new__` (see `Interpreter::core_new_user`): its
+    /// result goes on to the class's `__init__` as `type_call` runs it,
+    /// not straight to the caller.
+    new_init: Option<Box<NewInit>>,
+}
+
+/// The rest of a constructor call whose Python `__new__` an inline
+/// activation runs (see [`InlineAct::new_init`]): the class, its plan,
+/// and the call's operands (the class, then the arguments), which its
+/// `__init__` takes.
+struct NewInit {
+    ty: Rc<TypeObject>,
+    plan: Rc<crate::types::InstancePlan>,
+    ops: Vec<Object>,
 }
 
 /// The levels of a collapsed `yield from` chain (see
@@ -69082,10 +71364,12 @@ impl InlineAct {
             owns_cells: false,
             direct: false,
             lazy_caller: std::ptr::null_mut(),
+            lazy_coro: false,
             binop: None,
             discard: false,
             chain: None,
             lru: None,
+            new_init: None,
         });
         act.act.frame = std::ptr::from_mut::<Frame>(&mut act.frame);
         act
@@ -69654,6 +71938,7 @@ struct LeanKwShape {
 /// on drop, or recycled by [`Interpreter::retire_lean_frame`]. Anything
 /// that keeps one of these handles beyond the activation (a shell or a
 /// materialized frame) clones it, which counts normally.
+#[repr(transparent)]
 struct LeanFrame(std::mem::ManuallyDrop<Frame>);
 
 impl std::ops::Deref for LeanFrame {
@@ -70152,7 +72437,9 @@ mod burst_stats {
     pub(crate) const CALL_PURE: usize = 5;
     pub(crate) const CALL_GENERAL: usize = 6;
     pub(crate) const CALL_TIER2: usize = 7;
-    const CALL_NAMES: [&str; 8] = [
+    pub(crate) const CALL_LAZY_AWAIT: usize = 8;
+    pub(crate) const CALL_LAZY_MADE: usize = 9;
+    const CALL_NAMES: [&str; 10] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -70161,8 +72448,10 @@ mod burst_stats {
         "pure leaf evaluated in place",
         "general frame run",
         "tier-2 entry from the general run",
+        "frame-JIT lazy await",
+        "lazy await's coroutine made",
     ];
-    static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
@@ -70231,6 +72520,50 @@ mod burst_stats {
 
     static SLOW_SITES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
         std::sync::Mutex::new(None);
+
+    static CORE_CALLS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    static DECLINES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// Why a compiled caller's call of `callee` left the direct-call path.
+    pub(crate) fn note_decline(why: &str, callee: &str) {
+        if !enabled() {
+            return;
+        }
+        let mut a = DECLINES.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(format!("{why}: {callee}"))
+            .or_insert(0) += 1;
+    }
+
+    /// A core-loop inline call's caller and callee, each marked when it
+    /// has frame-JIT code for its activation.
+    pub(crate) fn note_core_call(caller: &crate::Frame, callee: &crate::Frame) {
+        #[cfg(feature = "jit")]
+        let native = |f: &crate::Frame| {
+            let n = f.locals.len();
+            match crate::code_vm_ext(&f.code).and_then(|e| e.frame_jit.compiled_nlocals()) {
+                Some(m) if m == n => " [native]".to_owned(),
+                Some(m) => format!(" [native for {m} locals, not {n}]"),
+                None => String::new(),
+            }
+        };
+        #[cfg(not(feature = "jit"))]
+        let native = |_: &crate::Frame| String::new();
+        let key = format!(
+            "{}{} -> {}{}",
+            caller.code.qualname,
+            native(caller),
+            callee.code.qualname,
+            native(callee),
+        );
+        let mut a = CORE_CALLS.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert(0) += 1;
+    }
 
     /// A slow step's site: the code, pc and opcode, and the operand that
     /// decides the step's shape (a call's callee, otherwise the top of
@@ -70339,6 +72672,28 @@ mod burst_stats {
         for (name, c) in CALL_NAMES.iter().zip(CALLS.iter()) {
             let _ = writeln!(out, "- {name}: {}", c.load(Ordering::Relaxed));
         }
+        let mut calls: Vec<(String, u64)> = CORE_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        calls.sort_by_key(|a| std::cmp::Reverse(a.1));
+        for (k, c) in calls.iter().take(40) {
+            let _ = writeln!(out, "  core call {k}: {c}");
+        }
+        let mut why: Vec<(String, u64)> = DECLINES
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        why.sort_by_key(|a| std::cmp::Reverse(a.1));
+        for (k, c) in why.iter().take(40) {
+            let _ = writeln!(out, "  direct declined {k}: {c}");
+        }
         out.push_str("\n## Slow-step sites\n\n");
         for (k, c) in sites.iter().take(40) {
             let _ = writeln!(out, "  slow {k}: {c}");
@@ -70384,6 +72739,117 @@ fn class_dunder_new(cls: &TypeObject) -> Option<Object> {
         }
     }
     None
+}
+
+/// Whether `inst`, a subclass instance of a built-in type with no `tp_str`
+/// of its own (`int`, `float`, `complex`, `list`, `dict`, `tuple`),
+/// overrides `__repr__` below the built-in base: `str(inst)` then renders
+/// through the override, as CPython's `object_str` makes it.
+fn native_subclass_own_repr(inst: &crate::types::PyInstance) -> bool {
+    matches!(
+        inst.native.get(),
+        Some(
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Tuple(_)
+        )
+    ) && inst
+        .cls()
+        .lookup_with_owner("__repr__")
+        .is_some_and(|(_, owner)| !owner.flags.is_builtin)
+}
+
+/// Whether `cls`'s memoized construction plan, current for its version,
+/// proved `object.__new__(cls)` the plain allocation (as `object_new`
+/// reads it): no abstract methods, built-in base or special allocator.
+#[inline]
+fn object_new_plain_memo(cls: &TypeObject) -> bool {
+    // SAFETY: a guard-free read of the memoized plan; nothing runs before
+    // its last use.
+    unsafe { cls.instance_plan.peek() }
+        .and_then(Option::as_ref)
+        .is_some_and(|(v, plan)| *v == cls.attr_version.get() && plan.object_new_plain)
+}
+
+/// Whether `object.__new__(cls)` is unsafe (CPython `tp_new_wrapper`'s
+/// check): the class whose native `__new__` serves `cls` (its
+/// `staticbase`, the first class on its MRO whose `__new__` doesn't
+/// resolve to Python code) allocates through a built-in type's own
+/// `__new__` (`dict`'s, `int`'s, `type`'s), which `object`'s can't stand
+/// in for. That class's name, for the error, or `None` when `object`'s
+/// allocator serves (or the native type is one WeavePy alone builds).
+fn object_new_unsafe(cls: &TypeObject) -> Option<String> {
+    // A class whose memoized plan is `object.__new__`'s plain allocation
+    // has no built-in base.
+    if object_new_plain_memo(cls) {
+        return None;
+    }
+    let bt = builtin_types();
+    let core = [
+        &bt.int_,
+        &bt.bool_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.bytearray_,
+        &bt.tuple_,
+        &bt.list_,
+        &bt.dict_,
+        &bt.set_,
+        &bt.frozenset_,
+        &bt.type_,
+    ];
+    let is_core = |t: &TypeObject| core.iter().any(|c| std::ptr::eq(Rc::as_ptr(c), t));
+    let mro = cls.mro.borrow();
+    // (A class with no core built-in on its MRO, the common case, is
+    // decided without a lookup.)
+    if !mro.iter().any(|t| is_core(t)) {
+        return None;
+    }
+    let base = mro.iter().find(|t| {
+        !matches!(t.lookup("__new__"), Some(Object::Function(_)))
+            && !matches!(
+                t.lookup("__new__"),
+                Some(Object::StaticMethod(sm)) if matches!(sm.func(), Object::Function(_))
+            )
+    })?;
+    let (new, owner) = base.lookup_with_owner("__new__")?;
+    if matches!(&new, Object::Builtin(b) if is_object_new(b)) {
+        return None;
+    }
+    is_core(&owner).then(|| base.name.clone())
+}
+
+/// Whether `b` is `object.__init__` (the process-wide builtin), which
+/// shares its name with the built-in types' own `__init__`s.
+fn is_object_init(b: &crate::object::BuiltinFn) -> bool {
+    thread_local! {
+        static OBJECT_INIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let want = OBJECT_INIT.with(|c| {
+        let p = c.get();
+        if p != 0 {
+            return p;
+        }
+        let p = match builtin_types()
+            .object_
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__init__"))
+        {
+            Some(Object::Builtin(f)) => Rc::as_ptr(f) as usize,
+            // (Not installed yet: nothing is object's.)
+            _ => return usize::MAX,
+        };
+        c.set(p);
+        p
+    });
+    std::ptr::from_ref(b) as usize == want
 }
 
 /// Whether `b` is `object.__new__` (the process-wide builtin).
@@ -70949,6 +73415,40 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
 }
 
+/// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
+/// in its `AttributeError` without running any code: a name that is no
+/// dunder (those have special and synthesized forms) and not `mro`, that
+/// neither the class's MRO nor its metaclass's supplies, on a class with
+/// no builtin base but `object` (whose methods and class methods are
+/// synthesized) and a metaclass with the default lookup and no
+/// `__getattr__`. `getattr(cls, name, default)` and `hasattr` then answer
+/// without building the error (enum's class creation probes a few dozen
+/// such names).
+fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
+    use crate::types::Dunder;
+    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    let object = &builtin_types().object_;
+    if t.flags.is_builtin
+        || t.native_kind.get() != 0
+        || t.mro
+            .borrow()
+            .iter()
+            .any(|b| b.flags.is_builtin && !Rc::ptr_eq(b, object))
+    {
+        return false;
+    }
+    let meta = t.metaclass_or_type();
+    let getattribute = meta.dunder(Dunder::GetAttribute);
+    if !(getattribute.type_owner() || getattribute.object_owner())
+        || meta.dunder(Dunder::GetAttr).present()
+    {
+        return false;
+    }
+    t.lookup(name).is_none() && meta.lookup(name).is_none()
+}
+
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
 /// (`exc`) with `.name` and `.obj`, for one built natively, whose storage
 /// lays both fields out (see `error::attribute_error`): stored in place
@@ -71035,7 +73535,7 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
         true
     });
     if !class_missing {
-        return false;
+        return !dunder && slot_member_unset(&cls, inst, name);
     }
     match inst.dict.published() {
         Some(d) => d
@@ -71047,6 +73547,34 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
             .try_borrow()
             .is_ok_and(|s| s.position_str(name).is_none()),
     }
+}
+
+/// The `AttributeError` a certainly missing `obj.name` (see
+/// [`attr_certainly_missing`]) raises: an unset `__slots__` member's names
+/// the class by its fully qualified name, as CPython's `member_get` does.
+fn certain_miss_error(obj: &Object, name: &str) -> RuntimeError {
+    match obj {
+        Object::Instance(inst)
+            if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
+        {
+            crate::error::attribute_error_typed(obj, name, &inst.cls().fully_qualified_name())
+        }
+        _ => crate::error::attribute_error_named(obj, name),
+    }
+}
+
+/// Whether `inst.name` is a `__slots__` member of its class (the data
+/// descriptor the default lookup finds first, under `object`'s own
+/// `__getattribute__`) that `inst` holds no value for: the member's
+/// `__get__` raises the lookup's `AttributeError` (CPython's `member_get`).
+#[inline(never)]
+fn slot_member_unset(cls: &Rc<TypeObject>, inst: &PyInstance, name: &str) -> bool {
+    use crate::types::Dunder;
+    if !cls.dunder(Dunder::GetAttribute).object_owner() || cls.is_super_proxy_type() {
+        return false;
+    }
+    matches!(cls.lookup(name), Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none())
+        && inst.slot_get(name).is_none()
 }
 
 /// Resolve a built-in slot-wrapper dunder reached via *type-level* attribute
@@ -71330,6 +73858,11 @@ fn init_is_from_object(cls: &Rc<TypeObject>) -> bool {
             // as overrides (RFC 0056 WS4).
             if crate::descr_registry::is_surface_only(init) {
                 continue;
+            }
+            // (`object.__init__` itself stored on a subclass is object's:
+            // see `builtin_types::overrides_dunder_init`.)
+            if matches!(init, Object::Builtin(b) if is_object_init(b)) {
+                return true;
             }
             return ty.name == "object";
         }
@@ -71847,6 +74380,22 @@ impl SortKind {
     #[inline]
     fn float_lt(a: &Object, b: &Object) -> bool {
         matches!((a, b), (Object::Float(x), Object::Float(y)) if x < y)
+    }
+
+    /// Whether two tuple items are equal as `PyObject_RichCompareBool`
+    /// would find them (identity first, then `==`), for a pair of native
+    /// `int`s, `float`s or `str`s; `None` for anything else.
+    #[inline(always)]
+    fn item_eq(a: &Object, b: &Object) -> Option<bool> {
+        match (a, b) {
+            (Object::Int(x), Object::Int(y)) => Some(x == y),
+            // (`is_same` compares a float's bits, so a NaN equals itself.)
+            (Object::Float(x), Object::Float(y)) => Some(x.to_bits() == y.to_bits() || x == y),
+            (Object::Str(x), Object::Str(y)) => {
+                Some(SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -72753,9 +75302,10 @@ enum PercentArgs<'a> {
 /// `template % args` in one pass when every conversion is a plain `%s`,
 /// `%d` or `%i` (no flags, width or precision; a mapping key for a
 /// mapping, none for positional arguments) of an exact `str`, `int`,
-/// `bool` or `None` (`%s` only for `str`, `None`), and every positional
-/// argument is consumed: the text `percent_format_with` renders for that
-/// shape. `None` for anything else (the general path then renders it, or
+/// `bool` or `None` (`%s` only for `str`, `None`), or one of the specs
+/// [`percent_render_spec`] renders, and every positional argument is
+/// consumed: the text `percent_format_with` renders for that shape.
+/// `None` for anything else (the general path then renders it, or
 /// raises), including a mapping key the dictionary lacks.
 fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String> {
     use std::fmt::Write as _;
@@ -72789,6 +75339,12 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
             }
             _ => return None,
         };
+        if !matches!(bytes.get(k)?, b's' | b'd' | b'i') {
+            k = percent_render_spec(&mut out, bytes, k, v)?;
+            i = k + 1;
+            lit = i;
+            continue;
+        }
         match (bytes.get(k)?, v) {
             (b's', Object::Str(s)) => out.push_str(s),
             (b's' | b'd' | b'i', Object::Int(n)) => {
@@ -72811,13 +75367,148 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
     Some(out)
 }
 
+/// One conversion with flags (`-`, `0`, `+`, space), a width and a
+/// precision, or a `%f` or `%r`, of an exact `str`, `int`, `bool`,
+/// `float` or `None`, whose spec starts at `bytes[k]`, rendered onto
+/// `out` as CPython's `unicode_format_arg` does: the position of the
+/// conversion character, or `None` (`out` then abandoned) for anything
+/// else: `#`, `*`, a length modifier, a non-finite `float`, another
+/// conversion or operand.
+fn percent_render_spec(out: &mut String, bytes: &[u8], mut k: usize, v: &Object) -> Option<usize> {
+    use std::fmt::Write as _;
+    let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+    loop {
+        match *bytes.get(k)? {
+            b'-' => left = true,
+            b'0' => zero = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            _ => break,
+        }
+        k += 1;
+    }
+    let digits = |k: &mut usize| -> Option<usize> {
+        let mut n = 0usize;
+        while let Some(d @ b'0'..=b'9') = bytes.get(*k) {
+            n = n * 10 + usize::from(d - b'0');
+            // (A huge width or precision is the general path's to judge.)
+            if n > 4096 {
+                return None;
+            }
+            *k += 1;
+        }
+        Some(n)
+    };
+    let width = digits(&mut k)?;
+    let prec = if bytes.get(k) == Some(&b'.') {
+        k += 1;
+        Some(digits(&mut k)?)
+    } else {
+        None
+    };
+    let conv = *bytes.get(k)?;
+    // The sign (numbers only) and the text.
+    let mut num = String::new();
+    let (sign, text, numeric): (&str, &str, bool) = match (conv, v) {
+        (b's' | b'r', _) => {
+            let text: &str = match (conv, v) {
+                (b's', Object::Str(s)) => s,
+                (b's', Object::Bool(b)) => {
+                    if *b {
+                        "True"
+                    } else {
+                        "False"
+                    }
+                }
+                (b's', Object::None) => "None",
+                (b's', Object::Int(n)) => {
+                    let _ = write!(num, "{n}");
+                    &num
+                }
+                (b'r', Object::Str(_)) => {
+                    num = v.repr();
+                    &num
+                }
+                _ => return None,
+            };
+            // A precision keeps that many characters.
+            let text = match prec {
+                Some(p) => text
+                    .char_indices()
+                    .nth(p)
+                    .map_or(text, |(at, _)| &text[..at]),
+                None => text,
+            };
+            ("", text, false)
+        }
+        (b'd' | b'i', Object::Int(_) | Object::Bool(_)) => {
+            let n = match v {
+                Object::Int(n) => *n,
+                _ => i64::from(matches!(v, Object::Bool(true))),
+            };
+            let _ = write!(num, "{}", n.unsigned_abs());
+            // A precision is the least number of digits.
+            if let Some(p) = prec {
+                if num.len() < p {
+                    num.insert_str(0, &"0".repeat(p - num.len()));
+                }
+            }
+            (if n < 0 { "-" } else { "" }, num.as_str(), true)
+        }
+        (b'f' | b'F', Object::Float(_) | Object::Int(_)) => {
+            let x = match v {
+                Object::Float(x) => *x,
+                // (Exactly representable: converted as CPython does.)
+                Object::Int(n) if n.unsigned_abs() <= 1 << 53 => *n as f64,
+                _ => return None,
+            };
+            if !x.is_finite() {
+                return None;
+            }
+            let _ = write!(num, "{:.*}", prec.unwrap_or(6), x.abs());
+            (
+                if x.is_sign_negative() { "-" } else { "" },
+                num.as_str(),
+                true,
+            )
+        }
+        _ => return None,
+    };
+    let sign = match (sign, numeric) {
+        ("", true) if plus => "+",
+        ("", true) if space => " ",
+        (sign, _) => sign,
+    };
+    let len = sign.len()
+        + if text.is_ascii() {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+    let pad = width.saturating_sub(len);
+    if left {
+        out.push_str(sign);
+        out.push_str(text);
+        out.extend(std::iter::repeat_n(' ', pad));
+    } else if zero && numeric {
+        out.push_str(sign);
+        out.extend(std::iter::repeat_n('0', pad));
+        out.push_str(text);
+    } else {
+        out.extend(std::iter::repeat_n(' ', pad));
+        out.push_str(sign);
+        out.push_str(text);
+    }
+    Some(k)
+}
+
 /// [`percent_render_plain`] of `template % value` for an argument tuple,
 /// a lone scalar argument or an exact dict.
 fn percent_render_plain_value(template: &str, value: &Object) -> Option<String> {
     let one;
     let items: &[Object] = match value {
         Object::Tuple(items) if !items.is_empty() => items,
-        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None => {
+        Object::Str(_) | Object::Int(_) | Object::Bool(_) | Object::None | Object::Float(_) => {
             one = [value.clone()];
             &one
         }
@@ -75156,22 +77847,20 @@ fn tsdbg() -> bool {
     *ON.get_or_init(|| std::env::var_os("WEAVEPY_TSDBG").is_some())
 }
 
-/// Class cache keys per operator (see
-/// `Interpreter::instance_dunder_function`): its method, and whether the
-/// reflected and in-place methods are absent.
-static BINOP_KEYS: [u8; 16] = [0; 16];
-static RBINOP_KEYS: [u8; 16] = [0; 16];
-static IBINOP_KEYS: [u8; 16] = [0; 16];
-
 /// The `TypeError` of a `BINARY_OP` of `op` (augmented when `inplace`)
 /// whose method returned `NotImplemented` for two instances of `cls`.
-fn binop_type_error(op: BinOpKind, inplace: bool, cls: &TypeObject) -> RuntimeError {
+fn binop_type_error(
+    op: BinOpKind,
+    inplace: bool,
+    left: &TypeObject,
+    right: &TypeObject,
+) -> RuntimeError {
     type_error(format!(
         "unsupported operand type(s) for {}{}: '{}' and '{}'",
         op.as_str(),
         if inplace { "=" } else { "" },
-        cls.name,
-        cls.name
+        left.name,
+        right.name
     ))
 }
 
@@ -76397,6 +79086,71 @@ struct LeafSiteData {
     func: crate::sync::Weak<crate::object::PyFunction>,
     code: *const CodeObject,
     effect: bool,
+    /// The class's shared names (`0` none) and how many of them come
+    /// before the method's name: an instance whose values are laid over
+    /// those names and hold no more than that can't shadow the method.
+    keys: usize,
+    limit: usize,
+}
+
+/// A [`LeafSite`]'s callee under a class version (see `leaf_site_hit`).
+#[derive(Clone, Copy)]
+struct LeafHit {
+    fp: *const crate::object::PyFunction,
+    code: *const CodeObject,
+    effect: bool,
+    keys: usize,
+    limit: usize,
+}
+
+/// A frame-JIT method site's cached leaf callee (see
+/// `Interpreter::leaf_method_callee`): the receiver class version it was
+/// verified under (`0` none), the function and its code, the code's
+/// extension, the shadowing bound (see [`LeafSiteData::limit`]), and
+/// whether it is an effect leaf.
+#[derive(Clone, Copy)]
+pub(crate) struct LeafCallee {
+    pub(crate) ver: u64,
+    fp: *const crate::object::PyFunction,
+    code: *const CodeObject,
+    cext: *const CodeConstObjects,
+    keys: usize,
+    limit: usize,
+    effect: bool,
+}
+
+impl LeafCallee {
+    pub(crate) const EMPTY: LeafCallee = LeafCallee {
+        ver: 0,
+        fp: std::ptr::null(),
+        code: std::ptr::null(),
+        cext: std::ptr::null(),
+        keys: 0,
+        limit: 0,
+        effect: false,
+    };
+
+    /// A version under which the site's method is no leaf to run in place.
+    pub(crate) const fn none(ver: u64) -> LeafCallee {
+        LeafCallee { ver, ..Self::EMPTY }
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.fp.is_null()
+    }
+}
+
+impl LeafSiteData {
+    #[inline(always)]
+    fn hit(&self) -> LeafHit {
+        LeafHit {
+            fp: self.func.as_ptr(),
+            code: self.code,
+            effect: self.effect,
+            keys: self.keys,
+            limit: self.limit,
+        }
+    }
 }
 
 // SAFETY: as `StampSlot`.
@@ -76414,17 +79168,14 @@ impl LeafSite {
     /// An earlier callee verified under `ver` (see `leaf_site_hit`).
     #[cold]
     #[inline(never)]
-    fn poly_hit(
-        &self,
-        ver: u64,
-    ) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+    fn poly_hit(&self, ver: u64) -> Option<LeafHit> {
         // SAFETY: GIL-serialized; the borrow ends before any refill.
         let poly = unsafe { &*self.1.get() }.as_deref()?;
         poly.entries
             .iter()
             .flatten()
             .find(|d| d.ver == ver && d.func.strong_count() > 0)
-            .map(|d| (d.func.as_ptr(), d.code, d.effect))
+            .map(LeafSiteData::hit)
     }
 
     /// Record `data` as the site's callee, keeping the one it replaces
@@ -76468,17 +79219,11 @@ impl LeafSite {
 /// The site at `pc`'s verified callee under `ver`: its function, code and
 /// effect flag.
 #[inline(always)]
-fn leaf_site_hit(
-    ext: &CodeConstObjects,
-    pc: usize,
-    ver: u64,
-) -> Option<(*const crate::object::PyFunction, *const CodeObject, bool)> {
+fn leaf_site_hit(ext: &CodeConstObjects, pc: usize, ver: u64) -> Option<LeafHit> {
     let site = ext.leaf_sites.get(pc)?;
     // SAFETY: GIL-serialized; the borrow ends before any refill.
     match unsafe { &*site.0.get() } {
-        Some(d) if d.ver == ver && d.func.strong_count() > 0 => {
-            Some((d.func.as_ptr(), d.code, d.effect))
-        }
+        Some(d) if d.ver == ver && d.func.strong_count() > 0 => Some(d.hit()),
         Some(_) => site.poly_hit(ver),
         None => None,
     }
@@ -76596,6 +79341,31 @@ pub(crate) fn call_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
 /// without an activation of its own.
 #[cfg(feature = "jit")]
 pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
+    method_site_leaf(ext, pc)
+        || ext.method_slot(pc).is_some_and(|slot| {
+            // SAFETY: GIL-serialized; the borrow ends here.
+            matches!(
+                unsafe { &(*slot.0.get()).1 },
+                MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..)
+            )
+        })
+}
+
+/// Whether the method-load site at `pc` last resolved a plain Python
+/// function (a leaf or not: a site that sees several classes calls both).
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_py(ext: &CodeConstObjects, pc: usize) -> bool {
+    method_site_leaf(ext, pc)
+        || ext.method_slot(pc).is_some_and(|slot| {
+            // SAFETY: GIL-serialized; the borrow ends here.
+            matches!(unsafe { &(*slot.0.get()).1 }, MethodSlotFn::Py(_))
+        })
+}
+
+/// Whether the method-load site at `pc` calls a Python function that runs
+/// in place, as a frameless leaf (see [`method_site_in_place`]).
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_leaf(ext: &CodeConstObjects, pc: usize) -> bool {
     // (A recursive effect leaf runs as an ordinary call, not in place:
     // `core_local_method` declines it, so a native method-call helper
     // there would only cost every call its probes.)
@@ -76611,7 +79381,6 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
     leaf || ext
         .method_slot(pc)
         .is_some_and(|slot| match unsafe { &(*slot.0.get()).1 } {
-            MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..) => true,
             MethodSlotFn::Py(w) | MethodSlotFn::Static(w) => {
                 // SAFETY: the function is alive while the upgrade holds it.
                 w.upgrade().is_some_and(|f| {
@@ -77410,6 +80179,18 @@ fn class_attr_hit(slot: &StampSlot, cls: &crate::types::TypeObject) -> Option<Ob
 /// class, which also needs the instance not to shadow the name.
 const CLASS_ATTR_VIA_INSTANCE: u64 = 0x100;
 
+/// The class version at which the `LOAD_ATTR` at `pc` last read a class
+/// attribute through an instance of the class (its stamp, see
+/// [`class_attr_fill_via`]), if that is what it last read.
+pub(crate) fn class_attr_site(ext: &CodeConstObjects, pc: usize) -> Option<u64> {
+    let [ver, tag, _] = ext.stamp_slot(pc)?.get();
+    matches!(
+        tag ^ CLASS_ATTR_VIA_INSTANCE,
+        CLASS_ATTR_INT | CLASS_ATTR_FLOAT | CLASS_ATTR_BOOL | CLASS_ATTR_NONE | CLASS_ATTR_ENTRY
+    )
+    .then_some(ver)
+}
+
 /// A `LOAD_ATTR` site's stamp tag for a named tuple field (a
 /// `_tuplegetter` on the class at that version): the bits are the field
 /// index. The descriptor is a data descriptor, so no instance shadows it.
@@ -77599,6 +80380,75 @@ fn class_entry_fill(
         slot.set([cls.attr_version.get(), CLASS_ATTR_ENTRY ^ via, bits]);
         slot.1.set(owner);
     }
+}
+
+/// A `LOAD_ATTR` site's stamp tag for an attribute of a class under a
+/// Python metaclass that doesn't intercept the name (see
+/// `Interpreter::leaf_load_meta_class_attr`; an enum's members): the bits
+/// locate the class's entry as [`CLASS_ATTR_ENTRY`]'s do, and the slot's
+/// value word is the metaclass's version, which the class's doesn't follow.
+const META_CLASS_ENTRY: u64 = 0x5ca1_a770_0000_000b;
+
+/// The metaclass-class attribute the `LOAD_ATTR` site at `pc` remembers
+/// for `cls` (see [`META_CLASS_ENTRY`]), while both versions stand.
+#[inline]
+fn meta_entry_hit(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize) -> Option<Object> {
+    let slot = code_stamp_slot(code, pc as u32)?;
+    let [ver, tag, bits] = slot.get();
+    if tag != META_CLASS_ENTRY || ver != cls.attr_version.get() {
+        return None;
+    }
+    // SAFETY: GIL-serialized raw read; the reference ends with the compare.
+    let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+    if slot.value() != meta.attr_version.get() {
+        return None;
+    }
+    // SAFETY: reads between two instructions, running no code; the view
+    // ends with the value's clone.
+    let mro = unsafe { cls.mro.peek() }?;
+    // SAFETY: as above.
+    let d = unsafe { mro.get((bits >> 32) as usize)?.dict.peek() }?;
+    let (k, v) = d.get_index(bits as u32 as usize)?;
+    slot_name_matches(code, code.instructions.get(pc)?.arg, k).then(|| clone_hot(v))
+}
+
+/// Remember at the `LOAD_ATTR` site at `pc` that `cls`, under its Python
+/// metaclass, answered `v` (see [`META_CLASS_ENTRY`]): a value no access
+/// can bind or call `__get__` on, or an instance of `cls` itself (an
+/// enum's member), whose class's changes move `cls`'s version.
+#[cold]
+fn meta_entry_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize, v: &Object) {
+    let plain = match v {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_)
+        | Object::Long(_)
+        | Object::Tuple(_)
+        | Object::FrozenSet(_)
+        | Object::Module(_) => true,
+        Object::Instance(i) => std::ptr::eq(i.cls_raw(), cls),
+        _ => false,
+    };
+    if !plain {
+        return;
+    }
+    // SAFETY: GIL-serialized raw read.
+    let Some(meta_ver) =
+        (unsafe { (*cls.metaclass.as_ptr()).as_ref() }).map(|m| m.attr_version.get())
+    else {
+        return;
+    };
+    let (Some(slot), Some(bits)) = (
+        code_stamp_slot(code, pc as u32),
+        class_entry_of(code, cls, pc, v),
+    ) else {
+        return;
+    };
+    slot.set([cls.attr_version.get(), META_CLASS_ENTRY, bits]);
+    slot.1.set(meta_ver);
 }
 
 /// A `LOAD_ATTR` site's stamp tag for a class attribute that is an object
@@ -78297,7 +81147,7 @@ fn code_method_slot(code: &CodeObject, cache_pc: u32) -> Option<&MethodSlot> {
 #[inline]
 fn class_cached_method_held(
     cls: &crate::types::TypeObject,
-    name_key: usize,
+    name_key: crate::types::AttrKey,
     ver: u64,
 ) -> Option<Rc<crate::object::PyFunction>> {
     match cls.leaf_attrs.get(name_key, ver)? {
@@ -79369,6 +82219,29 @@ enum NativeTruth {
     Len(Rc<crate::object::BuiltinFn>),
     /// Anything else: the full path decides.
     Decline,
+}
+
+/// [`inst_may_shadow`] first settled by a leaf site's bound (see
+/// [`LeafSiteData::limit`]): values laid over the class's names `keys`
+/// that hold no more than `limit` of them don't hold the method's.
+#[inline(always)]
+fn inst_may_shadow_bounded(
+    inst: &PyInstance,
+    code: &CodeObject,
+    name_idx: u32,
+    keys: usize,
+    limit: usize,
+) -> bool {
+    if inst.dict.published().is_none() {
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        if let Some(split) = unsafe { inst.dict.split_cell().peek() } {
+            let (k, n) = split.keys_and_len();
+            if n == 0 || (k == keys && k != 0 && n <= limit) {
+                return false;
+            }
+        }
+    }
+    inst_may_shadow(inst, code, name_idx)
 }
 
 /// Whether `inst`'s own attributes may shadow `co_names[name_idx]` (a

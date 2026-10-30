@@ -146,7 +146,7 @@ for _ in range(3):
 
 
 # Demote in logical order, including during an outer native-key miss.
-for unsupported in ((frozenset([4.0]),), (frozenset([False]), 'four'), (b'four',)):
+for unsupported in ((frozenset([4.0]),), (frozenset([False]), 'four'), (4j,)):
     calls = []
 
     @functools.lru_cache(3)

@@ -2370,6 +2370,25 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
 
+/// `object.__repr__(self)` (CPython `object_repr`): `<module.qualname
+/// object at 0x…>` of the receiver's type for any receiver, a dict or an
+/// int as much as an instance, with neither the type's own `__repr__` nor
+/// a built-in subclass's payload consulted. (`super().__repr__()` reaching
+/// `object` takes its own path, `object_base_repr_string`.)
+fn slot_object_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__repr__() takes exactly one argument (0 given)"))?;
+    let addr = match o {
+        Object::Instance(inst) => Rc::as_ptr(inst) as usize,
+        other => object_identity(other) as usize,
+    };
+    Ok(Object::from_str(format!(
+        "<{} object at 0x{addr:x}>",
+        class_of(o).qualified_display_name()
+    )))
+}
+
 /// `str.__str__(self)` / `object.__str__(self)` — `str()` of `self`. Mirrors
 /// CPython: for a value that doesn't define its own `__str__`, this is the
 /// `repr`-derived default; for `str`/`bytes` it returns the payload.
@@ -2592,6 +2611,7 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
     }
     let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) = match name
     {
+        "__repr__" if base_name == "object" => ("__repr__", slot_object_repr),
         "__repr__" => ("__repr__", slot_repr),
         "__format__" => ("__format__", slot_format),
         // `object`'s default rich comparisons: `==`/`!=` compare by
@@ -12616,6 +12636,12 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
+    if let Some(recv @ Object::Str(_)) = args.first() {
+        // No tab: CPython answers the string itself.
+        if matches!(args.get(1), None | Some(Object::Int(_))) && !s.as_bytes().contains(&b'\t') {
+            return Ok(recv.clone());
+        }
+    }
     let tabsize = match args.get(1) {
         // A negative tabsize collapses tabs to zero columns in CPython
         // (`'x\ty'.expandtabs(-1) == 'xy'`); clamp so the `as usize` cast
@@ -12787,8 +12813,68 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let mut out = String::with_capacity(s.len());
     let receiver_bridged = matches!(args.first(), Some(Object::WStr(_)));
+    if matches!(args.first(), Some(Object::Str(r)) if crate::shared_value::SharedStr::is_ascii(r)) {
+        // CPython's `unicode_fast_translate`: an ASCII string whose
+        // characters each map to an ASCII character or to nothing is
+        // translated byte by byte, each entry looked up once. Any other
+        // entry leaves it to the general loop below.
+        const UNSEEN: u16 = 0x100;
+        const DELETE: u16 = 0x101;
+        let mut map = [UNSEEN; 128];
+        let bytes = s.as_bytes();
+        let mut out = vec![0u8; bytes.len()];
+        let mut n = 0;
+        let mut simple = true;
+        for &b in bytes {
+            // (`b` is ASCII, so the mask changes nothing.)
+            let mut m = map[usize::from(b & 0x7f)];
+            if m < UNSEEN {
+                // SAFETY: `n` trails the input position, inside `out`.
+                unsafe { *out.as_mut_ptr().add(n) = m as u8 };
+                n += 1;
+                continue;
+            }
+            if m == UNSEEN {
+                let entry = match &table {
+                    Table::Dict(Object::Dict(d)) => {
+                        d.borrow().get(&DictKey(Object::Int(i64::from(b)))).cloned()
+                    }
+                    Table::Dict(_) => None,
+                    Table::Seq(v) => v.get(b as usize).cloned(),
+                };
+                m = match entry {
+                    None => u16::from(b),
+                    Some(Object::None) => DELETE,
+                    Some(Object::Int(i)) if (0..128).contains(&i) => i as u16,
+                    Some(Object::Str(v)) if v.len() == 1 && v.is_ascii() => {
+                        u16::from(v.as_bytes()[0])
+                    }
+                    Some(_) => {
+                        simple = false;
+                        break;
+                    }
+                };
+                map[b as usize] = m;
+            }
+            if m != DELETE {
+                // SAFETY: as above.
+                unsafe { *out.as_mut_ptr().add(n) = m as u8 };
+                n += 1;
+            }
+        }
+        if simple {
+            // SAFETY: every byte written is ASCII.
+            let text = unsafe { std::str::from_utf8_unchecked(&out[..n]) };
+            // (Up to two characters, the shared small strings.)
+            return Ok(if n <= 2 {
+                Object::from_str(text)
+            } else {
+                Object::Str(crate::shared_value::SharedStr::from_ascii(text))
+            });
+        }
+    }
+    let mut out = String::with_capacity(s.len());
     let mut saw_surrogate = receiver_bridged;
     // Each ASCII character's entry, looked up once per call (CPython's
     // `unicode_fast_translate` caches its ASCII table the same way).
@@ -13875,10 +13961,14 @@ pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeE
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
+    let ascii = crate::shared_value::SharedStr::is_ascii(s);
     let s: &str = s;
+    // (The text's own bytes are copied once, straight into the result.)
     let bytes = match plain_codec(rest.first())? {
-        PlainCodec::Utf8 => s.as_bytes().to_vec(),
-        PlainCodec::Ascii if s.is_ascii() => s.as_bytes().to_vec(),
+        PlainCodec::Utf8 => return Some(Ok(bytes_from_slice(s.as_bytes()))),
+        PlainCodec::Ascii | PlainCodec::Latin1 if ascii => {
+            return Some(Ok(bytes_from_slice(s.as_bytes())))
+        }
         PlainCodec::Latin1 => s
             .chars()
             .map(|c| u8::try_from(u32::from(c)).ok())
@@ -13886,6 +13976,14 @@ pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeE
         PlainCodec::Ascii => return None,
     };
     Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// A `bytes` object holding a copy of `data`.
+fn bytes_from_slice(data: &[u8]) -> Object {
+    if data.is_empty() {
+        return Object::new_bytes(Vec::new());
+    }
+    Object::Bytes(crate::shared_value::SharedSlice::from(data))
 }
 
 /// `b.decode([encoding])` with a plain codec, when the bytes decode (an
@@ -13897,10 +13995,24 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
+    // (ASCII text is copied once, straight into the result, which is born
+    // knowing its length in characters.)
+    let ascii = |b: &[u8]| {
+        // SAFETY: ASCII is UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(b) };
+        if text.len() <= 2 {
+            Object::Str(crate::shared_value::SharedStr::from(text))
+        } else {
+            Object::Str(crate::shared_value::SharedStr::from_ascii(text))
+        }
+    };
     let text = match plain_codec(rest.first())? {
-        PlainCodec::Utf8 => std::str::from_utf8(b).ok()?.to_owned(),
-        PlainCodec::Ascii if b.is_ascii() => std::str::from_utf8(b).ok()?.to_owned(),
-        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect(),
+        _ if b.is_ascii() => return Some(Ok(ascii(b))),
+        PlainCodec::Utf8 => {
+            let text = std::str::from_utf8(b).ok()?;
+            return Some(Ok(Object::Str(crate::shared_value::SharedStr::from(text))));
+        }
+        PlainCodec::Latin1 => b.iter().map(|&c| char::from(c)).collect::<String>(),
         PlainCodec::Ascii => return None,
     };
     Some(Ok(Object::from_str(text)))
@@ -13908,6 +14020,33 @@ pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 
 /// `i.to_bytes([length[, byteorder]])` over plain arguments.
 pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // A non-negative machine int that fits a length of one to eight
+    // bytes, in either order: its bytes, with no byte order string or
+    // staging vector built.
+    if let [Object::Int(v), Object::Int(len), rest @ ..] = args {
+        let little = match rest {
+            [] => Some(false),
+            [Object::Str(order)] => match order.as_bytes() {
+                b"big" => Some(false),
+                b"little" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(little), 1..=8) = (little, *len) {
+            let len = *len as usize;
+            if *v >= 0 && (len == 8 || (*v as u64) >> (8 * len) == 0) {
+                let bytes = if little {
+                    (*v as u64).to_le_bytes()
+                } else {
+                    ((*v as u64) << (8 * (8 - len) as u32 % 64)).to_be_bytes()
+                };
+                return Some(Ok(Object::Bytes(crate::shared_value::SharedSlice::from(
+                    &bytes[..len],
+                ))));
+            }
+        }
+    }
     match args {
         [Object::Int(_)]
         | [Object::Int(_), Object::Int(_)]
@@ -13919,6 +14058,31 @@ pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 /// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
 /// `bytes` buffer.
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // One to seven bytes in either order: the machine int, with no byte
+    // order string or copy of the data built.
+    if let [Object::Type(t), Object::Bytes(data), rest @ ..] = args {
+        let little = match rest {
+            [] => Some(false),
+            [Object::Str(order)] => match order.as_bytes() {
+                b"big" => Some(false),
+                b"little" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(little), 1..=7) = (little, data.len()) {
+            if crate::sync::Rc::ptr_eq(t, &builtin_types().int_) {
+                let v = data.iter().enumerate().fold(0u64, |v, (i, &b)| {
+                    if little {
+                        v | u64::from(b) << (8 * i)
+                    } else {
+                        v << 8 | u64::from(b)
+                    }
+                });
+                return Some(Ok(Object::Int(v as i64)));
+            }
+        }
+    }
     match args {
         [Object::Type(t), Object::Bytes(_)]
         | [Object::Type(t), Object::Bytes(_), Object::Str(_)]

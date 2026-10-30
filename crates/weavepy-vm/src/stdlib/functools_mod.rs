@@ -743,15 +743,15 @@ enum ScalarLru {
 #[inline]
 fn native_lru_key(key: &Object) -> bool {
     match key {
-        Object::Int(_) | Object::Long(_) | Object::Str(_) => true,
+        Object::Int(_) | Object::Long(_) | Object::Str(_) | Object::Bytes(_) => true,
         Object::Tuple(_) => native_lru_tuple_key(key, 8, &mut 64),
         _ => false,
     }
 }
 
 /// Bound admission work and stack use independently of user key size.
-/// Exact tuples of native leaves (`None`, `bool`, `int`, `float`, `str`)
-/// cannot call Python or own finalizers, and compare and hash natively;
+/// Exact tuples of native leaves (`None`, `bool`, `int`, `float`, `str`,
+/// `bytes`) cannot call Python or own finalizers, and compare and hash natively;
 /// subclasses and larger/deeper keys keep the callback-capable path.
 fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bool {
     if *remaining == 0 {
@@ -762,6 +762,7 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
         Object::Int(_)
         | Object::Long(_)
         | Object::Str(_)
+        | Object::Bytes(_)
         | Object::None
         | Object::Bool(_)
         | Object::Float(_) => true,
@@ -771,6 +772,7 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
             let builtins = crate::builtin_types::builtin_types();
             Rc::ptr_eq(cls, &builtins.int_)
                 || Rc::ptr_eq(cls, &builtins.str_)
+                || Rc::ptr_eq(cls, &builtins.bytes_)
                 || Rc::ptr_eq(cls, &builtins.tuple_)
         }
         Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
@@ -1298,7 +1300,7 @@ impl<'a> ArgsProbe<'a> {
             hash.push(match probe.item(i) {
                 Object::Int(i) => crate::object::py_hash_long_i64(*i),
                 Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
-                item @ (Object::None | Object::Bool(_) | Object::Float(_)) => {
+                item @ (Object::None | Object::Bool(_) | Object::Float(_) | Object::Bytes(_)) => {
                     crate::object::py_hash_value(item)?
                 }
                 _ => return None,
@@ -1354,8 +1356,14 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
                             crate::shared_value::SharedStr::ptr_eq(a, b)
                                 || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
                         }
+                        (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
                         // A scalar never equals a tuple.
                         (_, Object::Tuple(_)) => false,
+                        // (`bytes` against a `str` may warn under `-b`.)
+                        (Object::Bytes(_), _) | (_, Object::Bytes(_)) => {
+                            self.foreign.set(true);
+                            return false;
+                        }
                         // Builtin scalars compare natively (`1 == 1.0 ==
                         // True`), identity first as a tuple's items do.
                         (
@@ -1384,6 +1392,7 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
             | Object::Long(_)
             | Object::Str(_)
             | Object::WStr(_)
+            | Object::Bytes(_)
             | Object::Tuple(_) => false,
             _ => {
                 self.foreign.set(true);

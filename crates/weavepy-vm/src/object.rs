@@ -3628,8 +3628,8 @@ impl<'a> LeafProbe<'a> {
     /// `None` unless `key` is a `str`, a machine `int`, a plain instance
     /// hashed by identity (its `__hash__` is `object`'s), a class whose
     /// metaclass keeps `type`'s `__hash__` and `__eq__`, a function,
-    /// generator-family object or module, or a tuple of machine ints and
-    /// strings.
+    /// generator-family object or module, a `bytes`, or a tuple of machine
+    /// ints, strings and `bytes`.
     #[inline(always)]
     pub fn new(key: &'a Object) -> Option<Self> {
         let hash = match key {
@@ -3682,14 +3682,15 @@ impl<'a> LeafProbe<'a> {
                 identity_hash(key)
             }
             Object::Type(t) if type_hash_is_identity(t) => identity_hash(key),
-            // A tuple of machine ints and strings: its (cached) hash, with
-            // no item's `__hash__` to run.
+            // A tuple of machine ints, strings and bytes: its (cached)
+            // hash, with no item's `__hash__` to run. (A bytes key too.)
             Object::Tuple(t)
                 if t.iter()
-                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_))) =>
+                    .all(|x| matches!(x, Object::Int(_) | Object::Str(_) | Object::Bytes(_))) =>
             {
                 py_hash_value(key)?
             }
+            Object::Bytes(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
             | Object::Generator(_)
@@ -3775,6 +3776,7 @@ impl LeafProbe<'_> {
             | (Object::Coroutine(a), Object::Coroutine(b))
             | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
@@ -3783,6 +3785,7 @@ impl LeafProbe<'_> {
                     match (x, y) {
                         (Object::Int(p), Object::Int(q)) => equal &= p == q,
                         (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
+                        (Object::Bytes(p), Object::Bytes(q)) => equal &= p[..] == q[..],
                         _ => {
                             self.foreign.set(true);
                             return false;
@@ -5642,6 +5645,10 @@ pub struct PyGenerator {
     /// [`Self::state`] puts the chain back as running it would have left
     /// it before anything sees the state.
     pub(crate) chain: crate::sync::Cell<usize>,
+    /// A generator expression's generator its `MAKE_FUNCTION` made, whose
+    /// `CALL 0` hasn't yet handed it its iterator (its `.0`): only that
+    /// call's operand stack holds it (see `Interpreter::make_genexp`).
+    pub(crate) genexp_pending: crate::sync::Cell<bool>,
 }
 
 /// The state of a [`PyGenerator`] that few carry.
@@ -5785,6 +5792,7 @@ impl PyGenerator {
             gc_slot: crate::gc_trace::GcSlot::new(),
             track_deferred: crate::sync::Cell::new(false),
             chain: crate::sync::Cell::new(0),
+            genexp_pending: crate::sync::Cell::new(false),
         }
     }
 
@@ -5925,6 +5933,7 @@ pub(crate) fn pooled_generator(
     m.hooks_inited.set(false);
     m.finalize_ran.set(false);
     m.track_deferred.set(false);
+    m.genexp_pending.set(false);
     Ok(g)
 }
 
@@ -10649,6 +10658,20 @@ impl Object {
         )
     }
 
+    /// Whether this value's truth needs the interpreter
+    /// (`Interpreter::obj_truthy`): an instance (its `__bool__` or
+    /// `__len__`), an object-backed mapping proxy (its mapping's length),
+    /// or a class whose metaclass isn't `type` (the metaclass's `__bool__`
+    /// or `__len__`). Anything else's is [`Self::is_truthy`].
+    #[inline]
+    pub fn truth_dispatches(&self) -> bool {
+        match self {
+            Object::Instance(_) | Object::MappingProxyObj(_) => true,
+            Object::Type(t) => !t.metaclass_is_type(),
+            _ => false,
+        }
+    }
+
     /// Python truthiness.
     pub fn is_truthy(&self) -> bool {
         match self {
@@ -11753,6 +11776,15 @@ impl Object {
                 let quote = if has_single && !has_double { '"' } else { '\'' };
                 let mut out = String::with_capacity(s.len() + 2);
                 out.push(quote);
+                // Printable ASCII other than the backslash and the quote,
+                // the usual string, is copied whole.
+                if s.bytes()
+                    .all(|b| (0x20..0x7f).contains(&b) && b != b'\\' && b != quote as u8)
+                {
+                    out.push_str(s);
+                    out.push(quote);
+                    return out;
+                }
                 for c in s.chars() {
                     match c {
                         '\\' => out.push_str("\\\\"),
@@ -12182,6 +12214,25 @@ impl Object {
                         }
                     }
                     format!("<{} object>", inst.cls().name)
+                } else if let Some(
+                    payload @ (Object::List(_)
+                    | Object::Dict(_)
+                    | Object::Tuple(_)
+                    | Object::Str(_)
+                    | Object::WStr(_)
+                    | Object::Int(_)
+                    | Object::Long(_)
+                    | Object::Float(_)
+                    | Object::Complex(_)
+                    | Object::Bytes(_)),
+                ) = inst.native.get()
+                {
+                    // A subclass of a value or container built-in that
+                    // doesn't override `__repr__` renders as its base does
+                    // (CPython's `list_repr`, `dict_repr`, … ignore the
+                    // exact type): `[9]` inside `(None, L([9]))`, not the
+                    // identity repr. (`set` subclasses are handled above.)
+                    payload.repr()
                 } else {
                     // CPython's `object.__repr__`: `<module.qualname object
                     // at 0x…>` (module omitted for builtins).
