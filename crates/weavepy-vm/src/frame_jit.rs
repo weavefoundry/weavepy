@@ -112,6 +112,21 @@ fn lean_above() -> usize {
     })
 }
 
+/// The instruction count from which a body is lowered lean without
+/// measuring it first (see `compile_with`; `WEAVEPY_FRAME_JIT_LEAN_LEN`
+/// overrides it, a tuning aid). Over the workload suite, every compiled
+/// body of 157 instructions or more came out above [`lean_above`]'s size
+/// (and none of fewer than 74).
+fn lean_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_LEAN_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160)
+    })
+}
+
 /// The most IR instructions one compile takes (`WEAVEPY_FRAME_JIT_CHUNK`
 /// overrides it, `0` never splits): a larger body compiles in chunks (see
 /// [`chunk_ranges`]). The register allocator's working memory grows with
@@ -9604,8 +9619,10 @@ fn compile_with(
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
-    // goes to its calls more than to the shortcuts in line.
-    let mut lean = false;
+    // goes to its calls more than to the shortcuts in line. A body this
+    // long always comes out large, so it's lowered lean at once (the
+    // measuring lowering cost the interpreter's thread as much again).
+    let mut lean = n >= lean_len();
     let whole = loop {
         let low = lower_range(
             engine,
