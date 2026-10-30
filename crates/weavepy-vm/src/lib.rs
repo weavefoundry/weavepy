@@ -30859,8 +30859,15 @@ impl Interpreter {
             }
         }
         match cls.lookup(name) {
+            // (A builtin class's miss the full path remembered, as `hasattr`
+            // of `coroutine` finds `_asyncio_future_blocking` missing.)
             None => default
-                .filter(|_| type_attr_certainly_missing(cls, name))
+                .filter(|_| {
+                    type_attr_certainly_missing(cls, name)
+                        || (cls.flags.is_builtin
+                            && cls.verdict_cached(crate::types::Verdict::TypeAttrMissing, name)
+                                == Some(true))
+                })
                 .cloned(),
             Some(
                 v @ (Object::None
@@ -37233,6 +37240,20 @@ impl Interpreter {
             if t.flags.is_builtin
                 && t.flags.is_exception
                 && exc_family_flags(t) & EXC_FAM_GROUP == 0
+            {
+                return Ok(self.build_exception_instance(t.clone(), &[]));
+            }
+            // A Python subclass with neither `__init__` nor `__new__` of its
+            // own, under a metaclass that calls like `type`: likewise.
+            if !t.flags.is_builtin
+                && t.flags.is_exception
+                && t.native_kind.get() == 0
+                && t.c_ext_ptr.get() == 0
+                && exc_family_flags(t) & !EXC_CUSTOM_INIT == 0
+                && lookup_exception_init(t).is_none()
+                && Self::metaclass_calls_like_type(t)
+                && t.lookup_with_owner("__new__")
+                    .is_none_or(|(_, owner)| owner.flags.is_builtin)
             {
                 return Ok(self.build_exception_instance(t.clone(), &[]));
             }
@@ -78582,7 +78603,7 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
             // sys
-            | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern"
+            | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern" | "exc_info"
             // struct
             | "pack" | "unpack" | "calcsize"
             // warnings (which reads the whole stack, lean activations included)
@@ -85098,7 +85119,7 @@ enum EqClass {
 fn eq_class(o: &Object) -> Option<EqClass> {
     use crate::types::Dunder;
     Some(match o {
-        Object::None | Object::Function(_) => EqClass::Identity,
+        Object::None | Object::Function(_) | Object::Builtin(_) => EqClass::Identity,
         Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) => EqClass::Value(0),
         Object::Str(_) => EqClass::Value(1),
         Object::Bytes(_) => EqClass::Value(2),

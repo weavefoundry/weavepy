@@ -932,6 +932,196 @@ show("subclasses", rows)
 print(rows[49][-1], rows[50][-1], rows[75][-1])
 '''
 
+CASES["getattr_hook_classes"] = r'''
+class Hook:
+    k = "class-value"
+    desc_calls = 0
+
+    def __init__(self):
+        self.x = 1
+
+    def m(self):
+        return "method"
+
+    @property
+    def p(self):
+        return "prop"
+
+    @property
+    def bad(self):
+        raise AttributeError("from property")
+
+    def __getattr__(self, name):
+        return "hook:" + name
+
+
+class NonData:
+    def __get__(self, obj, owner=None):
+        raise AttributeError("from descriptor")
+
+
+class WithDescr(Hook):
+    nd = NonData()
+
+
+class Slots:
+    __slots__ = ("a", "b")
+
+    def __init__(self):
+        self.a = 1
+
+    def __getattr__(self, name):
+        return "slots-hook:" + name
+
+
+class Late:
+    def __init__(self):
+        self.x = 1
+
+    def m(self):
+        return "late-m"
+
+
+h, w, s, late = Hook(), WithDescr(), Slots(), Late()
+
+
+def probe():
+    m = h.m
+    out = [h.x, h.k, m if isinstance(m, str) else m(), h.p, h.bad, h.missing, w.nd, w.x, s.a, s.b,
+           s.c, late.x, late.m()]
+    try:
+        out.append(late.nope)
+    except AttributeError as e:
+        out.append(str(e))
+    h.y = 2
+    out.append(h.y)
+    return out
+
+
+rows = []
+for i in range(N):
+    if i == 100:
+        del h.x
+        del Hook.m
+        Late.__getattr__ = lambda self, name: "late-hook:" + name
+        del late.x
+    if i == 150:
+        h.x = 5
+        Hook.m = lambda self: "new-method"
+        late.x = 9
+    if i == 200:
+        h.__dict__["k"] = "instance-value"
+        del Late.__getattr__
+    try:
+        rows.append(probe())
+    except AttributeError as e:
+        rows.append(str(e))
+show("hook", rows)
+print(rows[99], rows[100], rows[150], rows[200])
+'''
+
+CASES["raised_classes"] = r'''
+import sys
+
+log = []
+
+
+class Plain(Exception):
+    pass
+
+
+class WithInit(Exception):
+    def __init__(self):
+        log.append("init")
+        super().__init__("from-init")
+
+
+class WithNew(Exception):
+    def __new__(cls):
+        log.append("new")
+        return super().__new__(cls)
+
+
+class Meta(type):
+    def __call__(cls, *a):
+        log.append("meta-call")
+        return super().__call__(*a)
+
+
+class WithMeta(Exception, metaclass=Meta):
+    pass
+
+
+class NotExc(Exception):
+    def __new__(cls):
+        return 5
+
+
+class Stop(StopIteration):
+    pass
+
+
+class Sys(SystemError):
+    pass
+
+
+class Attr(AttributeError):
+    pass
+
+
+class Os(OSError):
+    pass
+
+
+class Late(Exception):
+    pass
+
+
+CLASSES = [Plain, WithInit, WithNew, WithMeta, NotExc, Stop, Sys, Attr, Os, Late, KeyError, ValueError]
+
+
+def run(i):
+    out = []
+    for c in CLASSES:
+        try:
+            raise c
+        except BaseException as e:
+            out.append((type(e).__name__, e.args, repr(e), e.__traceback__.tb_lineno
+                        - sys._getframe().f_code.co_firstlineno, e.__context__ is None, vars(e)))
+    try:
+        raise Plain from ValueError(1)
+    except Plain as e:
+        out.append((repr(e.__cause__), e.__suppress_context__))
+    try:
+        try:
+            raise ValueError
+        except ValueError:
+            raise Plain
+    except Plain as e:
+        out.append(repr(e.__context__))
+    p = Plain()
+    p.x = i
+    out.append(p.x)
+    out.append(sys.exc_info())
+    try:
+        raise Plain
+    except Plain:
+        out.append((sys.exc_info()[0].__name__, repr(sys.exc_info()[1])))
+    return out
+
+
+rows = []
+for i in range(N):
+    if i == 100:
+        Late.__init__ = lambda self: Exception.__init__(self, "late-init")
+    if i == 200:
+        del Late.__init__
+        Late.__new__ = lambda cls: Exception.__new__(cls, "late-new")
+    rows.append(run(i))
+show("raised", rows)
+print(rows[99][9], rows[100][9], rows[200][9], len(log))
+'''
+
 EXPECTED = {
     'identity_compares': "identity 300 1902506595 [1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1\n< '<' not supported between instances of 'NoneType' and 'A'\n>= '>=' not supported between instances of 'NoneType' and 'A'\n< '<' not supported between instances of 'A' and 'A'\n>= '>=' not supported between instances of 'A' and 'A'\n< '<' not supported between instances of 'type' and 'A'\n>= '>=' not supported between instances of 'type' and 'A'\n< '<' not supported between instances of 'function' and 'A'\n>= '>=' not supported between instances of 'function' and 'A'\n< '<' not supported between instances of 'Color' and 'A'\n>= '>=' not supported between instances of 'Color' and 'A'\nTrue False True False\n",
     'numbers_and_bytes': 'nums 100 485371766 [[[True, False, False, True, False, True], [False, True, False, False, True, True], [False, True, False, False, True, True], [True, False, False, True, False, True], [False, True, False, False, True, \nbytes 100 1296585994 [[[True, False, False, True, False, True], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, F\nseqs 100 1762798722 [[[True, False, False, True, False, True], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, F\n',
@@ -946,6 +1136,8 @@ EXPECTED = {
     'class_calls_in_a_lane': "calls 100 274867561 [[False, False, b'\\x00\\x00', 255, 1.5, '0', [0], (0, 1), 'ab', 1, 0, 0, ('meta', (0,), 'calls'), 'int', '__main__', '__main__', '__main__', '__main__', 'Err(0)', 2, (1,), ('ValueError', 'invalid liter\n1000 [('I line', 98), ('D line', 98, 'calls'), 'before arg', 'del arg', 'after arg', 'before kw', 'del kw', 'after kw', 'del in-list', 'end', ('I line', 98), ('D line', 98, 'calls')] ['before arg', 'del arg', 'after arg', 'before kw', 'del kw', 'after kw', 'del in-list', 'end']\n",
     'operator_and_step_lanes': 'lanes 300 234783539 [["{\'i\': 0} [0]", \'P(0)\', \'P(0)\', [1, 1], (1, 2), \'aa\', b\'0\', {1, 2}, {\'a\': 1, \'b\': 2}, True, True, True, True, True, True, True, True, True, True, (\'KeyError\', \'1\'), (\'TypeError\', "argument of type \'\n["{\'i\': 299} [299]", \'P(299)\', \'P(299)\', [1, 1]] 600\n',
     'value_subclasses': "subclasses 100 3695704447 [[(True, False), (False, True), (False, True), (True, False), (False, True), (False, True), (False, True), (True, False), (False, True), (True, False), (True, False), (True, False), (False, True), (Tr\n(1, 2, 'over', 'ridden', 'list', 'over', 5, 6, [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], [1, 2], True, False) (1, 2, 'over', 'ridden', 'list', 'over', 'late', 'iter', [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], ['iter', 'late'], 'late-eq', False) (1, 2, 'over', 'ridden', 'list', 'over', 5, 6, [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], [1, 2], True, 'late-ne')\n",
+    'getattr_hook_classes': 'hook 300 3352274017 [[1, \'class-value\', \'method\', \'prop\', \'hook:bad\', \'hook:missing\', \'hook:nd\', 1, 1, \'slots-hook:b\', \'slots-hook:c\', 1, \'late-m\', "\'Late\' object has no attribute \'nope\'", 2], [1, \'class-value\', \'method\'\n[1, \'class-value\', \'method\', \'prop\', \'hook:bad\', \'hook:missing\', \'hook:nd\', 1, 1, \'slots-hook:b\', \'slots-hook:c\', 1, \'late-m\', "\'Late\' object has no attribute \'nope\'", 2] [\'hook:x\', \'class-value\', \'hook:m\', \'prop\', \'hook:bad\', \'hook:missing\', \'hook:nd\', 1, 1, \'slots-hook:b\', \'slots-hook:c\', \'late-hook:x\', \'late-m\', \'late-hook:nope\', 2] [5, \'class-value\', \'new-method\', \'prop\', \'hook:bad\', \'hook:missing\', \'hook:nd\', 1, 1, \'slots-hook:b\', \'slots-hook:c\', 9, \'late-m\', \'late-hook:nope\', 2] [5, \'instance-value\', \'new-method\', \'prop\', \'hook:bad\', \'hook:missing\', \'hook:nd\', 1, 1, \'slots-hook:b\', \'slots-hook:c\', 9, \'late-m\', "\'Late\' object has no attribute \'nope\'", 2]\n',
+    'raised_classes': 'raised 300 3517363377 [[(\'Plain\', (), \'Plain()\', 4, True, {}), (\'WithInit\', (\'from-init\',), "WithInit(\'from-init\')", 4, True, {}), (\'WithNew\', (), \'WithNew()\', 4, True, {}), (\'WithMeta\', (), \'WithMeta()\', 4, True, {}), (\'T\n(\'Late\', (), \'Late()\', 4, True, {}) (\'Late\', (\'late-init\',), "Late(\'late-init\')", 4, True, {}) (\'Late\', (), \'Late()\', 4, True, {}) 900\n',
 }
 
 ENVS = [
