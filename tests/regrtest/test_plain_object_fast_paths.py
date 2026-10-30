@@ -648,6 +648,290 @@ show("formats", run())
 print(run()[:6])
 '''
 
+CASES["class_calls_in_a_lane"] = r'''
+import collections
+import enum
+import sys
+import traceback
+import typing
+
+log = []
+
+
+class Fin:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        log.append("del " + self.tag)
+
+
+class D(dict):
+    def __init__(self, *a):
+        log.append(("D line", sys._getframe(1).f_lineno, sys._getframe(1).f_code.co_name))
+        super().__init__()
+
+
+class I(int):
+    def __new__(cls, v):
+        log.append(("I line", sys._getframe(1).f_lineno))
+        return super().__new__(cls, v)
+
+
+class L(list):
+    pass
+
+
+class St(str):
+    pass
+
+
+class Tu(tuple):
+    pass
+
+
+class Bad:
+    def __bool__(self):
+        raise ValueError("bad bool")
+
+
+class Stack(dict):
+    def __init__(self):
+        self.where = [f.lineno for f in traceback.extract_stack()[-2:]]
+
+
+class Deep(dict):
+    def __init__(self, n):
+        if n:
+            Deep(n - 1)
+
+
+class MetaCall(type):
+    def __call__(cls, *a):
+        return ("meta", a, sys._getframe(1).f_code.co_name)
+
+
+class M(metaclass=MetaCall):
+    pass
+
+
+class Err(Exception):
+    pass
+
+
+class ErrInit(Exception):
+    def __init__(self, a, b):
+        super().__init__(a)
+        self.b = b
+
+
+def where(e):
+    tb = e.__traceback__
+    out = []
+    while tb:
+        out.append((tb.tb_frame.f_code.co_name, tb.tb_lineno - tb.tb_frame.f_code.co_firstlineno))
+        tb = tb.tb_next
+    return out
+
+
+def calls(i):
+    out = [bool(i), bool([]), bytes(2), int("ff", 16), float("1.5"), str(i), L((i,)), Tu((i, 1)),
+           St("a") + "b", I(i) + 1, len(D()), Stack().where[0] - sys._getframe().f_lineno,
+           M(i), type(i).__name__, type("X", (), {}).__module__,
+           collections.namedtuple("N", "a").__module__, enum.Enum("E", "A").__module__,
+           typing.TypeVar("T").__module__, repr(Err(i)), ErrInit(1, 2).b, ErrInit(1, 2).args]
+    for bad in (lambda: int("x"), lambda: bool(Bad()), lambda: L(1), lambda: ErrInit(1),
+                lambda: Deep(100000), lambda: float("y")):
+        try:
+            bad()
+        except (ValueError, TypeError, RecursionError) as e:
+            out.append((type(e).__name__, str(e)[:40], where(e)[:2]))
+    for tag in ("arg", "kw"):
+        log.append("before " + tag)
+        out.append(bool(Fin(tag)))
+        log.append("after " + tag)
+    out.append(L([Fin("in-list")])[0].tag)
+    log.append("end")
+    return out
+
+
+rows = [calls(i) for i in range(N // 3)]
+show("calls", rows)
+print(len(log), log[:12], log[-8:])
+sys.setrecursionlimit(1000)
+'''
+
+CASES["operator_and_step_lanes"] = r'''
+import sys
+
+
+class P:
+    def __init__(self, v):
+        self.v = v
+
+    def __repr__(self):
+        return "P(%d)" % self.v
+
+
+class Hashy:
+    def __init__(self, v):
+        self.v = v
+
+    def __hash__(self):
+        log.append("hash")
+        return self.v
+
+    def __eq__(self, other):
+        log.append("eq")
+        return self.v == other
+
+
+class Raises:
+    def __contains__(self, x):
+        raise KeyError(x)
+
+
+class Iters:
+    def __iter__(self):
+        return iter((1, 2))
+
+
+log = []
+
+
+def f():
+    pass
+
+
+def run(i):
+    out = ["%r %s" % ({"i": i}, [i]), "%(a)s" % {"a": P(i)}, "%s" % (P(i),), [1] * 2, (1,) + (2,),
+           "a" * 2, b"%d" % i, {1} | {2}, {"a": 1} | {"b": 2}]
+    out += [1 in [1], 2 in {2}, Hashy(1) in {1: 1}, 1 in Iters(), 3 not in Iters(), "a" in "abc",
+            b"a" in b"abc", 1 in range(3), "k" in {"k": 1}.keys(), 1 in (i for i in (1, 2))]
+    for bad in (lambda: 1 in Raises(), lambda: 1 in 2, lambda: [] in {}, lambda: 1 in None,
+                lambda: "%d" % "x", lambda: 1 + "a", lambda: {} + {}):
+        try:
+            out.append(bad())
+        except (KeyError, TypeError) as e:
+            out.append((type(e).__name__, str(e)))
+    f.attr = i
+    f.__doc__ = "doc%d" % i
+    f.__qualname__ = "q%d" % i
+    f.__name__ = "n%d" % i
+    out += [f.attr, f.__doc__, f.__qualname__, f.__name__]
+    for bad in (lambda: setattr(f, "__name__", 1), lambda: setattr(f, "__code__", 1)):
+        try:
+            bad()
+        except TypeError as e:
+            out.append(str(e))
+    try:
+        (1).x = 1
+    except AttributeError as e:
+        out.append(str(e))
+    try:
+        None.x = 1
+    except AttributeError as e:
+        out.append(str(e))
+    return out
+
+
+rows = [run(i) for i in range(N)]
+show("lanes", rows)
+print(rows[-1][:4], len(log))
+'''
+
+CASES["value_subclasses"] = r'''
+import enum
+from collections import namedtuple
+
+
+class IE(enum.IntEnum):
+    A = 1
+    B = 2
+
+
+class SE(str, enum.Enum):
+    X = "x"
+
+
+class I(int):
+    pass
+
+
+class S(str):
+    pass
+
+
+class F(float):
+    pass
+
+
+class EqI(int):
+    def __eq__(self, other):
+        return "eqi"
+
+    __hash__ = int.__hash__
+
+
+class NeI(int):
+    def __ne__(self, other):
+        return "nei"
+
+
+class It(tuple):
+    def __iter__(self):
+        return iter(("over", "ridden"))
+
+
+class Li(list):
+    def __iter__(self):
+        return iter(("list", "over"))
+
+
+class Late(tuple):
+    pass
+
+
+class LateI(int):
+    pass
+
+
+NT = namedtuple("NT", "x y")
+nt, plain = NT(1, 2), (1, 2)
+late = Late((5, 6))
+lateI = LateI(3)
+VALUES = [IE.A, IE.B, SE.X, I(1), I(2), S("x"), S("y"), F(1.0), F(1.5), EqI(1), NeI(1), 1, 2, 1.0, 1.5,
+          "x", "y", None, True, b"x"]
+
+
+def probe():
+    out = []
+    for x in VALUES:
+        for y in VALUES:
+            out.append((x == y, x != y))
+    a, b = nt
+    c, d = It((1, 2))
+    e, g = Li((1, 2))
+    h, j = late
+    out.append((a, b, c, d, e, g, h, j, list(nt), tuple(Li((1, 2))), [v for v in It((1,))],
+                list(iter(Li((3,)))), sorted(Late((2, 1))), lateI == 3, lateI != 3))
+    return out
+
+
+rows = []
+for i in range(N // 3):
+    if i == 50:
+        Late.__iter__ = lambda self: iter(("late", "iter"))
+        LateI.__eq__ = lambda self, other: "late-eq"
+    if i == 75:
+        del Late.__iter__
+        del LateI.__eq__
+        LateI.__ne__ = lambda self, other: "late-ne"
+    rows.append(probe())
+show("subclasses", rows)
+print(rows[49][-1], rows[50][-1], rows[75][-1])
+'''
+
 EXPECTED = {
     'identity_compares': "identity 300 1902506595 [1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1058, 1\n< '<' not supported between instances of 'NoneType' and 'A'\n>= '>=' not supported between instances of 'NoneType' and 'A'\n< '<' not supported between instances of 'A' and 'A'\n>= '>=' not supported between instances of 'A' and 'A'\n< '<' not supported between instances of 'type' and 'A'\n>= '>=' not supported between instances of 'type' and 'A'\n< '<' not supported between instances of 'function' and 'A'\n>= '>=' not supported between instances of 'function' and 'A'\n< '<' not supported between instances of 'Color' and 'A'\n>= '>=' not supported between instances of 'Color' and 'A'\nTrue False True False\n",
     'numbers_and_bytes': 'nums 100 485371766 [[[True, False, False, True, False, True], [False, True, False, False, True, True], [False, True, False, False, True, True], [True, False, False, True, False, True], [False, True, False, False, True, \nbytes 100 1296585994 [[[True, False, False, True, False, True], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, F\nseqs 100 1762798722 [[[True, False, False, True, False, True], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, False], [False, True, True, True, False, F\n',
@@ -659,6 +943,9 @@ EXPECTED = {
     'metaclass_checks': "checks 300 625156900 [[True, False, False, True, False, True, False, True, False, True, False, True, False, True, True, False, True, True, True, True, True, 'issubclass() arg 1 must be a class', 'issubclass() arg 2 must b\n[True, False, True, False] [True, True, True, False] [True, False, True, False]\n",
     'dict_subclass_contains': 'contains 300 1163586197 [[True, False, True, False, True, True, True, True, True, False, True, False, False, True, \'no hash\', "cannot use \'list\' as a dict key (unhashable type: \'list\')"], [True, False, True, False, True, Tru\n[True, False, True, False, True, True, True, True, True, False, True, False, False, True, \'no hash\', "cannot use \'list\' as a dict key (unhashable type: \'list\')"] [True, False, True, False, True, True, True, True, True, False, False, True, False, True, \'no hash\', "cannot use \'list\' as a dict key (unhashable type: \'list\')"] [True, False, True, False, True, True, True, True, True, False, True, False, False, True, \'no hash\', "cannot use \'list\' as a dict key (unhashable type: \'list\')"] 600\n',
     'format_keyerrors': 'formats 1800 2769395197 [("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'b\')", (\'b\',), "\'b\'"), ("KeyError(b\'a\')", (b\'a\',), "b\'a\'"), ("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'a\')", (\'a\',), \n[("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'b\')", (\'b\',), "\'b\'"), ("KeyError(b\'a\')", (b\'a\',), "b\'a\'"), ("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'a\')", (\'a\',), "\'a\'"), ("KeyError(\'a\')", (\'a\',), "\'a\'")]\n',
+    'class_calls_in_a_lane': "calls 100 274867561 [[False, False, b'\\x00\\x00', 255, 1.5, '0', [0], (0, 1), 'ab', 1, 0, 0, ('meta', (0,), 'calls'), 'int', '__main__', '__main__', '__main__', '__main__', 'Err(0)', 2, (1,), ('ValueError', 'invalid liter\n1000 [('I line', 98), ('D line', 98, 'calls'), 'before arg', 'del arg', 'after arg', 'before kw', 'del kw', 'after kw', 'del in-list', 'end', ('I line', 98), ('D line', 98, 'calls')] ['before arg', 'del arg', 'after arg', 'before kw', 'del kw', 'after kw', 'del in-list', 'end']\n",
+    'operator_and_step_lanes': 'lanes 300 234783539 [["{\'i\': 0} [0]", \'P(0)\', \'P(0)\', [1, 1], (1, 2), \'aa\', b\'0\', {1, 2}, {\'a\': 1, \'b\': 2}, True, True, True, True, True, True, True, True, True, True, (\'KeyError\', \'1\'), (\'TypeError\', "argument of type \'\n["{\'i\': 299} [299]", \'P(299)\', \'P(299)\', [1, 1]] 600\n',
+    'value_subclasses': "subclasses 100 3695704447 [[(True, False), (False, True), (False, True), (True, False), (False, True), (False, True), (False, True), (True, False), (False, True), (True, False), (True, False), (True, False), (False, True), (Tr\n(1, 2, 'over', 'ridden', 'list', 'over', 5, 6, [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], [1, 2], True, False) (1, 2, 'over', 'ridden', 'list', 'over', 'late', 'iter', [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], ['iter', 'late'], 'late-eq', False) (1, 2, 'over', 'ridden', 'list', 'over', 5, 6, [1, 2], ('list', 'over'), ['over', 'ridden'], ['list', 'over'], [1, 2], True, 'late-ne')\n",
 }
 
 ENVS = [

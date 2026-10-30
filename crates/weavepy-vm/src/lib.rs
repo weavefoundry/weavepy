@@ -11430,7 +11430,11 @@ impl Interpreter {
                         {
                             return None
                         }
-                        Some(OpCode::StoreAttr) if self.core_setter(sw) => return None,
+                        Some(OpCode::StoreAttr)
+                            if self.core_setter(sw) || self.core_step_lane(sw) =>
+                        {
+                            return None
+                        }
                         Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => {
                             return None
                         }
@@ -11453,6 +11457,9 @@ impl Interpreter {
                 Some(OpCode::CallKw | OpCode::CallEx) if self.core_call_lane(sw) => return None,
                 Some(OpCode::BinaryOp | OpCode::SetUpdate) if self.core_set_op(sw) => return None,
                 Some(OpCode::BinaryOp | OpCode::CompareOp) if self.core_operator_lane(sw) => {
+                    return None
+                }
+                Some(OpCode::ContainsOp | OpCode::StoreAttr) if self.core_step_lane(sw) => {
                     return None
                 }
                 _ => {}
@@ -16526,10 +16533,10 @@ impl Interpreter {
     }
 
     /// A `BINARY_OP` or `COMPARE_OP` at `sw`'s running activation's `pc`
-    /// with an instance operand (a Python dunder, `Vector.__sub__`): the
-    /// full handler's own step, run with the activation on the pending
-    /// list (the dunder runs as a nested call) instead of as a full
-    /// interpreter step. `false` touches nothing.
+    /// the core loop's arms declined (a Python dunder, `Vector.__sub__`; a
+    /// `%` of a `dict`): the full handler's own step, run with the activation
+    /// on the pending list (a dunder runs as a nested call) instead of as a
+    /// full interpreter step. `false` touches nothing.
     #[inline(never)]
     fn core_operator_lane(&mut self, sw: &mut CoreSwitch) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
@@ -16540,13 +16547,12 @@ impl Interpreter {
             return false;
         };
         let n = frame.stack.len();
-        if n < 2
-            || !(matches!(frame.stack[n - 1], Object::Instance(_))
-                || matches!(frame.stack[n - 2], Object::Instance(_)))
-        {
+        if n < 2 {
             return false;
         }
-        if matches!(ins.op, OpCode::BinaryOp | OpCode::CompareOp) {
+        if matches!(frame.stack[n - 1], Object::Instance(_))
+            || matches!(frame.stack[n - 2], Object::Instance(_))
+        {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
@@ -16559,6 +16565,64 @@ impl Interpreter {
             self.binary_op_step(frame, pc as u32, ins.arg)
         } else {
             self.compare_op_step(frame, pc as u32, ins.arg)
+        };
+        self.core_pending_exit(sw, pending);
+        match result {
+            // SAFETY: the running activation's last-pc slot.
+            Ok(()) => unsafe { *sw.last = pc },
+            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// `CONTAINS_OP` (or `STORE_ATTR` on something other than an instance)
+    /// at `sw`'s running activation's `pc` that the core loop's arms
+    /// declined: as [`Self::core_operator_lane`] runs an operator, the full
+    /// handler's own work with the activation on the pending list. `false`
+    /// touches nothing.
+    #[inline(never)]
+    fn core_step_lane(&mut self, sw: &mut CoreSwitch) -> bool {
+        // SAFETY: see `CoreSwitch`: the running activation is synced and
+        // unborrowed here.
+        let frame = unsafe { &mut *sw.cur };
+        let pc = frame.pc as usize;
+        let Some(&ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        let n = frame.stack.len();
+        if n < 2 {
+            return false;
+        }
+        let store = match ins.op {
+            OpCode::ContainsOp => false,
+            OpCode::StoreAttr if !matches!(frame.stack[n - 1], Object::Instance(_)) => true,
+            _ => return false,
+        };
+        frame.pc = pc as u32 + 1;
+        let pending = self.core_pending_enter(sw, frame, pc);
+        let result = if store {
+            self.specialized_store_attr(frame, pc as u32, ins.arg)
+        } else {
+            let container = frame.stack.pop().expect("checked above");
+            let item = frame.stack.pop().expect("checked above");
+            let globals = frame.globals.clone();
+            let found = self.contains_full(&container, &item, &globals);
+            // (The full handler's release, in its order.)
+            let container = if let Object::MappingProxyObj(inner) = &container {
+                (**inner).clone()
+            } else {
+                container
+            };
+            self.release(container);
+            found.map(|found| {
+                frame
+                    .stack
+                    .push(Object::Bool(if ins.arg == 1 { !found } else { found }));
+            })
         };
         self.core_pending_exit(sw, pending);
         match result {
@@ -30691,7 +30755,15 @@ impl Interpreter {
             {
                 return Some(Object::Bool(true));
             }
-            _ => return None,
+            // A built-in value's class the full path found has no such
+            // attribute (`enum`'s `hasattr(1, "__get__")`).
+            _ => {
+                let d = default?;
+                let c = builtin_value_class(recv)?;
+                return (c.verdict_cached(crate::types::Verdict::ValueAttrMissing, name)
+                    == Some(true))
+                .then(|| d.clone());
+            }
         };
         // A dunder nothing supplies (`copy`'s `__deepcopy__` probe): the
         // default.
@@ -30753,10 +30825,14 @@ impl Interpreter {
         name: &str,
         default: Option<&Object>,
     ) -> Option<Object> {
+        // (A VM-native builtin class with a C mirror keeps its own dict
+        // authoritative, as in `leaf_load_type_attr`.)
         if cls.native_kind.get() != 0
-            || cls.c_ext_ptr.get() != 0
+            || (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin)
             || crate::capi_watchers::types_active()
-            || (name.starts_with("__") && !Self::type_dunder_transparent(name))
+            || (name.starts_with("__")
+                && !Self::type_dunder_transparent(name)
+                && !matches!(name, "__format__" | "__new_member__"))
         {
             return None;
         }
@@ -30806,6 +30882,11 @@ impl Interpreter {
             Some(Object::Instance(i)) if i.cls_raw().lookup("__get__").is_none() => {
                 Some(Object::Instance(i))
             }
+            // A static method reads as its function, never bound.
+            Some(Object::StaticMethod(w)) => match w.func() {
+                f @ Object::Function(_) => Some(f),
+                _ => None,
+            },
             Some(_) => None,
         }
     }
@@ -46206,6 +46287,20 @@ impl Interpreter {
                 self.call(&method, &[], &[], globals)
             }
             Object::Instance(_) => {
+                // A list or tuple subclass inheriting `__iter__` (a named
+                // tuple's unpacking): its value's iterator, with no bound
+                // method and no call.
+                if let Object::Instance(inst) = v {
+                    if let Some(native @ (Object::List(_) | Object::Tuple(_))) = inst.native.get() {
+                        let cls = inst.cls_raw();
+                        if cls.native_kind.get() == 0
+                            && cls.c_ext_ptr.get() == 0
+                            && cls.dunder(crate::types::Dunder::Iter).builtin_owner()
+                        {
+                            return self.make_iter(native, globals);
+                        }
+                    }
+                }
                 // `__iter__ = None` disables the slot (CPython's
                 // "anti-registration" convention — typing's special forms
                 // use it so `iter(Union[int, str])` raises "not iterable"
@@ -50616,6 +50711,16 @@ impl Interpreter {
             }
         }
         if !tried_reflected {
+            // A float or a bool answers an `int` subclass itself (`float`'s
+            // and `int`'s comparisons take it, and it's no subclass of
+            // theirs), ahead of the subclass's reflected method.
+            if let (Object::Float(_) | Object::Bool(_), Object::Instance(ib)) = (a, b) {
+                if let Some(v @ (Object::Int(_) | Object::Long(_) | Object::Bool(_))) =
+                    ib.native.get()
+                {
+                    return Ok(Object::Bool(compare_op(a, v, op)?));
+                }
+            }
             if !a_foreign && b_foreign {
                 b_slot_ran = true;
                 match crate::foreign::compare(op, a, b) {
@@ -53835,7 +53940,7 @@ impl Interpreter {
             // not TypeError — when a dict-less object has no such
             // attribute (`None.loader = x`).
             _ => Err(attribute_error(format!(
-                "'{}' object has no attribute '{}'",
+                "'{}' object has no attribute '{}' and no __dict__ for setting new attributes",
                 obj.type_name(),
                 name
             ))),
@@ -55788,6 +55893,9 @@ impl Interpreter {
         let _ = outer_globals;
         if burst_stats::enabled() {
             burst_stats::note_generic_call(callable, args.len(), kwargs.len());
+            if matches!(callable, Object::Builtin(b) if matches!(b.name, "getattr" | "hasattr")) {
+                burst_stats::note_generic_probe(args);
+            }
         }
         match callable {
             Object::Builtin(b) => {
@@ -72802,6 +72910,22 @@ mod burst_stats {
             .or_insert(0) += 1;
     }
 
+    /// A `getattr` or `hasattr` that took the general call.
+    pub(crate) fn note_generic_probe(args: &[crate::Object]) {
+        let (Some(recv), Some(crate::Object::Str(name))) = (args.first(), args.get(1)) else {
+            return;
+        };
+        let recv = match recv {
+            crate::Object::Instance(_) => "instance".to_owned(),
+            crate::Object::Type(_) => "class".to_owned(),
+            o => o.type_name().to_owned(),
+        };
+        let mut a = GENERIC.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(format!("probe {} on {recv}", &**name))
+            .or_insert(0) += 1;
+    }
+
     pub(crate) fn note_slow(op: Option<weavepy_compiler::OpCode>) {
         if let Some(op) = op {
             SLOW[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
@@ -78458,7 +78582,9 @@ fn builtin_fn_lane_ok(name: &str) -> bool {
             | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
             // sys
-            | "_getframe" | "_getframemodulename" | "getrecursionlimit"
+            | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern"
+            // struct
+            | "pack" | "unpack" | "calcsize"
             // warnings (which reads the whole stack, lean activations included)
             | "warn"
             // asyncio (`gather` reads the running loop's current task)
@@ -85009,6 +85135,24 @@ fn eq_class(o: &Object) -> Option<EqClass> {
     })
 }
 
+/// The value of an instance of a subclass of `int`, `float` or `str` whose
+/// `__eq__` and `__ne__` are the built-in ones.
+#[inline]
+fn inherited_eq_value(o: &Object) -> Option<&Object> {
+    use crate::types::Dunder;
+    let Object::Instance(i) = o else {
+        return None;
+    };
+    let v = i.native.get()?;
+    let cls = i.cls_raw();
+    (matches!(v, Object::Int(_) | Object::Float(_) | Object::Str(_))
+        && cls.native_kind.get() == 0
+        && cls.c_ext_ptr.get() == 0
+        && cls.dunder(Dunder::Eq).builtin_owner()
+        && cls.dunder(Dunder::Ne).builtin_owner())
+    .then_some(v)
+}
+
 /// `a <op> b` when the answer runs no Python code and needs no dunder
 /// dispatch: numbers, strings and bytes by value, the sequences
 /// [`native_seq_compare`] takes, and equality that comes down to identity
@@ -85049,6 +85193,14 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
     }
     if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
         return None;
+    }
+    // A subclass of a number or a string (`IntEnum`) that inherits their
+    // equality compares as its value.
+    if let (Object::Instance(_), _) | (_, Object::Instance(_)) = (a, b) {
+        let (va, vb) = (inherited_eq_value(a), inherited_eq_value(b));
+        if va.is_some() || vb.is_some() {
+            return plain_compare(va.unwrap_or(a), vb.unwrap_or(b), op);
+        }
     }
     let same = match (eq_class(a)?, eq_class(b)?) {
         (EqClass::Identity, EqClass::Identity) => a.is_same(b),
