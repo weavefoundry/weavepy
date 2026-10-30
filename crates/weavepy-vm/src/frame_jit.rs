@@ -62,6 +62,7 @@ use crate::object::{Object, PyIterator};
 use crate::sync::Rc;
 use crate::{body_pcs, CodeConstObjects, FieldSlot, Interpreter};
 
+mod inline;
 mod queue;
 pub(crate) use queue::quiesce as quiesce_compiler;
 
@@ -208,6 +209,12 @@ pub(crate) struct State {
     /// caller's last-instruction slot, for its return to restore.
     pub(crate) lazy_depth: usize,
     pub(crate) lazy_last: *mut usize,
+    /// While a `CALL` in an inlined body runs as a direct call (see
+    /// `inline`), that call: registering its callee builds the bodies'
+    /// activations first. Null for any other.
+    pub(crate) inl_call: *const inline::InlineCall,
+    /// Those activations were built: the code's native run is over.
+    pub(crate) inl_gone: bool,
 }
 
 const S_LOCALS: i32 = 0;
@@ -288,6 +295,11 @@ struct Caches {
     mods: Vec<Box<ModCache>>,
     /// The leaf method calls' sites.
     leaf_methods: Vec<Box<LeafMethodSite>>,
+    /// The sites of the callees lowered in line (see `inline`), and the
+    /// callees' code, which the code addresses.
+    inline_sites: Vec<Box<inline::InlineSite>>,
+    inline_calls: Vec<Box<inline::InlineCall>>,
+    held_codes: Vec<Rc<CodeObject>>,
 }
 
 impl Caches {
@@ -302,6 +314,9 @@ impl Caches {
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
         self.leaf_methods.append(&mut other.leaf_methods);
+        self.inline_sites.append(&mut other.inline_sites);
+        self.inline_calls.append(&mut other.inline_calls);
+        self.held_codes.append(&mut other.held_codes);
     }
 }
 
@@ -1708,14 +1723,13 @@ unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
     0
 }
 
-/// `STORE_FAST i` of the value at stack `slot` over a heap value: `0`
+/// `STORE_FAST` of the value at stack `slot` over the heap value at `local`: `0`
 /// stored (the value left the stack), anything else declined untouched.
-unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, i: u64) -> u32 {
+unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, local: *mut Object) -> u32 {
     // SAFETY: the code passes its live state, an initialized stack slot,
-    // and a local index in range.
+    // and the local's address.
     unsafe {
         let st = &mut *st;
-        let local = st.locals.add(i as usize);
         if !droppable(&*local) {
             return 1;
         }
@@ -2559,6 +2573,8 @@ unsafe fn lazy_state(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: true,
+            inl_call: std::ptr::null(),
+            inl_gone: false,
         }
     }
 }
@@ -3108,6 +3124,8 @@ pub(crate) unsafe fn core_lazy_resume(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            inl_call: std::ptr::null(),
+            inl_gone: false,
         };
         let st = &mut st;
         let arg = frame.code.instructions[pc].arg;
@@ -5346,25 +5364,31 @@ unsafe extern "C" fn h_leaf_method(
 /// it: `0` stored (the value left the stack), anything else declined
 /// untouched.
 unsafe extern "C" fn h_store_attr(
-    st: *mut State,
+    local: *const Object,
     code: *const CodeObject,
     pc: u64,
     slot: *mut Object,
 ) -> u32 {
-    // SAFETY: the code passes its live state, its own code, a `LOAD_FAST`
-    // of an in-range local followed by `STORE_ATTR`, and the value's slot.
+    // SAFETY: the code passes the local's address, its own code, a
+    // `LOAD_FAST` followed by `STORE_ATTR`, and the value's slot.
     unsafe {
-        let st = &*st;
         let (code, pc) = (&*code, pc as usize);
-        let local = &*st.locals.add(code.instructions[pc].arg as usize);
+        let local = &*local;
         let name = code.instructions[pc + 1].arg;
-        u32::from(!Interpreter::core_store_local_attr(
-            code,
-            local,
-            pc + 1,
-            name,
-            &*slot,
-        ))
+        if Interpreter::core_store_local_attr(code, local, pc + 1, name, &*slot) {
+            return 0;
+        }
+        // (A site that has only run frameless has no inline cache yet.)
+        match local {
+            Object::Instance(inst) => u32::from(!Interpreter::leaf_attr_store_any(
+                code,
+                inst,
+                pc + 1,
+                name,
+                &*slot,
+            )),
+            _ => 1,
+        }
     }
 }
 
@@ -6366,8 +6390,10 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
             }
             _ => return 1,
         };
+        let name = code.instructions[pc].arg;
         if !droppable(recv)
-            || !Interpreter::core_store_attr(code, inst, pc, code.instructions[pc].arg, val)
+            || !(Interpreter::core_store_attr(code, inst, pc, name, val)
+                || Interpreter::leaf_attr_store_any(code, inst, pc, name, val))
         {
             return 1;
         }
@@ -6540,6 +6566,8 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            inl_call: std::ptr::null(),
+            inl_gone: false,
         };
         interp.direct_calls.set(nested + 1);
         let status = native.run(&mut cst);
@@ -6685,6 +6713,8 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            inl_call: std::ptr::null(),
+            inl_gone: false,
         };
         interp.direct_calls.set(nested + 1);
         let outer = interp.lazy_top.get();
@@ -7829,6 +7859,12 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         if !caller.lazy.is_null() {
             register_lazy(caller);
         }
+        // A callee of an inlined body has that body's frame for its caller.
+        let caller_frame = if caller.inl_call.is_null() {
+            caller.frame
+        } else {
+            inline::spill(caller)
+        };
         // A lazily resumed generator's yield and return are the core
         // loop's from here (see [`lazy_gen_resume`]).
         if st.gen_lazy {
@@ -7860,7 +7896,7 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         *sw.last = caller.last;
         st.lazy_last = sw.last;
         let call_pc = (*act).call_pc;
-        (*act).caller_pending = interp.core_pending_enter_fast(sw, &mut *caller.frame, call_pc);
+        (*act).caller_pending = interp.core_pending_enter_fast(sw, &mut *caller_frame, call_pc);
         // A collapsed chain's levels wait on the pending list, outermost
         // first, as `Interpreter::collapse_commit` enters them.
         if let Some(rec) = (*act).chain.as_mut() {
@@ -8275,6 +8311,7 @@ unsafe fn direct_enter(
         }
         let callee: *mut crate::Frame = &raw mut *act.frame;
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
+        crate::burst_stats::note_callee("direct", code_rc);
         // The callee runs lazily (see `register_lazy`): the caller stays
         // the switch's running activation, off the pending list, unless
         // something needs the core loop's view of the callee.
@@ -8431,6 +8468,8 @@ unsafe fn direct_run<const PUSHED: bool>(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            inl_call: std::ptr::null(),
+            inl_gone: false,
         };
         interp.direct_calls.set(nested + 1);
         let outer = interp.lazy_top.get();
@@ -8518,7 +8557,9 @@ unsafe fn direct_done<const PUSHED: bool>(
                     callable => interp.release(callable),
                 }
                 interp.gil_countdown -= 1;
-                if (*sw.maybe_dead).get() {
+                // (An inlined body's caller checks for itself, with its
+                // frames built by the exit that takes.)
+                if (*sw.maybe_dead).get() && st.inl_call.is_null() {
                     // (The finalizers may run Python code: the caller's
                     // view first.)
                     settle(st);
@@ -8569,6 +8610,7 @@ unsafe fn direct_done<const PUSHED: bool>(
         };
         if status == DIRECT_RET {
             let clean = cst.len == 1
+                && !st.inl_gone
                 && inl.last().is_some_and(|a| {
                     a.act.shell.is_none()
                         && (!PUSHED
@@ -9461,9 +9503,24 @@ unsafe extern "C" fn h_call_kernel(
     // SAFETY: as `h_call`'s; the site is this `CALL`'s, and the code holds
     // its builtin.
     unsafe {
-        let s = &mut *st;
-        let site = &*site;
-        let lenu = len as usize;
+        if call_kernel_in_place(&mut *st, &*site, len as usize) {
+            return 0;
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// The kernel of the builtin `site` settled on, on the operands up a
+/// `lenu`-deep stack: `true` with the result in place, `false` declined
+/// untouched.
+///
+/// # Safety
+///
+/// As [`h_call_kernel`]'s.
+#[inline(always)]
+unsafe fn call_kernel_in_place(s: &mut State, site: &BuiltinSite, lenu: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
         let start = lenu - site.argc - 2;
         let base = s.stack;
         // The receiver: the self slot's, or a bound method's (`append =
@@ -9492,11 +9549,11 @@ unsafe extern "C" fn h_call_kernel(
                     crate::release_operands(&*s.interp, base.add(start), lenu - start);
                     base.add(start).write(out.assume_init());
                     s.len = start + 1;
-                    return 0;
+                    return true;
                 }
             }
         }
-        h_call(st, code, ext, pc, len)
+        false
     }
 }
 
@@ -9513,13 +9570,34 @@ unsafe extern "C" fn h_call_leaf(
     len: u64,
     site: *const BuiltinSite,
 ) -> u32 {
-    use crate::LeafKind;
     // SAFETY: as `h_call`'s; the site is this `CALL`'s, and the code holds
     // its builtin.
     unsafe {
-        let s = &mut *st;
-        let site = &*site;
-        let lenu = len as usize;
+        if let Some(r) = call_leaf_in_place(&mut *st, &*site, pc, len as usize) {
+            return r;
+        }
+        h_call(st, code, ext, pc, len)
+    }
+}
+
+/// The leaf body of the builtin `site` settled on, on the operands up a
+/// `lenu`-deep stack (the `CALL` at `pc`): `Some(0)` with the result in
+/// place, `Some(RAISED)` with the operands released and the error in the
+/// state, `None` declined untouched.
+///
+/// # Safety
+///
+/// As [`h_call_leaf`]'s.
+#[inline(always)]
+unsafe fn call_leaf_in_place(
+    s: &mut State,
+    site: &BuiltinSite,
+    pc: u64,
+    lenu: usize,
+) -> Option<u32> {
+    use crate::LeafKind;
+    // SAFETY: the caller's contract.
+    unsafe {
         let start = lenu - site.argc - 2;
         let base = s.stack;
         let hit =
@@ -9565,18 +9643,18 @@ unsafe extern "C" fn h_call_leaf(
                     crate::release_operands(&*s.interp, base.add(start), lenu - start);
                     base.add(start).write(v);
                     s.len = start + 1;
-                    return 0;
+                    return Some(0);
                 }
                 Some(Err(e)) => {
                     crate::release_operands(&*s.interp, base.add(start), lenu - start);
                     s.len = start;
                     s.pc = pc as usize + 1;
                     s.err = Some(e);
-                    return RAISED;
+                    return Some(RAISED);
                 }
             }
         }
-        h_call(st, code, ext, pc, len)
+        None
     }
 }
 
@@ -11046,6 +11124,10 @@ fn compile_with(
     // The attribute sites' field caches (allocated here if no read has
     // recorded one yet: the code addresses them).
     let field_slots = ext.alloc_field_sites(code);
+    // (Callees in line must not make a body too large for one compile: a
+    // jump between chunks costs more than the calls they'd save.)
+    let mut plans = inline::plan(code, ext, depths, inline::MAX_TOTAL);
+    let mut need = stack_need(depths).max(plans.need);
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
@@ -11064,19 +11146,51 @@ fn compile_with(
             0..n,
             lean,
             prune,
+            &plans,
+            need,
         )?;
         // (Measured as if every exit's tail were in line, the size the
         // threshold was tuned with.)
-        if !lean && engine.ctx.func.dfg.num_insts() + low.tail_savings > lean_above() {
+        // (A callee's body doesn't count: it costs what a body of its own
+        // would.)
+        if !lean
+            && engine.ctx.func.dfg.num_insts() + low.tail_savings - low.inline_ir > lean_above()
+        {
             lean = true;
             engine.release();
+            continue;
+        }
+        let total = engine.ctx.func.dfg.num_insts();
+        if stats::enabled() && low.inline_ir > 0 {
+            eprintln!(
+                "frame jit inline: {} {total} IR, {} of it {} instructions in line",
+                code.qualname, low.inline_ir, plans.total
+            );
+        }
+        // A body that fits one compile stays in one: a jump between chunks
+        // can cost more than the calls in line save. (A little room above
+        // the limit for them: a jump costs more than the memory.)
+        let own = total - low.inline_ir;
+        let room = chunk_ir() + chunk_ir() / 2;
+        if low.inline_ir > 0 && chunk_ir() != 0 && own <= chunk_ir() && total > room {
+            let each = (low.inline_ir / plans.total.max(1)).max(1);
+            let fits = (room * 9 / 10).saturating_sub(own) / each;
+            let budget = fits.min(plans.total / 2);
+            engine.release();
+            plans = inline::plan(code, ext, depths, budget);
+            need = stack_need(depths).max(plans.need);
             continue;
         }
         break low;
     };
     let total = engine.ctx.func.dfg.num_insts();
-    let limit = chunk_ir();
-    let ranges = (limit != 0 && total > limit)
+    let own = total - whole.inline_ir;
+    let limit = if own <= chunk_ir() {
+        chunk_ir() + chunk_ir() / 2
+    } else {
+        chunk_ir()
+    };
+    let ranges = (chunk_ir() != 0 && total > limit)
         .then(|| chunk_ranges(code, &whole.starts, &whole.sizes, total, limit))
         .filter(|r| u8::try_from(r.len()).is_ok());
     let Some(ranges) = ranges else {
@@ -11087,6 +11201,7 @@ fn compile_with(
                 code,
                 nlocals,
                 depths,
+                need,
                 false,
                 Vec::new(),
                 whole.entries,
@@ -11112,6 +11227,8 @@ fn compile_with(
             range.clone(),
             lean,
             prune,
+            &plans,
+            need,
         )?;
         chunks.push(define(engine, code, lean, t0, Some(&range))?);
         for pc in range {
@@ -11122,7 +11239,7 @@ fn compile_with(
     }
     Some((
         chunks,
-        parts(code, nlocals, depths, true, chunk_at, entries, caches),
+        parts(code, nlocals, depths, need, true, chunk_at, entries, caches),
     ))
 }
 
@@ -11135,6 +11252,8 @@ struct Lowered {
     starts: Vec<bool>,
     sizes: Vec<u32>,
     tail_savings: usize,
+    /// The IR instructions of the callees lowered in line.
+    inline_ir: usize,
     caches: Caches,
 }
 
@@ -11152,6 +11271,8 @@ fn lower_range(
     range: std::ops::Range<usize>,
     lean: bool,
     prune: bool,
+    plans: &inline::Plans,
+    need: usize,
 ) -> Option<Lowered> {
     engine.module.clear_context(&mut engine.ctx);
     let ptr = engine.ptr;
@@ -11171,6 +11292,8 @@ fn lower_range(
             depths,
             field_slots,
             range,
+            plans,
+            need,
         );
         lower.cold = lean;
         lower.prune = prune;
@@ -11180,6 +11303,7 @@ fn lower_range(
             starts: std::mem::take(&mut lower.starts),
             sizes: std::mem::take(&mut lower.sizes),
             tail_savings: lower.tail_savings,
+            inline_ir: lower.inline_ir,
             caches: Caches {
                 globals: std::mem::take(&mut lower.global_caches),
                 slots: std::mem::take(&mut lower.slot_caches),
@@ -11191,6 +11315,9 @@ fn lower_range(
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
                 leaf_methods: std::mem::take(&mut lower.leaf_methods),
+                inline_sites: std::mem::take(&mut lower.inline_sites),
+                inline_calls: std::mem::take(&mut lower.inline_calls),
+                held_codes: std::mem::take(&mut lower.held_codes),
             },
         };
         if done {
@@ -11327,6 +11454,7 @@ fn parts(
     code: &CodeObject,
     nlocals: usize,
     depths: &[i64],
+    need: usize,
     chunked: bool,
     chunk_at: Vec<u8>,
     entries: Vec<bool>,
@@ -11340,7 +11468,7 @@ fn parts(
         name: code.qualname.to_string(),
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
-        need: stack_need(depths),
+        need,
         caches,
     }
 }
@@ -11606,6 +11734,19 @@ struct Lower<'a> {
     /// The block every [`Self::leave`] jumps to with its status, made on
     /// first use.
     leave_tail: Option<Block>,
+    /// The callees lowered in line (see `inline`), the bodies being lowered,
+    /// innermost last, and what their code keeps.
+    plans: &'a inline::Plans,
+    inl: Vec<inline::InlineFrame<'a>>,
+    #[allow(clippy::vec_box)]
+    inline_sites: Vec<Box<inline::InlineSite>>,
+    #[allow(clippy::vec_box)]
+    inline_calls: Vec<Box<inline::InlineCall>>,
+    held_codes: Vec<Rc<CodeObject>>,
+    /// The IR instructions of the callees lowered in line.
+    inline_ir: usize,
+    /// The stack capacity the code needs.
+    need: usize,
 }
 
 /// An exit block of [`Lower::exit_with`], filled after the body from the
@@ -11618,6 +11759,124 @@ struct SideExit {
     restore: Vec<Item>,
     status: u32,
     pc: usize,
+}
+
+/// The instructions of `code` (its start depths `depths`) that start blocks
+/// of its native code.
+fn block_starts(code: &CodeObject, depths: &[i64]) -> Vec<bool> {
+    let n = code.instructions.len();
+    // Block starts: the entry, jump targets, and every instruction
+    // after one that ends a block or that the core loop runs.
+    let mut starts = vec![false; n];
+    starts[0] = true;
+    for (pc, ins) in code.instructions.iter().enumerate() {
+        let next = pc + 1;
+        let target = match ins.op {
+            OpCode::JumpForward
+            | OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => Some(next + ins.arg as usize),
+            OpCode::JumpBackward => Some(next.saturating_sub(ins.arg as usize)),
+            _ => None,
+        };
+        // A `SEND`'s exit (`END_SEND`), where a delegate's return
+        // resumes the activation.
+        if ins.op == OpCode::Send && next + (ins.arg as usize) < n {
+            starts[next + ins.arg as usize] = true;
+        }
+        // And its `YIELD_VALUE`, where a delegate's yield goes on (the
+        // `SEND`'s lowering jumps there).
+        if ins.op == OpCode::Send && next < n {
+            starts[next] = true;
+        }
+        if let Some(t) = target {
+            if t < n {
+                starts[t] = true;
+            }
+            if fused_pair_at(code, pc) {
+                // Past the `UNPACK_SEQUENCE` a fused step skips.
+                starts[pc + 2] = true;
+            }
+            if ins.op == OpCode::ForIter {
+                // The loop exit past `END_FOR` / `POP_ITER`.
+                let mut to = t;
+                if code.instructions.get(to).map(|i| i.op) == Some(OpCode::EndFor) {
+                    to += 1;
+                    if matches!(
+                        code.instructions.get(to).map(|i| i.op),
+                        Some(OpCode::PopIter | OpCode::PopTop)
+                    ) {
+                        to += 1;
+                    }
+                }
+                if to < n {
+                    starts[to] = true;
+                }
+            }
+        }
+        if next < n && (target.is_some() || !native_at(code, pc)) {
+            starts[next] = true;
+        }
+        // A fused attribute store continues after its `STORE_ATTR`.
+        if ins.op == OpCode::LoadFast
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::StoreAttr)
+            && pc + 2 < n
+        {
+            starts[pc + 2] = true;
+        }
+        // A function built with its defaults or closure continues after
+        // its last `SET_FUNCTION_ATTRIBUTE`.
+        if ins.op == OpCode::MakeFunction && ins.arg == 0 {
+            let k = fused_function_attrs(code, pc);
+            if k > 0 && pc + 1 + k < n {
+                starts[pc + 1 + k] = true;
+            }
+        }
+        // A forwarding call (`f(*args, **kwargs)`) continues after its
+        // `CALL_FUNCTION_EX`.
+        if ins.op == OpCode::BuildMap
+            && ins.arg == 0
+            && crate::forward_call_shape(code, pc)
+            && pc + 4 < n
+        {
+            starts[pc + 4] = true;
+        }
+        // A global's fused class-constant read continues after its
+        // `LOAD_ATTR`.
+        if ins.op == OpCode::LoadGlobal
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadAttr)
+            && pc + 2 < n
+        {
+            starts[pc + 2] = true;
+        }
+        // A fused method call continues after its `CALL`.
+        if ins.op == OpCode::LoadFast
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadMethodAttr)
+        {
+            if let Some(call) =
+                (pc + 2..n.min(pc + 12)).find(|&k| code.instructions[k].op == OpCode::Call)
+            {
+                if call + 1 < n {
+                    starts[call + 1] = true;
+                }
+            }
+        }
+    }
+    // A handler, entered from a helper's raise (see `h_catch`).
+    for h in &code.exception_table {
+        if (h.handler as usize) < n {
+            starts[h.handler as usize] = true;
+        }
+    }
+    for (pc, s) in starts.iter_mut().enumerate() {
+        if *s && depths[pc] < 0 {
+            // Unreachable on the ordinary paths (a handler's): no entry.
+            *s = false;
+        }
+    }
+    starts
 }
 
 /// Whether the native code runs `op` itself (the rest are handed to the
@@ -11635,6 +11894,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::LoadSmallInt
             | OpCode::StoreFast
             | OpCode::PopTop
+            | OpCode::PopIter
             | OpCode::BinaryOp
             | OpCode::CompareOp
             | OpCode::ToBool
@@ -11720,6 +11980,24 @@ fn prologue_cell(code: &CodeObject, pc: usize) -> bool {
         .all(|i| matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
 }
 
+/// Which of a code's `nlocals` locals may be unbound when a block starts
+/// (parameters no `DELETE_FAST` names never are).
+fn maybe_unbound_locals(code: &CodeObject, nlocals: usize) -> Vec<bool> {
+    let params = code.arg_count as usize
+        + code.kwonly_count as usize
+        + usize::from(code.has_varargs)
+        + usize::from(code.has_varkeywords);
+    let mut m: Vec<bool> = (0..nlocals).map(|i| i >= params).collect();
+    for ins in &code.instructions {
+        if matches!(ins.op, OpCode::DeleteFast | OpCode::LoadFastAndClear) {
+            if let Some(x) = m.get_mut(ins.arg as usize) {
+                *x = true;
+            }
+        }
+    }
+    m
+}
+
 impl<'a> Lower<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -11732,6 +12010,8 @@ impl<'a> Lower<'a> {
         depths: &'a [i64],
         field_slots: crate::Sites<'a, FieldSlot>,
         range: std::ops::Range<usize>,
+        plans: &'a inline::Plans,
+        need: usize,
     ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -11754,21 +12034,7 @@ impl<'a> Lower<'a> {
             locals,
             stack,
             last_pc: None,
-            maybe_unbound: {
-                let params = code.arg_count as usize
-                    + code.kwonly_count as usize
-                    + usize::from(code.has_varargs)
-                    + usize::from(code.has_varkeywords);
-                let mut m: Vec<bool> = (0..nlocals).map(|i| i >= params).collect();
-                for ins in &code.instructions {
-                    if matches!(ins.op, OpCode::DeleteFast | OpCode::LoadFastAndClear) {
-                        if let Some(x) = m.get_mut(ins.arg as usize) {
-                            *x = true;
-                        }
-                    }
-                }
-                m
-            },
+            maybe_unbound: maybe_unbound_locals(code, nlocals),
             bound: vec![false; nlocals],
             blocks: Vec::new(),
             never_ran: Vec::new(),
@@ -11796,6 +12062,13 @@ impl<'a> Lower<'a> {
             leaf_methods: Vec::new(),
             catch: None,
             leave_tail: None,
+            plans,
+            inl: Vec::new(),
+            inline_sites: Vec::new(),
+            inline_calls: Vec::new(),
+            held_codes: Vec::new(),
+            inline_ir: 0,
+            need,
         }
     }
 
@@ -11840,6 +12113,10 @@ impl<'a> Lower<'a> {
 
     /// Write the last instruction to the state (unless the state has it).
     fn store_last(&mut self) {
+        // (An inlined body's isn't the state's.)
+        if self.inlining() {
+            return;
+        }
         if let Some(pc) = self.last_pc {
             let v = self.b.ins().iconst(types::I64, pc as i64);
             self.b.ins().store(FLAGS, v, self.st, S_LAST);
@@ -11859,6 +12136,9 @@ impl<'a> Lower<'a> {
     }
 
     fn local_addr(&mut self, i: u32) -> Value {
+        if let Some(at) = self.inline_local_addr(i) {
+            return at;
+        }
         self.b.ins().iadd_imm(self.locals, 16 * i64::from(i))
     }
 
@@ -12103,6 +12383,10 @@ impl<'a> Lower<'a> {
     /// instruction as arguments: a body has hundreds of exits, and their
     /// tails would otherwise be most of its IR.
     fn exit(&mut self, status: u32, pc: usize) {
+        if self.inlining() {
+            self.inline_exit(status, pc);
+            return;
+        }
         let cold = std::mem::replace(&mut self.cold, true);
         self.flush();
         self.cold = cold;
@@ -12179,6 +12463,14 @@ impl<'a> Lower<'a> {
     fn leave(&mut self, r: Value) {
         // (One shared tail: a test, a branch and a return per helper call
         // cost more compile memory than a jump.)
+        // (Nothing in an inlined body raises or switches through here: see
+        // `inline`.)
+        if self.inlining() {
+            self.b
+                .ins()
+                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+            return;
+        }
         let tail = *self.leave_tail.get_or_insert_with(|| {
             let tail = self.b.create_block();
             self.b.append_block_param(tail, types::I32);
@@ -12218,16 +12510,21 @@ impl<'a> Lower<'a> {
             self.b.ins().return_(&[r]);
         }
         while let Some(x) = self.side_exits.pop() {
-            self.b.switch_to_block(x.block);
-            self.vs = x.vs;
-            self.depth = x.depth;
-            self.last_pc = x.last_pc;
-            for item in x.restore {
-                self.push(item);
-            }
-            self.exit(x.status, x.pc);
+            self.fill_side_exit(x);
         }
         self.exit_tails();
+    }
+
+    /// Fill a side exit's block.
+    fn fill_side_exit(&mut self, x: SideExit) {
+        self.b.switch_to_block(x.block);
+        self.vs = x.vs;
+        self.depth = x.depth;
+        self.last_pc = x.last_pc;
+        for item in x.restore {
+            self.push(item);
+        }
+        self.exit(x.status, x.pc);
     }
 
     /// Stop for a queued finalizer (with `pc` next), from the current
@@ -12434,117 +12731,7 @@ impl<'a> Lower<'a> {
         if self.depths.len() != n {
             return false;
         }
-        // Block starts: the entry, jump targets, and every instruction
-        // after one that ends a block or that the core loop runs.
-        let mut starts = vec![false; n];
-        starts[0] = true;
-        for (pc, ins) in code.instructions.iter().enumerate() {
-            let next = pc + 1;
-            let target = match ins.op {
-                OpCode::JumpForward
-                | OpCode::PopJumpIfFalse
-                | OpCode::PopJumpIfTrue
-                | OpCode::PopJumpIfNone
-                | OpCode::PopJumpIfNotNone
-                | OpCode::ForIter => Some(next + ins.arg as usize),
-                OpCode::JumpBackward => Some(next.saturating_sub(ins.arg as usize)),
-                _ => None,
-            };
-            // A `SEND`'s exit (`END_SEND`), where a delegate's return
-            // resumes the activation.
-            if ins.op == OpCode::Send && next + (ins.arg as usize) < n {
-                starts[next + ins.arg as usize] = true;
-            }
-            // And its `YIELD_VALUE`, where a delegate's yield goes on (the
-            // `SEND`'s lowering jumps there).
-            if ins.op == OpCode::Send && next < n {
-                starts[next] = true;
-            }
-            if let Some(t) = target {
-                if t < n {
-                    starts[t] = true;
-                }
-                if fused_pair_at(code, pc) {
-                    // Past the `UNPACK_SEQUENCE` a fused step skips.
-                    starts[pc + 2] = true;
-                }
-                if ins.op == OpCode::ForIter {
-                    // The loop exit past `END_FOR` / `POP_ITER`.
-                    let mut to = t;
-                    if code.instructions.get(to).map(|i| i.op) == Some(OpCode::EndFor) {
-                        to += 1;
-                        if matches!(
-                            code.instructions.get(to).map(|i| i.op),
-                            Some(OpCode::PopIter | OpCode::PopTop)
-                        ) {
-                            to += 1;
-                        }
-                    }
-                    if to < n {
-                        starts[to] = true;
-                    }
-                }
-            }
-            if next < n && (target.is_some() || !native_at(code, pc)) {
-                starts[next] = true;
-            }
-            // A fused attribute store continues after its `STORE_ATTR`.
-            if ins.op == OpCode::LoadFast
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::StoreAttr)
-                && pc + 2 < n
-            {
-                starts[pc + 2] = true;
-            }
-            // A function built with its defaults or closure continues after
-            // its last `SET_FUNCTION_ATTRIBUTE`.
-            if ins.op == OpCode::MakeFunction && ins.arg == 0 {
-                let k = fused_function_attrs(code, pc);
-                if k > 0 && pc + 1 + k < n {
-                    starts[pc + 1 + k] = true;
-                }
-            }
-            // A forwarding call (`f(*args, **kwargs)`) continues after its
-            // `CALL_FUNCTION_EX`.
-            if ins.op == OpCode::BuildMap
-                && ins.arg == 0
-                && crate::forward_call_shape(code, pc)
-                && pc + 4 < n
-            {
-                starts[pc + 4] = true;
-            }
-            // A global's fused class-constant read continues after its
-            // `LOAD_ATTR`.
-            if ins.op == OpCode::LoadGlobal
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadAttr)
-                && pc + 2 < n
-            {
-                starts[pc + 2] = true;
-            }
-            // A fused method call continues after its `CALL`.
-            if ins.op == OpCode::LoadFast
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadMethodAttr)
-            {
-                if let Some(call) =
-                    (pc + 2..n.min(pc + 12)).find(|&k| code.instructions[k].op == OpCode::Call)
-                {
-                    if call + 1 < n {
-                        starts[call + 1] = true;
-                    }
-                }
-            }
-        }
-        // A handler, entered from a helper's raise (see `h_catch`).
-        for h in &code.exception_table {
-            if (h.handler as usize) < n {
-                starts[h.handler as usize] = true;
-            }
-        }
-        for (pc, s) in starts.iter_mut().enumerate() {
-            if *s && self.depths[pc] < 0 {
-                // Unreachable on the ordinary paths (a handler's): no entry.
-                *s = false;
-            }
-        }
+        let starts = block_starts(code, self.depths);
         self.blocks = starts
             .iter()
             .enumerate()
@@ -12568,7 +12755,7 @@ impl<'a> Lower<'a> {
         // The code writes stack slots at fixed offsets: the frame's stack
         // must have room for the deepest point plus an instruction's own
         // pushes (a pooled stack can be smaller; the core loop grows it).
-        let need = stack_need(self.depths) as i64;
+        let need = self.need as i64;
         let cap = self.b.ins().load(types::I64, FLAGS, self.st, S_CAP);
         let short = self.b.ins().icmp_imm(IntCC::SignedLessThan, cap, need);
         let roomy = self.b.create_block();
@@ -12618,7 +12805,7 @@ impl<'a> Lower<'a> {
         let n = self.code.instructions.len();
         self.b.switch_to_block(blk);
         self.vs.clear();
-        self.depth = self.depths[start] as usize;
+        self.depth = self.depth_at(start) as usize;
         self.last_pc = None;
         self.bound.iter_mut().for_each(|b| *b = false);
         if self.never_ran[start] {
@@ -12653,6 +12840,9 @@ impl<'a> Lower<'a> {
             self.exit(INTERP, pc);
             return false;
         }
+        if let Some(r) = self.inline_gate(pc, ins.op) {
+            return r;
+        }
         let cont = match ins.op {
             OpCode::Nop | OpCode::NotTaken | OpCode::Resume | OpCode::CopyFreeVars => true,
             OpCode::MakeCell if prologue_cell(self.code, pc) => true,
@@ -12667,7 +12857,7 @@ impl<'a> Lower<'a> {
                 true
             }
             OpCode::StoreFast if (ins.arg as usize) < self.nlocals => self.store_fast(pc, ins.arg),
-            OpCode::PopTop => {
+            OpCode::PopTop | OpCode::PopIter => {
                 match self.pop() {
                     Item::Mem(s) => {
                         let at = self.slot_addr(s);
@@ -13086,6 +13276,7 @@ impl<'a> Lower<'a> {
                 self.branch_out(r, out);
                 true
             }
+            OpCode::LoadDeref if self.inlining() => return self.inline_load_deref(pc, ins.arg),
             OpCode::LoadDeref => {
                 let s = self.depth;
                 let dst = self.slot_addr(s);
@@ -13225,6 +13416,7 @@ impl<'a> Lower<'a> {
             // A generator body's yield and return switch to its consumer
             // (`h_gen_yield`, `h_gen_return`); in a fast step (no switch)
             // they're the step's own.
+            OpCode::ReturnValue if self.inlining() => return self.inline_return(pc),
             OpCode::YieldValue | OpCode::ReturnValue if self.is_gen() && self.depth > 0 => {
                 self.flush();
                 let sw = self.b.ins().load(self.ptr, FLAGS, self.st, S_SW);
@@ -13359,9 +13551,17 @@ impl<'a> Lower<'a> {
                     && crate::method_site_in_place(self.ext, pc + 1)
                     && !self.native_body_call(pc + 2) =>
             {
-                self.leaf_method(pc + 1, false);
-                self.method_kernel(pc);
-                self.method_call(pc)
+                // (A callee lowered in line takes the plain method load, and
+                // an inlined body runs only what can't see its frame.)
+                if !self.method_inlined(pc + 1) {
+                    if !self.inlining() {
+                        self.leaf_method(pc + 1, false);
+                    }
+                    self.method_kernel(pc);
+                    if !self.inlining() {
+                        self.method_call(pc);
+                    }
+                }
             }
             Some(OpCode::StoreAttr) => return self.store_attr(pc),
             _ => {}
@@ -13380,7 +13580,8 @@ impl<'a> Lower<'a> {
             self.branch_out(unbound, out);
             self.bound[ix] = true;
         }
-        self.push(Item::Local(i));
+        let item = self.inline_value(i).unwrap_or(Item::Local(i));
+        self.push(item);
         true
     }
 
@@ -13721,10 +13922,11 @@ impl<'a> Lower<'a> {
             .ins()
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let local = self.local_addr(self.code.instructions[pc].arg);
         let r = self
             .call(
                 h_store_attr as *const () as usize,
-                &[self.st, code, pcv, slot],
+                &[local, code, pcv, slot],
                 true,
             )
             .expect("returns");
@@ -13927,9 +14129,9 @@ impl<'a> Lower<'a> {
     /// virtual stack) over a heap value, through the helper.
     fn store_from_slot(&mut self, pc: usize, i: u32, slot: usize) {
         let src = self.slot_addr(slot);
-        let iv = self.b.ins().iconst(types::I64, i64::from(i));
+        let local = self.local_addr(i);
         let r = self
-            .call(h_store as *const () as usize, &[self.st, src, iv], true)
+            .call(h_store as *const () as usize, &[self.st, src, local], true)
             .expect("returns");
         // Declined: the value is on the stack, as the core loop expects.
         let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
@@ -14266,7 +14468,8 @@ impl<'a> Lower<'a> {
     fn binop_declined(&mut self, pc: usize, slot: usize, r: Value, out: Block, ok: Block) {
         // (A lean body tries the method only at a site that has run on
         // instances: elsewhere the core loop runs it.)
-        if !self.vs.iter().all(|i| matches!(i, Item::Mem(_)))
+        if self.inlining()
+            || !self.vs.iter().all(|i| matches!(i, Item::Mem(_)))
             || (self.cold && !crate::instance_site(self.ext, pc))
         {
             self.b.ins().brif(r, out, &[], ok, &[]);
@@ -14384,7 +14587,7 @@ impl<'a> Lower<'a> {
     /// A container instruction through [`h_container`] (the operands on
     /// the stack; the depth after is the static one).
     fn container(&mut self, pc: usize) -> bool {
-        let after = self.depths.get(pc + 1).copied().unwrap_or(-1);
+        let after = self.depth_at(pc + 1);
         if after < 0 {
             self.exit(INTERP, pc);
             return false;
@@ -14415,7 +14618,8 @@ impl<'a> Lower<'a> {
             )
             .expect("returns")
         } else {
-            let can_raise = self.b.ins().iconst(types::I64, 1);
+            let raises = i64::from(!self.inlining());
+            let can_raise = self.b.ins().iconst(types::I64, raises);
             self.call_typed(
                 h_container as *const () as usize,
                 &[self.st, ins, code, pcv, len, can_raise],
@@ -14591,7 +14795,7 @@ impl<'a> Lower<'a> {
         let code = self.code_ptr();
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let lenv = self.b.ins().iconst(types::I64, (slot + n) as i64);
-        let raisable = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+        let raisable = !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
         let flags = self
             .b
             .ins()
@@ -15206,7 +15410,7 @@ impl<'a> Lower<'a> {
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
         // An instance's comparison method that is a warm pure leaf, at a
         // site that has compared one: evaluated in place.
-        let r = if !self.cold && crate::instance_site(self.ext, pc) {
+        let r = if !self.cold && !self.inlining() && crate::instance_site(self.ext, pc) {
             let dunder = self.b.create_block();
             let join = self.b.create_block();
             self.b.append_block_param(join, types::I32);
@@ -15386,7 +15590,9 @@ impl<'a> Lower<'a> {
         // An inlined `list(...)`, `tuple(...)`, `all(...)` or `any(...)` of a
         // generator expression may drain its generator (see
         // [`for_iter_drain`]).
-        let helper = if drain_shape(self.code, pc) {
+        let helper = if self.inlining() {
+            inline::h_inline_for_iter as *const () as usize
+        } else if drain_shape(self.code, pc) {
             h_for_iter_drain as *const () as usize
         } else {
             h_for_iter as *const () as usize
@@ -15722,7 +15928,7 @@ impl<'a> Lower<'a> {
         // A property site: the getter the site cached for the receiver's
         // class first, ahead of the cached reads that would all decline
         // (CPython's `LOAD_ATTR_PROPERTY`).
-        let all_mem = self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+        let all_mem = !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
         let site_at = all_mem.then(|| {
             let site: Box<DirectSite> = Box::default();
             let at = std::ptr::from_ref::<DirectSite>(&site) as i64;
@@ -15845,6 +16051,9 @@ impl<'a> Lower<'a> {
     /// [`h_load_global`] (which fills the cache); a fused shape continues
     /// at whatever follows it (through the dispatch).
     fn load_global(&mut self, pc: usize) -> bool {
+        if self.inlining() {
+            return self.inline_load_global(pc);
+        }
         let next = self.code.instructions.get(pc + 1).map(|i| i.op);
         let may_fuse = matches!(
             next,
@@ -15959,7 +16168,9 @@ impl<'a> Lower<'a> {
             return false;
         }
         // A leaf method of the value on top, called in place.
-        self.leaf_method(pc, true);
+        if !self.inlining() && !self.method_inlined(pc) {
+            self.leaf_method(pc, true);
+        }
         self.flush();
         let helper = self.b.create_block();
         let done = self.b.create_block();
@@ -16375,6 +16586,12 @@ impl<'a> Lower<'a> {
             self.exit(INTERP, pc);
             return false;
         }
+        if let Some(plan) = self.plan_at(pc) {
+            return self.inline_call(pc, argc, plan);
+        }
+        if self.inlining() {
+            return self.inline_builtin_call(pc, argc);
+        }
         self.flush();
         // (A raise leaves `st.last` as the instruction before.)
         self.store_last();
@@ -16643,6 +16860,13 @@ impl<'a> Lower<'a> {
     /// `CALL_KW` through [`h_call_kw`] (as [`Self::call_op`]; the depth
     /// after is the static one).
     fn call_kw(&mut self, pc: usize) -> bool {
+        if let Some(plans) = self.plan_at(pc) {
+            return self.inline_call(pc, inline::call_argc(self.code, self.ext, pc), plans);
+        }
+        if self.inlining() {
+            self.exit(INTERP, pc);
+            return false;
+        }
         self.call_with(pc, h_call_kw as *const () as usize, false)
     }
 
