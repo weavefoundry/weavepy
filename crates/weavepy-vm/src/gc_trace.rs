@@ -563,6 +563,10 @@ enum Hit {
     Temp(u32),
 }
 
+/// How many doublings of the young collection's wait a run of collections
+/// that found nothing can build up (see [`GcState::maybe_auto_collect`]).
+const MAX_IDLE: usize = 6;
+
 /// How many entries of the older generations each young collection or
 /// prune examines for dead objects, so a dead old object's allocation is
 /// released within a bounded number of young collections rather than at
@@ -818,24 +822,18 @@ impl GcState {
     /// collector already holds it. `false` leaves it to eager registration.
     #[inline]
     fn nurse_own<T: YoungKind>(&self, set: &RefCell<YoungSet<T>>, obj: &crate::Rc<T>) -> bool {
-        let over = {
-            // SAFETY: nothing below runs code while the set is borrowed.
-            let Some(young) = (unsafe { set.peek_mut() }) else {
-                // A flush is walking the set, or cells are shared.
-                return false;
-            };
-            let slot = obj.young_slot();
-            if slot.get() != NO_SLOT {
-                return true;
-            }
-            slot.set(YOUNG_BIT | young.0.len() as u32);
-            young.0.push(crate::Rc::as_ptr(obj));
-            young.0.len() >= YOUNG_CAP
+        // SAFETY: nothing below runs code while the set is borrowed.
+        let Some(young) = (unsafe { set.peek_mut() }) else {
+            // A flush is walking the set, or cells are shared.
+            return false;
         };
-        self.note_gen0_alloc();
-        if over {
-            self.flush_young();
+        let slot = obj.young_slot();
+        if slot.get() != NO_SLOT {
+            return true;
         }
+        slot.set(YOUNG_BIT | young.0.len() as u32);
+        young.0.push(crate::Rc::as_ptr(obj));
+        self.note_gen0_alloc();
         true
     }
 
@@ -1627,6 +1625,7 @@ impl GcState {
     }
 
     pub fn set_thresholds(&self, t: [usize; N_GENERATIONS]) {
+        self.idle_collections.store(0, Ordering::Relaxed);
         *self.thresholds.borrow_mut() = t;
         self.sync_gen0_gauge(self.counts.borrow()[0], Some(t[0]));
     }
@@ -1733,7 +1732,7 @@ impl GcState {
         }
         // How many collections in a row have found nothing (see `wanted`
         // below).
-        let idle = self.idle_collections.load(Ordering::Relaxed).min(3);
+        let idle = self.idle_collections.load(Ordering::Relaxed).min(MAX_IDLE);
         let (due, eligible, threshold0) = {
             let counts = self.counts.borrow();
             let thresholds = self.thresholds.borrow();
@@ -1745,9 +1744,12 @@ impl GcState {
             // next older one waits for, up to eight times the threshold (an
             // older collection rescans every survivor promoted since the
             // last, so a program whose objects live on, as a pending task
-            // tree does, pays for it again and again).
+            // tree does, pays for it again and again). Past that, each young
+            // collection covers twice the allocations (see `wanted`), so
+            // half as many keep the older ones' period where it got to.
+            let older_shift = if idle <= 3 { idle } else { 6 - idle };
             let mut gen = 0;
-            if counts[1] + 1 >= thresholds[1].saturating_mul(1 << idle) {
+            if counts[1] + 1 >= thresholds[1].saturating_mul(1 << older_shift) {
                 gen = 1;
                 if counts[2] + 1 >= thresholds[2] {
                     gen = 2;
@@ -1771,9 +1773,10 @@ impl GcState {
         // A program whose young collections keep finding no cycles (its
         // objects die by reference count, or live on) collects less often:
         // each idle one doubles the survivors the next waits for, up to
-        // eight thresholds' worth, and any that reclaims something resets
-        // the pace. (A young collection costs far more per object than
-        // CPython's, whose candidates sit on intrusive lists.)
+        // [`MAX_IDLE`] doublings, and any that reclaims something resets the
+        // pace, as does an explicit collection. (A young collection costs
+        // far more per object than CPython's, whose candidates sit on
+        // intrusive lists.)
         let wanted = if eligible == 0 {
             (threshold0 / 2) << idle
         } else {
@@ -1874,6 +1877,8 @@ impl GcState {
     /// full sweep. The re-entrancy guard still applies — a collection
     /// triggered from inside a collection is a no-op.
     pub fn collect(&self, upto: usize) -> usize {
+        // (Someone wants garbage found: the automatic pace starts over.)
+        self.idle_collections.store(0, Ordering::Relaxed);
         self.collect_impl(upto, true)
     }
 
@@ -2570,10 +2575,48 @@ impl Tally<'_> {
                 if may_be_temporary(child)
                     && promotes_temporarily(child, self.parent_is_iter, self.parent_is_frame)
                 {
+                    if self.inline_sole(child) {
+                        return;
+                    }
                     self.found.push(child.clone());
                 }
             }
         }
+    }
+
+    /// Walk `child`, an untracked bound method or cell the walked object
+    /// alone holds (an event loop handle's callback, say), as part of it:
+    /// nothing else can reach it, so as a node of its own it would only ever
+    /// pass on its holder's reachability. A collection's temporaries are the
+    /// costliest nodes it has (an index entry, a counted handle, a second
+    /// walk). `false` leaves any other to become a temporary, as it does a
+    /// weakly referenced one, which must outlive the clearing of the dead
+    /// (a weak reference's callback that dies with the cycle isn't called).
+    fn inline_sole(&mut self, child: &Object) -> bool {
+        if crate::weakref_registry::may_have_weakrefs(id_of(child)) {
+            return false;
+        }
+        let (parent_iter, parent_frame) = (self.parent_is_iter, self.parent_is_frame);
+        match child {
+            Object::BoundMethod(b) if crate::sync::Rc::strong_count(b) == 1 => {
+                self.parent_is_iter = false;
+                self.parent_is_frame = false;
+                self.visit(&b.function);
+                self.visit(&b.receiver);
+            }
+            Object::Cell(c) if crate::sync::Rc::strong_count(c) == 1 => {
+                let Ok(v) = c.try_borrow() else {
+                    return false;
+                };
+                self.parent_is_iter = false;
+                self.parent_is_frame = false;
+                self.visit(&v);
+            }
+            _ => return false,
+        }
+        self.parent_is_iter = parent_iter;
+        self.parent_is_frame = parent_frame;
+        true
     }
 }
 
@@ -3943,8 +3986,9 @@ fn root_debug() -> bool {
 /// sweep's fixed cost outweighs what it reclaims.
 const DEFERRED_FLOOR: usize = 4096;
 
-/// How many young instances wait before the set is handed to the
-/// collector regardless (collections normally flush it well before).
+/// How many young lists or dicts wait before their sets are handed to the
+/// collector regardless (a weak handle holds a dead one's allocation until
+/// then; collections normally flush them well before).
 const YOUNG_CAP: usize = 8192;
 
 /// How many containers may stay deferred at once. Past this the sweep
