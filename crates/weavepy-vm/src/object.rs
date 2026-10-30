@@ -166,12 +166,12 @@ pub enum Object {
     Unbound,
     Bool(bool),
     Int(i64),
+    Float(f64),
     /// Arbitrary-precision integer (RFC 0019). Created on i64 overflow,
     /// large literals, or explicit `int.from_bytes(...)` /
     /// `int(...)` parsing of large strings. `Object::int_from_bigint`
     /// auto-demotes to `Int(i64)` when the value fits.
     Long(Rc<BigInt>),
-    Float(f64),
     /// Complex number with rectangular components (RFC 0019).
     Complex(Rc<PyComplex>),
     Str(SharedStr),
@@ -10653,8 +10653,10 @@ impl PyIterator {
 // ---------- behavior ----------
 
 /// The variants whose second word is not a counted pointer (`None`,
-/// `Unbound`, `Bool`, `Int`, `Float`), by tag.
-const SCALAR_TAGS: u64 = 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 5;
+/// `Unbound`, `Bool`, `Int`, `Float`), the first of them all: one compare
+/// tells them apart from the rest, here and in compiled code.
+pub(crate) const PLAIN_TAGS: u8 = 5;
+const SCALAR_TAGS: u64 = (1 << PLAIN_TAGS) - 1;
 
 /// The variants whose pointer is a [`ThinArc`]'s (`Str`, `WStr`, `Tuple`,
 /// `Bytes`): it addresses the payload, 16 bytes past the strong count
@@ -10688,8 +10690,8 @@ impl Object {
     /// for a scalar.
     #[inline(always)]
     pub(crate) fn strong_word(&self) -> Option<*const std::sync::atomic::AtomicUsize> {
-        let tag = u64::from(self.tag());
-        if (SCALAR_TAGS >> tag) & 1 != 0 {
+        let tag = self.tag();
+        if tag < PLAIN_TAGS {
             return None;
         }
         // SAFETY: a counted variant's second word is its pointer.
@@ -13033,9 +13035,9 @@ fn fresh_nan_bits(v: f64) -> f64 {
 pub fn fresh_float(v: f64) -> Object {
     // Built as two whole words: the enum's constructor writes the tag as
     // a byte, and the 16-byte move that reads the value back stalls on
-    // store forwarding. `repr(u8)`: `Float` is variant 5, its payload in
+    // store forwarding. `repr(u8)`: `Float` is variant 4, its payload in
     // the second word.
-    const FLOAT_TAG: u64 = 5;
+    const FLOAT_TAG: u64 = 4;
     // SAFETY: two initialized words in exactly `Object::Float`'s layout.
     unsafe { std::mem::transmute::<[u64; 2], Object>([FLOAT_TAG, tag_nan(v).to_bits()]) }
 }
@@ -14715,7 +14717,7 @@ mod tests {
             (Object::Unbound, 1),
             (Object::Bool(true), 2),
             (Object::Int(7), 3),
-            (Object::Float(1.5), 5),
+            (Object::Float(1.5), 4),
             (Object::from_str("a fresh string".to_owned()), 7),
             (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
             (Object::new_bytes(vec![1, 2, 3]), 27),
@@ -14723,7 +14725,7 @@ mod tests {
             (Object::new_dict(), 11),
             (
                 Object::int_from_bigint(num_bigint::BigInt::from(1u8) << 100),
-                4,
+                5,
             ),
         ];
         for (v, tag) in &tags {
