@@ -7,12 +7,12 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
-Measured on October 29, 2026, at `faa68a33` (PR #STACKED,
+Measured on October 29, 2026, at `faa68a33` (PR #102,
 `perf/step-change`, stacked on PR #101), on the same host and CPython,
 both WeavePy binaries profile-guided and interleaved with CPython in one
 idle session. The base is PR #101's PGO binary (`ba518cf0`).
 
-| Measure | PR #101 | PR #STACKED |
+| Measure | PR #101 | PR #102 |
 | --- | ---: | ---: |
 | Warm time, 33 workloads (geomean) | 1.113 | 1.098 |
 | Cold time (first call, including compilation) | 1.366 | 1.261 |
@@ -340,7 +340,7 @@ slowdown in that run was the even-sized chunks, since fixed.
     and `test_value_fast_paths.py` are differential harnesses that run
     overrides and values hot under five JIT settings against CPython's
     output.
-- **PR #STACKED, `perf/step-change`** (October 2026), stacked on PR #101.
+- **PR #102, `perf/step-change`** (October 2026), stacked on PR #101.
   Cold time 0.923 of PR #101's, warm 0.987, instructions 0.990, peak
   memory 1.011 (PGO, one session):
   - *Background code generation.* The frame JIT lowers a hot body on the
@@ -488,7 +488,7 @@ slowdown in that run was the even-sized chunks, since fixed.
   peak (Cranelift and regalloc2 1.9 MB in `chaos`). Only 154 of 2,094 code
   objects are nested in functions, so materializing them lazily wouldn't
   pay.
-- **Tried and dropped in PR #STACKED**: tier-2 compiles in the background
+- **Tried and dropped in PR #102**: tier-2 compiles in the background
   (while a constructor's compile was pending, interpreted constructors
   built instances in another shape and the compiled loop side-exited on
   them: `float_points` 25% to 35% slower); decoding instructions lazily
