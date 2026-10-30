@@ -1660,6 +1660,226 @@ unsafe extern "C" fn h_for_iter_gen(
     }
 }
 
+/// Whether the `FOR_ITER` at `pc` of `code` runs a loop [`for_iter_drain`]
+/// may drain: `LIST_APPEND 2; JUMP_BACKWARD` back to it (an inlined
+/// `list(...)` or `tuple(...)`), or `TO_BOOL; POP_JUMP_IF_FALSE/TRUE;
+/// NOT_TAKEN; JUMP_BACKWARD` (an inlined `all(...)` or `any(...)`).
+fn drain_shape(code: &CodeObject, pc: usize) -> bool {
+    let op = |k: usize| {
+        code.instructions
+            .get(pc + k)
+            .map(|i| (i.op, i.arg as usize))
+    };
+    match op(1) {
+        Some((OpCode::ListAppend, 2)) => {
+            matches!(op(2), Some((OpCode::JumpBackward, back)) if back == 3)
+        }
+        Some((OpCode::ToBool, _)) => {
+            matches!(
+                op(2),
+                Some((OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue, _))
+            ) && matches!(op(3), Some((OpCode::NotTaken, _)))
+                && matches!(op(4), Some((OpCode::JumpBackward, back)) if back == 5)
+        }
+        _ => false,
+    }
+}
+
+/// [`h_for_iter`] at a `FOR_ITER` whose loop [`drain_shape`] admits: a
+/// fresh generator's first step drains it ([`for_iter_drain`]); anything
+/// else is `h_for_iter`'s.
+unsafe extern "C" fn h_for_iter_drain(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
+    // SAFETY: as `h_for_iter`'s; a read of the generator's state tag
+    // between instructions.
+    unsafe {
+        if let Object::Generator(g) = &*it {
+            if !(*st).sw.is_null()
+                && matches!(
+                    &*g.state_raw().as_ptr(),
+                    crate::object::GeneratorState::Created(_)
+                )
+            {
+                if let Some(r) = for_iter_drain(&mut *st, it, out, pc as usize) {
+                    return r;
+                }
+            }
+        }
+        h_for_iter(st, it, out, pc)
+    }
+}
+
+/// [`h_for_iter_gen`]'s `FOR_ITER` at `pc` when its loop only appends to a
+/// list nothing else holds (`FOR_ITER; LIST_APPEND 2; JUMP_BACKWARD`, an
+/// inlined `list(...)` or `tuple(...)` of a generator expression): the
+/// generator's fast steps drain it into the list (see
+/// `Interpreter::gen_fast_drain`), as the loop's own iterations would
+/// append each yield (only the generator runs meanwhile, and it can't
+/// reach the list). Its end leaves the loop (`2`); steps that stopped
+/// short hand the last value appended back as the instruction's result
+/// (`1`), for the loop to append again. `None` (nothing done) for any
+/// other loop, or a drain that got nowhere.
+///
+/// # Safety
+///
+/// As [`h_for_iter_gen`]'s, with `it` holding a generator.
+#[inline(never)]
+unsafe fn for_iter_drain(
+    st: &mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: usize,
+) -> Option<u32> {
+    use crate::gen_fast::GenNext;
+    // SAFETY: the caller's contract: the running activation's frame and
+    // its stack, the iterator at `it` above the loop's list.
+    unsafe {
+        // (Only a fresh generator's first `FOR_ITER` drains it: any later
+        // one follows a drain that stopped short, or none was tried.)
+        let Object::Generator(g) = &*it else {
+            return None;
+        };
+        if !matches!(
+            g.state_raw().peek(),
+            Some(crate::object::GeneratorState::Created(_))
+        ) || !crate::gen_fast::steps_body(g)
+        {
+            return None;
+        }
+        let ins = &(&*st.frame).code.instructions;
+        let (append, back) = (ins.get(pc + 1)?, ins.get(pc + 2)?);
+        // An inlined `all(...)` or `any(...)` (`FOR_ITER; TO_BOOL;
+        // POP_JUMP_IF_FALSE/TRUE; NOT_TAKEN; JUMP_BACKWARD`).
+        if append.op == OpCode::ToBool {
+            return for_iter_truth(st, it, out, pc);
+        }
+        if append.op != OpCode::ListAppend
+            || append.arg != 2
+            || back.op != OpCode::JumpBackward
+            || (pc + 3).checked_sub(back.arg as usize) != Some(pc)
+            || it.offset_from(st.stack) < 1
+        {
+            return None;
+        }
+        let Object::List(list) = &*it.sub(1) else {
+            return None;
+        };
+        let Object::Generator(g) = &*it else {
+            return None;
+        };
+        if Rc::strong_count(list) != 1 {
+            return None;
+        }
+        // (Growing the list runs no code: nothing reaches it while it's
+        // peeked at.)
+        let items: *mut Vec<Object> = list.peek_mut()?;
+        let before = (*items).len();
+        let interp = &mut *st.interp.cast_mut();
+        match interp.gen_fast_drain(
+            g,
+            crate::FoldSink::Collect(items),
+            st.snap_gen,
+            st.maybe_dead,
+        ) {
+            GenNext::Exhausted(v) => {
+                drop(v);
+                // The finished generator leaves the stack.
+                drop(it.read());
+                if (*st.maybe_dead).get() {
+                    return Some(for_iter_gen_marked(st, it, pc as u64));
+                }
+                Some(2)
+            }
+            GenNext::Yielded(v) => {
+                out.write(v);
+                Some(1)
+            }
+            GenNext::Partial | GenNext::Declined => {
+                if (*items).len() == before {
+                    return None;
+                }
+                out.write((*items).pop().expect("an item appended"));
+                Some(1)
+            }
+        }
+    }
+}
+
+/// [`for_iter_drain`] for a loop that only tests each item's truth and
+/// leaves on the deciding one (an inlined `all(...)`: the first false
+/// item; `any(...)`: the first true one): the generator's fast steps
+/// drain it, each item whose truth is known and doesn't decide folded away
+/// (see `FoldSink::Truth`). Its end leaves the loop (`2`); a deciding
+/// item, or one whose truth only the loop can tell, is the instruction's
+/// result (`1`); steps that stopped short after folding some hand back a
+/// non-deciding stand-in (`1`), for the loop to go on from. `None` (nothing
+/// done) for any other shape, or a drain that got nowhere.
+///
+/// # Safety
+///
+/// As [`for_iter_drain`]'s.
+#[inline(never)]
+unsafe fn for_iter_truth(
+    st: &mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: usize,
+) -> Option<u32> {
+    use crate::gen_fast::GenNext;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let ins = &(&*st.frame).code.instructions;
+        let (test, taken, back) = (ins.get(pc + 2)?, ins.get(pc + 3)?, ins.get(pc + 4)?);
+        let decides = match test.op {
+            OpCode::PopJumpIfFalse => false,
+            OpCode::PopJumpIfTrue => true,
+            _ => return None,
+        };
+        if taken.op != OpCode::NotTaken
+            || back.op != OpCode::JumpBackward
+            || (pc + 5).checked_sub(back.arg as usize) != Some(pc)
+        {
+            return None;
+        }
+        let Object::Generator(g) = &*it else {
+            return None;
+        };
+        let interp = &mut *st.interp.cast_mut();
+        match interp.gen_fast_drain(
+            g,
+            crate::FoldSink::Truth(decides),
+            st.snap_gen,
+            st.maybe_dead,
+        ) {
+            GenNext::Exhausted(v) => {
+                drop(v);
+                // The finished generator leaves the stack.
+                drop(it.read());
+                if (*st.maybe_dead).get() {
+                    return Some(for_iter_gen_marked(st, it, pc as u64));
+                }
+                Some(2)
+            }
+            GenNext::Yielded(v) => {
+                out.write(v);
+                Some(1)
+            }
+            // (A step that stopped partway may have folded items; the
+            // loop goes on past a stand-in that doesn't decide, and its
+            // next `FOR_ITER` resumes the generator where it stopped.)
+            GenNext::Partial => {
+                out.write(Object::Bool(!decides));
+                Some(1)
+            }
+            GenNext::Declined => None,
+        }
+    }
+}
+
 /// [`h_for_iter_gen`] of a generator its fast step declined: resumed
 /// lazily ([`lazy_gen_resume`]), or else as an inline activation
 /// ([`for_iter_gen_switch`]).
@@ -14525,12 +14745,16 @@ impl<'a> Lower<'a> {
             self.b.switch_to_block(single);
         }
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        // An inlined `list(...)`, `tuple(...)`, `all(...)` or `any(...)` of a
+        // generator expression may drain its generator (see
+        // [`for_iter_drain`]).
+        let helper = if drain_shape(self.code, pc) {
+            h_for_iter_drain as *const () as usize
+        } else {
+            h_for_iter as *const () as usize
+        };
         let r = self
-            .call(
-                h_for_iter as *const () as usize,
-                &[self.st, it, out_slot, pcv],
-                true,
-            )
+            .call(helper, &[self.st, it, out_slot, pcv], true)
             .expect("returns");
         let int_b = self.b.create_block();
         let other = self.b.create_block();

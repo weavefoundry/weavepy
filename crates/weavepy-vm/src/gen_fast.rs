@@ -1103,13 +1103,39 @@ impl Interpreter {
         if g.chain.get() != 0 || verdicts(code, ext) & CODE_MASK == CODE_NO {
             return GenNext::Declined;
         }
-        self.gen_fast_resume(g, ext, sent, snap_gen, depth, dead)
+        self.gen_fast_resume::<false>(g, ext, sent, snap_gen, depth, dead, None)
+    }
+
+    /// Drain `g` into a draining consumer's `sink` by fast steps (see
+    /// [`Self::gen_fast_step`]'s `fold`): resumed with `None`, each yield
+    /// the sink takes resumes the body at once. `Exhausted` when it
+    /// returned, `Yielded` with a yield the sink declined, `Partial` when
+    /// the steps stopped short (the eval breaker, an instruction they don't
+    /// run) after the resume began, `Declined` when nothing happened.
+    pub(crate) fn gen_fast_drain(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        sink: FoldSink,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+    ) -> GenNext {
+        let Object::Code(code) = &g.code else {
+            return GenNext::Declined;
+        };
+        let Some(ext) = crate::code_vm_ext(code) else {
+            return GenNext::Declined;
+        };
+        if g.chain.get() != 0 || verdicts(code, ext) & CODE_MASK == CODE_NO {
+            return GenNext::Declined;
+        }
+        self.gen_fast_resume::<true>(g, ext, Object::None, snap_gen, 0, dead, Some(sink))
     }
 
     /// [`Self::gen_fast_send`] once the body's verdict admits fast steps
-    /// (`ext` is its code's extension table).
+    /// (`ext` is its code's extension table); with `FOLD`, a drain's (see
+    /// [`Self::gen_fast_drain`]), its yields into `fold`.
     #[allow(clippy::too_many_arguments)]
-    fn gen_fast_resume(
+    fn gen_fast_resume<const FOLD: bool>(
         &mut self,
         g: &Rc<PyGenerator>,
         ext: &crate::CodeConstObjects,
@@ -1117,6 +1143,7 @@ impl Interpreter {
         snap_gen: u64,
         depth: u8,
         dead: *const std::cell::Cell<bool>,
+        fold: Option<FoldSink>,
     ) -> GenNext {
         if depth > MAX_DEPTH
             || crate::recursion::current_depth() + usize::from(depth) + 2
@@ -1164,7 +1191,7 @@ impl Interpreter {
         let handed = {
             // SAFETY: a length read with nothing running.
             let n = frame.locals.len();
-            match ext.frame_jit.get(n) {
+            match ext.frame_jit.get(n).filter(|_| !FOLD) {
                 Some(native) => match self.gen_native_yield(frame, native, snap_gen, depth, dead) {
                     Ok((v, false)) => {
                         Self::park_stepped(g, boxed);
@@ -1186,10 +1213,10 @@ impl Interpreter {
         let step = if handed == MARKED_AT {
             GenStep::Bail
         } else {
-            self.gen_fast_step(frame, ext, snap_gen, depth, None, dead, true, handed)
+            self.gen_fast_step(frame, ext, snap_gen, depth, fold, dead, true, handed)
         };
         #[cfg(not(feature = "jit"))]
-        let step = self.gen_fast_step(frame, ext, snap_gen, depth, None, dead, true, handed);
+        let step = self.gen_fast_step(frame, ext, snap_gen, depth, fold, dead, true, handed);
         let out = match step {
             GenStep::Yielded(v) => GenNext::Yielded(v),
             // The general epilogue of a return (`inline_gen_finish`): the
