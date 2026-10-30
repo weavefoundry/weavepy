@@ -2127,15 +2127,27 @@ pub(crate) unsafe fn lazy_gen_resume(
     unsafe {
         let interp = &mut *st.interp.cast_mut();
         let sw = &mut *st.sw;
-        let nested = interp.direct_calls.get();
-        if nested >= DIRECT_CALL_DEPTH
+        if interp.direct_calls.get() >= DIRECT_CALL_DEPTH
             || !sw.calls_ok
-            || g.chain.get() != 0
             || crate::hot_gates::loop_gen() != st.snap_gen
             || (*st.maybe_dead).get()
         {
             crate::burst_stats::note_decline("lazy gen: gates", "-");
             return LazyGen::No;
+        }
+        // The outermost level of a parked `yield from` chain resumes the
+        // chain's innermost generator.
+        if g.chain.get() != 0 {
+            return lazy_chain_resume(
+                st,
+                g,
+                sent,
+                ops,
+                call_pc,
+                exhaust_arg,
+                caller_len,
+                caller_pc,
+            );
         }
         // Validate and take the frame under one exclusive view; no Python
         // runs while it's held.
@@ -2148,78 +2160,61 @@ pub(crate) unsafe fn lazy_gen_resume(
         };
         let first = matches!(*state, GeneratorState::Created(_));
         let sent_none = sent.is_null() || matches!(&*sent, Object::None);
-        let pc = gf.pc as usize;
         // (A generator suspended in a `yield from` resumes its delegate:
         // one that is itself in a `yield from` makes a chain, which the
         // switch's chain collapse takes.)
-        if (crate::yield_from_resend(&gf.code.instructions, pc).is_some() && !simple_delegate(gf))
-            || gf.py_frame.is_some()
-            || gf.has_saved_exc_info()
-            || pc == 0
-            || gf.parked_native.is_some()
-            || gf.shell_cache.as_ref().is_some_and(|c| {
-                c.has_materialized
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            })
-            || (!sent_none && (first || gf.sent_consumed))
+        if crate::yield_from_resend(&gf.code.instructions, gf.pc as usize).is_some()
+            && !simple_delegate(gf)
         {
-            crate::burst_stats::note_decline("lazy gen: frame", &gf.code.qualname);
+            crate::burst_stats::note_decline("lazy gen: chain", &gf.code.qualname);
             return LazyGen::No;
         }
-        let Some(ext) = crate::code_vm_ext(&gf.code) else {
+        let Some(native) = lazy_ready(gf, first, sent_none) else {
             return LazyGen::No;
         };
-        let Some(native) = ext.frame_jit.get(gf.locals.len()) else {
-            crate::burst_stats::note_decline("lazy gen: no native", &gf.code.qualname);
-            return LazyGen::No;
-        };
-        // (The frame, which the activation holds while the body runs,
-        // holds the code and with it its native code.)
-        let native: &Native = &*std::ptr::from_ref(native);
-        if pc >= ext.dispatch_len
-            || !native.enters_at(pc)
-            || !Interpreter::lean_gen_code_ok(&gf.code)
-        {
-            crate::burst_stats::note_decline(
-                if first {
-                    "lazy gen: no first entry"
-                } else {
-                    "lazy gen: no entry"
-                },
-                &gf.code.qualname,
-            );
-            return LazyGen::No;
-        }
-        let dc = &*sw.depth_cell;
-        let depth = dc.get() + 1;
-        if depth > crate::recursion::recursion_limit() {
+        if (*sw.depth_cell).get() + 1 > crate::recursion::recursion_limit() {
             return LazyGen::No;
         }
         // Committed: the generator runs, its consumer synced as the core
         // loop's resume leaves it.
-        dc.set(depth);
-        let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) =
+        let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) =
             std::mem::replace(state, GeneratorState::Running)
         else {
             unreachable!("checked above");
         };
-        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_GEN);
         let held = g.clone();
         let sent = if sent.is_null() {
             Object::None
         } else {
             sent.read()
         };
-        let gframe: &mut crate::Frame = &mut boxed;
-        gframe.gen_first_resume = first;
-        // (A fast step that stopped partway already consumed it.)
-        if !std::mem::take(&mut gframe.sent_consumed) {
-            gframe.stack.push(sent);
-        } else {
-            drop(sent);
-        }
-        // The instruction's operands leave (plain decrements: the
-        // generator, which they may hold, is held above).
+        lazy_sync(st, ops, caller_len, caller_pc);
+        lazy_launch(
+            st,
+            held,
+            boxed,
+            first,
+            sent,
+            native,
+            call_pc,
+            exhaust_arg,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// The consumer's side of a committed lazy resume (see
+/// [`lazy_gen_resume`]): the instruction's operands leave (plain
+/// decrements: whatever they held that runs is held elsewhere), and its
+/// frame is synced as `caller_len` deep, at `caller_pc`.
+///
+/// # Safety
+///
+/// As [`lazy_gen_resume`]'s.
+#[inline(always)]
+unsafe fn lazy_sync(st: &mut State, ops: LazyOps, caller_len: usize, caller_pc: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
         match ops {
             LazyOps::None => {}
             LazyOps::Release(at, n) => crate::release_run(at, n),
@@ -2229,10 +2224,98 @@ pub(crate) unsafe fn lazy_gen_resume(
                 at.write(top);
             }
         }
-        let callee: *mut crate::Frame = gframe;
         let caller = &mut *st.frame;
         caller.stack.set_len(caller_len);
         caller.pc = caller_pc as u32;
+    }
+}
+
+/// Whether a suspended (or, `first`, fresh) generator's frame `gf` may run
+/// lazily (see [`lazy_gen_resume`]) with a value sent in (`sent_none`
+/// whether it's `None`): no state the general machinery keeps extra (a
+/// frame object, saved exception state, a parked native activation), and
+/// its body's native code, entered where the frame stands.
+///
+/// # Safety
+///
+/// `gf` is a suspended generator's frame, read between instructions.
+#[inline(always)]
+unsafe fn lazy_ready(gf: &crate::Frame, first: bool, sent_none: bool) -> Option<&'static Native> {
+    let pc = gf.pc as usize;
+    if gf.py_frame.is_some()
+        || gf.has_saved_exc_info()
+        || pc == 0
+        || gf.parked_native.is_some()
+        || gf.shell_cache.as_ref().is_some_and(|c| {
+            c.has_materialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        || (!sent_none && (first || gf.sent_consumed))
+    {
+        crate::burst_stats::note_decline("lazy gen: frame", &gf.code.qualname);
+        return None;
+    }
+    let ext = crate::code_vm_ext(&gf.code)?;
+    let Some(native) = ext.frame_jit.get(gf.locals.len()) else {
+        crate::burst_stats::note_decline("lazy gen: no native", &gf.code.qualname);
+        return None;
+    };
+    if pc >= ext.dispatch_len || !native.enters_at(pc) || !Interpreter::lean_gen_code_ok(&gf.code) {
+        crate::burst_stats::note_decline(
+            if first {
+                "lazy gen: no first entry"
+            } else {
+                "lazy gen: no entry"
+            },
+            &gf.code.qualname,
+        );
+        return None;
+    }
+    // SAFETY: the frame, which the activation holds while the body runs,
+    // holds the code and with it its native code.
+    Some(unsafe { &*std::ptr::from_ref(native) })
+}
+
+/// Run `held`'s frame `boxed` (just taken out of its state, which is
+/// `Running`; `first` a fresh generator's) from where it stands by its
+/// native code `native`, lazily (see [`lazy_gen_resume`]), `sent` going
+/// in (unless a fast step that stopped partway already consumed one). Its
+/// activation's consumer-facing fields are `call_pc` and `exhaust_arg`; a
+/// running collapsed chain's record (`chain`, or null) goes with it.
+///
+/// # Safety
+///
+/// As [`lazy_gen_resume`]'s, the consumer synced; `chain`, when not null,
+/// is a record no one else owns, whose levels' recursion depth is entered.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn lazy_launch(
+    st: &mut State,
+    held: Rc<crate::object::PyGenerator>,
+    mut boxed: Box<crate::Frame>,
+    first: bool,
+    sent: Object,
+    native: &Native,
+    call_pc: usize,
+    exhaust_arg: u32,
+    chain: *mut crate::ChainRec,
+) -> LazyGen {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let dc = &*st.depth_cell;
+        dc.set(dc.get() + 1);
+        crate::burst_stats::note_call(crate::burst_stats::CALL_LAZY_GEN);
+        let gframe: &mut crate::Frame = &mut boxed;
+        gframe.gen_first_resume = first;
+        // (A fast step that stopped partway already consumed it.)
+        if !std::mem::take(&mut gframe.sent_consumed) {
+            gframe.stack.push(sent);
+        } else {
+            drop(sent);
+        }
+        let callee: *mut crate::Frame = gframe;
+        let pc = gframe.pc as usize;
         // The activation's record, bound into an `InlineAct` only if it
         // registers (see `LazyGenRec`).
         let mut rec = LazyGenRec {
@@ -2242,19 +2325,47 @@ pub(crate) unsafe fn lazy_gen_resume(
             exhaust_arg,
             exc_depth: interp.exc_info_len(),
             caller: st,
+            chain,
         };
-        let act = LazyGenRec::tagged(&mut rec);
+        let mut cst = lazy_state(st, callee, LazyGenRec::tagged(&mut rec), native.need());
+        let nested = interp.direct_calls.get();
+        interp.direct_calls.set(nested + 1);
+        let outer = interp.lazy_top.get();
+        interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
+        let status = native.run_direct(&mut cst, pc);
+        interp.lazy_top.set(outer);
+        interp.direct_calls.set(nested);
+        lazy_gen_done(st, callee, status, &mut cst, &mut rec)
+    }
+}
+
+/// A lazily running generator frame `callee`'s native state (see
+/// [`lazy_launch`]), its activation's (tagged) record `act`, its stack
+/// made room for `need` slots.
+///
+/// # Safety
+///
+/// As [`lazy_launch`]'s.
+#[inline(always)]
+unsafe fn lazy_state(
+    st: &State,
+    callee: *mut crate::Frame,
+    act: *mut crate::InlineAct,
+    need: usize,
+) -> State {
+    // SAFETY: the caller's contract.
+    unsafe {
         let cframe = &mut *callee;
         let stack = &mut cframe.stack;
-        if stack.capacity() < native.need() {
-            stack.reserve(native.need() - stack.len());
+        if stack.capacity() < need {
+            stack.reserve(need - stack.len());
         }
-        let mut cst = State {
+        State {
             locals: cframe.locals.as_mut_ptr(),
             stack: stack.as_mut_ptr(),
             len: stack.len(),
             cap: stack.capacity(),
-            pc,
+            pc: cframe.pc as usize,
             last: usize::MAX,
             countdown: st.countdown,
             snap_gen: st.snap_gen,
@@ -2271,14 +2382,244 @@ pub(crate) unsafe fn lazy_gen_resume(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: true,
+        }
+    }
+}
+
+/// [`lazy_launch`] for a frame whose body can't run lazily: its
+/// activation registers at once (see [`register_lazy`]), the switch's
+/// running one from here, for the core loop to run (`Switched`).
+///
+/// # Safety
+///
+/// As [`lazy_launch`]'s.
+#[allow(clippy::too_many_arguments)]
+unsafe fn lazy_register_now(
+    st: &mut State,
+    held: Rc<crate::object::PyGenerator>,
+    mut boxed: Box<crate::Frame>,
+    first: bool,
+    call_pc: usize,
+    exhaust_arg: u32,
+    chain: *mut crate::ChainRec,
+) -> LazyGen {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let dc = &*st.depth_cell;
+        dc.set(dc.get() + 1);
+        let gframe: &mut crate::Frame = &mut boxed;
+        gframe.gen_first_resume = first;
+        if !std::mem::take(&mut gframe.sent_consumed) {
+            gframe.stack.push(Object::None);
+        }
+        let callee: *mut crate::Frame = gframe;
+        let mut rec = LazyGenRec {
+            gen: Some(held),
+            boxed: Box::into_raw(boxed),
+            call_pc,
+            exhaust_arg,
+            exc_depth: interp.exc_info_len(),
+            caller: st,
+            chain,
         };
-        interp.direct_calls.set(nested + 1);
-        let outer = interp.lazy_top.get();
-        interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
-        let status = native.run_direct(&mut cst, pc);
-        interp.lazy_top.set(outer);
-        interp.direct_calls.set(nested);
-        lazy_gen_done(st, callee, status, &mut cst, &mut rec)
+        let mut cst = lazy_state(st, callee, LazyGenRec::tagged(&mut rec), 0);
+        register_lazy(&mut cst);
+        LazyGen::Switched
+    }
+}
+
+/// [`lazy_gen_resume`] of `g`, the outermost level of a parked `yield
+/// from` chain (see `crate::ChainRec`), resumed with `None`: the chain's
+/// innermost generator runs (lazily, by a fast step, or registered when
+/// neither can run it), the levels staying collapsed. Its yield passes
+/// them by to the consumer, the chain parking again; its return lands in
+/// the innermost level's `SEND`, which runs on in its place, until the
+/// outermost level itself yields or returns to the consumer. Anything
+/// that doesn't qualify declines untouched, for the switch's chain resume.
+///
+/// # Safety
+///
+/// As [`lazy_gen_resume`]'s.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn lazy_chain_resume(
+    st: &mut State,
+    g: &Rc<crate::object::PyGenerator>,
+    sent: *mut Object,
+    ops: LazyOps,
+    call_pc: usize,
+    exhaust_arg: u32,
+    caller_len: usize,
+    caller_pc: usize,
+) -> LazyGen {
+    // SAFETY: the caller's contract; a parked record owns itself, and its
+    // levels are alive and delegating (see `crate::ChainRec`).
+    unsafe {
+        if !(sent.is_null() || matches!(&*sent, Object::None)) {
+            return LazyGen::No;
+        }
+        let Some(addr) = Interpreter::parked_head(g) else {
+            crate::burst_stats::note_decline("lazy gen: running chain", "-");
+            return LazyGen::No;
+        };
+        let rec = addr as *mut crate::ChainRec;
+        let base = (*rec).levels.len();
+        let last = (*rec).levels.last().expect("a collapsed chain");
+        // The innermost generator, held by the innermost level's stack.
+        let inner: &Rc<crate::object::PyGenerator> = match (&*last.act.frame).stack.last() {
+            Some(Object::Generator(i) | Object::Coroutine(i)) => &*std::ptr::from_ref(i),
+            _ => return LazyGen::No,
+        };
+        let Some(inner_frame) = Interpreter::collapse_frame(inner) else {
+            crate::burst_stats::note_decline("lazy gen: chain inner", "-");
+            return LazyGen::No;
+        };
+        // An innermost generator that has since started delegating (a
+        // `yield from` of a fresh generator) joins the chain as a level, as
+        // `Interpreter::core_send_unpark` adds it, with the generators below
+        // it that qualify in turn.
+        let (inner, inner_frame) = match Interpreter::collapse_next(&*inner_frame) {
+            Some((next, next_send)) => match Interpreter::collapse_frame(next) {
+                Some(next_frame) => Interpreter::collapse_walk(
+                    &mut *rec,
+                    Rc::as_ptr(inner),
+                    inner_frame,
+                    Rc::as_ptr(next),
+                    next_send,
+                    next_frame,
+                ),
+                None => (Rc::as_ptr(inner), inner_frame),
+            },
+            None => (Rc::as_ptr(inner), inner_frame),
+        };
+        let levels = (*rec).levels.len();
+        // It runs as it stands: by a fast step, or lazily.
+        let dc = &*st.depth_cell;
+        if !((crate::gen_fast::may_step(&*inner)
+            || lazy_ready(&*inner_frame, false, true).is_some())
+            && dc.get() + levels + 2 <= crate::recursion::recursion_limit())
+        {
+            for level in (*rec).levels.drain(base..).rev() {
+                // SAFETY: delegating since the walk.
+                level.suspend();
+            }
+            crate::burst_stats::note_decline("lazy gen: chain inner", "-");
+            return LazyGen::No;
+        }
+        Rc::increment_strong_count(inner);
+        let inner = Rc::from_raw(inner);
+        // Committed: the chain runs, its levels counting against the
+        // recursion limit as when resumed.
+        (*rec).parked = false;
+        let mut cur = inner;
+        // A `next()` or `send()` call's operands held the outermost level.
+        if !matches!(ops, LazyOps::None) {
+            (*rec).hold = Some(g.clone());
+        }
+        if !sent.is_null() {
+            drop(sent.read());
+        }
+        lazy_sync(st, ops, caller_len, caller_pc);
+        dc.set(dc.get() + levels);
+        let mut chain = rec;
+        let interp = &mut *st.interp.cast_mut();
+        loop {
+            let levels = if chain.is_null() {
+                0
+            } else {
+                (*chain).levels.len()
+            };
+            let ran = lazy_step(st, &cur, call_pc, exhaust_arg, chain);
+            match ran {
+                LazyGen::Yielded(v) => {
+                    if !chain.is_null() {
+                        // The chain parks again, its levels still
+                        // delegating, off the recursion depth.
+                        dc.set(dc.get() - levels);
+                        interp.chain_repark(Box::from_raw(chain));
+                    }
+                    return LazyGen::Yielded(v);
+                }
+                LazyGen::Returned(r) => {
+                    if chain.is_null() {
+                        return LazyGen::Returned(r);
+                    }
+                    // The innermost level's `SEND` exits with the return
+                    // value, the level suspended there having taken it; it
+                    // runs on in the returned generator's place.
+                    let level = (*chain).levels.pop().expect("a collapsed chain");
+                    dc.set(dc.get() - 1);
+                    level.suspend();
+                    let frame = &mut *level.act.frame;
+                    let jump = frame.code.instructions[level.send_pc].arg;
+                    frame.pc = level.send_pc as u32 + 1 + jump;
+                    frame.stack.push(r);
+                    frame.sent_consumed = true;
+                    Rc::increment_strong_count(level.gen);
+                    cur = Rc::from_raw(level.gen);
+                    if (*chain).levels.is_empty() {
+                        interp.chain_recycle(Box::from_raw(chain));
+                        chain = std::ptr::null_mut();
+                    }
+                }
+                // Registered: the activation owns the chain's record.
+                LazyGen::Switched | LazyGen::No => return LazyGen::Switched,
+            }
+        }
+    }
+}
+
+/// One step of [`lazy_chain_resume`]: `gen` (suspended, resumed with
+/// `None` unless a step already gave it its value) runs to its next yield
+/// or return by a fast step when its body allows, else lazily, else
+/// registered (`Switched`), with the chain's record `chain` (or null).
+///
+/// # Safety
+///
+/// As [`lazy_chain_resume`]'s.
+unsafe fn lazy_step(
+    st: &mut State,
+    gen: &Rc<crate::object::PyGenerator>,
+    call_pc: usize,
+    exhaust_arg: u32,
+    chain: *mut crate::ChainRec,
+) -> LazyGen {
+    use crate::gen_fast::GenNext;
+    use crate::object::GeneratorState;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        if crate::gen_fast::may_step(gen) {
+            match interp.gen_fast_next(gen, st.snap_gen, 0, st.maybe_dead) {
+                GenNext::Yielded(v) => return LazyGen::Yielded(v),
+                GenNext::Exhausted(r) => return LazyGen::Returned(r),
+                GenNext::Declined | GenNext::Partial => {}
+            }
+        }
+        let state = &mut *gen.state_raw().as_ptr();
+        let native = match &*state {
+            GeneratorState::Suspended(f) => lazy_ready(f, false, true),
+            _ => unreachable!("a chain's generator is suspended"),
+        };
+        let GeneratorState::Suspended(boxed) = std::mem::replace(state, GeneratorState::Running)
+        else {
+            unreachable!("checked above");
+        };
+        match native {
+            Some(native) => lazy_launch(
+                st,
+                gen.clone(),
+                boxed,
+                false,
+                Object::None,
+                native,
+                call_pc,
+                exhaust_arg,
+                chain,
+            ),
+            None => lazy_register_now(st, gen.clone(), boxed, false, call_pc, exhaust_arg, chain),
+        }
     }
 }
 
@@ -2294,6 +2635,9 @@ pub(crate) struct LazyGenRec {
     exhaust_arg: u32,
     exc_depth: usize,
     caller: *mut State,
+    /// A running collapsed chain's record (see [`lazy_chain_resume`]), or
+    /// null.
+    chain: *mut crate::ChainRec,
 }
 
 impl LazyGenRec {
@@ -2337,6 +2681,12 @@ impl LazyGenRec {
         act.call_pc = self.call_pc;
         act.exc_depth = self.exc_depth;
         act.lazy_caller = self.caller;
+        if !self.chain.is_null() {
+            // SAFETY: the chain's record, no one else's (see `lazy_launch`).
+            act.chain = Some(unsafe {
+                Box::from_raw(std::mem::replace(&mut self.chain, std::ptr::null_mut()))
+            });
+        }
         Box::into_raw(act)
     }
 }
@@ -7334,6 +7684,14 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         st.lazy_last = sw.last;
         let call_pc = (*act).call_pc;
         (*act).caller_pending = interp.core_pending_enter_fast(sw, &mut *caller.frame, call_pc);
+        // A collapsed chain's levels wait on the pending list, outermost
+        // first, as `Interpreter::collapse_commit` enters them.
+        if let Some(rec) = (*act).chain.as_mut() {
+            rec.pend_at = interp.lean_pending.len();
+            for level in &mut rec.levels {
+                crate::push_fast(&mut interp.lean_pending, &raw mut level.act as usize);
+            }
+        }
         crate::push_fast(&mut *sw.inl, Box::from_raw(act));
         sw.cur = st.frame;
         sw.scratch = usize::MAX;

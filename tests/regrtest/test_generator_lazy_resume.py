@@ -5,6 +5,8 @@ frames seen from inside, tracebacks, `StopIteration` values, `close` and
 and inlined `list`/`tuple`/`all`/`any` of generator expressions that drain
 their generator."""
 
+import os
+import subprocess
 import sys
 import traceback
 
@@ -278,3 +280,17 @@ def drains(n):
 
 
 assert drains(N // 3)
+
+
+# Again with bodies compiling at once, and without tier 2, so the lazy
+# paths run from the start (CPython ignores the settings).
+if not os.environ.get("_LAZY_GEN_CHILD"):
+    for extra in (
+        {"WEAVEPY_FRAME_JIT_HOT": "5"},
+        {"WEAVEPY_FRAME_JIT_HOT": "5", "WEAVEPY_TIER2": "0"},
+    ):
+        env = dict(os.environ, _LAZY_GEN_CHILD="1", **extra)
+        r = subprocess.run(
+            [sys.executable, __file__], env=env, capture_output=True, text=True, timeout=300
+        )
+        assert r.returncode == 0, (extra, r.stderr[-3000:])
