@@ -8507,7 +8507,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                 let v = cst.stack.read();
                 cframe.stack.set_len(0);
                 let mut done = Box::from_raw(cst.lazy);
-                crate::release_locals(cframe.locals.storage());
+                crate::release_activation_locals(cframe, done.owns_cells);
                 drop(done.guard.take());
                 // A `functools.lru_cache` miss's function returned: its
                 // result is stored before the caller takes it.
@@ -8610,7 +8610,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                 } else {
                     v
                 };
-                crate::release_locals(cframe.locals.storage());
+                crate::release_activation_locals(cframe, done.owns_cells);
                 drop(done.guard.take());
                 // A `functools.lru_cache` miss's function returned: its
                 // result is stored before the caller takes it.

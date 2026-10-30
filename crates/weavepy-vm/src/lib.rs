@@ -124,6 +124,15 @@ const POOLED_STACK_CAPACITY: usize = 16;
 #[doc(hidden)]
 pub struct Frame {
     code: Rc<CodeObject>,
+    /// Evaluation stack. (The stack, the cells and the locals are declared
+    /// in the order a frame's plain drop should release them: see
+    /// [`frame_slots::release_cells_and_locals`].)
+    stack: frame_slots::FrameStack,
+    /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
+    /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
+    /// resized afterwards, and shared with the frame's `FrameShell` /
+    /// `PyFrame` without a per-call `Vec` clone.
+    cells: Rc<Vec<Rc<RefCell<Object>>>>,
     /// Local variables, indexed by `LOAD_FAST` / `STORE_FAST`.
     ///
     /// Shared storage (RFC 0047): the same allocation backs the
@@ -138,13 +147,6 @@ pub struct Frame {
     /// (`getrefcount(self) <= REF_COUNT` in `Series.__setitem__` &
     /// friends).
     locals: frame_slots::FrameLocals,
-    /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
-    /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
-    /// resized afterwards, and shared with the frame's `FrameShell` /
-    /// `PyFrame` without a per-call `Vec` clone.
-    cells: Rc<Vec<Rc<RefCell<Object>>>>,
-    /// Evaluation stack.
-    stack: frame_slots::FrameStack,
     /// Globals shared across frames within the same module.
     globals: Rc<RefCell<DictData>>,
     /// The builtins mapping this frame resolves names against —
@@ -2670,7 +2672,8 @@ impl Interpreter {
     /// the result (CPython's `CALL` decrefs its operands first): an
     /// argument only the call held dies here, finalizers and all.
     fn reap_call_args(&mut self, args: &mut [Object]) {
-        for a in args {
+        // (The last first: a Python callee's arguments are its locals.)
+        for a in args.iter_mut().rev() {
             drop(std::mem::replace(a, Object::Unbound));
         }
     }
@@ -2689,7 +2692,9 @@ impl Interpreter {
         }
         let mut t = t;
         if let Some(slots) = ThinArc::get_mut(&mut t) {
-            for s in slots.iter_mut() {
+            // (The last first, as CPython's tuple goes: `f(*args)`'s run
+            // through a leaf callee's locals this way.)
+            for s in slots.iter_mut().rev() {
                 let old = std::mem::replace(s, Object::Unbound);
                 // Scalars have no drop glue; skip the out-of-line call.
                 if matches!(
@@ -4041,9 +4046,11 @@ impl Interpreter {
     fn recycle_frame_allocs(&self, frame: &mut Frame) {
         const POOL_CAP: usize = 64;
         let mut stack = std::mem::take(&mut frame.stack);
+        // The operands go before the cells and locals, whatever the stack's
+        // fate.
+        stack.clear();
         // (A generator's stack, sized to its code, is too small to pool.)
         if stack.capacity() >= POOLED_STACK_CAPACITY {
-            stack.clear();
             let mut pool = self.frame_stack_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(stack);
@@ -4055,7 +4062,8 @@ impl Interpreter {
             // bookkeeping), which must not observe a held pool borrow.
             // SAFETY: sole owner (checked above) — no other path can
             // reach this vector, including the drop glue of its elements.
-            unsafe { release_locals(frame.locals.storage()) };
+            // These frames own their cells.
+            unsafe { release_owned_cells_and_locals(frame) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.shared().clone());
@@ -4153,11 +4161,13 @@ impl Interpreter {
         let (locals, stack, boxed, sole) = unsafe {
             let (locals, mut stack) = (std::ptr::read(locals), std::ptr::read(stack));
             stack.clear();
-            // (An escaped `PyFrame` sharing them drops below: the decision
-            // is made before it does.)
+            // A frame object or shell only this frame still holds goes
+            // first: the values are then the frame's to release, in order.
+            std::ptr::drop_in_place(py_frame);
+            std::ptr::drop_in_place(shell_cache);
             let sole = !locals.is_shared();
             if sole {
-                release_locals(locals.storage());
+                frame_slots::release_cells_and_locals(code, cells, locals.storage());
             }
             std::ptr::drop_in_place(code);
             std::ptr::drop_in_place(cells);
@@ -4165,8 +4175,6 @@ impl Interpreter {
             std::ptr::drop_in_place(builtins);
             std::ptr::drop_in_place(rare);
             std::ptr::drop_in_place(exc);
-            std::ptr::drop_in_place(py_frame);
-            std::ptr::drop_in_place(shell_cache);
             #[cfg(feature = "jit")]
             std::ptr::drop_in_place(parked_native);
             (
@@ -5863,7 +5871,7 @@ impl Interpreter {
             lasti: Cell::new(frame.pc),
             back: RefCell::new(back),
             locals_cache: RefCell::new(None),
-            cells: frame.cells.clone(),
+            cells: RefCell::new(frame.cells.clone()),
             class_namespace: frame.class_namespace().cloned(),
             class_namespace_obj: frame.class_namespace_obj().cloned(),
             // At module / exec scope CPython makes `locals() is
@@ -6101,17 +6109,11 @@ impl Interpreter {
     /// storage, any frozen `take_ownership` snapshot (in place, so
     /// earlier `f_locals` handles observe the wipe), and the PEP 667
     /// extra-locals dict. The `cleared` flag makes the
-    /// `FrameLocalsProxy` report an empty mapping even though the cell
-    /// vector (shared with closures) still holds values — CPython
-    /// likewise clears the cell *slots* while the cell objects live on
-    /// in the closures that captured them.
+    /// `FrameLocalsProxy` report an empty mapping — CPython likewise
+    /// clears the cell *slots* while the cell objects live on in the
+    /// closures that captured them.
     fn wipe_frame_locals(py: &Rc<PyFrame>) {
-        if let Some(mirror) = py.locals_mirror.borrow().as_ref() {
-            mirror.borrow_mut().clear();
-        }
-        if let Some(Object::Dict(d)) = py.locals_cache.borrow().as_ref() {
-            d.borrow_mut().clear();
-        }
+        py.release_held_values(true);
         if let Some(extra) = py.extra_locals.borrow().as_ref() {
             extra.borrow_mut().clear();
         }
@@ -8532,9 +8534,7 @@ impl Interpreter {
         fr.stack.clear();
         if !fr.locals.is_shared() {
             // SAFETY: sole owner — no other path reaches this vector.
-            let v = unsafe { fr.locals.storage() };
-            // SAFETY: sole owner (checked above).
-            unsafe { release_locals(v) };
+            unsafe { release_activation_locals(fr, act.owns_cells) };
         } else {
             // The storage escaped (a materialized frame shares it): the
             // slot takes fresh storage.
@@ -9063,7 +9063,7 @@ impl Interpreter {
                     && !frame.locals.is_shared()
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    unsafe { release_locals(frame.locals.storage()) };
+                    unsafe { release_activation_locals(frame, done.owns_cells) };
                     drop(done.guard.take());
                     return Ok(v);
                 }
@@ -17805,7 +17805,7 @@ impl Interpreter {
         }
         // Committed: the operands leave the stack.
         let callee = frame.stack[callee_at].clone();
-        let operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
+        let mut operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
@@ -17824,6 +17824,12 @@ impl Interpreter {
                 if let Some(r) = receiver {
                     args.insert(0, r);
                 }
+                // The arguments are the callee's locals, held by what binds
+                // them from here (`args`, `kwvals`): nothing dies with the
+                // operands, and what dies with the locals goes in their order.
+                for o in operands.drain(..) {
+                    self.release(o);
+                }
                 self.call_python_kw_names(&f, args, &kwnames, kwvals)
             }
             None => {
@@ -17838,7 +17844,7 @@ impl Interpreter {
         self.core_pending_exit(sw, pending);
         drop(kwnames);
         drop(callee);
-        for o in operands {
+        for o in operands.into_iter().rev() {
             self.release(o);
         }
         // SAFETY: the running activation's last-pc slot.
@@ -18457,6 +18463,11 @@ impl Interpreter {
         {
             return false;
         }
+        // A value only the mapping holds would die in the mapping's order:
+        // the activation's locals release it in the parameters'.
+        if kw.is_some_and(|d| d.iter().any(|(_, v)| holds_last_reference(v))) {
+            return false;
+        }
         let mut ptrs: [*const Object; 8] = [std::ptr::null(); 8];
         let arity = leaf_arity(code);
         if kw.is_none()
@@ -18494,7 +18505,7 @@ impl Interpreter {
         };
         frame.stack.push(r);
         frame.pc = pc as u32 + 1;
-        for o in operands {
+        for o in operands.into_iter().rev() {
             self.release_hot(o);
         }
         true
@@ -23092,6 +23103,19 @@ impl Interpreter {
         }
         let kw_vals = &ops[first + eff_argc..ops.len() - 1];
         let mut varkw: Option<DictData> = None;
+        // The caller releases the operands in call order. Keywords given out
+        // of their parameters' order, when one dies with the call, take the
+        // activation, whose locals go in the parameters' order.
+        let mut last_slot = 0;
+        let mut out_of_order = false;
+        for (j, _) in kw_vals.iter().enumerate() {
+            let slot = (perm >> (4 * j)) & 0xF;
+            out_of_order |= slot != specialize::KW_TO_VARKW && slot < last_slot;
+            last_slot = slot;
+        }
+        if out_of_order && kw_vals.iter().any(holds_last_reference) {
+            return None;
+        }
         for (j, o) in kw_vals.iter().enumerate() {
             let slot = ((perm >> (4 * j)) & 0xF) as usize;
             if slot == specialize::KW_TO_VARKW as usize {
@@ -25202,7 +25226,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(frame.locals.storage()) };
+            unsafe { release_activation_locals(frame, done.owns_cells) };
             drop(done.guard.take());
             // A `functools.lru_cache` miss's function returned: its result
             // is stored before the caller takes it (`inline_deliver`'s).
@@ -25286,7 +25310,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(frame.locals.storage()) };
+            unsafe { release_activation_locals(frame, done.owns_cells) };
             drop(done.guard.take());
             Ok(v)
         } else {
@@ -34607,10 +34631,11 @@ impl Interpreter {
                 let r = result?;
                 frame.push(r);
                 self.release(callable);
-                self.reap_call_args(&mut pos_args);
-                for (_, v) in &mut kw_pairs {
+                // (The operands' top first: the keywords, the last first.)
+                for (_, v) in kw_pairs.iter_mut().rev() {
                     self.reap_call_args(std::slice::from_mut(v));
                 }
+                self.reap_call_args(&mut pos_args);
             }
             OpCode::CallEx => {
                 // CALL_FUNCTION_EX (3.14 shape): the stack always holds
@@ -34868,6 +34893,24 @@ impl Interpreter {
                     Object::BoundMethod(bm) if bm.is_pymethod_type()
                         && matches!(bm.function, Object::Builtin(_))
                 );
+                // The `*` sequence and the `**` mapping go first (usually
+                // compiler temporaries): the values live on in `pos_args` and
+                // `kw_pairs`, and die in a callee's locals' order, as CPython's
+                // handler gives its frame the arguments and drops the two.
+                // `f(**d)` lowers to `BuildMap 0` + `dict.update(d)`, and
+                // populating that fresh dict GC-tracks it: a plain Rust drop
+                // would leave it refcount-dead but pinned by its own collector
+                // handle, holding every kwarg value until the next full
+                // collection, so it goes through the prompt reaper (e.g.
+                // `Thread(target=..., kwargs={'x': obj})` doesn't pin `obj`
+                // past `Thread.join()`:
+                // test_threading.test_no_refcycle_through_target). The
+                // deadness guard inside leaves a still-referenced mapping
+                // untouched, so a user-held dict passed as `**d` is safe.
+                if let Some(kw) = kwargs_obj {
+                    self.release(kw);
+                }
+                self.release(args_obj);
                 let result = if py_method_over_builtin {
                     self.call(&callable, &pos_args, &kw_pairs, &frame.globals)
                 } else {
@@ -34898,28 +34941,11 @@ impl Interpreter {
                 let r = result?;
                 frame.push(r);
                 self.release(callable);
-                self.reap_call_args(&mut pos_args);
-                for (_, v) in &mut kw_pairs {
+                // (The operands' top first: the keywords, the last first.)
+                for (_, v) in kw_pairs.iter_mut().rev() {
                     self.reap_call_args(std::slice::from_mut(v));
                 }
-                // The `**kwargs` mapping is (usually) a compiler temporary:
-                // `f(**d)` lowers to `BuildMap 0` + `dict.update(d)`, and
-                // populating that fresh dict GC-tracks it. Dropping it with
-                // a plain Rust drop would leave it refcount-dead but pinned
-                // by its own collector handle — holding a strong clone of
-                // every kwarg value until the next full collection. CPython
-                // frees the temporary (and everything it holds) by refcount
-                // the instant the call returns; run it through the prompt
-                // reaper so e.g. `Thread(target=..., kwargs={'x': obj})`
-                // doesn't pin `obj` past `Thread.join()`
-                // (test_threading.test_no_refcycle_through_target). The
-                // deadness guard inside leaves a still-referenced mapping
-                // untouched, so a user-held dict passed as `**d` is safe.
-                if let Some(kw) = kwargs_obj {
-                    self.release(kw);
-                }
-                // Same for the `*args` sequence temporary.
-                self.release(args_obj);
+                self.reap_call_args(&mut pos_args);
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -62388,7 +62414,7 @@ impl Interpreter {
             // temporary container is reaped now, not at the next
             // collection).
             let mut positional = positional;
-            for v in positional.drain(..) {
+            for v in positional.drain(..).rev() {
                 self.release(v);
             }
             self.recycle_scratch(positional);
@@ -72597,12 +72623,10 @@ fn fresh_cells(
 ) -> Rc<Vec<Rc<RefCell<Object>>>> {
     let mut cells: Vec<Rc<RefCell<Object>>> =
         Vec::with_capacity(code.cellvars.len() + code.freevars.len());
-    for name in &code.cellvars {
-        let initial = code
-            .varnames
-            .iter()
-            .position(|n| n == name)
-            .and_then(|i| locals.get_mut(i))
+    let args: &[u32] = code_vm_ext(code).map_or(&[], |ext| &ext.cell_args);
+    for &slot in args {
+        let initial = locals
+            .get_mut(slot as usize)
             .map_or(Object::Unbound, |slot| {
                 std::mem::replace(slot, Object::Unbound)
             });
@@ -72692,8 +72716,52 @@ fn push_grow<T>(v: &mut Vec<T>, x: T) {
     v.push(x);
 }
 
-/// Empty a finished activation's `locals`, releasing each value (an
-/// object that dies queues its finalizer, as any release does).
+/// Whether `o` is the only reference to its value, which would die with it.
+fn holds_last_reference(o: &Object) -> bool {
+    // SAFETY: `o` is live, and its count word with it.
+    o.strong_word()
+        .is_some_and(|w| unsafe { (*w).load(std::sync::atomic::Ordering::Relaxed) == 1 })
+}
+
+/// [`release_locals`] for a finished activation's frame, with its cells
+/// when it owns them (see [`frame_slots::release_cells_and_locals`]).
+///
+/// # Safety
+///
+/// Nothing else borrows the frame's locals, and it holds a count on its
+/// cells if `owns_cells`.
+#[inline(always)]
+unsafe fn release_activation_locals(frame: &mut Frame, owns_cells: bool) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if owns_cells {
+            release_owned_cells_and_locals(frame);
+        } else {
+            release_locals(frame.locals.storage());
+        }
+    }
+}
+
+/// [`frame_slots::release_cells_and_locals`] for `frame`.
+///
+/// # Safety
+///
+/// As [`release_activation_locals`], with cells it holds a count on.
+#[inline]
+unsafe fn release_owned_cells_and_locals(frame: &mut Frame) {
+    let Frame {
+        code,
+        cells,
+        locals,
+        ..
+    } = frame;
+    // SAFETY: the caller's contract.
+    frame_slots::release_cells_and_locals(code, cells, unsafe { locals.storage() });
+}
+
+/// Empty a finished activation's `locals`, releasing each value, the last
+/// first as CPython does (an object that dies queues its finalizer, as any
+/// release does).
 ///
 /// # Safety
 ///
@@ -72710,10 +72778,10 @@ unsafe fn release_locals(locals: &mut Vec<Object>) {
     }
 }
 
-/// Release the `n` values from `base` on (each read out once), as
-/// [`drop_hot`] releases one: the bias is tested once for the run, and a
-/// shared owner's decrement reads only the tag and the pointer (a moved
-/// out copy of each value showed in every return's profile).
+/// Release the `n` values from `base` on, the last first (each read out
+/// once), as [`drop_hot`] releases one: the bias is tested once for the run,
+/// and a shared owner's decrement reads only the tag and the pointer (a
+/// moved out copy of each value showed in every return's profile).
 ///
 /// # Safety
 ///
@@ -72724,12 +72792,12 @@ pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
     // SAFETY: the caller's contract.
     unsafe {
         if !crate::rc::refcounts_biased() {
-            for k in 0..n {
+            for k in (0..n).rev() {
                 drop(base.add(k).read());
             }
             return;
         }
-        for k in 0..n {
+        for k in (0..n).rev() {
             let at = base.add(k);
             if let Some(word) = (*at).strong_word() {
                 // While the bias holds this thread alone updates counts.
@@ -78977,6 +79045,10 @@ fn fusion_enabled() -> bool {
 /// allocated twice per execution before this).
 struct CodeConstObjects {
     objects: Vec<Object>,
+    /// The local slot of each `co_cellvars` entry that is an argument, whose
+    /// value moves into its cell as a call starts, `u32::MAX` for the others
+    /// (a call's cells are made and released by these slots).
+    cell_args: Box<[u32]>,
     /// RFC 0077 WS4: `py_str_hash` of every `co_names` entry, so the
     /// attribute-name dict probes the eval loop issues per execution of a
     /// site (inline-cache shadow guards, generic lookups) hash the
@@ -82514,6 +82586,16 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
                 .names
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
+                .collect(),
+            cell_args: code
+                .cellvars
+                .iter()
+                .map(|c| {
+                    code.varnames
+                        .iter()
+                        .position(|n| n == c)
+                        .map_or(u32::MAX, |i| i as u32)
+                })
                 .collect(),
             site_ranks: std::sync::OnceLock::new(),
             method_slots: SiteSlots::new(),
