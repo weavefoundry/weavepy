@@ -7032,7 +7032,7 @@ fn finish_deopted(
         agen_yielded_value: true,
         pc: 0,
         py_frame,
-        gen_owner: None,
+        gen_owner: crate::GenOwner::NONE,
         suppress_call_event: true,
         gen_first_resume: false,
         sent_consumed: false,

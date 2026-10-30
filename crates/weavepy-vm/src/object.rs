@@ -5922,7 +5922,7 @@ pub(crate) fn pooled_generator(
     let Some(g) = (unsafe { &mut *GEN_POOL.0.get() }).pop() else {
         return Err((code, frame));
     };
-    frame.gen_owner = Some(Rc::downgrade(&g));
+    frame.gen_owner = crate::GenOwner::of(&g);
     // SAFETY: a pooled generator is unique (see `recycle_generator`), and
     // the backlink just made can't be used before the generator is
     // returned.
