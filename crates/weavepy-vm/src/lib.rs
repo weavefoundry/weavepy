@@ -8696,6 +8696,7 @@ impl Interpreter {
             }
             _ => {}
         }
+        crate::burst_stats::note_call(crate::burst_stats::CALL_INLINE_GEN);
         let mut act = self.inline_slot();
         // A pooled slot holds none of these (every path back to the pool
         // takes them), so they're written without drop glue.
@@ -12023,6 +12024,58 @@ impl Interpreter {
             // modes) without leaving the loop: when the activation goes on
             // in place, so does the loop, with no reload (see
             // `core_offload_in_loop`).
+            // A generator resumed by the instruction at `pc` (`$mode`) runs
+            // its compiled body lazily (see `frame_jit::core_lazy_resume`):
+            // when that finishes the instruction, the loop goes on in place.
+            macro_rules! lazy_resume {
+                ($mode:expr) => {
+                    #[cfg(feature = "jit")]
+                    // SAFETY: the running activation, the instruction's
+                    // operands atop its stack.
+                    match unsafe {
+                        frame_jit::core_lazy_resume(
+                            self, sw, base, len, cap, last, pc, snap_gen, $mode,
+                        )
+                    } {
+                        frame_jit::CoreLazy::Declined => {}
+                        frame_jit::CoreLazy::Next { len: n, pc: to } => {
+                            len = n;
+                            last = pc;
+                            pc = to;
+                            after_release!();
+                            continue;
+                        }
+                        // A `FOR_ITER`'s loop exits past its `END_FOR` and
+                        // `POP_ITER` pair.
+                        frame_jit::CoreLazy::Exhausted { len: n } => {
+                            len = n;
+                            last = pc;
+                            // SAFETY: the `FOR_ITER` at `pc`.
+                            pc += 1 + unsafe { (*instrs.add(pc)).arg } as usize;
+                            // SAFETY: a loop's exit and the `END_FOR` after
+                            // it never end the code (see `code_dispatch_len`).
+                            if unsafe { (*instrs.add(pc)).op } == OpCode::EndFor {
+                                pc += 1;
+                                // SAFETY: as above.
+                                if matches!(
+                                    unsafe { (*instrs.add(pc)).op },
+                                    OpCode::PopIter | OpCode::PopTop
+                                ) {
+                                    pc += 1;
+                                }
+                            }
+                            after_release!();
+                            continue;
+                        }
+                        frame_jit::CoreLazy::Raised(e, n) => {
+                            len = n;
+                            pc += 1;
+                            break Some(CoreExit::Stop(LeafStop::Raised(e)));
+                        }
+                        frame_jit::CoreLazy::Reload => break Some(CoreExit::Reload),
+                    }
+                };
+            }
             macro_rules! offload {
                 ($mode:expr) => {{
                     let mut at = CoreAt { len, pc, last };
@@ -12082,6 +12135,7 @@ impl Interpreter {
                             lazy: std::ptr::null_mut(),
                             lazy_depth: 0,
                             lazy_last: std::ptr::null_mut(),
+                            gen_lazy: false,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -13390,6 +13444,7 @@ impl Interpreter {
                                 continue;
                             }
                         }
+                        lazy_resume!(InlineResume::Send);
                         // SAFETY: `len <= cap`, every slot initialized.
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
@@ -13520,6 +13575,7 @@ impl Interpreter {
                                     }
                                     gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
                                 }
+                                lazy_resume!(InlineResume::ForIter);
                                 // SAFETY: `len <= cap`, every slot initialized.
                                 unsafe { frame.stack.set_len(len) };
                                 frame.pc = pc as u32;
@@ -14362,6 +14418,7 @@ impl Interpreter {
                                     gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
                                 }
                             }
+                            lazy_resume!(InlineResume::NextCall);
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
@@ -14421,6 +14478,7 @@ impl Interpreter {
                                     gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => {}
                                 }
                             }
+                            lazy_resume!(InlineResume::SendCall);
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
@@ -14441,6 +14499,7 @@ impl Interpreter {
                                     if Rc::as_ptr(b) as usize == self.leaf_fns().next_ptr
                             )
                         {
+                            lazy_resume!(InlineResume::NextDefault);
                             // SAFETY: `len <= cap`, every slot initialized.
                             unsafe { frame.stack.set_len(len) };
                             frame.pc = pc as u32;
@@ -62432,31 +62491,73 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
-        let Some(ins) = frame.code.instructions.get(pc) else {
+        let await_ok = self.inline_calls_ok();
+        let Some((await_send, deferred)) = self.core_gen_make(frame, pc, await_ok) else {
             return false;
         };
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // `await f(...)`: the coroutine starts at once, as the `SEND` after
+        // its `GET_AWAITABLE` (which passes a fresh coroutine through) would
+        // start it with the `None` sent. The caller rests at the `SEND`,
+        // where the coroutine's return lands; the caller of this function
+        // finds the switch in `sw`.
+        let caller: *mut Frame = frame;
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        let started = if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            false
+        } else if let Some(send_pc) = await_send {
+            // SAFETY: as above (the `LOAD_CONST` before the `SEND`).
+            unsafe { *sw.last = send_pc - 1 };
+            let started = self.core_await_enter(sw, send_pc);
+            if !started {
+                // SAFETY: as above.
+                unsafe { *sw.last = pc };
+            }
+            started
+        } else {
+            false
+        };
+        if deferred && !started {
+            // SAFETY: as above.
+            if let Some(obj @ Object::Coroutine(g)) = unsafe { (*caller).stack.last() } {
+                g.track_deferred.set(false);
+                gc_trace::track_generator(obj);
+            }
+        }
+        true
+    }
+
+    /// [`Self::core_gen_call`]'s making of the generator, the call at `pc`
+    /// of `frame` (synced at it) replaced by its result, `frame.pc` past
+    /// it: `None` touched nothing. With `await_ok` (inline calls allowed),
+    /// an `await f(...)`'s coroutine is made for the caller to start: the
+    /// await's `SEND`, and whether the coroutine's tracking was deferred.
+    pub(crate) fn core_gen_make(
+        &mut self,
+        frame: &mut Frame,
+        pc: usize,
+        await_ok: bool,
+    ) -> Option<(Option<usize>, bool)> {
+        let ins = frame.code.instructions.get(pc)?;
         let argc = ins.arg as usize;
-        let Some(callee_at) = frame.stack.len().checked_sub(argc + 2) else {
-            return false;
-        };
+        let callee_at = frame.stack.len().checked_sub(argc + 2)?;
         let (f, receiver) = match (&frame.stack[callee_at], &frame.stack[callee_at + 1]) {
             (Object::Function(f), Object::Unbound) => (f, None),
             (Object::Function(f), recv) => (f, Some(recv)),
             (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
                 match &bm.function {
                     Object::Function(f) => (f, Some(&bm.receiver)),
-                    _ => return false,
+                    _ => return None,
                 }
             }
-            _ => return false,
+            _ => return None,
         };
         // SAFETY: GIL-serialized raw read of the function's code cell (the
         // callee on the stack holds the function).
         let code_ref: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        let Some(start) = self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))
-        else {
-            return false;
-        };
+        let start = self.generator_start(f, code_ref, argc + usize::from(receiver.is_some()))?;
         let code = code_ref.clone();
         // A body without cells of its own shares the function's (see
         // `PyFunction::lean_cells`), and its frame is built right here.
@@ -62493,7 +62594,7 @@ impl Interpreter {
             v.set_len(v.len() + nargs);
         };
         // `await f(...)`: the coroutine starts as it is made (see below).
-        let await_send = if code.is_coroutine && self.inline_calls_ok() {
+        let await_send = if code.is_coroutine && await_ok {
             await_send_after(&frame.code, pc)
         } else {
             None
@@ -62554,38 +62655,7 @@ impl Interpreter {
         let deferred = matches!(&gen, Object::Coroutine(g) if g.track_deferred.get());
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
-        // SAFETY: the running activation's last-pc slot.
-        unsafe { *sw.last = pc };
-        // `await f(...)`: the coroutine starts at once, as the `SEND` after
-        // its `GET_AWAITABLE` (which passes a fresh coroutine through) would
-        // start it with the `None` sent. The caller rests at the `SEND`,
-        // where the coroutine's return lands; the caller of this function
-        // finds the switch in `sw`.
-        let caller: *mut Frame = frame;
-        // SAFETY: the running thread's own flag (see `quiet_run`).
-        let started = if unsafe { (*sw.maybe_dead).get() } {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-            false
-        } else if let Some(send_pc) = await_send {
-            // SAFETY: as above (the `LOAD_CONST` before the `SEND`).
-            unsafe { *sw.last = send_pc - 1 };
-            let started = self.core_await_enter(sw, send_pc);
-            if !started {
-                // SAFETY: as above.
-                unsafe { *sw.last = pc };
-            }
-            started
-        } else {
-            false
-        };
-        if deferred && !started {
-            // SAFETY: as above.
-            if let Some(obj @ Object::Coroutine(g)) = unsafe { (*caller).stack.last() } {
-                g.track_deferred.set(false);
-                gc_trace::track_generator(obj);
-            }
-        }
-        true
+        Some((await_send, deferred))
     }
 
     /// The `await` (its `SEND` at `send_pc`) of the coroutine atop `sw`'s
@@ -72429,7 +72499,10 @@ mod burst_stats {
     pub(crate) const CALL_TIER2: usize = 7;
     pub(crate) const CALL_LAZY_AWAIT: usize = 8;
     pub(crate) const CALL_LAZY_MADE: usize = 9;
-    const CALL_NAMES: [&str; 10] = [
+    pub(crate) const CALL_LAZY_GEN: usize = 10;
+    pub(crate) const CALL_LAZY_GEN_REG: usize = 11;
+    pub(crate) const CALL_INLINE_GEN: usize = 12;
+    const CALL_NAMES: [&str; 13] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -72440,8 +72513,11 @@ mod burst_stats {
         "tier-2 entry from the general run",
         "frame-JIT lazy await",
         "lazy await's coroutine made",
+        "lazy generator resume",
+        "lazy generator resume registered",
+        "switched generator resume",
     ];
-    static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    static CALLS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
