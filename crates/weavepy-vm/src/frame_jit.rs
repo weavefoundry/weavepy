@@ -15,11 +15,16 @@
 //!
 //! What doesn't run in line runs through helpers (`h_*`) that do what the
 //! core loop's arm for the instruction does, on the same caches: global
-//! and attribute loads (with in-line caches of their own for a global's
-//! value and a `__slots__` member), method loads, attribute stores,
-//! builds, subscripts, and the calls the core loop runs in place. A call
-//! of a Python function, and an inline activation's return, switch the
-//! running activation as the core loop's arms do and return `RELOAD`.
+//! and attribute loads, method loads, truth tests and heap releases (each
+//! with its site's caches read first, one copy of the guards for every
+//! site), attribute stores, builds, subscripts, and the calls the core loop
+//! runs in place. A site passes its helper one pointer or word, and the
+//! helper writes the state for any exit itself (see [`LEFT_INTERP`]): what
+//! a site costs to compile is what matters here, about 12,000 host
+//! instructions of code generation per IR instruction, and the code that
+//! stays in line is scalar arithmetic, compares and branches. A call of a
+//! Python function, and an inline activation's return, switch the running
+//! activation as the core loop's arms do and return `RELOAD`.
 //!
 //! An instruction the native code doesn't take, and any shape neither the
 //! in-line code nor a helper settles (an overflow, a Python dunder, a
@@ -30,8 +35,8 @@
 //! store) start at their `LOAD_FAST`, so the native code takes those at
 //! it too.
 //!
-//! Compiling costs far more than interpreting a few iterations (some 30 to
-//! 50 microseconds per instruction), and every hand-over to the core loop
+//! Compiling costs far more than interpreting a few iterations (some 15 to
+//! 25 microseconds per instruction), and every hand-over to the core loop
 //! costs a round trip, so a code object compiles once its interpreting has
 //! cost about what compiling would (see `Slot::warm`), and only if the
 //! loop that got hot, or for a call of loop-free code its body, runs
@@ -5898,8 +5903,8 @@ unsafe extern "C" fn h_load_global(
             }
             _ => {}
         }
-        // The value itself: the native code reads it in line while the
-        // dicts' stamps hold (a stamp changes with every mutation, so the
+        // The value itself: `h_global` reads it while the dicts' stamps
+        // hold (a stamp changes with every mutation, so the
         // value stays where it is). A fused shape that declined fills the
         // cache too: the next read tries the shape again only through a
         // miss.
@@ -5927,6 +5932,7 @@ unsafe extern "C" fn h_load_global(
 /// namespaces and their stamps match the cache, anything else through
 /// [`h_load_global`] (which fills the cache). One copy of the guards for
 /// every site. `0` the value in its slot, or a status (see [`LEFT_INTERP`]).
+#[allow(clippy::cast_ptr_alignment)] // (Word fields, at their offsets.)
 unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
     // SAFETY: the code passes its live state (whose frame is the running
     // one) and the site's cache, whose non-zero `gdata` and `bdata` address
@@ -6293,7 +6299,7 @@ unsafe extern "C" fn h_load_special(
     }
 }
 
-/// A method-load site's in-line cache (see `Lower::load_method`): the
+/// A method-load site's first cache (see [`h_method`]): the
 /// class version (`0` empty) whose method `func` (its payload word: a
 /// plain function, or a native method whose count compiled code may take,
 /// see [`builtin_counted`]) the site loaded, and what proves an instance
@@ -6533,7 +6539,7 @@ pub(crate) struct SlotCache {
 /// Remember in the `LOAD_ATTR` site's `cache` the class attribute `v`
 /// that `inst`'s read at `pc` just took through the site's stamp for a
 /// class attribute read through an instance (see `crate::class_attr_site`),
-/// for compiled code's in-line read (see `Lower::load_attr`).
+/// for [`attr_hit`].
 #[cold]
 fn class_attr_note(
     ext: &CodeConstObjects,
@@ -6577,8 +6583,7 @@ fn class_attr_note(
 }
 
 /// Remember in the `LOAD_ATTR` site's `cache` the entry of `m`'s dict the
-/// site's stamp (see `MODULE_ENTRY`) just proved, for compiled code's
-/// in-line read.
+/// site's stamp (see `MODULE_ENTRY`) just proved, for [`attr_hit`].
 fn mod_attr_note(
     ext: &CodeConstObjects,
     m: &crate::object::PyModule,
@@ -6746,9 +6751,9 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         }
         let r = if local {
             let dst = (*st).stack.add(site.slot as usize);
-            h_local_attr(dst, site.code, site.ext, pc, at, &site.cache)
+            h_local_attr(dst, site.code, site.ext, pc, at, &raw const site.cache)
         } else {
-            h_stack_attr(site.code, site.ext, pc, at, &site.cache)
+            h_stack_attr(site.code, site.ext, pc, at, &raw const site.cache)
         };
         if r == 0 {
             return 0;
@@ -8138,8 +8143,8 @@ unsafe fn dunder_call(
     }
 }
 
-/// `LOAD_ATTR` (the `pc`th instruction of `code`) the in-line and cached
-/// reads declined: a `property` whose getter the site has cached for the
+/// `LOAD_ATTR` (the `pc`th instruction of `code`) the cached reads
+/// declined: a `property` whose getter the site has cached for the
 /// receiver's class (see `MethodSlot::getter`) called directly
 /// ([`direct_call`]), or anything else as the full handler loads it
 /// ([`attr_lane`]); the result at stack slot `slot`. The receiver is the
@@ -8532,12 +8537,10 @@ unsafe extern "C" fn h_call_direct(
     }
 }
 
-/// `CALL` from a lean body (see [`Lower::call_op`]): a Python function's
-/// call tries [`h_call_direct`] first, unless its site found the callee
-/// without a native body and has retries left to count down; anything
-/// else goes through [`h_call`]. A lean body makes this choice here
-/// rather than in line: its code is large enough that compile memory
-/// matters more than the branches.
+/// `CALL` (see [`Lower::call_op`]): a Python function's call tries
+/// [`h_call_direct`] first, unless its site found the callee without a
+/// native body and has retries left to count down; anything else goes
+/// through [`h_call`].
 unsafe extern "C" fn h_call_site(
     st: *mut State,
     code: *const CodeObject,
@@ -16494,9 +16497,6 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// `TO_BOOL`: a scalar's truth in line, and an instance's of a class
-    /// the site found always true (see [`h_truth_site`]); any other value's
-    /// through the helper.
     /// `TO_BOOL` of a local or the value on the stack through
     /// [`h_truth_local`] or [`h_truth_stack`].
     fn truth_shared(&mut self, pc: usize, item: Item) -> bool {
