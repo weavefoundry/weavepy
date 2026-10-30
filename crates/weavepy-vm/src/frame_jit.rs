@@ -4996,8 +4996,8 @@ unsafe extern "C" fn h_binop_ref(
 
 /// `COMPARE_OP` with oparg `arg` over the values at `at` and above it, for
 /// the shapes the core loop's arm runs (two ints, two floats, two natively
-/// served instances): `0` the `bool` at `at` (the operands released),
-/// anything else declined untouched.
+/// served instances, what [`crate::core_plain_compare`] takes): `0` the
+/// `bool` at `at` (the operands released), anything else declined untouched.
 unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
     // SAFETY: the code passes two initialized stack slots, and the oparg
     // the compiler emitted (as `compare_op_step` reads it).
@@ -5020,7 +5020,15 @@ unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
                 at.write(r);
                 return 0;
             }
-            _ => return 1,
+            _ => {
+                return match crate::core_plain_compare(at, kind) {
+                    Some(r) => {
+                        at.write(Object::Bool(r));
+                        0
+                    }
+                    None => 1,
+                };
+            }
         };
         let r = match kind {
             CompareKind::Lt => ord.is_lt(),
@@ -5036,9 +5044,9 @@ unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
 }
 
 /// `COMPARE_OP` with oparg `arg` over the values at `at` and above it,
-/// for the shapes the leaf arm runs (two ints, two floats, two strings):
-/// `0` or `1` the answer (the operands released), anything else declined
-/// untouched.
+/// for the shapes the leaf arm runs (two ints, two floats, two strings, what
+/// [`crate::core_plain_compare`] takes): `0` or `1` the answer (the operands
+/// released), anything else declined untouched.
 unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
     // SAFETY: the code passes two initialized stack slots, and the oparg
     // the compiler emitted (as `compare_op_step` reads it).
@@ -5052,7 +5060,12 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
                 None => return 2,
             },
             (Object::Str(x), Object::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
-            _ => return 2,
+            _ => {
+                return match crate::core_plain_compare(at, kind) {
+                    Some(r) => u32::from(r),
+                    None => 2,
+                };
+            }
         };
         if !droppable(a) || !droppable(b) {
             return 2;
@@ -9205,7 +9218,7 @@ unsafe extern "C" fn h_call(
                     crate::note_type_site(Some(ext), pc, &*base.add(start));
                     return done(st, r);
                 }
-                if argc == 1 && !st.sw.is_null() {
+                if !st.sw.is_null() {
                     sync(st);
                     settle(st);
                     let sw = &mut *st.sw;
@@ -9389,7 +9402,9 @@ unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, p
                 false
             }
         } else {
+            // (A class the constructor path declines runs through its lane.)
             interp.core_new(sw, pc, st.snap_gen)
+                || (sw.pending.is_none() && interp.core_type_lane(sw))
         };
         if !switched && sw.pending.is_none() {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
@@ -15227,7 +15242,7 @@ impl<'a> Lower<'a> {
             self.branch_out(declined, out);
             r
         };
-        // (The helpers release only numbers and strings, or operands
+        // (The helpers release only what owns no objects, or operands
         // another owner holds: no finalizer.)
         let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
         self.b.ins().jump(done, &[t.into()]);

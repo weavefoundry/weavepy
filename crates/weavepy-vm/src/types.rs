@@ -52,10 +52,11 @@ pub enum Dunder {
     Set,
     Delete,
     Class,
+    Ne,
 }
 
 impl Dunder {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -71,6 +72,7 @@ impl Dunder {
             Self::Set => "__set__",
             Self::Delete => "__delete__",
             Self::Class => "__class__",
+            Self::Ne => "__ne__",
         }
     }
 }
