@@ -184,11 +184,11 @@ pub struct Frame {
     /// first entry and re-push the same object on each resume.
     /// `None` for ordinary frames, which are only ever entered once.
     py_frame: Option<Rc<PyFrame>>,
-    /// Backlink to the generator/coroutine owning this frame (weak),
-    /// set at generator creation. Copied onto each activation's
-    /// `FrameShell` so `gi_frame` can locate the executing frame of a
-    /// *running* generator even when nothing has been materialised.
-    gen_owner: Option<crate::sync::Weak<PyGenerator>>,
+    /// Backlink to the generator/coroutine owning this frame, set at
+    /// generator creation. Copied onto each activation's `FrameShell` so
+    /// `gi_frame` can locate the executing frame of a *running* generator
+    /// even when nothing has been materialised.
+    gen_owner: GenOwner,
     /// RFC 0051 (WS4): skip the frame-entry `'call'` trace event for
     /// the *next* activation. Set by `generator_throw`, which fires
     /// CPython's PY_THROW (`'call'`) + RAISE (`'exception'`) pair at
@@ -222,6 +222,45 @@ pub struct Frame {
     /// frames and interpreted suspensions.
     #[cfg(feature = "jit")]
     parked_native: Option<Box<crate::tier2::NativeActivation>>,
+}
+
+/// A generator frame's backlink to its generator (see `Frame::gen_owner`):
+/// an uncounted pointer, since a frame lives inside its generator or in the
+/// activation running it, which holds the generator too. Only what outlives
+/// the frame (a shell, a frame object) takes a weak handle, from
+/// [`Self::weak`].
+#[derive(Clone, Copy)]
+pub(crate) struct GenOwner(*const PyGenerator);
+
+// SAFETY: only followed while the frame's generator is alive (see above),
+// and `PyGenerator` is `Send + Sync`.
+unsafe impl Send for GenOwner {}
+// SAFETY: as above.
+unsafe impl Sync for GenOwner {}
+
+impl GenOwner {
+    pub(crate) const NONE: Self = Self(std::ptr::null());
+
+    #[inline(always)]
+    pub(crate) fn of(gen: &Rc<PyGenerator>) -> Self {
+        Self(Rc::as_ptr(gen))
+    }
+
+    #[inline(always)]
+    fn is_some(self) -> bool {
+        !self.0.is_null()
+    }
+
+    /// A weak handle on the generator, if the frame has one.
+    fn weak(self) -> Option<crate::sync::Weak<PyGenerator>> {
+        if self.0.is_null() {
+            return None;
+        }
+        // SAFETY: the frame's generator is alive (see above); the view takes
+        // no reference and is never dropped.
+        let view = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(self.0) });
+        Some(Rc::downgrade(&view))
+    }
 }
 
 impl std::fmt::Debug for Frame {
@@ -3963,34 +4002,6 @@ impl Interpreter {
         Rc::new(RefCell::new(v))
     }
 
-    /// An empty locals vector with room for `n`, recycled when the pool
-    /// has one this frame can own (see [`Self::pooled_locals_from_args`]).
-    #[inline]
-    fn pooled_locals_empty(&self, n: usize) -> Rc<RefCell<Vec<Object>>> {
-        let pooled = {
-            let mut pool = self.frame_locals_pool.borrow_mut();
-            loop {
-                match pool.pop() {
-                    Some(rc) if Rc::strong_count(&rc) == 1 => break Some(rc),
-                    // Still shared: only our clone is dropped (no element
-                    // destructor runs under the borrow).
-                    Some(_) => (),
-                    None => break None,
-                }
-            }
-        };
-        match pooled {
-            Some(rc) => {
-                // SAFETY: sole owner, checked at the pop above.
-                let v = unsafe { &mut *rc.as_ptr() };
-                debug_assert!(v.is_empty());
-                v.reserve(n);
-                rc
-            }
-            None => Rc::new(RefCell::new(Vec::with_capacity(n))),
-        }
-    }
-
     /// RFC 0061 (WS3b): fetch a recycled argument-staging vector, or
     /// allocate one. Deliberately a separate pool from
     /// [`Self::pooled_stack`] — see the `scratch_pool` field docs.
@@ -4052,11 +4063,14 @@ impl Interpreter {
         }
     }
 
-    /// A new generator frame's allocations: an empty locals vector with
-    /// room for `nlocals`, an empty operand stack, and the box, a finished
-    /// generator's (see [`Self::retire_gen_frame`]) when the pool has them.
+    /// A new generator frame's allocations (its code `code`): an empty
+    /// locals vector with room for `nlocals`, an empty operand stack, and the
+    /// box, a finished generator's (see [`Self::retire_gen_frame`]) when the
+    /// pool has them. A new stack has room for what the code needs and no
+    /// more: a generator can outlive any number of calls, suspended (a task
+    /// tree holds thousands).
     #[inline]
-    fn gen_parts(&self, nlocals: usize) -> GenParts {
+    fn gen_parts(&self, code: &CodeObject, nlocals: usize) -> GenParts {
         let spare = self.gen_spares.borrow_mut().pop();
         match spare {
             Some(parts) => {
@@ -4065,8 +4079,8 @@ impl Interpreter {
                 parts
             }
             None => GenParts {
-                locals: self.pooled_locals_empty(nlocals),
-                stack: self.pooled_stack(),
+                locals: Rc::new(RefCell::new(Vec::with_capacity(nlocals))),
+                stack: frame_slots::FrameStack::with_capacity(gen_stack_room(code, nlocals)),
                 boxed: Box::new_uninit(),
             },
         }
@@ -4086,11 +4100,13 @@ impl Interpreter {
             return Box::new(frame);
         };
         const POOL_CAP: usize = 64;
-        let mut pool = self.frame_stack_pool.borrow_mut();
-        if pool.len() < POOL_CAP {
-            pool.push(stack);
+        // (A generator's stack, sized to its code, is too small to pool.)
+        if stack.capacity() >= POOLED_STACK_CAPACITY {
+            let mut pool = self.frame_stack_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(stack);
+            }
         }
-        drop(pool);
         let mut pool = self.frame_locals_pool.borrow_mut();
         if pool.len() < POOL_CAP {
             pool.push(locals);
@@ -4122,7 +4138,7 @@ impl Interpreter {
             agen_yielded_value: _,
             pc: _,
             py_frame,
-            gen_owner,
+            gen_owner: _,
             suppress_call_event: _,
             gen_first_resume: _,
             sent_consumed: _,
@@ -4134,7 +4150,7 @@ impl Interpreter {
         // after which the box holds uninitialized storage. The values go
         // first, in the order the frame's drop releases them, and none
         // while a pool is borrowed (their drop glue can run code).
-        let (locals, mut stack, boxed, sole) = unsafe {
+        let (locals, stack, boxed, sole) = unsafe {
             let (locals, mut stack) = (std::ptr::read(locals), std::ptr::read(stack));
             stack.clear();
             // (An escaped `PyFrame` sharing them drops below: the decision
@@ -4150,7 +4166,6 @@ impl Interpreter {
             std::ptr::drop_in_place(rare);
             std::ptr::drop_in_place(exc);
             std::ptr::drop_in_place(py_frame);
-            std::ptr::drop_in_place(gen_owner);
             std::ptr::drop_in_place(shell_cache);
             #[cfg(feature = "jit")]
             std::ptr::drop_in_place(parked_native);
@@ -4164,10 +4179,6 @@ impl Interpreter {
         if !sole {
             return;
         }
-        // (A compacted stack regains the room a pooled one has.)
-        if stack.capacity() < POOLED_STACK_CAPACITY {
-            stack.reserve(POOLED_STACK_CAPACITY);
-        }
         let mut pool = self.gen_spares.borrow_mut();
         if pool.len() < POOL_CAP {
             pool.push(GenParts {
@@ -4175,6 +4186,17 @@ impl Interpreter {
                 stack,
                 boxed,
             });
+        }
+    }
+
+    /// [`Self::retire_gen_frame`] with no interpreter at hand (a generator's
+    /// last release closing it): the running thread's, if it has one.
+    pub(crate) fn retire_detached_frame(boxed: Box<Frame>) {
+        match crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: this thread's interpreter, which only the running code
+            // is using; retiring touches only its pool.
+            Some(interp) => unsafe { (*interp).retire_gen_frame(boxed) },
+            None => drop(boxed),
         }
     }
 
@@ -4275,7 +4297,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
-            gen_owner: None,
+            gen_owner: GenOwner::NONE,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -5576,8 +5598,8 @@ impl Interpreter {
                     .load(std::sync::atomic::Ordering::Relaxed)
             {
                 if cached.gen_owner.borrow().is_none() {
-                    if let Some(owner) = &frame.gen_owner {
-                        *cached.gen_owner.borrow_mut() = Some(owner.clone());
+                    if let Some(owner) = frame.gen_owner.weak() {
+                        *cached.gen_owner.borrow_mut() = Some(owner);
                     }
                 }
                 cached
@@ -5605,7 +5627,7 @@ impl Interpreter {
             let gen_owner = materialized
                 .as_ref()
                 .and_then(|py| py.gen_owner.borrow().clone())
-                .or_else(|| frame.gen_owner.clone());
+                .or_else(|| frame.gen_owner.weak());
             *cached.gen_owner.borrow_mut() = gen_owner;
             cached
                 .lasti
@@ -5632,7 +5654,7 @@ impl Interpreter {
         let gen_owner = materialized
             .as_ref()
             .and_then(|py| py.gen_owner.borrow().clone())
-            .or_else(|| frame.gen_owner.clone());
+            .or_else(|| frame.gen_owner.weak());
         // RFC 0061 (WS3a): reuse a recycled shell allocation when one is
         // parked. The pool only ever holds sole-owner shells, so the
         // `get_mut` is a formality — but a fresh allocation is always a
@@ -5852,7 +5874,7 @@ impl Interpreter {
             is_module_scope: frame.code.name == "<module>",
             locals_mirror: RefCell::new(Some(frame.locals.shared().clone())),
             trace: RefCell::new(Object::None),
-            gen_owner: RefCell::new(frame.gen_owner.clone()),
+            gen_owner: RefCell::new(frame.gen_owner.weak()),
             override_lineno: crate::sync::RefCell::new(None),
             trace_event: Cell::new(crate::linejump::TraceEvent::None),
             pending_jump: crate::sync::RefCell::new(None),
@@ -7666,9 +7688,23 @@ impl Interpreter {
     fn quiet_run(
         &mut self,
         frame: &mut Frame,
+        shell: QuietShell<'_>,
+        snap_gen: u64,
+        prev_pc: &mut Option<usize>,
+    ) -> QuietExit {
+        self.quiet_run_from(frame, shell, snap_gen, prev_pc, None)
+    }
+
+    /// [`Self::quiet_run`], a generator step's compiled body `native` (when
+    /// given) entered first (see [`Self::quiet_native_step`]).
+    #[inline(always)]
+    fn quiet_run_from(
+        &mut self,
+        frame: &mut Frame,
         mut shell: QuietShell<'_>,
         snap_gen: u64,
         prev_pc: &mut Option<usize>,
+        native: Option<&frame_jit::Native>,
     ) -> QuietExit {
         // SAFETY (for the reads in `quiet_frame`): the flag is this
         // thread's own thread-local, which outlives this call; a greenlet
@@ -7690,6 +7726,23 @@ impl Interpreter {
             maybe_dead,
         };
         let mut entry = QuietEntry::Fresh;
+        #[cfg(feature = "jit")]
+        if let Some(native) = native {
+            // SAFETY: the root activation, fresh, as `quiet_frame` gets it.
+            match unsafe { self.quiet_native_step(native, &roots, snap_gen) } {
+                Ok(exit) => {
+                    // (Nothing registered: the vector is as it came.)
+                    const SPARES_CAP: usize = 16;
+                    if inl.capacity() != 0 && self.inl_spares.len() < SPARES_CAP {
+                        self.inl_spares.push(std::mem::take(&mut inl));
+                    }
+                    return exit;
+                }
+                Err(from) => entry = from,
+            }
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = native;
         loop {
             // SAFETY: see `CoreSwitch`; an activation's box outlives its
             // stretch of the loop (the vector only moves the boxes).
@@ -7828,6 +7881,112 @@ impl Interpreter {
                     }
                 }
             };
+        }
+    }
+
+    /// A generator step a native caller makes (`next()`, `send()`, an asyncio
+    /// task's step, `enumerate` or `zip` over a generator) of a compiled
+    /// body, run straight from here with the body's frame the root of a
+    /// switch made for it: no burst or stretch of the quiet loop is set up
+    /// for it, and the body's yield or return hands back here (`DIRECT_YIELD`,
+    /// `DIRECT_RET`) as a lazily resumed generator's does (see
+    /// `frame_jit::lazy_gen_resume`). `Ok` is the step's end; `Err` is where
+    /// the quiet loop goes on from, the switch as the native code left it,
+    /// exactly as if its burst had run the native code.
+    ///
+    /// # Safety
+    ///
+    /// `roots` are a fresh `quiet_run`'s, the root frame's stack holding the
+    /// sent value, its pc where `native` enters.
+    #[cfg(feature = "jit")]
+    unsafe fn quiet_native_step(
+        &mut self,
+        native: &frame_jit::Native,
+        roots: &SwitchRoots,
+        snap_gen: u64,
+    ) -> Result<QuietExit, QuietEntry> {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let frame = &mut *roots.root;
+            let need = native.need();
+            if frame.stack.capacity() < need {
+                frame.stack.reserve(need - frame.stack.len());
+            }
+            // (`Self::generator_send_lean` checked `inline_calls_ok`'s inputs.)
+            let mut sw = CoreSwitch::enter(
+                roots,
+                &mut *roots.root,
+                &mut *roots.root_shell.cast::<QuietShell<'_>>(),
+                &mut *roots.root_last,
+                true,
+                snap_gen,
+            );
+            let pc = frame.pc as usize;
+            let mut st = frame_jit::State {
+                locals: frame.locals.as_mut_ptr(),
+                stack: frame.stack.as_mut_ptr(),
+                len: frame.stack.len(),
+                cap: frame.stack.capacity(),
+                pc,
+                last: usize::MAX,
+                countdown: std::ptr::addr_of_mut!(self.gil_countdown),
+                snap_gen,
+                maybe_dead: sw.maybe_dead,
+                interp: std::ptr::from_ref(self),
+                out: 0,
+                depth_cell: sw.depth_cell,
+                err: None,
+                frame: roots.root,
+                sw: std::ptr::from_mut(&mut sw),
+                gen_depth: 0,
+                direct: true,
+                lazy: std::ptr::null_mut(),
+                lazy_depth: 0,
+                lazy_last: std::ptr::null_mut(),
+                gen_lazy: true,
+            };
+            let status = native.run_direct(&mut st, pc);
+            // (`frame` again: the helpers reach the frame through `st`.)
+            let frame = &mut *roots.root;
+            if status == frame_jit::RELOAD || sw.pending.is_some() {
+                // The switch moved on (or stopped), synced: the burst goes on
+                // from there.
+                return Err(QuietEntry::Stop(self.leaf_burst(&mut sw, snap_gen)));
+            }
+            frame.stack.set_len(st.len);
+            frame.pc = st.pc as u32;
+            *roots.root_last = st.last;
+            if (status == frame_jit::DIRECT_YIELD || status == frame_jit::DIRECT_RET)
+                && st.len >= 1
+                && crate::hot_gates::loop_gen() == snap_gen
+            {
+                let cur_pc = st.pc;
+                let v = frame.stack.pop().unwrap_unchecked();
+                frame.pc = cur_pc as u32 + 1;
+                if self.gil_countdown > 1 {
+                    self.gil_countdown -= 1;
+                }
+                let stepped = if status == frame_jit::DIRECT_YIELD {
+                    frame.agen_yielded_value = frame.code.instructions[cur_pc].arg == 0;
+                    StepOutcome::Yield(v)
+                } else {
+                    StepOutcome::Return(v)
+                };
+                return Ok(QuietExit::Outcome {
+                    stepped: Ok(stepped),
+                    cur_pc,
+                });
+            }
+            if status == frame_jit::MARKED {
+                return Err(QuietEntry::Stop(LeafStop::Marked));
+            }
+            if let Some(e) = st.err.take() {
+                return Err(QuietEntry::Stop(LeafStop::Raised(e)));
+            }
+            if st.pc >= frame.code.instructions.len() {
+                return Err(QuietEntry::Stop(LeafStop::Step));
+            }
+            Err(QuietEntry::Fresh)
         }
     }
 
@@ -8398,7 +8557,7 @@ impl Interpreter {
             }
             fr.rare = None;
             fr.py_frame = None;
-            fr.gen_owner = None;
+            fr.gen_owner = GenOwner::NONE;
             fr.shell_cache = None;
             fr.agen_yielded_value = true;
             fr.suppress_call_event = false;
@@ -9165,7 +9324,7 @@ impl Interpreter {
                 m.class_namespace = frame.class_namespace().cloned();
                 m.class_namespace_obj = frame.class_namespace_obj().cloned();
                 m.is_gen = false;
-                *m.gen_owner.get_mut() = frame.gen_owner.clone();
+                *m.gen_owner.get_mut() = frame.gen_owner.weak();
                 m.lasti = std::sync::atomic::AtomicU32::new(lasti);
                 m.has_materialized = std::sync::atomic::AtomicBool::new(false);
                 *m.materialized.get_mut() = None;
@@ -9183,7 +9342,7 @@ impl Interpreter {
             class_namespace: frame.class_namespace().cloned(),
             class_namespace_obj: frame.class_namespace_obj().cloned(),
             is_gen: false,
-            gen_owner: RefCell::new(frame.gen_owner.clone()),
+            gen_owner: RefCell::new(frame.gen_owner.weak()),
             lasti: std::sync::atomic::AtomicU32::new(lasti),
             has_materialized: std::sync::atomic::AtomicBool::new(false),
             materialized: RefCell::new(None),
@@ -10775,7 +10934,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
-            gen_owner: None,
+            gen_owner: GenOwner::NONE,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -46751,13 +46910,8 @@ impl Interpreter {
         match iter {
             Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
-            Object::Generator(g) => match self.generator_next_raw(g, false) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            // (Its end builds no `StopIteration` just to catch it.)
+            Object::Generator(g) => self.gen_drain_next(g, None, false),
             // ``__await__`` returns the coroutine itself, so driving it via
             // ``next()`` must advance it with ``send(None)`` like a generator.
             Object::Coroutine(_) => match self.gen_method_send(iter, Object::None) {
@@ -48982,12 +49136,28 @@ impl Interpreter {
                     shell: None,
                 };
                 let mut prev_pc: Option<usize> = None;
+                #[cfg(feature = "jit")]
+                let native = self.gen_step_native(frame, fold.is_some());
+                #[cfg(not(feature = "jit"))]
+                let native = None;
                 let run = if guard.depth() % 4 == 0 {
                     stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-                        self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc)
+                        self.quiet_run_from(
+                            frame,
+                            QuietShell::Lazy(&mut act),
+                            snap_gen,
+                            &mut prev_pc,
+                            native,
+                        )
                     })
                 } else {
-                    self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc)
+                    self.quiet_run_from(
+                        frame,
+                        QuietShell::Lazy(&mut act),
+                        snap_gen,
+                        &mut prev_pc,
+                        native,
+                    )
                 };
                 self.sum_fold = prev_fold;
                 match (run, act.shell) {
@@ -49056,6 +49226,30 @@ impl Interpreter {
         })
     }
 
+    /// The native code a native caller's step of `frame`, a generator's,
+    /// enters (see [`Self::quiet_native_step`]), if it has any that enters
+    /// where it stands. A draining consumer (`folding`) stays with the core
+    /// loop, whose yields fold. A body without any warms, as a native
+    /// caller's callee does.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn gen_step_native(&self, frame: &Frame, folding: bool) -> Option<&'static frame_jit::Native> {
+        let ext = code_vm_ext(&frame.code)?;
+        let nlocals = frame.locals.len();
+        let Some(native) = ext.frame_jit.get(nlocals) else {
+            ext.frame_jit.warm_native(&frame.code, ext, nlocals);
+            return None;
+        };
+        let pc = frame.pc as usize;
+        (!folding
+            && pc < ext.dispatch_len
+            && native.enters_at(pc)
+            && self.direct_calls.get() < frame_jit::DIRECT_CALL_DEPTH)
+        // SAFETY: the frame, which the step holds while the body runs, holds
+        // the code and with it its native code.
+        .then(|| unsafe { &*std::ptr::from_ref(native) })
+    }
+
     /// A generator that just finished holds no frame, so it can neither
     /// take part in a cycle nor need finalizing: the collector lets go
     /// of it now, and its last program reference frees it outright
@@ -49068,11 +49262,10 @@ impl Interpreter {
             return;
         }
         // A generator still in the collector's young set has no registry
-        // entry to remove: it leaves the set (whose entry would hold its
-        // allocation until the set dropped it). One whose tracking was
+        // entry to remove: it just leaves the set. One whose tracking was
         // deferred never joined it.
         if !gen.gc_slot.is_registered() {
-            if !gen.track_deferred.get() {
+            if gen.gc_slot.is_young() {
                 gc_trace::forget_young_generator(gen);
             }
             return;
@@ -62303,7 +62496,7 @@ impl Interpreter {
     /// without eager `PyFrame` construction.
     fn set_frame_gen_owner(gen: &Rc<PyGenerator>) {
         if let GeneratorState::Created(boxed) = &mut *gen.state().borrow_mut() {
-            boxed.gen_owner = Some(Rc::downgrade(gen));
+            boxed.gen_owner = GenOwner::of(gen);
         }
     }
 
@@ -62352,7 +62545,7 @@ impl Interpreter {
         // The code's names, which the generator reads by default, in a
         // dead generator's object when the pool has one.
         let named = f.code_names_kept(|| code_gen_names(code));
-        let (gen_code, mut frame) = if named {
+        let (gen_code, frame) = if named {
             match crate::object::pooled_generator(kind, gen_code, frame) {
                 Ok(gen) => {
                     return if code.is_coroutine {
@@ -62368,24 +62561,20 @@ impl Interpreter {
         } else {
             (gen_code, frame)
         };
-        // The frame's weak backlink (see `set_frame_gen_owner`), stamped as
-        // the generator is made.
-        let gen = Rc::new_cyclic(|owner| {
-            frame.gen_owner = Some(owner.clone());
-            if named {
-                // The code's names, which the generator reads by default.
-                PyGenerator::new(kind, gen_code, frame)
-            } else {
-                let (name, qualname) = f.name_objects();
-                PyGenerator::with_names(
-                    name.unwrap_or_else(|| Object::from_str(f.name.clone())),
-                    qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
-                    kind,
-                    gen_code,
-                    frame,
-                )
-            }
+        let gen = Rc::new(if named {
+            // The code's names, which the generator reads by default.
+            PyGenerator::new(kind, gen_code, frame)
+        } else {
+            let (name, qualname) = f.name_objects();
+            PyGenerator::with_names(
+                name.unwrap_or_else(|| Object::from_str(f.name.clone())),
+                qualname.unwrap_or_else(|| Object::from_str(code.qualname.clone())),
+                kind,
+                gen_code,
+                frame,
+            )
         });
+        Self::set_frame_gen_owner(&gen);
         if code.is_coroutine {
             Object::Coroutine(gen)
         } else if code.is_async_generator {
@@ -62422,7 +62611,7 @@ impl Interpreter {
                 locals,
                 stack,
                 boxed,
-            } = self.gen_parts(nlocals);
+            } = self.gen_parts(&code, nlocals);
             {
                 // SAFETY: sole owner (see `gen_parts`).
                 let l = unsafe { &mut *locals.as_ptr() };
@@ -62536,7 +62725,7 @@ impl Interpreter {
                     locals,
                     stack,
                     boxed,
-                } = self.gen_parts(nlocals);
+                } = self.gen_parts(code, nlocals);
                 {
                     // SAFETY: sole owner (see `gen_parts`).
                     let l = unsafe { &mut *locals.as_ptr() };
@@ -62602,7 +62791,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: start as u32 + 1,
             py_frame: None,
-            gen_owner: None,
+            gen_owner: GenOwner::NONE,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -62669,7 +62858,7 @@ impl Interpreter {
             locals,
             stack,
             boxed,
-        } = self.gen_parts(nlocals);
+        } = self.gen_parts(code, nlocals);
         // SAFETY: sole owner (see `gen_parts`). (`.0` stays unbound until
         // the call.)
         unsafe { (*locals.as_ptr()).resize(nlocals, Object::Unbound) };
@@ -62679,10 +62868,11 @@ impl Interpreter {
         let kind = crate::object::CoroutineKind::Generator;
         let gen = match crate::object::pooled_generator(kind, Object::Code(code.clone()), frame) {
             Ok(gen) => gen,
-            Err((gen_code, mut frame)) => Rc::new_cyclic(|owner| {
-                frame.gen_owner = Some(owner.clone());
-                PyGenerator::new(kind, gen_code, frame)
-            }),
+            Err((gen_code, frame)) => {
+                let gen = Rc::new(PyGenerator::new(kind, gen_code, frame));
+                Self::set_frame_gen_owner(&gen);
+                gen
+            }
         };
         gen.genexp_pending.set(true);
         Some(Object::Generator(gen))
@@ -62938,7 +63128,7 @@ impl Interpreter {
                 locals,
                 stack,
                 boxed,
-            } = self.gen_parts(nlocals);
+            } = self.gen_parts(&code, nlocals);
             {
                 // SAFETY: sole owner (see `gen_parts`).
                 let v = unsafe { &mut *locals.as_ptr() };
@@ -63167,7 +63357,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
-            gen_owner: None,
+            gen_owner: GenOwner::NONE,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -63212,10 +63402,11 @@ impl Interpreter {
         let code = Object::Code(boxed.code.clone());
         let gen = match crate::object::pooled_generator(kind, code, boxed) {
             Ok(gen) => gen,
-            Err((code, mut frame)) => Rc::new_cyclic(|owner| {
-                frame.gen_owner = Some(owner.clone());
-                PyGenerator::new(kind, code, frame)
-            }),
+            Err((code, frame)) => {
+                let gen = Rc::new(PyGenerator::new(kind, code, frame));
+                Self::set_frame_gen_owner(&gen);
+                gen
+            }
         };
         gen.track_deferred.set(true);
         // SAFETY: just made; nothing else reaches its state yet.
@@ -63304,7 +63495,7 @@ impl Interpreter {
         fr.rare = None;
         fr.exc = None;
         fr.py_frame = None;
-        fr.gen_owner = None;
+        fr.gen_owner = GenOwner::NONE;
         fr.shell_cache = None;
         fr.sent_consumed = false;
         fr.suppress_call_event = false;
@@ -64054,7 +64245,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
-            gen_owner: None,
+            gen_owner: GenOwner::NONE,
             suppress_call_event: false,
             gen_first_resume: false,
             sent_consumed: false,
@@ -71785,7 +71976,7 @@ fn parked_lean_frame() -> LeanFrame {
         agen_yielded_value: true,
         pc: 0,
         py_frame: None,
-        gen_owner: None,
+        gen_owner: GenOwner::NONE,
         suppress_call_event: false,
         gen_first_resume: false,
         sent_consumed: false,
@@ -82242,13 +82433,24 @@ pub(crate) fn code_gen_names(code: &CodeObject) -> (Object, Object) {
     }
 }
 
+/// The operand stack a generator frame of `code` needs room for: the code's
+/// own depth, and what its native code writes.
+fn gen_stack_room(code: &CodeObject, nlocals: usize) -> usize {
+    // (Its native code writes at fixed offsets up to its own need.)
+    let need = code_vm_ext(code)
+        .and_then(|e| e.frame_jit.get(nlocals))
+        .map_or(0, frame_jit::Native::need);
+    code.stacksize
+        .map_or(POOLED_STACK_CAPACITY, |s| s as usize)
+        .max(need)
+}
+
 /// Trim the storage of `gen`'s frame, unless it's running, to what its
-/// code needs: the operand stack to `co_stacksize` and the locals to
-/// their count. A generator's frame starts on the pooled vectors every
-/// activation draws from (sized for whatever ran last), which suits one
-/// that's consumed at once; the collector calls this as a generator
-/// outlives its young set, so a long-lived one (a parked coroutine, say)
-/// holds no more than it needs.
+/// code needs: the operand stack to [`gen_stack_room`] and the locals to
+/// their count. A generator's frame may be on the vectors of a finished
+/// generator (sized for whatever ran last), which suits one that's consumed
+/// at once; the collector calls this as a generator outlives its young set,
+/// so a long-lived one (a parked coroutine, say) holds no more than it needs.
 pub(crate) fn compact_generator_frame(gen: &PyGenerator) {
     let Ok(mut state) = gen.state().try_borrow_mut() else {
         return;
@@ -82261,11 +82463,7 @@ pub(crate) fn compact_generator_frame(gen: &PyGenerator) {
     if frame.parked_native.is_some() {
         return;
     }
-    let depth = frame
-        .code
-        .stacksize
-        .map_or(POOLED_STACK_CAPACITY, |s| s as usize)
-        .max(frame.stack.len());
+    let depth = gen_stack_room(&frame.code, frame.locals.len()).max(frame.stack.len());
     if frame.stack.capacity() > depth {
         frame.stack.shrink_to(depth);
     }

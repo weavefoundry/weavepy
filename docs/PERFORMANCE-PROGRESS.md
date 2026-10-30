@@ -451,13 +451,28 @@ slowdown in that run was the even-sized chunks, since fixed.
   its activation a record on the native stack, bound and pushed on the
   switch only if something needs the core loop's view; inlined
   `list`, `tuple`, `all` and `any` of a generator expression drain it in
-  one fast step. What remains is creation and teardown (making, yielding
-  once and exhausting a generator costs about 2,570 instructions against
-  CPython's 1,130, almost all of it outside the resume), the resume's own
-  checks and native entry (a resume of a body that calls a builtin costs
-  about 1,270 against 436), and a native caller's single step of a body
-  that isn't simple (`enumerate`, `zip`, an asyncio task's step), which
-  still enters `quiet_run` (about 2,800 instructions against 930).
+  one fast step. A native caller's step of a compiled body (`enumerate`,
+  `zip`, an asyncio task's step) now enters its native code from a switch
+  made for it, without a stretch of the quiet loop. What remains is thin and
+  flat: making, yielding once and exhausting a generator costs about 2,240
+  instructions on Linux (CPython's about 1,130), of which creation is about
+  750, the two resumes 800, compiled code 290 and teardown 420, each 30 or
+  more steps of 5 to 60 instructions.
+- **One allocation per generator wouldn't pay in instructions.** A
+  short-lived generator's blocks are pooled, so its allocator cost is
+  already near zero, and all of `async_tree`'s allocations are 5% of its
+  instructions. A suspended generator's five blocks take 390 bytes (CPython's
+  250), most of it the 16-byte `Object` slots and the frame's own fields, and
+  the locals' `Rc` can't merge while frame objects and shells share it.
+- **The collector's cost was its candidates' number, not its visit.** A
+  young pass costs about 570 instructions per object (CPython's about 330),
+  and `async_tree` spent no more instructions on it than CPython's collector
+  does. Its survivors are a live task tree, which each pass scans and frees
+  nothing of, so waiting longer after passes that find nothing removes the
+  whole cost. Its peak RSS rose from 66 to 75 MB, but that's when the
+  background compiles land against the tree's peak, not the objects: with
+  the frame JIT off it's 70.7 against 69.6 MB, and with synchronous compiles
+  75.7 against 74.3 MB.
 - **Compiles are a third of `stdlib_utils`' and `logging_mix`' gap in
   `run.py`'s window.** The frame JIT emits 20 to 35 IR instructions per
   bytecode instruction and Cranelift spends about 11,000 host instructions
@@ -505,11 +520,10 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. Generators: a generator pooled with its frame box and fewer counted
-   handles per frame (creation and teardown are now most of a short-lived
-   generator's cost), and a native caller's step of a compiled body
-   without `quiet_run` (`async_tree`, `enumerate` and `zip` over
-   generators).
+1. Generators: `async_tree` and `context_managers` are now mostly general
+   calls, attribute stores and asyncio's own loop, not generator mechanics.
+   `next(map(next, [g]))` loses a finished generator's `StopIteration` value,
+   and `gc.callbacks` doesn't fire for automatic collections.
 2. Cold time: the lowering left on the interpreter's thread (a third of a
    compile) and the time a body runs interpreted before its code is
    ready; a much cheaper baseline compiler or compiled code kept across

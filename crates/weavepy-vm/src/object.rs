@@ -5146,7 +5146,7 @@ pub struct PyFunction {
     /// current code's own interned names (see [`Self::code_names_kept`]).
     /// Cleared when `__code__` is rebound.
     pub names_kept: crate::sync::Cell<u64>,
-    /// The function's slot in the cycle collector's registry (see
+    /// Where the cycle collector holds the function (see
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,
 }
@@ -5159,6 +5159,7 @@ pub struct LazySlots(pub Option<Object>);
 /// A dying PyFunction clears the weak references watching it.
 impl Drop for PyFunction {
     fn drop(&mut self) {
+        crate::gc_trace::forget_dying_function(self);
         crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
     }
 }
@@ -5628,8 +5629,8 @@ pub struct PyGenerator {
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
-    /// The generator's slot in the cycle collector's registry (see
-    /// [`crate::gc_trace::GcSlot`]); unregistered while it is still in a
+    /// Where the cycle collector holds the generator (see
+    /// [`crate::gc_trace::GcSlot`]): its registry slot, or its place in its
     /// young set.
     pub gc_slot: crate::gc_trace::GcSlot,
     /// Not yet handed to the collector: a coroutine an `await` started
@@ -5883,7 +5884,7 @@ pub(crate) fn recycle_generator(
         || std::sync::Arc::weak_count(&g) != 0
         || g.kind == CoroutineKind::AsyncGenerator
         || g.chain.get() != 0
-        || g.gc_slot.is_registered()
+        || g.gc_slot.get() != crate::gc_trace::NO_SLOT
         || crate::weakref_registry::may_have_weakrefs(std::sync::Arc::as_ptr(&g) as usize as u64)
     {
         return Err(g);
@@ -5921,7 +5922,7 @@ pub(crate) fn pooled_generator(
     let Some(g) = (unsafe { &mut *GEN_POOL.0.get() }).pop() else {
         return Err((code, frame));
     };
-    frame.gen_owner = Some(Rc::downgrade(&g));
+    frame.gen_owner = crate::GenOwner::of(&g);
     // SAFETY: a pooled generator is unique (see `recycle_generator`), and
     // the backlink just made can't be used before the generator is
     // returned.
@@ -5939,6 +5940,7 @@ pub(crate) fn pooled_generator(
 
 impl Drop for PyGenerator {
     fn drop(&mut self) {
+        crate::gc_trace::forget_dying_generator(self);
         // A suspended generator's `close()` (and a never-awaited
         // coroutine's warning) already ran: `rc::Rc`'s `Drop` queued the
         // generator for it at its last release. A created or suspended

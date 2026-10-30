@@ -79,7 +79,7 @@ pub(crate) const RELOAD: u32 = 4;
 /// A directly called activation returned (see [`direct_call`]), its state
 /// synced to the return with the value atop its stack: the caller
 /// finishes the return.
-const DIRECT_RET: u32 = 5;
+pub(crate) const DIRECT_RET: u32 = 5;
 /// A `CALL` of a coroutine function followed by an `await` of its result
 /// started the coroutine, which returned (see [`gen_call_done`]): the
 /// await's `END_SEND` goes on, `[coroutine, result]` atop the stack.
@@ -87,7 +87,7 @@ const AWAITED: u32 = 6;
 /// A lazily resumed generator yielded (see [`lazy_gen_resume`]), its
 /// state synced to the `YIELD_VALUE` with the value atop its stack: the
 /// consumer finishes the yield.
-const DIRECT_YIELD: u32 = 8;
+pub(crate) const DIRECT_YIELD: u32 = 8;
 /// A jump into another chunk of the same code (see [`chunk_ranges`]), the
 /// state synced at its target: [`Native::run`] goes on there.
 const CHAIN: u32 = 7;
@@ -2435,6 +2435,9 @@ unsafe fn lazy_ready(gf: &crate::Frame, first: bool, sent_none: bool) -> Option<
     let ext = crate::code_vm_ext(&gf.code)?;
     let Some(native) = ext.frame_jit.get(gf.locals.len()) else {
         crate::burst_stats::note_decline("lazy gen: no native", &gf.code.qualname);
+        // The switch this resume falls back on costs far more than the body
+        // alone: it warms as a compiled caller's switched call does.
+        ext.frame_jit.warm_switched(&gf.code, ext, gf.locals.len());
         return None;
     };
     if pc >= ext.dispatch_len || !native.enters_at(pc) || !Interpreter::lean_gen_code_ok(&gf.code) {
@@ -6462,7 +6465,7 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
 
 /// How deep compiled callees may run inside their compiled callers' calls
 /// (each level holds two native frames and the helpers between them).
-const DIRECT_CALL_DEPTH: u32 = 48;
+pub(crate) const DIRECT_CALL_DEPTH: u32 = 48;
 
 /// Run the activation a compiled caller's `CALL` just switched to, the
 /// callee, through its own native code, from the caller's call helper:
