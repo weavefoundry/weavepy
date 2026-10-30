@@ -4626,7 +4626,7 @@ impl Drop for PyInstance {
         // allocation until its generation is next collected.
         let slot = self.gc_slot.get();
         if slot != crate::gc_trace::NO_SLOT {
-            crate::gc_trace::forget_instance(slot, id as usize);
+            crate::gc_trace::forget_instance(self, slot);
         }
     }
 }

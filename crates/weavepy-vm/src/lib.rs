@@ -48765,11 +48765,10 @@ impl Interpreter {
             return;
         }
         // A generator still in the collector's young set has no registry
-        // entry to remove: it leaves the set (whose entry would hold its
-        // allocation until the set dropped it). One whose tracking was
+        // entry to remove: it just leaves the set. One whose tracking was
         // deferred never joined it.
         if !gen.gc_slot.is_registered() {
-            if !gen.track_deferred.get() {
+            if gen.gc_slot.is_young() {
                 gc_trace::forget_young_generator(gen);
             }
             return;
