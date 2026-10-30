@@ -154,16 +154,11 @@ slot is a 16-byte `Object`.
 Ranked by expected gain on the warm-time geomean. Each item is its own
 branch and pull request.
 
-1. **One cheap activation protocol.** Rework the activation record so a call
-   between compiled functions binds a compact frame (locals and operand
-   stack in one buffer, spine link instead of the pending list, no separate
-   native `State`), then route the core loop's inline calls and
-   constructors through it, and delete the frameless-leaf machinery
-   (`leaf_plan`, pure-leaf and site-leaf calls) that exists only because
-   activations were expensive. Target: a call and return in under 150
-   instructions. Expected: 8% to 12% on the geomean, 15% to 25% on `go`,
-   `deepcopy`, `raytrace`, `mini_interpreter`, `closures_decorators`, and
-   `context_managers`, and a smaller hot footprint.
+1. **One cheap activation protocol.** Done for compiled callers and callees
+   (see Done: direct calls on per-thread records). Left: route the core loop's
+   inline calls through records, and delete the frameless-leaf machinery
+   (`leaf_plan`, site leaves) once native callers (`sorted`'s keys) no longer
+   need it.
 2. **Generators and coroutines on the same records.** A resume links the
    generator's own record and a yield unlinks it. Expected: 3% to 4%;
    `coroutines`, `generators_tree`, `async_tree`, and `nqueens` 15% to 30%.
@@ -370,6 +365,28 @@ slowdown in that run was the even-sized chunks, since fixed.
     workloads run (`scripts/extend-order-file.py`). On x86-64 Linux, lld
     gets it too (`--symbol-ordering-file`).
 
+- **Direct calls on per-thread records** (`frame_jit/records.rs`). A direct
+  call between compiled functions runs on a record from a per-thread stack:
+  its `State` and a parked activation slot, kept between calls with their
+  per-thread fields and buffers in place. No `State` is rebuilt, no slot comes
+  from a pool, and the callee's code takes no count (a `__code__` assignment
+  settles first). The function stays in its slot on the caller's stack; the
+  recursion guard, the caller's sync and the switch and spine links wait until
+  something looks (`records::commit`). A compiled body records its entry on
+  its code (`JitHint::set_direct`), so a call site caches nothing and a
+  megamorphic site costs what a monomorphic one does. Compiled code enters
+  through `h_direct_enter`, calls the callee's native code itself and finishes
+  through `h_direct_leave`; a clean return writes nothing to the state
+  (`REC_RET`). Constructors run `__init__` on a record, and native bodies, leaf
+  and generator spreads leave a lazy callee lazy unless Python code looks. A
+  leaf callee compiles and runs through its body when compiled code calls it,
+  so `h_leaf_method` is gone. Against the branch it merged (quick builds):
+  instructions 0.976 (1.113 to 1.086 of CPython), `go` 0.77, `tomllib_loads`
+  0.90, `context_managers` 0.90, `raytrace` 0.93, `mini_interpreter` 0.93,
+  `deepcopy` 0.94, `coroutines` and `chaos` 0.95; `collections_mix` 1.03,
+  `oo_patterns` and `unpack_sequence` 1.02. Wall time over those five
+  call-heavy workloads 0.856.
+
 ## What the measurements say
 
 - **The gap is spread thin.** A direct call costs about 480 instructions,
@@ -444,6 +461,24 @@ slowdown in that run was the even-sized chunks, since fixed.
   full compiled entry would leave about 330 (roughly 2% on `go`) for 150
   to 200 more IR instructions at every call site, and wouldn't reach lean
   bodies' calls (267,000 per `go` call) or recursive ones (150,000).
+- **What a direct call costs on records.** A call and return of a one-argument
+  function costs about 210 instructions over the same statements in line
+  (CPython about 165), against about 540 before; `fib` 315 a call (CPython
+  481). What's left, roughly: the entry helper 70 (guards 25, argument moves,
+  the frame's handles and the call's notes), the return helper 50 plus 8 a
+  local, the callee's prologue and epilogue 18, and the calling code's moves
+  and spills about 40. CPython moves a call's arguments into the new frame too,
+  so arguments in place wouldn't reach its layout: they'd save 4 instructions
+  an argument, and a contiguous stack for locals needs every path that grows or
+  takes a frame's vectors to change. It wasn't built. A call that registers
+  costs far more, and each registers its whole chain of callers: an instruction
+  native code leaves to the core loop does that (`Rect.__init__`'s polymorphic
+  attribute stores, `DictUpdate`, `PushExcInfo`), as does a
+  generator drained for a spread (`deepcopy`'s `callable(*args)`, 16% of its
+  direct calls). `WEAVEPY_BURST_STATS` names the site of each registration.
+- **Most of `deepcopy`'s gap isn't calls.** It's 1.36 of CPython with calls at
+  CPython's cost: per call, the rest is `memo` lookups, `id`, `__reduce_ex__`
+  and `copyreg`.
 - **Generators now resume lazily, as direct calls run.** A compiled
   generator body resumed from compiled code or the core loop (`for`,
   `next()`, `send()`, `yield from`, `await`, and a parked `yield from`

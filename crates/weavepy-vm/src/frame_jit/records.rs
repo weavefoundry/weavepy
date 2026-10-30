@@ -82,9 +82,13 @@ pub(crate) struct DirectRec {
 pub(super) struct CallAt(u64);
 
 impl CallAt {
+    /// `last` is the instruction before, if the caller's state doesn't
+    /// have it.
     #[inline(always)]
-    pub(super) fn new(pc: usize, start: usize, argc: usize) -> Self {
-        CallAt(pc as u64 | (start as u64) << 24 | (argc as u64) << 44)
+    pub(super) fn new(pc: usize, start: usize, argc: usize, last: Option<usize>) -> Self {
+        debug_assert!(pc < 1 << 13 && start < 1 << 18);
+        let last = last.map_or(0, |l| l as u64 + 1);
+        CallAt(pc as u64 | last << 13 | (start as u64) << 26 | (argc as u64) << 44)
     }
 
     #[inline(always)]
@@ -94,12 +98,21 @@ impl CallAt {
 
     #[inline(always)]
     fn pc(self) -> u32 {
-        (self.0 & 0xff_ffff) as u32
+        (self.0 & 0x1fff) as u32
     }
 
     #[inline(always)]
     fn start(self) -> usize {
-        (self.0 >> 24 & 0xf_ffff) as usize
+        (self.0 >> 26 & 0x3_ffff) as usize
+    }
+
+    /// The instruction before, if the caller's state doesn't have it.
+    #[inline(always)]
+    fn last(self) -> Option<usize> {
+        match self.0 >> 13 & 0x1fff {
+            0 => None,
+            l => Some(l as usize - 1),
+        }
     }
 
     #[inline(always)]
@@ -914,7 +927,7 @@ pub(super) unsafe fn enter(
                 rec.st.clean = false;
             }
         }
-        rec.arm(st, CallAt::new(pc, start, 0), interp);
+        rec.arm(st, CallAt::new(pc, start, 0, None), interp);
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         true
     }
@@ -934,6 +947,9 @@ pub(super) unsafe fn commit(st: &mut State, act: *mut crate::InlineAct) {
         let rec = &mut *std::ptr::from_mut(st).cast::<DirectRec>();
         let act = &mut *act;
         let caller = &mut *rec.caller;
+        if let Some(last) = rec.call.last() {
+            caller.last = last;
+        }
         let start = rec.call.start();
         std::ptr::write(&raw mut act.callable, caller.stack.add(start).read());
         let frame = &mut *caller.frame;
@@ -985,14 +1001,17 @@ pub(super) unsafe extern "C" fn h_direct_leave(
         let n = (*rec.locals).len();
         let dc = &*s.depth_cell;
         dc.set(dc.get() - 1);
+        // (The last first, as CPython releases them.)
         let locals = rec.st.locals;
-        for k in 0..n {
+        let mut k = n;
+        while k != 0 {
+            k -= 1;
             if let Some(word) = (*locals.add(k)).strong_word() {
                 // While the gates are off this thread alone updates counts.
                 let w = &*word;
                 let c = w.load(std::sync::atomic::Ordering::Relaxed);
                 if c == 1 {
-                    return release_rest(s, rec, k, n);
+                    return release_rest(s, rec, k + 1);
                 }
                 w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1014,18 +1033,21 @@ pub(super) unsafe extern "C" fn h_direct_leave(
         b.add(1).write(y);
         interp.gil_countdown -= 1;
         interp.recs.set_top(std::ptr::from_mut(rec));
+        if (*s.maybe_dead).get() {
+            return super::left_marked(st, rec.call.pc(), rec.call.start() + 1);
+        }
         0
     }
 }
 
-/// [`h_direct_leave`] for a local whose last reference goes (the `k`th of
-/// `n`, none of them released from there on).
+/// [`h_direct_leave`] for a local whose last reference goes, the first `n`
+/// still to release.
 #[cold]
 #[inline(never)]
-unsafe fn release_rest(s: &mut State, rec: &mut DirectRec, k: usize, n: usize) -> u32 {
-    // SAFETY: as `h_direct_leave`'s; the values from `k` on are still owned.
+unsafe fn release_rest(s: &mut State, rec: &mut DirectRec, n: usize) -> u32 {
+    // SAFETY: as `h_direct_leave`'s; the first `n` values are still owned.
     unsafe {
-        crate::release_run(rec.st.locals.add(k), n - k);
+        crate::release_run(rec.st.locals, n);
         finish_rest(s, rec)
     }
 }
@@ -1141,9 +1163,8 @@ unsafe fn finish_clean(st: &mut State, rec: &mut DirectRec, interp: &mut Interpr
     // SAFETY: as `leave`'s.
     unsafe {
         (*rec.frame).stack.set_len(0);
-        let n = (*rec.locals).len();
-        (*rec.locals).set_len(0);
-        crate::release_run(rec.st.locals, n);
+        let owns_cells = rec.extra && (*rec.st.lazy).owns_cells;
+        crate::release_activation_locals(&mut *rec.frame, owns_cells);
         let dc = &*st.depth_cell;
         dc.set(dc.get() - 1);
         if rec.extra {

@@ -1321,7 +1321,7 @@ fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
                 Some(recv @ (Object::Instance(_) | Object::LazyIter(_))) => {
                     let interp = reentrant_interp()?;
                     let globals = interp.builtins_dict();
-                    match interp.iter_next(recv, &globals)? {
+                    match interp.iter_step(recv, &globals)? {
                         Some(v) => Ok(v),
                         None => Err(crate::error::stop_iteration()),
                     }

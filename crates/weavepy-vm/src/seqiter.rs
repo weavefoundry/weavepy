@@ -113,7 +113,9 @@ fn arg_range(count: usize) -> String {
 
 impl Interpreter {
     /// `next(it)` for an adapter's source: a native iterator steps in
-    /// place, anything else through the iterator protocol.
+    /// place, anything else through the iterator protocol. A `StopIteration`
+    /// that says something comes back as an error, for the adapter's
+    /// consumer (see [`Interpreter::iter_step`]).
     #[inline]
     fn seq_step_source(
         &mut self,
@@ -123,7 +125,7 @@ impl Interpreter {
         if let Object::Iter(c) = it {
             return c.borrow_mut().next_value_checked();
         }
-        self.iter_next(it, globals)
+        self.iter_step(it, globals)
     }
 
     /// `func(v)` for an adapter's callback: a pure callback in place (see
@@ -203,13 +205,17 @@ impl Interpreter {
                 }
             }
         }
-        while let Some(v) = self.seq_step_source(&source, globals)? {
+        loop {
+            let v = match self.seq_step_source(&source, globals) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(true),
+                Err(e) => return stop(e),
+            };
             match self.seq_call1(&func, v, globals) {
                 Ok(r) => out.push(r),
                 Err(e) => return stop(e),
             }
         }
-        Ok(true)
     }
 
     /// An exact `map`/`filter`/`zip` built from positional arguments
@@ -402,7 +408,7 @@ impl Interpreter {
                 iters,
                 strict,
             } => {
-                if iters.len() == 1 {
+                if iters.len() == 1 && !*strict {
                     Step::Map1(func.clone(), iters[0].clone())
                 } else {
                     Step::MapN(func.clone(), iters.len(), *strict)
@@ -497,7 +503,13 @@ impl Interpreter {
             let Some(it) = source(l, i) else {
                 return Ok(None);
             };
-            match self.seq_step_source(&it, globals)? {
+            // (Strict mode's checks clear a `StopIteration`, as they read on.)
+            let step = if strict {
+                self.iter_next(&it, globals)?
+            } else {
+                self.seq_step_source(&it, globals)?
+            };
+            match step {
                 Some(v) => items.push(v),
                 None if !strict => return Ok(None),
                 None => {
@@ -514,7 +526,7 @@ impl Interpreter {
                         let Some(it) = source(l, j) else {
                             break;
                         };
-                        if self.seq_step_source(&it, globals)?.is_some() {
+                        if self.iter_next(&it, globals)?.is_some() {
                             return Err(value_error(format!(
                                 "{name}() argument {} is longer than {}",
                                 j + 1,
@@ -632,7 +644,8 @@ pub(crate) fn seq_next(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let interp = interp()?;
     let globals = interp.builtins_dict();
-    match interp.lazy_iter_next(&l, &globals)? {
+    // (A `StopIteration` its source raised goes on, value and all.)
+    match interp.lazy_iter_step(&l, &globals)? {
         Some(v) => Ok(v),
         None => Err(crate::error::stop_iteration()),
     }

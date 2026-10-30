@@ -124,6 +124,15 @@ const POOLED_STACK_CAPACITY: usize = 16;
 #[doc(hidden)]
 pub struct Frame {
     code: Rc<CodeObject>,
+    /// Evaluation stack. (The stack, the cells and the locals are declared
+    /// in the order a frame's plain drop should release them: see
+    /// [`frame_slots::release_cells_and_locals`].)
+    stack: frame_slots::FrameStack,
+    /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
+    /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
+    /// resized afterwards, and shared with the frame's `FrameShell` /
+    /// `PyFrame` without a per-call `Vec` clone.
+    cells: Rc<Vec<Rc<RefCell<Object>>>>,
     /// Local variables, indexed by `LOAD_FAST` / `STORE_FAST`.
     ///
     /// Shared storage (RFC 0047): the same allocation backs the
@@ -138,13 +147,6 @@ pub struct Frame {
     /// (`getrefcount(self) <= REF_COUNT` in `Series.__setitem__` &
     /// friends).
     locals: frame_slots::FrameLocals,
-    /// Cell storage. Layout: `code.cellvars` first, then `code.freevars`.
-    /// Behind an `Rc` (RFC 0058): built once in `make_frame`, never
-    /// resized afterwards, and shared with the frame's `FrameShell` /
-    /// `PyFrame` without a per-call `Vec` clone.
-    cells: Rc<Vec<Rc<RefCell<Object>>>>,
-    /// Evaluation stack.
-    stack: frame_slots::FrameStack,
     /// Globals shared across frames within the same module.
     globals: Rc<RefCell<DictData>>,
     /// The builtins mapping this frame resolves names against —
@@ -2669,7 +2671,8 @@ impl Interpreter {
     /// the result (CPython's `CALL` decrefs its operands first): an
     /// argument only the call held dies here, finalizers and all.
     fn reap_call_args(&mut self, args: &mut [Object]) {
-        for a in args {
+        // (The last first: a Python callee's arguments are its locals.)
+        for a in args.iter_mut().rev() {
             drop(std::mem::replace(a, Object::Unbound));
         }
     }
@@ -2688,7 +2691,9 @@ impl Interpreter {
         }
         let mut t = t;
         if let Some(slots) = ThinArc::get_mut(&mut t) {
-            for s in slots.iter_mut() {
+            // (The last first, as CPython's tuple goes: `f(*args)`'s run
+            // through a leaf callee's locals this way.)
+            for s in slots.iter_mut().rev() {
                 let old = std::mem::replace(s, Object::Unbound);
                 // Scalars have no drop glue; skip the out-of-line call.
                 if matches!(
@@ -2910,10 +2915,7 @@ impl Interpreter {
         let Some(Object::List(list)) = callbacks else {
             return;
         };
-        // Snapshot the list so a callback that mutates `gc.callbacks` can't
-        // invalidate the iteration.
-        let cbs: Vec<Object> = list.borrow().clone();
-        if cbs.is_empty() {
+        if list.borrow().is_empty() {
             return;
         }
         let mut info = DictData::default();
@@ -2932,12 +2934,87 @@ impl Interpreter {
         let info_obj = Object::Dict(Rc::new(RefCell::new(info)));
         let phase_obj = Object::from_static(phase);
         let globals = self.builtins.clone();
-        for cb in cbs {
+        // The live list by index, as `invoke_gc_callback` walks it: a
+        // callback may change it.
+        let mut i = 0;
+        loop {
+            let Some(cb) = list.borrow().get(i).cloned() else {
+                break;
+            };
+            i += 1;
             let cb_args = [phase_obj.clone(), info_obj.clone()];
             if let Err(err) = self.call(&cb, &cb_args, &[], &globals) {
                 let context_repr = cb.repr();
                 self.write_unraisable(&err, &cb, &context_repr);
             }
+        }
+    }
+
+    /// Whether `gc.callbacks` holds anything.
+    fn gc_callbacks_wanted(&self) -> bool {
+        let Some(Object::Module(m)) = self.cache.get("gc") else {
+            return false;
+        };
+        let callbacks = m
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("callbacks")))
+            .cloned();
+        matches!(callbacks, Some(Object::List(list)) if !list.borrow().is_empty())
+    }
+
+    /// [`Self::fire_gc_callbacks`] with collections held off: the callbacks'
+    /// allocations start none, and a `gc.collect()` in one does nothing.
+    fn fire_gc_callbacks_held(
+        &mut self,
+        phase: &'static str,
+        generation: usize,
+        collected: usize,
+        uncollectable: usize,
+    ) {
+        let entered = gc_trace::with_state(gc_trace::GcState::enter_observed_span);
+        self.fire_gc_callbacks(phase, generation, collected, uncollectable);
+        if entered {
+            gc_trace::with_state(gc_trace::GcState::exit_observed_span);
+        }
+    }
+
+    /// A threshold-driven collection of `generation` (from
+    /// `GcState::maybe_auto_collect`, whose caller runs any finalizers it
+    /// queues): one pass, with `gc.garbage` brought up to date, and, when
+    /// `gc.callbacks` holds anything, its `start` and `stop` around the pass
+    /// and the finalizers, which run in between as under CPython. Returns
+    /// the objects collected.
+    pub(crate) fn automatic_collection(&mut self, generation: usize) -> usize {
+        if !self.gc_callbacks_wanted() {
+            let collected = gc_trace::with_state(|s| s.collect_automatic_pass(generation));
+            self.drain_gc_garbage();
+            return collected;
+        }
+        self.fire_gc_callbacks_held("start", generation, 0, 0);
+        let collected = gc_trace::with_state(|s| s.collect_automatic_pass(generation));
+        let entered = gc_trace::with_state(gc_trace::GcState::enter_observed_span);
+        self.run_pending_finalizers();
+        if entered {
+            gc_trace::with_state(gc_trace::GcState::exit_observed_span);
+        }
+        let uncollectable = self.collection_uncollectable();
+        self.fire_gc_callbacks_held("stop", generation, collected, uncollectable);
+        collected
+    }
+
+    /// [`Self::drain_gc_garbage`] at a collection's end, returning what its
+    /// `stop` callbacks report as uncollectable: what `gc.DEBUG_SAVEALL` kept
+    /// was collectable (CPython counts it as collected).
+    fn collection_uncollectable(&mut self) -> usize {
+        let saved_all = gc_trace::with_state(|s| {
+            s.debug.load(std::sync::atomic::Ordering::Acquire) & gc_trace::DEBUG_SAVEALL != 0
+        });
+        let parked = self.drain_gc_garbage();
+        if saved_all {
+            0
+        } else {
+            parked
         }
     }
 
@@ -4040,9 +4117,11 @@ impl Interpreter {
     fn recycle_frame_allocs(&self, frame: &mut Frame) {
         const POOL_CAP: usize = 64;
         let mut stack = std::mem::take(&mut frame.stack);
+        // The operands go before the cells and locals, whatever the stack's
+        // fate.
+        stack.clear();
         // (A generator's stack, sized to its code, is too small to pool.)
         if stack.capacity() >= POOLED_STACK_CAPACITY {
-            stack.clear();
             let mut pool = self.frame_stack_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(stack);
@@ -4054,7 +4133,8 @@ impl Interpreter {
             // bookkeeping), which must not observe a held pool borrow.
             // SAFETY: sole owner (checked above) — no other path can
             // reach this vector, including the drop glue of its elements.
-            unsafe { release_locals(frame.locals.storage()) };
+            // These frames own their cells.
+            unsafe { release_owned_cells_and_locals(frame) };
             let mut pool = self.frame_locals_pool.borrow_mut();
             if pool.len() < POOL_CAP {
                 pool.push(frame.locals.shared().clone());
@@ -4152,11 +4232,13 @@ impl Interpreter {
         let (locals, stack, boxed, sole) = unsafe {
             let (locals, mut stack) = (std::ptr::read(locals), std::ptr::read(stack));
             stack.clear();
-            // (An escaped `PyFrame` sharing them drops below: the decision
-            // is made before it does.)
+            // A frame object or shell only this frame still holds goes
+            // first: the values are then the frame's to release, in order.
+            std::ptr::drop_in_place(py_frame);
+            std::ptr::drop_in_place(shell_cache);
             let sole = !locals.is_shared();
             if sole {
-                release_locals(locals.storage());
+                frame_slots::release_cells_and_locals(code, cells, locals.storage());
             }
             std::ptr::drop_in_place(code);
             std::ptr::drop_in_place(cells);
@@ -4164,8 +4246,6 @@ impl Interpreter {
             std::ptr::drop_in_place(builtins);
             std::ptr::drop_in_place(rare);
             std::ptr::drop_in_place(exc);
-            std::ptr::drop_in_place(py_frame);
-            std::ptr::drop_in_place(shell_cache);
             #[cfg(feature = "jit")]
             std::ptr::drop_in_place(parked_native);
             (
@@ -5862,7 +5942,7 @@ impl Interpreter {
             lasti: Cell::new(frame.pc),
             back: RefCell::new(back),
             locals_cache: RefCell::new(None),
-            cells: frame.cells.clone(),
+            cells: RefCell::new(frame.cells.clone()),
             class_namespace: frame.class_namespace().cloned(),
             class_namespace_obj: frame.class_namespace_obj().cloned(),
             // At module / exec scope CPython makes `locals() is
@@ -6100,17 +6180,11 @@ impl Interpreter {
     /// storage, any frozen `take_ownership` snapshot (in place, so
     /// earlier `f_locals` handles observe the wipe), and the PEP 667
     /// extra-locals dict. The `cleared` flag makes the
-    /// `FrameLocalsProxy` report an empty mapping even though the cell
-    /// vector (shared with closures) still holds values — CPython
-    /// likewise clears the cell *slots* while the cell objects live on
-    /// in the closures that captured them.
+    /// `FrameLocalsProxy` report an empty mapping — CPython likewise
+    /// clears the cell *slots* while the cell objects live on in the
+    /// closures that captured them.
     fn wipe_frame_locals(py: &Rc<PyFrame>) {
-        if let Some(mirror) = py.locals_mirror.borrow().as_ref() {
-            mirror.borrow_mut().clear();
-        }
-        if let Some(Object::Dict(d)) = py.locals_cache.borrow().as_ref() {
-            d.borrow_mut().clear();
-        }
+        py.release_held_values(true);
         if let Some(extra) = py.extra_locals.borrow().as_ref() {
             extra.borrow_mut().clear();
         }
@@ -8539,9 +8613,7 @@ impl Interpreter {
         fr.stack.clear();
         if !fr.locals.is_shared() {
             // SAFETY: sole owner — no other path reaches this vector.
-            let v = unsafe { fr.locals.storage() };
-            // SAFETY: sole owner (checked above).
-            unsafe { release_locals(v) };
+            unsafe { release_activation_locals(fr, act.owns_cells) };
         } else {
             // The storage escaped (a materialized frame shares it): the
             // slot takes fresh storage.
@@ -9048,7 +9120,7 @@ impl Interpreter {
                     && !frame.locals.is_shared()
                 {
                     // SAFETY: sole owner; nothing else reaches the vector.
-                    unsafe { release_locals(frame.locals.storage()) };
+                    unsafe { release_activation_locals(frame, done.owns_cells) };
                     drop(done.guard.take());
                     return Ok(v);
                 }
@@ -17833,7 +17905,7 @@ impl Interpreter {
         }
         // Committed: the operands leave the stack.
         let callee = frame.stack[callee_at].clone();
-        let operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
+        let mut operands: Vec<Object> = frame.stack.drain(callee_at..).collect();
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
@@ -17852,6 +17924,12 @@ impl Interpreter {
                 if let Some(r) = receiver {
                     args.insert(0, r);
                 }
+                // The arguments are the callee's locals, held by what binds
+                // them from here (`args`, `kwvals`): nothing dies with the
+                // operands, and what dies with the locals goes in their order.
+                for o in operands.drain(..) {
+                    self.release(o);
+                }
                 self.call_python_kw_names(&f, args, &kwnames, kwvals)
             }
             None => {
@@ -17866,7 +17944,7 @@ impl Interpreter {
         self.core_pending_exit(sw, pending);
         drop(kwnames);
         drop(callee);
-        for o in operands {
+        for o in operands.into_iter().rev() {
             self.release(o);
         }
         // SAFETY: the running activation's last-pc slot.
@@ -18524,6 +18602,11 @@ impl Interpreter {
         {
             return false;
         }
+        // A value only the mapping holds would die in the mapping's order:
+        // the activation's locals release it in the parameters'.
+        if kw.is_some_and(|d| d.iter().any(|(_, v)| holds_last_reference(v))) {
+            return false;
+        }
         let mut ptrs: [*const Object; 8] = [std::ptr::null(); 8];
         let arity = leaf_arity(code);
         if kw.is_none()
@@ -18561,7 +18644,7 @@ impl Interpreter {
         };
         frame.stack.push(r);
         frame.pc = pc as u32 + 1;
-        for o in operands {
+        for o in operands.into_iter().rev() {
             self.release_hot(o);
         }
         true
@@ -23099,6 +23182,19 @@ impl Interpreter {
         }
         let kw_vals = &ops[first + eff_argc..ops.len() - 1];
         let mut varkw: Option<DictData> = None;
+        // The caller releases the operands in call order. Keywords given out
+        // of their parameters' order, when one dies with the call, take the
+        // activation, whose locals go in the parameters' order.
+        let mut last_slot = 0;
+        let mut out_of_order = false;
+        for (j, _) in kw_vals.iter().enumerate() {
+            let slot = (perm >> (4 * j)) & 0xF;
+            out_of_order |= slot != specialize::KW_TO_VARKW && slot < last_slot;
+            last_slot = slot;
+        }
+        if out_of_order && kw_vals.iter().any(holds_last_reference) {
+            return None;
+        }
         for (j, o) in kw_vals.iter().enumerate() {
             let slot = ((perm >> (4 * j)) & 0xF) as usize;
             if slot == specialize::KW_TO_VARKW as usize {
@@ -25209,7 +25305,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(frame.locals.storage()) };
+            unsafe { release_activation_locals(frame, done.owns_cells) };
             drop(done.guard.take());
             // A `functools.lru_cache` miss's function returned: its result
             // is stored before the caller takes it (`inline_deliver`'s).
@@ -25293,7 +25389,7 @@ impl Interpreter {
             done.clean = !had_shell;
             // SAFETY: as above.
             // SAFETY: as above.
-            unsafe { release_locals(frame.locals.storage()) };
+            unsafe { release_activation_locals(frame, done.owns_cells) };
             drop(done.guard.take());
             Ok(v)
         } else {
@@ -34614,10 +34710,11 @@ impl Interpreter {
                 let r = result?;
                 frame.push(r);
                 self.release(callable);
-                self.reap_call_args(&mut pos_args);
-                for (_, v) in &mut kw_pairs {
+                // (The operands' top first: the keywords, the last first.)
+                for (_, v) in kw_pairs.iter_mut().rev() {
                     self.reap_call_args(std::slice::from_mut(v));
                 }
+                self.reap_call_args(&mut pos_args);
             }
             OpCode::CallEx => {
                 // CALL_FUNCTION_EX (3.14 shape): the stack always holds
@@ -34875,6 +34972,24 @@ impl Interpreter {
                     Object::BoundMethod(bm) if bm.is_pymethod_type()
                         && matches!(bm.function, Object::Builtin(_))
                 );
+                // The `*` sequence and the `**` mapping go first (usually
+                // compiler temporaries): the values live on in `pos_args` and
+                // `kw_pairs`, and die in a callee's locals' order, as CPython's
+                // handler gives its frame the arguments and drops the two.
+                // `f(**d)` lowers to `BuildMap 0` + `dict.update(d)`, and
+                // populating that fresh dict GC-tracks it: a plain Rust drop
+                // would leave it refcount-dead but pinned by its own collector
+                // handle, holding every kwarg value until the next full
+                // collection, so it goes through the prompt reaper (e.g.
+                // `Thread(target=..., kwargs={'x': obj})` doesn't pin `obj`
+                // past `Thread.join()`:
+                // test_threading.test_no_refcycle_through_target). The
+                // deadness guard inside leaves a still-referenced mapping
+                // untouched, so a user-held dict passed as `**d` is safe.
+                if let Some(kw) = kwargs_obj {
+                    self.release(kw);
+                }
+                self.release(args_obj);
                 let result = if py_method_over_builtin {
                     self.call(&callable, &pos_args, &kw_pairs, &frame.globals)
                 } else {
@@ -34905,28 +35020,11 @@ impl Interpreter {
                 let r = result?;
                 frame.push(r);
                 self.release(callable);
-                self.reap_call_args(&mut pos_args);
-                for (_, v) in &mut kw_pairs {
+                // (The operands' top first: the keywords, the last first.)
+                for (_, v) in kw_pairs.iter_mut().rev() {
                     self.reap_call_args(std::slice::from_mut(v));
                 }
-                // The `**kwargs` mapping is (usually) a compiler temporary:
-                // `f(**d)` lowers to `BuildMap 0` + `dict.update(d)`, and
-                // populating that fresh dict GC-tracks it. Dropping it with
-                // a plain Rust drop would leave it refcount-dead but pinned
-                // by its own collector handle — holding a strong clone of
-                // every kwarg value until the next full collection. CPython
-                // frees the temporary (and everything it holds) by refcount
-                // the instant the call returns; run it through the prompt
-                // reaper so e.g. `Thread(target=..., kwargs={'x': obj})`
-                // doesn't pin `obj` past `Thread.join()`
-                // (test_threading.test_no_refcycle_through_target). The
-                // deadness guard inside leaves a still-referenced mapping
-                // untouched, so a user-held dict passed as `**d` is safe.
-                if let Some(kw) = kwargs_obj {
-                    self.release(kw);
-                }
-                // Same for the `*args` sequence temporary.
-                self.release(args_obj);
+                self.reap_call_args(&mut pos_args);
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -36585,9 +36683,10 @@ impl Interpreter {
                                 iter.type_name_owned()
                             )));
                         }
-                        match self.iter_next(&iter, &frame.globals)? {
-                            Some(v) => Ok(v),
-                            None => Err(stop_iteration()),
+                        match self.iter_step(&iter, &frame.globals) {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => Err(stop_iteration()),
+                            Err(e) => Err(e),
                         }
                     }
                     // A custom awaitable's `__await__` may return any
@@ -43494,9 +43593,13 @@ impl Interpreter {
                 }
                 Err(e) => Err(e),
             },
-            _ => match self.iter_next(it, globals) {
+            // (A `StopIteration` its source raised goes on, value and all.)
+            _ => match self.iter_step(it, globals) {
                 Ok(Some(v)) => Ok(v),
                 Ok(None) => default.ok_or_else(stop_iteration),
+                Err(e) if default.is_some() && crate::seqiter::is_stop_iteration(&e) => {
+                    Ok(default.expect("checked above"))
+                }
                 Err(e) => Err(e),
             },
         }
@@ -46908,7 +47011,9 @@ impl Interpreter {
     }
 
     /// Pull the next value from `iter`. Returns `Ok(None)` on
-    /// exhaustion, `Ok(Some(v))` on yield, or propagates errors.
+    /// exhaustion, `Ok(Some(v))` on yield, or propagates errors: what
+    /// CPython's `PyIter_Next` does, a `StopIteration` being an end and its
+    /// value dropped.
     pub(crate) fn iter_next(
         &mut self,
         iter: &Object,
@@ -46919,15 +47024,30 @@ impl Interpreter {
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
             // (Its end builds no `StopIteration` just to catch it.)
             Object::Generator(g) => self.gen_drain_next(g, None, false),
+            _ => match self.iter_step(iter, globals) {
+                Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+                r => r,
+            },
+        }
+    }
+
+    /// [`Self::iter_next`] as a direct call of `iter`'s `tp_iternext`, what
+    /// `next()`, `yield from` and most native iterators do with their
+    /// sources: a `StopIteration` that says something (a finished
+    /// generator's return value) comes back as the error it is, to be passed
+    /// on. `Ok(None)` is still an end, with nothing to say.
+    pub(crate) fn iter_step(
+        &mut self,
+        iter: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        match iter {
+            Object::Iter(it) => it.borrow_mut().next_value_checked(),
+            Object::LazyIter(l) => self.lazy_iter_step(l, globals),
+            Object::Generator(g) => self.gen_step(g),
             // ``__await__`` returns the coroutine itself, so driving it via
             // ``next()`` must advance it with ``send(None)`` like a generator.
-            Object::Coroutine(_) => match self.gen_method_send(iter, Object::None) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            Object::Coroutine(_) => self.gen_method_send(iter, Object::None).map(Some),
             Object::Instance(inst) => {
                 // A registered native leaf `__next__` (the class cache the
                 // core loop's `FOR_ITER` uses): called directly.
@@ -46936,38 +47056,14 @@ impl Interpreter {
                         // SAFETY: the cache (and the class) keep the builtin
                         // alive through the call, whose body runs no Python.
                         let b = unsafe { &*b };
-                        return match (b.call)(std::slice::from_ref(iter)) {
-                            Ok(v) => Ok(Some(v)),
-                            Err(RuntimeError::PyException(exc))
-                                if exc.type_name() == "StopIteration" =>
-                            {
-                                Ok(None)
-                            }
-                            Err(e) => Err(e),
-                        };
+                        return (b.call)(std::slice::from_ref(iter)).map(Some);
                     }
                 }
                 if let Some(r) = instance_native_dunder(iter, "__next__", None) {
-                    return match r {
-                        Ok(v) => Ok(Some(v)),
-                        Err(RuntimeError::PyException(exc))
-                            if exc.type_name() == "StopIteration" =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    };
+                    return r.map(Some);
                 }
                 if let Some(method) = instance_method(iter, "__next__") {
-                    match self.call(&method, &[], &[], globals) {
-                        Ok(v) => Ok(Some(v)),
-                        Err(RuntimeError::PyException(exc))
-                            if exc.type_name() == "StopIteration" =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    }
+                    self.call(&method, &[], &[], globals).map(Some)
                 } else if let Some(native) = inst.native.get().filter(|n| {
                     // A subclass of a built-in iterator type
                     // (`class MyEnum(enumerate)`) inherits the C-level
@@ -46980,7 +47076,7 @@ impl Interpreter {
                     ) || instance_method(n, "__next__").is_some()
                 }) {
                     let native = native.clone();
-                    self.iter_next(&native, globals)
+                    self.iter_step(&native, globals)
                 } else {
                     Err(type_error(format!(
                         "'{}' object is not an iterator",
@@ -46991,13 +47087,7 @@ impl Interpreter {
             // A file *is* its own iterator (CPython `file.__next__`): `next(f)`
             // yields the next line and raises `ValueError` on a closed stream
             // (`test_io.test_io_after_close`).
-            Object::File(_) => match crate::builtins::file_next(std::slice::from_ref(iter)) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            Object::File(_) => crate::builtins::file_next(std::slice::from_ref(iter)).map(Some),
             // A foreign/extension iterator (numpy array iterator, Cython
             // generator, any C `tp_iternext`) is advanced through its
             // `__next__`, with `StopIteration` meaning exhaustion.
@@ -47375,10 +47465,10 @@ impl Interpreter {
                 }
             }
             Snap::Compress { data, selectors } => loop {
-                let Some(item) = self.iter_next(&data, globals)? else {
+                let Some(item) = self.iter_step(&data, globals)? else {
                     return Ok(None);
                 };
-                let Some(keep) = self.iter_next(&selectors, globals)? else {
+                let Some(keep) = self.iter_step(&selectors, globals)? else {
                     return Ok(None);
                 };
                 if self.obj_truthy(&keep, globals)? {
@@ -47391,10 +47481,10 @@ impl Interpreter {
                 started,
             } => {
                 if started {
-                    return self.iter_next(&source, globals);
+                    return self.iter_step(&source, globals);
                 }
                 loop {
-                    let Some(item) = self.iter_next(&source, globals)? else {
+                    let Some(item) = self.iter_step(&source, globals)? else {
                         return Ok(None);
                     };
                     let verdict = self.seq_call1(&func, item.clone(), globals)?;
@@ -47416,7 +47506,7 @@ impl Interpreter {
                 if stopped {
                     return Ok(None);
                 }
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let verdict = self.seq_call1(&func, item.clone(), globals)?;
@@ -47430,7 +47520,7 @@ impl Interpreter {
                 }
             }
             Snap::FilterFalse { func, source } => loop {
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let truthy = match &func {
@@ -47445,7 +47535,7 @@ impl Interpreter {
                 }
             },
             Snap::StarMap { func, source } => {
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let call_args: Vec<Object> = match &item {
@@ -47477,11 +47567,15 @@ impl Interpreter {
                         // the iterator's state *before* pulling the second —
                         // a reentrant `next()` from inside the source (the
                         // test_pairwise_reenter pattern) must observe it.
-                        let first = match self.iter_next(&src, globals)? {
-                            Some(first) => first,
-                            None => {
+                        let first = match self.iter_step(&src, globals) {
+                            Ok(Some(first)) => first,
+                            Ok(None) => {
                                 clear();
                                 return Ok(None);
+                            }
+                            Err(e) => {
+                                clear();
+                                return Err(e);
                             }
                         };
                         if let LazyIterKind::Pairwise { source: s, old: o } =
@@ -47499,11 +47593,15 @@ impl Interpreter {
                         first
                     }
                 };
-                let new = match self.iter_next(&src, globals)? {
-                    Some(v) => v,
-                    None => {
+                let new = match self.iter_step(&src, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
                         clear();
                         return Ok(None);
+                    }
+                    Err(e) => {
+                        clear();
+                        return Err(e);
                     }
                 };
                 if let LazyIterKind::Pairwise { old: o, .. } = &mut *l.state.borrow_mut() {
@@ -47571,7 +47669,7 @@ impl Interpreter {
                     }
                     return Ok(Some(init));
                 }
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let new_total = match total {
@@ -47707,7 +47805,7 @@ impl Interpreter {
                 // `islice(it, 3, 3)` advances `it` by three even though
                 // it yields nothing.
                 while pos < next_idx {
-                    match self.iter_next(&source, globals) {
+                    match self.iter_step(&source, globals) {
                         Ok(Some(_)) => pos += 1,
                         Ok(None) => {
                             write_back(next_idx, pos, true);
@@ -47723,7 +47821,7 @@ impl Interpreter {
                     write_back(next_idx, pos, true);
                     return Ok(None);
                 }
-                let item = match self.iter_next(&source, globals) {
+                let item = match self.iter_step(&source, globals) {
                     Ok(Some(item)) => item,
                     Ok(None) => {
                         write_back(next_idx, pos, true);
@@ -49395,6 +49493,20 @@ impl Interpreter {
                 }
                 Ok(None)
             }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::iter_step`] of a generator: a return with nothing to say
+    /// builds no `StopIteration`.
+    fn gen_step(&mut self, g: &Rc<PyGenerator>) -> Result<Option<Object>, RuntimeError> {
+        let raw = !crate::trace::any_observers_active();
+        match self.generator_next_raw(g, raw) {
+            Ok(Object::Unbound) if raw => match GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()) {
+                None | Some(Object::None) => Ok(None),
+                Some(v) => Err(stop_iteration_with(v)),
+            },
+            Ok(x) => Ok(Some(x)),
             Err(e) => Err(e),
         }
     }
@@ -56858,11 +56970,16 @@ impl Interpreter {
                                 )));
                             }
                         };
+                        // Inside a collection's callback or finalizer it does
+                        // nothing (CPython's `gcstate->collecting`).
+                        if gc_trace::with_state(gc_trace::GcState::in_observed_span) {
+                            return Ok(Object::Int(0));
+                        }
                         // CPython invokes every `gc.callbacks` entry with
                         // ("start", info) before the sweep and ("stop", info)
                         // after, where `info` carries generation/collected/
                         // uncollectable. Fire them around the real collection.
-                        self.fire_gc_callbacks("start", generation, 0, 0);
+                        self.fire_gc_callbacks_held("start", generation, 0, 0);
                         // CPython's collector runs `__del__` finalizers *during*
                         // the collection and then re-scans to see which objects
                         // their finalizers resurrected — all within one
@@ -56912,8 +57029,8 @@ impl Interpreter {
                         // objects in a Rust-side buffer (it can't touch the
                         // interpreter). Move them into the Python-visible
                         // `gc.garbage` list now that we can.
-                        let uncollectable = self.drain_gc_garbage();
-                        self.fire_gc_callbacks("stop", generation, collected, uncollectable);
+                        let uncollectable = self.collection_uncollectable();
+                        self.fire_gc_callbacks_held("stop", generation, collected, uncollectable);
                         return Ok(Object::Int(collected as i64));
                     }
                     // Pre-materialize VM-only iterables (generators, user
@@ -62398,7 +62515,7 @@ impl Interpreter {
             // temporary container is reaped now, not at the next
             // collection).
             let mut positional = positional;
-            for v in positional.drain(..) {
+            for v in positional.drain(..).rev() {
                 self.release(v);
             }
             self.recycle_scratch(positional);
@@ -72607,12 +72724,10 @@ fn fresh_cells(
 ) -> Rc<Vec<Rc<RefCell<Object>>>> {
     let mut cells: Vec<Rc<RefCell<Object>>> =
         Vec::with_capacity(code.cellvars.len() + code.freevars.len());
-    for name in &code.cellvars {
-        let initial = code
-            .varnames
-            .iter()
-            .position(|n| n == name)
-            .and_then(|i| locals.get_mut(i))
+    let args: &[u32] = code_vm_ext(code).map_or(&[], |ext| &ext.cell_args);
+    for &slot in args {
+        let initial = locals
+            .get_mut(slot as usize)
             .map_or(Object::Unbound, |slot| {
                 std::mem::replace(slot, Object::Unbound)
             });
@@ -72702,8 +72817,52 @@ fn push_grow<T>(v: &mut Vec<T>, x: T) {
     v.push(x);
 }
 
-/// Empty a finished activation's `locals`, releasing each value (an
-/// object that dies queues its finalizer, as any release does).
+/// Whether `o` is the only reference to its value, which would die with it.
+fn holds_last_reference(o: &Object) -> bool {
+    // SAFETY: `o` is live, and its count word with it.
+    o.strong_word()
+        .is_some_and(|w| unsafe { (*w).load(std::sync::atomic::Ordering::Relaxed) == 1 })
+}
+
+/// [`release_locals`] for a finished activation's frame, with its cells
+/// when it owns them (see [`frame_slots::release_cells_and_locals`]).
+///
+/// # Safety
+///
+/// Nothing else borrows the frame's locals, and it holds a count on its
+/// cells if `owns_cells`.
+#[inline(always)]
+unsafe fn release_activation_locals(frame: &mut Frame, owns_cells: bool) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if owns_cells {
+            release_owned_cells_and_locals(frame);
+        } else {
+            release_locals(frame.locals.storage());
+        }
+    }
+}
+
+/// [`frame_slots::release_cells_and_locals`] for `frame`.
+///
+/// # Safety
+///
+/// As [`release_activation_locals`], with cells it holds a count on.
+#[inline]
+unsafe fn release_owned_cells_and_locals(frame: &mut Frame) {
+    let Frame {
+        code,
+        cells,
+        locals,
+        ..
+    } = frame;
+    // SAFETY: the caller's contract.
+    frame_slots::release_cells_and_locals(code, cells, unsafe { locals.storage() });
+}
+
+/// Empty a finished activation's `locals`, releasing each value, the last
+/// first as CPython does (an object that dies queues its finalizer, as any
+/// release does).
 ///
 /// # Safety
 ///
@@ -72720,10 +72879,10 @@ unsafe fn release_locals(locals: &mut Vec<Object>) {
     }
 }
 
-/// Release the `n` values from `base` on (each read out once), as
-/// [`drop_hot`] releases one: the bias is tested once for the run, and a
-/// shared owner's decrement reads only the tag and the pointer (a moved
-/// out copy of each value showed in every return's profile).
+/// Release the `n` values from `base` on, the last first (each read out
+/// once), as [`drop_hot`] releases one: the bias is tested once for the run,
+/// and a shared owner's decrement reads only the tag and the pointer (a
+/// moved out copy of each value showed in every return's profile).
 ///
 /// # Safety
 ///
@@ -72734,12 +72893,12 @@ pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
     // SAFETY: the caller's contract.
     unsafe {
         if !crate::rc::refcounts_biased() {
-            for k in 0..n {
+            for k in (0..n).rev() {
                 drop(base.add(k).read());
             }
             return;
         }
-        for k in 0..n {
+        for k in (0..n).rev() {
             let at = base.add(k);
             if let Some(word) = (*at).strong_word() {
                 // While the bias holds this thread alone updates counts.
@@ -78989,6 +79148,10 @@ fn fusion_enabled() -> bool {
 /// allocated twice per execution before this).
 struct CodeConstObjects {
     objects: Vec<Object>,
+    /// The local slot of each `co_cellvars` entry that is an argument, whose
+    /// value moves into its cell as a call starts, `u32::MAX` for the others
+    /// (a call's cells are made and released by these slots).
+    cell_args: Box<[u32]>,
     /// RFC 0077 WS4: `py_str_hash` of every `co_names` entry, so the
     /// attribute-name dict probes the eval loop issues per execution of a
     /// site (inline-cache shadow guards, generic lookups) hash the
@@ -82478,6 +82641,16 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
                 .names
                 .iter()
                 .map(|n| crate::stdlib::sys::intern_name(n))
+                .collect(),
+            cell_args: code
+                .cellvars
+                .iter()
+                .map(|c| {
+                    code.varnames
+                        .iter()
+                        .position(|n| n == c)
+                        .map_or(u32::MAX, |i| i as u32)
+                })
                 .collect(),
             site_ranks: std::sync::OnceLock::new(),
             method_slots: SiteSlots::new(),

@@ -106,7 +106,7 @@ pub const MAX_COLLECT_PASSES: usize = 16;
 /// `gc.DEBUG_SAVEALL`: instead of freeing unreachable objects, append them to
 /// `gc.garbage` so a debugging session can inspect what would have been
 /// collected. Mirrors CPython's `gc.set_debug(gc.DEBUG_SAVEALL)`.
-const DEBUG_SAVEALL: i64 = 0x20;
+pub(crate) const DEBUG_SAVEALL: i64 = 0x20;
 
 /// Walk all child references reachable through `obj`. Used by
 /// the GC's mark phase. Container types should implement this;
@@ -599,6 +599,11 @@ pub struct GcState {
     /// Re-entrancy guard: a nested collection would see torn generation
     /// lists. Atomic so the whole `GcState` is `Sync`.
     collecting: AtomicBool,
+    /// A collection's `gc.callbacks` or finalizers are running (their Python
+    /// code can't start another collection, as under CPython's
+    /// `gcstate->collecting`). Apart from `collecting`, which also tells the
+    /// C boundary that only the collector's own marshalling is going on.
+    observed_span: AtomicBool,
     /// Per-generation thresholds. Gen 0's threshold is
     /// "allocations since last gen 0 collection"; gens 1 and 2
     /// are "collections of the previous gen since last
@@ -687,6 +692,7 @@ impl GcState {
             reg: RefCell::new(Registry::new()),
             tracked_filter: crate::hot_filter::RebuildableBloom::new(),
             collecting: AtomicBool::new(false),
+            observed_span: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
             gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
@@ -744,6 +750,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
             // A peer may have vanished mid-collection with this set.
             (*this).collecting.store(false, Ordering::Release);
+            (*this).observed_span.store(false, Ordering::Release);
         }
     }
 
@@ -1757,7 +1764,7 @@ impl GcState {
             }
             (counts[0] >= thresholds[0], gen, thresholds[0])
         };
-        if !due {
+        if !due || self.observed_span.load(Ordering::Acquire) {
             return false;
         }
         // The older objects found dead (a slice of the older generations
@@ -1796,8 +1803,14 @@ impl GcState {
             return false;
         }
         // Automatic young collection: a single pass (see `collect_impl`'s
-        // `exact` discussion).
-        let collected = self.collect_impl(eligible, false);
+        // `exact` discussion), with whatever observes collections around it.
+        let collected = match crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: this thread's interpreter. Every poll is at a safe
+            // point where the caller goes on to run Python code (the
+            // finalizers this collection queues).
+            Some(interp) => unsafe { (*interp).automatic_collection(eligible) },
+            None => self.collect_impl(eligible, false),
+        };
         if collected == 0 {
             self.idle_collections.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1880,6 +1893,29 @@ impl GcState {
         // (Someone wants garbage found: the automatic pace starts over.)
         self.idle_collections.store(0, Ordering::Relaxed);
         self.collect_impl(upto, true)
+    }
+
+    /// One automatic collection's single pass (see
+    /// [`Self::maybe_auto_collect`]).
+    pub(crate) fn collect_automatic_pass(&self, gen: usize) -> usize {
+        self.collect_impl(gen, false)
+    }
+
+    /// Claim the span of a collection's Python code (its callbacks and
+    /// finalizers), returning whether this call did: nested in another's
+    /// span, it isn't this call's to end.
+    pub(crate) fn enter_observed_span(&self) -> bool {
+        !self.observed_span.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn exit_observed_span(&self) {
+        self.observed_span.store(false, Ordering::Release);
+    }
+
+    /// Whether a collection's Python code is running: `gc.collect()` does
+    /// nothing then, and an allocation starts no collection.
+    pub(crate) fn in_observed_span(&self) -> bool {
+        self.observed_span.load(Ordering::Acquire)
     }
 
     /// Run the cycle collector's mark phase across all generations and fire
