@@ -9218,7 +9218,7 @@ unsafe extern "C" fn h_call(
                     crate::note_type_site(Some(ext), pc, &*base.add(start));
                     return done(st, r);
                 }
-                if argc == 1 && !st.sw.is_null() {
+                if !st.sw.is_null() {
                     sync(st);
                     settle(st);
                     let sw = &mut *st.sw;
@@ -9402,7 +9402,9 @@ unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, p
                 false
             }
         } else {
+            // (A class the constructor path declines runs through its lane.)
             interp.core_new(sw, pc, st.snap_gen)
+                || (sw.pending.is_none() && interp.core_type_lane(sw))
         };
         if !switched && sw.pending.is_none() {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));

@@ -9062,7 +9062,7 @@ pub fn class_matches_classinfo_named(
             Ok(false)
         }
         _ => Err(type_error(
-            "issubclass() arg 2 must be a class or tuple of classes",
+            "issubclass() arg 2 must be a class, a tuple of classes, or a union",
         )),
     }
 }

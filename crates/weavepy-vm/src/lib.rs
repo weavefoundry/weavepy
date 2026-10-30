@@ -16495,7 +16495,9 @@ impl Interpreter {
             let result = if via_call {
                 let globals = frame.globals.clone();
                 match &*base.add(start) {
-                    callable @ Object::Builtin(_) => self.call(callable, args, &[], &globals),
+                    callable @ (Object::Builtin(_) | Object::Type(_)) => {
+                        self.call(callable, args, &[], &globals)
+                    }
                     callable => self.call(&bm_builtin(callable), args, &[], &globals),
                 }
             } else {
@@ -17378,11 +17380,11 @@ impl Interpreter {
         let Some(ins) = frame.code.instructions.get(pc) else {
             return false;
         };
-        if ins.op != OpCode::Call || ins.arg != 1 {
+        if ins.op != OpCode::Call {
             return false;
         }
         let n = frame.stack.len();
-        let Some(callee_at) = n.checked_sub(3) else {
+        let Some(callee_at) = n.checked_sub(ins.arg as usize + 2) else {
             return false;
         };
         let (Object::Type(ty), Object::Unbound) =
@@ -17391,15 +17393,39 @@ impl Interpreter {
             return false;
         };
         let bt = builtin_types();
+        // Zero-argument `super` reads its caller's frame.
+        if Rc::ptr_eq(ty, &bt.super_) {
+            return false;
+        }
         // (`str(obj)` runs the object's `__str__`.)
-        if ![&bt.list_, &bt.tuple_, &bt.set_, &bt.frozenset_, &bt.dict_, &bt.str_]
+        if ins.arg != 1
+            || ![
+                &bt.list_,
+                &bt.tuple_,
+                &bt.set_,
+                &bt.frozenset_,
+                &bt.dict_,
+                &bt.str_,
+            ]
             .iter()
             .any(|t| Rc::ptr_eq(t, ty))
-            // (`weakref.ref(obj)` and `types.MappingProxyType(mapping)`,
-            // as `inspect` makes them, read no frame either.)
-            && !(ty.flags.is_builtin && matches!(ty.name.as_str(), "ReferenceType" | "mappingproxy"))
         {
-            return false;
+            // Any other class's call takes the ordinary protocol, on the
+            // operands where they are.
+            // SAFETY: the activation is synced, and the shape was checked;
+            // the body reads `b` only when it isn't called through `call`.
+            let raised =
+                unsafe { self.core_native_body(sw, frame, pc, callee_at, std::ptr::null(), true) };
+            match raised {
+                // SAFETY: the running activation's last-pc slot.
+                None => unsafe { *sw.last = pc },
+                Some(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+            }
+            // SAFETY: the running thread's own flag (see `quiet_run`).
+            if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            }
+            return true;
         }
         // Committed: the callee, its self slot, and the argument leave.
         let arg = frame.stack.pop().expect("checked above");
@@ -44156,7 +44182,7 @@ impl Interpreter {
         self.check_class(cls, "issubclass() arg 1 must be a class")?;
         self.check_class(
             classinfo,
-            "issubclass() arg 2 must be a class or tuple of classes",
+            "issubclass() arg 2 must be a class, a tuple of classes, or a union",
         )?;
         Ok(Object::Bool(self.abstract_issubclass(cls, classinfo)?))
     }
