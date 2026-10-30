@@ -2051,7 +2051,7 @@ pub(crate) enum LazyOps {
 /// delegates to a generator or coroutine that isn't a collapsed chain's
 /// level or itself in a `yield from`: resuming `gf` resumes the two in
 /// turn, which a lazy resume runs as well as the switch's chain collapse.
-fn simple_delegate(gf: &crate::Frame) -> bool {
+fn simple_delegate(gf: &crate::Frame, depth: u32) -> bool {
     use crate::object::GeneratorState;
     // (The delegate tops the stack until the resume's value goes on.)
     let n = gf.stack.len();
@@ -2068,11 +2068,16 @@ fn simple_delegate(gf: &crate::Frame) -> bool {
     match unsafe { d.state_raw().peek() } {
         Some(GeneratorState::Suspended(df)) => {
             crate::yield_from_resend(&df.code.instructions, df.pc as usize).is_none()
+                || (depth > 1 && simple_delegate(df, depth - 1))
         }
         Some(GeneratorState::Created(_)) => true,
         _ => false,
     }
 }
+
+/// How deep a `yield from` chain that isn't collapsed resumes lazily
+/// level by level (see [`simple_delegate`]); a deeper one collapses.
+const LAZY_CHAIN_DEPTH: u32 = 3;
 
 /// How a lazy generator resume ([`lazy_gen_resume`]) went.
 pub(crate) enum LazyGen {
@@ -2171,7 +2176,7 @@ pub(crate) unsafe fn lazy_gen_resume(
         // one that is itself in a `yield from` makes a chain, which the
         // switch's chain collapse takes.)
         if crate::yield_from_resend(&gf.code.instructions, gf.pc as usize).is_some()
-            && !simple_delegate(gf)
+            && !simple_delegate(gf, LAZY_CHAIN_DEPTH)
         {
             crate::burst_stats::note_decline("lazy gen: chain", &gf.code.qualname);
             return LazyGen::No;
