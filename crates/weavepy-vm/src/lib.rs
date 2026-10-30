@@ -58831,6 +58831,9 @@ impl Interpreter {
                 *cell.borrow_mut() = mapping;
             }
         }
+        // The body's cells, for after it has run (a finished frame releases
+        // its own).
+        let body_cells = Rc::clone(&frame.cells);
         let _ = self.run_frame(&mut frame)?;
 
         // PEP 3135: when the body created a `__class__` cell (a method
@@ -58845,7 +58848,7 @@ impl Interpreter {
             .cellvars
             .iter()
             .position(|c| c == "__class__")
-            .and_then(|i| frame.cells.get(i).cloned());
+            .and_then(|i| body_cells.get(i).cloned());
         if let Some(cell) = &class_cell {
             let cell_obj = Object::Cell(cell.clone());
             if let Some(obj) = &ns_obj {
@@ -59056,14 +59059,14 @@ impl Interpreter {
         // (RuntimeError), and one that creates a second class from the
         // same namespace re-points it (TypeError) — test_super
         // test___classcell___missing / test___classcell___wrong_cell.
-        Self::check_classcell_propagated(&frame, &body_fn, &name, &Object::Type(ty.clone()))?;
+        Self::check_classcell_propagated(&body_cells, &body_fn, &name, &Object::Type(ty.clone()))?;
         for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             // PEP 695: re-point `__classdict__` at the *type's* dict
             // (CPython `type_new` via `__classdictcell__`), so lazy
             // bounds/aliases see post-creation mutations like
             // `X.T = float` (test_modified_later).
             if cell_name == "__classdict__" {
-                if let Some(cell) = frame.cells.get(i) {
+                if let Some(cell) = body_cells.get(i) {
                     *cell.borrow_mut() = Object::Dict(ty.dict.clone());
                 }
             }
@@ -59075,7 +59078,7 @@ impl Interpreter {
     /// class body minted a `__class__` cell, it must now hold exactly the
     /// object being returned as the class.
     fn check_classcell_propagated(
-        frame: &Frame,
+        body_cells: &[Rc<RefCell<Object>>],
         body_fn: &Rc<PyFunction>,
         name: &str,
         cls: &Object,
@@ -59084,7 +59087,7 @@ impl Interpreter {
             if cell_name != "__class__" {
                 continue;
             }
-            let Some(cell) = frame.cells.get(i) else {
+            let Some(cell) = body_cells.get(i) else {
                 continue;
             };
             let current = cell.borrow().clone();
@@ -59201,6 +59204,9 @@ impl Interpreter {
                 *cell.borrow_mut() = mapping;
             }
         }
+        // The body's cells, for after it has run (a finished frame releases
+        // its own).
+        let body_cells = Rc::clone(&frame.cells);
         let _ = self.run_frame(&mut frame)?;
 
         // PEP 560: when `__mro_entries__` rewrote the bases, expose the
@@ -59235,7 +59241,7 @@ impl Interpreter {
         // returned, so zero-arg `super()` in methods doesn't dangle.
         for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             if cell_name == "__class__" {
-                if let Some(cell) = frame.cells.get(i) {
+                if let Some(cell) = body_cells.get(i) {
                     *cell.borrow_mut() = result.clone();
                 }
             }
