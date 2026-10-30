@@ -91,7 +91,13 @@ class ChunksTest(unittest.TestCase):
     def run_with(self, **env):
         r = subprocess.run(
             [sys.executable, __file__, "run"],
-            env=dict(os.environ, PYTHONHASHSEED="0", WEAVEPY_TIER2="0", **env),
+            env=dict(
+                os.environ,
+                PYTHONHASHSEED="0",
+                WEAVEPY_TIER2="0",
+                WEAVEPY_JIT_SYNC="1",
+                **env,
+            ),
             capture_output=True,
             text=True,
             timeout=120,

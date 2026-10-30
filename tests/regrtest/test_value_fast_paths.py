@@ -1027,7 +1027,7 @@ print(loop(400, 31))
 ENVS = [
     {},
     {"WEAVEPY_JIT_THRESHOLD": "2"},
-    {"WEAVEPY_FRAME_JIT_HOT": "50"},
+    {"WEAVEPY_FRAME_JIT_HOT": "50", "WEAVEPY_JIT_SYNC": "1"},
     {"WEAVEPY_TIER2": "0"},
     {"WEAVEPY_JIT": "0"},
 ]

@@ -877,16 +877,18 @@ pub(crate) fn prewarm_on_heat() {
 static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
-/// Wait for the code generator's warm-up to finish, before `fork()`: the
-/// child then inherits no thread partway through it (holding a lock the
-/// child would wait on forever), and `os.fork` doesn't count it as a
-/// thread of a multi-threaded process.
+/// Wait for the code generator's warm-up, and the background frame
+/// compiler's queued jobs, to finish before `fork()`: the child then
+/// inherits no thread partway through either (holding a lock the child
+/// would wait on forever), and `os.fork` doesn't count them as threads of
+/// a multi-threaded process.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn join_codegen_prewarm() {
     let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle {
         let _ = handle.join();
     }
+    crate::frame_jit::quiesce_compiler();
 }
 
 /// Compile, on a throwaway engine, a small counted loop of the shape hot
