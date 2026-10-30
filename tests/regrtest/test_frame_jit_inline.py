@@ -523,6 +523,35 @@ try:
     shadow_len(5)
 except TypeError as e:
     print(e)
+
+
+class Swap:
+    def m(self, x):
+        return x + 1
+
+    def other(self, x):
+        return x + 100
+
+    def __add__(self, o):
+        return 1
+
+    def __sub__(self, o):
+        return 100
+
+
+def swap_method(o, n):
+    t = 0
+    for i in range(n):
+        t += o.m(i) + (o + o)
+    return t
+
+
+o = Swap()
+print(swap_method(o, N))
+Swap.m.__code__ = Swap.other.__code__
+print(swap_method(o, N))
+Swap.__add__.__code__ = Swap.__sub__.__code__
+print(swap_method(o, N))
 '''
 
 CASES["finalizers"] = r'''
@@ -1334,6 +1363,208 @@ def slots(n):
 print(slots(N))
 '''
 
+CASES["handlers_and_containers"] = r'''
+import sys
+import traceback
+
+N = 600
+
+
+def lookup(d, k):
+    try:
+        return d[k]
+    except KeyError:
+        return -1
+
+
+def safe(d, k):
+    v = 0
+    try:
+        v = d[k]
+    except KeyError as e:
+        v = (sys.exc_info()[0].__name__, str(e))
+    finally:
+        d["finally"] = d.get("finally", 0) + 1
+    return v
+
+
+def reraises(d, k):
+    try:
+        return d[k]
+    except KeyError:
+        raise ValueError("no " + str(k))
+
+
+def outer(d, k):
+    try:
+        return reraises(d, k) + 1
+    except ValueError as e:
+        return str(e), [f.name for f in traceback.extract_tb(e.__traceback__)]
+
+
+def run(n):
+    d = {i: i for i in range(10)}
+    t = 0
+    for i in range(n):
+        t += lookup(d, i % 10)
+    r = [lookup(d, 99), safe(d, 1), safe(d, 99), outer(d, 2), outer(d, 77)]
+    for i in range(n):
+        r[0] += lookup(d, 1000 + i)
+    return t, r, d["finally"]
+
+
+print(run(N))
+
+
+class Ctx:
+    def __init__(self):
+        self.log = []
+
+    def __enter__(self):
+        self.log.append("enter")
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append(("exit", exc[0].__name__ if exc[0] else None))
+        return exc[0] is KeyError
+
+
+def with_body(c, d, k):
+    with c:
+        return d[k]
+
+
+def run_with(n):
+    c = Ctx()
+    d = {1: 1}
+    t = 0
+    for i in range(n):
+        c.log.clear()
+        t += with_body(c, d, 1)
+    log = list(c.log)
+    c.log.clear()
+    return t, log, with_body(c, d, 2), list(c.log)
+
+
+print(run_with(N))
+
+
+def slice_it(xs, a, b):
+    return xs[a:b]
+
+
+def store_slice(xs, a, b, v):
+    xs[a:b] = v
+    return len(xs)
+
+
+def del_item(xs, i):
+    del xs[i]
+    return len(xs)
+
+
+def comp(n):
+    return [i * 2 for i in range(n)]
+
+
+def dicts(k, v):
+    return {k: v, "x": 1}
+
+
+def del_local(a):
+    b = a + 1
+    del b
+    try:
+        return b
+    except UnboundLocalError as e:
+        return str(e)
+
+
+def unpacks(t):
+    a, *b = t
+    return a, b
+
+
+def sets(a, b):
+    s = {a, b}
+    return len(s), sorted(s)
+
+
+class D:
+    def __init__(self):
+        self.x = 1
+
+    def drop(self):
+        del self.x
+        return hasattr(self, "x")
+
+    def put(self):
+        self.x = 2
+
+
+def run_containers(n):
+    xs = list(range(10))
+    r = None
+    for i in range(n):
+        r = (
+            slice_it(xs, 1, 3),
+            store_slice(xs, 0, 1, [0]),
+            comp(3),
+            dicts("k", i),
+            del_local(i),
+            unpacks((1, 2, 3)),
+            sets(1, 2),
+        )
+        xs.append(i)
+        del_item(xs, 0)
+    d = D()
+    for i in range(n):
+        d.put()
+        r2 = d.drop()
+    return r, xs[:3], r2, comp(0), slice_it("abc", 1, None), unpacks([1])
+
+
+print(run_containers(N))
+
+
+def bad_slice(x):
+    return x[1:2]
+
+
+def run_bad(n):
+    for i in range(n):
+        bad_slice([1, 2, 3])
+    try:
+        bad_slice(5)
+    except TypeError as e:
+        return str(e), [f.name for f in traceback.extract_tb(e.__traceback__)]
+
+
+print(run_bad(N))
+
+
+def looped(xs):
+    t = 0
+    for x in xs:
+        if x < 0:
+            return "negative"
+        t += x
+    return t
+
+
+def loops(n):
+    r = None
+    for i in range(n):
+        r = looped([1, 2, 3]), looped((1, -1)), looped(range(3))
+    def gen():
+        yield 1
+        yield 2
+    return r, looped(gen()), looped({1: 2}), looped("")
+
+
+print(loops(N))
+'''
+
 ENVS = [
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1"},
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1", "WEAVEPY_TIER2": "0"},
@@ -1348,11 +1579,12 @@ EXPECTED = {
     'trace_mid_loop': "361800\n361800\n[('body', 'call', 18), ('body', 'line', 19), ('body', 'line', 20), ('other', 'call', 14), ('other', 'line', 15), ('other', 'return', 15), ('body', 'line', 21), ('body', 'return', 21), ('body', 'call', 18), ('body', 'line', 19), ('body', 'line', 20), ('other', 'call', 14), ('other', 'line', 15), ('other', 'return', 15), ('body', 'line', 21), ('body', 'return', 21)]\n901500\n[('body', 'call', 18), ('body', 'line', 19), ('body', 'line', 20), ('other', 'call', 14), ('other', 'line', 15), ('other', 'return', 15), ('body', 'line', 21), ('body', 'return', 21)]\n",
     'monitoring_mid_loop': "360600\n360600\n[('start', 'body'), ('return', 1192), ('start', 'body'), ('return', 1194)]\n",
     'recursion_limit': "180900\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n(180300, 2, 3)\n",
-    'rebinding': "180900\n182700\nf() missing 1 required positional argument: 'b'\n180900\n359400\n188700\n-89099\n2400 3000 2400\n7800 3000\n61800\n24000\n19200\n3600\n1200 60600 1200\n1800\nname 'K' is not defined\n1800\n30000\n1800\nobject of type 'int' has no len()\n",
+    'rebinding': "180900\n182700\nf() missing 1 required positional argument: 'b'\n180900\n359400\n188700\n-89099\n2400 3000 2400\n7800 3000\n61800\n24000\n19200\n3600\n1200 60600 1200\n1800\nname 'K' is not defined\n1800\n30000\n1800\nobject of type 'int' has no len()\n180900\n240300\n299700\n",
     'finalizers': "(179700, ['body', 'x', 'caller'])\n['in', 'a', 'caller']\n['in', 'caller', 'held']\n['in', 'caller', 'held']\n['before', 'arg', 'after', 'caller']\n['before', 'after', 'caller']\n['r', 'caller']\n['first', 'mid', 'second', 'caller']\n['dropped', 'popped', 'caller']\ndead\n['drops']\n",
     'values_and_arguments': '(658607465038423, 21267647932558653971072598982912901120)\n[-598, 597.5, 604, (True, True), None, \'constant\', 600, 1, 6.5]\n(72004026, [592, 593, 594, 595, 596, 597, 598, 599], {0: 1, 1: 1, 2: 1, 3: 1, 4: 1})\n["IndexError(\'list index out of range\')", \'TypeError("\\\'NoneType\\\' object is not subscriptable")\', "TypeError(\'list indices must be integers or slices, not str\')"]\n([0, 100, 200, 300], 6)\nnothing() missing 1 required positional argument: \'a\'\nnothing() takes 1 positional argument but 2 were given\nnothing() takes 1 positional argument but 2 were given\n540300\n729000\n((600, False, 1, \'yes\'), \'dunder-add\', \'dunder-eq\', (\'item\', 3), \'no\')\n(\'prop\', 3)\n',
     'deep_exits': "3006\n([('c', 26), ('b', 18), ('a', 14), ('run', 41), ('<module>', 48)], ['f', 'names', 'q', 'r', 'self'])\ntb 57\nd 32\n1200\n'NoneType' object is not subscriptable\n(<class 'KeyError'>, None)\n",
     'operators': 'V(3) V(3) V(6) V(3.0)\nW.radd V(3) None\nZ.rsub\nunsupported operand type(s) for -: \'V\' and \'V\'\n(V(3), "unsupported operand type(s) for -: \'V\' and \'V\'")\n[(\'<module>\', 96), (\'div\', 69), (\'__truediv__\', 24)]\n(0.5, [(\'div_hot\', 108), (\'__truediv__\', 24)])\n(V(3), \'patched\', "unsupported operand type(s) for +: \'V\' and \'V\'")\n(\'__add__\', \'frames\', 3)\n600\n[2, 3, \'after\']\n(1800, \'KeyError(1)\', [\'slots\', \'__sub__\'])\n',
+    'handlers_and_containers': '(2700, [-601, 1, (\'KeyError\', \'99\'), 3, (\'no 77\', [\'outer\', \'reraises\'])], 2)\n(600, [\'enter\', (\'exit\', None)], None, [\'enter\', (\'exit\', \'KeyError\')])\n(([590, 591], 10, [0, 2, 4], {\'k\': 599, \'x\': 1}, "cannot access local variable \'b\' where it is not associated with a value", (1, [2, 3]), (2, [1, 2])), [590, 591, 592], False, [], \'bc\', (1, []))\n("\'int\' object is not subscriptable", [\'run_bad\', \'bad_slice\'])\n((6, \'negative\', 3), 3, 1, 0)\n',
 }
 
 

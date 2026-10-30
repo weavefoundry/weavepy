@@ -36,6 +36,11 @@
 //! operand's class or tag. Its frame has no callable below it, and its
 //! `NotImplemented` leaves for the core loop with the operator's protocol.
 //!
+//! A method call whose arguments are plain loads fuses with its method load
+//! ([`Lower::inline_method`]): the receiver's class version guards the body,
+//! the receiver stays where it lies, and neither the method nor the receiver
+//! takes a reference.
+//!
 //! A `CALL` of a compiled Python function in an inlined body runs as a direct
 //! call ([`h_inline_call`]), which is lazy already: its callee registers only
 //! if something needs the core loop's view, and registering builds the
@@ -51,6 +56,7 @@ use super::{
     EXIT_PC_SHIFT, FLAGS, GC_BDATA, GC_BSTAMP, GC_BUILTINS, GC_GDATA, GC_GLOBALS, GC_GSTAMP,
     GC_VALUE, INTERP, I_MISSING, MARKED, RAISED, RELOAD, S_INTERP, S_SNAP, S_SW,
 };
+use super::{fill_method_cache, MethodCache, MC_BEFORE, MC_KEYS, MC_VER};
 use cranelift_codegen::ir::types;
 
 /// How many callees deep a site's inlining goes.
@@ -103,9 +109,18 @@ pub(crate) struct InlineSite {
     /// The arguments the body borrows: each local's slot and where its
     /// value lies, for the activation to take a reference.
     borrowed: Vec<(usize, Place)>,
-    /// An operator method's function, which no stack slot holds, and its
-    /// `BINARY_OP`'s argument.
-    method: Option<(Object, u32)>,
+    /// A function no stack slot holds (an operator's or a fused method
+    /// call's), and for an operator, its `BINARY_OP`'s argument.
+    method: Option<(Object, Option<u32>)>,
+}
+
+/// What a fused method call's slow path remembers for its guards: for each
+/// callee, its function and the caches its guards read (see
+/// [`h_inline_method_note`]).
+pub(crate) struct MethodNotes {
+    entries: Vec<(*const crate::object::PyFunction, Vec<*mut MethodCache>)>,
+    ext: *const CodeConstObjects,
+    name: u32,
 }
 
 const IS_KEY: i32 = std::mem::offset_of!(InlineSite, key) as i32;
@@ -167,6 +182,8 @@ pub(super) struct Plan {
     /// method.
     func: Rc<crate::object::PyFunction>,
     dunder: Option<Dunder>,
+    /// How many receiver classes the site recorded for it.
+    classes: usize,
 }
 
 /// A `BINARY_OP` site's guard on the operands (see `dunder_note`).
@@ -275,6 +292,19 @@ fn inline_op(op: OpCode) -> bool {
             | OpCode::ForIter
             | OpCode::JumpBackward
             | OpCode::PopIter
+            | OpCode::BinarySlice
+            | OpCode::StoreSlice
+            | OpCode::DeleteSubscr
+            | OpCode::ListAppend
+            | OpCode::ListExtend
+            | OpCode::SetAdd
+            | OpCode::MapAdd
+            | OpCode::UnpackEx
+            | OpCode::ListToTuple
+            | OpCode::BuildMap
+            | OpCode::DeleteFast
+            | OpCode::LoadFastAndClear
+            | OpCode::DeleteAttr
     )
 }
 
@@ -364,7 +394,7 @@ fn callees_at(
     ext: &CodeConstObjects,
     depths: &[i64],
     pc: usize,
-) -> Vec<(Rc<crate::object::PyFunction>, bool)> {
+) -> Vec<(Rc<crate::object::PyFunction>, bool, usize)> {
     let mut found = crate::call_site_callees(ext, pc);
     let start = call_start(code, ext, pc, depths[pc]);
     if let Some(attr) = call_method_pc(code, depths, pc, start) {
@@ -374,14 +404,15 @@ fn callees_at(
                 .map(|f| (f, true)),
         );
     }
-    let mut seen: Vec<(Rc<crate::object::PyFunction>, bool)> = Vec::new();
+    let mut seen: Vec<(Rc<crate::object::PyFunction>, bool, usize)> = Vec::new();
     for (f, has_self) in found {
         let c = f.code();
-        if !seen
-            .iter()
-            .any(|(g, s)| *s == has_self && Rc::ptr_eq(&g.code(), &c))
+        match seen
+            .iter_mut()
+            .find(|(g, s, _)| *s == has_self && Rc::ptr_eq(&g.code(), &c))
         {
-            seen.push((f, has_self));
+            Some(entry) => entry.2 += 1,
+            None => seen.push((f, has_self, 1)),
         }
     }
     seen
@@ -447,7 +478,7 @@ pub(super) fn plan(
         }
         let names = kw_names(code, ext, pc).filter(|_| i.op == OpCode::CallKw);
         let mut chosen = Vec::new();
-        for (f, has_self) in callees.into_iter().take(MAX_POLY) {
+        for (f, has_self, classes) in callees.into_iter().take(MAX_POLY) {
             let callee = f.code();
             match admit(
                 &f,
@@ -458,7 +489,8 @@ pub(super) fn plan(
                 &mut path,
                 &mut left,
             ) {
-                Ok(p) => {
+                Ok(mut p) => {
+                    p.classes = classes;
                     note(code, pc, "inlined", &callee.qualname);
                     let start = call_start(code, ext, pc, depths[pc]) as usize;
                     plans.need = plans.need.max(start + 2 + p.need);
@@ -488,6 +520,54 @@ fn callee_never_ran(code: &CodeObject, ext: &CodeConstObjects, starts: &[bool]) 
     use weavepy_compiler::InlineCache as IC;
     let mut cold = never_ran_blocks(code, starts);
     let n = starts.len();
+    // A handler (and what only it leads to) runs in the activation an exit
+    // builds, never in line.
+    let ins = &code.instructions;
+    let mut reached = vec![false; n];
+    let mut work = vec![0];
+    while let Some(from) = work.pop() {
+        if std::mem::replace(&mut reached[from], true) {
+            continue;
+        }
+        let end = (from + 1..n).find(|&k| starts[k]).unwrap_or(n);
+        let last = ins[end - 1];
+        let next = end;
+        let target = match last.op {
+            OpCode::JumpForward
+            | OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => Some(next + last.arg as usize),
+            OpCode::JumpBackward => Some(next.saturating_sub(last.arg as usize)),
+            _ => None,
+        };
+        let falls = !matches!(
+            last.op,
+            OpCode::JumpForward
+                | OpCode::JumpBackward
+                | OpCode::ReturnValue
+                | OpCode::RaiseVarargs
+                | OpCode::Reraise
+        );
+        // (A loop's exit lies past its `END_FOR` and `POP_ITER`.)
+        let mut targets = vec![target, falls.then_some(next)];
+        if last.op == OpCode::ForIter {
+            for k in 1..=2 {
+                targets.push(target.map(|t| t + k));
+            }
+        }
+        for t in targets.into_iter().flatten() {
+            if t < n && starts[t] {
+                work.push(t);
+            }
+        }
+    }
+    for k in 0..n {
+        if starts[k] && !reached[k] {
+            cold[k] = true;
+        }
+    }
     let resolved = |pc: usize| {
         !matches!(code.caches.get(pc as u32), IC::Empty) || crate::site_resolved(ext, pc)
     };
@@ -540,12 +620,8 @@ fn admit(
     if path.len() > MAX_LEVELS {
         return Err("too deep");
     }
-    // (A recursive function takes itself in line once: every other frame
-    // of its recursion then never exists.)
-    let at = std::ptr::from_ref(code) as usize;
-    if path.iter().filter(|&&c| c == at).count() > 1 || path[1..].contains(&at) {
-        return Err("recursive");
-    }
+    // (A recursive function takes itself in line: most frames of its
+    // recursion then never exist. The depth limit above bounds it.)
     if code.is_generator || code.is_coroutine || code.is_async_generator {
         return Err("generator");
     }
@@ -554,9 +630,6 @@ fn admit(
     }
     if !code.cellvars.is_empty() || f.lean_cells_ref(code).is_none() {
         return Err("cells");
-    }
-    if !code.exception_table.is_empty() {
-        return Err("handlers");
     }
     if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
         return Err("wire");
@@ -628,18 +701,21 @@ fn admit(
             OpCode::CompareOp | OpCode::BinarySubscr if crate::instance_site(ext, pc) => {
                 leaves = true;
             }
+            // (`FOR_ITER` takes the loop's exit past it.)
+            OpCode::EndFor => leaves = false,
             OpCode::CallKw if call_start(code, ext, pc, depths[pc]) >= 0 => {
                 // (Lowered in line, or it leaves.)
                 let names = kw_names(code, ext, pc);
                 let mut chosen = Vec::new();
                 if names.is_some() {
-                    for (g, self_slot) in callees_at(code, ext, &depths, pc)
+                    for (g, self_slot, classes) in callees_at(code, ext, &depths, pc)
                         .into_iter()
                         .take(MAX_POLY)
                     {
                         let c = g.code();
                         let n = call_argc(code, ext, pc);
-                        if let Ok(p) = admit(&g, &c, self_slot, n, names, path, budget) {
+                        if let Ok(mut p) = admit(&g, &c, self_slot, n, names, path, budget) {
+                            p.classes = classes;
                             let start = nlocals + call_start(code, ext, pc, depths[pc]) as usize;
                             inner_need = inner_need.max(start + 2 + p.need);
                             chosen.push(p);
@@ -663,14 +739,15 @@ fn admit(
                             weavepy_compiler::InlineCache::Empty
                         );
                     let mut chosen = Vec::new();
-                    for (g, self_slot) in callees.into_iter().take(MAX_POLY) {
+                    for (g, self_slot, classes) in callees.into_iter().take(MAX_POLY) {
                         let c = g.code();
                         if c.is_generator || c.is_coroutine || c.is_async_generator {
                             leaves = true;
                         }
-                        if let Ok(p) =
+                        if let Ok(mut p) =
                             admit(&g, &c, self_slot, ins.arg as usize, None, path, budget)
                         {
+                            p.classes = classes;
                             let start = nlocals + (depths[pc] - i64::from(ins.arg) - 2) as usize;
                             inner_need = inner_need.max(start + 2 + p.need);
                             chosen.push(p);
@@ -686,7 +763,10 @@ fn admit(
         // What a body has run that can't run in line would leave every time
         // it runs again. (Error paths are worth leaving by.)
         if leaves && !matches!(ins.op, OpCode::RaiseVarargs | OpCode::Reraise) {
-            result = Err("leaves");
+            result = Err(match ins.op {
+                OpCode::Call if crate::call_site_builtin(ext, pc).is_some() => "calls a builtin",
+                op => op.name(),
+            });
             break;
         }
         pc += 1;
@@ -711,6 +791,7 @@ fn admit(
         layout: FnLayout::of(f),
         func: f.clone(),
         dunder: None,
+        classes: 1,
     })
 }
 
@@ -1071,7 +1152,7 @@ impl<'a> Lower<'a> {
             self.vs.clear();
             self.depth = start + 2;
             self.last_pc = call_last;
-            self.inline_body(pc, plan, &args, start, next, join);
+            self.inline_body(pc, plan, &args, start, next, join, None);
             self.b.switch_to_block(next);
             slow = Some(next);
         }
@@ -1090,33 +1171,8 @@ impl<'a> Lower<'a> {
                 self.call_with(pc, h_call_kw as *const () as usize, false);
                 self.b.ins().jump(join, &[]);
             }
-        } else if nested {
-            self.inline_python_call(pc, argc);
-            self.b.ins().jump(join, &[]);
         } else {
-            self.flush();
-            self.store_last();
-            let code = self.code_ptr();
-            let ext = self.ext_ptr();
-            let len = self.b.ins().iconst(types::I64, self.depth as i64);
-            let pc_argc = self
-                .b
-                .ins()
-                .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
-            let dsite: Box<DirectSite> = Box::default();
-            let dsite_at = self
-                .b
-                .ins()
-                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&dsite) as i64);
-            self.direct_sites.push(dsite);
-            let r = self
-                .call(
-                    h_call_site as *const () as usize,
-                    &[self.st, code, ext, pc_argc, len, dsite_at],
-                    true,
-                )
-                .expect("returns");
-            self.called(pc, argc, r);
+            self.plain_call(pc, argc);
             self.b.ins().jump(join, &[]);
         }
         self.b.switch_to_block(join);
@@ -1127,6 +1183,236 @@ impl<'a> Lower<'a> {
             self.inline_ir += self.b.func.dfg.num_insts() - before;
         }
         true
+    }
+
+    /// The ordinary `CALL` of `argc` arguments at `pc`, what its site's
+    /// bodies' guards didn't take: the block goes on with the result in place.
+    fn plain_call(&mut self, pc: usize, argc: usize) {
+        if self.inlining() {
+            self.inline_python_call(pc, argc);
+            return;
+        }
+        self.flush();
+        self.store_last();
+        let code = self.code_ptr();
+        let ext = self.ext_ptr();
+        let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let pc_argc = self
+            .b
+            .ins()
+            .iconst(types::I64, (pc as i64) | ((argc as i64) << 32));
+        let dsite: Box<DirectSite> = Box::default();
+        let dsite_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&dsite) as i64);
+        self.direct_sites.push(dsite);
+        let r = self
+            .call(
+                h_call_site as *const () as usize,
+                &[self.st, code, ext, pc_argc, len, dsite_at],
+                true,
+            )
+            .expect("returns");
+        self.called(pc, argc, r);
+    }
+
+    /// `LOAD_ATTR` of a method at `attr_pc` whose `CALL`, past plain loads of
+    /// its arguments, runs callees lowered in line: the whole call here, each
+    /// body guarded by the receiver's class version, with the ordinary method
+    /// load and call for anything their guards don't take (a load that
+    /// declines leaves for the core loop at `attr_pc`, nothing done: the
+    /// argument loads have no effects). The block goes on past the `CALL`.
+    /// `None`, emitting nothing, for any other shape.
+    pub(super) fn inline_method(&mut self, attr_pc: usize) -> Option<bool> {
+        self.layout?;
+        let before = self.b.func.dfg.num_insts();
+        let code = self.code;
+        let ins = &code.instructions;
+        let call_pc = method_call_pc(code, self.ext, self.depths, attr_pc)?;
+        if ins[call_pc].op != OpCode::Call
+            || ins[call_pc].arg as usize != call_pc - attr_pc - 1
+            || self.depth == 0
+            || self.starts[attr_pc + 1..=call_pc].iter().any(|&s| s)
+        {
+            return None;
+        }
+        let plans = self.plan_at(call_pc)?;
+        if !plans.iter().all(|p| p.has_self && p.dunder.is_none()) {
+            return None;
+        }
+        for i in &ins[attr_pc + 1..call_pc] {
+            match i.op {
+                OpCode::LoadFast | OpCode::LoadFastBorrow => {
+                    let k = i.arg as usize;
+                    if k >= self.nlocals || (self.maybe_unbound[k] && !self.bound[k]) {
+                        return None;
+                    }
+                }
+                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {}
+                OpCode::LoadSmallInt => {}
+                _ => return None,
+            }
+        }
+        if !matches!(self.vs.last(), None | Some(Item::Local(_) | Item::Mem(_))) {
+            return None;
+        }
+        let recv = self.pop();
+        let mut items = vec![recv];
+        for i in &ins[attr_pc + 1..call_pc] {
+            items.push(match i.op {
+                OpCode::LoadConst => Item::Const(i.arg),
+                OpCode::LoadSmallInt => {
+                    Item::Int(self.b.ins().iconst(types::I64, i64::from(i.arg)))
+                }
+                _ => self.inline_value(i.arg).unwrap_or(Item::Local(i.arg)),
+            });
+        }
+        // All below the receiver on the stack; it and the arguments as they
+        // are.
+        self.flush();
+        let start = self.depth;
+        let call_last = self.last_pc;
+        let nested = self.inlining();
+        let join = self.b.create_block();
+        let mut notes = Box::new(MethodNotes {
+            entries: Vec::new(),
+            ext: std::ptr::from_ref(self.ext),
+            name: ins[attr_pc].arg,
+        });
+        let mut slow = None;
+        for plan in plans {
+            let next = self.b.create_block();
+            let mut caches = Vec::new();
+            for _ in 0..plan.classes.min(2) {
+                let mut cache: Box<MethodCache> = Box::default();
+                caches.push(std::ptr::from_mut::<MethodCache>(&mut cache));
+                self.method_caches.push(cache);
+            }
+            let addrs: Vec<i64> = caches.iter().map(|&c| c as i64).collect();
+            notes.entries.push((Rc::as_ptr(&plan.func), caches));
+            self.vs.clear();
+            self.depth = start;
+            self.last_pc = call_last;
+            self.inline_body(call_pc, plan, &items, start, next, join, Some(&addrs));
+            self.b.switch_to_block(next);
+            slow = Some(next);
+        }
+        if let Some(slow) = slow {
+            self.b.set_cold_block(slow);
+        }
+        // Anything else: the method's load, what the guards need for next
+        // time, and the call.
+        self.vs = vec![recv];
+        self.depth = start + 1;
+        self.last_pc = call_last;
+        self.flush();
+        let cache: Box<MethodCache> = Box::default();
+        let cache_at = std::ptr::from_ref::<MethodCache>(&cache) as i64;
+        self.method_caches.push(cache);
+        let done = self.b.create_block();
+        self.load_method_helper(attr_pc, cache_at, done);
+        let callee = self.slot_addr(start);
+        let notes_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<MethodNotes>(&notes) as i64);
+        self.method_notes.push(notes);
+        self.call(
+            h_inline_method_note as *const () as usize,
+            &[callee, notes_at],
+            false,
+        );
+        self.vs = items[1..].to_vec();
+        self.depth = start + 2 + items.len() - 1;
+        self.plain_call(call_pc, items.len() - 1);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+        self.vs.clear();
+        self.depth = start + 1;
+        self.set_last(call_pc);
+        if !nested {
+            self.inline_ir += self.b.func.dfg.num_insts() - before;
+        }
+        self.skip_to = Some(call_pc);
+        Some(true)
+    }
+
+    /// The guards of a fused method call: the receiver an instance of a class
+    /// one of the caches read, which holds no dictionary and no value that
+    /// could shadow the method (a mismatch of either kind goes to `slow`).
+    /// The values to test: the site's being off, and a value false.
+    fn method_guards(
+        &mut self,
+        recv: Item,
+        caches: &[i64],
+        sv: Value,
+        slow: Block,
+    ) -> (Value, Value) {
+        let l = *self.layout.expect("checked by the caller");
+        let ptr = self.ptr;
+        let at = self
+            .operand_addr(recv)
+            .expect("checked by the caller: a local or on the stack");
+        let tag = self.tag_at(at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, slow);
+        let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let ver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let c = self.b.ins().iconst(ptr, caches[0]);
+        let want = self.b.ins().load(types::I64, FLAGS, c, MC_VER);
+        let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let unguarded = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+        let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self.b.ins().bor(lazy, unguarded);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let ckeys = self.b.ins().load(types::I64, FLAGS, c, MC_KEYS);
+        let before = self.b.ins().uload32(FLAGS, c, MC_BEFORE);
+        let (stale, ckeys, before) = if let Some(&second) = caches.get(1) {
+            let c2 = self.b.ins().iconst(ptr, second);
+            let want2 = self.b.ins().load(types::I64, FLAGS, c2, MC_VER);
+            let keys2 = self.b.ins().load(types::I64, FLAGS, c2, MC_KEYS);
+            let before2 = self.b.ins().uload32(FLAGS, c2, MC_BEFORE);
+            let first = self.b.ins().icmp(IntCC::Equal, ver, want);
+            let second = self.b.ins().icmp(IntCC::Equal, ver, want2);
+            let hit = self.b.ins().bor(first, second);
+            let stale = self.b.ins().bxor_imm(hit, 1);
+            let ckeys = self.b.ins().select(first, ckeys, keys2);
+            let before = self.b.ins().select(first, before, before2);
+            (stale, ckeys, before)
+        } else {
+            (self.b.ins().icmp(IntCC::NotEqual, ver, want), ckeys, before)
+        };
+        let bad = self.b.ins().bor(stale, busy);
+        let bad = self.b.ins().bor(bad, other);
+        self.branch_out(bad, slow);
+        let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+        let check = self.b.create_block();
+        let hit = self.b.create_block();
+        self.b.ins().brif(block, check, &[], hit, &[]);
+        self.b.switch_to_block(check);
+        let n = self.b.ins().uload32(FLAGS, block, l.split_len);
+        let keys = self.b.ins().load(types::I64, FLAGS, block, l.split_keys);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, n, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, keys, ckeys);
+        let short = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, n, before);
+        let held = self.b.ins().band(same, short);
+        let ok = self.b.ins().bor(empty, held);
+        self.b.ins().brif(ok, hit, &[], slow, &[]);
+        self.b.switch_to_block(hit);
+        let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
+        let off = self.b.ins().icmp_imm(IntCC::Equal, key, 0);
+        let no = self.b.ins().iconst(types::I8, 0);
+        (off, no)
     }
 
     /// One callee of [`Self::inline_call`], the callable and all below it on
@@ -1141,14 +1427,17 @@ impl<'a> Lower<'a> {
         start: usize,
         slow: Block,
         join: Block,
+        method: Option<&[i64]>,
     ) {
         let nested = self.inlining();
         let argc = args.len();
         let code: &'a CodeObject = &plan.code;
-        let first = match (plan.dunder, plan.has_self) {
-            (Some(_), _) => start,
-            (None, true) => start + 1,
-            (None, false) => start + 2,
+        // (A fused method call's arguments start with its receiver.)
+        let self_slot = usize::from(plan.has_self && method.is_none());
+        let first = match (plan.dunder.is_some() || method.is_some(), plan.has_self) {
+            (true, _) => start,
+            (false, true) => start + 1,
+            (false, false) => start + 2,
         };
         let nlocals = plan.nlocals;
         let base = first + nlocals;
@@ -1171,9 +1460,12 @@ impl<'a> Lower<'a> {
             base,
             nlocals,
             borrowed: Vec::new(),
-            method: plan
-                .dunder
-                .map(|d| (Object::Function(plan.func.clone()), d.arg)),
+            method: (plan.dunder.is_some() || method.is_some()).then(|| {
+                (
+                    Object::Function(plan.func.clone()),
+                    plan.dunder.map(|d| d.arg),
+                )
+            }),
         });
         let site_at = std::ptr::from_ref::<InlineSite>(&site) as i64;
         let method_at = site
@@ -1184,9 +1476,18 @@ impl<'a> Lower<'a> {
         // The guards: nothing has happened yet when one fails.
         let ptr = self.ptr;
         let sv = self.b.ins().iconst(ptr, site_at);
-        let (other, wrong) = match plan.dunder {
-            Some(d) => self.dunder_guards(d, args, sv, slow),
-            None => {
+        let (other, wrong) = match (plan.dunder, method) {
+            (Some(d), _) => {
+                let (other, wrong) = self.dunder_guards(d, args, sv, slow);
+                let swapped = self.code_swapped(plan, handle);
+                (other, self.b.ins().bor(wrong, swapped))
+            }
+            (None, Some(caches)) => {
+                let (other, wrong) = self.method_guards(args[0], caches, sv, slow);
+                let swapped = self.code_swapped(plan, handle);
+                (other, self.b.ins().bor(wrong, swapped))
+            }
+            (None, None) => {
                 let at = self.slot_addr(start);
                 let tag = self.tag_at(at);
                 let not_fn =
@@ -1239,10 +1540,13 @@ impl<'a> Lower<'a> {
         self.branch_out(bad, slow);
         // The defaults (`__defaults__` may have been rebound).
         if plan.missing > 0 {
-            let given = argc + usize::from(plan.has_self);
+            let given = argc + self_slot;
             let dst = self.slot_addr(first + given);
             let n = self.b.ins().iconst(types::I64, plan.missing as i64);
-            let at = self.slot_addr(start);
+            let at = match method_at {
+                Some(a) => self.b.ins().iconst(ptr, a),
+                None => self.slot_addr(start),
+            };
             let r = self
                 .call(h_inline_defaults as *const () as usize, &[at, dst, n], true)
                 .expect("returns");
@@ -1265,7 +1569,7 @@ impl<'a> Lower<'a> {
         let mut owned = vec![true; nlocals];
         let mut borrowed: Vec<(usize, Place)> = Vec::new();
         for (k, &item) in args.iter().enumerate() {
-            let li = k + usize::from(plan.has_self);
+            let li = k + self_slot;
             let home = first + li;
             let keep = !plan.stored[li];
             match item {
@@ -1422,7 +1726,7 @@ impl<'a> Lower<'a> {
             }
         }
         let at = self.slot_addr(start);
-        if plan.dunder.is_none() {
+        if method_at.is_none() {
             self.release_slot(at);
         }
         let src = self.slot_addr(base);
@@ -1432,6 +1736,20 @@ impl<'a> Lower<'a> {
         self.set_last(pc);
         self.check_released(pc + 1);
         self.b.ins().jump(join, &[]);
+    }
+
+    /// Whether a function a body's guards found by its class no longer runs
+    /// the body's code (`__code__` was reassigned, which moves no version).
+    fn code_swapped(&mut self, plan: &Plan, handle: u64) -> Value {
+        let obj = std::mem::ManuallyDrop::new(Object::Function(plan.func.clone()));
+        // SAFETY: an `Object` is 16 bytes, its second word the payload (the
+        // site keeps the function alive; this copy's count is released).
+        let word = unsafe { std::ptr::from_ref(&*obj).cast::<[u64; 2]>().read() }[1];
+        drop(std::mem::ManuallyDrop::into_inner(obj));
+        let at = self.b.ins().iconst(self.ptr, word as i64);
+        let current = self.b.ins().load(types::I64, FLAGS, at, plan.layout.code);
+        let want = self.b.ins().iconst(types::I64, handle as i64);
+        self.b.ins().icmp(IntCC::NotEqual, current, want)
     }
 
     /// The guards of a `BINARY_OP`'s method: the left operand an instance of
@@ -1533,7 +1851,7 @@ impl<'a> Lower<'a> {
         let call_last = self.last_pc;
         let join = self.b.create_block();
         let slow = self.b.create_block();
-        self.inline_body(pc, &plans[0], &args, start, slow, join);
+        self.inline_body(pc, &plans[0], &args, start, slow, join, None);
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
         self.vs = args.to_vec();
@@ -2012,6 +2330,33 @@ pub(super) unsafe extern "C" fn h_inline_for_iter(
     }
 }
 
+/// A fused method call's slow path loaded the method at `callee`, its
+/// receiver above it: if it's one of the bodies' functions, called on an
+/// instance, the guards take the receiver's class from now on.
+unsafe extern "C" fn h_inline_method_note(callee: *const Object, notes: *const MethodNotes) {
+    // SAFETY: the code passes the callable's slot, with the self slot above
+    // it, and its site's notes; the caches are the same code's.
+    unsafe {
+        let (Object::Function(f), Object::Instance(inst)) = (&*callee, &*callee.add(1)) else {
+            return;
+        };
+        let notes = &*notes;
+        let at = Rc::as_ptr(f);
+        let Some((_, caches)) = notes.entries.iter().find(|(p, _)| std::ptr::eq(*p, at)) else {
+            return;
+        };
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let target = caches
+            .iter()
+            .find(|&&c| (*c).ver == 0 || (*c).ver == ver)
+            .or(caches.last());
+        if let Some(&c) = target {
+            fill_method_cache(&mut *c, cls, ver, &*callee, &*notes.ext, notes.name);
+        }
+    }
+}
+
 /// Release the value at `at` (it leaves the stack for good).
 unsafe extern "C" fn h_release(at: *const Object) {
     // SAFETY: the code passes an initialized slot, which it doesn't read
@@ -2254,7 +2599,7 @@ unsafe fn bind_levels(
             act.owns_cells = false;
             // An operator method's `NotImplemented` becomes the operator's
             // `TypeError` (see `InlineAct::binop`).
-            if let Some((_, arg)) = &s.method {
+            if let Some((_, Some(arg))) = &s.method {
                 let locals = fr.locals.storage();
                 if let Object::Instance(a) = &locals[0] {
                     let cls = a.cls();

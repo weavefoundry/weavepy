@@ -299,6 +299,7 @@ struct Caches {
     /// callees' code, which the code addresses.
     inline_sites: Vec<Box<inline::InlineSite>>,
     inline_calls: Vec<Box<inline::InlineCall>>,
+    method_notes: Vec<Box<inline::MethodNotes>>,
     held_codes: Vec<Rc<CodeObject>>,
 }
 
@@ -316,6 +317,7 @@ impl Caches {
         self.leaf_methods.append(&mut other.leaf_methods);
         self.inline_sites.append(&mut other.inline_sites);
         self.inline_calls.append(&mut other.inline_calls);
+        self.method_notes.append(&mut other.method_notes);
         self.held_codes.append(&mut other.held_codes);
     }
 }
@@ -10662,11 +10664,10 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
 /// `DELETE_FAST i` of the running frame's bound local: `0` the local
 /// emptied and its value released, anything else (an unbound local, whose
 /// `UnboundLocalError` is the core loop's) declined untouched.
-unsafe extern "C" fn h_delete_fast(st: *mut State, i: u64) -> u32 {
-    // SAFETY: the code passes its live state and one of its locals.
+unsafe extern "C" fn h_delete_fast(st: *mut State, slot: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and a local's address.
     unsafe {
         let st = &*st;
-        let slot = st.locals.add(i as usize);
         if matches!(&*slot, Object::Unbound) {
             return 1;
         }
@@ -11322,6 +11323,7 @@ fn lower_range(
                 leaf_methods: std::mem::take(&mut lower.leaf_methods),
                 inline_sites: std::mem::take(&mut lower.inline_sites),
                 inline_calls: std::mem::take(&mut lower.inline_calls),
+                method_notes: std::mem::take(&mut lower.method_notes),
                 held_codes: std::mem::take(&mut lower.held_codes),
             },
         };
@@ -11747,7 +11749,11 @@ struct Lower<'a> {
     inline_sites: Vec<Box<inline::InlineSite>>,
     #[allow(clippy::vec_box)]
     inline_calls: Vec<Box<inline::InlineCall>>,
+    #[allow(clippy::vec_box)]
+    method_notes: Vec<Box<inline::MethodNotes>>,
     held_codes: Vec<Rc<CodeObject>>,
+    /// A fused call just lowered: the last instruction it covers.
+    skip_to: Option<usize>,
     /// The IR instructions of the callees lowered in line.
     inline_ir: usize,
     /// The stack capacity the code needs.
@@ -12071,7 +12077,9 @@ impl<'a> Lower<'a> {
             inl: Vec::new(),
             inline_sites: Vec::new(),
             inline_calls: Vec::new(),
+            method_notes: Vec::new(),
             held_codes: Vec::new(),
+            skip_to: None,
             inline_ir: 0,
             need,
         }
@@ -12824,7 +12832,7 @@ impl<'a> Lower<'a> {
             if !self.instruction(pc) {
                 break;
             }
-            pc += 1;
+            pc = self.skip_to.take().unwrap_or(pc) + 1;
             if pc >= n {
                 self.exit(INTERP, pc);
                 break;
@@ -13091,9 +13099,9 @@ impl<'a> Lower<'a> {
             OpCode::DeleteFast if (ins.arg as usize) < self.nlocals => {
                 let i = ins.arg;
                 self.flush_local(i);
-                let iv = self.b.ins().iconst(types::I64, i64::from(i));
+                let local = self.local_addr(i);
                 let r = self
-                    .call(h_delete_fast as *const () as usize, &[self.st, iv], true)
+                    .call(h_delete_fast as *const () as usize, &[self.st, local], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
                 self.branch_out(r, out);
@@ -16186,6 +16194,9 @@ impl<'a> Lower<'a> {
         if self.depth == 0 {
             self.exit(INTERP, pc);
             return false;
+        }
+        if let Some(r) = self.inline_method(pc) {
+            return r;
         }
         // A leaf method of the value on top, called in place.
         if !self.inlining() && !self.method_inlined(pc) {
