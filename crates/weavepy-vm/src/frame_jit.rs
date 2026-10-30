@@ -878,7 +878,12 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
         };
         Some(if in_line { 2 } else { 1 })
     };
-    if matches!(at, Heat::Call) && code.jit_hint.loop_free(code) {
+    // (A loop-free generator body warms by its resumes' steps as well as
+    // its creations: either way a resume runs the body as a call would.)
+    let gen = code.is_generator || code.is_coroutine || code.is_async_generator;
+    if (matches!(at, Heat::Call) || (gen && matches!(at, Heat::Step)))
+        && code.jit_hint.loop_free(code)
+    {
         // The body as a call runs it (the handlers aside).
         let (mut n, mut cost) = (0usize, 0usize);
         for k in body_pcs(code) {
@@ -887,8 +892,10 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
                 None => {
                     cost += match ins[k].op {
                         // Every activation leaves at one; the core loop
-                        // would dispatch it too.
+                        // would dispatch it too. A resume ends at its yield
+                        // whether or not the body runs natively.
                         OpCode::ReturnValue => 0,
+                        OpCode::YieldValue if gen => 0,
                         OpCode::Call | OpCode::CallKw | OpCode::CallEx => t.call_exit,
                         _ => t.exit,
                     }
