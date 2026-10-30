@@ -1024,6 +1024,52 @@ mod tests {
     }
 
     #[test]
+    fn nested_bodies_decode_when_first_read() {
+        let inner = CodeObject {
+            name: "f".into(),
+            qualname: "f".into(),
+            arg_count: 2,
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0)],
+                varnames: vec!["a".into(), "b".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..CodeObject::default()
+        };
+        let code = CodeObject {
+            name: "<module>".into(),
+            body: crate::CodeBody {
+                constants: vec![Constant::Code(Arc::new(inner.clone()))],
+                ..Default::default()
+            }
+            .into(),
+            ..CodeObject::default()
+        };
+        let bytes = encode(&code).expect("encodable");
+        let buffer = crate::TableBuffer::new(bytes.into_boxed_slice());
+        let root = decode_lazily(buffer, "m.py").expect("decodable");
+        assert!(root.body_decoded());
+        let Some(Constant::Code(nested)) = root.constants.first() else {
+            panic!("nested code object expected");
+        };
+        // A function needs only the header.
+        assert_eq!(nested.name, "f");
+        assert!(Arc::ptr_eq(&root.filename, &nested.filename));
+        assert_eq!(nested.arg_count, 2);
+        assert!(!nested.body_decoded());
+        // A clone decodes on its own.
+        let clone = (**nested).clone();
+        assert!(!clone.body_decoded());
+        assert_eq!(clone.varnames.len(), 2);
+        assert!(clone.body_decoded() && !nested.body_decoded());
+        // The first read of a body field decodes the body.
+        assert_eq!(nested.instructions.len(), 1);
+        assert!(nested.body_decoded());
+        assert_eq!(nested.varnames, inner.varnames);
+    }
+
+    #[test]
     fn rejects_truncated_or_foreign_input() {
         let code = CodeObject {
             name: "<module>".into(),
