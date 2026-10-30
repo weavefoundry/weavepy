@@ -4189,6 +4189,17 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::retire_gen_frame`] with no interpreter at hand (a generator's
+    /// last release closing it): the running thread's, if it has one.
+    pub(crate) fn retire_detached_frame(boxed: Box<Frame>) {
+        match crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: this thread's interpreter, which only the running code
+            // is using; retiring touches only its pool.
+            Some(interp) => unsafe { (*interp).retire_gen_frame(boxed) },
+            None => drop(boxed),
+        }
+    }
+
     /// Finish `gen`, running (its frame `boxed` out of its state): the
     /// generator is marked finished, its frame retired (see
     /// [`Self::retire_gen_frame`]), and the collector lets go of it (see
@@ -62392,7 +62403,7 @@ impl Interpreter {
                     locals,
                     stack,
                     boxed,
-                } = self.gen_parts(&code, nlocals);
+                } = self.gen_parts(code, nlocals);
                 {
                     // SAFETY: sole owner (see `gen_parts`).
                     let l = unsafe { &mut *locals.as_ptr() };
@@ -62525,7 +62536,7 @@ impl Interpreter {
             locals,
             stack,
             boxed,
-        } = self.gen_parts(&code, nlocals);
+        } = self.gen_parts(code, nlocals);
         // SAFETY: sole owner (see `gen_parts`). (`.0` stays unbound until
         // the call.)
         unsafe { (*locals.as_ptr()).resize(nlocals, Object::Unbound) };
