@@ -2916,10 +2916,7 @@ impl Interpreter {
         let Some(Object::List(list)) = callbacks else {
             return;
         };
-        // Snapshot the list so a callback that mutates `gc.callbacks` can't
-        // invalidate the iteration.
-        let cbs: Vec<Object> = list.borrow().clone();
-        if cbs.is_empty() {
+        if list.borrow().is_empty() {
             return;
         }
         let mut info = DictData::default();
@@ -2938,12 +2935,87 @@ impl Interpreter {
         let info_obj = Object::Dict(Rc::new(RefCell::new(info)));
         let phase_obj = Object::from_static(phase);
         let globals = self.builtins.clone();
-        for cb in cbs {
+        // The live list by index, as `invoke_gc_callback` walks it: a
+        // callback may change it.
+        let mut i = 0;
+        loop {
+            let Some(cb) = list.borrow().get(i).cloned() else {
+                break;
+            };
+            i += 1;
             let cb_args = [phase_obj.clone(), info_obj.clone()];
             if let Err(err) = self.call(&cb, &cb_args, &[], &globals) {
                 let context_repr = cb.repr();
                 self.write_unraisable(&err, &cb, &context_repr);
             }
+        }
+    }
+
+    /// Whether `gc.callbacks` holds anything.
+    fn gc_callbacks_wanted(&self) -> bool {
+        let Some(Object::Module(m)) = self.cache.get("gc") else {
+            return false;
+        };
+        let callbacks = m
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("callbacks")))
+            .cloned();
+        matches!(callbacks, Some(Object::List(list)) if !list.borrow().is_empty())
+    }
+
+    /// [`Self::fire_gc_callbacks`] with collections held off: the callbacks'
+    /// allocations start none, and a `gc.collect()` in one does nothing.
+    fn fire_gc_callbacks_held(
+        &mut self,
+        phase: &'static str,
+        generation: usize,
+        collected: usize,
+        uncollectable: usize,
+    ) {
+        let entered = gc_trace::with_state(gc_trace::GcState::enter_observed_span);
+        self.fire_gc_callbacks(phase, generation, collected, uncollectable);
+        if entered {
+            gc_trace::with_state(gc_trace::GcState::exit_observed_span);
+        }
+    }
+
+    /// A threshold-driven collection of `generation` (from
+    /// `GcState::maybe_auto_collect`, whose caller runs any finalizers it
+    /// queues): one pass, with `gc.garbage` brought up to date, and, when
+    /// `gc.callbacks` holds anything, its `start` and `stop` around the pass
+    /// and the finalizers, which run in between as under CPython. Returns
+    /// the objects collected.
+    pub(crate) fn automatic_collection(&mut self, generation: usize) -> usize {
+        if !self.gc_callbacks_wanted() {
+            let collected = gc_trace::with_state(|s| s.collect_automatic_pass(generation));
+            self.drain_gc_garbage();
+            return collected;
+        }
+        self.fire_gc_callbacks_held("start", generation, 0, 0);
+        let collected = gc_trace::with_state(|s| s.collect_automatic_pass(generation));
+        let entered = gc_trace::with_state(gc_trace::GcState::enter_observed_span);
+        self.run_pending_finalizers();
+        if entered {
+            gc_trace::with_state(gc_trace::GcState::exit_observed_span);
+        }
+        let uncollectable = self.collection_uncollectable();
+        self.fire_gc_callbacks_held("stop", generation, collected, uncollectable);
+        collected
+    }
+
+    /// [`Self::drain_gc_garbage`] at a collection's end, returning what its
+    /// `stop` callbacks report as uncollectable: what `gc.DEBUG_SAVEALL` kept
+    /// was collectable (CPython counts it as collected).
+    fn collection_uncollectable(&mut self) -> usize {
+        let saved_all = gc_trace::with_state(|s| {
+            s.debug.load(std::sync::atomic::Ordering::Acquire) & gc_trace::DEBUG_SAVEALL != 0
+        });
+        let parked = self.drain_gc_garbage();
+        if saved_all {
+            0
+        } else {
+            parked
         }
     }
 
@@ -56888,11 +56960,16 @@ impl Interpreter {
                                 )));
                             }
                         };
+                        // Inside a collection's callback or finalizer it does
+                        // nothing (CPython's `gcstate->collecting`).
+                        if gc_trace::with_state(gc_trace::GcState::in_observed_span) {
+                            return Ok(Object::Int(0));
+                        }
                         // CPython invokes every `gc.callbacks` entry with
                         // ("start", info) before the sweep and ("stop", info)
                         // after, where `info` carries generation/collected/
                         // uncollectable. Fire them around the real collection.
-                        self.fire_gc_callbacks("start", generation, 0, 0);
+                        self.fire_gc_callbacks_held("start", generation, 0, 0);
                         // CPython's collector runs `__del__` finalizers *during*
                         // the collection and then re-scans to see which objects
                         // their finalizers resurrected — all within one
@@ -56942,8 +57019,8 @@ impl Interpreter {
                         // objects in a Rust-side buffer (it can't touch the
                         // interpreter). Move them into the Python-visible
                         // `gc.garbage` list now that we can.
-                        let uncollectable = self.drain_gc_garbage();
-                        self.fire_gc_callbacks("stop", generation, collected, uncollectable);
+                        let uncollectable = self.collection_uncollectable();
+                        self.fire_gc_callbacks_held("stop", generation, collected, uncollectable);
                         return Ok(Object::Int(collected as i64));
                     }
                     // Pre-materialize VM-only iterables (generators, user
