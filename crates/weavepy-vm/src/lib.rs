@@ -36604,9 +36604,10 @@ impl Interpreter {
                                 iter.type_name_owned()
                             )));
                         }
-                        match self.iter_next(&iter, &frame.globals)? {
-                            Some(v) => Ok(v),
-                            None => Err(stop_iteration()),
+                        match self.iter_step(&iter, &frame.globals) {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => Err(stop_iteration()),
+                            Err(e) => Err(e),
                         }
                     }
                     // A custom awaitable's `__await__` may return any
@@ -43513,9 +43514,13 @@ impl Interpreter {
                 }
                 Err(e) => Err(e),
             },
-            _ => match self.iter_next(it, globals) {
+            // (A `StopIteration` its source raised goes on, value and all.)
+            _ => match self.iter_step(it, globals) {
                 Ok(Some(v)) => Ok(v),
                 Ok(None) => default.ok_or_else(stop_iteration),
+                Err(e) if default.is_some() && crate::seqiter::is_stop_iteration(&e) => {
+                    Ok(default.expect("checked above"))
+                }
                 Err(e) => Err(e),
             },
         }
@@ -46927,7 +46932,9 @@ impl Interpreter {
     }
 
     /// Pull the next value from `iter`. Returns `Ok(None)` on
-    /// exhaustion, `Ok(Some(v))` on yield, or propagates errors.
+    /// exhaustion, `Ok(Some(v))` on yield, or propagates errors: what
+    /// CPython's `PyIter_Next` does, a `StopIteration` being an end and its
+    /// value dropped.
     pub(crate) fn iter_next(
         &mut self,
         iter: &Object,
@@ -46938,15 +46945,30 @@ impl Interpreter {
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
             // (Its end builds no `StopIteration` just to catch it.)
             Object::Generator(g) => self.gen_drain_next(g, None, false),
+            _ => match self.iter_step(iter, globals) {
+                Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+                r => r,
+            },
+        }
+    }
+
+    /// [`Self::iter_next`] as a direct call of `iter`'s `tp_iternext`, what
+    /// `next()`, `yield from` and most native iterators do with their
+    /// sources: a `StopIteration` that says something (a finished
+    /// generator's return value) comes back as the error it is, to be passed
+    /// on. `Ok(None)` is still an end, with nothing to say.
+    pub(crate) fn iter_step(
+        &mut self,
+        iter: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        match iter {
+            Object::Iter(it) => it.borrow_mut().next_value_checked(),
+            Object::LazyIter(l) => self.lazy_iter_step(l, globals),
+            Object::Generator(g) => self.gen_step(g),
             // ``__await__`` returns the coroutine itself, so driving it via
             // ``next()`` must advance it with ``send(None)`` like a generator.
-            Object::Coroutine(_) => match self.gen_method_send(iter, Object::None) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            Object::Coroutine(_) => self.gen_method_send(iter, Object::None).map(Some),
             Object::Instance(inst) => {
                 // A registered native leaf `__next__` (the class cache the
                 // core loop's `FOR_ITER` uses): called directly.
@@ -46955,38 +46977,14 @@ impl Interpreter {
                         // SAFETY: the cache (and the class) keep the builtin
                         // alive through the call, whose body runs no Python.
                         let b = unsafe { &*b };
-                        return match (b.call)(std::slice::from_ref(iter)) {
-                            Ok(v) => Ok(Some(v)),
-                            Err(RuntimeError::PyException(exc))
-                                if exc.type_name() == "StopIteration" =>
-                            {
-                                Ok(None)
-                            }
-                            Err(e) => Err(e),
-                        };
+                        return (b.call)(std::slice::from_ref(iter)).map(Some);
                     }
                 }
                 if let Some(r) = instance_native_dunder(iter, "__next__", None) {
-                    return match r {
-                        Ok(v) => Ok(Some(v)),
-                        Err(RuntimeError::PyException(exc))
-                            if exc.type_name() == "StopIteration" =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    };
+                    return r.map(Some);
                 }
                 if let Some(method) = instance_method(iter, "__next__") {
-                    match self.call(&method, &[], &[], globals) {
-                        Ok(v) => Ok(Some(v)),
-                        Err(RuntimeError::PyException(exc))
-                            if exc.type_name() == "StopIteration" =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    }
+                    self.call(&method, &[], &[], globals).map(Some)
                 } else if let Some(native) = inst.native.get().filter(|n| {
                     // A subclass of a built-in iterator type
                     // (`class MyEnum(enumerate)`) inherits the C-level
@@ -46999,7 +46997,7 @@ impl Interpreter {
                     ) || instance_method(n, "__next__").is_some()
                 }) {
                     let native = native.clone();
-                    self.iter_next(&native, globals)
+                    self.iter_step(&native, globals)
                 } else {
                     Err(type_error(format!(
                         "'{}' object is not an iterator",
@@ -47010,13 +47008,7 @@ impl Interpreter {
             // A file *is* its own iterator (CPython `file.__next__`): `next(f)`
             // yields the next line and raises `ValueError` on a closed stream
             // (`test_io.test_io_after_close`).
-            Object::File(_) => match crate::builtins::file_next(std::slice::from_ref(iter)) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            Object::File(_) => crate::builtins::file_next(std::slice::from_ref(iter)).map(Some),
             // A foreign/extension iterator (numpy array iterator, Cython
             // generator, any C `tp_iternext`) is advanced through its
             // `__next__`, with `StopIteration` meaning exhaustion.
@@ -47394,10 +47386,10 @@ impl Interpreter {
                 }
             }
             Snap::Compress { data, selectors } => loop {
-                let Some(item) = self.iter_next(&data, globals)? else {
+                let Some(item) = self.iter_step(&data, globals)? else {
                     return Ok(None);
                 };
-                let Some(keep) = self.iter_next(&selectors, globals)? else {
+                let Some(keep) = self.iter_step(&selectors, globals)? else {
                     return Ok(None);
                 };
                 if self.obj_truthy(&keep, globals)? {
@@ -47410,10 +47402,10 @@ impl Interpreter {
                 started,
             } => {
                 if started {
-                    return self.iter_next(&source, globals);
+                    return self.iter_step(&source, globals);
                 }
                 loop {
-                    let Some(item) = self.iter_next(&source, globals)? else {
+                    let Some(item) = self.iter_step(&source, globals)? else {
                         return Ok(None);
                     };
                     let verdict = self.seq_call1(&func, item.clone(), globals)?;
@@ -47435,7 +47427,7 @@ impl Interpreter {
                 if stopped {
                     return Ok(None);
                 }
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let verdict = self.seq_call1(&func, item.clone(), globals)?;
@@ -47449,7 +47441,7 @@ impl Interpreter {
                 }
             }
             Snap::FilterFalse { func, source } => loop {
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let truthy = match &func {
@@ -47464,7 +47456,7 @@ impl Interpreter {
                 }
             },
             Snap::StarMap { func, source } => {
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let call_args: Vec<Object> = match &item {
@@ -47496,11 +47488,15 @@ impl Interpreter {
                         // the iterator's state *before* pulling the second —
                         // a reentrant `next()` from inside the source (the
                         // test_pairwise_reenter pattern) must observe it.
-                        let first = match self.iter_next(&src, globals)? {
-                            Some(first) => first,
-                            None => {
+                        let first = match self.iter_step(&src, globals) {
+                            Ok(Some(first)) => first,
+                            Ok(None) => {
                                 clear();
                                 return Ok(None);
+                            }
+                            Err(e) => {
+                                clear();
+                                return Err(e);
                             }
                         };
                         if let LazyIterKind::Pairwise { source: s, old: o } =
@@ -47518,11 +47514,15 @@ impl Interpreter {
                         first
                     }
                 };
-                let new = match self.iter_next(&src, globals)? {
-                    Some(v) => v,
-                    None => {
+                let new = match self.iter_step(&src, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
                         clear();
                         return Ok(None);
+                    }
+                    Err(e) => {
+                        clear();
+                        return Err(e);
                     }
                 };
                 if let LazyIterKind::Pairwise { old: o, .. } = &mut *l.state.borrow_mut() {
@@ -47590,7 +47590,7 @@ impl Interpreter {
                     }
                     return Ok(Some(init));
                 }
-                let Some(item) = self.iter_next(&source, globals)? else {
+                let Some(item) = self.iter_step(&source, globals)? else {
                     return Ok(None);
                 };
                 let new_total = match total {
@@ -47726,7 +47726,7 @@ impl Interpreter {
                 // `islice(it, 3, 3)` advances `it` by three even though
                 // it yields nothing.
                 while pos < next_idx {
-                    match self.iter_next(&source, globals) {
+                    match self.iter_step(&source, globals) {
                         Ok(Some(_)) => pos += 1,
                         Ok(None) => {
                             write_back(next_idx, pos, true);
@@ -47742,7 +47742,7 @@ impl Interpreter {
                     write_back(next_idx, pos, true);
                     return Ok(None);
                 }
-                let item = match self.iter_next(&source, globals) {
+                let item = match self.iter_step(&source, globals) {
                     Ok(Some(item)) => item,
                     Ok(None) => {
                         write_back(next_idx, pos, true);
@@ -49414,6 +49414,20 @@ impl Interpreter {
                 }
                 Ok(None)
             }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::iter_step`] of a generator: a return with nothing to say
+    /// builds no `StopIteration`.
+    fn gen_step(&mut self, g: &Rc<PyGenerator>) -> Result<Option<Object>, RuntimeError> {
+        let raw = !crate::trace::any_observers_active();
+        match self.generator_next_raw(g, raw) {
+            Ok(Object::Unbound) if raw => match GEN_RETURN_VALUE.with(|v| v.borrow_mut().take()) {
+                None | Some(Object::None) => Ok(None),
+                Some(v) => Err(stop_iteration_with(v)),
+            },
+            Ok(x) => Ok(Some(x)),
             Err(e) => Err(e),
         }
     }
