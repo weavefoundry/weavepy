@@ -22,7 +22,9 @@
 //! go away under it.
 //!
 //! Compiled code makes the common call in three steps, none of which needs
-//! a frame of its own: [`h_direct_enter`] checks the callee and binds it,
+//! a frame of its own: [`h_direct_enter`] checks the callee (a compiled body
+//! records its direct entry on its own code, so a call site caches nothing,
+//! and any number of callees cost it the same) and binds it,
 //! the code calls the callee's native code straight, and [`h_direct_leave`]
 //! finishes a clean return, moving the result into the function's slot and
 //! leaving the record as it found it. Both helpers are leaves on those
@@ -36,7 +38,7 @@ use crate::sync::Rc;
 use crate::Interpreter;
 use weavepy_compiler::CodeObject;
 
-use super::{DirectSite, State, DIRECT_CALL_DEPTH};
+use super::{State, DIRECT_CALL_DEPTH};
 
 /// An instance operator's call (see [`super::direct_call`]).
 pub(super) type Binop<'a> = Option<(
@@ -73,12 +75,37 @@ pub(crate) struct DirectRec {
     no_cells: *const Vec<Rc<crate::sync::RefCell<Object>>>,
 }
 
-/// A `CALL`'s pc and its operands' start on the stack.
+/// A `CALL`'s pc, its operands' start on the stack and its argument count,
+/// in one word (a constant of the compiled code).
 #[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub(super) struct CallAt {
-    pub(super) pc: u32,
-    pub(super) start: u32,
+#[repr(transparent)]
+pub(super) struct CallAt(u64);
+
+impl CallAt {
+    #[inline(always)]
+    pub(super) fn new(pc: usize, start: usize, argc: usize) -> Self {
+        CallAt(pc as u64 | (start as u64) << 24 | (argc as u64) << 44)
+    }
+
+    #[inline(always)]
+    pub(super) fn bits(self) -> i64 {
+        self.0 as i64
+    }
+
+    #[inline(always)]
+    fn pc(self) -> u32 {
+        (self.0 & 0xff_ffff) as u32
+    }
+
+    #[inline(always)]
+    fn start(self) -> usize {
+        (self.0 >> 24 & 0xf_ffff) as usize
+    }
+
+    #[inline(always)]
+    fn argc(self) -> usize {
+        (self.0 >> 44) as usize
+    }
 }
 
 /// A thread's records: one per [`DIRECT_CALL_DEPTH`] level, and one more
@@ -128,6 +155,8 @@ impl DirectRecs {
                     in_rec: true,
                     at_start: true,
                     clean: true,
+                    wait_pc: usize::MAX,
+                    wait_pending: None,
                 },
                 frame: std::ptr::null_mut(),
                 locals: std::ptr::null_mut(),
@@ -325,29 +354,68 @@ impl DirectRec {
     }
 }
 
-/// What a `CALL` site knows of a callee that binds without allocating and
-/// runs its native code whole (see [`h_direct_enter`]).
-#[derive(Clone, Copy, Default)]
-pub(super) struct FastCallee {
-    /// The site key ([`super::site_key`]), `0` for none.
-    pub(super) key: usize,
-    pub(super) entry: usize,
-    /// The locals to bind.
-    pub(super) total: u32,
-    /// The record's room it takes.
-    pub(super) room: u32,
-    /// The arguments it gets, and the parameters after them that take the
-    /// function's defaults.
-    pub(super) nargs: u32,
-    pub(super) missing: u32,
-    /// Whether it reads its function's closure.
-    pub(super) closure: bool,
-    /// Whether it has either that or defaults to take.
-    pub(super) more: bool,
+/// What [`h_direct_enter`] needs of a callee whose code has a direct entry
+/// (`JitHint::set_direct`): the parameters arguments bind to, the locals to
+/// bind, the record's room it takes and whether it reads its function's
+/// closure, packed in a word.
+#[derive(Clone, Copy)]
+struct Shape(u32);
+
+impl Shape {
+    const CLOSURE: u32 = 1 << 31;
+
+    #[inline(always)]
+    fn params(self) -> usize {
+        (self.0 & 0xf) as usize
+    }
+
+    #[inline(always)]
+    fn room(self) -> u32 {
+        self.0 >> 4 & 0x3fff
+    }
+
+    #[inline(always)]
+    fn total(self) -> usize {
+        (self.0 >> 18 & 0x1fff) as usize
+    }
+
+    #[inline(always)]
+    fn closure(self) -> bool {
+        self.0 & Self::CLOSURE != 0
+    }
 }
 
 /// The most arguments [`h_direct_enter`] moves.
-pub(super) const FAST_ARGS: usize = 8;
+const FAST_ARGS: usize = 8;
+
+/// Record `code`'s direct entry (`native`, its body) if a call of it binds
+/// without allocating and runs the body whole from its start, and it's past
+/// the warm-up hooks only the general path runs (see [`enter`]). `packed` is
+/// the binding of [`super::direct_body`].
+#[inline(never)]
+pub(super) fn note_direct(code: &CodeObject, native: &super::Native, packed: usize) {
+    let hint = &code.jit_hint;
+    let nlocals = code.varnames.len();
+    let room = nlocals.max(native.need);
+    if packed & super::EXTENDED_BIT as usize != 0
+        || !code.cellvars.is_empty()
+        || !native.chunks.is_empty()
+        || !native.enters_at(0)
+        || native.nlocals != nlocals
+        || (code.arg_count as usize) > FAST_ARGS
+        || room > 0x1fff
+        || hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+        || (hint.is_compiled() && !hint.is_not_jitable() && !crate::tier2::jit_off_for_process())
+    {
+        return;
+    }
+    let closure = packed & super::CELLS_BIT as usize != 0;
+    let shape = code.arg_count
+        | (room as u32) << 4
+        | (nlocals as u32) << 18
+        | if closure { Shape::CLOSURE } else { 0 };
+    hint.set_direct(native.func as usize, shape);
+}
 
 /// Move `n` (at most [`FAST_ARGS`]) values, without a call to `memcpy`.
 ///
@@ -401,96 +469,101 @@ const NOT_ENTERED: Entered = Entered {
     entry: 0,
 };
 
-/// A `CALL`'s callee entered from compiled code: its arguments bound and
-/// its record armed, for the code to call the native code and pass the
-/// status to [`h_direct_leave`]. Null touched nothing (the code then calls
-/// `h_call_direct`, which settles anything this doesn't, and fills the
-/// site).
+/// A `CALL`'s callee entered from compiled code, the function at `slot` on
+/// the stack and `call` the `CALL`'s own: its arguments bound and its record
+/// armed, for the code to call the native code and pass the status to
+/// [`h_direct_leave`]. Null touched nothing (the code then goes on to the
+/// general paths, which settle anything this doesn't).
 ///
 /// # Safety
 ///
-/// `st` is the running code's live state, and `site` this `CALL`'s own
-/// cache, whose operands are on the stack.
-pub(super) unsafe extern "C" fn h_direct_enter(st: *mut State, site: *const DirectSite) -> Entered {
-    // SAFETY: the caller's contract; a site key holds its code's count, so
-    // an equal key names the same code.
+/// `st` is the running code's live state, whose stack holds the `CALL`'s
+/// operands from `slot` on.
+pub(super) unsafe extern "C" fn h_direct_enter(
+    st: *mut State,
+    slot: *mut Object,
+    call: CallAt,
+) -> Entered {
+    // SAFETY: the caller's contract.
     unsafe {
         let s = &*st;
-        let site = &*site;
-        let slot = s.stack.add(site.call.start as usize);
         let Object::Function(f) = &*slot else {
             return NOT_ENTERED;
         };
         let fp = Rc::as_ptr(f);
         let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
-        let has_self = !matches!(&*slot.add(1), Object::Unbound);
-        let key = super::site_key(Rc::as_ptr(code_rc) as usize, has_self);
-        let c = if key == site.fast[0].key {
-            &site.fast[0]
-        } else if key == site.fast[1].key {
-            &site.fast[1]
-        } else {
+        let entry = code_rc.jit_hint.direct_entry();
+        if entry == 0 {
             return NOT_ENTERED;
-        };
+        }
+        let shape = Shape(code_rc.jit_hint.direct_shape());
         let interp = &*s.interp;
         let rec = &mut *interp.recs.top();
-        let dc = &*s.depth_cell;
-        let depth = dc.get() + 1;
         // (A full stack's top has no slot.)
         if rec.st.lazy.is_null()
             || s.no_direct
-            || rec.room < c.room
+            || rec.room < shape.room()
             || crate::hot_gates::loop_gen() != s.snap_gen
-            || code_rc.jit_hint.is_compiled()
-            || depth > crate::recursion::recursion_limit()
         {
             return NOT_ENTERED;
         }
-        if c.more {
-            return enter_more(st, site, c);
+        let dc = &*s.depth_cell;
+        let depth = dc.get() + 1;
+        if depth > crate::recursion::recursion_limit() {
+            return NOT_ENTERED;
         }
-        // Committed.
+        let has_self = !matches!(&*slot.add(1), Object::Unbound);
+        let n = call.argc() + usize::from(has_self);
+        if n != shape.params() || shape.closure() {
+            return enter_more(st, slot, call, entry);
+        }
+        // Committed. (The native code's entry marks the other locals unbound
+        // before anything can see them.)
         dc.set(depth);
-        let n = c.nargs as usize;
-        let dst = rec.st.locals;
-        move_args(slot.add(2 - usize::from(has_self)), dst, n);
-        let total = c.total as usize;
-        for k in n..total {
-            dst.add(k).write(Object::Unbound);
-        }
-        (*rec.locals).set_len(total);
+        move_args(slot.add(2 - usize::from(has_self)), rec.st.locals, n);
+        (*rec.locals).set_len(shape.total());
         rec.write_handles(fp, code_rc);
         std::ptr::write(&raw mut (*rec.frame).cells, Rc::from_raw(rec.no_cells));
-        rec.arm(st, site.call, interp);
+        rec.arm(st, call, interp);
         interp.recs.set_top(std::ptr::from_mut(rec).add(1));
         Entered {
             st: &raw mut rec.st,
-            entry: c.entry,
+            entry,
         }
     }
 }
 
-/// [`h_direct_enter`] for a callee `c` with defaults to take or a closure to
-/// read, the other checks passed.
+/// [`h_direct_enter`] for a callee `entry` with defaults to take or a closure
+/// to read, or with the wrong number of arguments, the other checks passed.
 ///
 /// # Safety
 ///
-/// As `h_direct_enter`'s.
+/// As `h_direct_enter`'s, with a function at `slot`.
 #[inline(never)]
-unsafe extern "C" fn enter_more(st: *mut State, site: &DirectSite, c: &FastCallee) -> Entered {
+unsafe extern "C" fn enter_more(
+    st: *mut State,
+    slot: *mut Object,
+    call: CallAt,
+    entry: usize,
+) -> Entered {
     // SAFETY: the caller's contract.
     unsafe {
         let s = &*st;
-        let slot = s.stack.add(site.call.start as usize);
         let Object::Function(f) = &*slot else {
-            return NOT_ENTERED;
+            std::hint::unreachable_unchecked()
         };
         let fp = Rc::as_ptr(f);
         let code_rc: &Rc<CodeObject> = &*(*fp).code.as_ptr();
+        let shape = Shape(code_rc.jit_hint.direct_shape());
         let has_self = !matches!(&*slot.add(1), Object::Unbound);
+        let n = call.argc() + usize::from(has_self);
         let interp = &*s.interp;
         let rec = &mut *interp.recs.top();
-        let missing = c.missing as usize;
+        let params = shape.params();
+        if n > params {
+            return NOT_ENTERED;
+        }
+        let missing = params - n;
         if missing != 0
             && (crate::sync::release_gates() != 0
                 || (*fp).defaults.len() < missing
@@ -498,7 +571,7 @@ unsafe extern "C" fn enter_more(st: *mut State, site: &DirectSite, c: &FastCalle
         {
             return NOT_ENTERED;
         }
-        let cells = if c.closure {
+        let cells = if shape.closure() {
             match (*fp).closure_cells.get() {
                 Some(cells) => Rc::as_ptr(cells),
                 None => return NOT_ENTERED,
@@ -509,7 +582,6 @@ unsafe extern "C" fn enter_more(st: *mut State, site: &DirectSite, c: &FastCalle
         // Committed.
         let dc = &*s.depth_cell;
         dc.set(dc.get() + 1);
-        let n = c.nargs as usize;
         let dst = rec.st.locals;
         move_args(slot.add(2 - usize::from(has_self)), dst, n);
         if missing != 0 {
@@ -530,19 +602,143 @@ unsafe extern "C" fn enter_more(st: *mut State, site: &DirectSite, c: &FastCalle
                 b.add(1).write(y);
             }
         }
-        let total = c.total as usize;
-        for k in n + missing..total {
-            dst.add(k).write(Object::Unbound);
-        }
-        (*rec.locals).set_len(total);
+        (*rec.locals).set_len(shape.total());
         rec.write_handles(fp, code_rc);
         std::ptr::write(&raw mut (*rec.frame).cells, Rc::from_raw(cells));
-        rec.arm(st, site.call, interp);
+        rec.arm(st, call, interp);
         interp.recs.set_top(std::ptr::from_mut(rec).add(1));
         Entered {
             st: &raw mut rec.st,
-            entry: c.entry,
+            entry,
         }
+    }
+}
+
+/// `CALL` (`call`, atop a `len`-deep stack) of a Python class whose memoized
+/// plan runs a plain `__init__` that has a native body, as
+/// `Interpreter::core_new_n` runs one: the instance allocated and that body
+/// run on a record, as a direct call of it, the caller taking the instance
+/// when it returns `None`. `None` touched nothing.
+///
+/// # Safety
+///
+/// As `h_call`'s, with a non-null switch.
+#[inline(never)]
+pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let start = call.start();
+        let argc = call.argc();
+        let slot = st.stack.add(start);
+        let (Object::Type(ty), Object::Unbound) = (&*slot, &*slot.add(1)) else {
+            return None;
+        };
+        let interp = &mut *st.interp.cast_mut();
+        let nested = interp.recs.top();
+        if st.no_direct
+            || interp.recs.full_at(nested)
+            || ty.flags.is_builtin
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || (*st.maybe_dead).get()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || !Interpreter::metaclass_calls_like_type(ty)
+        {
+            return None;
+        }
+        // SAFETY: a guard-free read of the memoized plan; nothing runs
+        // before its last use.
+        let (ver, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
+        if *ver != ty.attr_version.get() || plan.user_new.is_some() || plan.seeds_exception_args {
+            return None;
+        }
+        // What runs on the frame alone (a store-only or leaf `__init__`, the
+        // bare allocation): a lazily running activation stays lazy.
+        {
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len);
+            frame.pc = call.pc();
+            let (ty, plan) = (ty.clone(), plan.clone());
+            if interp.core_init_on_frame(frame, &ty, &plan, argc, start, st.depth_cell) {
+                st.len = start + 1;
+                return Some(0);
+            }
+        }
+        let Object::Type(ty) = &*slot else {
+            return None;
+        };
+        let (_, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
+        let (init, code) = plan.lean_init.as_ref()?;
+        // SAFETY: GIL-serialized raw read of the function's code cell; only
+        // the pointer is compared.
+        if !std::ptr::eq(Rc::as_ptr(&*init.code.as_ptr()), Rc::as_ptr(code))
+            || !Interpreter::lean_code_ok(code)
+            || Interpreter::has_extended_params(code)
+        {
+            return None;
+        }
+        let missing = Interpreter::missing_defaults(init, code, argc + 1)?;
+        let cells = !code.cellvars.is_empty() || !code.freevars.is_empty();
+        if cells && code.cellvars.is_empty() && init.lean_cells_ref(code).is_none() {
+            return None;
+        }
+        let ext = crate::code_vm_ext(code)?;
+        let native: &super::Native = ext.frame_jit.get(code.varnames.len())?;
+        if !native.enters_at(0) {
+            return None;
+        }
+        let dc = &*st.depth_cell;
+        if dc.get() + 1 > crate::recursion::recursion_limit() {
+            return None;
+        }
+        // Committed: the frame as the core loop's arm has it at the call,
+        // the instance made (a collection it sets off may run finalizers).
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = call.pc();
+        let (ty, plan) = (ty.clone(), plan.clone());
+        let (init, _) = plan.lean_init.as_ref().expect("checked above");
+        let (inst, tracked) = interp.alloc_lean_instance_obj(&ty, &plan.native);
+        if tracked && crate::gc_trace::maybe_auto_collect() {
+            interp.run_pending_finalizers();
+        }
+        // The function takes the class's slot, and the instance the empty
+        // self slot.
+        let init = Rc::clone(init);
+        slot.add(1).write(inst.clone());
+        let cls = slot.replace(Object::Function(init));
+        drop(plan);
+        drop(ty);
+        drop(cls);
+        let Object::Function(f) = &*slot else {
+            std::hint::unreachable_unchecked()
+        };
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        let bound = enter(
+            st,
+            call.pc() as usize,
+            start,
+            len,
+            Rc::as_ptr(f),
+            code_rc,
+            true,
+            BindArgs::Positional {
+                missing,
+                extended: false,
+            },
+            cells,
+            native.need(),
+            interp.recs.top(),
+            None,
+        );
+        assert!(bound, "the depth was checked above");
+        let rec_at = interp.recs.top();
+        let rec = &mut *rec_at;
+        std::ptr::write(&raw mut (*rec.st.lazy).init_inst, Some(inst));
+        rec.extra = true;
+        rec.st.clean = false;
+        Some(run(st, rec_at, native, None))
     }
 }
 
@@ -718,14 +914,7 @@ pub(super) unsafe fn enter(
                 rec.st.clean = false;
             }
         }
-        rec.arm(
-            st,
-            CallAt {
-                pc: pc as u32,
-                start: start as u32,
-            },
-            interp,
-        );
+        rec.arm(st, CallAt::new(pc, start, 0), interp);
         crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
         true
     }
@@ -745,12 +934,12 @@ pub(super) unsafe fn commit(st: &mut State, act: *mut crate::InlineAct) {
         let rec = &mut *std::ptr::from_mut(st).cast::<DirectRec>();
         let act = &mut *act;
         let caller = &mut *rec.caller;
-        let start = rec.call.start as usize;
+        let start = rec.call.start();
         std::ptr::write(&raw mut act.callable, caller.stack.add(start).read());
         let frame = &mut *caller.frame;
         frame.stack.set_len(start);
-        frame.pc = rec.call.pc + 1;
-        act.call_pc = rec.call.pc as usize;
+        frame.pc = rec.call.pc() + 1;
+        act.call_pc = rec.call.pc() as usize;
         act.exc_depth = rec.exc_depth;
         act.guard = Some(crate::recursion::Guard::adopt(st.depth_cell));
         act.lazy_caller = rec.caller;
@@ -808,7 +997,7 @@ pub(super) unsafe extern "C" fn h_direct_leave(
                 w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let slot = s.stack.add(rec.call.start as usize);
+        let slot = s.stack.add(rec.call.start());
         if !matches!(&*slot, Object::Function(_)) {
             return finish_rest(s, rec);
         }
@@ -848,7 +1037,7 @@ unsafe fn finish_rest(s: &mut State, rec: &mut DirectRec) -> u32 {
     // SAFETY: as `h_direct_leave`'s.
     unsafe {
         let interp = &mut *s.interp.cast_mut();
-        let start = rec.call.start as usize;
+        let start = rec.call.start();
         let slot = s.stack.add(start);
         let callable = slot.read();
         slot.write(rec.st.stack.read());
@@ -871,10 +1060,10 @@ unsafe fn finish_rest(s: &mut State, rec: &mut DirectRec) -> u32 {
 unsafe fn finalizers_after(st: &mut State, call: CallAt, interp: &mut Interpreter) -> u32 {
     // SAFETY: as `h_direct_leave`'s.
     unsafe {
-        let start = call.start as usize;
+        let start = call.start();
         let frame = &mut *st.frame;
         frame.stack.set_len(start + 1);
-        frame.pc = call.pc + 1;
+        frame.pc = call.pc() + 1;
         super::settle(st);
         let sw = &mut *st.sw;
         let mut tmp = None;
@@ -929,6 +1118,7 @@ unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, binop: Binop<'
             && !rec.st.lazy.is_null()
             && rec.st.len == 1
             && !(*rec.frame).locals.is_shared()
+            && (!rec.extra || rec.extra_allows_clean())
             && !interp.countdown_out(2)
             && crate::hot_gates::loop_gen() == rec.st.snap_gen
         {
@@ -972,6 +1162,11 @@ impl DirectRec {
         // SAFETY: the record is armed, its slot its own.
         unsafe {
             let act = &mut *self.st.lazy;
+            // A constructor's `__init__` returned `None`: the caller takes
+            // the instance.
+            if let Some(inst) = act.init_inst.take() {
+                self.st.stack.write(inst);
+            }
             // A `functools.lru_cache` miss's function returned: its result
             // is stored before the caller takes it.
             if act.lru.is_some() {
@@ -984,6 +1179,19 @@ impl DirectRec {
             self.extra = false;
             self.st.clean = true;
         }
+    }
+
+    /// Whether a return with [`DirectRec::extra`] set can finish cleanly: a
+    /// constructor's `__init__` that returned anything but `None` raises.
+    ///
+    /// # Safety
+    ///
+    /// The record is armed, unregistered, its result atop its stack.
+    #[cold]
+    #[inline(never)]
+    unsafe fn extra_allows_clean(&self) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { (*self.st.lazy).init_inst.is_none() || matches!(&*self.st.stack, Object::None) }
     }
 
     /// `status` as [`leave`] takes it: a clean return's ([`super::REC_RET`]
@@ -1016,12 +1224,12 @@ unsafe fn left_uncleanly(
     // SAFETY: as `leave`'s.
     unsafe {
         super::register_lazy(&mut rec.st);
-        let CallAt { pc, start } = rec.call;
+        let (pc, start) = (rec.call.pc(), rec.call.start());
         let callee = rec.st.frame;
         super::direct_done::<false>(
             st,
             pc as usize,
-            start as usize,
+            start,
             callee,
             0,
             std::ptr::null_mut(),

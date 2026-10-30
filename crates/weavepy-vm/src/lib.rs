@@ -7948,6 +7948,8 @@ impl Interpreter {
                 in_rec: false,
                 at_start: false,
                 clean: false,
+                wait_pc: usize::MAX,
+                wait_pending: None,
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -11007,6 +11009,7 @@ impl Interpreter {
     /// reads it: they are older than whatever comes next, and a stack walk
     /// must find them.
     #[inline(always)]
+    #[track_caller]
     pub(crate) fn settle_lazy(&self) {
         if self.lazy_top.get() != 0 {
             self.settle_lazy_cold();
@@ -11015,6 +11018,7 @@ impl Interpreter {
 
     #[cold]
     #[inline(never)]
+    #[track_caller]
     fn settle_lazy_cold(&self) {
         // (Cleared first: registering links the callees onto the spine,
         // which mustn't come back here.)
@@ -12309,6 +12313,8 @@ impl Interpreter {
                             in_rec: false,
                             at_start: false,
                             clean: false,
+                            wait_pc: usize::MAX,
+                            wait_pending: None,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -16590,7 +16596,9 @@ impl Interpreter {
                 _ => return false,
             };
         // SAFETY: the activation is synced, and the shape was checked.
-        match unsafe { self.core_native_body(sw, frame, pc, callee_at, b, via_call) } {
+        match unsafe {
+            self.core_native_body(sw, frame, pc, callee_at, b, via_call, std::ptr::null_mut())
+        } {
             // SAFETY: the running activation's last-pc slot.
             None => unsafe { *sw.last = pc },
             Some(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
@@ -16633,6 +16641,7 @@ impl Interpreter {
         start: usize,
         b: *const crate::object::BuiltinFn,
         via_call: bool,
+        lazy: *mut frame_jit::State,
     ) -> Option<RuntimeError> {
         let len = frame.stack.len();
         // SAFETY: the caller's contract: `start + 2 <= len`; the stack
@@ -16652,8 +16661,15 @@ impl Interpreter {
                 start + 1
             };
             frame.pc = pc as u32 + 1;
-            // The body may run Python code that looks up the stack.
-            let pending = self.core_pending_enter_fast(sw, frame, pc);
+            // The body may run Python code that looks up the stack: the
+            // activation waits on the pending list, or (`lazy`, running
+            // lazily) enters it if it registers (`register_lazy`).
+            let pending = if lazy.is_null() {
+                self.core_pending_enter_fast(sw, frame, pc)
+            } else {
+                (*lazy).wait_pc = pc;
+                None
+            };
             let args = std::slice::from_raw_parts(base.add(first), len - first);
             let result = if via_call {
                 let globals = frame.globals.clone();
@@ -16669,6 +16685,12 @@ impl Interpreter {
                     Some(call_kw) => call_kw(args, &[]),
                     None => (b.call)(args),
                 }
+            };
+            let pending = if lazy.is_null() {
+                pending
+            } else {
+                (*lazy).wait_pc = usize::MAX;
+                (*lazy).wait_pending.take()
             };
             self.core_pending_exit(sw, pending);
             // The operands leave the stack, then are released: the
@@ -17634,8 +17656,17 @@ impl Interpreter {
             // operands where they are.
             // SAFETY: the activation is synced, and the shape was checked;
             // the body reads `b` only when it isn't called through `call`.
-            let raised =
-                unsafe { self.core_native_body(sw, frame, pc, callee_at, std::ptr::null(), true) };
+            let raised = unsafe {
+                self.core_native_body(
+                    sw,
+                    frame,
+                    pc,
+                    callee_at,
+                    std::ptr::null(),
+                    true,
+                    std::ptr::null_mut(),
+                )
+            };
             match raised {
                 // SAFETY: the running activation's last-pc slot.
                 None => unsafe { *sw.last = pc },
@@ -18252,13 +18283,48 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
-        let n = frame.stack.len();
-        let Some(callee_slot) = n.checked_sub(4) else {
+        let Some(r) = self.builtin_ex_on_frame(frame, pc) else {
             return false;
         };
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        if let Err(e) = r {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// The `CALL_FUNCTION_EX` at `pc` of `frame` (synced at it) when it runs
+    /// on the frame alone, needing neither the switch nor the spine: a
+    /// generator function's, whose generator is made in place, or a leaf
+    /// builtin's. `None` touched nothing; with `Err`, the operands are gone.
+    pub(crate) fn core_ex_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        if self.gen_ex_on_frame(frame, pc) || self.try_leaf_call_ex(frame, pc) {
+            return Some(Ok(()));
+        }
+        self.builtin_ex_on_frame(frame, pc)
+    }
+
+    /// [`Self::core_builtin_call_ex`] on `frame` alone (see
+    /// [`Self::core_ex_on_frame`]), `frame.pc` past the call.
+    fn builtin_ex_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        let n = frame.stack.len();
+        let callee_slot = n.checked_sub(4)?;
         let [Object::Builtin(b), Object::Unbound, spread, mapping] = &frame.stack[callee_slot..]
         else {
-            return false;
+            return None;
         };
         let empty_kw = match mapping {
             Object::Unbound => true,
@@ -18266,15 +18332,15 @@ impl Interpreter {
             _ => false,
         };
         if !empty_kw || b.binds_instance {
-            return false;
+            return None;
         }
         let items: Vec<Object> = match spread {
             Object::Tuple(t) => t.to_vec(),
             Object::List(l) => match l.try_borrow() {
                 Ok(l) => l.clone(),
-                Err(_) => return false,
+                Err(_) => return None,
             },
-            _ => return false,
+            _ => return None,
         };
         // As the core loop's `CALL` arm runs a leaf builtin.
         let r = match self.leaf_call_kind(b) {
@@ -18287,28 +18353,23 @@ impl Interpreter {
             }
             _ => None,
         };
-        let Some(r) = r else {
-            return false;
-        };
+        let r = r?;
         drop(items);
         // The operands leave the stack; one that dies queues its finalizer,
         // which runs before the next instruction.
         let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
         frame.pc = pc as u32 + 1;
-        // SAFETY: the running activation's last-pc slot.
-        unsafe { *sw.last = pc };
-        match r {
-            Ok(v) => frame.stack.push(v),
-            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
-        }
+        let out = match r {
+            Ok(v) => {
+                frame.stack.push(v);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
         for o in ops {
             self.release(o);
         }
-        // SAFETY: the running thread's own flag (see `quiet_run`).
-        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-        }
-        true
+        Some(out)
     }
 
     /// [`Self::core_gen_call`] for the `CALL_FUNCTION_EX` at `pc`:
@@ -18318,6 +18379,21 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        if !self.gen_ex_on_frame(frame, pc) {
+            return false;
+        }
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// [`Self::core_gen_call_ex`] on `frame` alone (see
+    /// [`Self::core_ex_on_frame`]), `frame.pc` past the call.
+    fn gen_ex_on_frame(&mut self, frame: &mut Frame, pc: usize) -> bool {
         let n = frame.stack.len();
         let Some(callee_slot) = n.checked_sub(4) else {
             return false;
@@ -18360,12 +18436,6 @@ impl Interpreter {
         }
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
-        // SAFETY: the running activation's last-pc slot.
-        unsafe { *sw.last = pc };
-        // SAFETY: the running thread's own flag (see `quiet_run`).
-        if unsafe { (*sw.maybe_dead).get() } {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-        }
         true
     }
 
@@ -19369,6 +19439,72 @@ impl Interpreter {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         true
+    }
+
+    /// What [`Self::core_new_n`] runs on `frame` alone for a call of `ty`
+    /// with the plan `plan` (no Python `__new__`), its operands from `start`
+    /// on `frame`'s synced stack: the bare allocation, or a store-only or
+    /// leaf `__init__`, the instance in the class's slot. `false` touched
+    /// nothing.
+    pub(crate) fn core_init_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        argc: usize,
+        start: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> bool {
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
+                let (inst, tracked) = self.alloc_plain_instance_obj(ty);
+                frame.stack.truncate(start);
+                frame.stack.push(inst);
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
+            return false;
+        };
+        if !matches!(plan.native, crate::types::NativeKind::Plain)
+            // SAFETY: GIL-serialized raw read of the function's code cell;
+            // only the pointer is compared.
+            || !std::ptr::eq(
+                unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+                Rc::as_ptr(code),
+            )
+            || !Self::lean_code_ok(code)
+        {
+            return false;
+        }
+        let Some(missing) = Self::lean_init_missing(init, code, argc + 1) else {
+            return false;
+        };
+        self.core_store_init(
+            frame,
+            ty,
+            plan,
+            init,
+            code,
+            true,
+            argc,
+            missing,
+            start + 1,
+            start,
+            depth_cell,
+        ) || (!Self::has_extended_params(code)
+            && self.core_leaf_init(
+                frame,
+                ty,
+                init,
+                code,
+                argc,
+                missing,
+                start + 1,
+                start,
+                depth_cell,
+            ))
     }
 
     /// [`Self::core_new_n`] (the `argc` arguments below the top of the
@@ -22583,132 +22719,6 @@ impl Interpreter {
             Err(true) => SiteCall::Missed,
             Err(false) => SiteCall::Declined,
         }
-    }
-
-    /// What a frame-JIT method site keeps of the leaf callee its last call
-    /// of `x.m(...)` (at the method load `attr_pc` of `code`, whose
-    /// extension is `ext`) ran on `recv`, for [`Self::leaf_method_run`]:
-    /// the site's verified callee under the receiver's class version (see
-    /// [`LeafSite`]), when nothing but the receiver's own attributes, the
-    /// callee's code cell and the recursion depth can change from call to
-    /// call; [`LeafCallee::none`] when the method resolved is no such leaf,
-    /// and `None` while the site hasn't resolved it.
-    pub(crate) fn leaf_method_callee(
-        ext: &CodeConstObjects,
-        attr_pc: usize,
-        name_idx: u32,
-        recv: &Object,
-    ) -> Option<LeafCallee> {
-        let Object::Instance(inst) = recv else {
-            return None;
-        };
-        let cls = inst.cls_raw();
-        let ver = cls.attr_version.get();
-        // The plain function the site's method slot resolved under this
-        // class version (the class holds it).
-        let fp = ext.method_sites().get(attr_pc)?.peek_fn(ver)?;
-        // SAFETY: the class holds the function at this version.
-        let f = unsafe { &*fp };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let callee: &CodeObject = unsafe { &*f.code.as_ptr() };
-        let effect = !code_is_pure_leaf(callee);
-        // (A recursive effect leaf runs as an ordinary call from here.)
-        if (effect && (!code_is_effect_leaf(callee) || code_recurses(callee)))
-            || !Self::leaf_code_ok(callee)
-            || callee.kwonly_count != 0
-            || callee.has_varargs
-            || callee.has_varkeywords
-            || !Self::default_getattribute(cls)
-        {
-            return Some(LeafCallee::none(ver));
-        }
-        let i = name_idx as usize;
-        let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
-            (Some(k), Some(Object::Str(n))) => ext.name_hashes.get(i).map_or((0, 0), |&h| {
-                (std::ptr::from_ref(k) as usize, k.names_before(n, h))
-            }),
-            _ => (0, 0),
-        };
-        Some(LeafCallee {
-            ver,
-            fp,
-            code: std::ptr::from_ref(callee),
-            cext: std::ptr::from_ref(code_vm_ext(callee)?),
-            keys,
-            limit,
-            effect,
-        })
-    }
-
-    /// `x.m(...)` with the leaf callee `c` a frame-JIT site cached (see
-    /// [`Self::leaf_method_callee`]) for `args[0]`'s class version: the
-    /// callee's tiny shape or compiled plan run directly. `None` (nothing
-    /// observable done) runs the call the general way.
-    ///
-    /// # Safety
-    ///
-    /// `args` are live; `args[0]` is an instance of the class `c` was
-    /// cached for, at that class version (so the class holds `c`'s
-    /// function, and the function its extension's code unless rebound).
-    #[inline(always)]
-    pub(crate) unsafe fn leaf_method_run(
-        &self,
-        c: &LeafCallee,
-        inst: &PyInstance,
-        args: &[*const Object],
-        depth_cell: *const std::cell::Cell<usize>,
-    ) -> Option<Object> {
-        // SAFETY: the caller's contract.
-        let (f, cext) = unsafe { (&*c.fp, &*c.cext) };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        // SAFETY: this thread's own depth cell.
-        let depth = unsafe { (*depth_cell).get() };
-        // (A leaf verdict withdrawn since, see `JitHint::note_leaf_miss`,
-        // sends the calls the ordinary way again.)
-        if !std::ptr::eq(Rc::as_ptr(code_rc), c.code)
-            || args.len() != code_rc.arg_count as usize
-            || depth >= crate::recursion::recursion_limit()
-            || inst.dict.published().is_some()
-            || !(code_is_pure_leaf(code_rc) || code_rc.jit_hint.effect_leaf())
-        {
-            return None;
-        }
-        // The receiver's own attributes can't shadow the method.
-        // SAFETY: a read between two instructions (see `GilCell::peek`).
-        let (keys, n) = unsafe { inst.dict.split_cell().peek() }?.keys_and_len();
-        if n != 0 && (keys != c.keys || keys == 0 || n > c.limit) {
-            return None;
-        }
-        let shape = cext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
-        if shape >= 3 {
-            if !Self::leaf_call_entry(code_rc) {
-                return None;
-            }
-            let r = if c.effect {
-                Self::leaf_tiny::<true>(code_rc, cext, shape, args)
-            } else {
-                Self::leaf_tiny::<false>(code_rc, cext, shape, args)
-            };
-            // (A miss is the general path's to count: it runs next.)
-            let r = r.flatten()?;
-            Self::leaf_call_exit(code_rc, true);
-            return Some(r);
-        }
-        // The plan's native code, or (not compiled yet) the shared frameless
-        // path, which compiles it once it is warm.
-        #[cfg(feature = "jit")]
-        {
-            let r = if c.effect {
-                self.leaf_site_native::<true>(code_rc, cext, f, args, depth)
-            } else {
-                self.leaf_site_native::<false>(code_rc, cext, f, args, depth)
-            };
-            if let Some(r) = r {
-                return r;
-            }
-        }
-        self.pure_leaf_call(code_rc, f, args, c.effect, depth)
     }
 
     /// [`Self::core_leaf_site_call`]'s evaluation, with `args` (the
@@ -79762,43 +79772,6 @@ struct LeafHit {
     limit: usize,
 }
 
-/// A frame-JIT method site's cached leaf callee (see
-/// `Interpreter::leaf_method_callee`): the receiver class version it was
-/// verified under (`0` none), the function and its code, the code's
-/// extension, the shadowing bound (see [`LeafSiteData::limit`]), and
-/// whether it is an effect leaf.
-#[derive(Clone, Copy)]
-pub(crate) struct LeafCallee {
-    pub(crate) ver: u64,
-    fp: *const crate::object::PyFunction,
-    code: *const CodeObject,
-    cext: *const CodeConstObjects,
-    keys: usize,
-    limit: usize,
-    effect: bool,
-}
-
-impl LeafCallee {
-    pub(crate) const EMPTY: LeafCallee = LeafCallee {
-        ver: 0,
-        fp: std::ptr::null(),
-        code: std::ptr::null(),
-        cext: std::ptr::null(),
-        keys: 0,
-        limit: 0,
-        effect: false,
-    };
-
-    /// A version under which the site's method is no leaf to run in place.
-    pub(crate) const fn none(ver: u64) -> LeafCallee {
-        LeafCallee { ver, ..Self::EMPTY }
-    }
-
-    pub(crate) fn is_none(&self) -> bool {
-        self.fp.is_null()
-    }
-}
-
 impl LeafSiteData {
     #[inline(always)]
     fn hit(&self) -> LeafHit {
@@ -80007,17 +79980,6 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
                 unsafe { &(*slot.0.get()).1 },
                 MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..)
             )
-        })
-}
-
-/// Whether the method-load site at `pc` last resolved a plain Python
-/// function (a leaf or not: a site that sees several classes calls both).
-#[cfg(feature = "jit")]
-pub(crate) fn method_site_py(ext: &CodeConstObjects, pc: usize) -> bool {
-    method_site_leaf(ext, pc)
-        || ext.method_slot(pc).is_some_and(|slot| {
-            // SAFETY: GIL-serialized; the borrow ends here.
-            matches!(unsafe { &(*slot.0.get()).1 }, MethodSlotFn::Py(_))
         })
 }
 

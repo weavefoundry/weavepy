@@ -567,6 +567,8 @@ impl Interpreter {
                         in_rec: false,
                         at_start: false,
                         clean: false,
+                        wait_pc: usize::MAX,
+                        wait_pending: None,
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -914,6 +916,8 @@ impl Interpreter {
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };

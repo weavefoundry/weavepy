@@ -227,6 +227,12 @@ pub(crate) struct State {
     /// A return hands back [`REC_RET`]: a record's callee, not registered,
     /// and with nothing more for its return to do.
     pub(crate) clean: bool,
+    /// While a native body runs from a lazily running activation (see
+    /// [`h_call_native`]), the `CALL`'s pc: registering it then enters it on
+    /// the pending list, as the body's run would have (`wait_pending`, for
+    /// the run to take out again). `usize::MAX` otherwise.
+    pub(crate) wait_pc: usize,
+    pub(crate) wait_pending: Option<usize>,
 }
 
 const S_LOCALS: i32 = 0;
@@ -307,8 +313,6 @@ struct Caches {
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     mods: Vec<Box<ModCache>>,
-    /// The leaf method calls' sites.
-    leaf_methods: Vec<Box<LeafMethodSite>>,
 }
 
 impl Caches {
@@ -322,7 +326,6 @@ impl Caches {
         self.supers.append(&mut other.supers);
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
-        self.leaf_methods.append(&mut other.leaf_methods);
     }
 }
 
@@ -2593,6 +2596,8 @@ unsafe fn lazy_state(
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         }
     }
 }
@@ -3146,6 +3151,8 @@ pub(crate) unsafe fn core_lazy_resume(
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         let st = &mut st;
         let arg = frame.code.instructions[pc].arg;
@@ -5286,112 +5293,6 @@ unsafe extern "C" fn h_local_method(
     }
 }
 
-/// How many receiver class versions a [`LeafMethodSite`] keeps a callee
-/// for (an expression tree's `node.eval(env)` sees several classes).
-const LEAF_METHOD_WAYS: usize = 8;
-
-/// Declined calls after which a [`LeafMethodSite`] that never ran one is
-/// skipped.
-const LEAF_METHOD_MISSES: u32 = 64;
-
-/// Where the code finds a [`LeafMethodSite`]'s skip flag.
-const LMS_OFF: i32 = std::mem::offset_of!(LeafMethodSite, off) as i32;
-
-/// Count a call `site` declined (see [`LeafMethodSite::off`]).
-#[cold]
-fn leaf_method_miss(site: &LeafMethodSite) -> u32 {
-    let m = site.misses.get().saturating_add(1);
-    site.misses.set(m);
-    if m >= LEAF_METHOD_MISSES && site.hits.get() == 0 {
-        site.off.set(1);
-    }
-    1
-}
-
-/// What an `x.m(<simple arguments>)` site whose method runs as a frameless
-/// leaf settled when it was compiled (see [`h_leaf_method`]).
-#[repr(C)]
-pub(crate) struct LeafMethodSite {
-    /// Nonzero once the site declined [`LEAF_METHOD_MISSES`] calls without
-    /// running one: the code then skips the helper (a site that calls
-    /// methods of several classes only sometimes calls a leaf).
-    off: std::cell::Cell<u8>,
-    /// The calls it declined and ran (each saturating).
-    misses: std::cell::Cell<u32>,
-    hits: std::cell::Cell<u32>,
-    ext: *const CodeConstObjects,
-    /// The method load's pc and name.
-    attr_pc: usize,
-    name: u32,
-    /// The arguments after the receiver.
-    nargs: usize,
-    /// The receiver is a stack temporary (the result of the code before the
-    /// method load), which the call releases; otherwise a local's value.
-    owned: bool,
-    /// The leaf callees its last calls ran, by receiver class version
-    /// (see `Interpreter::leaf_method_callee`), the newest first.
-    callees: [std::cell::Cell<crate::LeafCallee>; LEAF_METHOD_WAYS],
-}
-
-/// `x.m(...)` at `site` with the receiver at `recv` and up to two
-/// arguments at `a` and `b` (borrowed: locals, constants or the scalars
-/// the code wrote): `0` with the method's result written to `out` (and an
-/// owned receiver released first) when the site's leaf callee ran it in
-/// place; anything else declined untouched.
-unsafe extern "C" fn h_leaf_method(
-    st: *mut State,
-    site: *const LeafMethodSite,
-    out: *mut Object,
-    recv: *mut Object,
-    a: *const Object,
-    b: *const Object,
-) -> u32 {
-    // SAFETY: the code passes its live state, its own site, a free stack
-    // slot (or the owned receiver's), and live operands.
-    unsafe {
-        let (st, site) = (&*st, &*site);
-        let args = [recv.cast_const(), a, b];
-        let args = args.get_unchecked(..=site.nargs);
-        let Object::Instance(inst) = &*recv else {
-            return leaf_method_miss(site);
-        };
-        let ver = inst.cls_raw().attr_version.get();
-        // The callee this site cached for the receiver's class version (read
-        // in place: only the matching entry is copied), or the one its
-        // method slot resolved, cached from here on. A version whose method
-        // is no such leaf is cached with no callee, and declined at once.
-        let c = match site.callees.iter().find(|c| (*c.as_ptr()).ver == ver) {
-            Some(c) => c.get(),
-            None => {
-                let Some(c) =
-                    Interpreter::leaf_method_callee(&*site.ext, site.attr_pc, site.name, &*recv)
-                else {
-                    return leaf_method_miss(site);
-                };
-                for k in (1..LEAF_METHOD_WAYS).rev() {
-                    site.callees[k].set(site.callees[k - 1].get());
-                }
-                site.callees[0].set(c);
-                c
-            }
-        };
-        if c.is_none() {
-            return leaf_method_miss(site);
-        }
-        let Some(v) = (*st.interp).leaf_method_run(&c, inst, args, st.depth_cell) else {
-            return leaf_method_miss(site);
-        };
-        if site.hits.get() == 0 {
-            site.hits.set(1);
-        }
-        if site.owned {
-            drop(recv.read());
-        }
-        out.write(v);
-        0
-    }
-}
-
 /// `LOAD_FAST x` (the `pc`th instruction of `code`) and `x.attr = v`
 /// after it, with `v` at stack `slot`, as the core loop's fused arm runs
 /// it: `0` stored (the value left the stack), anything else declined
@@ -6595,6 +6496,8 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run(&mut cst);
@@ -6744,6 +6647,8 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
@@ -7045,12 +6950,6 @@ pub(crate) struct DirectSite {
     /// Nonzero while the site has a body or a leaf to take: the native
     /// code tries the direct helper first then.
     hot: usize,
-    /// The `CALL`'s pc and operands' start (see
-    /// [`records::h_direct_enter`]).
-    call: records::CallAt,
-    /// The callees (the first and the second) that bind with nothing but
-    /// their arguments.
-    fast: [records::FastCallee; 2],
 }
 
 /// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
@@ -7062,8 +6961,6 @@ fn site_key(code: usize, has_self: bool) -> usize {
 
 const DS_HOT: i32 = std::mem::offset_of!(DirectSite, hot) as i32;
 const DS_RETRY: i32 = std::mem::offset_of!(DirectSite, retry) as i32;
-const DS_FAST_KEY: i32 = (std::mem::offset_of!(DirectSite, fast)
-    + std::mem::offset_of!(records::FastCallee, key)) as i32;
 
 impl Drop for DirectSite {
     fn drop(&mut self) {
@@ -7097,44 +6994,6 @@ impl DirectSite {
             site_key(self.code, has_self)
         };
         self.hot = self.native | self.leaf_key;
-        self.fast[0] = records::FastCallee::default();
-    }
-
-    /// Note `key`'s callee (the first or second, with its packed binding
-    /// and native body) for [`records::h_direct_enter`], if it qualifies: a
-    /// binding that allocates nothing for `nargs` positional arguments, a
-    /// native body run whole from its start, and past its warm-up hooks,
-    /// which only the general path runs.
-    #[inline(never)]
-    fn note_fast(
-        &mut self,
-        second: bool,
-        key: usize,
-        code: &CodeObject,
-        native: &Native,
-        packed: usize,
-        nargs: usize,
-    ) {
-        let missing = packed & !((CELLS_BIT | EXTENDED_BIT) as usize);
-        if packed & EXTENDED_BIT as usize != 0
-            || !code.cellvars.is_empty()
-            || !native.chunks.is_empty()
-            || !native.enters_at(0)
-            || nargs > records::FAST_ARGS
-            || code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
-        {
-            return;
-        }
-        self.fast[usize::from(second)] = records::FastCallee {
-            key,
-            entry: native.func as usize,
-            total: native.nlocals as u32,
-            room: native.nlocals.max(native.need) as u32,
-            nargs: nargs as u32,
-            missing: missing as u32,
-            closure: packed & CELLS_BIT as usize != 0,
-            more: packed != 0,
-        };
     }
 
     /// Record a frameless leaf callee running `code` (with or without its
@@ -7180,7 +7039,6 @@ impl DirectSite {
             self.alt_has_self = self.has_self;
             self.alt_key = self.key;
             self.key = 0;
-            self.fast[1] = self.fast[0];
         }
         self.fill(code, has_self, native, missing);
     }
@@ -7663,6 +7521,18 @@ unsafe extern "C" fn h_call_ctor(
         if ctor_store_init(s, &*code, pc as usize, argc, len as usize) {
             return 0;
         }
+        // (The site's first execution specializes it.)
+        if !matches!(
+            (&*code).caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Empty
+        ) && !s.sw.is_null()
+        {
+            let start = len as usize - argc - 2;
+            let call = records::CallAt::new(pc as usize, start, argc);
+            if let Some(r) = records::ctor_direct(s, call, len as usize) {
+                return r;
+            }
+        }
         h_call(st, code, ext, pc, len)
     }
 }
@@ -7902,6 +7772,7 @@ unsafe fn leaf_site_call(st: &mut State, start: usize, len: usize, missing: usiz
 /// just returned), and its lazy callers' states are live.
 #[cold]
 #[inline(never)]
+#[track_caller]
 pub(crate) unsafe fn register_lazy(st: &mut State) {
     // SAFETY: the caller's contract; the activation is the box
     // `direct_enter` leaked, owned by the switch from here on.
@@ -7923,8 +7794,15 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
             if crate::burst_stats::enabled() {
                 let code = &(*st.frame).code;
                 let at = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+                let from = std::panic::Location::caller();
                 crate::burst_stats::note_decline(
-                    &format!("direct registered (last {:?}@{})", at(st.last), st.last),
+                    &format!(
+                        "direct registered from {}:{} (last {:?}@{})",
+                        from.file().rsplit('/').next().unwrap_or(""),
+                        from.line(),
+                        at(st.last),
+                        st.last
+                    ),
                     &code.qualname,
                 );
             }
@@ -7981,6 +7859,12 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         st.lazy_depth = (*sw.inl).len();
+        // A native body running from here: the activation waits on the
+        // pending list, as if it had registered first.
+        if st.wait_pc != usize::MAX {
+            sw.scratch = st.last;
+            st.wait_pending = interp.core_pending_enter_fast(sw, &mut *st.frame, st.wait_pc);
+        }
         interp.lazy_top.set(outer);
     }
 }
@@ -8002,6 +7886,7 @@ pub(crate) fn retire_code(code: Rc<CodeObject>) {
 ///
 /// As [`register_lazy`]'s.
 #[inline(always)]
+#[track_caller]
 unsafe fn settle(st: &mut State) {
     if !st.lazy.is_null() {
         // SAFETY: the caller's contract.
@@ -8070,37 +7955,33 @@ unsafe fn direct_call<const CALL: bool>(
         let at = Rc::as_ptr(code_rc) as usize;
         let key = site_key(at, has_self);
         let (native, packed) = if site.key == key {
-            if CALL && site.fast[0].key != key {
-                site.note_fast(
-                    false,
-                    key,
-                    code_rc,
-                    &*(site.native as *const Native),
-                    site.missing as usize,
-                    len - start - 2 + usize::from(has_self),
-                );
-            }
             (site.native, site.missing as usize)
         } else if site.alt_key == key {
-            if CALL && site.fast[1].key != key {
-                site.note_fast(
-                    true,
-                    key,
-                    code_rc,
-                    &*(site.alt_native as *const Native),
-                    site.alt_missing as usize,
-                    len - start - 2 + usize::from(has_self),
-                );
-            }
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
-            // A frameless leaf evaluates in place, which costs less than an
-            // activation (even one with a body): the site's two leaves,
-            // or any other (a site that calls several, as an operator
-            // table's lambdas, takes them all, caching the first two).
+            // A leaf's compiled body costs less than evaluating it frameless:
+            // one without a body evaluates in place until it gets one, as a
+            // callee of compiled code that switches does. (A site that calls
+            // several leaves, as an operator table's lambdas, takes them all,
+            // caching the first two.)
             let cached = CALL && (site.leaf_key == key || site.alt_leaf_key == key);
-            let leaf = if cached {
+            let body_first = CALL && {
+                let has = direct_body(f, code_rc, nargs).is_some();
+                if !has && crate::fn_is_leaf(f) {
+                    if let Some(ext) = crate::code_vm_ext(code_rc) {
+                        ext.frame_jit.warm_switched(
+                            code_rc,
+                            ext,
+                            code_rc.varnames.len().max(nargs),
+                        );
+                    }
+                }
+                has
+            };
+            let leaf = if body_first {
+                None
+            } else if cached {
                 Some(if site.leaf_key == key {
                     site.leaf_missing as usize
                 } else {
@@ -8164,6 +8045,10 @@ unsafe fn direct_call<const CALL: bool>(
             return None;
         }
         let native = &*(native as *const Native);
+        // (Compiled code goes straight in from here on.)
+        if CALL && code_rc.jit_hint.direct_entry() == 0 {
+            records::note_direct(code_rc, native, packed);
+        }
         let interp = &mut *st.interp.cast_mut();
         let nested = interp.recs.top();
         let code: &CodeObject = code_rc;
@@ -8378,6 +8263,8 @@ unsafe fn direct_run_pushed(
             in_rec: false,
             at_start: false,
             clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run_direct(&mut cst, from);
@@ -8454,10 +8341,9 @@ unsafe fn direct_done<const PUSHED: bool>(
             let clean = cst.len == 1
                 && inl.last().is_some_and(|a| {
                     a.act.shell.is_none()
-                        && (!PUSHED
-                            || ((cframe.code.cellvars.is_empty() || a.owns_cells)
-                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
-                                && a.new_init.is_none()))
+                        && (cframe.code.cellvars.is_empty() || a.owns_cells)
+                        && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
+                        && a.new_init.is_none()
                 })
                 && !cframe.locals.is_shared()
                 && !interp.countdown_out(2)
@@ -8472,11 +8358,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                 if depth == sw.entry_depth {
                     sw.entry_dead = true;
                 }
-                let v = if PUSHED {
-                    done.init_inst.take().unwrap_or(v)
-                } else {
-                    v
-                };
+                let v = done.init_inst.take().unwrap_or(v);
                 crate::release_locals(cframe.locals.storage());
                 drop(done.guard.take());
                 // A `functools.lru_cache` miss's function returned: its
@@ -9561,11 +9443,48 @@ unsafe extern "C" fn h_call_native(
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;
         frame.stack.set_len(lenu);
-        settle(s);
+        // A lazily running activation stays so unless something looks while
+        // the body runs, which a body that runs no Python code rarely makes
+        // happen. (Other threads can look without settling it: it registers
+        // first once there are any.)
+        let lazy = !s.lazy.is_null() && !crate::sync::rc_shared_flag().load(Ordering::Relaxed);
+        if !lazy {
+            settle(s);
+            *(*s.sw).last = s.last;
+        }
         let sw = &mut *s.sw;
-        *sw.last = s.last;
         let interp = &mut *s.interp.cast_mut();
-        let r = interp.core_native_body(sw, frame, pcu, start, site.f, site.via_call);
+        let r = interp.core_native_body(
+            sw,
+            frame,
+            pcu,
+            start,
+            site.f,
+            site.via_call,
+            if lazy {
+                std::ptr::from_mut(s)
+            } else {
+                std::ptr::null_mut()
+            },
+        );
+        if !s.lazy.is_null() {
+            if sw.pending.is_none() && crate::hot_gates::loop_gen() == s.snap_gen {
+                return match r {
+                    None => {
+                        s.len = start + 1;
+                        0
+                    }
+                    Some(e) => {
+                        s.len = start;
+                        s.pc = pcu + 1;
+                        s.err = Some(e);
+                        RAISED
+                    }
+                };
+            }
+            settle(s);
+        }
+        let sw = &mut *s.sw;
         let in_place = sw.pending.is_none()
             && std::ptr::eq(sw.cur, s.frame)
             && crate::hot_gates::loop_gen() == s.snap_gen;
@@ -9882,10 +9801,15 @@ unsafe fn spread_direct(
         };
         let len = start + 2 + n;
         let want = u32::try_from(n + 1).ok()?;
-        if len > st.cap || (site.spread != 0 && site.spread != want) {
+        if len > st.cap {
             return None;
         }
-        site.spread = want;
+        // (Its cached callees' defaults taken depend on the length.)
+        if site.spread != want {
+            site.spread = want;
+            site.key = 0;
+            site.alt_key = 0;
+        }
         let spread = base.add(start + 2).read();
         let items: &[Object] = match &spread {
             Object::Tuple(t) => t,
@@ -9908,6 +9832,34 @@ unsafe fn spread_direct(
                 base.add(start + 2).write(spread);
                 base.add(start + 3).write(Object::Unbound);
                 None
+            }
+        }
+    }
+}
+
+/// The `CALL_FUNCTION_EX` at `pc` (its operands from `start`, synced on the
+/// frame) when it needs nothing but the frame (see
+/// `Interpreter::core_ex_on_frame`): `h_call_ex`'s results. A finalizer it
+/// queued is the native code's own check's. `None` touched nothing.
+///
+/// # Safety
+///
+/// As `h_call_ex`'s.
+#[inline(never)]
+unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        match interp.core_ex_on_frame(&mut *st.frame, pc)? {
+            Ok(()) => {
+                st.len = start + 1;
+                Some(0)
+            }
+            Err(e) => {
+                st.len = start;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                Some(RAISED)
             }
         }
     }
@@ -9937,6 +9889,11 @@ unsafe extern "C" fn h_call_ex(
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        // What's made or run on this frame alone: a lazily running
+        // activation stays lazy.
+        if let Some(r) = spread_on_frame(st, pc, start) {
+            return r;
+        }
         settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
@@ -10000,6 +9957,12 @@ unsafe extern "C" fn h_call_forward(
         {
             st.stack.add(len).write(Object::Unbound);
             if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
+                return r;
+            }
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len + 1);
+            frame.pc = pc as u32 + 3;
+            if let Some(r) = spread_on_frame(st, pc + 3, start) {
                 return r;
             }
         }
@@ -11070,7 +11033,6 @@ fn lower_range(
                 supers: std::mem::take(&mut lower.supers),
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
-                leaf_methods: std::mem::take(&mut lower.leaf_methods),
             },
         };
         if done {
@@ -11479,9 +11441,6 @@ struct Lower<'a> {
     /// The method loads' module-attribute caches.
     #[allow(clippy::vec_box)]
     mod_caches: Vec<Box<ModCache>>,
-    /// The leaf method calls' sites (see [`LeafMethodSite`]).
-    #[allow(clippy::vec_box)]
-    leaf_methods: Vec<Box<LeafMethodSite>>,
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
     /// first use.
     catch: Option<Block>,
@@ -11675,7 +11634,6 @@ impl<'a> Lower<'a> {
             supers: Vec::new(),
             held: Vec::new(),
             mod_caches: Vec::new(),
-            leaf_methods: Vec::new(),
             catch: None,
             leave_tail: None,
             enter_sig: None,
@@ -12442,18 +12400,30 @@ impl<'a> Lower<'a> {
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
-        // (A record's callee starts at its first instruction, the stack
-        // checked; a raise it catches goes on through the dispatch, and a
-        // chunk without that instruction finds it there too.)
-        match self.blocks[0].filter(|_| !self.never_ran[0]) {
-            Some(first) => {
-                let at_start = self.b.ins().uload8(types::I32, FLAGS, self.st, S_AT_START);
-                self.b.ins().brif(at_start, first, &[], self.dispatch, &[]);
-            }
-            None => {
-                self.b.ins().jump(self.dispatch, &[]);
+        // A record's callee starts at its first instruction, the stack
+        // checked, with its locals past the parameters still to mark unbound.
+        // (A raise it catches goes on through the dispatch, and a chunk
+        // without that instruction finds it there too.)
+        let fresh = self.b.create_block();
+        let at_start = self.b.ins().uload8(types::I32, FLAGS, self.st, S_AT_START);
+        self.b.ins().brif(at_start, fresh, &[], self.dispatch, &[]);
+        self.b.switch_to_block(fresh);
+        let params = code.arg_count as usize
+            + code.kwonly_count as usize
+            + usize::from(code.has_varargs)
+            + usize::from(code.has_varkeywords);
+        if params < self.nlocals {
+            let unbound = self.b.ins().iconst(types::I8, i64::from(self.tags.unbound));
+            for i in params..self.nlocals {
+                self.b
+                    .ins()
+                    .store(FLAGS, unbound, self.locals, 16 * i as i32);
             }
         }
+        let first = self.blocks[0]
+            .filter(|_| !self.never_ran[0])
+            .unwrap_or(self.dispatch);
+        self.b.ins().jump(first, &[]);
         self.b.switch_to_block(self.dispatch);
         let pc = self.b.ins().load(types::I64, FLAGS, self.st, S_PC);
         let len = self.b.ins().load(types::I64, FLAGS, self.st, S_LEN);
@@ -13269,7 +13239,6 @@ impl<'a> Lower<'a> {
                     && crate::method_site_in_place(self.ext, pc + 1)
                     && !self.native_body_call(pc + 2) =>
             {
-                self.leaf_method(pc + 1, false);
                 self.method_kernel(pc);
                 self.method_call(pc)
             }
@@ -13430,127 +13399,6 @@ impl<'a> Lower<'a> {
         let (depth, last) = (self.depth, self.last_pc);
         self.push(Item::Mem(slot));
         self.set_last(call_pc);
-        self.goto(call_pc + 1);
-        self.depth = depth;
-        self.last_pc = last;
-        self.vs.clear();
-        self.b.switch_to_block(declined);
-    }
-
-    /// `x.m(<up to two local, constant or small-int arguments>); CALL`
-    /// (`attr_pc` the method load) of a Python method the site runs as a
-    /// frameless leaf: [`h_leaf_method`] on the operands in place,
-    /// continuing after the `CALL`. The receiver is the local the
-    /// instruction before loads, or with `owned` the stack's top, which the
-    /// call consumes. Lowering continues (at the general method call) where
-    /// the helper declines; nothing is emitted for another site.
-    fn leaf_method(&mut self, attr_pc: usize, owned: bool) {
-        let code = self.code;
-        let ins = &code.instructions;
-        if self.is_gen() || (owned && self.depth == 0) {
-            return;
-        }
-        let mut args: Vec<(OpCode, u32)> = Vec::new();
-        let mut k = attr_pc + 1;
-        let call_pc = loop {
-            let Some(i) = ins.get(k) else {
-                return;
-            };
-            match i.op {
-                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {}
-                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {}
-                OpCode::LoadSmallInt => {}
-                OpCode::Call if i.arg as usize == args.len() => break k,
-                _ => return,
-            }
-            args.push((i.op, i.arg));
-            if args.len() > 2 {
-                return;
-            }
-            k += 1;
-        };
-        if call_pc + 1 >= ins.len()
-            || !self.starts.get(call_pc + 1).copied().unwrap_or(false)
-            || !crate::method_site_py(self.ext, attr_pc)
-        {
-            return;
-        }
-        self.flush();
-        // The result's slot: the receiver's own, or the free one above.
-        let slot = self.depth - usize::from(owned);
-        let declined = self.b.create_block();
-        let recv = if owned {
-            self.slot_addr(slot)
-        } else {
-            self.local_addr(ins[attr_pc - 1].arg)
-        };
-        let null = self.b.ins().iconst(self.ptr, 0);
-        let mut addrs = [null, null];
-        for (j, &(op, arg)) in args.iter().enumerate() {
-            addrs[j] = match op {
-                OpCode::LoadConst => self.const_addr(arg),
-                // A scalar in the slot the argument would take.
-                OpCode::LoadSmallInt => {
-                    let at = self.slot_addr(slot + 2 + j);
-                    self.write_tag(at, self.tags.int);
-                    let v = self.b.ins().iconst(types::I64, i64::from(arg));
-                    self.b.ins().store(FLAGS, v, at, 8);
-                    at
-                }
-                _ => {
-                    let at = self.local_addr(arg);
-                    if self.maybe_unbound[arg as usize] && !self.bound[arg as usize] {
-                        let t = self.tag_at(at);
-                        let unbound =
-                            self.b
-                                .ins()
-                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
-                        self.branch_out(unbound, declined);
-                    }
-                    at
-                }
-            };
-        }
-        let site = Box::new(LeafMethodSite {
-            off: std::cell::Cell::new(0),
-            misses: std::cell::Cell::new(0),
-            hits: std::cell::Cell::new(0),
-            ext: std::ptr::from_ref(self.ext),
-            attr_pc,
-            name: ins[attr_pc].arg,
-            nargs: args.len(),
-            owned,
-            callees: [const { std::cell::Cell::new(crate::LeafCallee::EMPTY) }; LEAF_METHOD_WAYS],
-        });
-        let sv = self.b.ins().iconst(
-            self.ptr,
-            std::ptr::from_ref::<LeafMethodSite>(&*site) as i64,
-        );
-        self.leaf_methods.push(site);
-        let off = self.b.ins().uload8(types::I64, FLAGS, sv, LMS_OFF);
-        self.branch_out(off, declined);
-        let out = self.slot_addr(slot);
-        self.store_last();
-        let r = self
-            .call(
-                h_leaf_method as *const () as usize,
-                &[self.st, sv, out, recv, addrs[0], addrs[1]],
-                true,
-            )
-            .expect("returns");
-        let ran = self.b.create_block();
-        self.b.ins().brif(r, declined, &[], ran, &[]);
-        // Ran: the result in the receiver's slot, as after the `CALL`.
-        self.b.switch_to_block(ran);
-        let (depth, last) = (self.depth, self.last_pc);
-        if owned {
-            self.pop();
-        }
-        self.push(Item::Mem(slot));
-        self.set_last(call_pc);
-        // (A temporary the leaf or the receiver's release freed may have
-        // queued a finalizer.)
-        self.check_released(call_pc + 1);
         self.goto(call_pc + 1);
         self.depth = depth;
         self.last_pc = last;
@@ -15869,7 +15717,6 @@ impl<'a> Lower<'a> {
             return false;
         }
         // A leaf method of the value on top, called in place.
-        self.leaf_method(pc, true);
         self.flush();
         let helper = self.b.create_block();
         let done = self.b.create_block();
@@ -16302,11 +16149,7 @@ impl<'a> Lower<'a> {
                 .expect("returns");
             return self.called(pc, argc, r);
         }
-        let mut site: Box<DirectSite> = Box::default();
-        site.call = records::CallAt {
-            pc: pc as u32,
-            start: (self.depth - argc - 2) as u32,
-        };
+        let site: Box<DirectSite> = Box::default();
         let site_at = self
             .b
             .ins()
@@ -16328,7 +16171,15 @@ impl<'a> Lower<'a> {
             // A lean body makes [`Self::call_choice`]'s choice in a helper.
             let called = self.b.create_block();
             self.b.append_block_param(called, types::I32);
-            self.direct_native_call(site_at, called);
+            let callee = self.slot_addr(self.depth - argc - 2);
+            let hot = self.b.ins().load(types::I64, FLAGS, site_at, DS_HOT);
+            let enter = self.b.create_block();
+            let lean = self.b.create_block();
+            self.b.ins().brif(hot, enter, &[], lean, &[]);
+            self.b.switch_to_block(enter);
+            self.direct_native_call(pc, argc, called, callee);
+            self.b.ins().jump(lean, &[]);
+            self.b.switch_to_block(lean);
             let pc_argc = self
                 .b
                 .ins()
@@ -16389,7 +16240,7 @@ impl<'a> Lower<'a> {
         self.b.ins().store(FLAGS, left, site_at, DS_RETRY);
         self.b.ins().jump(general, &[]);
         self.b.switch_to_block(direct);
-        self.direct_native_call(site_at, called);
+        self.direct_native_call(pc, argc, called, callee);
         // (The direct helper takes the argument count with the pc.)
         let pc_argc = self
             .b
@@ -16461,28 +16312,23 @@ impl<'a> Lower<'a> {
         self.b.block_params(called)[0]
     }
 
-    /// A direct call straight to the callee's native code (see
-    /// [`records`]) when the site at `site_at` has a callee that binds with
-    /// nothing but its arguments: its status goes to `called`. Lowering
+    /// The `CALL` at `pc` of `argc` arguments, straight to the callee's
+    /// native code (see [`records`]) when the callee (`callee` its slot) is
+    /// a function with a direct entry: its status goes to `called`. Lowering
     /// goes on in the block for anything else. (The statistics count every
     /// call in the helpers, so they take none of this.)
-    fn direct_native_call(&mut self, site_at: Value, called: Block) {
+    fn direct_native_call(&mut self, pc: usize, argc: usize, called: Block, callee: Value) {
         if stats::enabled() || crate::burst_stats::enabled() {
             return;
         }
         let run = self.b.create_block();
         let slow = self.b.create_block();
-        if self.cold {
-            // (Its callee's kind isn't known yet: most aren't.)
-            let enter = self.b.create_block();
-            let key = self.b.ins().load(self.ptr, FLAGS, site_at, DS_FAST_KEY);
-            self.b.ins().brif(key, enter, &[], slow, &[]);
-            self.b.switch_to_block(enter);
-        }
+        let start = self.depth - argc - 2;
         let sig = *self.enter_sig.get_or_insert_with(|| {
             let mut sig = Signature::new(self.b.func.signature.call_conv);
             sig.params.push(AbiParam::new(self.ptr));
             sig.params.push(AbiParam::new(self.ptr));
+            sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(self.ptr));
             sig.returns.push(AbiParam::new(self.ptr));
             self.b.import_signature(sig)
@@ -16491,7 +16337,14 @@ impl<'a> Lower<'a> {
             self.ptr,
             records::h_direct_enter as *const () as usize as i64,
         );
-        let inst = self.b.ins().call_indirect(sig, helper, &[self.st, site_at]);
+        let call = self
+            .b
+            .ins()
+            .iconst(types::I64, records::CallAt::new(pc, start, argc).bits());
+        let inst = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.st, callee, call]);
         let (cst, entry) = (self.b.inst_results(inst)[0], self.b.inst_results(inst)[1]);
         self.b.ins().brif(cst, run, &[], slow, &[]);
         self.b.switch_to_block(run);
