@@ -384,8 +384,8 @@ slowdown in that run was the even-sized chunks, since fixed.
   instructions 0.976 (1.113 to 1.086 of CPython), `go` 0.77, `tomllib_loads`
   0.90, `context_managers` 0.90, `raytrace` 0.93, `mini_interpreter` 0.93,
   `deepcopy` 0.94, `coroutines` and `chaos` 0.95; `collections_mix` 1.03,
-  `oo_patterns` and `unpack_sequence` 1.02. Wall time over those five
-  call-heavy workloads 0.856.
+  `oo_patterns` and `unpack_sequence` 1.02. Wall time over `context_managers`,
+  `deepcopy`, `go`, `mini_interpreter` and `raytrace` 0.856.
 
 ## What the measurements say
 
@@ -474,11 +474,11 @@ slowdown in that run was the even-sized chunks, since fixed.
   costs far more, and each registers its whole chain of callers: an instruction
   native code leaves to the core loop does that (`Rect.__init__`'s polymorphic
   attribute stores, `DictUpdate`, `PushExcInfo`), as does a
-  generator drained for a spread (`deepcopy`'s `callable(*args)`, 16% of its
-  direct calls). `WEAVEPY_BURST_STATS` names the site of each registration.
-- **Most of `deepcopy`'s gap isn't calls.** It's 1.36 of CPython with calls at
-  CPython's cost: per call, the rest is `memo` lookups, `id`, `__reduce_ex__`
-  and `copyreg`.
+  generator drained for a spread (`deepcopy`'s `callable(*args)`, with the
+  callers it registers about 14% of its direct calls). `WEAVEPY_BURST_STATS` names the site of each registration.
+- **Most of `deepcopy`'s gap isn't the call protocol.** Copying a small nested
+  list cost 42,000 instructions against CPython's 27,200, and records took off
+  only 2,000. Where the rest goes wasn't attributed.
 - **Generators now resume lazily, as direct calls run.** A compiled
   generator body resumed from compiled code or the core loop (`for`,
   `next()`, `send()`, `yield from`, `await`, and a parked `yield from`
