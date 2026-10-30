@@ -716,10 +716,15 @@ impl Reader<'_> {
         if depth > MAX_NESTING {
             return None;
         }
-        let name = self.name(module)?;
+        let name_at = usize::try_from(self.uint()?).ok()?;
+        let name = Name::new(module.identifier(name_at)?);
         // (A qualified name other than a plain name is seldom shared.)
-        let i = usize::try_from(self.uint()?).ok()?;
-        let qualname = Name::unpooled(module.identifier(i)?);
+        let qualname_at = usize::try_from(self.uint()?).ok()?;
+        let qualname = if qualname_at == name_at {
+            name.clone()
+        } else {
+            Name::unpooled(module.identifier(qualname_at)?)
+        };
         let arg_count = self.u32()?;
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;

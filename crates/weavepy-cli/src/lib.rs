@@ -2342,6 +2342,12 @@ fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) 
 }
 
 fn init_tracing() {
+    // Nothing in the interpreter logs through `tracing`, only a few
+    // dependencies: without `WEAVEPY_LOG`, a run needn't parse a filter,
+    // build a registry, or page in the code that does.
+    if std::env::var_os("WEAVEPY_LOG").is_none() {
+        return;
+    }
     let filter = EnvFilter::try_from_env("WEAVEPY_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
