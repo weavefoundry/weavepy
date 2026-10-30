@@ -562,6 +562,7 @@ impl Interpreter {
                         lazy: std::ptr::null_mut(),
                         lazy_depth: 0,
                         lazy_last: std::ptr::null_mut(),
+                        gen_lazy: false,
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -849,7 +850,8 @@ impl Interpreter {
 
     /// A resume of a compiled body by its native code `native` alone (see
     /// `frame_jit`), without the general loop's setup: `Ok` with the value
-    /// the body yielded, the frame suspended past the yield; `Err` with
+    /// the body yielded, the frame suspended past the yield, or (`true`)
+    /// the value it returned, run here as a fast step runs it; `Err` with
     /// the pc the native code stopped at (`usize::MAX` if it didn't run),
     /// the frame synced there for [`Self::gen_fast_step`] to go on from,
     /// or [`MARKED_AT`] for the general loop to go on from.
@@ -862,7 +864,7 @@ impl Interpreter {
         snap_gen: u64,
         depth: u8,
         dead: *const std::cell::Cell<bool>,
-    ) -> Result<Object, usize> {
+    ) -> Result<(Object, bool), usize> {
         let frame_ptr: *mut Frame = frame;
         // SAFETY: as in `gen_fast_step`.
         let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
@@ -903,6 +905,7 @@ impl Interpreter {
             lazy: std::ptr::null_mut(),
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
+            gen_lazy: false,
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };
@@ -915,7 +918,15 @@ impl Interpreter {
             Some(ins) if ins.op == OpCode::YieldValue && len > 0 => {
                 frame.pc += 1;
                 frame.agen_yielded_value = ins.arg == 0;
-                Ok(frame.stack.pop().expect("a yielded value"))
+                Ok((frame.stack.pop().expect("a yielded value"), false))
+            }
+            Some(ins)
+                if ins.op == OpCode::ReturnValue
+                    && len > 0
+                    && status == crate::frame_jit::INTERP =>
+            {
+                frame.pc += 1;
+                Ok((frame.stack.pop().expect("a returned value"), true))
             }
             // A release queued a finalizer: the general loop takes over.
             _ if status == crate::frame_jit::MARKED => Err(MARKED_AT),
@@ -1155,9 +1166,14 @@ impl Interpreter {
             let n = frame.locals.len();
             match ext.frame_jit.get(n) {
                 Some(native) => match self.gen_native_yield(frame, native, snap_gen, depth, dead) {
-                    Ok(v) => {
+                    Ok((v, false)) => {
                         Self::park_stepped(g, boxed);
                         return GenNext::Yielded(v);
+                    }
+                    // The general epilogue of a return, as below.
+                    Ok((v, true)) => {
+                        self.retire_gen(g, boxed);
+                        return GenNext::Exhausted(v);
                     }
                     Err(pc) => pc,
                 },
