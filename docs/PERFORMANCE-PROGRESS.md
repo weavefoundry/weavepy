@@ -7,6 +7,31 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on October 29, 2026, at `faa68a33` (PR #STACKED,
+`perf/step-change`, stacked on PR #101), on the same host and CPython,
+both WeavePy binaries profile-guided and interleaved with CPython in one
+idle session. The base is PR #101's PGO binary (`ba518cf0`).
+
+| Measure | PR #101 | PR #STACKED |
+| --- | ---: | ---: |
+| Warm time, 33 workloads (geomean) | 1.113 | 1.098 |
+| Cold time (first call, including compilation) | 1.366 | 1.261 |
+| Peak resident memory | 1.670 | 1.688 |
+| Instructions (quick build) | 1.156 | 1.145 |
+
+Against PR #101, cold time is 0.923 (`tomllib_loads` 0.73, `go` 0.81,
+`text_processing` 0.82, `nqueens` 0.84, `async_tree` and
+`generators_tree` 0.85), warm time 0.987 (`generators_tree` 0.84,
+`nqueens` 0.86, `coroutines`, `pickle_roundtrip` and `stdlib_utils`
+0.91), and peak memory 1.011: start-up and imports are smaller (`-c pass`
+9.95 to 9.16 MB, the harness's imports 16.7 to 15.8 MB), but a workload
+that compiles keeps about 2 MB more for the background compiler. Eleven
+workloads beat CPython's warm time (`pickle_roundtrip` 0.56,
+`json_roundtrip` 0.68, `scimark` 0.70, `decimal_telco` 0.71), and
+`coroutines`, `graph_search` and `text_processing` are within 1% of it.
+
+The earlier checkpoints follow.
+
 Measured on October 28, 2026, at `e4112942` (PR #101,
 `perf/beat-cpython-everywhere`), on the macOS x86-64 development host
 (Intel Core i9-9980HK), against CPython 3.14.8, with both WeavePy binaries
@@ -315,6 +340,35 @@ slowdown in that run was the even-sized chunks, since fixed.
     and `test_value_fast_paths.py` are differential harnesses that run
     overrides and values hot under five JIT settings against CPython's
     output.
+- **PR #STACKED, `perf/step-change`** (October 2026), stacked on PR #101.
+  Cold time 0.923 of PR #101's, warm 0.987, instructions 0.990, peak
+  memory 1.011 (PGO, one session):
+  - *Background code generation.* The frame JIT lowers a hot body on the
+    interpreter's thread and queues the Cranelift function for one worker
+    thread, which generates the machine code while the interpreter keeps
+    running the body; the interpreter installs finished code at its
+    warm-up checks (`frame_jit/queue.rs`). The queue holds at most 8 jobs
+    or 24,000 IR instructions, `fork` waits for the worker to finish and
+    exit, and `WEAVEPY_JIT_SYNC=1` compiles synchronously (the VM's unit
+    tests and the regression tests that force early compiles set it). A
+    body of 160 or more instructions is lowered lean at once instead of
+    after a full lowering that always came out too large.
+  - *Lazy generator resumes.* A compiled generator body resumed from
+    compiled code or the core loop runs from its consumer's native code,
+    its activation a record on the native stack, as direct calls run
+    (`for`, `next()`, `send()`, `yield from`, `await`); a parked
+    `yield from` chain resumes at its innermost generator, and chains up to
+    three deep level by level; inlined `list`, `tuple`, `all` and `any` of a
+    generator expression drain it in one step; a hot loop-free generator
+    body now compiles. Instructions: `generators_tree` 0.836 of PR #101's,
+    `nqueens` 0.899, `context_managers` 0.949, `sudoku` 0.962,
+    `coroutines` 0.965.
+  - *Code layout.* The checked-in order file had gone stale (484 of its
+    5,050 names matched, since names embed crate hashes); the host targets
+    now link through `scripts/link-ordered.sh`, which remaps the order onto
+    each link's own symbols, and the order covers start-up and what 19
+    workloads run (`scripts/extend-order-file.py`). On x86-64 Linux, lld
+    gets it too (`--symbol-ordering-file`).
 
 ## What the measurements say
 
@@ -409,6 +463,40 @@ slowdown in that run was the even-sized chunks, since fixed.
   bytecode instruction and Cranelift spends about 11,000 host instructions
   per IR instruction. A single-pass allocator, lean lowering everywhere and
   other thresholds each trade warm time for cold.
+- **Background compilation's costs.** It moves about two thirds of a
+  compile (Cranelift's code generation) off the interpreter's thread; the
+  lowering stays (a third). CPU time rises about 2%, and a workload that
+  compiles peaks about 2 MB higher: the worker's compile memory comes from
+  its own allocator heap rather than the interpreter's free blocks. The
+  same rise shows with the interpreter blocked during the compile, and
+  neither `mi_collect` when the worker idles, immediate purging, smaller
+  jobs nor letting the worker exit when idle brought it down.
+- **Memory on Linux.** mimalloc's arenas are backed by transparent huge
+  pages there (`madvise` mode, the distributions' default), which is much
+  of why Linux peak RSS is about 3.6 times CPython's (the CI's `startup`
+  fixture peaks at 32 MiB). Memory mapped for one object isn't, so mapping
+  large pages from the OS (PR #101's `arena_max_object_size`) made
+  `deque_ops` take 6,000 page faults against 770 and run 20% slower; that
+  setting now applies off Linux only. Turning THP off for the process
+  (`PR_SET_THP_DISABLE`) takes `startup` to 20 MiB but brings the faults
+  back (7,500 on `deque_ops`) and is inherited by child processes, so it
+  isn't in.
+- **Heap, from the allocation profiler** (`--features alloc-profile`):
+  the harness's imports add 3.7 MB live, 2.3 MB of it code objects
+  (decoded instructions 0.5 MB, the `Arc<CodeObject>`s 0.5, VM extensions
+  0.45, inline caches 0.3), and a tier-2 compile sets most workloads'
+  peak (Cranelift and regalloc2 1.9 MB in `chaos`). Only 154 of 2,094 code
+  objects are nested in functions, so materializing them lazily wouldn't
+  pay.
+- **Tried and dropped in PR #STACKED**: tier-2 compiles in the background
+  (while a constructor's compile was pending, interpreted constructors
+  built instances in another shape and the compiled loop side-exited on
+  them: `float_points` 25% to 35% slower); decoding instructions lazily
+  from the mapped code cache (0.6 MB less heap, 0.5 MB more file pages,
+  0.9% more instructions); a lower frame-JIT threshold (`class_creation`
+  8% slower cold, 6.5 MB more memory); resuming `yield from` chains of any
+  depth level by level (O(depth) work a value: `generators_tree` 4.4
+  times CPython's).
 - **Tried and dropped in PR #101**: instance values in the instance's own
   allocation (the object-heavy workloads hold 300 to 650 live instances at
   their peak); mimalloc v2 (mixed, instructions up); opt-level `s` for
@@ -422,10 +510,14 @@ slowdown in that run was the even-sized chunks, since fixed.
    generator's cost), and a native caller's step of a compiled body
    without `quiet_run` (`async_tree`, `enumerate` and `zip` over
    generators).
-2. Cold time: a much cheaper baseline compiler (fewer IR instructions per
-   operation) or compiled code kept across processes.
-3. Peak memory: the binary's touched pages (12 to 13 MiB against
-   CPython's 6.4), now the largest share of RSS.
+2. Cold time: the lowering left on the interpreter's thread (a third of a
+   compile) and the time a body runs interpreted before its code is
+   ready; a much cheaper baseline compiler or compiled code kept across
+   processes.
+3. Peak memory: code objects (2.3 MB of the harness's 3.7 MB of imports),
+   the compile peak (now partly the background compiler's own heap), and
+   on Linux the arenas' huge pages, without the page faults that turning
+   them off brings.
 4. Builtins take keywords as `&[(String, Object)]`, so every keyword call
    of one allocates a `String` per keyword; a calling convention over the
    names tuple would remove it.
