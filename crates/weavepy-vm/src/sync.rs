@@ -400,18 +400,8 @@ pub(crate) fn cells_unguarded() -> bool {
     CELLS_UNGUARDED.load(Ordering::Relaxed)
 }
 
-/// The byte offsets of a `GilCell<Vec<Object>>`'s borrow counter and of
-/// its vector, for compiled code that reads a list in place.
-pub(crate) fn object_vec_cell_offsets() -> (usize, usize) {
-    type Cell = GilCell<Vec<crate::object::Object>>;
-    (
-        std::mem::offset_of!(Cell, borrow),
-        std::mem::offset_of!(Cell, data),
-    )
-}
-
-/// [`object_vec_cell_offsets`] for a cell holding one object (a closure
-/// cell): its borrow counter's and value's byte offsets.
+/// A `GilCell` holding one object (a closure cell): its borrow counter's
+/// and value's byte offsets, for compiled code.
 pub(crate) fn object_cell_offsets() -> (usize, usize) {
     type Cell = GilCell<crate::object::Object>;
     (
