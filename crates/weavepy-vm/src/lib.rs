@@ -16537,6 +16537,15 @@ impl Interpreter {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
+                    if ins.op == OpCode::BinaryOp {
+                        // SAFETY: the compiler emits only `BinOpKind`s.
+                        let op: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                        let inplace = ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
+                        let (a, b) = (&frame.stack[n - 2], &frame.stack[n - 1]);
+                        if let Some(f) = Self::binop_instance_dunder(a, b, op, inplace) {
+                            dunder_note(ext, pc, &f, a, b);
+                        }
+                    }
                 }
             }
         }
@@ -78580,6 +78589,9 @@ struct CodeConstObjects {
     /// operands and result on the stack (see `frame_jit::h_binop_dunder`);
     /// allocated on the first recorded one.
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
+    /// The `BINARY_OP` sites' Python operator methods (see
+    /// [`DunderSeen`]), allocated on the first recorded one.
+    dunders: std::sync::OnceLock<Box<DunderTable>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
     leaf_sites: SiteSlots<LeafSite>,
@@ -79843,6 +79855,87 @@ pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
+/// The Python operator method a `BINARY_OP` site ran, for the frame JIT to
+/// lower in line: the method, the left operand's class version it was
+/// resolved under, and the right operand's tag (`None` an instance of the
+/// same class).
+struct DunderSeen {
+    pc: usize,
+    func: crate::sync::Weak<crate::object::PyFunction>,
+    ver: u64,
+    right: Option<u8>,
+}
+
+/// A code's [`DunderSeen`]s.
+#[derive(Default)]
+struct DunderTable(std::cell::UnsafeCell<Vec<DunderSeen>>);
+
+// SAFETY: read and written only with the GIL held (the `MethodSlot`
+// invariant).
+unsafe impl Send for DunderTable {}
+unsafe impl Sync for DunderTable {}
+
+/// Record the Python method `a <op> b` (at the `BINARY_OP` at `pc`) runs, if
+/// its site has none yet and the method is decided by what a guard on the
+/// operands can check.
+#[cold]
+pub(crate) fn dunder_note(
+    ext: &CodeConstObjects,
+    pc: usize,
+    f: &Rc<crate::object::PyFunction>,
+    a: &Object,
+    b: &Object,
+) {
+    let Object::Instance(ai) = a else {
+        return;
+    };
+    let cls = ai.cls_raw();
+    if cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 || ai.native.get().is_some() {
+        return;
+    }
+    let right = match b {
+        Object::Instance(bi) if std::ptr::eq(bi.cls_raw(), cls) => None,
+        Object::Int(_) | Object::Float(_) => Some(b.tag()),
+        _ => return,
+    };
+    let table = ext.dunders.get_or_init(Box::default);
+    // SAFETY: GIL-serialized; the borrow ends here.
+    let seen = unsafe { &mut *table.0.get() };
+    if seen.iter().all(|d| d.pc != pc) {
+        seen.push(DunderSeen {
+            pc,
+            func: Rc::downgrade(f),
+            ver: cls.attr_version.get(),
+            right,
+        });
+    }
+}
+
+/// Whether the `BINARY_OP` at `pc` has recorded an operator method.
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn dunder_known(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.dunders.get().is_some_and(|table| {
+        // SAFETY: GIL-serialized; the borrow ends here.
+        unsafe { &*table.0.get() }.iter().any(|d| d.pc == pc)
+    })
+}
+
+/// The operator method the `BINARY_OP` at `pc` recorded (see
+/// [`dunder_note`]), if it's alive: the method, the left class's version
+/// and the right operand's tag.
+#[cfg(feature = "jit")]
+pub(crate) fn dunder_seen(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::PyFunction>, u64, Option<u8>)> {
+    let table = ext.dunders.get()?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    let seen = unsafe { &*table.0.get() };
+    let d = seen.iter().find(|d| d.pc == pc)?;
+    Some((d.func.upgrade()?, d.ver, d.right))
+}
+
 /// Record that the `BINARY_OP` at `pc` ran on an instance operand (see
 /// [`CodeConstObjects::instance_sites`]).
 #[cold]
@@ -82139,6 +82232,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             call_slots: SiteSlots::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             leaf_tries: std::sync::atomic::AtomicU64::new(0),
+            dunders: std::sync::OnceLock::new(),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             gen_start: std::sync::atomic::AtomicU32::new(0),

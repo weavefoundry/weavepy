@@ -7210,6 +7210,11 @@ unsafe extern "C" fn h_binop_dunder(
         let Some(f) = Interpreter::binop_instance_dunder(&*at, &*at.add(1), op, inplace) else {
             return CALL_DECLINED;
         };
+        if let Some(ext) = crate::code_vm_ext(&*code) {
+            if !crate::dunder_known(ext, pc) {
+                crate::dunder_note(ext, pc, &f, &*at, &*at.add(1));
+            }
+        }
         let Object::Instance(a) = &*at else {
             return CALL_DECLINED;
         };
@@ -12805,6 +12810,7 @@ impl<'a> Lower<'a> {
         let n = self.code.instructions.len();
         self.b.switch_to_block(blk);
         self.vs.clear();
+        self.inline_settle_fields();
         self.depth = self.depth_at(start) as usize;
         self.last_pc = None;
         self.bound.iter_mut().for_each(|b| *b = false);
@@ -14143,6 +14149,15 @@ impl<'a> Lower<'a> {
     }
 
     fn binary(&mut self, pc: usize, arg: u32) -> bool {
+        // (A Python operator method lowered in line.)
+        if let (Some(plans), Some(_)) = (self.plan_at(pc), self.layout) {
+            return self.inline_binop(pc, arg, plans);
+        }
+        self.binary_plain(pc, arg)
+    }
+
+    /// [`Self::binary`] without a Python method in line.
+    pub(crate) fn binary_plain(&mut self, pc: usize, arg: u32) -> bool {
         let kind = arg as u8;
         let is = |k: BinOpKind| kind == k as u8;
         let bi = self.pop();
@@ -15717,6 +15732,11 @@ impl<'a> Lower<'a> {
     }
 
     fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
+        if self.inlining() {
+            if let Some(r) = self.inline_field(pc) {
+                return r;
+            }
+        }
         // A property's getter may run here (see `h_property`), which needs
         // the whole stack on the frame's.
         if crate::property_site(self.ext, pc) {

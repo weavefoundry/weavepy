@@ -1115,6 +1115,225 @@ def in_handler(n):
 print(in_handler(N))
 '''
 
+CASES["operators"] = r'''
+import sys
+import traceback
+
+N = 600
+
+
+class V:
+    def __init__(self, x):
+        self.x = x
+
+    def __add__(self, o):
+        return V(self.x + o.x)
+
+    def __sub__(self, o):
+        if o.x == -1:
+            return NotImplemented
+        return V(self.x - o.x)
+
+    def __mul__(self, k):
+        return V(self.x * k)
+
+    def __truediv__(self, o):
+        return self.x / o.x
+
+    def __rsub__(self, o):
+        return "rsub"
+
+    def __repr__(self):
+        return "V(%r)" % (self.x,)
+
+
+class W(V):
+    def __radd__(self, o):
+        return "W.radd"
+
+
+class Z:
+    x = -1
+
+    def __rsub__(self, o):
+        return "Z.rsub"
+
+
+def add(a, b, n):
+    r = None
+    for i in range(n):
+        r = a + b
+    return r
+
+
+def sub(a, b, n):
+    r = None
+    for i in range(n):
+        r = a - b
+    return r
+
+
+def mul(a, k, n):
+    r = None
+    for i in range(n):
+        r = a * k
+    return r
+
+
+def div(a, b, n):
+    r = None
+    for i in range(n):
+        r = a / b
+    return r
+
+
+print(add(V(1), V(2), N), sub(V(5), V(2), N), mul(V(2), 3, N), mul(V(2), 1.5, N))
+print(add(V(1), W(2), 1), add(W(1), V(2), 1), sub(V(5), V(-1), 1) if False else None)
+# The right operand's reflected method, and a bare NotImplemented.
+print(sub(V(5), Z(), 3))
+try:
+    sub(V(5), V(-1), 3)
+except TypeError as e:
+    print(e)
+
+
+def not_impl(n):
+    a, b, c = V(5), V(2), V(-1)
+    out = None
+    for i in range(n):
+        out = a - b
+    try:
+        a - c
+    except TypeError as e:
+        return out, str(e)
+
+
+print(not_impl(N))
+try:
+    div(V(1), V(0), 3)
+except ZeroDivisionError as e:
+    print([(f.name, f.lineno) for f in traceback.extract_tb(e.__traceback__)])
+
+
+def div_hot(n):
+    a, b = V(1), V(2)
+    r = 0
+    for i in range(n):
+        r = a / b
+    b.x = 0
+    try:
+        a / b
+    except ZeroDivisionError as e:
+        return r, [(f.name, f.lineno) for f in traceback.extract_tb(e.__traceback__)]
+
+
+print(div_hot(N))
+
+
+def patched(n):
+    a, b = V(1), V(2)
+    out = []
+    for i in range(n):
+        out = a + b
+    V.__add__ = lambda s, o: "patched"
+    r = a + b
+    del V.__add__
+    try:
+        a + b
+    except TypeError as e:
+        return out, r, str(e)
+
+
+print(patched(N))
+
+
+class P:
+    def __init__(self, x):
+        self.x = x
+
+    def __add__(self, o):
+        f = sys._getframe()
+        return (f.f_code.co_name, f.f_back.f_code.co_name, self.x + o.x)
+
+    def __iadd__(self, o):
+        self.x += o.x
+        return self
+
+
+def frames(n):
+    a, b = P(1), P(2)
+    r = None
+    for i in range(n):
+        r = a + b
+    return r
+
+
+print(frames(N))
+
+
+def inplace(n):
+    a, b = P(0), P(1)
+    for i in range(n):
+        a += b
+    return a.x
+
+
+print(inplace(N))
+
+
+class Q:
+    def __init__(self, x):
+        self.x = x
+
+    def __add__(self, o):
+        return Q(self.x + o.x)
+
+    def __del__(self):
+        log.append(self.x)
+
+
+log = []
+
+
+def released(n):
+    a = Q(1)
+    for i in range(n):
+        log.clear()
+        Q(2) + a
+        log.append("after")
+    return list(log)
+
+
+print(released(N))
+
+
+class S:
+    __slots__ = ("x",)
+
+    def __init__(self, x):
+        self.x = x
+
+    def __add__(self, o):
+        return self.x + o.x
+
+    def __sub__(self, o):
+        raise KeyError(self.x)
+
+
+def slots(n):
+    a, b = S(1), S(2)
+    t = 0
+    for i in range(n):
+        t += a + b
+    try:
+        a - b
+    except KeyError as e:
+        return t, repr(e), [f.name for f in traceback.extract_tb(e.__traceback__)]
+
+
+print(slots(N))
+'''
+
 ENVS = [
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1"},
     {"WEAVEPY_FRAME_JIT_HOT": "20", "WEAVEPY_JIT_SYNC": "1", "WEAVEPY_TIER2": "0"},
@@ -1133,6 +1352,7 @@ EXPECTED = {
     'finalizers': "(179700, ['body', 'x', 'caller'])\n['in', 'a', 'caller']\n['in', 'caller', 'held']\n['in', 'caller', 'held']\n['before', 'arg', 'after', 'caller']\n['before', 'after', 'caller']\n['r', 'caller']\n['first', 'mid', 'second', 'caller']\n['dropped', 'popped', 'caller']\ndead\n['drops']\n",
     'values_and_arguments': '(658607465038423, 21267647932558653971072598982912901120)\n[-598, 597.5, 604, (True, True), None, \'constant\', 600, 1, 6.5]\n(72004026, [592, 593, 594, 595, 596, 597, 598, 599], {0: 1, 1: 1, 2: 1, 3: 1, 4: 1})\n["IndexError(\'list index out of range\')", \'TypeError("\\\'NoneType\\\' object is not subscriptable")\', "TypeError(\'list indices must be integers or slices, not str\')"]\n([0, 100, 200, 300], 6)\nnothing() missing 1 required positional argument: \'a\'\nnothing() takes 1 positional argument but 2 were given\nnothing() takes 1 positional argument but 2 were given\n540300\n729000\n((600, False, 1, \'yes\'), \'dunder-add\', \'dunder-eq\', (\'item\', 3), \'no\')\n(\'prop\', 3)\n',
     'deep_exits': "3006\n([('c', 26), ('b', 18), ('a', 14), ('run', 41), ('<module>', 48)], ['f', 'names', 'q', 'r', 'self'])\ntb 57\nd 32\n1200\n'NoneType' object is not subscriptable\n(<class 'KeyError'>, None)\n",
+    'operators': 'V(3) V(3) V(6) V(3.0)\nW.radd V(3) None\nZ.rsub\nunsupported operand type(s) for -: \'V\' and \'V\'\n(V(3), "unsupported operand type(s) for -: \'V\' and \'V\'")\n[(\'<module>\', 96), (\'div\', 69), (\'__truediv__\', 24)]\n(0.5, [(\'div_hot\', 108), (\'__truediv__\', 24)])\n(V(3), \'patched\', "unsupported operand type(s) for +: \'V\' and \'V\'")\n(\'__add__\', \'frames\', 3)\n600\n[2, 3, \'after\']\n(1800, \'KeyError(1)\', [\'slots\', \'__sub__\'])\n',
 }
 
 

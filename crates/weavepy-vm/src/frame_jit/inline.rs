@@ -25,6 +25,17 @@
 //! site whose exits come too often turns itself off and takes the ordinary
 //! call from then on.
 //!
+//! Between two operations that could change anything, a field read needs no
+//! copy: the value stays where it lies, read through a temporary "local" until
+//! something takes it (see [`Lower::inline_field`]), and a second read of the
+//! same receiver checks only the field's own position. Nothing runs in between
+//! that could move it, and the only way out materializes it.
+//!
+//! A `BINARY_OP` whose site ran a Python operator method lowers the method the
+//! same way, guarded by the left operand's class version and the right
+//! operand's class or tag. Its frame has no callable below it, and its
+//! `NotImplemented` leaves for the core loop with the operator's protocol.
+//!
 //! A `CALL` of a compiled Python function in an inlined body runs as a direct
 //! call ([`h_inline_call`]), which is lazy already: its callee registers only
 //! if something needs the core loop's view, and registering builds the
@@ -34,11 +45,11 @@
 use super::{
     block_starts, call_kernel_in_place, call_leaf_in_place, ctor_store_init, direct_call,
     h_call_kw, h_call_site, h_for_iter, kernel_for, maybe_unbound_locals, never_ran_blocks, settle,
-    stats, type_of_call, Block, BuiltinSite, Cell, CodeConstObjects, CodeObject, DirectSite,
-    FieldSlot, GlobalCache, InstBuilder, IntCC, Interpreter, Item, Lower, Object, OpCode,
-    PyIterator, Rc, State, Value, CALL_DECLINED, DICT_STAMP, EXIT_LAST_SHIFT, EXIT_PC_SHIFT, FLAGS,
-    GC_BDATA, GC_BSTAMP, GC_BUILTINS, GC_GDATA, GC_GLOBALS, GC_GSTAMP, GC_VALUE, INTERP, I_MISSING,
-    MARKED, RAISED, RELOAD, S_INTERP, S_SNAP, S_SW,
+    stats, type_of_call, type_slot_layout, BinOpKind, Block, BuiltinSite, Cell, CodeConstObjects,
+    CodeObject, DirectSite, FieldSlot, GlobalCache, InstBuilder, IntCC, Interpreter, Item, Lower,
+    Object, OpCode, PyIterator, Rc, State, Value, CALL_DECLINED, DICT_STAMP, EXIT_LAST_SHIFT,
+    EXIT_PC_SHIFT, FLAGS, GC_BDATA, GC_BSTAMP, GC_BUILTINS, GC_GDATA, GC_GLOBALS, GC_GSTAMP,
+    GC_VALUE, INTERP, I_MISSING, MARKED, RAISED, RELOAD, S_INTERP, S_SNAP, S_SW,
 };
 use cranelift_codegen::ir::types;
 
@@ -92,6 +103,9 @@ pub(crate) struct InlineSite {
     /// The arguments the body borrows: each local's slot and where its
     /// value lies, for the activation to take a reference.
     borrowed: Vec<(usize, Place)>,
+    /// An operator method's function, which no stack slot holds, and its
+    /// `BINARY_OP`'s argument.
+    method: Option<(Object, u32)>,
 }
 
 const IS_KEY: i32 = std::mem::offset_of!(InlineSite, key) as i32;
@@ -149,6 +163,42 @@ pub(super) struct Plan {
     /// The stack slots it takes from its first local up.
     need: usize,
     layout: FnLayout,
+    /// The function, and how a `BINARY_OP` site calls it, for an operator
+    /// method.
+    func: Rc<crate::object::PyFunction>,
+    dunder: Option<Dunder>,
+}
+
+/// A `BINARY_OP` site's guard on the operands (see `dunder_note`).
+#[derive(Clone, Copy)]
+struct Dunder {
+    ver: u64,
+    right: Option<u8>,
+    arg: u32,
+}
+
+/// The method of the `BINARY_OP` at `pc`, to lower in line.
+fn dunder_plan(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    pc: usize,
+    path: &mut Vec<usize>,
+    budget: &mut usize,
+) -> Result<Plan, &'static str> {
+    let Some((f, ver, right)) = crate::dunder_seen(ext, pc) else {
+        return Err("no method known");
+    };
+    let callee = f.code();
+    let mut p = admit(&f, &callee, false, 2, None, path, budget)?;
+    if p.missing != 0 {
+        return Err("defaults");
+    }
+    p.dunder = Some(Dunder {
+        ver,
+        right,
+        arg: code.instructions[pc].arg,
+    });
+    Ok(p)
 }
 
 impl Plan {
@@ -359,9 +409,10 @@ pub(super) fn plan(
         .iter()
         .enumerate()
         .filter(|&(pc, i)| {
-            matches!(i.op, OpCode::Call | OpCode::CallKw)
-                && call_start(code, ext, pc, depths[pc]) >= 0
-                && crate::await_send_after(code, pc).is_none()
+            (i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
+                || (matches!(i.op, OpCode::Call | OpCode::CallKw)
+                    && call_start(code, ext, pc, depths[pc]) >= 0
+                    && crate::await_send_after(code, pc).is_none())
         })
         .map(|(pc, _)| {
             let loops = ins
@@ -379,6 +430,17 @@ pub(super) fn plan(
     let mut path = vec![std::ptr::from_ref(code) as usize];
     for (_, pc) in sites {
         let i = ins[pc];
+        if i.op == OpCode::BinaryOp {
+            match dunder_plan(code, ext, pc, &mut path, &mut left) {
+                Ok(p) => {
+                    note(code, pc, "inlined", &p.code.qualname);
+                    plans.need = plans.need.max(depths[pc] as usize - 2 + p.need);
+                    plans.calls.push((pc, vec![p]));
+                }
+                Err(why) => note(code, pc, why, "operator"),
+            }
+            continue;
+        }
         let callees = callees_at(code, ext, depths, pc);
         if callees.is_empty() {
             note(code, pc, "no callee known", "");
@@ -553,9 +615,17 @@ fn admit(
                 }
             }
             OpCode::LoadAttr if crate::property_site(ext, pc) => leaves = true,
-            OpCode::BinaryOp | OpCode::CompareOp | OpCode::BinarySubscr
-                if crate::instance_site(ext, pc) =>
-            {
+            OpCode::BinaryOp if crate::instance_site(ext, pc) => {
+                match dunder_plan(code, ext, pc, path, budget) {
+                    Ok(p) => {
+                        let start = nlocals + depths[pc] as usize - 2;
+                        inner_need = inner_need.max(start + p.need);
+                        inner.push((pc, vec![p]));
+                    }
+                    Err(_) => leaves = true,
+                }
+            }
+            OpCode::CompareOp | OpCode::BinarySubscr if crate::instance_site(ext, pc) => {
                 leaves = true;
             }
             OpCode::CallKw if call_start(code, ext, pc, depths[pc]) >= 0 => {
@@ -639,6 +709,8 @@ fn admit(
         stored,
         inner,
         layout: FnLayout::of(f),
+        func: f.clone(),
+        dunder: None,
     })
 }
 
@@ -664,6 +736,51 @@ enum Place {
     Root(u32),
     /// A constant at this address (a borrowed argument).
     At(i64),
+    /// At this address, valid until the next operation that isn't
+    /// [`pure_op`] (a field read's value, see [`Lower::inline_field`]).
+    Temp(Value),
+}
+
+/// What a field read proved about its receiver, for the next read of the
+/// same receiver up to the next operation that isn't [`pure_op`].
+#[derive(Clone, Copy)]
+enum FieldMemo {
+    /// Its split values block and their count.
+    Split { block: Value, len: Value },
+    /// Its laid-out `__slots__` values.
+    Slots { values: Value },
+}
+
+/// The operations between which a field read's value can't move: they change
+/// nothing a field read looked at, and run no Python code. (A `BINARY_OP`'s or
+/// `COMPARE_OP`'s helpers take their operands' copies and touch nothing else.)
+fn pure_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::Nop
+            | OpCode::NotTaken
+            | OpCode::Resume
+            | OpCode::CopyFreeVars
+            | OpCode::LoadFast
+            | OpCode::LoadFastBorrow
+            | OpCode::LoadConst
+            | OpCode::LoadSmallInt
+            | OpCode::LoadAttr
+            | OpCode::BinaryOp
+            | OpCode::CompareOp
+            | OpCode::UnaryOp
+            | OpCode::IsOp
+            | OpCode::ToBool
+            | OpCode::CopyTop
+            | OpCode::Swap
+            | OpCode::BinarySubscr
+            | OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::JumpForward
+            | OpCode::ReturnValue
+    )
 }
 
 /// An inlined body being lowered: what its instructions need beyond the
@@ -674,9 +791,14 @@ pub(super) struct InlineFrame<'a> {
     site: i64,
     start: usize,
     base: usize,
+    /// Where the function's `Object` is, when no stack slot holds it.
+    method_at: Option<i64>,
     places: Vec<Place>,
     /// A parameter's value, where it's known unboxed (it never changes).
     values: Vec<Option<Item>>,
+    /// What this block's field reads proved, by receiver (see
+    /// [`Lower::inline_field`]).
+    fields: Vec<(u32, FieldMemo)>,
     exit_block: Block,
     ret: Block,
     saved: Saved<'a>,
@@ -741,7 +863,155 @@ impl<'a> Lower<'a> {
             Place::Stack(s) => self.slot_addr(s),
             Place::Root(j) => self.b.ins().iadd_imm(self.locals, 16 * i64::from(j)),
             Place::At(a) => self.b.ins().iconst(self.ptr, a),
+            Place::Temp(v) => v,
         })
+    }
+
+    /// Whether a field read of the local `i` has proved its receiver this
+    /// block.
+    fn field_memo(&self, i: u32) -> Option<FieldMemo> {
+        let f = self.inl.last()?;
+        f.fields.iter().find(|(k, _)| *k == i).map(|&(_, m)| m)
+    }
+
+    /// Forget what field reads proved, and write the values they left on the
+    /// virtual stack to the stack (with their references taken): something
+    /// that could move them is next.
+    pub(super) fn inline_settle_fields(&mut self) {
+        let Some(f) = self.inl.last_mut() else {
+            return;
+        };
+        f.fields.clear();
+        let nlocals = self.nlocals as u32;
+        let base = self.depth - self.vs.len();
+        for k in 0..self.vs.len() {
+            if let Item::Local(i) = self.vs[k] {
+                if i >= nlocals {
+                    self.materialize(Item::Local(i), base + k);
+                    self.vs[k] = Item::Mem(base + k);
+                }
+            }
+        }
+    }
+
+    /// `LOAD_ATTR` in an inlined body of the local atop the stack, at a site
+    /// settled on one instance field of one class: the guards (leaving for
+    /// the core loop, with nothing done, when one fails), or only the
+    /// position's when an earlier read proved the receiver, and the value
+    /// left where it lies. `None`, emitting nothing, for another site.
+    pub(super) fn inline_field(&mut self, pc: usize) -> Option<bool> {
+        let l = *self.layout?;
+        let &Item::Local(i) = self.vs.last()? else {
+            return None;
+        };
+        if crate::property_site(self.ext, pc) || self.ext.attr_poly_slot(pc).is_some() {
+            return None;
+        }
+        let (ver, idx) = self.field_slots.get(pc)?.get();
+        let slots = idx & crate::SLOT_FIELD != 0;
+        if ver == 0 || (slots && !l.slots_ok) {
+            return None;
+        }
+        let item = self.pop();
+        let out = self.exit_with(pc, &[item], INTERP);
+        let ptr = self.ptr;
+        let memo = match self.field_memo(i) {
+            Some(m) => m,
+            None => {
+                let at = self.local_addr(i);
+                let otag = self.tag_at(at);
+                let not_inst =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
+                self.branch_out(not_inst, out);
+                let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+                let cver = self
+                    .b
+                    .ins()
+                    .load(types::I64, FLAGS, cls, l.type_attr_version);
+                let want = self.b.ins().iconst(types::I64, ver as i64);
+                let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
+                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+                let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+                let m = if slots {
+                    let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(&l));
+                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
+                    let form = self
+                        .b
+                        .ins()
+                        .uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
+                    let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
+                    let values = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
+                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    let other =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+                    let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
+                    let unsafe_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+                    let bad = self.b.ins().bor(stale, busy);
+                    let bad = self.b.ins().bor(bad, other);
+                    let bad = self.b.ins().bor(bad, foreign);
+                    let bad = self.b.ins().bor(bad, unsafe_now);
+                    self.branch_out(bad, out);
+                    FieldMemo::Slots { values }
+                } else {
+                    let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+                    let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+                    let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+                    let other = self.b.ins().bor(lazy, shared);
+                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+                    let bad = self.b.ins().bor(stale, busy);
+                    let bad = self.b.ins().bor(bad, empty);
+                    let bad = self.b.ins().bor(bad, other);
+                    self.branch_out(bad, out);
+                    let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
+                    let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
+                    let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+                    self.branch_out(foreign, out);
+                    let len = self.b.ins().uload32(FLAGS, block, l.split_len);
+                    FieldMemo::Split { block, len }
+                };
+                self.inl
+                    .last_mut()
+                    .expect("in an inlined body")
+                    .fields
+                    .push((i, m));
+                m
+            }
+        };
+        let v = match memo {
+            FieldMemo::Slots { values } => {
+                let off = i64::from(idx & !crate::SLOT_FIELD) * 16;
+                let v = self.b.ins().iadd_imm(values, off);
+                let vt = self.tag_at(v);
+                let none = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, vt, i64::from(self.tags.unbound));
+                self.branch_out(none, out);
+                v
+            }
+            FieldMemo::Split { block, len } => {
+                let absent =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedLessThanOrEqual, len, i64::from(idx));
+                self.branch_out(absent, out);
+                let off = i64::from(idx) * 16 + i64::from(l.split_values);
+                self.b.ins().iadd_imm(block, off)
+            }
+        };
+        let f = self.inl.last_mut().expect("in an inlined body");
+        let temp = f.places.len() as u32;
+        f.places.push(Place::Temp(v));
+        self.push(Item::Local(temp));
+        self.set_last(pc);
+        Some(true)
     }
 
     /// An inlined body's parameter `i`, where its value is known unboxed.
@@ -752,9 +1022,20 @@ impl<'a> Lower<'a> {
     /// The instruction at `pc` as an inlined body runs it: `Some` when it
     /// doesn't (it leaves for the core loop there).
     pub(super) fn inline_gate(&mut self, pc: usize, op: OpCode) -> Option<bool> {
-        if self.inlining() && !inline_op(op) {
+        if !self.inlining() {
+            return None;
+        }
+        if !inline_op(op) {
             self.exit(INTERP, pc);
             return Some(false);
+        }
+        // (A method lowered in line may do anything; so may the fused
+        // shapes a `LOAD_FAST` starts.)
+        let next = self.code.instructions.get(pc + 1).map(|i| i.op);
+        let fused = matches!(op, OpCode::LoadFast | OpCode::LoadFastBorrow)
+            && matches!(next, Some(OpCode::StoreAttr | OpCode::LoadMethodAttr));
+        if !pure_op(op) || fused || (op == OpCode::BinaryOp && self.plan_at(pc).is_some()) {
+            self.inline_settle_fields();
         }
         None
     }
@@ -790,7 +1071,7 @@ impl<'a> Lower<'a> {
             self.vs.clear();
             self.depth = start + 2;
             self.last_pc = call_last;
-            self.inline_body(pc, plan, &args, next, join);
+            self.inline_body(pc, plan, &args, start, next, join);
             self.b.switch_to_block(next);
             slow = Some(next);
         }
@@ -852,12 +1133,23 @@ impl<'a> Lower<'a> {
     /// the stack and `args` as they are: its guards, going to `slow` with
     /// nothing done, then its body, going on to `join` with its result in
     /// the callable's slot.
-    fn inline_body(&mut self, pc: usize, plan: &'a Plan, args: &[Item], slow: Block, join: Block) {
+    fn inline_body(
+        &mut self,
+        pc: usize,
+        plan: &'a Plan,
+        args: &[Item],
+        start: usize,
+        slow: Block,
+        join: Block,
+    ) {
         let nested = self.inlining();
-        let start = self.depth - 2;
         let argc = args.len();
         let code: &'a CodeObject = &plan.code;
-        let first = if plan.has_self { start + 1 } else { start + 2 };
+        let first = match (plan.dunder, plan.has_self) {
+            (Some(_), _) => start,
+            (None, true) => start + 1,
+            (None, false) => start + 2,
+        };
         let nlocals = plan.nlocals;
         let base = first + nlocals;
         let handle = {
@@ -865,7 +1157,7 @@ impl<'a> Lower<'a> {
             unsafe { std::ptr::from_ref(&plan.code).cast::<u64>().read() }
         };
         let mut site = Box::new(InlineSite {
-            key: Cell::new(handle),
+            key: Cell::new(plan.dunder.map_or(handle, |d| d.ver)),
             entries: Cell::new(0),
             exits: Cell::new(0),
             parent: self
@@ -879,33 +1171,46 @@ impl<'a> Lower<'a> {
             base,
             nlocals,
             borrowed: Vec::new(),
+            method: plan
+                .dunder
+                .map(|d| (Object::Function(plan.func.clone()), d.arg)),
         });
         let site_at = std::ptr::from_ref::<InlineSite>(&site) as i64;
+        let method_at = site
+            .method
+            .as_ref()
+            .map(|(f, _)| std::ptr::from_ref(f) as i64);
 
         // The guards: nothing has happened yet when one fails.
         let ptr = self.ptr;
-        let at = self.slot_addr(start);
-        let tag = self.tag_at(at);
-        let not_fn = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.function));
-        self.branch_out(not_fn, slow);
-        let word = self.b.ins().load(ptr, FLAGS, at, 8);
-        let current = self.b.ins().load(types::I64, FLAGS, word, plan.layout.code);
         let sv = self.b.ins().iconst(ptr, site_at);
-        let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
-        let other = self.b.ins().icmp(IntCC::NotEqual, current, key);
-        let self_at = self.slot_addr(start + 1);
-        let self_tag = self.tag_at(self_at);
-        let no_self = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, self_tag, i64::from(self.tags.unbound));
-        let wrong = if plan.has_self {
-            no_self
-        } else {
-            self.b.ins().bxor_imm(no_self, 1)
+        let (other, wrong) = match plan.dunder {
+            Some(d) => self.dunder_guards(d, args, sv, slow),
+            None => {
+                let at = self.slot_addr(start);
+                let tag = self.tag_at(at);
+                let not_fn =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.function));
+                self.branch_out(not_fn, slow);
+                let word = self.b.ins().load(ptr, FLAGS, at, 8);
+                let current = self.b.ins().load(types::I64, FLAGS, word, plan.layout.code);
+                let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
+                let other = self.b.ins().icmp(IntCC::NotEqual, current, key);
+                let self_at = self.slot_addr(start + 1);
+                let self_tag = self.tag_at(self_at);
+                let no_self =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, self_tag, i64::from(self.tags.unbound));
+                let wrong = if plan.has_self {
+                    no_self
+                } else {
+                    self.b.ins().bxor_imm(no_self, 1)
+                };
+                (other, wrong)
+            }
         };
         let gen_addr = self
             .b
@@ -937,6 +1242,7 @@ impl<'a> Lower<'a> {
             let given = argc + usize::from(plan.has_self);
             let dst = self.slot_addr(first + given);
             let n = self.b.ins().iconst(types::I64, plan.missing as i64);
+            let at = self.slot_addr(start);
             let r = self
                 .call(h_inline_defaults as *const () as usize, &[at, dst, n], true)
                 .expect("returns");
@@ -1052,8 +1358,10 @@ impl<'a> Lower<'a> {
             site: site_at,
             start,
             base,
+            method_at,
             places,
             values,
+            fields: Vec::new(),
             exit_block,
             ret,
             saved,
@@ -1114,7 +1422,9 @@ impl<'a> Lower<'a> {
             }
         }
         let at = self.slot_addr(start);
-        self.release_slot(at);
+        if plan.dunder.is_none() {
+            self.release_slot(at);
+        }
         let src = self.slot_addr(base);
         self.copy16(at, src);
         self.vs.clear();
@@ -1122,6 +1432,136 @@ impl<'a> Lower<'a> {
         self.set_last(pc);
         self.check_released(pc + 1);
         self.b.ins().jump(join, &[]);
+    }
+
+    /// The guards of a `BINARY_OP`'s method: the left operand an instance of
+    /// a class at the site's version, the right as the site saw it (a
+    /// mismatch of either kind goes to `slow`). The values to test: the
+    /// version compared, and a value false.
+    fn dunder_guards(
+        &mut self,
+        d: Dunder,
+        args: &[Item],
+        sv: Value,
+        slow: Block,
+    ) -> (Value, Value) {
+        let l = *self.layout.expect("checked by the caller");
+        let ptr = self.ptr;
+        let Some(a_at) = self.operand_addr(args[0]) else {
+            self.b.ins().jump(slow, &[]);
+            let dead = self.b.create_block();
+            self.b.switch_to_block(dead);
+            let f = self.b.ins().iconst(types::I8, 0);
+            return (f, f);
+        };
+        let tag = self.tag_at(a_at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, slow);
+        let inst = self.b.ins().load(ptr, FLAGS, a_at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let ver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
+        let other = self.b.ins().icmp(IntCC::NotEqual, ver, key);
+        let wrong = match (d.right, args[1]) {
+            (Some(t), Item::Int(_)) => self
+                .b
+                .ins()
+                .iconst(types::I8, i64::from(t != self.tags.int)),
+            (Some(t), Item::Float(_)) => self
+                .b
+                .ins()
+                .iconst(types::I8, i64::from(t != self.tags.float)),
+            (Some(t), Item::Const(k)) => {
+                let same = self.ext.objects[k as usize].tag() == t;
+                self.b.ins().iconst(types::I8, i64::from(!same))
+            }
+            (right, item) => {
+                let Some(b_at) = self.operand_addr(item) else {
+                    self.b.ins().jump(slow, &[]);
+                    let dead = self.b.create_block();
+                    self.b.switch_to_block(dead);
+                    let f = self.b.ins().iconst(types::I8, 0);
+                    return (f, f);
+                };
+                let btag = self.tag_at(b_at);
+                match right {
+                    Some(t) => self.b.ins().icmp_imm(IntCC::NotEqual, btag, i64::from(t)),
+                    None => {
+                        let not_inst = self.b.ins().icmp_imm(
+                            IntCC::NotEqual,
+                            btag,
+                            i64::from(self.tags.instance),
+                        );
+                        self.branch_out(not_inst, slow);
+                        let binst = self.b.ins().load(ptr, FLAGS, b_at, 8);
+                        let bcls = self.b.ins().load(ptr, FLAGS, binst, l.inst_class);
+                        self.b.ins().icmp(IntCC::NotEqual, bcls, cls)
+                    }
+                }
+            }
+        };
+        (other, wrong)
+    }
+
+    /// The address of an operand that's a local or on the stack.
+    fn operand_addr(&mut self, item: Item) -> Option<Value> {
+        match item {
+            Item::Local(i) => Some(self.local_addr(i)),
+            Item::Mem(s) => Some(self.slot_addr(s)),
+            _ => None,
+        }
+    }
+
+    /// `BINARY_OP` at `pc` of the Python method `plans` lowers in line: its
+    /// guards and body, with the instruction's other shapes for anything
+    /// the guards don't take. The result on the stack where the left
+    /// operand was.
+    pub(super) fn inline_binop(&mut self, pc: usize, arg: u32, plans: &'a [Plan]) -> bool {
+        let before = self.b.func.dfg.num_insts();
+        let nested = self.inlining();
+        let bi = self.pop();
+        let ai = self.pop();
+        let args = [ai, bi];
+        self.flush();
+        let start = self.depth;
+        let call_last = self.last_pc;
+        let join = self.b.create_block();
+        let slow = self.b.create_block();
+        self.inline_body(pc, &plans[0], &args, start, slow, join);
+        self.b.switch_to_block(slow);
+        self.b.set_cold_block(slow);
+        self.vs = args.to_vec();
+        self.depth = start + 2;
+        self.last_pc = call_last;
+        if nested {
+            self.exit(INTERP, pc);
+        } else if self.binary_plain(pc, arg) {
+            self.flush();
+            self.b.ins().jump(join, &[]);
+        }
+        self.b.switch_to_block(join);
+        self.vs.clear();
+        self.depth = start + 1;
+        self.set_last(pc);
+        if !nested {
+            self.inline_ir += self.b.func.dfg.num_insts() - before;
+        }
+        true
+    }
+
+    /// The address of the running inlined body's function's `Object`.
+    fn inline_callable(&mut self) -> Value {
+        let f = self.inl.last().expect("in an inlined body");
+        match (f.method_at, f.start) {
+            (Some(at), _) => self.b.ins().iconst(self.ptr, at),
+            (None, start) => self.slot_addr(start),
+        }
     }
 
     /// Release the value at `at`: a plain decrement while another owner
@@ -1169,12 +1609,30 @@ impl<'a> Lower<'a> {
     /// on to its return.
     pub(super) fn inline_return(&mut self, pc: usize) -> bool {
         let f = self.inl.last().expect("in an inlined body");
-        let (base, ret) = (f.base, f.ret);
+        let (base, ret, dunder) = (f.base, f.ret, f.plan.dunder.is_some());
         if self.depth != base + 1 {
             self.exit(INTERP, pc);
             return false;
         }
         self.flush();
+        // An operator method's `NotImplemented` is the core loop's: the
+        // activation's return runs the operator's protocol.
+        if dunder {
+            let ni = crate::vm_singletons::not_implemented();
+            // SAFETY: an `Object` is 16 bytes, its second word the payload.
+            let word = unsafe { std::ptr::from_ref(&ni).cast::<[u64; 2]>().read() }[1];
+            let at = self.slot_addr(base);
+            let tag = self.tag_at(at);
+            let w = self.b.ins().load(types::I64, FLAGS, at, 8);
+            let same_tag = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, tag, i64::from(ni.tag()));
+            let same_word = self.b.ins().icmp_imm(IntCC::Equal, w, word as i64);
+            let is_ni = self.b.ins().band(same_tag, same_word);
+            let out = self.exit_with(pc, &[], INTERP);
+            self.branch_out(is_ni, out);
+        }
         self.b.ins().jump(ret, &[]);
         false
     }
@@ -1184,7 +1642,7 @@ impl<'a> Lower<'a> {
     /// no fused shapes.
     pub(super) fn inline_load_global(&mut self, pc: usize) -> bool {
         let f = self.inl.last().expect("in an inlined body");
-        let (start, layout) = (f.start, f.plan.layout);
+        let layout = f.plan.layout;
         let s = self.depth;
         let dst = self.slot_addr(s);
         let cache: Box<GlobalCache> = Box::default();
@@ -1193,7 +1651,7 @@ impl<'a> Lower<'a> {
         let helper = self.b.create_block();
         let done = self.b.create_block();
         let ptr = self.ptr;
-        let callee = self.slot_addr(start);
+        let callee = self.inline_callable();
         let word = self.b.ins().load(ptr, FLAGS, callee, 8);
         let c = self.b.ins().iconst(ptr, cache_at);
         let g = self.b.ins().load(types::I64, FLAGS, word, layout.globals);
@@ -1252,10 +1710,9 @@ impl<'a> Lower<'a> {
     /// `LOAD_DEREF` in an inlined body: the cell its function's closure
     /// holds, through [`h_inline_deref`].
     pub(super) fn inline_load_deref(&mut self, pc: usize, i: u32) -> bool {
-        let start = self.inl.last().expect("in an inlined body").start;
         let s = self.depth;
         let dst = self.slot_addr(s);
-        let callee = self.slot_addr(start);
+        let callee = self.inline_callable();
         let iv = self.b.ins().iconst(types::I64, i64::from(i));
         let r = self
             .call(
@@ -1739,6 +2196,7 @@ unsafe fn bind_levels(
                     Place::Stack(at) => base.add(at),
                     Place::Root(j) => st.locals.add(j as usize),
                     Place::At(a) => a as *const Object,
+                    Place::Temp(_) => unreachable!("settled before a call"),
                 };
                 base.add(home).write(crate::clone_hot(&*src));
             }
@@ -1751,7 +2209,11 @@ unsafe fn bind_levels(
         for (k, s) in chain.iter().enumerate() {
             let caller_frame = &mut *caller;
             caller_frame.pc = s.call_pc as u32 + 1;
-            let Object::Function(f) = &*base.add(s.start) else {
+            let callable: *const Object = match &s.method {
+                Some((f, _)) => f,
+                None => base.add(s.start),
+            };
+            let Object::Function(f) = &*callable else {
                 unreachable!("a site's callable is a function");
             };
             let fp: *const crate::object::PyFunction = Rc::as_ptr(f);
@@ -1771,7 +2233,13 @@ unsafe fn bind_levels(
             locals.set_len(s.nlocals);
             // The slot's handles are stale copies, overwritten without a
             // drop; the rest borrow from the callable, which it holds.
-            std::ptr::write(&raw mut act.callable, base.add(s.start).read());
+            std::ptr::write(
+                &raw mut act.callable,
+                match &s.method {
+                    Some((f, _)) => f.clone(),
+                    None => base.add(s.start).read(),
+                },
+            );
             std::ptr::write(&raw mut fr.code, code_rc.clone());
             std::ptr::write(&raw mut fr.globals, crate::borrowed_rc(&(*fp).globals));
             std::ptr::write(&raw mut fr.builtins, crate::borrowed_rc(&(*fp).builtins));
@@ -1784,6 +2252,21 @@ unsafe fn bind_levels(
                 ),
             );
             act.owns_cells = false;
+            // An operator method's `NotImplemented` becomes the operator's
+            // `TypeError` (see `InlineAct::binop`).
+            if let Some((_, arg)) = &s.method {
+                let locals = fr.locals.storage();
+                if let Object::Instance(a) = &locals[0] {
+                    let cls = a.cls();
+                    let right = match &locals[1] {
+                        Object::Instance(_) => cls.clone(),
+                        b => crate::builtins::class_of(b),
+                    };
+                    let op: BinOpKind = std::mem::transmute(*arg as u8);
+                    let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
+                    act.binop = Some((op, inplace, cls, right));
+                }
+            }
             // Its operands: up to its callee's callable, or its depth.
             let n = match chain.get(k + 1) {
                 Some(next) => next.start - s.base,
