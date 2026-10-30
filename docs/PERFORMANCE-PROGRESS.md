@@ -390,11 +390,20 @@ slowdown in that run was the even-sized chunks, since fixed.
   full compiled entry would leave about 330 (roughly 2% on `go`) for 150
   to 200 more IR instructions at every call site, and wouldn't reach lean
   bodies' calls (267,000 per `go` call) or recursive ones (150,000).
-- **Suspending generators and coroutines are protocol-bound.** Making,
-  yielding once and exhausting a generator costs 2,682 instructions against
-  CPython's 1,107, each `yield from` level about 3,700 more, spread over
-  about 40 functions; turning chain collapse off makes `generators_tree`
-  3.7 times slower. Closing it needs a lighter resume and yield protocol.
+- **Generators now resume lazily, as direct calls run.** A compiled
+  generator body resumed from compiled code or the core loop (`for`,
+  `next()`, `send()`, `yield from`, `await`, and a parked `yield from`
+  chain's innermost generator) runs from its consumer's native code with
+  its activation a record on the native stack, bound and pushed on the
+  switch only if something needs the core loop's view; inlined
+  `list`, `tuple`, `all` and `any` of a generator expression drain it in
+  one fast step. What remains is creation and teardown (making, yielding
+  once and exhausting a generator costs about 2,570 instructions against
+  CPython's 1,130, almost all of it outside the resume), the resume's own
+  checks and native entry (a resume of a body that calls a builtin costs
+  about 1,270 against 436), and a native caller's single step of a body
+  that isn't simple (`enumerate`, `zip`, an asyncio task's step), which
+  still enters `quiet_run` (about 2,800 instructions against 930).
 - **Compiles are a third of `stdlib_utils`' and `logging_mix`' gap in
   `run.py`'s window.** The frame JIT emits 20 to 35 IR instructions per
   bytecode instruction and Cranelift spends about 11,000 host instructions
@@ -408,10 +417,11 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. A lighter generator resume and yield protocol: no `InlineAct` push and
-   pop, pending-list entry or core-loop reload per switch, and a
-   generator pooled with its frame box (`generators_tree`, `async_tree`,
-   `nqueens`).
+1. Generators: a generator pooled with its frame box and fewer counted
+   handles per frame (creation and teardown are now most of a short-lived
+   generator's cost), and a native caller's step of a compiled body
+   without `quiet_run` (`async_tree`, `enumerate` and `zip` over
+   generators).
 2. Cold time: a much cheaper baseline compiler (fewer IR instructions per
    operation) or compiled code kept across processes.
 3. Peak memory: the binary's touched pages (12 to 13 MiB against
