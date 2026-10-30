@@ -13265,7 +13265,22 @@ impl Interpreter {
                                 pc += 1;
                                 continue;
                             }
-                            _ => break None,
+                            // What takes no dunder dispatch, out of line.
+                            _ => {
+                                // SAFETY: the two top slots are initialized.
+                                let Some(r) =
+                                    (unsafe { core_plain_compare(base.add(len - 2), kind) })
+                                else {
+                                    break None;
+                                };
+                                len -= 1;
+                                // SAFETY: the operands left; the result takes
+                                // the lower one's slot.
+                                unsafe { base.add(len - 1).write(bool_hot(r)) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                         };
                         let r = match kind {
                             CompareKind::Lt => ord.is_lt(),
@@ -37594,6 +37609,9 @@ impl Interpreter {
     }
 
     fn load_attr_inner(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
+        if burst_stats::enabled() {
+            burst_stats::note_generic("load", obj, name);
+        }
         // `__class__` is readable on *every* object and returns its
         // type. Instances and classes keep their dedicated handling
         // below (which honours `__class__` reassignment and the
@@ -41456,7 +41474,7 @@ impl Interpreter {
             keyword
                 .iter()
                 .find_map(|(k, v)| (k == base).then(|| v.clone()))
-                .ok_or_else(|| key_error(format!("'{base}'")))?
+                .ok_or_else(|| crate::error::key_error_object(Object::from_str(base)))?
         };
         for trailer in trailers {
             value = self.apply_trailer_interp(value, trailer, globals)?;
@@ -50232,10 +50250,7 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        if let Some(r) = native_scalar_compare(a, b, op) {
-            return Ok(Object::Bool(r));
-        }
-        if let Some(r) = native_seq_compare(a, b, op, 0) {
+        if let Some(r) = plain_compare(a, b, op) {
             return Ok(Object::Bool(r));
         }
         // Two instances whose left one's comparison dunder is a Python
@@ -53151,6 +53166,9 @@ impl Interpreter {
     }
 
     fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
+        if burst_stats::enabled() {
+            burst_stats::note_generic("store", obj, name);
+        }
         match obj {
             Object::Instance(inst) => self.store_attr_instance(inst, obj, name, value),
             // An exact `itertools` object's `__setstate__` replaces its
@@ -54132,6 +54150,9 @@ impl Interpreter {
     }
 
     fn delete_attr(&mut self, obj: &Object, name: &str) -> Result<(), RuntimeError> {
+        if burst_stats::enabled() {
+            burst_stats::note_generic("delete", obj, name);
+        }
         match obj {
             Object::Instance(inst) => {
                 if let Some(delattr) = inst.cls().lookup("__delattr__") {
@@ -55596,6 +55617,9 @@ impl Interpreter {
         outer_globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         let _ = outer_globals;
+        if burst_stats::enabled() {
+            burst_stats::note_generic_call(callable, args.len(), kwargs.len());
+        }
         match callable {
             Object::Builtin(b) => {
                 // Unbound generator-family methods reached via the type
@@ -72573,6 +72597,42 @@ mod burst_stats {
         }
     }
 
+    static GENERIC: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// A full attribute path's read, store or delete of `name` on `obj`.
+    pub(crate) fn note_generic(what: &str, obj: &crate::Object, name: &str) {
+        let recv = match obj {
+            crate::Object::Instance(i) => format!("instance of {}", i.cls_raw().name),
+            crate::Object::Type(t) => format!("class {}", t.name),
+            o => o.type_name().to_owned(),
+        };
+        let mut a = GENERIC.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(format!("{what} {name} on {recv}"))
+            .or_insert(0) += 1;
+    }
+
+    /// A call through the general `call` entry.
+    pub(crate) fn note_generic_call(callee: &crate::Object, nargs: usize, nkw: usize) {
+        use crate::Object;
+        let what = match callee {
+            Object::Function(f) => format!("function {}", f.code().qualname),
+            Object::Builtin(b) => format!("builtin {}", b.name),
+            Object::BoundMethod(bm) => match &bm.function {
+                Object::Function(f) => format!("method {}", f.code().qualname),
+                Object::Builtin(b) => format!("builtin method {}", b.name),
+                other => format!("bound {}", other.type_name()),
+            },
+            Object::Type(t) => format!("class {}", t.name),
+            o => o.type_name().to_owned(),
+        };
+        let mut a = GENERIC.lock().unwrap();
+        *a.get_or_insert_with(Default::default)
+            .entry(format!("call {what} ({nargs}, {nkw})"))
+            .or_insert(0) += 1;
+    }
+
     pub(crate) fn note_slow(op: Option<weavepy_compiler::OpCode>) {
         if let Some(op) = op {
             SLOW[op as u8 as usize].fetch_add(1, Ordering::Relaxed);
@@ -72769,6 +72829,18 @@ mod burst_stats {
         why.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (k, c) in why.iter().take(40) {
             let _ = writeln!(out, "  direct declined {k}: {c}");
+        }
+        let mut generic: Vec<(String, u64)> = GENERIC
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
+        generic.sort_by_key(|a| std::cmp::Reverse(a.1));
+        out.push_str("\n## General attribute paths and calls\n\n");
+        for (k, c) in generic.iter().take(80) {
+            let _ = writeln!(out, "  generic {k}: {c}");
         }
         out.push_str("\n## Slow-step sites\n\n");
         for (k, c) in sites.iter().take(40) {
@@ -75147,12 +75219,12 @@ fn resolve_field_name(
         map.borrow()
             .get(&key)
             .cloned()
-            .ok_or_else(|| key_error(format!("'{base}'")))?
+            .ok_or_else(|| crate::error::key_error_object(Object::from_str(base)))?
     } else {
         keyword
             .iter()
             .find_map(|(k, v)| (k == base).then(|| v.clone()))
-            .ok_or_else(|| key_error(format!("'{base}'")))?
+            .ok_or_else(|| crate::error::key_error_object(Object::from_str(base)))?
     };
     for trailer in trailers {
         value = apply_trailer(value, trailer)?;
@@ -75932,7 +76004,7 @@ pub(crate) fn percent_format_with(
                         .borrow()
                         .get(&DictKey(key_obj.clone()))
                         .cloned()
-                        .ok_or_else(|| key_error(key_obj.repr()))?,
+                        .ok_or_else(|| crate::error::key_error_object(key_obj.clone()))?,
                     // A mapping *instance* — a dict subclass that overrides
                     // `__getitem__` (Django's `DictWrapper` computes values
                     // for `qn_`-prefixed keys), `UserDict`, … — goes through
@@ -75951,7 +76023,9 @@ pub(crate) fn percent_format_with(
                                     .borrow()
                                     .get(&DictKey(key_obj.clone()))
                                     .cloned()
-                                    .ok_or_else(|| key_error(key_obj.repr()))?,
+                                    .ok_or_else(|| {
+                                        crate::error::key_error_object(key_obj.clone())
+                                    })?,
                                 _ => return Err(type_error("format requires a mapping")),
                             },
                         }
@@ -84657,6 +84731,155 @@ fn native_scalar_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool
         CompareKind::Gt => ord == Some(Ordering::Greater),
         CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
     })
+}
+
+/// [`plain_compare`] of the operands at `at` and above it, when releasing
+/// them can run nothing (so the caller needn't check for a queued finalizer
+/// at this instruction): the answer, with the operands released, or `None`,
+/// having touched nothing.
+///
+/// # Safety
+///
+/// The two slots at `at` are initialized; on `Some` they are moved out.
+#[inline(never)]
+pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Option<bool> {
+    // SAFETY: the caller's contract.
+    let (a, b) = unsafe { (&*at, &*at.add(1)) };
+    // A value that dies here may hold or be anything with a finalizer,
+    // except what owns no objects.
+    fn quiet(o: &Object) -> bool {
+        match o.strong_word() {
+            None => true,
+            // SAFETY: a counted variant's word, live while `o` is.
+            Some(w) => {
+                matches!(o, Object::Str(_) | Object::Bytes(_))
+                    || unsafe { &*w }.load(std::sync::atomic::Ordering::Relaxed) > 1
+            }
+        }
+    }
+    if !Interpreter::core_drops_plain()
+        || matches!(a, Object::AsyncGenAwait(_))
+        || matches!(b, Object::AsyncGenAwait(_))
+        || !quiet(a)
+        || !quiet(b)
+    {
+        return None;
+    }
+    let r = plain_compare(a, b, op)?;
+    // SAFETY: the operands leave their slots, each releasing a plain count.
+    unsafe {
+        drop_hot(at.add(1).read());
+        drop_hot(at.read());
+    }
+    Some(r)
+}
+
+/// How an operand of `==` or `!=` compares (see [`plain_compare`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EqClass {
+    /// An object that has no value but itself: `None`, a function, a class
+    /// or an instance whose `__eq__` and `__ne__` are the defaults.
+    Identity,
+    /// An exact built-in value that only answers its own family: numbers,
+    /// strings, bytes, tuples, lists, dicts, or sets.
+    Value(u8),
+}
+
+/// [`EqClass`] of `o`, `None` for anything else (its comparison is the full
+/// path's to run).
+#[inline]
+fn eq_class(o: &Object) -> Option<EqClass> {
+    use crate::types::Dunder;
+    Some(match o {
+        Object::None | Object::Function(_) => EqClass::Identity,
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) => EqClass::Value(0),
+        Object::Str(_) => EqClass::Value(1),
+        Object::Bytes(_) => EqClass::Value(2),
+        Object::Tuple(_) => EqClass::Value(3),
+        Object::List(_) => EqClass::Value(4),
+        Object::Dict(_) => EqClass::Value(5),
+        Object::Set(_) | Object::FrozenSet(_) => EqClass::Value(6),
+        Object::Instance(i) => {
+            let cls = i.cls_raw();
+            if i.native.get().is_some()
+                || cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || !cls.dunder(Dunder::Eq).object_owner()
+                || !cls.dunder(Dunder::Ne).object_owner()
+            {
+                return None;
+            }
+            EqClass::Identity
+        }
+        Object::Type(t) => {
+            if t.c_ext_ptr.get() != 0 {
+                return None;
+            }
+            if !t.metaclass_is_type() {
+                let meta = t.metaclass_or_type();
+                let default = |d: crate::types::DunderInfo| d.object_owner() || d.type_owner();
+                if !default(meta.dunder(Dunder::Eq)) || !default(meta.dunder(Dunder::Ne)) {
+                    return None;
+                }
+            }
+            EqClass::Identity
+        }
+        _ => return None,
+    })
+}
+
+/// `a <op> b` when the answer runs no Python code and needs no dunder
+/// dispatch: numbers, strings and bytes by value, the sequences
+/// [`native_seq_compare`] takes, and equality that comes down to identity
+/// because neither operand defines any (`x == None`, two instances or two
+/// classes with the default `__eq__`, a `str` against an `int`). `None`
+/// for everything else, which the full path decides.
+#[inline(never)]
+pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
+    use std::cmp::Ordering;
+    let by_ord = |ord: Option<Ordering>| match op {
+        CompareKind::Eq => ord == Some(Ordering::Equal),
+        CompareKind::NotEq => ord != Some(Ordering::Equal),
+        CompareKind::Lt => ord == Some(Ordering::Less),
+        CompareKind::LtE => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        CompareKind::Gt => ord == Some(Ordering::Greater),
+        CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+    };
+    match (a, b) {
+        (Object::Int(_), Object::Int(_))
+        | (Object::Float(_), Object::Float(_))
+        | (Object::Str(_), Object::Str(_)) => return native_scalar_compare(a, b, op),
+        (Object::Bool(x), Object::Bool(y)) => return Some(by_ord(Some(x.cmp(y)))),
+        (Object::Bool(x), Object::Int(y)) => return Some(by_ord(Some(i64::from(*x).cmp(y)))),
+        (Object::Int(x), Object::Bool(y)) => return Some(by_ord(Some(x.cmp(&i64::from(*y))))),
+        // (An int the float format holds exactly; Python compares the two
+        // exactly.)
+        (Object::Float(x), Object::Int(y)) if y.unsigned_abs() <= 1 << 53 => {
+            return Some(by_ord(x.partial_cmp(&(*y as f64))));
+        }
+        (Object::Int(x), Object::Float(y)) if x.unsigned_abs() <= 1 << 53 => {
+            return Some(by_ord((*x as f64).partial_cmp(y)));
+        }
+        (Object::Bytes(x), Object::Bytes(y)) => return Some(by_ord(Some(x[..].cmp(&y[..])))),
+        (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_)) => {
+            return native_seq_compare(a, b, op, 0);
+        }
+        _ => {}
+    }
+    if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+        return None;
+    }
+    let same = match (eq_class(a)?, eq_class(b)?) {
+        (EqClass::Identity, EqClass::Identity) => a.is_same(b),
+        (EqClass::Identity, EqClass::Value(_)) | (EqClass::Value(_), EqClass::Identity) => false,
+        // (`str` against `bytes` warns under `-b`.)
+        (EqClass::Value(1), EqClass::Value(2)) | (EqClass::Value(2), EqClass::Value(1)) => {
+            return None;
+        }
+        (EqClass::Value(x), EqClass::Value(y)) if x != y => false,
+        _ => return None,
+    };
+    Some(same == matches!(op, CompareKind::Eq))
 }
 
 /// `a <op> b` for two exact tuples (or two exact lists) whose compared
