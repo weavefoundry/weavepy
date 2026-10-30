@@ -191,6 +191,7 @@ class FrameJitExceptionsTest(unittest.TestCase):
             WEAVEPY_JIT="0",
             WEAVEPY_FRAME_JIT_TUNE="8,1,3,0",
             WEAVEPY_FRAME_JIT_HOT="50",
+            WEAVEPY_JIT_SYNC="1",
         )
         r = subprocess.run(
             [sys.executable, __file__, FORCED],

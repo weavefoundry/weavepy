@@ -86933,6 +86933,48 @@ assert loop(2000) == 1999000
         );
     }
 
+    /// Frame compiles generating their code in the background: the
+    /// interpreter keeps running the code until its native form comes
+    /// back, installs it at a warm-up check, and computes what it
+    /// computed without it. (In a child process: the switch is
+    /// process-wide.)
+    #[cfg(feature = "jit")]
+    #[test]
+    fn frame_compiles_install_from_the_background() {
+        const CHILD: &str = "WEAVEPY_BACKGROUND_COMPILE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::frame_compiles_install_from_the_background",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WEAVEPY_TIER2", "0")
+                    .env("WEAVEPY_FRAME_JIT_HOT", "50")
+                    .status()
+                    .expect("spawn background-compile test");
+            assert!(status.success(), "background-compile test failed: {status}");
+            return;
+        }
+        let src = "def tri(n):\n    t = 0\n    for i in range(n):\n        if i % 3:\n            t += i\n        else:\n            t -= 1\n    return t\n\
+                   def poly(a, b):\n    return a * b + a - b\n\
+                   s = 0\nfor k in range(3000):\n    s += tri(40) + poly(k, 7)\n\
+                   print(s)\n";
+        let sync = run(src);
+        crate::frame_jit::FORCE_ASYNC.store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = crate::frame_jit::INSTALLED.load(std::sync::atomic::Ordering::Relaxed);
+        let out = run(src);
+        let installed =
+            crate::frame_jit::INSTALLED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(out, sync);
+        assert!(installed >= 1, "no background compile was installed");
+        // A process can fork with the compiler idle and start it again.
+        crate::frame_jit::quiesce_compiler();
+        assert_eq!(run(src), sync);
+    }
+
     fn check_cold_instance_dictionaries() {
         let _gil = crate::gil::hold_gil();
         let source = r"

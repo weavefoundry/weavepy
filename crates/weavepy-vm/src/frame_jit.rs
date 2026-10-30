@@ -44,7 +44,7 @@
 //! object layout tier 2 measures (see `tier2::obj_layout`).
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
@@ -61,6 +61,9 @@ use crate::error::RuntimeError;
 use crate::object::{Object, PyIterator};
 use crate::sync::Rc;
 use crate::{body_pcs, CodeConstObjects, FieldSlot, Interpreter};
+
+mod queue;
+pub(crate) use queue::quiesce as quiesce_compiler;
 
 /// The core loop runs the instruction at `pc` itself.
 pub(crate) const INTERP: u32 = 0;
@@ -106,6 +109,21 @@ fn lean_above() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000)
+    })
+}
+
+/// The instruction count from which a body is lowered lean without
+/// measuring it first (see `compile_with`; `WEAVEPY_FRAME_JIT_LEAN_LEN`
+/// overrides it, a tuning aid). Over the workload suite, every compiled
+/// body of 157 instructions or more came out above [`lean_above`]'s size
+/// (and none of fewer than 74).
+fn lean_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_LEAN_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160)
     })
 }
 
@@ -425,6 +443,20 @@ pub(crate) struct Slot {
     /// How many times the code got hot while start-up or an import ran
     /// (see `try_compile`).
     deferred: AtomicU32,
+    /// The code's compile waiting for its machine code (see `queue`):
+    /// its ticket, or `0`.
+    ticket: AtomicU64,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let ticket = *self.ticket.get_mut();
+        if ticket != 0 {
+            // The code went away before its machine code came back: the
+            // compile's caches go now, and the machine code is discarded.
+            drop(take_waiting(ticket));
+        }
+    }
 }
 
 impl Slot {
@@ -450,7 +482,7 @@ impl Slot {
     /// native code, compiling it once it is hot.
     #[inline(always)]
     pub(crate) fn warm(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
-        if self.native.get().is_some() {
+        if self.native.get().is_some() || (queue::ready() && self.drained()) {
             return;
         }
         // The heat estimates the interpreting so far: a back edge counts its
@@ -494,7 +526,7 @@ impl Slot {
     /// `pathlib`'s callees switching for most of a benchmark run.)
     #[inline]
     pub(crate) fn warm_switched(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
-        if self.native.get().is_some() {
+        if self.native.get().is_some() || (queue::ready() && self.drained()) {
             return;
         }
         let n = code.instructions.len() as u32;
@@ -520,7 +552,7 @@ impl Slot {
     /// `chaos` and `raytrace` gain (1% to 3%) without that loss.
     #[inline]
     pub(crate) fn warm_native(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
-        if self.native.get().is_some() {
+        if self.native.get().is_some() || (queue::ready() && self.drained()) {
             return;
         }
         let n = code.instructions.len() as u32;
@@ -535,11 +567,30 @@ impl Slot {
         }
     }
 
+    /// Install the compiles whose machine code came back (see [`drain`]):
+    /// whether this code now has its native form.
+    #[cold]
+    #[inline(never)]
+    fn drained(&self) -> bool {
+        drain();
+        self.native.get().is_some()
+    }
+
     #[cold]
     #[inline(never)]
     fn try_compile(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
         if !enabled() {
             let _ = self.native.set(None);
+            return;
+        }
+        // Already compiling; or no room in the queue, so the code waits a
+        // little and tries again.
+        if self.ticket.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        if !sync_compiles() && queue::full() {
+            let at_hot = hot().saturating_mul(code.instructions.len() as u32);
+            self.heat.store(at_hot - at_hot / 8, Ordering::Relaxed);
             return;
         }
         // Code that start-up or an import runs is mostly run once (a
@@ -579,17 +630,131 @@ impl Slot {
             return;
         }
         let t0 = stats::enabled().then(std::time::Instant::now);
-        let n = self
-            .native
-            .get_or_init(|| compile(code, ext, nlocals, at).map(Box::new));
+        let Some(lowered) = compile(code, ext, nlocals, at) else {
+            let _ = self.native.set(None);
+            return;
+        };
+        let Compile { isa, units, parts } = lowered;
+        if !sync_compiles() {
+            let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+            let size = units.iter().map(|u| u.func.dfg.num_insts()).sum();
+            self.ticket.store(ticket, Ordering::Relaxed);
+            waiting().0.push((ticket, std::ptr::from_ref(self), parts));
+            match queue::submit(
+                &isa,
+                queue::Job {
+                    ticket,
+                    units,
+                    size,
+                },
+            ) {
+                Ok(()) => {
+                    if let Some(t0) = t0 {
+                        eprintln!(
+                            "frame jit: {} queued ({} instructions, {:?})",
+                            code.qualname,
+                            code.instructions.len(),
+                            t0.elapsed()
+                        );
+                    }
+                    return;
+                }
+                Err(job) => {
+                    // No worker: generate the code here after all.
+                    let parts = take_waiting(ticket).expect("just queued").2;
+                    publish(self, install(parts, queue::generate(&*isa, job.units)));
+                    return;
+                }
+            }
+        }
+        let compiled = publish(self, install(parts, queue::generate(&*isa, units)));
         if let Some(t0) = t0 {
             eprintln!(
                 "frame jit: {} compiled: {} ({} instructions, {:?})",
                 code.qualname,
-                n.is_some(),
+                compiled,
                 code.instructions.len(),
                 t0.elapsed()
             );
+        }
+    }
+}
+
+/// Whether frame compiles generate their code on the interpreter's thread,
+/// where the code got hot (`WEAVEPY_JIT_SYNC=1`, for tests that expect a
+/// compile at a deterministic point; the default in unit tests), rather
+/// than on the background compiler's (see `queue`).
+fn sync_compiles() -> bool {
+    #[cfg(test)]
+    if FORCE_ASYNC.load(Ordering::Relaxed) {
+        return false;
+    }
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| match std::env::var_os("WEAVEPY_JIT_SYNC") {
+        Some(v) => v != "0",
+        None => cfg!(test),
+    })
+}
+
+/// Unit tests of background compiles turn them on here, and count the
+/// compiles installed from the queue.
+#[cfg(test)]
+pub(crate) static FORCE_ASYNC: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static INSTALLED: AtomicU64 = AtomicU64::new(0);
+
+/// Tickets for queued compiles (`0` is none).
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// The queued compiles, by ticket: the slot each publishes to, and what
+/// its native form keeps besides the machine code. They hold objects, so
+/// only the interpreter's thread (holding the GIL: frame compiles are off
+/// without one) touches them.
+struct Waiting(Vec<(u64, *const Slot, Parts)>);
+
+// SAFETY: only used under the GIL (see `Waiting`).
+unsafe impl Send for Waiting {}
+
+static WAITING: std::sync::Mutex<Waiting> = std::sync::Mutex::new(Waiting(Vec::new()));
+
+fn waiting() -> std::sync::MutexGuard<'static, Waiting> {
+    WAITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Remove the queued compile `ticket` (dropped by the caller, outside the
+/// lock: its caches may hold the last references to objects).
+fn take_waiting(ticket: u64) -> Option<(u64, *const Slot, Parts)> {
+    let mut w = waiting();
+    let at = w.0.iter().position(|e| e.0 == ticket)?;
+    Some(w.0.swap_remove(at))
+}
+
+/// Install the queued compiles whose machine code came back: each code's
+/// native form is published as a synchronous compile publishes it, and a
+/// compile whose code went away meanwhile is discarded. Runs where the
+/// warm-up counters run (the core loop's activations and back edges of
+/// code without native code), which every code waiting for its compile
+/// passes through.
+#[cold]
+#[inline(never)]
+fn drain() {
+    for (ticket, outcome) in queue::take_done() {
+        let Some((_, slot, parts)) = take_waiting(ticket) else {
+            continue;
+        };
+        let installed = install(parts, outcome);
+        // SAFETY: a slot removes its entry from `WAITING` as it drops, and
+        // nothing that could drop one ran since the entry was taken
+        // (`publish` drops a failed compile's caches last).
+        let compiled = publish(unsafe { &*slot }, installed);
+        #[cfg(test)]
+        if compiled {
+            INSTALLED.fetch_add(1, Ordering::Relaxed);
+        }
+        if stats::enabled() {
+            eprintln!("frame jit: installed: {compiled}");
         }
     }
 }
@@ -9330,6 +9495,8 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
 /// code is never freed).
 struct Engine {
     module: JITModule,
+    /// The module's target, which the background compiler shares.
+    isa: cranelift_codegen::isa::OwnedTargetIsa,
     ctx: cranelift_codegen::Context,
     fbctx: FunctionBuilderContext,
     ptr: types::Type,
@@ -9372,13 +9539,14 @@ impl Engine {
             .finish(settings::Flags::new(flags))
             .ok()?;
         let module = JITModule::new(JITBuilder::with_isa(
-            isa,
+            isa.clone(),
             cranelift_module::default_libcall_names(),
         ));
         let ptr = module.target_config().pointer_type();
         let ctx = module.make_context();
         Some(Engine {
             module,
+            isa,
             ctx,
             fbctx: FunctionBuilderContext::new(),
             ptr,
@@ -9395,10 +9563,18 @@ fn verify() -> bool {
     *VERIFY.get_or_init(|| std::env::var_os("WEAVEPY_FRAME_JIT_VERIFY").is_some())
 }
 
-/// Compile `code`; `None` leaves it to the core loop. A compiler panic
+/// A lowered compile: its functions, for code generation (see `queue`),
+/// and the rest of its native form.
+struct Compile {
+    isa: cranelift_codegen::isa::OwnedTargetIsa,
+    units: Vec<queue::Unit>,
+    parts: Parts,
+}
+
+/// Lower `code`; `None` leaves it to the core loop. A compiler panic
 /// turns frame compilation off for the process rather than taking the
 /// interpreter down.
-fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) -> Option<Native> {
+fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) -> Option<Compile> {
     if code.instructions.is_empty() || code.instructions.len() > MAX_INSTRUCTIONS {
         return None;
     }
@@ -9416,7 +9592,11 @@ fn compile(code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) 
         compile_with(engine, code, ext, nlocals, &depths, prune)
     }));
     match built {
-        Ok(native) => native,
+        Ok(lowered) => lowered.map(|(units, parts)| Compile {
+            isa: engine.isa.clone(),
+            units,
+            parts,
+        }),
         Err(_) => {
             *guard = Some(None);
             None
@@ -9431,7 +9611,7 @@ fn compile_with(
     nlocals: usize,
     depths: &[i64],
     prune: bool,
-) -> Option<Native> {
+) -> Option<(Vec<queue::Unit>, Parts)> {
     let n = code.instructions.len();
     // The attribute sites' field caches (allocated here if no read has
     // recorded one yet: the code addresses them).
@@ -9439,8 +9619,10 @@ fn compile_with(
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
-    // goes to its calls more than to the shortcuts in line.
-    let mut lean = false;
+    // goes to its calls more than to the shortcuts in line. A body this
+    // long always comes out large, so it's lowered lean at once (the
+    // measuring lowering cost the interpreter's thread as much again).
+    let mut lean = n >= lean_len();
     let whole = loop {
         let low = lower_range(
             engine,
@@ -9468,16 +9650,18 @@ fn compile_with(
         .then(|| chunk_ranges(code, &whole.starts, &whole.sizes, total, limit))
         .filter(|r| u8::try_from(r.len()).is_ok());
     let Some(ranges) = ranges else {
-        let func = define(engine, code, lean, t0, None)?;
-        return Some(native(
-            code,
-            nlocals,
-            depths,
-            func,
-            Vec::new(),
-            Vec::new(),
-            whole.entries,
-            whole.caches,
+        let unit = define(engine, code, lean, t0, None)?;
+        return Some((
+            vec![unit],
+            parts(
+                code,
+                nlocals,
+                depths,
+                false,
+                Vec::new(),
+                whole.entries,
+                whole.caches,
+            ),
         ));
     };
     // Too large for one compile: each chunk lowered and compiled on its
@@ -9506,8 +9690,9 @@ fn compile_with(
         }
         caches.append(low.caches);
     }
-    Some(native(
-        code, nlocals, depths, chunks[0], chunks, chunk_at, entries, caches,
+    Some((
+        chunks,
+        parts(code, nlocals, depths, true, chunk_at, entries, caches),
     ))
 }
 
@@ -9591,21 +9776,19 @@ fn lower_range(
     low
 }
 
-/// Compile the function in the engine's context (the code's, or its
-/// chunk `range`'s) and release the context: its entry, or `None`.
+/// Take the function in the engine's context (the code's, or its chunk
+/// `range`'s) for code generation, declared in the module, and release
+/// the context: `None` if it can't be declared.
 fn define(
     engine: &mut Engine,
     code: &CodeObject,
     lean: bool,
     t0: Option<std::time::Instant>,
     range: Option<&std::ops::Range<usize>>,
-) -> Option<NativeFn> {
+) -> Option<queue::Unit> {
     if std::env::var("WEAVEPY_FRAME_JIT_DUMP").is_ok_and(|n| code.qualname.contains(&n)) {
         eprintln!("{}", engine.ctx.func.display());
     }
-    let t1 = stats::enabled().then(std::time::Instant::now);
-    let insts = engine.ctx.func.dfg.num_insts();
-    let blocks = engine.ctx.func.dfg.num_blocks();
     let name = format!("wpframe_{}", engine.next);
     engine.next += 1;
     let Ok(id) = engine
@@ -9615,59 +9798,144 @@ fn define(
         engine.release();
         return None;
     };
-    let defined = engine.module.define_function(id, &mut engine.ctx);
-    if let (Some(t0), Some(t1)) = (t0, t1) {
-        let bytes = engine
-            .ctx
-            .compiled_code()
-            .map_or(0, |c| c.code_buffer().len());
-        eprintln!(
-            "frame jit: {}{} lowered in {:?} ({insts} IR instructions, {blocks} blocks{}, {bytes} bytes), compiled in {:?}",
-            code.qualname,
-            range.map_or(String::new(), |r| format!(" [{}..{})", r.start, r.end)),
-            t1 - t0,
-            if lean { ", lean" } else { "" },
-            t1.elapsed()
-        );
-    }
-    if let (Err(e), true) = (&defined, verify()) {
-        eprintln!(
-            "weavepy: frame {:?} failed to compile: {e:?}",
-            code.qualname
-        );
-    }
+    let func = std::mem::replace(&mut engine.ctx.func, cranelift_codegen::ir::Function::new());
     engine.release();
-    defined.ok()?;
-    engine.module.finalize_definitions().ok()?;
-    let func = engine.module.get_finalized_function(id);
-    // SAFETY: `func` is a finalized function with exactly the signature
-    // declared above, and the module (never dropped) keeps it alive.
-    Some(unsafe { std::mem::transmute::<*const u8, NativeFn>(func) })
+    let label = if stats::enabled() || verify() {
+        format!(
+            "{}{}",
+            code.qualname,
+            range.map_or(String::new(), |r| format!(" [{}..{})", r.start, r.end))
+        )
+    } else {
+        String::new()
+    };
+    Some(queue::Unit {
+        id,
+        func,
+        label,
+        lean,
+        lowered: t0.map(|t0| t0.elapsed()),
+    })
+}
+
+/// Define a compile's machine code in the engine's module: its native
+/// form, or, when it has none, its parts back (for the caller to drop
+/// once the code's slot is settled: the caches may hold the last
+/// references to objects, the code's own among them). A panicked code
+/// generator turns frame compiles off.
+fn install(parts: Parts, outcome: queue::Outcome) -> Result<Native, Box<Parts>> {
+    let funcs = {
+        let mut guard = ENGINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            queue::Outcome::Ready(machines) => match guard.as_mut() {
+                Some(Some(engine)) => {
+                    let defined = machines.iter().all(|m| {
+                        engine
+                            .module
+                            .define_function_bytes(m.id, m.align, &m.bytes, &m.relocs)
+                            .is_ok()
+                    });
+                    (defined && engine.module.finalize_definitions().is_ok()).then(|| {
+                        machines
+                            .iter()
+                            .map(|m| {
+                                let f = engine.module.get_finalized_function(m.id);
+                                // SAFETY: `f` is a finalized function with
+                                // exactly the signature it was declared
+                                // with, and the module (never dropped) keeps
+                                // it alive.
+                                unsafe { std::mem::transmute::<*const u8, NativeFn>(f) }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }
+                _ => None,
+            },
+            queue::Outcome::Failed => None,
+            queue::Outcome::Panicked => {
+                *guard = Some(None);
+                None
+            }
+        }
+    };
+    match funcs {
+        Some(funcs) => Ok(parts.finish(funcs)),
+        None => Err(Box::new(parts)),
+    }
+}
+
+/// Publish `installed` (see [`install`]) to `slot`, then drop what a
+/// failed compile leaves.
+fn publish(slot: &Slot, installed: Result<Native, Box<Parts>>) -> bool {
+    let (native, rest) = match installed {
+        Ok(native) => (Some(Box::new(native)), None),
+        Err(parts) => (None, Some(parts)),
+    };
+    slot.ticket.store(0, Ordering::Relaxed);
+    let compiled = slot.native.get_or_init(|| native).is_some();
+    drop(rest);
+    compiled
+}
+
+/// A native form but for its machine code (see [`Native`]).
+struct Parts {
+    nlocals: usize,
+    chunked: bool,
+    chunk_at: Vec<u8>,
+    entries: Vec<bool>,
+    name: String,
+    ops: Box<[OpCode]>,
+    depths: Box<[i64]>,
+    need: usize,
+    caches: Caches,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn native(
+fn parts(
     code: &CodeObject,
     nlocals: usize,
     depths: &[i64],
-    func: NativeFn,
-    chunks: Vec<NativeFn>,
+    chunked: bool,
     chunk_at: Vec<u8>,
     entries: Vec<bool>,
     caches: Caches,
-) -> Native {
-    Native {
-        func,
-        chunks: chunks.into(),
-        chunk_at: chunk_at.into(),
+) -> Parts {
+    Parts {
         nlocals,
-        fails: entries.iter().map(|_| AtomicU8::new(0)).collect(),
-        entries: entries.into_iter().map(AtomicBool::new).collect(),
+        chunked,
+        chunk_at,
+        entries,
         name: code.qualname.to_string(),
         ops: code.instructions.iter().map(|i| i.op).collect(),
         depths: depths.into(),
         need: stack_need(depths),
-        _caches: caches,
+        caches,
+    }
+}
+
+impl Parts {
+    /// The native form, with its functions' code (the chunks', in order,
+    /// for a body compiled in chunks).
+    fn finish(self, funcs: Vec<NativeFn>) -> Native {
+        Native {
+            func: funcs[0],
+            chunks: if self.chunked {
+                funcs.into()
+            } else {
+                Box::default()
+            },
+            chunk_at: self.chunk_at.into(),
+            nlocals: self.nlocals,
+            fails: self.entries.iter().map(|_| AtomicU8::new(0)).collect(),
+            entries: self.entries.into_iter().map(AtomicBool::new).collect(),
+            name: self.name,
+            ops: self.ops,
+            depths: self.depths,
+            need: self.need,
+            _caches: self.caches,
+        }
     }
 }
 
