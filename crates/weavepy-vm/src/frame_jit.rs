@@ -147,6 +147,19 @@ fn chunk_ir() -> usize {
     })
 }
 
+/// The most IR instructions one compile takes for a body that fits
+/// [`chunk_ir`] on its own and has callees in line
+/// (`WEAVEPY_FRAME_JIT_INLINE_ROOM` overrides it, a tuning aid).
+fn chunk_room() -> usize {
+    static ROOM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_INLINE_ROOM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(chunk_ir() + chunk_ir() / 2)
+    })
+}
+
 /// How many entries at a pc may get nowhere before the core loop stops
 /// entering there.
 const MAX_FAILS: u8 = 32;
@@ -8281,7 +8294,10 @@ unsafe fn direct_enter(
         // without a drop: the code owned (unless the warm slot holds it),
         // the rest borrowed from the callable, which the slot holds.
         std::ptr::write(&raw mut act.callable, base.add(start).read());
-        caller.stack.set_len(start);
+        // (An inlined body's depth isn't its frame's: `h_inline_call` set it.)
+        if st.inl_call.is_null() {
+            caller.stack.set_len(start);
+        }
         if !held {
             std::ptr::write(&raw mut fr.code, code_rc.clone());
         }
@@ -11132,7 +11148,7 @@ fn compile_with(
     let field_slots = ext.alloc_field_sites(code);
     // (Callees in line must not make a body too large for one compile: a
     // jump between chunks costs more than the calls they'd save.)
-    let mut plans = inline::plan(code, ext, depths, inline::MAX_TOTAL);
+    let mut plans = inline::plan(code, ext, depths, inline::max_total());
     let mut need = stack_need(depths).max(plans.need);
     let t0 = stats::enabled().then(std::time::Instant::now);
     // A body whose code comes out large is lowered again lean: compiling
@@ -11177,7 +11193,7 @@ fn compile_with(
         // can cost more than the calls in line save. (A little room above
         // the limit for them: a jump costs more than the memory.)
         let own = total - low.inline_ir;
-        let room = chunk_ir() + chunk_ir() / 2;
+        let room = chunk_room();
         if low.inline_ir > 0 && chunk_ir() != 0 && own <= chunk_ir() && total > room {
             let each = (low.inline_ir / plans.total.max(1)).max(1);
             let fits = (room * 9 / 10).saturating_sub(own) / each;
@@ -11192,7 +11208,7 @@ fn compile_with(
     let total = engine.ctx.func.dfg.num_insts();
     let own = total - whole.inline_ir;
     let limit = if own <= chunk_ir() {
-        chunk_ir() + chunk_ir() / 2
+        chunk_room()
     } else {
         chunk_ir()
     };

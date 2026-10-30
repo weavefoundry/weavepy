@@ -64,10 +64,22 @@ const MAX_LEVELS: usize = 3;
 /// The longest callee inlined, in instructions.
 const MAX_BODY: usize = 64;
 /// How many instructions of callees one caller's lowering takes at first
-/// (see [`plan`]).
-pub(super) const MAX_TOTAL: usize = 320;
-/// How many callees one site guards for, one after another.
+/// (see [`plan`]; `WEAVEPY_FRAME_JIT_INLINE_BUDGET` overrides it, a tuning
+/// aid).
+pub(super) fn max_total() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_INLINE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160)
+    })
+}
+/// How many callees one site guards for, one after another, and how many of
+/// the shortest (a table of small lambdas, a tree's node classes).
 const MAX_POLY: usize = 3;
+const MAX_POLY_TINY: usize = 6;
+const TINY_BODY: usize = 8;
 /// How many exits a site takes before its ratio to the entries counts.
 const MIN_EXITS: u32 = 64;
 /// A site turns off once more than one entry in this many exits.
@@ -305,6 +317,8 @@ fn inline_op(op: OpCode) -> bool {
             | OpCode::DeleteFast
             | OpCode::LoadFastAndClear
             | OpCode::DeleteAttr
+            | OpCode::LoadSpecial
+            | OpCode::LoadSuperAttr
     )
 }
 
@@ -478,8 +492,11 @@ pub(super) fn plan(
         }
         let names = kw_names(code, ext, pc).filter(|_| i.op == OpCode::CallKw);
         let mut chosen = Vec::new();
-        for (f, has_self, classes) in callees.into_iter().take(MAX_POLY) {
+        for (f, has_self, classes) in callees.into_iter().take(MAX_POLY_TINY) {
             let callee = f.code();
+            if chosen.len() >= MAX_POLY && callee.instructions.len() > TINY_BODY {
+                continue;
+            }
             match admit(
                 &f,
                 &callee,
@@ -710,9 +727,12 @@ fn admit(
                 if names.is_some() {
                     for (g, self_slot, classes) in callees_at(code, ext, &depths, pc)
                         .into_iter()
-                        .take(MAX_POLY)
+                        .take(MAX_POLY_TINY)
                     {
                         let c = g.code();
+                        if chosen.len() >= MAX_POLY && c.instructions.len() > TINY_BODY {
+                            continue;
+                        }
                         let n = call_argc(code, ext, pc);
                         if let Ok(mut p) = admit(&g, &c, self_slot, n, names, path, budget) {
                             p.classes = classes;
@@ -739,8 +759,11 @@ fn admit(
                             weavepy_compiler::InlineCache::Empty
                         );
                     let mut chosen = Vec::new();
-                    for (g, self_slot, classes) in callees.into_iter().take(MAX_POLY) {
+                    for (g, self_slot, classes) in callees.into_iter().take(MAX_POLY_TINY) {
                         let c = g.code();
+                        if chosen.len() >= MAX_POLY && c.instructions.len() > TINY_BODY {
+                            continue;
+                        }
                         if c.is_generator || c.is_coroutine || c.is_async_generator {
                             leaves = true;
                         }
@@ -1230,8 +1253,10 @@ impl<'a> Lower<'a> {
         let code = self.code;
         let ins = &code.instructions;
         let call_pc = method_call_pc(code, self.ext, self.depths, attr_pc)?;
-        if ins[call_pc].op != OpCode::Call
-            || ins[call_pc].arg as usize != call_pc - attr_pc - 1
+        // (A `CALL_KW`'s names, the load before it, aren't an argument.)
+        let is_kw = ins[call_pc].op == OpCode::CallKw;
+        let last_arg = call_pc - usize::from(is_kw);
+        if call_argc(code, self.ext, call_pc) != last_arg - attr_pc - 1
             || self.depth == 0
             || self.starts[attr_pc + 1..=call_pc].iter().any(|&s| s)
         {
@@ -1241,7 +1266,7 @@ impl<'a> Lower<'a> {
         if !plans.iter().all(|p| p.has_self && p.dunder.is_none()) {
             return None;
         }
-        for i in &ins[attr_pc + 1..call_pc] {
+        for i in &ins[attr_pc + 1..last_arg] {
             match i.op {
                 OpCode::LoadFast | OpCode::LoadFastBorrow => {
                     let k = i.arg as usize;
@@ -1259,7 +1284,7 @@ impl<'a> Lower<'a> {
         }
         let recv = self.pop();
         let mut items = vec![recv];
-        for i in &ins[attr_pc + 1..call_pc] {
+        for i in &ins[attr_pc + 1..last_arg] {
             items.push(match i.op {
                 OpCode::LoadConst => Item::Const(i.arg),
                 OpCode::LoadSmallInt => {
@@ -1325,8 +1350,18 @@ impl<'a> Lower<'a> {
         );
         self.vs = items[1..].to_vec();
         self.depth = start + 2 + items.len() - 1;
-        self.plain_call(call_pc, items.len() - 1);
-        self.b.ins().jump(join, &[]);
+        if is_kw {
+            self.push(Item::Const(ins[last_arg].arg));
+            if nested {
+                self.exit(INTERP, call_pc);
+            } else {
+                self.call_with(call_pc, h_call_kw as *const () as usize, false);
+                self.b.ins().jump(join, &[]);
+            }
+        } else {
+            self.plain_call(call_pc, items.len() - 1);
+            self.b.ins().jump(join, &[]);
+        }
         self.b.switch_to_block(join);
         self.vs.clear();
         self.depth = start + 1;
@@ -2223,6 +2258,9 @@ unsafe extern "C" fn h_inline_call(
         };
         dc.set(depth + (*call).levels);
         s.inl_call = call;
+        // What the frame holds while the callee runs: the bodies' values
+        // aren't its yet.
+        (*s.frame).stack.set_len(root_site((*call).site).start);
         let r = direct_call::<false>(s, pc, start, len, &mut *site, None, None);
         if s.inl_gone {
             return r.unwrap_or(RELOAD);
