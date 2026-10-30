@@ -1752,7 +1752,7 @@ unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
         if !droppable(&*slot) {
             return 1;
         }
-        crate::drop_hot(slot.read());
+        crate::drop_hot_at(slot);
     }
     0
 }
@@ -1812,7 +1812,7 @@ unsafe fn h_pop_slow(st: *mut State, site: SlotWord) -> u32 {
         if !droppable(&*at) {
             return left(st, site.pc(), site.last(), site.slot() + 1);
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         if (*(*st).maybe_dead).get() {
             return left_marked(st, site.pc(), site.slot());
         }
@@ -4553,8 +4553,8 @@ unsafe extern "C" fn h_super_attr(
                 // moves into the shape the `CALL` expects, or binds.
                 let f = Object::Function(f.clone());
                 let self_v = base.add(len - 1).read();
-                crate::drop_hot(base.add(len - 2).read());
-                crate::drop_hot(base.add(len - 3).read());
+                crate::drop_hot_at(base.add(len - 2));
+                crate::drop_hot_at(base.add(len - 3));
                 if ins.arg & 1 != 0 {
                     base.add(len - 3).write(f);
                     base.add(len - 2).write(self_v);
@@ -4630,8 +4630,8 @@ unsafe extern "C" fn h_container(
                         .is_some_and(|d| d.get(&probe).is_none() && probe.miss_is_exact());
                     if missing {
                         let err = crate::error::key_error_object(k.clone());
-                        crate::drop_hot(st.stack.add(len - 1).read());
-                        crate::drop_hot(st.stack.add(len - 2).read());
+                        crate::drop_hot_at(st.stack.add(len - 1));
+                        crate::drop_hot_at(st.stack.add(len - 2));
                         st.len = len - 2;
                         st.pc = pc as usize + 1;
                         st.err = Some(err);
@@ -4657,9 +4657,9 @@ unsafe extern "C" fn h_container(
                 return u64::MAX;
             };
             crate::drop_hot(v);
-            crate::drop_hot(st.stack.add(len - 1).read());
-            crate::drop_hot(st.stack.add(len - 2).read());
-            crate::drop_hot(st.stack.add(len - 3).read());
+            crate::drop_hot_at(st.stack.add(len - 1));
+            crate::drop_hot_at(st.stack.add(len - 2));
+            crate::drop_hot_at(st.stack.add(len - 3));
             return (len - 3) as u64;
         }
         // An instance whose class's `__getitem__` is a native fast
@@ -4677,8 +4677,8 @@ unsafe extern "C" fn h_container(
         };
         #[cfg(test)]
         crate::NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
-        crate::drop_hot(st.stack.add(len - 1).read());
-        crate::drop_hot(st.stack.add(len - 2).read());
+        crate::drop_hot_at(st.stack.add(len - 1));
+        crate::drop_hot_at(st.stack.add(len - 2));
         st.stack.add(len - 2).write(v);
         (len - 1) as u64
     }
@@ -4696,8 +4696,8 @@ unsafe extern "C" fn h_contains(at: *mut Object) -> u32 {
         let Some(found) = Interpreter::leaf_contains(container, item) else {
             return 2;
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(found)
     }
 }
@@ -4720,10 +4720,10 @@ unsafe fn contains_fast(item: *const Object, cont: *const Object, owned: u32) ->
             return 2;
         };
         if owned & 2 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         if owned & 1 != 0 {
-            crate::drop_hot(item.read());
+            crate::drop_hot_at(item);
         }
         u32::from(found)
     }
@@ -4804,10 +4804,10 @@ unsafe fn subscr_fast(
             _ => return 1,
         };
         if owned & 2 != 0 {
-            crate::drop_hot(key.read());
+            crate::drop_hot_at(key);
         }
         if owned & 1 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         out.write(r);
         0
@@ -4974,10 +4974,10 @@ unsafe fn store_subscr_fast(
             _ => return 1,
         };
         if owned & 4 != 0 {
-            crate::drop_hot(key.read());
+            crate::drop_hot_at(key);
         }
         if owned & 2 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         crate::drop_hot(old);
         0
@@ -5205,8 +5205,8 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
         let Some(r) = r else {
             return 1;
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         at.write(r);
     }
     0
@@ -5277,8 +5277,8 @@ unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
                     Some(Ok(r)) if droppable(a) && droppable(b) => r,
                     _ => return 1,
                 };
-                crate::drop_hot(at.add(1).read());
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
                 at.write(r);
                 return 0;
             }
@@ -5340,8 +5340,8 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
             CompareKind::Gt => ord.is_gt(),
             CompareKind::GtE => ord.is_ge(),
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(r)
     }
 }
@@ -5377,8 +5377,8 @@ unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u3
         let ptrs = [at.cast_const(), at.add(1).cast_const()];
         match (*(*st).interp).pure_leaf_eval::<false, false>(code, &f, &ptrs) {
             Some(Object::Bool(r)) => {
-                crate::drop_hot(at.add(1).read());
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
                 u32::from(r)
             }
             Some(v) => {
@@ -5507,7 +5507,7 @@ unsafe fn truth_release(st: *mut State, s: &TruthSite, at: *mut Object, b: bool)
         if !droppable(&*at) {
             return left(st, s.pc, s.last, s.slot as usize + 1);
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         if (*(*st).maybe_dead).get() {
             at.write(Object::Bool(b));
             return left_marked(st, s.pc, s.slot as usize + 1);
@@ -5545,7 +5545,7 @@ unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
         if !droppable(v) {
             return 2;
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         u32::from(b)
     }
 }
@@ -5561,8 +5561,8 @@ unsafe extern "C" fn h_is(at: *mut Object, arg: u32) -> u32 {
             return 2;
         }
         let same = a.is_same(b);
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(same != (arg == 1))
     }
 }
@@ -6264,7 +6264,7 @@ unsafe extern "C" fn h_load_method(
                 return 0;
             }
         };
-        crate::drop_hot(top.read());
+        crate::drop_hot_at(top);
         top.write(Object::Function(f));
         st.stack.add(len).write(Object::Unbound);
         0
@@ -7211,7 +7211,7 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
             return 1;
         }
         // The value moved in (its slot is a stand-in now).
-        crate::drop_hot(at.add(1).read());
+        crate::drop_hot_at(at.add(1));
         0
     }
 }
@@ -8119,7 +8119,7 @@ unsafe fn dunder_call(
             ];
             if let Some(v) = (*st.interp).pure_leaf_eval::<false, false>(code, &f, &ptrs[..n]) {
                 for k in (0..n).rev() {
-                    crate::drop_hot(at.add(k).read());
+                    crate::drop_hot_at(at.add(k));
                 }
                 if not_implemented(st, &v) {
                     crate::drop_hot(v);
@@ -8151,7 +8151,7 @@ unsafe fn dunder_call(
                 CALL_DECLINED
             }
             Some(0) if not_implemented(st, &*at) => {
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at);
                 RAISED
             }
             Some(r) => r,
@@ -8209,7 +8209,7 @@ unsafe extern "C" fn h_property(
             if let Some(v) = v {
                 let at = st.stack.add(slot);
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8236,7 +8236,7 @@ unsafe extern "C" fn h_property(
             {
                 let at = st.stack.add(slot);
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8262,7 +8262,7 @@ unsafe extern "C" fn h_property(
             let interp = &*st.interp;
             if let Some(v) = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv]) {
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8288,7 +8288,7 @@ unsafe extern "C" fn h_property(
                     }
                 }
                 if local != 0 {
-                    crate::drop_hot(at.add(1).read());
+                    crate::drop_hot_at(at.add(1));
                 } else {
                     at.write(at.add(1).read());
                 }
@@ -10133,8 +10133,8 @@ unsafe extern "C" fn h_call(
                 },
                 _ => return CALL_DECLINED,
             };
-            crate::drop_hot(base.add(top - 1).read());
-            crate::drop_hot(base.add(top - 2).read());
+            crate::drop_hot_at(base.add(top - 1));
+            crate::drop_hot_at(base.add(top - 2));
             base.add(top - 2).write(result);
             st.len = top - 1;
             return 0;

@@ -2658,10 +2658,7 @@ impl Interpreter {
         // counts) and no observer watches releases.
         if crate::sync::release_gates() == 0 {
             // SAFETY: `dropped` owns a reference to the live allocation.
-            let w = unsafe { &*word };
-            let c = w.load(std::sync::atomic::Ordering::Relaxed);
-            if c != 1 {
-                w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            if unsafe { crate::rc::plain_release(word) } {
                 return std::mem::forget(dropped);
             }
         }
@@ -12842,8 +12839,8 @@ impl Interpreter {
                         // SAFETY: both operands leave the stack (checked
                         // droppable above); the result takes the lower slot.
                         unsafe {
-                            drop_hot(base.add(len - 1).read());
-                            drop_hot(base.add(len - 2).read());
+                            drop_hot_at(base.add(len - 1));
+                            drop_hot_at(base.add(len - 2));
                             base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
@@ -12866,8 +12863,8 @@ impl Interpreter {
                         let r = if ins.arg == 1 { !found } else { found };
                         // SAFETY: as `IS_OP`.
                         unsafe {
-                            drop_hot(base.add(len - 1).read());
-                            drop_hot(base.add(len - 2).read());
+                            drop_hot_at(base.add(len - 1));
+                            drop_hot_at(base.add(len - 2));
                             base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
@@ -13028,7 +13025,7 @@ impl Interpreter {
                                     if grown {
                                         // The suffix leaves; the grown string is the
                                         // `STORE_FAST` (its local is now empty).
-                                        drop_hot(base.add(len - 1).read());
+                                        drop_hot_at(base.add(len - 1));
                                         lbase.add(li).write(base.add(len - 2).read());
                                         len -= 2;
                                         last = pc + 1;
@@ -13143,8 +13140,8 @@ impl Interpreter {
                                 // SAFETY: both operands leave by plain
                                 // decrements (checked).
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13170,8 +13167,8 @@ impl Interpreter {
                                 let r = core_bignum_op(a, b, kind);
                                 // SAFETY: ints leave by plain decrements.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13199,8 +13196,8 @@ impl Interpreter {
                                 // (or a tuple of them): releasing them runs no
                                 // code and frees nothing the collector tracks.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13227,8 +13224,8 @@ impl Interpreter {
                                 // SAFETY: both operand slots are initialized and
                                 // leave the stack; the result takes the first.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13268,8 +13265,8 @@ impl Interpreter {
                                 // leave the stack (a bytes or bytearray release
                                 // runs nothing); the result takes the first.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13350,8 +13347,8 @@ impl Interpreter {
                                 #[cfg(test)]
                                 NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13398,9 +13395,9 @@ impl Interpreter {
                                 // SAFETY: the operands leave by plain
                                 // decrements (checked above).
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
-                                    drop_hot(base.add(len - 3).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
+                                    drop_hot_at(base.add(len - 3));
                                 }
                                 len -= 3;
                                 match r {
@@ -13470,8 +13467,8 @@ impl Interpreter {
                                 // decrements (checked); the result takes the
                                 // lower one's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13494,8 +13491,8 @@ impl Interpreter {
                                 // SAFETY: the operands leave; the result takes
                                 // the lower one's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(bool_hot(r)) };
@@ -15036,8 +15033,8 @@ impl Interpreter {
                                 // (count above one) leave by plain decrements;
                                 // the result takes the callee's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                     base.add(len - 2).write(result);
                                 }
                                 len -= 1;
@@ -15072,7 +15069,7 @@ impl Interpreter {
                                 // the result takes the callee's slot.
                                 unsafe {
                                     items.push(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 3).read());
+                                    drop_hot_at(base.add(len - 3));
                                     base.add(len - 3).write(Object::None);
                                 }
                                 len -= 2;
@@ -15659,7 +15656,7 @@ impl Interpreter {
                         // SAFETY: `len < cap`; the class (count above one) is
                         // released in place of an empty self slot.
                         unsafe {
-                            drop_hot(top.read());
+                            drop_hot_at(top);
                             top.write(Object::Function(f));
                             base.add(len).write(Object::Unbound);
                         }
@@ -20302,7 +20299,7 @@ impl Interpreter {
                 // SAFETY: the class (or tuple of classes) leaves the top
                 // slot; releasing it runs nothing.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
+                    drop_hot_at(base.add(len - 1));
                     base.add(len - 1).write(bool_hot(matched));
                 }
                 Some(len)
@@ -20487,8 +20484,8 @@ impl Interpreter {
         // `CALL` expects.
         unsafe {
             let self_v = base.add(len - 1).read();
-            drop_hot(base.add(len - 2).read());
-            drop_hot(base.add(len - 3).read());
+            drop_hot_at(base.add(len - 2));
+            drop_hot_at(base.add(len - 3));
             if ins.arg & 1 != 0 {
                 base.add(len - 3).write(f);
                 base.add(len - 2).write(self_v);
@@ -20805,8 +20802,8 @@ impl Interpreter {
                 // neither release runs code; the result takes the
                 // container's slot.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                     base.add(len - 2).write(r);
                 }
                 Some(len - 1)
@@ -20841,9 +20838,9 @@ impl Interpreter {
                 // SAFETY: the bounds are scalars and the container a
                 // shared value (checked); the result takes its slot.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
-                    drop_hot(base.add(len - 3).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
+                    drop_hot_at(base.add(len - 3));
                     base.add(len - 3).write(r);
                 }
                 Some(len - 2)
@@ -20917,8 +20914,8 @@ impl Interpreter {
                 // value slot was moved out above); each release is a scalar
                 // or a plain decrement.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                 }
                 drop_hot(old);
                 Some(len - 3)
@@ -20968,8 +20965,8 @@ impl Interpreter {
                 // SAFETY: both operand slots are initialized; each release
                 // is a scalar or a plain decrement.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                 }
                 drop_hot(removed);
                 drop_hot(key);
@@ -21075,7 +21072,7 @@ impl Interpreter {
                 // container (droppable).
                 unsafe {
                     for k in (len - 4..len).rev() {
-                        drop_hot(base.add(k).read());
+                        drop_hot_at(base.add(k));
                     }
                 }
                 Some(len - 4)
@@ -21199,7 +21196,7 @@ impl Interpreter {
                                 // droppable.
                                 unsafe {
                                     drop_hot(std::mem::replace(slot, v.read()));
-                                    drop_hot(k.read());
+                                    drop_hot_at(k);
                                 }
                             }
                             crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
@@ -72892,11 +72889,7 @@ pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
             let at = base.add(k);
             if let Some(word) = (*at).strong_word() {
                 // While the bias holds this thread alone updates counts.
-                let w = &*word;
-                let c = w.load(std::sync::atomic::Ordering::Relaxed);
-                if c != 1 {
-                    w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
-                } else {
+                if !crate::rc::plain_release(word) {
                     drop(at.read());
                 }
             }
@@ -80505,6 +80498,24 @@ fn drop_hot(v: Object) {
     }
 }
 
+/// [`drop_hot`] of the value at `at`, which leaves its slot: nothing is
+/// copied unless it's a last owner's.
+///
+/// # Safety
+///
+/// `at` holds an initialized value, which isn't used again.
+#[inline(always)]
+unsafe fn drop_hot_at(at: *const Object) {
+    // SAFETY: per the caller; a value owns a reference to its allocation.
+    unsafe {
+        if let Some(word) = (*at).strong_word() {
+            if !crate::rc::try_release_word(word) {
+                std::ptr::drop_in_place(at.cast_mut());
+            }
+        }
+    }
+}
+
 /// Whether a shared value's reference may be released by a plain
 /// decrement: one thread owns every count and no observer wants releases
 /// (one load of [`plain_release_gate`]'s flags; a debug build's counts are
@@ -80957,10 +80968,7 @@ unsafe fn release_operands(interp: &Interpreter, p: *const Object, n: usize) {
             let Some(word) = (*at).strong_word() else {
                 continue;
             };
-            let c = (*word).load(std::sync::atomic::Ordering::Relaxed);
-            if plain && c > 1 {
-                (*word).store(c - 1, std::sync::atomic::Ordering::Relaxed);
-            } else {
+            if !(plain && crate::rc::plain_release(word)) {
                 interp.release(at.read());
             }
         }
@@ -85467,8 +85475,8 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
     let r = plain_compare(a, b, op)?;
     // SAFETY: the operands leave their slots, each releasing a plain count.
     unsafe {
-        drop_hot(at.add(1).read());
-        drop_hot(at.read());
+        drop_hot_at(at.add(1));
+        drop_hot_at(at);
     }
     Some(r)
 }
