@@ -13705,8 +13705,52 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // `enumerate` over bytes or tuples into typed lanes first: one peek
+    // tells any other iterator apart, where the list, tuple and
+    // `dict.items()` steps below would each borrow and inspect it (an
+    // `enumerate(bytes)` step cost a third more behind them).
+    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
+        let pair = match ctx.pins.get(pin as usize) {
+            Some(Pin::Obj(it)) => next_enumerated_byte(it),
+            _ => NativeBytePair::Unsupported,
+        };
+        match pair {
+            NativeBytePair::Value(index, byte) => {
+                jf.ret_bits = index as u64;
+                // SAFETY: the marshal buffer has at least one slot,
+                // as required by this helper's live-buffer contract.
+                unsafe { *jf.call_args = u64::from(byte) };
+                return 0;
+            }
+            NativeBytePair::Exhausted => return 1,
+            NativeBytePair::Unsupported => {}
+        }
+    } else if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
+        let pair = match ctx.pins.get(pin as usize) {
+            Some(Pin::Obj(it)) => next_enumerated_tuple(it, ctx.pins.len() < RUNTIME_PIN_CAP),
+            _ => NativeObjectPair::Unsupported,
+        };
+        match pair {
+            NativeObjectPair::Value(index, value) => {
+                let bits = if matches!(value, Object::None) {
+                    u64::MAX
+                } else {
+                    debug_assert!(ctx.pins.len() < RUNTIME_PIN_CAP);
+                    let bits = ctx.pins.len() as u64;
+                    ctx.pins.push(Pin::Obj(value));
+                    bits
+                };
+                jf.ret_bits = index as u64;
+                // SAFETY: the helper's marshal buffer contains one slot.
+                unsafe { *jf.call_args = bits };
+                return 0;
+            }
+            NativeObjectPair::Exhausted => return 1,
+            NativeObjectPair::Unsupported => {}
+        }
+    }
     // A list or tuple iterator (a row of `(neighbor, weight)` pairs), the
-    // commonest source, steps in place first: no Python runs, so the
+    // commonest source, steps in place next: no Python runs, so the
     // header's countdown poll covers the step, and the element unpacks
     // like the generic step's below.
     let seq_step = match ctx.pins.get(pin as usize) {
@@ -13800,48 +13844,6 @@ unsafe extern "C" fn wpjit_iter_next_pair(
                 3
             }
         };
-    }
-    // `enumerate` over bytes or tuples into typed lanes: the specialized
-    // steps, ahead of the general pure step below.
-    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
-        let pair = match ctx.pins.get(pin as usize) {
-            Some(Pin::Obj(it)) => next_enumerated_byte(it),
-            _ => NativeBytePair::Unsupported,
-        };
-        match pair {
-            NativeBytePair::Value(index, byte) => {
-                jf.ret_bits = index as u64;
-                // SAFETY: the marshal buffer has at least one slot,
-                // as required by this helper's live-buffer contract.
-                unsafe { *jf.call_args = u64::from(byte) };
-                return 0;
-            }
-            NativeBytePair::Exhausted => return 1,
-            NativeBytePair::Unsupported => {}
-        }
-    } else if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
-        let pair = match ctx.pins.get(pin as usize) {
-            Some(Pin::Obj(it)) => next_enumerated_tuple(it, ctx.pins.len() < RUNTIME_PIN_CAP),
-            _ => NativeObjectPair::Unsupported,
-        };
-        match pair {
-            NativeObjectPair::Value(index, value) => {
-                let bits = if matches!(value, Object::None) {
-                    u64::MAX
-                } else {
-                    debug_assert!(ctx.pins.len() < RUNTIME_PIN_CAP);
-                    let bits = ctx.pins.len() as u64;
-                    ctx.pins.push(Pin::Obj(value));
-                    bits
-                };
-                jf.ret_bits = index as u64;
-                // SAFETY: the helper's marshal buffer contains one slot.
-                unsafe { *jf.call_args = bits };
-                return 0;
-            }
-            NativeObjectPair::Exhausted => return 1,
-            NativeObjectPair::Unsupported => {}
-        }
     }
     // An `enumerate` or two-source `zip` over native iterators whose step
     // runs no code: the pair straight into the lanes, as above.
