@@ -106,6 +106,7 @@ fn generate_one(isa: &dyn TargetIsa, unit: Unit) -> Option<Machine> {
         .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
         .collect();
     if let (Some(lowered), Some(t1)) = (lowered, t1) {
+        super::stats::take_passes();
         eprintln!(
             "frame jit: {label} lowered in {lowered:?} ({insts} IR instructions, {blocks} blocks{}, {} bytes), compiled in {:?}",
             if lean { ", lean" } else { "" },

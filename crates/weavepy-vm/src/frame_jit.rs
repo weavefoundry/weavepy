@@ -153,6 +153,35 @@ const MAX_FAILS: u8 = 32;
 /// The longest code compiled.
 const MAX_INSTRUCTIONS: usize = 4096;
 
+/// Which operations run through their shared helpers rather than a guard
+/// chain in line at every site (`WEAVEPY_FRAME_JIT_SHARED`, a bit mask, a
+/// tuning aid).
+const SH_GLOBAL: u32 = 1;
+const SH_ATTR: u32 = 2;
+const SH_METHOD: u32 = 4;
+const SH_RELEASE: u32 = 8;
+const SH_COPY: u32 = 16;
+const SH_CALL: u32 = 32;
+const SH_COPY_SCALAR: u32 = 64;
+const SH_SEQ: u32 = 128;
+const SH_SITE_KIND: u32 = 256;
+const SH_TRUTH: u32 = 512;
+
+fn shared(bit: u32) -> bool {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("WEAVEPY_FRAME_JIT_SHARED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u32::MAX)
+    }) & bit
+        != 0
+}
+
+/// A shared helper's status: the value's in place and a release queued a
+/// finalizer (the code stops, past the instruction, with `MARKED`).
+const HELPER_DEAD: u32 = 100;
+
 /// An exit's packed constant (see `Lower::exit`): the stack depth in its
 /// low bits, the pc from bit `EXIT_PC_SHIFT`, and the last instruction
 /// from bit `EXIT_LAST_SHIFT` (both below `MAX_INSTRUCTIONS`).
@@ -265,6 +294,8 @@ pub(crate) struct Native {
     need: usize,
     /// The caches the code addresses.
     _caches: Caches,
+    /// Where each pc enters (see [`ROUTE_NONE`]): the code addresses it.
+    _route: Box<[u32]>,
 }
 
 /// The per-site caches a lowering allocates, which its code addresses.
@@ -288,6 +319,11 @@ struct Caches {
     mods: Vec<Box<ModCache>>,
     /// The leaf method calls' sites.
     leaf_methods: Vec<Box<LeafMethodSite>>,
+    /// The attribute reads' and method loads' sites.
+    attrs: Vec<Box<AttrSite>>,
+    method_sites: Vec<Box<MethodSite>>,
+    /// The flushes' lists (see [`h_copies`]).
+    copies: Vec<Box<[CopyItem]>>,
 }
 
 impl Caches {
@@ -298,6 +334,9 @@ impl Caches {
         self.direct.append(&mut other.direct);
         self.builtin_sites.append(&mut other.builtin_sites);
         self.type_sites.append(&mut other.type_sites);
+        self.attrs.append(&mut other.attrs);
+        self.method_sites.append(&mut other.method_sites);
+        self.copies.append(&mut other.copies);
         self.supers.append(&mut other.supers);
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
@@ -1212,6 +1251,46 @@ mod stats {
     /// direct call's return tests it).
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     static COUNTS: Mutex<Option<Counts>> = Mutex::new(None);
+    /// The lowering's output by what it lowered (an opcode's name, or a
+    /// part of the function around them): IR instructions, blocks and how
+    /// many were lowered.
+    static LOWERED: Mutex<Option<HashMap<String, [u64; 3]>>> = Mutex::new(None);
+    /// Cranelift's time by pass, over every unit.
+    static PASSES: Mutex<Option<cranelift_codegen::timing::PassTimes>> = Mutex::new(None);
+
+    /// Record what lowering `what` added to the function.
+    #[cold]
+    pub(super) fn lowered(what: String, insts: usize, blocks: usize) {
+        let mut l = LOWERED.lock().unwrap_or_else(|e| e.into_inner());
+        let e = l.get_or_insert_with(HashMap::new).entry(what).or_default();
+        e[0] += insts as u64;
+        e[1] += blocks as u64;
+        e[2] += 1;
+    }
+
+    /// Add the calling thread's Cranelift time since the last call.
+    pub(super) fn take_passes() {
+        let t = cranelift_codegen::timing::take_current();
+        let mut p = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+        p.get_or_insert_with(Default::default).add(&t);
+    }
+
+    fn dump_lowered() {
+        let l = LOWERED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = l.as_ref() {
+            let mut rows: Vec<_> = l.iter().collect();
+            rows.sort_by_key(|(_, n)| std::cmp::Reverse(n[0]));
+            for (what, n) in rows {
+                eprintln!(
+                    "frame jit ir: {what} insts={} blocks={} n={}",
+                    n[0], n[1], n[2]
+                );
+            }
+        }
+        if let Some(p) = PASSES.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            eprintln!("frame jit passes:\n{p}");
+        }
+    }
 
     #[inline(always)]
     pub(super) fn enabled() -> bool {
@@ -1230,6 +1309,7 @@ mod stats {
             let on = std::env::var_os("WEAVEPY_FRAME_JIT_STATS").is_some();
             if on {
                 extern "C" fn dump() {
+                    dump_lowered();
                     let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
                     let mut rows: Vec<_> = counts.iter().flat_map(|c| c.iter()).collect();
                     rows.sort_by_key(|(_, n)| std::cmp::Reverse(n[0]));
@@ -1374,14 +1454,6 @@ struct Tags {
     by_pointer: i64,
 }
 
-impl Tags {
-    /// `None`, `bool`, `int` and `float`: copied by value, dropped by
-    /// forgetting.
-    fn scalar_mask(self) -> i64 {
-        (1i64 << self.none) | (1 << self.boolean) | (1 << self.int) | (1 << self.float)
-    }
-}
-
 /// The tags, read off sample values, if the layout is the one the code
 /// assumes.
 fn tags() -> Option<Tags> {
@@ -1489,7 +1561,13 @@ fn tags() -> Option<Tags> {
         .iter()
         .enumerate()
         .all(|(i, a)| all[i + 1..].iter().all(|b| a != b));
+    // (`None`, `Unbound`, `bool`, `int` and `float` come first: see
+    // `Lower::is_scalar`.)
+    let plain = [t.none, t.unbound, t.boolean, t.int, t.float]
+        .iter()
+        .all(|&t| t < crate::object::PLAIN_TAGS);
     (distinct
+        && plain
         && all.iter().all(|&t| t < 64)
         && tag(&Object::Bool(false)) == t.boolean
         && byte1(&Object::Bool(true)) == 1
@@ -1689,6 +1767,62 @@ fn droppable(v: &Object) -> bool {
     Interpreter::core_droppable(v)
 }
 
+/// Give up the reference `v` holds by a plain decrement when another owner
+/// keeps the value alive and nothing observes releases (a scalar holds
+/// none): `false`, changing nothing, otherwise. Nothing dies, so no
+/// finalizer queues. The caller forgets `v`.
+///
+/// # Safety
+///
+/// `v` is initialized, and the caller overwrites or forgets it.
+#[inline(always)]
+unsafe fn plain_release(v: &Object) -> bool {
+    let Some(word) = v.strong_word() else {
+        return true;
+    };
+    if crate::sync::release_gates() != 0 {
+        return false;
+    }
+    // SAFETY: `v` owns a reference to the live allocation.
+    let w = unsafe { &*word };
+    let c = w.load(Ordering::Relaxed);
+    if c == 1 {
+        return false;
+    }
+    w.store(c - 1, Ordering::Relaxed);
+    true
+}
+
+/// One operand a flush writes to the frame's stack (see [`h_copies`]).
+pub(crate) struct CopyItem {
+    /// The stack slot it goes to.
+    slot: u32,
+    /// The local it copies, or `COPY_CONST`.
+    local: u32,
+    konst: *const Object,
+}
+
+const COPY_CONST: u32 = u32::MAX;
+
+/// Write `n` locals' and constants' values to the frame's stack, a
+/// reference taken for each: the virtual stack's flush, in one call however
+/// many operands it holds.
+unsafe extern "C" fn h_copies(st: *mut State, items: *const CopyItem, n: u64) {
+    // SAFETY: the code passes its live state and its own items, whose
+    // locals are bound and whose slots are free.
+    unsafe {
+        let (locals, stack) = ((*st).locals, (*st).stack);
+        for it in std::slice::from_raw_parts(items, n as usize) {
+            let src: *const Object = if it.local == COPY_CONST {
+                it.konst
+            } else {
+                locals.add(it.local as usize)
+            };
+            stack.add(it.slot as usize).write(crate::clone_hot(&*src));
+        }
+    }
+}
+
 /// `*dst = (*src).clone()`.
 unsafe extern "C" fn h_clone(dst: *mut Object, src: *const Object) {
     // SAFETY: the code passes an initialized value and a free slot.
@@ -1714,6 +1848,20 @@ unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, i: u64) -> u32 {
     // SAFETY: the code passes its live state, an initialized stack slot,
     // and a local index in range.
     unsafe {
+        let local = (*st).locals.add(i as usize);
+        if plain_release(&*local) {
+            local.write(slot.read());
+            return 0;
+        }
+        h_store_slow(st, slot, i)
+    }
+}
+
+/// [`h_store`] of a value over one this may free.
+#[inline(never)]
+unsafe fn h_store_slow(st: *mut State, slot: *mut Object, i: u64) -> u32 {
+    // SAFETY: as `h_store`'s.
+    unsafe {
         let st = &mut *st;
         let local = st.locals.add(i as usize);
         if !droppable(&*local) {
@@ -1721,6 +1869,37 @@ unsafe extern "C" fn h_store(st: *mut State, slot: *mut Object, i: u64) -> u32 {
         }
         let v = slot.read();
         (*st.interp).release(std::mem::replace(&mut *local, v));
+        if (*st.maybe_dead).get() {
+            return HELPER_DEAD;
+        }
+    }
+    0
+}
+
+/// Release the heap value at `slot` as [`h_pop`] does: [`HELPER_DEAD`] when
+/// that queued a finalizer.
+unsafe extern "C" fn h_pop_checked(st: *mut State, slot: *mut Object) -> u32 {
+    // SAFETY: the code passes its live state and an initialized stack slot.
+    unsafe {
+        if plain_release(&*slot) {
+            return 0;
+        }
+        h_pop_slow(st, slot)
+    }
+}
+
+/// [`h_pop_checked`] of a value this may free.
+#[inline(never)]
+unsafe fn h_pop_slow(st: *mut State, slot: *mut Object) -> u32 {
+    // SAFETY: as `h_pop_checked`'s.
+    unsafe {
+        if !droppable(&*slot) {
+            return 1;
+        }
+        crate::drop_hot(slot.read());
+        if (*(*st).maybe_dead).get() {
+            return HELPER_DEAD;
+        }
     }
     0
 }
@@ -5119,6 +5298,105 @@ unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u3
 /// (scalars, strings, lists, tuples, dicts, an instance with a native or
 /// no `__bool__` / `__len__`): `0` or `1` the truth (the operand
 /// released), anything else declined untouched.
+/// The truth of `v` for [`h_truth_local`] and [`h_truth_stack`], the tests
+/// that run no Python code: `None` for anything else. An instance of a
+/// class the site found always true (no `__bool__` or `__len__`), while the
+/// class keeps that version, takes no look at its class's slots.
+///
+/// # Safety
+///
+/// The code's contract for those helpers.
+#[inline(always)]
+unsafe fn truth_at(st: *mut State, v: &Object, cache: *mut MethodCache) -> Option<bool> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        Some(match v {
+            Object::Bool(b) => *b,
+            Object::Int(i) => *i != 0,
+            Object::None => false,
+            Object::Str(s) => !s.is_empty(),
+            Object::Float(f) => *f != 0.0,
+            Object::Tuple(t) => !t.is_empty(),
+            Object::List(l) => !l.peek()?.is_empty(),
+            Object::Dict(d) => !d.peek()?.is_empty(),
+            Object::Instance(inst) => {
+                let ver = inst.cls_raw().attr_version.get();
+                if ver != 0 && (*cache).ver == ver {
+                    return Some(true);
+                }
+                truth_instance(st, v, cache)?
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// [`truth_at`] of an instance the site hasn't found always true.
+#[inline(never)]
+unsafe fn truth_instance(st: *mut State, v: &Object, cache: *mut MethodCache) -> Option<bool> {
+    // SAFETY: the code's contract for the helpers.
+    unsafe {
+        if let Object::Instance(inst) = v {
+            if let Some(ver) = (*(*st).interp).instance_always_true_version(inst) {
+                (*cache).ver = ver;
+            }
+        }
+        (*(*st).interp).leaf_instance_truth(v)
+    }
+}
+
+/// `TO_BOOL` of the local at `at`: its truth, or `2` declined.
+unsafe extern "C" fn h_truth_local(
+    st: *mut State,
+    at: *const Object,
+    cache: *mut MethodCache,
+) -> u32 {
+    // SAFETY: the code passes its live state, a bound local and its site's
+    // cache; the tests run no Python code.
+    match unsafe { truth_at(st, &*at, cache) } {
+        Some(b) => u32::from(b),
+        None => 2,
+    }
+}
+
+/// `TO_BOOL` of the value on the stack at `at`, released: its truth,
+/// [`HELPER_DEAD`] with the truth at `at` when the release queued a
+/// finalizer, or `2` declined, the value still there.
+unsafe extern "C" fn h_truth_stack(
+    st: *mut State,
+    at: *mut Object,
+    cache: *mut MethodCache,
+) -> u32 {
+    // SAFETY: the code passes its live state, an initialized stack slot and
+    // its site's cache; the tests run no Python code.
+    unsafe {
+        let Some(b) = truth_at(st, &*at, cache) else {
+            return 2;
+        };
+        if plain_release(&*at) {
+            return u32::from(b);
+        }
+        truth_release(st, at, b)
+    }
+}
+
+/// [`h_truth_stack`]'s release of a value it may free.
+#[inline(never)]
+unsafe fn truth_release(st: *mut State, at: *mut Object, b: bool) -> u32 {
+    // SAFETY: as `h_truth_stack`'s.
+    unsafe {
+        if !droppable(&*at) {
+            return 2;
+        }
+        crate::drop_hot(at.read());
+        if (*(*st).maybe_dead).get() {
+            at.write(Object::Bool(b));
+            return HELPER_DEAD;
+        }
+        u32::from(b)
+    }
+}
+
 unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
     // SAFETY: the code passes its live state and an initialized stack
     // slot; the truth tests run no Python code.
@@ -5563,6 +5841,52 @@ unsafe extern "C" fn h_load_global(
     }
 }
 
+/// `LOAD_GLOBAL` at the site `c`: the cached value while the frame's
+/// namespaces and their stamps match the cache, anything else through
+/// [`h_load_global`] (which fills the cache). One copy of the guards for
+/// every site; its status is [`h_load_global`]'s.
+unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
+    // SAFETY: the code passes its live state (whose frame is the running
+    // one) and the site's cache, whose non-zero `gdata` and `bdata` address
+    // dicts its namespaces match (a namespace's dict lives as its handle
+    // does), and whose `value` an entry their stamps prove unmoved.
+    unsafe {
+        let site = &*c;
+        let frame = (*st).frame.cast::<u8>();
+        let word = |off: usize| frame.add(off).cast::<u64>().read();
+        let stamp = |data: u64| {
+            (data as *const u8)
+                .add(DICT_STAMP as usize)
+                .cast::<u64>()
+                .read()
+        };
+        if word(F_GLOBALS) == site.globals
+            && stamp(site.gdata) == site.gstamp
+            && word(F_RARE) == 0
+            && (site.builtins == 0
+                || (word(F_BUILTINS) == site.builtins
+                    && stamp(site.bdata) == site.bstamp
+                    && !(*(*st).interp).globals_missing_any.get()))
+        {
+            let v = &*(site.value as *const Object);
+            (*st)
+                .stack
+                .add(site.len as usize)
+                .write(crate::clone_hot(v));
+            return PUSHED;
+        }
+        h_load_global(
+            st,
+            site.code as *const CodeObject,
+            site.ext as *const CodeConstObjects,
+            u64::from(site.pc),
+            u64::from(site.nlocals),
+            site.len,
+            c,
+        )
+    }
+}
+
 /// A `LOAD_GLOBAL` site's in-line cache: the frame's namespaces (their
 /// `Rc` handles' bits) and the dicts' stamps the value at `value` was
 /// found under (`builtins` 0 for a module global; `globals` 0 empty).
@@ -5576,6 +5900,14 @@ pub(crate) struct GlobalCache {
     bstamp: u64,
     bdata: u64,
     value: u64,
+    /// The site itself, for [`h_global`]'s miss: the code and its
+    /// extension (as addresses), the instruction, the code's local count
+    /// and the stack depth.
+    code: u64,
+    ext: u64,
+    pc: u32,
+    nlocals: u32,
+    len: u64,
 }
 
 const GC_GLOBALS: i32 = std::mem::offset_of!(GlobalCache, globals) as i32;
@@ -5880,6 +6212,87 @@ pub(crate) struct MethodCache {
     poly: [MethodEntry; 3],
 }
 
+/// A method load's site of compiled code: its caches and what
+/// [`h_method`] needs of the code, so that the code passes one pointer.
+pub(crate) struct MethodSite {
+    cache: MethodCache,
+    mods: ModCache,
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u32,
+    /// The stack depth, the receiver on top.
+    len: u32,
+    /// A site that loaded an exact `list`, `dict`, `set` or `str`
+    /// receiver's method: that receiver's tag (else `u8::MAX`) and the
+    /// method's two words (the code holds it).
+    builtin_recv: u8,
+    builtin: [u64; 2],
+}
+
+/// `LOAD_ATTR` with the method flag at `site`: the method in the
+/// receiver's slot and the receiver above it, for a receiver the site's
+/// caches know, anything else through [`h_load_method`]. `0` done,
+/// [`HELPER_DEAD`] the same and a release queued a finalizer, anything else
+/// declined untouched.
+unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
+    // SAFETY: the code passes its live state and its site, with the
+    // receiver on top of the stack and room above it. A cached method's
+    // class (or the code, for a builtin) holds it while the version stands,
+    // so a clone takes a count of it. Nothing here runs code.
+    unsafe {
+        let s = &mut *site;
+        let top = (*st).stack.add(s.len as usize - 1);
+        let hit = match &*top {
+            Object::Instance(inst) => {
+                let c = &s.cache;
+                let ver = inst.cls_raw().attr_version.get();
+                (c.ver == ver
+                    && ver != 0
+                    && match inst.dict.split_peek() {
+                        Some(split) => {
+                            let (keys, n) = split.keys_and_len();
+                            n == 0 || (keys as u64 == c.keys && n <= c.before as usize)
+                        }
+                        None => false,
+                    })
+                .then_some([c.head, c.func])
+            }
+            r => (r.tag() == s.builtin_recv).then_some(s.builtin),
+        };
+        if let Some(words) = hit {
+            let f = std::mem::ManuallyDrop::new(std::mem::transmute::<[u64; 2], Object>(words));
+            let f = crate::clone_hot(&f);
+            let recv = top.read();
+            top.write(f);
+            (*st).stack.add(s.len as usize).write(recv);
+            return 0;
+        }
+        method_slow(st, site)
+    }
+}
+
+/// [`h_method`] for a receiver the site's first cache doesn't know.
+#[inline(never)]
+unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
+    // SAFETY: as `h_method`'s.
+    unsafe {
+        let s = &mut *site;
+        let r = h_load_method(
+            st,
+            s.code,
+            s.ext,
+            u64::from(s.pc),
+            u64::from(s.len),
+            &raw mut s.cache,
+            &raw const s.mods,
+        );
+        if r == 0 && (*(*st).maybe_dead).get() {
+            return HELPER_DEAD;
+        }
+        r
+    }
+}
+
 /// One of a [`MethodCache`]'s polymorphic entries.
 #[derive(Default, Clone, Copy)]
 struct MethodEntry {
@@ -6141,6 +6554,245 @@ fn slot_note(code: &CodeObject, recv: &Object, pc: usize, cache: *const SlotCach
                 let name = code.instructions[pc].arg;
                 crate::slot_field_note(code, ext, pc, inst, key_idx, name);
             }
+        }
+    }
+}
+
+/// A `LOAD_ATTR` site of compiled code: what [`h_attr_local`] and
+/// [`h_attr_stack`] need, so that the code passes one pointer.
+pub(crate) struct AttrSite {
+    code: *const CodeObject,
+    ext: *const CodeConstObjects,
+    pc: u32,
+    /// The stack slot the value takes (a stack receiver's own).
+    slot: u32,
+    /// A local receiver's index.
+    local: u32,
+    /// Whether the site has run a property's getter.
+    property: bool,
+    /// The site's field cache, if the code has any.
+    field: *const FieldSlot,
+    /// A property's direct call's cache, when nothing virtual lies below
+    /// the receiver (the call can raise or switch); null otherwise.
+    direct: *mut DirectSite,
+    cache: SlotCache,
+}
+
+/// The value `recv`'s read at `site` finds through the site's caches, the
+/// shapes CPython specializes: an instance's field, a class's attribute
+/// read through an instance that can't shadow it, a module's attribute.
+///
+/// # Safety
+///
+/// A read between two instructions, running no code; the reference ends
+/// with the value's clone.
+#[inline(always)]
+unsafe fn attr_hit<'a>(site: &'a AttrSite, recv: &'a Object) -> Option<&'a Object> {
+    // SAFETY: the caller's contract; a cache's value is the entry its
+    // version or stamp proves unmoved.
+    unsafe {
+        match recv {
+            Object::Instance(inst) => {
+                let ver = inst.cls_raw().attr_version.get();
+                if !site.field.is_null() {
+                    let (want, idx) = (*site.field).get();
+                    if want == ver && want != 0 {
+                        let v = if idx & crate::SLOT_FIELD != 0 {
+                            inst.laid_out_slot((idx & !crate::SLOT_FIELD) as usize)
+                        } else {
+                            inst.split_field(idx as usize)
+                        };
+                        if v.is_some() {
+                            return v;
+                        }
+                    }
+                }
+                let c = &site.cache;
+                if c.cver.get() == ver && ver != 0 {
+                    let (keys, n) = inst.dict.split_peek()?.keys_and_len();
+                    if n == 0 || (keys as u64 == c.ckeys.get() && n <= c.cbefore.get() as usize) {
+                        return Some(&*c.cobj.as_ptr().cast::<Object>());
+                    }
+                }
+                None
+            }
+            Object::Module(m) => {
+                let c = &site.cache;
+                let v = c.mvalue.get();
+                (v != 0 && (*m.dict.as_ptr()).mutation_stamp() == c.mstamp.get())
+                    .then(|| &*(v as *const Object))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// [`attr_hit`] missed for the receiver at `at`: a property's cached
+/// getter first at a site that has run one, then the core loop's cached
+/// reads, then a property's getter (the code's `0`, a status to return, or
+/// `CALL_DECLINED`).
+///
+/// # Safety
+///
+/// The code's contract for [`h_local_attr`], [`h_stack_attr`] and
+/// [`h_property`].
+#[inline(never)]
+unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: bool) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (pc, slot) = (u64::from(site.pc), u64::from(site.slot));
+        if site.property && !site.direct.is_null() {
+            let flags = PROPERTY_ONLY | u64::from(local);
+            let r = h_property(st, site.code, pc, slot, at, flags, site.direct);
+            if r != CALL_DECLINED {
+                return r;
+            }
+        }
+        let r = if local {
+            let dst = (*st).stack.add(site.slot as usize);
+            h_local_attr(dst, site.code, site.ext, pc, at, &site.cache)
+        } else {
+            h_stack_attr(site.code, site.ext, pc, at, &site.cache)
+        };
+        if r == 0 {
+            return 0;
+        }
+        if site.direct.is_null() {
+            return CALL_DECLINED;
+        }
+        h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
+    }
+}
+
+/// The instance's field `site` remembers, in its split values: the
+/// commonest read, kept apart from [`attr_hit`] so that its helpers need no
+/// frame of their own.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+#[inline(always)]
+unsafe fn split_field_hit<'a>(
+    site: &AttrSite,
+    inst: &'a crate::types::PyInstance,
+) -> Option<&'a Object> {
+    if site.field.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract; the site's field slot lives as long as
+    // the code does.
+    unsafe {
+        let (want, idx) = (*site.field).get();
+        if want != inst.cls_raw().attr_version.get() || want == 0 || idx & crate::SLOT_FIELD != 0 {
+            return None;
+        }
+        inst.split_field(idx as usize)
+    }
+}
+
+/// `LOAD_ATTR` at `site` of a local: `0` the value written to the site's
+/// free slot, else a status (`CALL_DECLINED` untouched).
+unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 {
+    // SAFETY: the code passes its live state and its site, whose local and
+    // slot are in range. The read runs no code.
+    unsafe {
+        let s = &*site;
+        let at = (*st).locals.add(s.local as usize);
+        if let Object::Instance(inst) = &*at {
+            if let Some(v) = split_field_hit(s, inst) {
+                (*st).stack.add(s.slot as usize).write(crate::clone_hot(v));
+                return 0;
+            }
+        }
+        attr_local_slow(st, site)
+    }
+}
+
+/// [`h_attr_local`] past its commonest shape.
+#[inline(never)]
+unsafe fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u32 {
+    // SAFETY: as `h_attr_local`'s.
+    unsafe {
+        let site = &*site;
+        let at = (*st).locals.add(site.local as usize);
+        if let Some(v) = attr_hit(site, &*at) {
+            (*st)
+                .stack
+                .add(site.slot as usize)
+                .write(crate::clone_hot(v));
+            return 0;
+        }
+        attr_miss(st, site, at, true)
+    }
+}
+
+/// `LOAD_ATTR` at `site` of the value on the stack at the site's slot: `0`
+/// the value in its place (the receiver released), [`HELPER_DEAD`] the same
+/// and that queued a finalizer, else a status (`CALL_DECLINED` untouched).
+unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 {
+    // SAFETY: the code passes its live state and its site, whose slot holds
+    // the receiver. The read runs no code; another owner keeps the receiver,
+    // and so the field, alive through the plain release.
+    unsafe {
+        let s = &*site;
+        let at = (*st).stack.add(s.slot as usize);
+        if let Object::Instance(inst) = &*at {
+            if let Some(v) = split_field_hit(s, inst) {
+                let v = crate::clone_hot(v);
+                if plain_release(&*at) {
+                    at.write(v);
+                    return 0;
+                }
+                drop(v);
+            }
+        }
+        attr_stack_slow(st, site)
+    }
+}
+
+/// [`h_attr_stack`] past its commonest shape.
+#[inline(never)]
+unsafe fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u32 {
+    // SAFETY: as `h_attr_stack`'s.
+    unsafe {
+        let site = &*site;
+        let at = (*st).stack.add(site.slot as usize);
+        let r = if let Some(v) = attr_hit(site, &*at) {
+            if !droppable(&*at) {
+                return CALL_DECLINED;
+            }
+            let v = crate::clone_hot(v);
+            crate::drop_hot(std::mem::replace(&mut *at, v));
+            0
+        } else {
+            attr_miss(st, site, at, false)
+        };
+        if r == 0 && (*(*st).maybe_dead).get() {
+            return HELPER_DEAD;
+        }
+        r
+    }
+}
+
+/// `BINARY_SUBSCR` of the commonest shapes, through the frameless helper
+/// for the operands' kinds: `0` the item at `out`, anything else declined.
+unsafe extern "C" fn h_subscr_hot<const OWNED: u32>(
+    out: *mut Object,
+    cont: *const Object,
+    key: *const Object,
+) -> u32 {
+    // SAFETY: as the helpers': the code passes two initialized values and
+    // the slot.
+    unsafe {
+        match (&*cont, &*key) {
+            (Object::List(_) | Object::Tuple(_), Object::Int(_)) => {
+                crate::h_seq_get::<OWNED>(out, cont, key)
+            }
+            (Object::Dict(_), Object::Int(_) | Object::Str(_)) => {
+                crate::h_dict_get::<OWNED>(out, cont, key)
+            }
+            (Object::Str(_), Object::Int(_)) => crate::h_str_get::<OWNED>(out, cont, key),
+            _ => 1,
         }
     }
 }
@@ -11047,6 +11699,31 @@ fn compile_with(
     // recorded one yet: the code addresses them).
     let field_slots = ext.alloc_field_sites(code);
     let t0 = stats::enabled().then(std::time::Instant::now);
+    let mut route: Box<[u32]> = vec![ROUTE_NONE; n].into_boxed_slice();
+    let route_at = route.as_mut_ptr();
+    // A body whose estimate is over the chunk limit goes straight to its
+    // chunks: lowering it whole only to measure them cost as much again.
+    let limit = chunk_ir();
+    let estimate = (limit != 0).then(|| estimate_ir(code, depths, prune));
+    let early = estimate.as_ref().filter(|e| e.total > limit).and_then(|e| {
+        Some(chunk_ranges(code, &e.starts, &e.sizes, e.total, limit))
+            .filter(|r| r.len() > 1 && u8::try_from(r.len()).is_ok())
+    });
+    if let Some(ranges) = early {
+        return compile_chunks(
+            engine,
+            code,
+            ext,
+            nlocals,
+            depths,
+            field_slots,
+            ranges,
+            n >= lean_len() || estimate.is_some_and(|e| e.total > lean_above()),
+            prune,
+            t0,
+            route,
+        );
+    }
     // A body whose code comes out large is lowered again lean: compiling
     // costs about the same per IR instruction, and a large body's time
     // goes to its calls more than to the shortcuts in line. A body this
@@ -11064,6 +11741,7 @@ fn compile_with(
             0..n,
             lean,
             prune,
+            route_at,
         )?;
         // (Measured as if every exit's tail were in line, the size the
         // threshold was tuned with.)
@@ -11075,8 +11753,7 @@ fn compile_with(
         break low;
     };
     let total = engine.ctx.func.dfg.num_insts();
-    let limit = chunk_ir();
-    let ranges = (limit != 0 && total > limit)
+    let ranges = (limit != 0 && total > limit + limit / 4)
         .then(|| chunk_ranges(code, &whole.starts, &whole.sizes, total, limit))
         .filter(|r| u8::try_from(r.len()).is_ok());
     let Some(ranges) = ranges else {
@@ -11091,12 +11768,46 @@ fn compile_with(
                 Vec::new(),
                 whole.entries,
                 whole.caches,
+                route,
             ),
         ));
     };
-    // Too large for one compile: each chunk lowered and compiled on its
-    // own (the whole body's lowering only measured them).
+    // Too large for one compile after all: its measured blocks say where
+    // to cut.
     engine.release();
+    compile_chunks(
+        engine,
+        code,
+        ext,
+        nlocals,
+        depths,
+        field_slots,
+        ranges,
+        lean,
+        prune,
+        t0,
+        route,
+    )
+}
+
+/// Too large for one compile: each chunk of `ranges` lowered and compiled
+/// on its own.
+#[allow(clippy::too_many_arguments)]
+fn compile_chunks(
+    engine: &mut Engine,
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    nlocals: usize,
+    depths: &[i64],
+    field_slots: crate::Sites<'_, FieldSlot>,
+    ranges: Vec<std::ops::Range<usize>>,
+    lean: bool,
+    prune: bool,
+    t0: Option<std::time::Instant>,
+    mut route: Box<[u32]>,
+) -> Option<(Vec<queue::Unit>, Parts)> {
+    let n = code.instructions.len();
+    let route_at = route.as_mut_ptr();
     let mut entries = vec![false; n];
     let mut chunk_at = vec![0u8; n];
     let mut chunks = Vec::with_capacity(ranges.len());
@@ -11112,6 +11823,7 @@ fn compile_with(
             range.clone(),
             lean,
             prune,
+            route_at,
         )?;
         chunks.push(define(engine, code, lean, t0, Some(&range))?);
         for pc in range {
@@ -11122,8 +11834,82 @@ fn compile_with(
     }
     Some((
         chunks,
-        parts(code, nlocals, depths, true, chunk_at, entries, caches),
+        parts(
+            code, nlocals, depths, true, chunk_at, entries, caches, route,
+        ),
     ))
+}
+
+/// What [`estimate_ir`] makes of a body.
+struct Estimate {
+    starts: Vec<bool>,
+    /// By block start.
+    sizes: Vec<u32>,
+    total: usize,
+}
+
+/// About how many IR instructions lowering `code` takes, and where its
+/// blocks are: enough to choose its chunks and whether it's lowered lean,
+/// without lowering it.
+fn estimate_ir(code: &CodeObject, depths: &[i64], prune: bool) -> Estimate {
+    let starts = block_starts(code, depths);
+    let n = starts.len();
+    let never_ran = if prune {
+        never_ran_blocks(code, &starts)
+    } else {
+        vec![false; n]
+    };
+    let mut sizes = vec![0u32; n];
+    let mut total = 0usize;
+    let mut block = 0;
+    let mut skip = false;
+    for (pc, ins) in code.instructions.iter().enumerate() {
+        if starts[pc] {
+            block = pc;
+            skip = never_ran[pc];
+            sizes[block] += 3;
+        }
+        if !skip {
+            sizes[block] += op_ir(ins.op);
+        }
+    }
+    for s in &sizes {
+        total += *s as usize;
+    }
+    Estimate {
+        starts,
+        sizes,
+        total,
+    }
+}
+
+/// About how many IR instructions one `op` lowers to, with what its exits
+/// add, measured over the workload suite (`WEAVEPY_FRAME_JIT_STATS` prints
+/// the table).
+fn op_ir(op: OpCode) -> u32 {
+    match op {
+        OpCode::LoadGlobal => 50,
+        OpCode::LoadMethodAttr => 72,
+        OpCode::StoreFast => 28,
+        OpCode::LoadAttr => 44,
+        OpCode::Call | OpCode::CallKw | OpCode::CallEx => 25,
+        OpCode::BinaryOp => 28,
+        OpCode::BinarySubscr => 48,
+        OpCode::ToBool => 40,
+        OpCode::CompareOp => 44,
+        OpCode::PopTop => 14,
+        OpCode::ForIter => 35,
+        OpCode::ReturnValue => 16,
+        OpCode::JumpBackward => 17,
+        OpCode::PopJumpIfFalse | OpCode::PopJumpIfTrue => 8,
+        OpCode::PopJumpIfNone | OpCode::PopJumpIfNotNone => 12,
+        OpCode::ContainsOp | OpCode::StoreSubscr | OpCode::BinarySlice => 45,
+        OpCode::LoadFast | OpCode::LoadFastBorrow => 4,
+        OpCode::Swap | OpCode::CopyTop => 10,
+        OpCode::LoadConst | OpCode::LoadSmallInt | OpCode::Nop | OpCode::NotTaken => 1,
+        OpCode::Resume => 0,
+        _ => 15,
+    }
 }
 
 /// A lowering of a code's instructions in a range (see [`lower_range`]).
@@ -11152,6 +11938,7 @@ fn lower_range(
     range: std::ops::Range<usize>,
     lean: bool,
     prune: bool,
+    route: *mut u32,
 ) -> Option<Lowered> {
     engine.module.clear_context(&mut engine.ctx);
     let ptr = engine.ptr;
@@ -11174,6 +11961,7 @@ fn lower_range(
         );
         lower.cold = lean;
         lower.prune = prune;
+        lower.route = route;
         let done = lower.lower();
         let low = Lowered {
             entries: (0..n).map(|pc| lower.enters_at(pc)).collect(),
@@ -11191,6 +11979,9 @@ fn lower_range(
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
                 leaf_methods: std::mem::take(&mut lower.leaf_methods),
+                attrs: std::mem::take(&mut lower.attr_sites),
+                method_sites: std::mem::take(&mut lower.method_sites),
+                copies: std::mem::take(&mut lower.copies),
             },
         };
         if done {
@@ -11320,6 +12111,8 @@ struct Parts {
     depths: Box<[i64]>,
     need: usize,
     caches: Caches,
+    /// Where each pc enters (see [`ROUTE_NONE`]): the code addresses it.
+    route: Box<[u32]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11331,6 +12124,7 @@ fn parts(
     chunk_at: Vec<u8>,
     entries: Vec<bool>,
     caches: Caches,
+    route: Box<[u32]>,
 ) -> Parts {
     Parts {
         nlocals,
@@ -11342,6 +12136,7 @@ fn parts(
         depths: depths.into(),
         need: stack_need(depths),
         caches,
+        route,
     }
 }
 
@@ -11365,6 +12160,7 @@ impl Parts {
             depths: self.depths,
             need: self.need,
             _caches: self.caches,
+            _route: self.route,
         }
     }
 }
@@ -11462,6 +12258,128 @@ fn chunk_ranges(
 
 const FLAGS: MemFlags = MemFlags::trusted();
 
+/// A [`Parts::route`] entry: `index << 16 | depth`, the entry's index in the
+/// jump table of the function that lowers the pc and the stack depth its
+/// block starts at. (`ROUTE_NONE`: no entry; no stack is this deep.)
+const ROUTE_NONE: u32 = u32::MAX;
+
+/// Which instructions of `code` start blocks: the entry, jump targets, and
+/// every instruction after one that ends a block or that the core loop
+/// runs.
+fn block_starts(code: &CodeObject, depths: &[i64]) -> Vec<bool> {
+    let n = code.instructions.len();
+    let mut starts = vec![false; n];
+    starts[0] = true;
+    for (pc, ins) in code.instructions.iter().enumerate() {
+        let next = pc + 1;
+        let target = match ins.op {
+            OpCode::JumpForward
+            | OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => Some(next + ins.arg as usize),
+            OpCode::JumpBackward => Some(next.saturating_sub(ins.arg as usize)),
+            _ => None,
+        };
+        // A `SEND`'s exit (`END_SEND`), where a delegate's return
+        // resumes the activation.
+        if ins.op == OpCode::Send && next + (ins.arg as usize) < n {
+            starts[next + ins.arg as usize] = true;
+        }
+        // And its `YIELD_VALUE`, where a delegate's yield goes on (the
+        // `SEND`'s lowering jumps there).
+        if ins.op == OpCode::Send && next < n {
+            starts[next] = true;
+        }
+        if let Some(t) = target {
+            if t < n {
+                starts[t] = true;
+            }
+            if fused_pair_at(code, pc) {
+                // Past the `UNPACK_SEQUENCE` a fused step skips.
+                starts[pc + 2] = true;
+            }
+            if ins.op == OpCode::ForIter {
+                // The loop exit past `END_FOR` / `POP_ITER`.
+                let mut to = t;
+                if code.instructions.get(to).map(|i| i.op) == Some(OpCode::EndFor) {
+                    to += 1;
+                    if matches!(
+                        code.instructions.get(to).map(|i| i.op),
+                        Some(OpCode::PopIter | OpCode::PopTop)
+                    ) {
+                        to += 1;
+                    }
+                }
+                if to < n {
+                    starts[to] = true;
+                }
+            }
+        }
+        if next < n && (target.is_some() || !native_at(code, pc)) {
+            starts[next] = true;
+        }
+        // A fused attribute store continues after its `STORE_ATTR`.
+        if ins.op == OpCode::LoadFast
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::StoreAttr)
+            && pc + 2 < n
+        {
+            starts[pc + 2] = true;
+        }
+        // A function built with its defaults or closure continues after
+        // its last `SET_FUNCTION_ATTRIBUTE`.
+        if ins.op == OpCode::MakeFunction && ins.arg == 0 {
+            let k = fused_function_attrs(code, pc);
+            if k > 0 && pc + 1 + k < n {
+                starts[pc + 1 + k] = true;
+            }
+        }
+        // A forwarding call (`f(*args, **kwargs)`) continues after its
+        // `CALL_FUNCTION_EX`.
+        if ins.op == OpCode::BuildMap
+            && ins.arg == 0
+            && crate::forward_call_shape(code, pc)
+            && pc + 4 < n
+        {
+            starts[pc + 4] = true;
+        }
+        // A global's fused class-constant read continues after its
+        // `LOAD_ATTR`.
+        if ins.op == OpCode::LoadGlobal
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadAttr)
+            && pc + 2 < n
+        {
+            starts[pc + 2] = true;
+        }
+        // A fused method call continues after its `CALL`.
+        if ins.op == OpCode::LoadFast
+            && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadMethodAttr)
+        {
+            if let Some(call) =
+                (pc + 2..n.min(pc + 12)).find(|&k| code.instructions[k].op == OpCode::Call)
+            {
+                if call + 1 < n {
+                    starts[call + 1] = true;
+                }
+            }
+        }
+    }
+    // A handler, entered from a helper's raise (see `h_catch`).
+    for h in &code.exception_table {
+        if (h.handler as usize) < n {
+            starts[h.handler as usize] = true;
+        }
+    }
+    for (pc, s) in starts.iter_mut().enumerate() {
+        if *s && depths[pc] < 0 {
+            // Unreachable on the ordinary paths (a handler's): no entry.
+            *s = false;
+        }
+    }
+    starts
+}
+
 /// The stack capacity the code needs: the deepest point plus an
 /// instruction's own pushes (it writes stack slots at fixed offsets).
 fn stack_need(depths: &[i64]) -> usize {
@@ -11553,6 +12471,9 @@ struct Lower<'a> {
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
+    /// The code's route table (see [`ROUTE_NONE`]): the code addresses it,
+    /// and this lowering fills the entries of its range.
+    route: *mut u32,
     /// Whether copies are on an exit path (one helper call each, not the
     /// scalar test in line: exits are rare, and code size costs compile
     /// time), or the whole body is lowered lean (see `compile_with`):
@@ -11600,6 +12521,17 @@ struct Lower<'a> {
     /// The leaf method calls' sites (see [`LeafMethodSite`]).
     #[allow(clippy::vec_box)]
     leaf_methods: Vec<Box<LeafMethodSite>>,
+    /// The attribute reads' sites (see [`AttrSite`]).
+    #[allow(clippy::vec_box)]
+    attr_sites: Vec<Box<AttrSite>>,
+    /// The method loads' sites (see [`MethodSite`]).
+    #[allow(clippy::vec_box)]
+    method_sites: Vec<Box<MethodSite>>,
+    /// The flushes' lists (see [`h_copies`]).
+    copies: Vec<Box<[CopyItem]>>,
+    /// The latest exits that hold nothing virtual (see
+    /// [`Self::exit_with`]).
+    plain_exits: Vec<(u32, usize, usize, Option<usize>, Block)>,
     /// The block a helper's raise goes to (see [`Self::leave`]), made on
     /// first use.
     catch: Option<Block>,
@@ -11777,6 +12709,7 @@ impl<'a> Lower<'a> {
             range,
             sizes: Vec::new(),
             dispatch: Block::from_u32(0),
+            route: std::ptr::null_mut(),
             cold: false,
             vs: Vec::new(),
             depth: 0,
@@ -11794,6 +12727,10 @@ impl<'a> Lower<'a> {
             held: Vec::new(),
             mod_caches: Vec::new(),
             leaf_methods: Vec::new(),
+            attr_sites: Vec::new(),
+            method_sites: Vec::new(),
+            copies: Vec::new(),
+            plain_exits: Vec::new(),
             catch: None,
             leave_tail: None,
         }
@@ -11871,11 +12808,14 @@ impl<'a> Lower<'a> {
         self.b.ins().uload8(types::I64, FLAGS, addr, 0)
     }
 
+    /// Whether `tag` is `None`'s, `bool`'s, `int`'s, `float`'s or
+    /// `Unbound`'s: copied by value, dropped by forgetting.
     fn is_scalar(&mut self, tag: Value) -> Value {
-        let one = self.b.ins().iconst(types::I64, 1);
-        let bit = self.b.ins().ishl(one, tag);
-        let m = self.b.ins().band_imm(bit, self.tags.scalar_mask());
-        self.b.ins().icmp_imm(IntCC::NotEqual, m, 0)
+        self.b.ins().icmp_imm(
+            IntCC::UnsignedLessThan,
+            tag,
+            i64::from(crate::object::PLAIN_TAGS),
+        )
     }
 
     fn write_tag(&mut self, dst: Value, t: u8) {
@@ -11942,7 +12882,7 @@ impl<'a> Lower<'a> {
                         let v = &self.ext.objects[k as usize];
                         let word = v
                             .strong_word()
-                            .filter(|_| !self.cold && self.counted_tag(v));
+                            .filter(|_| !self.cold && !shared(SH_COPY) && self.counted_tag(v));
                         let src = self.const_addr(k);
                         let Some(word) = word else {
                             self.call(h_clone as *const () as usize, &[dst, src], false);
@@ -12011,8 +12951,25 @@ impl<'a> Lower<'a> {
     /// `*dst = (*src).clone()`: a scalar by value, anything else through
     /// its clone.
     fn copy_value(&mut self, dst: Value, src: Value) {
-        if self.cold {
+        if self.cold || shared(SH_COPY) {
             self.call(h_clone as *const () as usize, &[dst, src], false);
+            return;
+        }
+        if shared(SH_COPY_SCALAR) {
+            // A scalar by value, anything else through its clone.
+            let tag = self.tag_at(src);
+            let scalar = self.is_scalar(tag);
+            let by_value = self.b.create_block();
+            let by_clone = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.ins().brif(scalar, by_value, &[], by_clone, &[]);
+            self.b.switch_to_block(by_value);
+            self.copy16(dst, src);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(by_clone);
+            self.call(h_clone as *const () as usize, &[dst, src], false);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
             return;
         }
         let tag = self.tag_at(src);
@@ -12078,8 +13035,39 @@ impl<'a> Lower<'a> {
     fn flush(&mut self) {
         let base = self.depth - self.vs.len();
         let items = std::mem::take(&mut self.vs);
+        // Two or more copies: one call, not one call (or a scalar test in
+        // line) each.
+        let copies = items
+            .iter()
+            .filter(|i| matches!(i, Item::Local(_) | Item::Const(_)))
+            .count();
+        if copies >= 2 {
+            let mut list = Vec::with_capacity(copies);
+            for (k, item) in items.iter().enumerate() {
+                let (local, konst) = match *item {
+                    Item::Local(i) => (i, std::ptr::null()),
+                    Item::Const(c) => (
+                        COPY_CONST,
+                        std::ptr::from_ref(&self.ext.objects[c as usize]),
+                    ),
+                    _ => continue,
+                };
+                list.push(CopyItem {
+                    slot: (base + k) as u32,
+                    local,
+                    konst,
+                });
+            }
+            let list = list.into_boxed_slice();
+            let at = self.b.ins().iconst(self.ptr, list.as_ptr() as i64);
+            let n = self.b.ins().iconst(types::I64, list.len() as i64);
+            self.copies.push(list);
+            self.call(h_copies as *const () as usize, &[self.st, at, n], false);
+        }
         for (k, item) in items.into_iter().enumerate() {
-            self.materialize(item, base + k);
+            if copies < 2 || !matches!(item, Item::Local(_) | Item::Const(_)) {
+                self.materialize(item, base + k);
+            }
         }
     }
 
@@ -12161,7 +13149,30 @@ impl<'a> Lower<'a> {
     /// with `restore` (the operands it popped) back on the stack, from a
     /// side block; lowering continues in the current block afterwards.
     fn exit_with(&mut self, pc: usize, restore: &[Item], status: u32) -> Block {
+        // An exit with nothing virtual to write out is one constant and a
+        // jump: an operation's guards share it.
+        let plain = self
+            .vs
+            .iter()
+            .chain(restore)
+            .all(|i| matches!(i, Item::Mem(_)));
+        let key = (status, pc, self.depth + restore.len(), self.last_pc);
+        if plain {
+            if let Some(e) = self
+                .plain_exits
+                .iter()
+                .find(|e| (e.0, e.1, e.2, e.3) == key)
+            {
+                return e.4;
+            }
+        }
         let block = self.b.create_block();
+        if plain {
+            if self.plain_exits.len() >= 16 {
+                self.plain_exits.remove(0);
+            }
+            self.plain_exits.push((key.0, key.1, key.2, key.3, block));
+        }
         self.side_exits.push(SideExit {
             block,
             vs: self.vs.clone(),
@@ -12217,6 +13228,7 @@ impl<'a> Lower<'a> {
             self.b.switch_to_block(ret);
             self.b.ins().return_(&[r]);
         }
+        let before = (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks());
         while let Some(x) = self.side_exits.pop() {
             self.b.switch_to_block(x.block);
             self.vs = x.vs;
@@ -12228,6 +13240,13 @@ impl<'a> Lower<'a> {
             self.exit(x.status, x.pc);
         }
         self.exit_tails();
+        if stats::enabled() {
+            stats::lowered(
+                "<side exits>".to_owned(),
+                self.b.func.dfg.num_insts() - before.0,
+                self.b.func.dfg.num_blocks() - before.1,
+            );
+        }
     }
 
     /// Stop for a queued finalizer (with `pc` next), from the current
@@ -12434,117 +13453,7 @@ impl<'a> Lower<'a> {
         if self.depths.len() != n {
             return false;
         }
-        // Block starts: the entry, jump targets, and every instruction
-        // after one that ends a block or that the core loop runs.
-        let mut starts = vec![false; n];
-        starts[0] = true;
-        for (pc, ins) in code.instructions.iter().enumerate() {
-            let next = pc + 1;
-            let target = match ins.op {
-                OpCode::JumpForward
-                | OpCode::PopJumpIfFalse
-                | OpCode::PopJumpIfTrue
-                | OpCode::PopJumpIfNone
-                | OpCode::PopJumpIfNotNone
-                | OpCode::ForIter => Some(next + ins.arg as usize),
-                OpCode::JumpBackward => Some(next.saturating_sub(ins.arg as usize)),
-                _ => None,
-            };
-            // A `SEND`'s exit (`END_SEND`), where a delegate's return
-            // resumes the activation.
-            if ins.op == OpCode::Send && next + (ins.arg as usize) < n {
-                starts[next + ins.arg as usize] = true;
-            }
-            // And its `YIELD_VALUE`, where a delegate's yield goes on (the
-            // `SEND`'s lowering jumps there).
-            if ins.op == OpCode::Send && next < n {
-                starts[next] = true;
-            }
-            if let Some(t) = target {
-                if t < n {
-                    starts[t] = true;
-                }
-                if fused_pair_at(code, pc) {
-                    // Past the `UNPACK_SEQUENCE` a fused step skips.
-                    starts[pc + 2] = true;
-                }
-                if ins.op == OpCode::ForIter {
-                    // The loop exit past `END_FOR` / `POP_ITER`.
-                    let mut to = t;
-                    if code.instructions.get(to).map(|i| i.op) == Some(OpCode::EndFor) {
-                        to += 1;
-                        if matches!(
-                            code.instructions.get(to).map(|i| i.op),
-                            Some(OpCode::PopIter | OpCode::PopTop)
-                        ) {
-                            to += 1;
-                        }
-                    }
-                    if to < n {
-                        starts[to] = true;
-                    }
-                }
-            }
-            if next < n && (target.is_some() || !native_at(code, pc)) {
-                starts[next] = true;
-            }
-            // A fused attribute store continues after its `STORE_ATTR`.
-            if ins.op == OpCode::LoadFast
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::StoreAttr)
-                && pc + 2 < n
-            {
-                starts[pc + 2] = true;
-            }
-            // A function built with its defaults or closure continues after
-            // its last `SET_FUNCTION_ATTRIBUTE`.
-            if ins.op == OpCode::MakeFunction && ins.arg == 0 {
-                let k = fused_function_attrs(code, pc);
-                if k > 0 && pc + 1 + k < n {
-                    starts[pc + 1 + k] = true;
-                }
-            }
-            // A forwarding call (`f(*args, **kwargs)`) continues after its
-            // `CALL_FUNCTION_EX`.
-            if ins.op == OpCode::BuildMap
-                && ins.arg == 0
-                && crate::forward_call_shape(code, pc)
-                && pc + 4 < n
-            {
-                starts[pc + 4] = true;
-            }
-            // A global's fused class-constant read continues after its
-            // `LOAD_ATTR`.
-            if ins.op == OpCode::LoadGlobal
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadAttr)
-                && pc + 2 < n
-            {
-                starts[pc + 2] = true;
-            }
-            // A fused method call continues after its `CALL`.
-            if ins.op == OpCode::LoadFast
-                && code.instructions.get(next).map(|i| i.op) == Some(OpCode::LoadMethodAttr)
-            {
-                if let Some(call) =
-                    (pc + 2..n.min(pc + 12)).find(|&k| code.instructions[k].op == OpCode::Call)
-                {
-                    if call + 1 < n {
-                        starts[call + 1] = true;
-                    }
-                }
-            }
-        }
-        // A handler, entered from a helper's raise (see `h_catch`).
-        for h in &code.exception_table {
-            if (h.handler as usize) < n {
-                starts[h.handler as usize] = true;
-            }
-        }
-        for (pc, s) in starts.iter_mut().enumerate() {
-            if *s && self.depths[pc] < 0 {
-                // Unreachable on the ordinary paths (a handler's): no entry.
-                *s = false;
-            }
-        }
+        let starts = block_starts(code, self.depths);
         self.blocks = starts
             .iter()
             .enumerate()
@@ -12563,7 +13472,6 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(self.dispatch);
         let pc = self.b.ins().load(types::I64, FLAGS, self.st, S_PC);
         let len = self.b.ins().load(types::I64, FLAGS, self.st, S_LEN);
-        let pc32 = self.b.ins().ireduce(types::I32, pc);
         let out = self.b.create_block();
         // The code writes stack slots at fixed offsets: the frame's stack
         // must have room for the deepest point plus an instruction's own
@@ -12574,29 +13482,56 @@ impl<'a> Lower<'a> {
         let roomy = self.b.create_block();
         self.b.ins().brif(short, out, &[], roomy, &[]);
         self.b.switch_to_block(roomy);
-        let mut tramps = Vec::new();
-        let mut calls = Vec::with_capacity(n);
-        for pc in 0..n {
-            let target = match self.blocks[pc].filter(|_| !self.never_ran[pc]) {
-                Some(blk) => {
-                    let t = self.b.create_block();
-                    tramps.push((t, blk, self.depths[pc]));
-                    t
+        // Where each pc enters (see [`Route`]): a pc outside this function
+        // or at another depth leaves for the core loop, and the jump table
+        // lists only the blocks entered (a table entry per instruction,
+        // each to the shared exit, was a critical edge and four bytes of
+        // code per instruction per chunk).
+        let mut calls = Vec::new();
+        for pc in self.range.clone() {
+            let target = self.blocks[pc].filter(|_| !self.never_ran[pc]);
+            let route = match target {
+                Some(blk) if self.depths[pc] < i64::from(ROUTE_NONE >> 16) => {
+                    calls.push(self.b.func.dfg.block_call(blk, &[]));
+                    ((calls.len() as u32 - 1) << 16) | self.depths[pc] as u32
                 }
-                None => out,
+                _ => ROUTE_NONE,
             };
-            calls.push(self.b.func.dfg.block_call(target, &[]));
+            // SAFETY: the route table has an entry for every pc.
+            unsafe { self.route.add(pc).write(route) };
         }
+        let from = self.b.ins().iadd_imm(pc, -(self.range.start as i64));
+        let outside = self.b.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            from,
+            self.range.len() as i64,
+        );
+        let inside = self.b.create_block();
+        self.b.ins().brif(outside, out, &[], inside, &[]);
+        self.b.switch_to_block(inside);
+        let table = self.b.ins().iconst(self.ptr, self.route as i64);
+        let off = self.b.ins().ishl_imm(pc, 2);
+        let at = self.b.ins().iadd(table, off);
+        let route = self.b.ins().uload32(FLAGS, at, 0);
+        let depth = self.b.ins().band_imm(route, 0xffff);
+        let wrong = self.b.ins().icmp(IntCC::NotEqual, depth, len);
+        let enter = self.b.create_block();
+        self.b.ins().brif(wrong, out, &[], enter, &[]);
+        self.b.switch_to_block(enter);
+        let index = self.b.ins().ushr_imm(route, 16);
+        let index = self.b.ins().ireduce(types::I32, index);
         let def = self.b.func.dfg.block_call(out, &[]);
         let jt = self.b.create_jump_table(JumpTableData::new(def, &calls));
-        self.b.ins().br_table(pc32, jt);
+        self.b.ins().br_table(index, jt);
         self.b.switch_to_block(out);
         let s = self.b.ins().iconst(types::I32, i64::from(INTERP));
         self.b.ins().return_(&[s]);
-        for (t, blk, depth) in tramps {
-            self.b.switch_to_block(t);
-            let wrong = self.b.ins().icmp_imm(IntCC::NotEqual, len, depth);
-            self.b.ins().brif(wrong, out, &[], blk, &[]);
+        if stats::enabled() {
+            stats::lowered(
+                "<dispatch>".to_owned(),
+                self.b.func.dfg.num_insts(),
+                self.b.func.dfg.num_blocks() - self.blocks.iter().flatten().count(),
+            );
         }
         // The blocks: each from its start until it ends or the next block
         // starts.
@@ -12628,7 +13563,16 @@ impl<'a> Lower<'a> {
         }
         let mut pc = start;
         loop {
-            if !self.instruction(pc) {
+            let before = (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks());
+            let goes_on = self.instruction(pc);
+            if stats::enabled() {
+                stats::lowered(
+                    format!("{:?}", self.code.instructions[pc].op),
+                    self.b.func.dfg.num_insts() - before.0,
+                    self.b.func.dfg.num_blocks() - before.1,
+                );
+            }
+            if !goes_on {
                 break;
             }
             pc += 1;
@@ -12679,14 +13623,13 @@ impl<'a> Lower<'a> {
                         self.release_or(scalar, at, tag, done, heap);
                         self.b.switch_to_block(heap);
                         let r = self
-                            .call(h_pop as *const () as usize, &[at], true)
+                            .call(h_pop_checked as *const () as usize, &[self.st, at], true)
                             .expect("returns");
                         let out = self.exit_with(pc, &[Item::Mem(s)], INTERP);
-                        self.branch_out(r, out);
-                        self.set_last(pc);
-                        self.check_released(next);
+                        self.helper_status(pc, r, out);
                         self.b.ins().jump(done, &[]);
                         self.b.switch_to_block(done);
+                        self.set_last(pc);
                     }
                     // A copy never taken has nothing to release.
                     _ => {}
@@ -13790,14 +14733,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let old = self.tag_at(local);
-        let plain_old = {
-            let s = self.is_scalar(old);
-            let u = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::Equal, old, i64::from(self.tags.unbound));
-            self.b.ins().bor(s, u)
-        };
+        let plain_old = self.is_scalar(old);
         // The value's slot (it left the virtual stack).
         let slot = self.depth;
         match words {
@@ -13825,14 +14761,18 @@ impl<'a> Lower<'a> {
                 // The value into its slot (a copy taken), then moved in.
                 self.materialize(item, slot);
                 let src = self.slot_addr(slot);
-                let vt = self.tag_at(src);
-                // The PEP 709 cell restore stays on the full path.
-                let cell = self
-                    .b
-                    .ins()
-                    .icmp_imm(IntCC::Equal, vt, i64::from(self.tags.cell));
-                let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
-                self.branch_out(cell, out);
+                // The PEP 709 cell restore stays on the full path. (Only a
+                // slot shared with a cell has one: elsewhere a cell is a
+                // value like any other.)
+                if Interpreter::shared_cell_index(self.code, i as usize).is_some() {
+                    let vt = self.tag_at(src);
+                    let cell = self
+                        .b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, vt, i64::from(self.tags.cell));
+                    let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
+                    self.branch_out(cell, out);
+                }
                 let slow = self.b.create_block();
                 let done = self.b.create_block();
                 let fast = self.b.create_block();
@@ -13855,7 +14795,10 @@ impl<'a> Lower<'a> {
     /// a plain decrement (one thread owns every count, and no watcher or
     /// tracer wants the release). Anything else goes to `slow`.
     fn release_or(&mut self, plain: Value, local: Value, old: Value, fast: Block, slow: Block) {
-        if self.cold || (self.tags.rc_counted == 0 && self.tags.rc_counted_hdr == 0) {
+        if self.cold
+            || shared(SH_RELEASE)
+            || (self.tags.rc_counted == 0 && self.tags.rc_counted_hdr == 0)
+        {
             self.b.ins().brif(plain, fast, &[], slow, &[]);
             return;
         }
@@ -13933,11 +14876,46 @@ impl<'a> Lower<'a> {
             .expect("returns");
         // Declined: the value is on the stack, as the core loop expects.
         let out = self.exit_with(pc, &[Item::Mem(slot)], INTERP);
-        self.branch_out(r, out);
+        self.helper_status(pc, r, out);
+    }
+
+    /// [`Self::helper_status`] for a helper that left one more value on the
+    /// stack.
+    fn helper_status_above(&mut self, pc: usize, r: Value, out: Block) {
+        let ok = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(r, other, &[], ok, &[]);
+        self.b.switch_to_block(other);
         let saved = self.last_pc;
         self.set_last(pc);
-        self.check_released(pc + 1);
+        let marked = self.exit_with(pc + 1, &[Item::Mem(self.depth)], MARKED);
         self.last_pc = saved;
+        let dead = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(HELPER_DEAD));
+        self.b.ins().brif(dead, marked, &[], out, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    /// After a helper that releases returned `r`: go on in a fresh block
+    /// on `0`, leave for `out` when it declined, and stop past the
+    /// instruction at `pc` on [`HELPER_DEAD`].
+    fn helper_status(&mut self, pc: usize, r: Value, out: Block) {
+        let ok = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(r, other, &[], ok, &[]);
+        self.b.switch_to_block(other);
+        let saved = self.last_pc;
+        self.set_last(pc);
+        let marked = self.exit_with(pc + 1, &[], MARKED);
+        self.last_pc = saved;
+        let dead = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, r, i64::from(HELPER_DEAD));
+        self.b.ins().brif(dead, marked, &[], out, &[]);
+        self.b.switch_to_block(ok);
     }
 
     fn binary(&mut self, pc: usize, arg: u32) -> bool {
@@ -14040,17 +15018,16 @@ impl<'a> Lower<'a> {
         }
         // At run time: two ints, or two numbers with a float; any other
         // shape through the helper.
+        let (want_int, want_float) = self.site_paths(pc);
+        let int_kind = int_kind && want_int;
+        let float_kind = float_kind && want_float;
+        let int_div = is(BinOpKind::Div) && want_int;
         let other = self.b.create_block();
         let to_v = |s: &mut Self, r: Result<bool, Value>| match r {
             Ok(x) => s.b.ins().iconst(types::I8, i64::from(x)),
             Err(v) => v,
         };
-        let (iav, ibv, fav, fbv) = (
-            to_v(self, ia),
-            to_v(self, ib),
-            to_v(self, fa),
-            to_v(self, fb),
-        );
+        let (iav, ibv) = (to_v(self, ia), to_v(self, ib));
         let done = self.b.create_block();
         for _ in 0..3 {
             self.b.append_block_param(done, types::I64);
@@ -14058,7 +15035,11 @@ impl<'a> Lower<'a> {
         let zero = self.b.ins().iconst(types::I64, 0);
         let both_int = self.b.ins().band(iav, ibv);
         let int_b = self.b.create_block();
-        let not_int = self.b.create_block();
+        let not_int = if float_kind {
+            self.b.create_block()
+        } else {
+            other
+        };
         self.b.ins().brif(both_int, int_b, &[], not_int, &[]);
         self.b.switch_to_block(int_b);
         if int_kind {
@@ -14071,7 +15052,7 @@ impl<'a> Lower<'a> {
                     self.b.ins().jump(other, &[]);
                 }
             }
-        } else if is(BinOpKind::Div) {
+        } else if int_div {
             let r = self.int_true_div(a.word, b.word, other);
             let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
             let t = self.b.ins().iconst(types::I64, i64::from(self.tags.float));
@@ -14081,8 +15062,9 @@ impl<'a> Lower<'a> {
         } else {
             self.b.ins().jump(other, &[]);
         }
-        self.b.switch_to_block(not_int);
         if float_kind {
+            self.b.switch_to_block(not_int);
+            let (fav, fbv) = (to_v(self, fa), to_v(self, fb));
             let na = self.b.ins().bor(iav, fav);
             let nb = self.b.ins().bor(ibv, fbv);
             let nums = self.b.ins().band(na, nb);
@@ -14096,8 +15078,6 @@ impl<'a> Lower<'a> {
             self.b
                 .ins()
                 .jump(done, &[t.into(), bits.into(), zero.into()]);
-        } else {
-            self.b.ins().jump(other, &[]);
         }
         self.binary_fallback(pc, kind, ai, bi, other, done);
         self.b.switch_to_block(done);
@@ -14106,6 +15086,33 @@ impl<'a> Lower<'a> {
         self.push(Item::Dyn(t, w, byte));
         self.set_last(pc);
         true
+    }
+
+    /// Which of a `BINARY_OP`'s or `COMPARE_OP`'s in-line paths the site
+    /// has any use for, going by what the interpreter last specialized it
+    /// for: `(ints, floats)`. (A site it hasn't specialized keeps both; a
+    /// shape that turns up later takes the helper.)
+    fn site_paths(&self, pc: usize) -> (bool, bool) {
+        use weavepy_compiler::InlineCache as IC;
+        if !shared(SH_SITE_KIND) {
+            return (true, true);
+        }
+        match self.code.caches.get(pc as u32) {
+            IC::BinOpAddInt
+            | IC::BinOpSubInt
+            | IC::BinOpMulInt
+            | IC::BinOpDivInt
+            | IC::BinOpFloorDivInt
+            | IC::BinOpModInt
+            | IC::CompareOpInt => (true, false),
+            IC::BinOpAddFloat
+            | IC::BinOpSubFloat
+            | IC::BinOpMulFloat
+            | IC::BinOpDivFloat
+            | IC::CompareOpFloat => (false, true),
+            IC::BinOpAddStr | IC::CompareOpStr => (false, false),
+            _ => (true, true),
+        }
     }
 
     /// `BINARY_OP` with an operand on the stack: two numbers in line, the
@@ -14132,6 +15139,10 @@ impl<'a> Lower<'a> {
         .any(&is);
         let float_kind =
             is(BinOpKind::Add) || is(BinOpKind::Sub) || is(BinOpKind::Mult) || is(BinOpKind::Div);
+        let (want_int, want_float) = self.site_paths(pc);
+        let int_kind = int_kind && want_int;
+        let float_kind = float_kind && want_float;
+        let int_div = is(BinOpKind::Div) && want_int;
         let slot = self.depth;
         let dst = self.slot_addr(slot);
         let other = self.b.create_block();
@@ -14143,14 +15154,16 @@ impl<'a> Lower<'a> {
         let (int_t, float_t) = (self.tags.int, self.tags.float);
         let iav = to_v(self, a, Kind::Int, int_t);
         let ibv = to_v(self, b, Kind::Int, int_t);
-        let fav = to_v(self, a, Kind::Float, float_t);
-        let fbv = to_v(self, b, Kind::Float, float_t);
         let both_int = self.b.ins().band(iav, ibv);
         let int_b = self.b.create_block();
-        let not_int = self.b.create_block();
+        let not_int = if float_kind {
+            self.b.create_block()
+        } else {
+            other
+        };
         self.b.ins().brif(both_int, int_b, &[], not_int, &[]);
         self.b.switch_to_block(int_b);
-        if is(BinOpKind::Div) {
+        if int_div {
             let r = self.int_true_div(a.word, b.word, other);
             let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), r);
             self.write_tag(dst, float_t);
@@ -14171,8 +15184,10 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        self.b.switch_to_block(not_int);
         if float_kind {
+            self.b.switch_to_block(not_int);
+            let fav = to_v(self, a, Kind::Float, float_t);
+            let fbv = to_v(self, b, Kind::Float, float_t);
             let na = self.b.ins().bor(iav, fav);
             let nb = self.b.ins().bor(ibv, fbv);
             let nums = self.b.ins().band(na, nb);
@@ -14185,8 +15200,6 @@ impl<'a> Lower<'a> {
             self.write_tag(dst, float_t);
             self.b.ins().store(FLAGS, bits, dst, 8);
             self.b.ins().jump(done, &[]);
-        } else {
-            self.b.ins().jump(other, &[]);
         }
         // Any other shape: the operands onto the stack and through the
         // helper (the operands it releases are the stack's own).
@@ -14454,7 +15467,11 @@ impl<'a> Lower<'a> {
             return false;
         };
         let n = self.vs.len();
-        if self.cold || n < 2 || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0 {
+        if self.cold
+            || shared(SH_SEQ)
+            || n < 2
+            || self.depths.get(pc + 1).copied().unwrap_or(-1) < 0
+        {
             return false;
         }
         let (cont, key) = (self.vs[n - 2], self.vs[n - 1]);
@@ -14750,24 +15767,23 @@ impl<'a> Lower<'a> {
     /// [`crate::h_seq_get`], then [`h_subscr_ref`]: the item in `slot`.
     fn subscr_call(&mut self, pc: usize, slot: usize, pcont: Value, pkey: Value, owned: u8) {
         let out = self.slot_addr(slot);
-        let t = self.tags;
-        let seqs = (1i64 << t.list) | (1 << t.tuple);
-        let (int, keys) = (1i64 << t.int, (1i64 << t.int) | (1 << t.str));
-        self.ref_call_hot(
+        let r = self
+            .call(by_owned!(h_subscr_hot, owned), &[out, pcont, pkey], true)
+            .expect("returns");
+        let full_b = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(r, full_b, &[], done, &[]);
+        self.b.switch_to_block(full_b);
+        self.ref_call(
             pc,
-            (pcont, pkey),
-            &[
-                (1i64 << t.dict, keys, by_owned!(crate::h_dict_get, owned)),
-                (seqs, int, by_owned!(crate::h_seq_get, owned)),
-                (1i64 << t.str, int, by_owned!(crate::h_str_get, owned)),
-            ],
-            &[out, pcont, pkey],
             h_subscr_ref as *const () as usize,
             slot,
             2,
             &[pcont, pkey],
             owned,
         );
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
     /// `BINARY_SUBSCR` through [`h_subscr_ref`], which reads a local's or
@@ -15130,22 +16146,35 @@ impl<'a> Lower<'a> {
                     Ok(x) => s.b.ins().iconst(types::I8, i64::from(x)),
                     Err(v) => v,
                 };
-                let (iav, ibv, fav, fbv) = (
-                    to_v(self, ia),
-                    to_v(self, ib),
-                    to_v(self, fa),
-                    to_v(self, fb),
-                );
+                let (want_int, want_float) = self.site_paths(pc);
+                let (iav, ibv) = (to_v(self, ia), to_v(self, ib));
                 let done = self.b.create_block();
                 self.b.append_block_param(done, types::I8);
                 let both_int = self.b.ins().band(iav, ibv);
                 let int_b = self.b.create_block();
-                let not_int = self.b.create_block();
+                let not_int = if want_float {
+                    self.b.create_block()
+                } else {
+                    other
+                };
                 self.b.ins().brif(both_int, int_b, &[], not_int, &[]);
                 self.b.switch_to_block(int_b);
-                let r = int_cmp(self);
-                self.b.ins().jump(done, &[r.into()]);
+                if want_int {
+                    let r = int_cmp(self);
+                    self.b.ins().jump(done, &[r.into()]);
+                } else {
+                    self.b.ins().jump(other, &[]);
+                }
+                if !want_float {
+                    self.compare_fallback(pc, arg, ai, bi, other, done);
+                    self.b.switch_to_block(done);
+                    let r = self.b.block_params(done)[0];
+                    self.push(Item::Bool(r));
+                    self.set_last(pc);
+                    return true;
+                }
                 self.b.switch_to_block(not_int);
+                let (fav, fbv) = (to_v(self, fa), to_v(self, fb));
                 let na = self.b.ins().bor(iav, fav);
                 let nb = self.b.ins().bor(ibv, fbv);
                 let nums = self.b.ins().band(na, nb);
@@ -15510,6 +16539,84 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `LOAD_ATTR` of `item` (a local, or the value on the stack) through
+    /// [`h_attr_local`] or [`h_attr_stack`].
+    fn load_attr_shared(&mut self, pc: usize, item: Item) -> bool {
+        let slot = self.depth;
+        // (A property's call needs the whole stack on the frame's.)
+        let direct = if self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+            let site: Box<DirectSite> = Box::default();
+            let at = std::ptr::from_ref::<DirectSite>(&site).cast_mut();
+            self.direct_sites.push(site);
+            at
+        } else {
+            std::ptr::null_mut()
+        };
+        let (helper, local) = match item {
+            Item::Local(i) => (h_attr_local as *const () as usize, i),
+            _ => (h_attr_stack as *const () as usize, 0),
+        };
+        let site = Box::new(AttrSite {
+            code: std::ptr::from_ref(self.code),
+            ext: std::ptr::from_ref(self.ext),
+            pc: pc as u32,
+            slot: slot as u32,
+            local,
+            property: crate::property_site(self.ext, pc),
+            field: self
+                .field_slots
+                .get(pc)
+                .map_or(std::ptr::null(), std::ptr::from_ref),
+            direct,
+            cache: SlotCache::default(),
+        });
+        let c = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<AttrSite>(&site) as i64);
+        self.attr_sites.push(site);
+        let r = self.call(helper, &[self.st, c], true).expect("returns");
+        let exit = self.exit_with(pc, &[item], INTERP);
+        let done = self.b.create_block();
+        let is_stack = matches!(item, Item::Mem(_));
+        if !is_stack && direct.is_null() {
+            self.b.ins().brif(r, exit, &[], done, &[]);
+        } else {
+            let other = self.b.create_block();
+            self.b.ins().brif(r, other, &[], done, &[]);
+            self.b.switch_to_block(other);
+            if is_stack {
+                let saved = self.last_pc;
+                self.set_last(pc);
+                let marked = self.exit_with(pc + 1, &[Item::Mem(slot)], MARKED);
+                self.last_pc = saved;
+                let dead = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(HELPER_DEAD));
+                let rest = self.b.create_block();
+                self.b.ins().brif(dead, marked, &[], rest, &[]);
+                self.b.switch_to_block(rest);
+            }
+            if direct.is_null() {
+                self.b.ins().jump(exit, &[]);
+            } else {
+                let declined = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+                let leave = self.b.create_block();
+                self.b.ins().brif(declined, exit, &[], leave, &[]);
+                self.b.switch_to_block(leave);
+                self.leave(r);
+            }
+        }
+        self.b.switch_to_block(done);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
+        true
+    }
+
     fn load_attr(&mut self, pc: usize, _arg: u32) -> bool {
         // A property's getter may run here (see `h_property`), which needs
         // the whole stack on the frame's.
@@ -15517,6 +16624,9 @@ impl<'a> Lower<'a> {
             self.flush();
         }
         let item = self.pop();
+        if shared(SH_ATTR) && matches!(item, Item::Local(_) | Item::Mem(_)) {
+            return self.load_attr_shared(pc, item);
+        }
         let at = match item {
             Item::Local(i) => self.local_addr(i),
             Item::Mem(s) => self.slot_addr(s),
@@ -15856,12 +16966,26 @@ impl<'a> Lower<'a> {
             self.flush();
         }
         let s = self.depth;
-        let dst = self.slot_addr(s);
-        let cache: Box<GlobalCache> = Box::default();
+        let cache: Box<GlobalCache> = Box::new(GlobalCache {
+            code: std::ptr::from_ref(self.code) as u64,
+            ext: std::ptr::from_ref(self.ext) as u64,
+            pc: pc as u32,
+            nlocals: self.nlocals as u32,
+            len: s as u64,
+            ..GlobalCache::default()
+        });
         let cache_at = std::ptr::from_ref::<GlobalCache>(&cache) as i64;
         self.global_caches.push(cache);
-        let helper = self.b.create_block();
         let done = self.b.create_block();
+        if shared(SH_GLOBAL) {
+            let c = self.b.ins().iconst(self.ptr, cache_at);
+            let r = self
+                .call(h_global as *const () as usize, &[self.st, c], true)
+                .expect("returns");
+            return self.global_status(pc, s, r, may_fuse, done);
+        }
+        let dst = self.slot_addr(s);
+        let helper = self.b.create_block();
         // (In line even in a lean body: the cached read is a few loads
         // and compares, the helper's a full call.)
         {
@@ -15929,6 +17053,19 @@ impl<'a> Lower<'a> {
                 true,
             )
             .expect("returns");
+        self.global_status(pc, s, r, may_fuse, done)
+    }
+
+    /// After [`h_global`] or [`h_load_global`] returned `r` for the
+    /// `LOAD_GLOBAL` at `pc`, whose value takes slot `s`.
+    fn global_status(
+        &mut self,
+        pc: usize,
+        s: usize,
+        r: Value,
+        may_fuse: bool,
+        done: Block,
+    ) -> bool {
         let out = self.exit_with(pc, &[], INTERP);
         if may_fuse {
             let other = self.b.create_block();
@@ -15961,6 +17098,43 @@ impl<'a> Lower<'a> {
         // A leaf method of the value on top, called in place.
         self.leaf_method(pc, true);
         self.flush();
+        if shared(SH_METHOD) {
+            let (builtin_recv, builtin) = match self.builtin_method_load(pc) {
+                Some((want, f)) => {
+                    let obj = Object::Builtin(f.clone());
+                    // SAFETY: an `Object` is 16 bytes; a counted variant's
+                    // two words are all there is of it.
+                    let words = unsafe { std::ptr::from_ref(&obj).cast::<[u64; 2]>().read() };
+                    drop(obj);
+                    self.held.push(f);
+                    (want, words)
+                }
+                None => (u8::MAX, [0; 2]),
+            };
+            let site = Box::new(MethodSite {
+                cache: MethodCache::default(),
+                mods: ModCache::default(),
+                code: std::ptr::from_ref(self.code),
+                ext: std::ptr::from_ref(self.ext),
+                pc: pc as u32,
+                len: self.depth as u32,
+                builtin_recv,
+                builtin,
+            });
+            let c = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<MethodSite>(&site) as i64);
+            self.method_sites.push(site);
+            let r = self
+                .call(h_method as *const () as usize, &[self.st, c], true)
+                .expect("returns");
+            let out = self.exit_with(pc, &[], INTERP);
+            self.helper_status_above(pc, r, out);
+            self.depth += 1;
+            self.set_last(pc);
+            return true;
+        }
         let helper = self.b.create_block();
         let done = self.b.create_block();
         let fn_counted = self.tags.rc_counted & (1i64 << self.tags.function) != 0;
@@ -16271,8 +17445,51 @@ impl<'a> Lower<'a> {
     /// `TO_BOOL`: a scalar's truth in line, and an instance's of a class
     /// the site found always true (see [`h_truth_site`]); any other value's
     /// through the helper.
+    /// `TO_BOOL` of a local or the value on the stack through
+    /// [`h_truth_local`] or [`h_truth_stack`].
+    fn truth_shared(&mut self, pc: usize, item: Item) -> bool {
+        let cache: Box<MethodCache> = Box::default();
+        let c = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<MethodCache>(&cache) as i64);
+        self.method_caches.push(cache);
+        let (helper, at) = match item {
+            Item::Local(i) => (h_truth_local as *const () as usize, self.local_addr(i)),
+            Item::Mem(s) => (h_truth_stack as *const () as usize, self.slot_addr(s)),
+            _ => unreachable!("a local or a stack value"),
+        };
+        let r = self.call(helper, &[self.st, at, c], true).expect("returns");
+        let out = self.exit_with(pc, &[item], INTERP);
+        let other = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
+        if let Item::Mem(s) = item {
+            let not_bool = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(other, not_bool, &[], ok, &[]);
+            self.b.switch_to_block(not_bool);
+            let saved = self.last_pc.replace(pc);
+            let marked = self.exit_with(pc + 1, &[Item::Mem(s)], MARKED);
+            self.last_pc = saved;
+            let dead = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, r, i64::from(HELPER_DEAD));
+            self.b.ins().brif(dead, marked, &[], out, &[]);
+            self.b.switch_to_block(ok);
+        } else {
+            self.branch_out(other, out);
+        }
+        let t = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
+        self.push(Item::Bool(t));
+        self.set_last(pc);
+        true
+    }
+
     fn truth_of(&mut self, pc: usize) -> bool {
         let item = self.pop();
+        if shared(SH_TRUTH) && matches!(item, Item::Local(_) | Item::Mem(_)) {
+            return self.truth_shared(pc, item);
+        }
         let o = self.operand(item);
         if o.is_some_and(|o| o.kind == Kind::Bool) {
             self.push(item);
@@ -16410,7 +17627,7 @@ impl<'a> Lower<'a> {
                 true,
             )
             .expect("returns")
-        } else if self.cold {
+        } else if self.cold || shared(SH_CALL) {
             // A lean body makes [`Self::call_choice`]'s choice in a helper.
             let pc_argc = self
                 .b
