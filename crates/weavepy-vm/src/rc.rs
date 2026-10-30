@@ -139,7 +139,7 @@ pub fn revoke_refcount_bias() {
 /// `strong_word_matches_arc_layout` test pins it for every payload shape
 /// the VM uses.
 #[inline(always)]
-fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
+pub(crate) fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
     let align = std::mem::align_of_val(unsafe { &*value });
     let header = 2 * std::mem::size_of::<usize>();
     let offset = (header + align - 1) & !(align - 1);
