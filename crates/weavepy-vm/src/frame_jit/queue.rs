@@ -222,6 +222,10 @@ fn work(isa: OwnedTargetIsa) {
         // it.)
         lock().done.push((ticket, size, outcome));
         READY.store(true, Ordering::Release);
+        // Nothing else allocates on this thread, so its pages are free now:
+        // they would stay resident on top of the interpreter's heap,
+        // unused until the next compile, if it comes.
+        crate::malloc_stats::release_free_memory();
     }
 }
 

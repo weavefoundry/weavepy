@@ -38,7 +38,7 @@ static SNAP_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// Return addresses kept per sample.
 const DEPTH: usize = 24;
 /// Sampled blocks tracked at once (open addressing, power of two).
-const SLOTS: usize = 1 << 18;
+const SLOTS: usize = 1 << 16;
 
 struct Sample {
     ptr: usize,
@@ -118,7 +118,14 @@ fn map_samples() -> Option<usize> {
             0,
         )
     };
-    (p != libc::MAP_FAILED).then_some(p as usize)
+    if p == libc::MAP_FAILED {
+        return None;
+    }
+    // Touch it all now, so that the table's own pages don't move the
+    // resident set the watcher thread follows.
+    // SAFETY: the mapping is `bytes` long and writable.
+    unsafe { std::ptr::write_bytes(p.cast::<u8>(), 0, bytes) };
+    Some(p as usize)
 }
 
 /// Copy the live samples into the peak snapshot.
@@ -558,7 +565,11 @@ fn write_vm(path: &std::ffi::OsStr) {
             swapped,
             share,
             { i.external_pager },
-            if i.external_pager != 0 { file.as_str() } else { "" }
+            if i.external_pager != 0 {
+                file.as_str()
+            } else {
+                ""
+            }
         ));
     }
     write_classes(path);
@@ -670,7 +681,8 @@ fn snapshot_classes(regions: &[Region]) {
                     OWNER[slice].load(Ordering::Relaxed) as usize,
                     CLASS_OF[slice].load(Ordering::Relaxed) as usize,
                 );
-                AT_PEAK_RES[t.min(THREADS - 1)][c].fetch_add((res * 4096) as isize, Ordering::Relaxed);
+                AT_PEAK_RES[t.min(THREADS - 1)][c]
+                    .fetch_add((res * 4096) as isize, Ordering::Relaxed);
             }
             a += n;
         }
@@ -678,7 +690,8 @@ fn snapshot_classes(regions: &[Region]) {
 }
 
 fn write_classes(path: &std::ffi::OsStr) {
-    let mut out = String::from("# thread class_size live_at_rss_peak resident_at_rss_peak class_peak_live\n");
+    let mut out =
+        String::from("# thread class_size live_at_rss_peak resident_at_rss_peak class_peak_live\n");
     for t in 0..THREADS {
         let (mut l, mut r, mut p) = (0, 0, 0);
         for c in 0..CLASSES {

@@ -8,8 +8,68 @@
 //! itself: the peak resident set size.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// What the VM asks of the process's allocator, set by the host program
+/// that chose it.
+#[derive(Clone, Copy)]
+pub struct AllocatorHooks {
+    /// Return the calling thread's free memory to the OS.
+    pub release_free_memory: fn(),
+    /// Make the calling thread's allocations come from the compile heap
+    /// (see [`CompileHeap`]); returns what to pass to `leave_compile_heap`.
+    pub enter_compile_heap: fn() -> *mut std::ffi::c_void,
+    /// Undo `enter_compile_heap`, and return the compile heap's free memory
+    /// to the OS.
+    pub leave_compile_heap: fn(*mut std::ffi::c_void),
+}
+
+static HOOKS: OnceLock<AllocatorHooks> = OnceLock::new();
+
+/// Tell the VM how to talk to the process's allocator.
+pub fn set_allocator_hooks(hooks: AllocatorHooks) {
+    let _ = HOOKS.set(hooks);
+}
+
+/// Return the calling thread's free memory to the OS, after a burst of
+/// work on a thread that does little else (a compile's working memory).
+pub fn release_free_memory() {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.release_free_memory)();
+    }
+}
+
+/// While one of these lives, the thread's allocations come from a heap of
+/// their own, whose free pages go back to the OS when it drops.
+///
+/// A compile on the interpreter's thread allocates megabytes for a moment,
+/// in the large size classes the interpreter barely uses. From the
+/// interpreter's heap, those blocks would stay resident as free blocks in
+/// partly used pages for the rest of the process.
+pub struct CompileHeap {
+    previous: *mut std::ffi::c_void,
+}
+
+impl CompileHeap {
+    #[must_use]
+    pub fn enter() -> Self {
+        Self {
+            previous: HOOKS
+                .get()
+                .map_or(std::ptr::null_mut(), |hooks| (hooks.enter_compile_heap)()),
+        }
+    }
+}
+
+impl Drop for CompileHeap {
+    fn drop(&mut self) {
+        if let Some(hooks) = HOOKS.get() {
+            (hooks.leave_compile_heap)(self.previous);
+        }
+    }
+}
 
 /// Arrange for the report to print on process exit (through the C
 /// `exit` path, which is how the CLI leaves after `SystemExit` too).

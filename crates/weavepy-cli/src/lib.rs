@@ -761,6 +761,11 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
         pcprof::start();
+        weavepy::vm::malloc_stats::set_allocator_hooks(weavepy::vm::malloc_stats::AllocatorHooks {
+            release_free_memory: alloc::release_free_memory,
+            enter_compile_heap: alloc::enter_compile_heap,
+            leave_compile_heap: alloc::leave_compile_heap,
+        });
         #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
         alloc_profile::start();
         let code = entry();
