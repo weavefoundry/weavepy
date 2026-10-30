@@ -225,7 +225,7 @@ fn getter_plan(
         return Err("no getter known");
     };
     let callee = f.code();
-    let mut p = admit(&f, &callee, false, 1, None, path, budget)?;
+    let mut p = admit(&f, &callee, false, 1, None, false, path, budget)?;
     if p.missing != 0 {
         return Err("defaults");
     }
@@ -245,7 +245,7 @@ fn dunder_plan(
         return Err("no method known");
     };
     let callee = f.code();
-    let mut p = admit(&f, &callee, false, 2, None, path, budget)?;
+    let mut p = admit(&f, &callee, false, 2, None, false, path, budget)?;
     if p.missing != 0 {
         return Err("defaults");
     }
@@ -529,6 +529,7 @@ pub(super) fn plan(
             note(code, pc, "no callee known", "");
         }
         let names = kw_names(code, ext, pc).filter(|_| i.op == OpCode::CallKw);
+        let poly = callees.len() > 1;
         let mut chosen = Vec::new();
         for (f, has_self, classes) in callees.into_iter().take(MAX_POLY_TINY) {
             let callee = f.code();
@@ -541,6 +542,7 @@ pub(super) fn plan(
                 has_self,
                 call_argc(code, ext, pc),
                 names,
+                poly,
                 &mut path,
                 &mut left,
             ) {
@@ -661,6 +663,7 @@ fn admit(
     has_self: bool,
     argc: usize,
     names: Option<&[Object]>,
+    poly: bool,
     path: &mut Vec<usize>,
     budget: &mut usize,
 ) -> Result<Plan, &'static str> {
@@ -675,8 +678,14 @@ fn admit(
     if path.len() > MAX_LEVELS {
         return Err("too deep");
     }
-    // (A recursive function takes itself in line: most frames of its
-    // recursion then never exist. The depth limit above bounds it.)
+    // (A recursive function takes itself in line once, at a site that calls
+    // nothing else: most frames of a chain's recursion then never exist. A
+    // tree's, whose sites call several classes, lose more to the guards and
+    // the compile budget than they save.)
+    let at = std::ptr::from_ref(code) as usize;
+    if path.iter().filter(|&&c| c == at).count() >= 2 || (poly && path.contains(&at)) {
+        return Err("recursive");
+    }
     if code.is_generator || code.is_coroutine || code.is_async_generator {
         return Err("generator");
     }
@@ -772,16 +781,15 @@ fn admit(
                 let names = kw_names(code, ext, pc);
                 let mut chosen = Vec::new();
                 if names.is_some() {
-                    for (g, self_slot, classes) in callees_at(code, ext, &depths, pc)
-                        .into_iter()
-                        .take(MAX_POLY_TINY)
-                    {
+                    let callees = callees_at(code, ext, &depths, pc);
+                    let poly = callees.len() > 1;
+                    for (g, self_slot, classes) in callees.into_iter().take(MAX_POLY_TINY) {
                         let c = g.code();
                         if chosen.len() >= MAX_POLY && c.instructions.len() > TINY_BODY {
                             continue;
                         }
                         let n = call_argc(code, ext, pc);
-                        if let Ok(mut p) = admit(&g, &c, self_slot, n, names, path, budget) {
+                        if let Ok(mut p) = admit(&g, &c, self_slot, n, names, poly, path, budget) {
                             p.classes = classes;
                             let start = nlocals + call_start(code, ext, pc, depths[pc]) as usize;
                             inner_need = inner_need.max(start + 2 + p.need);
@@ -800,6 +808,7 @@ fn admit(
                     // (Anything not lowered in line runs as a direct call,
                     // see `h_inline_call`, and a site with an inline cache
                     // and no Python function may be a class's.)
+                    let poly = callees.len() > 1;
                     leaves = callees.is_empty()
                         && matches!(
                             code.caches.get(pc as u32),
@@ -814,9 +823,16 @@ fn admit(
                         if c.is_generator || c.is_coroutine || c.is_async_generator {
                             leaves = true;
                         }
-                        if let Ok(mut p) =
-                            admit(&g, &c, self_slot, ins.arg as usize, None, path, budget)
-                        {
+                        if let Ok(mut p) = admit(
+                            &g,
+                            &c,
+                            self_slot,
+                            ins.arg as usize,
+                            None,
+                            poly,
+                            path,
+                            budget,
+                        ) {
                             p.classes = classes;
                             let start = nlocals + (depths[pc] - i64::from(ins.arg) - 2) as usize;
                             inner_need = inner_need.max(start + 2 + p.need);
