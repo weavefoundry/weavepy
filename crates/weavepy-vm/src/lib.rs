@@ -46596,13 +46596,8 @@ impl Interpreter {
         match iter {
             Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
-            Object::Generator(g) => match self.generator_next_raw(g, false) {
-                Ok(v) => Ok(Some(v)),
-                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
+            // (Its end builds no `StopIteration` just to catch it.)
+            Object::Generator(g) => self.gen_drain_next(g, None, false),
             // ``__await__`` returns the coroutine itself, so driving it via
             // ``next()`` must advance it with ``send(None)`` like a generator.
             Object::Coroutine(_) => match self.gen_method_send(iter, Object::None) {
