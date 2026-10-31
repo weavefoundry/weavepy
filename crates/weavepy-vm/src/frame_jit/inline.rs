@@ -1,7 +1,7 @@
 //! Python callees lowered into their callers' native code.
 //!
-//! A direct call between compiled functions costs about 455 instructions,
-//! spread over its binding, its `State`, moves and reference counts. At a
+//! A direct call between compiled functions costs about 210 instructions,
+//! spread over its binding, its record, moves and reference counts. At a
 //! `CALL` whose site has settled on a small callee, the compiler lowers the
 //! callee's body into the caller instead, guarded by the callee's code
 //! ([`InlineSite::key`]): no activation, no `State`, no call helper.
@@ -2404,6 +2404,7 @@ unsafe extern "C" fn h_inline_call(
         }
         dc.set(depth + (*call).levels);
         s.inl_call = call;
+        s.inl_gone = false;
         // What the frame holds while the callee runs: the bodies' values
         // aren't its yet.
         (*s.frame).stack.set_len(root_site((*call).site).start);

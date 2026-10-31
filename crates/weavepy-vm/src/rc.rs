@@ -50,6 +50,50 @@ pub(crate) fn refcounts_biased() -> bool {
     }
 }
 
+/// Add an owner through the count `word`, with the bias held.
+///
+/// While the bias holds no other thread touches the count, so this is a
+/// plain (non-atomic) update, one read-modify-write instruction on x86.
+///
+/// # Safety
+///
+/// `word` is the count of a live allocation, and the bias holds.
+#[inline(always)]
+pub(crate) unsafe fn plain_increment(word: *const AtomicUsize) {
+    // SAFETY: per the caller.
+    unsafe {
+        let p = (*word).as_ptr();
+        *p = (*p).wrapping_add(1);
+    }
+}
+
+/// Release an owner through the count `word`, with the bias held, unless
+/// it's the last one: `false`, with the count unchanged. A plain update, as
+/// in [`plain_increment`].
+///
+/// # Safety
+///
+/// As [`plain_increment`], and the caller owns one of the references; on
+/// `true` that reference is released.
+#[inline(always)]
+pub(crate) unsafe fn plain_release(word: *const AtomicUsize) -> bool {
+    // SAFETY: per the caller.
+    unsafe {
+        let p = (*word).as_ptr();
+        let n = (*p).wrapping_sub(1);
+        *p = n;
+        if n != 0 {
+            return true;
+        }
+        // (The fence, which emits nothing, keeps the two stores apart: merged
+        // into one conditional store, they'd cost the shared case five more
+        // instructions than the decrement and branch it is now.)
+        std::sync::atomic::compiler_fence(Ordering::Acquire);
+        *p = 1;
+        false
+    }
+}
+
 /// Add a strong owner through the strong-count word `word` (see
 /// [`crate::object::Object`]'s `Clone`).
 ///
@@ -59,12 +103,12 @@ pub(crate) fn refcounts_biased() -> bool {
 /// a reference to.
 #[inline(always)]
 pub(crate) unsafe fn increment_word(word: *const AtomicUsize) {
-    // SAFETY: per the caller.
-    let word = unsafe { &*word };
     if refcounts_biased() {
-        word.store(word.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        // SAFETY: per the caller.
+        unsafe { plain_increment(word) };
     } else {
-        word.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: per the caller.
+        unsafe { &*word }.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -75,17 +119,8 @@ pub(crate) unsafe fn increment_word(word: *const AtomicUsize) {
 /// As [`increment_word`]; on `true` the caller's reference is released.
 #[inline(always)]
 pub(crate) unsafe fn try_release_word(word: *const AtomicUsize) -> bool {
-    if !refcounts_biased() {
-        return false;
-    }
-    // SAFETY: per the caller.
-    let word = unsafe { &*word };
-    let n = word.load(Ordering::Relaxed);
-    if n == 1 {
-        return false;
-    }
-    word.store(n - 1, Ordering::Relaxed);
-    true
+    // SAFETY: per the caller, and the bias holds if the first test passes.
+    refcounts_biased() && unsafe { plain_release(word) }
 }
 
 /// Revoke the single-thread bias before starting a thread that may touch VM
@@ -104,7 +139,7 @@ pub fn revoke_refcount_bias() {
 /// `strong_word_matches_arc_layout` test pins it for every payload shape
 /// the VM uses.
 #[inline(always)]
-fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
+pub(crate) fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
     let align = std::mem::align_of_val(unsafe { &*value });
     let header = 2 * std::mem::size_of::<usize>();
     let offset = (header + align - 1) & !(align - 1);
@@ -125,8 +160,7 @@ fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
 pub(crate) unsafe fn increment_strong<T: ?Sized>(value: *const T) {
     if refcounts_biased() {
         // SAFETY: live allocation, per the caller.
-        let word = unsafe { &*strong_word(value) };
-        word.store(word.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        unsafe { plain_increment(strong_word(value)) };
     } else {
         // SAFETY: as above.
         unsafe { Arc::increment_strong_count(value) };
@@ -144,17 +178,8 @@ pub(crate) unsafe fn increment_strong<T: ?Sized>(value: *const T) {
 /// caller must own one of its strong references.
 #[inline(always)]
 pub(crate) unsafe fn try_release_shared<T: ?Sized>(value: *const T) -> bool {
-    if !refcounts_biased() {
-        return false;
-    }
     // SAFETY: live allocation, per the caller.
-    let word = unsafe { &*strong_word(value) };
-    let n = word.load(Ordering::Relaxed);
-    if n == 1 {
-        return false;
-    }
-    word.store(n - 1, Ordering::Relaxed);
-    true
+    unsafe { try_release_word(strong_word(value)) }
 }
 
 /// Free the `Arc` allocation holding `value` when this is its last owner
@@ -228,15 +253,15 @@ pub(crate) fn drop_arc<T: ?Sized>(arc: Arc<T>) {
 unsafe fn drop_arc_in<T: ?Sized>(slot: &mut ManuallyDrop<Arc<T>>) {
     if refcounts_biased() {
         let value = Arc::as_ptr(slot);
-        // SAFETY: the allocation is live while `slot` owns a reference.
-        let strong = unsafe { &*strong_word(value) };
-        let n = strong.load(Ordering::Relaxed);
-        if n != 1 {
-            strong.store(n - 1, Ordering::Relaxed);
-            return;
+        let strong = strong_word(value);
+        // SAFETY: the allocation is live while `slot` owns a reference;
+        // `plain_release` declines for the last strong owner, which this
+        // then is.
+        unsafe {
+            if !plain_release(strong) {
+                release_last(value, &*strong);
+            }
         }
-        // SAFETY: the last strong owner, per the load above.
-        unsafe { release_last(value, strong) };
         return;
     }
     // SAFETY: per the caller.

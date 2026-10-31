@@ -565,6 +565,12 @@ impl Interpreter {
                         gen_lazy: false,
                         inl_call: std::ptr::null(),
                         inl_gone: false,
+                        no_direct: true,
+                        in_rec: false,
+                        at_start: false,
+                        clean: false,
+                        wait_pc: usize::MAX,
+                        wait_pending: None,
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -595,7 +601,7 @@ impl Interpreter {
                         if !Self::core_droppable(top) {
                             break None;
                         }
-                        crate::drop_hot(unsafe { base.add(len - 1).read() });
+                        unsafe { crate::drop_hot_at(base.add(len - 1)) };
                     }
                     len -= 1;
                     pc += 1;
@@ -795,7 +801,7 @@ impl Interpreter {
                             // leaves, and the loop exits past its
                             // `END_FOR`/`POP_ITER` pair.
                             len -= 1;
-                            crate::drop_hot(unsafe { base.add(len).read() });
+                            unsafe { crate::drop_hot_at(base.add(len)) };
                             pc += 1 + ins.arg as usize;
                             let op_at =
                                 |pc: usize| (pc < ninstrs).then(|| unsafe { (*instrs.add(pc)).op });
@@ -910,6 +916,12 @@ impl Interpreter {
             gen_lazy: false,
             inl_call: std::ptr::null(),
             inl_gone: false,
+            no_direct: true,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };

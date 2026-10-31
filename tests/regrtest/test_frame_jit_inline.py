@@ -631,6 +631,71 @@ show(run_rebound)
 show(run_method)
 '''
 
+CASES["bodies_on_records"] = r'''
+import sys
+
+N = 200
+seen = []
+
+
+def tail(i):
+    # Long enough to stay a call, and it looks at its callers now and then,
+    # which builds every activation around it.
+    t = i
+    t = t + 1
+    t = t - 1
+    t = t * 1
+    t = t + 0
+    t = t - 0
+    t = t * 1
+    t = t + 2
+    t = t - 2
+    if i % 7 == 0:
+        f = sys._getframe(1)
+        names = []
+        while f is not None and len(names) < 5:
+            module = f.f_code.co_name == "<module>"
+            names.append((f.f_code.co_name, [] if module else sorted(f.f_locals)))
+            f = f.f_back
+        if names not in seen:
+            seen.append(names)
+    if i % 11 == 0:
+        raise KeyError(i)
+    return t
+
+
+def body(a, b):
+    c = a + b
+    return tail(c) - b
+
+
+def record_callee(i):
+    try:
+        return body(i, 1)
+    except KeyError as e:
+        return -e.args[0]
+
+
+def run():
+    total = 0
+    for i in range(N):
+        total += record_callee(i)
+    return total
+
+
+def drive():
+    # `run`, with its callee in line, on a record of its own, call after call.
+    total = 0
+    for _ in range(40):
+        total += run()
+    return total
+
+
+print(drive())
+print(drive())
+print(seen)
+'''
+
 CASES["finalizers"] = r'''
 import gc
 import weakref
@@ -1922,6 +1987,7 @@ EXPECTED = {
     'recursion_limit': "180900\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n(180300, 2, 3)\n",
     'rebinding': "180900\n182700\nf() missing 1 required positional argument: 'b'\n180900\n359400\n188700\n-89099\n2400 3000 2400\n7800 3000\n61800\n24000\n19200\n3600\n1200 60600 1200\n1800\nname 'K' is not defined\n1800\n30000\n1800\nobject of type 'int' has no len()\n180900\n240300\n299700\n",
     'release_order': "[['z', 'y', 'x', 'caller']]\n[['d', 'c', 'b', 'a', 'caller']]\n[['a', 'new', 'b', 'caller']]\n[['c', 'b', 'a', 'caller']]\n",
+    'bodies_on_records': "646240\n646240\n[[('body', ['a', 'b', 'c']), ('record_callee', ['i']), ('run', ['i', 'total']), ('drive', ['_', 'total']), ('<module>', [])]]\n",
     'finalizers': "(179700, ['body', 'x', 'caller'])\n['in', 'a', 'caller']\n['in', 'caller', 'held']\n['in', 'caller', 'held']\n['before', 'arg', 'after', 'caller']\n['before', 'after', 'caller']\n['r', 'caller']\n['first', 'mid', 'second', 'caller']\n['dropped', 'popped', 'caller']\ndead\n['drops']\n",
     'values_and_arguments': '(658607465038423, 21267647932558653971072598982912901120)\n[-598, 597.5, 604, (True, True), None, \'constant\', 600, 1, 6.5]\n(72004026, [592, 593, 594, 595, 596, 597, 598, 599], {0: 1, 1: 1, 2: 1, 3: 1, 4: 1})\n["IndexError(\'list index out of range\')", \'TypeError("\\\'NoneType\\\' object is not subscriptable")\', "TypeError(\'list indices must be integers or slices, not str\')"]\n([0, 100, 200, 300], 6)\nnothing() missing 1 required positional argument: \'a\'\nnothing() takes 1 positional argument but 2 were given\nnothing() takes 1 positional argument but 2 were given\n540300\n729000\n((600, False, 1, \'yes\'), \'dunder-add\', \'dunder-eq\', (\'item\', 3), \'no\')\n(\'prop\', 3)\n',
     'deep_exits': "3006\n([('c', 26), ('b', 18), ('a', 14), ('run', 41), ('<module>', 48)], ['f', 'names', 'q', 'r', 'self'])\ntb 57\nd 32\n1200\n'NoneType' object is not subscriptable\n(<class 'KeyError'>, None)\n",
