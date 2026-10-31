@@ -546,6 +546,37 @@ pub(super) unsafe extern "C" fn h_direct_enter(
     }
 }
 
+/// [`h_direct_enter`] as compiled code calls it on Windows, whose C convention
+/// returns [`Entered`] through a hidden pointer rather than in two registers
+/// (see [`ENTER_CONV`]).
+///
+/// # Safety
+///
+/// As `h_direct_enter`'s.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(super) unsafe extern "sysv64" fn h_direct_enter_regs(
+    st: *mut State,
+    slot: *mut Object,
+    call: CallAt,
+) -> Entered {
+    // SAFETY: per the caller.
+    unsafe { h_direct_enter(st, slot, call) }
+}
+
+/// [`h_direct_enter`] as compiled code calls it: this convention's C
+/// functions return [`Entered`] in two registers.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub(super) use h_direct_enter as h_direct_enter_regs;
+
+/// The convention compiled code calls [`h_direct_enter_regs`] with (`None`:
+/// its own).
+pub(super) const ENTER_CONV: Option<cranelift_codegen::isa::CallConv> =
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        Some(cranelift_codegen::isa::CallConv::SystemV)
+    } else {
+        None
+    };
+
 /// [`h_direct_enter`] for a callee `entry` with defaults to take or a closure
 /// to read, or with the wrong number of arguments, the other checks passed.
 ///

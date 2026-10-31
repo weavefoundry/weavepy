@@ -16415,7 +16415,8 @@ impl<'a> Lower<'a> {
         let start = self.depth - argc - 2;
         let callee = self.slot_addr(start);
         let sig = *self.enter_sig.get_or_insert_with(|| {
-            let mut sig = Signature::new(self.b.func.signature.call_conv);
+            let conv = records::ENTER_CONV.unwrap_or(self.b.func.signature.call_conv);
+            let mut sig = Signature::new(conv);
             sig.params.push(AbiParam::new(self.ptr));
             sig.params.push(AbiParam::new(self.ptr));
             sig.params.push(AbiParam::new(types::I64));
@@ -16425,7 +16426,7 @@ impl<'a> Lower<'a> {
         });
         let helper = self.b.ins().iconst(
             self.ptr,
-            records::h_direct_enter as *const () as usize as i64,
+            records::h_direct_enter_regs as *const () as usize as i64,
         );
         let call = self.b.ins().iconst(
             types::I64,
