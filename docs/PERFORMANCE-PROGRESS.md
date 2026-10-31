@@ -538,14 +538,19 @@ slowdown in that run was the even-sized chunks, since fixed.
 
   | | Before | After | CPython |
   | --- | ---: | ---: | ---: |
-  | Peak resident set | 24.5 | 20.6 | 14.8 |
+  | Peak resident set | 24.5 | 20.8 | 14.5 |
   | File-backed (binary, shared libraries) | 9.3 | 9.8 | 6.3 |
-  | Dirty (the footprint) | 15.1 | 10.9 | 8.5 |
-  | mimalloc resident at the peak | 12.6 | 7.0 | |
-  | Interpreter's live heap | 7.7 | 5.8 | |
-  | Interpreter's free blocks in its pages | 1.9 | 1.3 | |
-  | Background compiler's free pages | 3.1 | 0.7 | |
+  | Dirty (the footprint) | 15.1 | 11.0 | 8.2 |
+  | mimalloc resident at the peak | 12.6 | 8.1 | |
+  | Interpreter's live heap | 7.7 | 5.9 | |
+  | Interpreter's free blocks in its pages | 1.9 | 1.0 | |
+  | Background compiler's free pages | 3.1 | 0.1 | |
   | Other dirty (`__DATA`, thread stacks, JIT code, system `malloc`) | 2.5 | 2.4 | |
+
+  ("Before" is the tree before this work and its frame-JIT rewrite, which
+  halved the IR a compile takes.) Over the suite on a quick build, this work
+  takes peak RSS from 1.578 to 1.423 times CPython's, on the tree with that
+  rewrite, at 1.010 of the instructions.
 
   What changed it:
   - *Function bodies decode on first read.* A code object is a header and a
@@ -569,8 +574,8 @@ slowdown in that run was the even-sized chunks, since fixed.
     after 50 ms instead of a second.
 
   What's left over CPython on `go` is about 3.5 MB of file-backed pages (the
-  interpreter's touched code; JIT off barely lowers it) and 2.4 MB of
-  dirty memory, 0.8 MB of it the frame JIT's. mimalloc's options (retained
+  interpreter's touched code; JIT off barely lowers it) and 2.8 MB of
+  dirty memory, about 0.8 MB of it the frame JIT's. mimalloc's options (retained
   pages, commit on demand, arena size, page map commit) don't move the peak.
   What remains of the heap is thin: `PyFunction` (216 bytes, about 1,300 to
   3,300 of them), code stubs, the VM's per-code extension (672 bytes), the
