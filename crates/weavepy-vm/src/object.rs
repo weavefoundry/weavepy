@@ -13400,6 +13400,8 @@ impl SipMemo {
     fn allocate(&self) -> *mut SipMemoEntry {
         // SAFETY: the layout has a non-zero size, and zeroed bytes are empty
         // entries (`len` is `0`).
+        // (The layout is the entries' own, so the block is aligned for them.)
+        #[allow(clippy::cast_ptr_alignment)]
         let entries = unsafe {
             std::alloc::alloc_zeroed(std::alloc::Layout::new::<[SipMemoEntry; SIP_MEMO_SLOTS]>())
         }

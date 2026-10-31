@@ -148,10 +148,15 @@ extern "C" {
     fn mi_heap_new_in_arena(arena_id: *mut c_void) -> *mut c_void;
     fn mi_heap_delete(heap: *mut c_void);
     fn mi_heap_collect(heap: *mut c_void, force: bool);
+    #[cfg(unix)]
     fn mi_heap_theap(heap: *mut c_void) -> *mut c_void;
+    #[cfg(unix)]
     fn mi_theap_get_default() -> *mut c_void;
     /// Internal: mimalloc 3's header declares `mi_theap_set_default`, but
-    /// no source defines it, and this is what it would call.
+    /// no source defines it, and this is what it would call. (MSVC builds
+    /// mimalloc as C++, which mangles this name; the compile arena that
+    /// needs it is Unix's alone.)
+    #[cfg(unix)]
     fn _mi_theap_default_set(theap: *mut c_void);
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
@@ -513,6 +518,7 @@ fn compile_heap() -> *mut c_void {
 
 /// Make this thread allocate from the compile heap; returns its previous
 /// default for [`restore_heap`].
+#[cfg(unix)]
 pub(crate) fn enter_compile_heap() -> *mut c_void {
     // SAFETY: plain FFI calls; the theap is this thread's own.
     unsafe {
@@ -522,11 +528,23 @@ pub(crate) fn enter_compile_heap() -> *mut c_void {
     }
 }
 
+/// Compile memory stays in this thread's default heap without a compile
+/// arena.
+#[cfg(not(unix))]
+pub(crate) fn enter_compile_heap() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
 /// Restore this thread's default heap.
+#[cfg(unix)]
 pub(crate) fn restore_heap(previous: *mut c_void) {
     // SAFETY: `previous` came from `enter_compile_heap` on this thread.
     unsafe { _mi_theap_default_set(previous) };
 }
+
+/// See [`enter_compile_heap`].
+#[cfg(not(unix))]
+pub(crate) fn restore_heap(_previous: *mut c_void) {}
 
 /// Run a collection that forces a purge, which should release compile memory
 /// only (see [`commit_first_arena_range`]).
