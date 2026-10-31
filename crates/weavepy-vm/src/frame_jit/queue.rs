@@ -85,6 +85,9 @@ fn generate_one(isa: &dyn TargetIsa, unit: Unit) -> Option<Machine> {
     let insts = func.dfg.num_insts();
     let blocks = func.dfg.num_blocks();
     let t1 = lowered.map(|_| std::time::Instant::now());
+    // (The IR came from the heap this goes back to; the machine code outlives
+    // the compile, so it comes from the thread's usual heap.)
+    let compile_heap = crate::malloc_stats::CompileHeap::enter();
     let mut ctx = cranelift_codegen::Context::for_function(func);
     let align = match ctx.compile(isa, &mut ControlPlane::default()) {
         Ok(compiled) => u64::from(compiled.buffer.alignment),
@@ -95,6 +98,7 @@ fn generate_one(isa: &dyn TargetIsa, unit: Unit) -> Option<Machine> {
             return None;
         }
     };
+    compile_heap.pause();
     let compiled = ctx.compiled_code()?;
     let bytes = compiled.code_buffer().to_vec();
     let relocs = compiled
@@ -158,6 +162,10 @@ static IN_FLIGHT_IR: AtomicUsize = AtomicUsize::new(0);
 const MAX_JOBS: usize = 8;
 const MAX_IR: usize = 24_000;
 
+/// How long the worker stays idle before its compile memory goes back to the
+/// OS.
+const IDLE_BEFORE_RELEASE: Duration = Duration::from_millis(10);
+
 fn lock() -> MutexGuard<'static, Queue> {
     QUEUE.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -201,6 +209,8 @@ pub(super) fn submit(isa: &OwnedTargetIsa, job: Job) -> Result<(), Job> {
 /// The worker: generate each job's code in turn, until told to stop with
 /// nothing left to do.
 fn work(isa: OwnedTargetIsa) {
+    // Whether compile memory may be waiting to go back to the OS.
+    let mut used_memory = false;
     loop {
         let job = {
             let mut q = lock();
@@ -211,9 +221,27 @@ fn work(isa: OwnedTargetIsa) {
                 if q.stop {
                     return;
                 }
-                q = WAKE.wait(q).unwrap_or_else(PoisonError::into_inner);
+                if !used_memory {
+                    q = WAKE.wait(q).unwrap_or_else(PoisonError::into_inner);
+                    continue;
+                }
+                // Keep the pages through a burst of compiles (faulting them
+                // back in costs more than the compile's allocations), and let
+                // them go once it's over, so they don't sit on top of the
+                // interpreter's heap as it runs.
+                let (guard, wait) = WAKE
+                    .wait_timeout(q, IDLE_BEFORE_RELEASE)
+                    .unwrap_or_else(PoisonError::into_inner);
+                q = guard;
+                if wait.timed_out() && q.jobs.is_empty() {
+                    drop(q);
+                    crate::malloc_stats::release_free_memory();
+                    used_memory = false;
+                    q = lock();
+                }
             }
         };
+        used_memory = true;
         let (ticket, size) = (job.ticket, job.size);
         let outcome = generate(&*isa, job.units);
         // (Its size counts against the bound until the interpreter takes

@@ -621,7 +621,12 @@ impl std::fmt::Debug for JitHint {
 
 /// A compiled Python code object. Mirrors the subset of
 /// `PyCodeObject` we need to emulate.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// The fields here are what a function made from the code needs; the rest,
+/// [`CodeBody`], is reached through `Deref`. A module loaded from the code
+/// cache decodes a nested code object's body when something first reads it,
+/// since most functions a module defines never run in a given program.
+#[derive(Debug, Clone, Default)]
 pub struct CodeObject {
     pub name: Name,
     /// Dotted qualified name (PEP 3155), computed at compile time from the
@@ -634,39 +639,10 @@ pub struct CodeObject {
     /// every code object compiled or decoded from one module holds the
     /// same allocation.
     pub filename: std::sync::Arc<str>,
-    pub instructions: Vec<Instruction>,
-    /// Per-instruction inline caches for adaptive specialization. The logical
-    /// count matches [`Self::instructions`], with storage allocated on the first
-    /// cache write. Marshal doesn't serialize cache state; loaded code starts
-    /// cold because process-local resolution tokens wouldn't remain valid.
-    pub caches: CacheTable,
     /// RFC 0061 (WS2a): VM-owned derived state (see [`VmExt`]).
     pub vm_ext: VmExt,
     /// RFC 0067: tier-2 "not jitable" fast-out hint (see [`JitHint`]).
     pub jit_hint: JitHint,
-    pub constants: Vec<Constant>,
-    /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
-    /// These and the other name tables hold pooled [`Name`]s.
-    pub names: Vec<Name>,
-    /// Local variable names (positional + keyword + `*args`/`**kwargs` + locals).
-    pub varnames: Vec<Name>,
-    /// Free variables — read from an enclosing scope.
-    pub freevars: Vec<Name>,
-    /// Cell variables — locally defined but referenced by an inner scope.
-    pub cellvars: Vec<Name>,
-    /// Out-of-line exception handlers. Looked up by current PC when a
-    /// `RuntimeError::PyException` propagates through this code object.
-    pub exception_table: Vec<ExcHandler>,
-    /// Source line number (1-based) per emitted instruction. Same length
-    /// as `instructions`. Used for traceback rendering. Decoded from the
-    /// code cache on first use (see [`LineTable`]).
-    pub linetable: LineTable,
-    /// PEP-657 fine-grained column spans, one per instruction (same length
-    /// as `instructions` once emission finishes). Drives the column fields
-    /// of `co_positions()`. Empty when never populated (e.g. code objects
-    /// reconstructed from marshal, which doesn't carry columns). Decoded
-    /// from the code cache on first use (see [`ColTable`]).
-    pub coltable: ColTable,
     /// Number of positional + keyword arguments (excluding `*args`/`**kwargs`).
     pub arg_count: u32,
     /// Number of positional-only arguments.
@@ -717,6 +693,82 @@ pub struct CodeObject {
     /// dont_inherit=False)` can inherit the caller's futures the way
     /// CPython does (RFC 0052).
     pub future_flags: u32,
+    /// `co_stacksize` as CPython's `calculate_stackdepth` computed it
+    /// over the control-flow graph (or as it arrived in a marshal
+    /// stream). The graph sees handler blocks a `SETUP_*` still targets
+    /// after their protected range emptied out (an `except* E as e:
+    /// pass` body), which the assembled exception table no longer
+    /// mentions; recomputing from the flat stream would miss them.
+    pub stacksize: Option<u32>,
+    /// A compiler-generated `__annotate__` scope (PEP 649):
+    /// `codegen_leave_annotations_scope` rebuilt its
+    /// `co_localsplusnames` (`.format` -> `format`) as a fresh tuple
+    /// outside the constant cache, so the marshal writer never shares
+    /// it. A user function named `__annotate__` is not one.
+    pub annotate_scope: bool,
+    /// The instruction stream and its tables (see [`CodeBody`]).
+    pub body: LazyBody,
+}
+
+impl PartialEq for CodeObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.qualname == other.qualname
+            && self.filename == other.filename
+            && self.vm_ext == other.vm_ext
+            && self.jit_hint == other.jit_hint
+            && self.arg_count == other.arg_count
+            && self.posonly_count == other.posonly_count
+            && self.kwonly_count == other.kwonly_count
+            && self.has_varargs == other.has_varargs
+            && self.has_varkeywords == other.has_varkeywords
+            && self.is_class_body == other.is_class_body
+            && self.is_generator == other.is_generator
+            && self.is_coroutine == other.is_coroutine
+            && self.is_async_generator == other.is_async_generator
+            && self.is_iterable_coroutine == other.is_iterable_coroutine
+            && self.has_docstring == other.has_docstring
+            && self.is_method == other.is_method
+            && self.is_nested == other.is_nested
+            && self.future_flags == other.future_flags
+            && self.stacksize == other.stacksize
+            && self.annotate_scope == other.annotate_scope
+            && **self == **other
+    }
+}
+
+/// The part of a [`CodeObject`] that only running or inspecting it reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodeBody {
+    pub instructions: Vec<Instruction>,
+    /// Per-instruction inline caches for adaptive specialization. The logical
+    /// count matches [`Self::instructions`], with storage allocated on the first
+    /// cache write. Marshal doesn't serialize cache state; loaded code starts
+    /// cold because process-local resolution tokens wouldn't remain valid.
+    pub caches: CacheTable,
+    pub constants: Vec<Constant>,
+    /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
+    /// These and the other name tables hold pooled [`Name`]s.
+    pub names: Vec<Name>,
+    /// Local variable names (positional + keyword + `*args`/`**kwargs` + locals).
+    pub varnames: Vec<Name>,
+    /// Free variables — read from an enclosing scope.
+    pub freevars: Vec<Name>,
+    /// Cell variables — locally defined but referenced by an inner scope.
+    pub cellvars: Vec<Name>,
+    /// Out-of-line exception handlers. Looked up by current PC when a
+    /// `RuntimeError::PyException` propagates through this code object.
+    pub exception_table: Vec<ExcHandler>,
+    /// Source line number (1-based) per emitted instruction. Same length
+    /// as `instructions`. Used for traceback rendering. Decoded from the
+    /// code cache on first use (see [`LineTable`]).
+    pub linetable: LineTable,
+    /// PEP-657 fine-grained column spans, one per instruction (same length
+    /// as `instructions` once emission finishes). Drives the column fields
+    /// of `co_positions()`. Empty when never populated (e.g. code objects
+    /// reconstructed from marshal, which doesn't carry columns). Decoded
+    /// from the code cache on first use (see [`ColTable`]).
+    pub coltable: ColTable,
     /// Memoised [`Self::to_cpython`] encoding (never compared, resets
     /// on clone).
     pub cp_cache: cpython_code::CpCache,
@@ -726,13 +778,6 @@ pub struct CodeObject {
     /// surface reports these bytes verbatim instead of re-encoding the
     /// instruction stream, so constructor/replace round-trips are exact.
     pub wire: Option<Box<WireOverrides>>,
-    /// `co_stacksize` as CPython's `calculate_stackdepth` computed it
-    /// over the control-flow graph (or as it arrived in a marshal
-    /// stream). The graph sees handler blocks a `SETUP_*` still targets
-    /// after their protected range emptied out (an `except* E as e:
-    /// pass` body), which the assembled exception table no longer
-    /// mentions; recomputing from the flat stream would miss them.
-    pub stacksize: Option<u32>,
     /// One [`bytecode::wire`] mark per instruction: how the codec
     /// presents it on the CPython wire (borrowing/checked loads,
     /// superinstruction fusion). Empty means all plain.
@@ -741,12 +786,157 @@ pub struct CodeObject {
     /// [`CodeRare`]), read through [`Self::no_interrupt_jumps`],
     /// [`Self::hidden_locals`] and [`Self::const_identifiers`].
     pub rare: CodeRare,
-    /// A compiler-generated `__annotate__` scope (PEP 649):
-    /// `codegen_leave_annotations_scope` rebuilt its
-    /// `co_localsplusnames` (`.format` -> `format`) as a fresh tuple
-    /// outside the constant cache, so the marshal writer never shares
-    /// it. A user function named `__annotate__` is not one.
-    pub annotate_scope: bool,
+}
+
+/// A [`CodeObject`]'s body: a box, or where the code cache holds its
+/// encoding, decoded on first use. (A null pointer with nothing to decode is
+/// an empty body, made when first read.)
+pub struct LazyBody {
+    body: std::sync::atomic::AtomicPtr<CodeBody>,
+    /// The module's encoding and the body's offset in it, until decoded.
+    source: Option<(std::sync::Arc<TableBuffer>, u32)>,
+}
+
+impl LazyBody {
+    pub(crate) fn encoded(buffer: std::sync::Arc<TableBuffer>, at: u32) -> Self {
+        LazyBody {
+            body: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            source: Some((buffer, at)),
+        }
+    }
+
+    /// Decode the body if it wasn't yet; `false` if its encoding is
+    /// malformed.
+    pub(crate) fn try_decode(&self, filename: &std::sync::Arc<str>) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.body.load(Ordering::Acquire).is_null() {
+            return true;
+        }
+        let body = match &self.source {
+            Some((buffer, at)) => match native_code::decode_body(buffer, *at, filename) {
+                Some(body) => body,
+                None => return false,
+            },
+            None => CodeBody::default(),
+        };
+        let fresh = Box::into_raw(Box::new(body));
+        if self
+            .body
+            .compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: never published.
+            drop(unsafe { Box::from_raw(fresh) });
+        }
+        true
+    }
+}
+
+impl From<CodeBody> for LazyBody {
+    fn from(body: CodeBody) -> Self {
+        LazyBody {
+            body: std::sync::atomic::AtomicPtr::new(Box::into_raw(Box::new(body))),
+            source: None,
+        }
+    }
+}
+
+impl Default for LazyBody {
+    fn default() -> Self {
+        LazyBody {
+            body: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            source: None,
+        }
+    }
+}
+
+impl Drop for LazyBody {
+    fn drop(&mut self) {
+        let body = *self.body.get_mut();
+        if !body.is_null() {
+            // SAFETY: a published body is a box this owns.
+            drop(unsafe { Box::from_raw(body) });
+        }
+    }
+}
+
+impl Clone for LazyBody {
+    fn clone(&self) -> Self {
+        let body = self.body.load(std::sync::atomic::Ordering::Acquire);
+        if body.is_null() {
+            // Not decoded yet: the clone decodes its own copy, when needed.
+            return LazyBody {
+                body: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                source: self.source.clone(),
+            };
+        }
+        // SAFETY: a published body lives as long as `self`.
+        LazyBody::from(unsafe { &*body }.clone())
+    }
+}
+
+impl std::fmt::Debug for LazyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = self.body.load(std::sync::atomic::Ordering::Acquire);
+        if body.is_null() {
+            f.write_str("LazyBody(undecoded)")
+        } else {
+            // SAFETY: a published body lives as long as `self`.
+            unsafe { &*body }.fmt(f)
+        }
+    }
+}
+
+impl std::ops::Deref for CodeObject {
+    type Target = CodeBody;
+
+    #[inline(always)]
+    fn deref(&self) -> &CodeBody {
+        let body = self.body.body.load(std::sync::atomic::Ordering::Acquire);
+        if body.is_null() {
+            return self.decode_body();
+        }
+        // SAFETY: a published body lives as long as `self`.
+        unsafe { &*body }
+    }
+}
+
+impl std::ops::DerefMut for CodeObject {
+    fn deref_mut(&mut self) -> &mut CodeBody {
+        self.decode_body();
+        // SAFETY: `decode_body` published a box this owns, and the borrow is
+        // exclusive.
+        unsafe { &mut **self.body.body.get_mut() }
+    }
+}
+
+impl CodeObject {
+    /// Decode the body, on its first read.
+    #[cold]
+    #[inline(never)]
+    fn decode_body(&self) -> &CodeBody {
+        assert!(
+            self.body.try_decode(&self.filename),
+            "the code cache's copy of {} is corrupt",
+            self.filename
+        );
+        // SAFETY: published just now; it lives as long as `self`.
+        unsafe { &*self.body.body.load(std::sync::atomic::Ordering::Acquire) }
+    }
+
+    /// Whether the body was decoded (or never needed decoding).
+    pub fn body_decoded(&self) -> bool {
+        !self
+            .body
+            .body
+            .load(std::sync::atomic::Ordering::Acquire)
+            .is_null()
+    }
 }
 
 /// The fields of a [`CodeObject`] that most code leaves empty, boxed so
@@ -826,10 +1016,10 @@ impl PartialEq for CodeRare {
 }
 
 // A decoded module holds a code object per function, class body and
-// comprehension, each behind an `Arc`'s two counts: at 368 bytes or
-// fewer, the allocation fits mimalloc's 384-byte size class.
+// comprehension, each behind an `Arc`'s two counts, most of which never run:
+// at 144 bytes or fewer, the allocation fits mimalloc's 160-byte size class.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<CodeObject>() <= 376);
+const _: () = assert!(std::mem::size_of::<CodeObject>() <= 144);
 
 impl CodeObject {
     /// See [`RareFields::no_interrupt_jumps`].
@@ -882,18 +1072,40 @@ struct LazyTable<T> {
     _items: std::marker::PhantomData<Vec<T>>,
 }
 
-/// The table section of a module in the code cache's native form (see
-/// `native_code`): its own bytes, or, say, a mapping of the cache file
-/// that only the tables something reads ever page in.
-pub struct TableBuffer(Box<dyn AsRef<[u8]> + Send + Sync>);
+/// The encoding of a module in the code cache's native form (see
+/// `native_code`): its own bytes, or, say, a mapping of the cache file.
+pub struct TableBuffer(Box<dyn CodeBytes>);
+
+/// Where a [`TableBuffer`] gets its bytes.
+pub trait CodeBytes: Send + Sync + 'static {
+    /// The bytes.
+    fn bytes(&self) -> &[u8];
+
+    /// Run `read` on the bytes. A source whose pages would otherwise stay
+    /// resident (a mapping) can give them a view that it drops afterward:
+    /// what a code object decodes is copied out, and it decodes once.
+    fn read(&self, read: &mut dyn FnMut(&[u8])) {
+        read(self.bytes());
+    }
+}
+
+impl CodeBytes for Box<[u8]> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
 
 impl TableBuffer {
-    pub fn new(bytes: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+    pub fn new(bytes: impl CodeBytes) -> Self {
         TableBuffer(Box::new(bytes))
     }
 
     fn bytes(&self) -> &[u8] {
-        (*self.0).as_ref()
+        self.0.bytes()
+    }
+
+    fn read(&self, read: &mut dyn FnMut(&[u8])) {
+        self.0.read(read);
     }
 }
 
@@ -970,12 +1182,13 @@ impl<T> LazyTable<T> {
             // decoded table takes over if it is published (and which a
             // published table keeps alive for any racing reader).
             let source = unsafe { std::sync::Arc::from_raw(buffer) };
-            let items = source
-                .bytes()
-                .get(self.start as usize..self.end as usize)
-                .and_then(decode)
-                .unwrap_or_default();
-            (items, Some(source))
+            let mut items = None;
+            source.read(&mut |bytes| {
+                items = bytes
+                    .get(self.start as usize..self.end as usize)
+                    .and_then(decode);
+            });
+            (items.unwrap_or_default(), Some(source))
         };
         let fresh = Box::into_raw(Box::new(Decoded { items, source }));
         match self.state.compare_exchange(
@@ -3152,7 +3365,8 @@ impl Compiler {
         flowgraph::optimize(&mut self.co, &input);
         // Record the instruction count without allocating inline caches.
         // The first cache write allocates storage for direct PC indexing.
-        self.co.caches.resize(self.co.instructions.len());
+        let n = self.co.instructions.len();
+        self.co.caches.resize(n);
         self.co
     }
 

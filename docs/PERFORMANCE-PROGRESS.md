@@ -515,12 +515,12 @@ slowdown in that run was the even-sized chunks, since fixed.
   other thresholds each trade warm time for cold.
 - **Background compilation's costs.** It moves about two thirds of a
   compile (Cranelift's code generation) off the interpreter's thread; the
-  lowering stays (a third). CPU time rises about 2%, and a workload that
-  compiles peaks about 2 MB higher: the worker's compile memory comes from
-  its own allocator heap rather than the interpreter's free blocks. The
-  same rise shows with the interpreter blocked during the compile, and
-  neither `mi_collect` when the worker idles, immediate purging, smaller
-  jobs nor letting the worker exit when idle brought it down.
+  lowering stays (a third). CPU time rises about 2%. A workload that compiled
+  peaked about 2 MB higher, as the worker's free pages stayed resident on top
+  of the interpreter's heap. Earlier attempts to collect that heap showed
+  nothing because on macOS `MADV_FREE_REUSABLE` lowers the footprint but not
+  the resident set, so no purge ever moved peak RSS there. See "Peak memory"
+  below.
 - **Memory on Linux.** mimalloc's arenas are backed by transparent huge
   pages there (`madvise` mode, the distributions' default), which is much
   of why Linux peak RSS is about 3.6 times CPython's (the CI's `startup`
@@ -531,13 +531,65 @@ slowdown in that run was the even-sized chunks, since fixed.
   (`PR_SET_THP_DISABLE`) takes `startup` to 20 MiB but brings the faults
   back (7,500 on `deque_ops`) and is inherited by child processes, so it
   isn't in.
-- **Heap, from the allocation profiler** (`--features alloc-profile`):
-  the harness's imports add 3.7 MB live, 2.3 MB of it code objects
-  (decoded instructions 0.5 MB, the `Arc<CodeObject>`s 0.5, VM extensions
-  0.45, inline caches 0.3), and a tier-2 compile sets most workloads'
-  peak (Cranelift and regalloc2 1.9 MB in `chaos`). Only 154 of 2,094 code
-  objects are nested in functions, so materializing them lazily wouldn't
-  pay.
+- **Peak memory, where it goes.** The profiler (`--features alloc-profile`,
+  now with `<file>.vm` and `<file>.classes`: the regions, and mimalloc's
+  resident bytes by thread and size class, at the resident set's high-water
+  mark) on `go`, before and after the memory work, in MB:
+
+  | | Before | After | CPython |
+  | --- | ---: | ---: | ---: |
+  | Peak resident set | 24.5 | 20.8 | 14.5 |
+  | File-backed (binary, shared libraries) | 9.3 | 9.8 | 6.3 |
+  | Dirty (the footprint) | 15.1 | 11.0 | 8.2 |
+  | mimalloc resident at the peak | 12.6 | 8.1 | |
+  | Interpreter's live heap | 7.7 | 5.9 | |
+  | Interpreter's free blocks in its pages | 1.9 | 1.0 | |
+  | Background compiler's free pages | 3.1 | 0.1 | |
+  | Other dirty (`__DATA`, thread stacks, JIT code, system `malloc`) | 2.5 | 2.4 | |
+
+  ("Before" is the tree before this work and its frame-JIT rewrite, which
+  halved the IR a compile takes.) Over the suite on a quick build, this work
+  takes peak RSS from 1.578 to 1.423 times CPython's, on the tree with that
+  rewrite, at 1.010 of the instructions.
+
+  What changed it:
+  - *Function bodies decode on first read.* A code object is a header and a
+    body behind `Deref`; a cached module's nested bodies stay encoded until
+    something reads them, and the code cache's mapping is read through a
+    second mapping removed afterward. The harness's imports fell from 15.3 to
+    13.6 MB (CPython 13.2), since most functions a module defines never run. A
+    stub costs 160 bytes, down from 384 plus its vectors. `Deref`'s check is
+    about three instructions at each of a few million reads a call of
+    `coroutines` (1.7% there, 0.6% on the geomean).
+  - *Compile memory has an arena of its own.* The worker and compiles on the
+    interpreter's thread allocate there, the worker returns it to the OS after
+    10 ms idle, and the interpreter's first arena declines the purges this
+    forces. Forcing purges of the first arena as well, after every compile,
+    made `stdlib_utils` 30% slower warm on Linux, as its free ranges faulted
+    back in. Purged ranges are mapped over on macOS, the only way to take them
+    out of the resident set at once.
+  - *Smaller things.* Thread-local storage per thread fell from 53 to 18 KB
+    (a hash memo and specialization statistics are allocated on first use),
+    `tracing` isn't set up without `WEAVEPY_LOG`, and macOS's arenas purge
+    after 50 ms instead of a second.
+
+  What's left over CPython on `go` is about 3.5 MB of file-backed pages (the
+  interpreter's touched code; JIT off barely lowers it) and 2.8 MB of
+  dirty memory, about 0.8 MB of it the frame JIT's. mimalloc's options (retained
+  pages, commit on demand, arena size, page map commit) don't move the peak.
+  What remains of the heap is thin: `PyFunction` (216 bytes, about 1,300 to
+  3,300 of them), code stubs, the VM's per-code extension (672 bytes), the
+  type cache and the collector's tracked list are 100 to 300 KB each.
+- **Tried and dropped in the memory work**: delaying inline cache storage until
+  a code object's second activation or a run of writes (0.8% less RSS, but
+  `closures_decorators` 56% more instructions: compiles and leaf plans read
+  what the caches hold when they're made); frame-JIT chunks of 1,200 IR
+  instructions (2.7% less RSS, 1.1% more instructions, `unpack_sequence` 18%);
+  a queue bound of one job and tier-2 compiles waiting for the worker (no
+  change); mapping blocks of 128 KiB or more one by one (no change except
+  `float_points`); LLVM's hot-cold splitting without a profile (the code
+  barely changes); `MADV_RANDOM` on the binary (this macOS has no fault-around:
+  a file-backed page in the resident set was touched).
 - **Tried and dropped in PR #102**: tier-2 compiles in the background
   (while a constructor's compile was pending, interpreted constructors
   built instances in another shape and the compiled loop side-exited on
@@ -563,10 +615,11 @@ slowdown in that run was the even-sized chunks, since fixed.
    compile) and the time a body runs interpreted before its code is
    ready; a much cheaper baseline compiler or compiled code kept across
    processes.
-3. Peak memory: code objects (2.3 MB of the harness's 3.7 MB of imports),
-   the compile peak (now partly the background compiler's own heap), and
-   on Linux the arenas' huge pages, without the page faults that turning
-   them off brings.
+3. Peak memory: the file-backed pages (3.5 MB over CPython's: the
+   interpreter's code is spread over many large functions, so hot-cold
+   splitting with a profile is the next thing to try), and dropping a body
+   again when its code stopped running (bodies, VM extensions and inline
+   caches of code run at import are about 2 MB).
 4. Builtins take keywords as `&[(String, Object)]`, so every keyword call
    of one allocates a `String` per keyword; a calling convention over the
    names tuple would remove it.

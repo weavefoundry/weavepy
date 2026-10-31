@@ -1787,6 +1787,7 @@ impl JitState {
             (r, callees.into_inner(), methods.into_inner(), obj_names)
         };
         let (res, callees, methods, obj_names) = {
+            let _compile_heap = crate::malloc_stats::CompileHeap::enter();
             let first = run(false);
             if matches!(
                 first.0,

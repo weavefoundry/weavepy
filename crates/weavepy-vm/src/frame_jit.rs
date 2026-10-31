@@ -757,6 +757,7 @@ impl Slot {
             return;
         }
         let t0 = stats::enabled().then(std::time::Instant::now);
+        let _compile_heap = crate::malloc_stats::CompileHeap::enter();
         let Some(lowered) = compile(code, ext, nlocals, at) else {
             let _ = self.native.set(None);
             return;
@@ -867,7 +868,14 @@ fn take_waiting(ticket: u64) -> Option<(u64, *const Slot, Parts)> {
 #[cold]
 #[inline(never)]
 fn drain() {
-    for (ticket, outcome) in queue::take_done() {
+    let done = queue::take_done();
+    if done.is_empty() {
+        return;
+    }
+    // (This also takes back the blocks of the compiles' IR, which the
+    // background compiler freed.)
+    let _compile_heap = crate::malloc_stats::CompileHeap::enter();
+    for (ticket, outcome) in done {
         let Some((_, slot, parts)) = take_waiting(ticket) else {
             continue;
         };
@@ -7945,7 +7953,7 @@ unsafe extern "C" fn h_binop_dunder(
             return CALL_DECLINED;
         }
         let (pc, slot) = (pc as usize, slot as usize);
-        let arg = (&(*code).instructions)[pc].arg;
+        let arg = (&(&*code).instructions)[pc].arg;
         let op: BinOpKind = std::mem::transmute(arg as u8);
         let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let at = st.stack.add(slot);

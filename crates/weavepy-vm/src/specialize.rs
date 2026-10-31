@@ -806,7 +806,9 @@ impl Default for Stats {
 pub const OPCODE_TABLE_LEN: usize = 256;
 
 thread_local! {
-    static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+    // (Boxed: every thread gets a copy of a thread-local's storage, and only
+    // `WEAVEPY_SPECIALIZE_STATS` runs fill this in.)
+    static STATS: RefCell<Box<Stats>> = RefCell::new(Box::default());
 }
 
 /// Tri-state stats switch: `2` = not yet read from the environment,
@@ -946,7 +948,7 @@ pub fn snapshot() -> Stats {
 /// Reset the calling thread's stats accumulator. Used by tests
 /// that want a clean baseline.
 pub fn reset() {
-    STATS.with(|s| *s.borrow_mut() = Stats::default());
+    STATS.with(|s| **s.borrow_mut() = Stats::default());
 }
 
 /// Format the snapshot as a markdown table — handy for CI logs
