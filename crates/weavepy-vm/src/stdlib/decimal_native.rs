@@ -1372,7 +1372,8 @@ pub(crate) fn recycle(mut inst: Rc<PyInstance>) -> Result<(), Rc<PyInstance>> {
     } else {
         Rc::get_mut(&mut inst).is_some()
     };
-    if !unique {
+    // (One the collector holds keeps its place: it's freed, not reused.)
+    if !unique || inst.gc_slot.get() != crate::gc_trace::NO_SLOT {
         return Err(inst);
     }
     // SAFETY: `inst` is the only reference (checked above).

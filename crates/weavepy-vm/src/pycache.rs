@@ -475,7 +475,11 @@ mod ownership_tests {
         });
         let root = Arc::new(CodeObject {
             filename: "original.py".into(),
-            constants: vec![Constant::Tuple(vec![Constant::Code(child.clone())])],
+            body: weavepy_compiler::CodeBody {
+                constants: vec![Constant::Tuple(vec![Constant::Code(child.clone())])],
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         });
         let mut moved = own_decoded_code(Rc::from_arc(root.clone()));

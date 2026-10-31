@@ -121,7 +121,16 @@ class _CallableIter:
     def __next__(self):
         if self._callable is None:
             raise StopIteration
-        result = self._callable()
+        # A ``StopIteration`` from the callable ends the iteration, and its
+        # value goes with it (CPython's ``calliter_iternext`` clears it).
+        stopped = False
+        try:
+            result = self._callable()
+        except StopIteration:
+            stopped = True
+        if stopped:
+            self._callable = None
+            raise StopIteration
         # gh-101892: the call may have re-entered and exhausted us; if so,
         # report exhaustion rather than yielding a post-sentinel value.
         if self._callable is None:

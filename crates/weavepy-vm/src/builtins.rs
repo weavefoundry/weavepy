@@ -1321,7 +1321,7 @@ fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
                 Some(recv @ (Object::Instance(_) | Object::LazyIter(_))) => {
                     let interp = reentrant_interp()?;
                     let globals = interp.builtins_dict();
-                    match interp.iter_next(recv, &globals)? {
+                    match interp.iter_step(recv, &globals)? {
                         Some(v) => Ok(v),
                         None => Err(crate::error::stop_iteration()),
                     }
@@ -4751,7 +4751,11 @@ pub fn foreign_code_object(
         name: name.into(),
         qualname: qualname.into(),
         filename: filename.into(),
-        varnames: names_of(varnames),
+        body: weavepy_compiler::CodeBody {
+            varnames: names_of(varnames),
+            ..Default::default()
+        }
+        .into(),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -4950,11 +4954,15 @@ pub(crate) fn code_type_call(
         name: name.into(),
         qualname: qualname.into(),
         filename: filename.into(),
-        constants,
-        names: names_of(names),
-        varnames: names_of(varnames),
-        freevars: names_of(freevars),
-        cellvars: names_of(cellvars),
+        body: weavepy_compiler::CodeBody {
+            constants,
+            names: names_of(names),
+            varnames: names_of(varnames),
+            freevars: names_of(freevars),
+            cellvars: names_of(cellvars),
+            ..Default::default()
+        }
+        .into(),
         arg_count,
         posonly_count,
         kwonly_count,
@@ -5367,7 +5375,13 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                         c.freevars.len()
                     )));
                 }
-                *f.code.borrow_mut() = c;
+                // (A lazily running callee's frame borrows its function's
+                // code until it registers.)
+                if let Some(interp) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: this thread's running interpreter.
+                    unsafe { (*interp).settle_lazy() };
+                }
+                crate::frame_jit::retire_code(f.code.replace(c));
                 f.names_kept.set(0);
             } else if crate::object::is_function_slot(name) {
                 f.set_slot(name, value);
@@ -9062,7 +9076,7 @@ pub fn class_matches_classinfo_named(
             Ok(false)
         }
         _ => Err(type_error(
-            "issubclass() arg 2 must be a class or tuple of classes",
+            "issubclass() arg 2 must be a class, a tuple of classes, or a union",
         )),
     }
 }
@@ -15413,7 +15427,9 @@ fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                 }
             }
         }
-        out.push_str(&format!("{b:02x}"));
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 15)] as char);
     }
     Ok(Object::from_str(out))
 }
