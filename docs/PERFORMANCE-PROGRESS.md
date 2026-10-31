@@ -7,6 +7,37 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on October 30, 2026, at `24afc77b` (PR #102, `perf/step-change`,
+stacked on PR #101), on the same host and CPython, both WeavePy binaries
+profile-guided and interleaved with CPython in one idle session. The base is
+PR #101's PGO binary (`ba518cf0`).
+
+| Measure | PR #101 | PR #102 | PR #102 / PR #101 |
+| --- | ---: | ---: | ---: |
+| Warm time, 33 workloads (geomean) | 1.089 | 1.001 | 0.919 |
+| Cold time (first call, including compilation) | 1.334 | 1.191 | 0.893 |
+| Peak resident memory | 1.577 | 1.432 | 0.908 |
+| Instructions (quick build) | 1.156 | 1.037 | 0.897 |
+
+A second suite run in the same session measured warm 1.011, cold 1.169 and
+peak memory 1.463, so warm time is at parity with CPython's within this
+machine's noise, not past it. Against PR #101, warm time moved most on `go`
+and `raytrace` 0.69, `deepcopy` 0.73, `tomllib_loads` 0.76, `generators_tree`
+0.81, `chaos` 0.82, `coroutines` 0.83 and `context_managers` 0.84. Sixteen
+workloads beat CPython's warm time in that run (`pickle_roundtrip` 0.56,
+`decimal_telco` 0.58, `oo_patterns` 0.63, `scimark` 0.65, `json_roundtrip`
+0.68, `raytrace` and `unpack_sequence` under 0.75), though single workloads
+moved by up to 40% between the two runs (`oo_patterns` 0.63 and 1.04). The worst
+are `async_tree` 1.67, `context_managers` 1.66, `stdlib_utils` 1.50, `nqueens`
+1.49, `logging_mix` 1.44, `class_creation`, `deepcopy` and `exceptions` 1.41.
+Some workloads read slower than PR #101 in that run (`decimal_telco` 1.22,
+`mini_interpreter` 1.15, `closures_decorators`, `nqueens` and `sorting` 1.09),
+though their instructions are lower or within 1% and `decimal_telco` read 0.58
+and 0.72 of CPython's in the two runs, so single wall-time ratios here are noisy.
+Linux's peak memory is higher than these macOS numbers (see "Memory on Linux").
+
+The earlier checkpoints follow.
+
 Measured on October 29, 2026, at `faa68a33` (PR #102,
 `perf/step-change`, stacked on PR #101), on the same host and CPython,
 both WeavePy binaries profile-guided and interleaved with CPython in one
@@ -335,9 +366,10 @@ slowdown in that run was the even-sized chunks, since fixed.
     and `test_value_fast_paths.py` are differential harnesses that run
     overrides and values hot under five JIT settings against CPython's
     output.
-- **PR #102, `perf/step-change`** (October 2026), stacked on PR #101.
-  Cold time 0.923 of PR #101's, warm 0.987, instructions 0.990, peak
-  memory 1.011 (PGO, one session):
+- **PR #102, `perf/step-change`** (October 2026), stacked on PR #101. Warm time
+  0.919 of PR #101's, cold 0.893, peak memory 0.908, instructions 0.897 (PGO, one
+  session; instructions on a quick build). Direct calls on records and small
+  callees in line have their own entries below. In the order they landed:
   - *Background code generation.* The frame JIT lowers a hot body on the
     interpreter's thread and queues the Cranelift function for one worker
     thread, which generates the machine code while the interpreter keeps
@@ -358,6 +390,36 @@ slowdown in that run was the even-sized chunks, since fixed.
     body now compiles. Instructions: `generators_tree` 0.836 of PR #101's,
     `nqueens` 0.899, `context_managers` 0.949, `sudoku` 0.962,
     `coroutines` 0.965.
+  - *A smaller frame JIT.* Most object operations call one helper through a
+    site pointer, helpers write their own exit state behind one shared tail, and
+    chunks come from a static estimate: IR 0.434 of before, machine code 0.462,
+    lowering time 0.24, code generation 0.42. Instructions 0.982, peak memory
+    about 0.96, wall time about even.
+  - *Reference counts.* Every counted variant's pointer addresses its strong
+    count, and with the bias held an update is one plain instruction, so a clone
+    or release is a compare and an `inc` or `dec`. Instructions 0.969, with no
+    workload higher.
+  - *Lazy function bodies.* A cached function's body decodes when it first runs,
+    so an unrun function costs 160 bytes rather than 384 and its vectors, and
+    compile memory has an arena of its own that goes back to the OS. Peak memory
+    0.902, instructions 1.010.
+  - *The young collector and generators' ends.* Young sets record their position
+    in the object, passes that find nothing back off, a native caller's step
+    enters native code directly, and the end of a generator builds no
+    `StopIteration` to catch. `async_tree` 0.86, `generators_tree` 0.96.
+  - *Comparisons, class attributes and raising.* Comparisons that need no dunder
+    stay in compiled code (`a != b` 6,884 instructions to 591), `__class__`,
+    `__mro__` and friends are answered at the attribute site, and `raise C` costs
+    3,403 against 5,953. `exceptions` 0.93, `class_creation` 0.96.
+  - *Linux's first arena.* Its first 16 MiB go without huge pages (see "Memory on
+    Linux").
+  - *Correctness, each with a regression test.* A frame's values release in
+    CPython's order, the last local first, on every path (they went forward);
+    `gc.callbacks` fires for automatic collections (it never did); a
+    `StopIteration`'s value survives native iterators; `KeyError` from `%` and
+    `str.format` holds the key, not its repr; `1.0 == x` and `True == x` no longer
+    run an `int` subclass's `__eq__` first; tier 2's `FOR_ITER` runs a finished
+    generator's finalizers before the next statement.
   - *Code layout.* The checked-in order file had gone stale (484 of its
     5,050 names matched, since names embed crate hashes); the host targets
     now link through `scripts/link-ordered.sh`, which remaps the order onto
@@ -545,7 +607,12 @@ slowdown in that run was the even-sized chunks, since fixed.
   setting now applies off Linux only. Turning THP off for the process
   (`PR_SET_THP_DISABLE`) takes `startup` to 20 MiB but brings the faults
   back (7,500 on `deque_ops`) and is inherited by child processes, so it
-  isn't in.
+  isn't in. What is in: the first arena's first 16 MiB are mapped with
+  `MADV_NOHUGEPAGE`, which only this mapping sees. Small programs stay lean and
+  larger heaps get huge pages past that (`startup` 33 to about 25 MiB on the CI's
+  Ubuntu runners, `deltablue` 64 to 38 MiB, `float_math` 2,598 faults against
+  6,645 for a first arena without any), though Linux is still about 2.8 times
+  CPython's at start-up against 0.9 on macOS.
 - **Peak memory, where it goes.** The profiler (`--features alloc-profile`,
   now with `<file>.vm` and `<file>.classes`: the regions, and mimalloc's
   resident bytes by thread and size class, at the resident set's high-water
@@ -605,6 +672,18 @@ slowdown in that run was the even-sized chunks, since fixed.
   `float_points`); LLVM's hot-cold splitting without a profile (the code
   barely changes); `MADV_RANDOM` on the binary (this macOS has no fault-around:
   a file-backed page in the resident set was touched).
+- **Instructions per cycle isn't a placement problem.** Simulated L1 instruction
+  misses fell to 0.67 of the round's baseline (`go` 0.22, `raytrace` 0.57,
+  `deepcopy` 0.80), but through the other work in this round: fewer instructions
+  and smaller code. A contiguous code arena near the binary's text left misses
+  unchanged (it needs an RWX mapping and a vendored `cranelift-jit`, so it wasn't
+  kept), though Cranelift does start each finalize on a fresh page. Near, direct
+  helper calls didn't lower cycles on `go` or `oo_patterns`. Ordering the binary's
+  hot functions first moved misses between -0.8% and +4%: the 8-way L1 is
+  capacity-bound, as `context_managers` touches about 2,700 distinct lines per
+  iteration against CPython's 1,100. Data-side misses are spread over calls,
+  allocation and clones, with no single offender. Sinking a frame's address
+  computations into the block that uses them saves 0.2% and wasn't taken.
 - **Tried and dropped in PR #102**: tier-2 compiles in the background
   (while a constructor's compile was pending, interpreted constructors
   built instances in another shape and the compiled loop side-exited on
@@ -622,10 +701,10 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. Generators: `async_tree` and `context_managers` are now mostly general
-   calls, attribute stores and asyncio's own loop, not generator mechanics.
-   `next(map(next, [g]))` loses a finished generator's `StopIteration` value,
-   and `gc.callbacks` doesn't fire for automatic collections.
+1. `async_tree` and `context_managers`, the two worst workloads: mostly general
+   calls, attribute stores and asyncio's own loop now, not generator mechanics.
+   Exits that register a call and its whole chain of callers (`Rect.__init__`'s
+   polymorphic stores, `DictUpdate`, `PushExcInfo`) want helper fallbacks.
 2. Cold time: the lowering left on the interpreter's thread (a third of a
    compile) and the time a body runs interpreted before its code is
    ready; a much cheaper baseline compiler or compiled code kept across
@@ -640,6 +719,18 @@ slowdown in that run was the even-sized chunks, since fixed.
    names tuple would remove it.
 5. Tier 2 holds an object that already has weak references, read through
    an attribute, until its activation exits.
+6. In-line reference counts in compiled code, now a compare, a flag test and an
+   `inc` (the compile-cost rewrite took them out of line, and a count is about
+   1.5% of the suite in `h_clone`), and freelists, which weren't reached.
+7. The code cache has no checksum: a damaged artifact that still decodes gives
+   wrong names or errors until it's replaced, and a function body that doesn't
+   decode fails its run (the cache is then discarded). Reading every page to
+   check one works against decoding bodies lazily.
+8. Divergences from CPython found and left: a tuple or list dropped outside the
+   tuple freelist releases its items forward (CPython's go in reverse), as do
+   operands of some native calls (`D("a") == D("b")`); closing a generator while
+   its frame object is held unwinds its stack at once; an instance holding only
+   scalars doesn't count toward a collection.
 
 ## Measurement notes
 
