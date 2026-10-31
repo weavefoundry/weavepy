@@ -174,14 +174,18 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
         let closed = owes
             && g.kind == CoroutineKind::Generator
             && crate::Interpreter::gen_close_quiet_detached(&g).is_some_and(|frame| {
-                drop(frame);
+                // (As an exhausted generator's: `any(...)` and a `for` that
+                // breaks leave one of these per generator.)
+                crate::Interpreter::retire_detached_frame(frame);
                 true
             });
         if closed {
             let g = Rc::from_arc(g);
             crate::Interpreter::release_finished_gen(&g);
             // (As a plain handle: this is the release being finalized.)
-            crate::rc::drop_arc(Rc::into_arc(g));
+            if let Err(g) = crate::object::recycle_generator(Rc::into_arc(g)) {
+                crate::rc::drop_arc(g);
+            }
         } else if owes {
             let kind = g.kind;
             let g = Rc::from_arc(g);

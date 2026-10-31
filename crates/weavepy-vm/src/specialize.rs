@@ -139,7 +139,11 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             // If the class has __getattr__ / __getattribute__ /
             // descriptors, the slow path is mandatory.
             let cls = inst.cls();
-            if type_has_attr_override(&cls) {
+            // (A `__getattr__` answers only what these shapes don't find. A
+            // builtin class's own, a module's, is left to its fast paths.)
+            if type_has_lookup_override(&cls)
+                || (cls.flags.is_builtin && cls.dunder(crate::types::Dunder::GetAttr).present())
+            {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let ver = cls.attr_version.get();
@@ -149,6 +153,11 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             // dict-index shape.
             match cls.lookup(name) {
                 Some(Object::SlotDescriptor(sd)) => {
+                    // (An unset member falls back to `__getattr__` on the
+                    // generic path.)
+                    if cls.dunder(crate::types::Dunder::GetAttr).present() {
+                        return InlineCache::Cooldown(COOLDOWN);
+                    }
                     // Only a genuine slot member on this very lookup path;
                     // `__weakref__`/`__dict__` pseudo-slots read
                     // differently.
@@ -193,6 +202,11 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
                         }
                     }
                 }
+                return InlineCache::Cooldown(COOLDOWN);
+            }
+            // (A descriptor's `AttributeError` falls back to `__getattr__`
+            // on the generic path.)
+            if cls.dunder(crate::types::Dunder::GetAttr).present() {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             // Otherwise look in the type's dict — the
@@ -269,7 +283,11 @@ pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
     match obj {
         Object::Instance(inst) => {
             let cls = inst.cls();
-            if type_has_attr_override(&cls) {
+            // (`__getattr__` has no say in a store; a builtin class's own is
+            // left to its fast paths, as for a read.)
+            if type_has_lookup_override(&cls)
+                || (cls.flags.is_builtin && cls.dunder(crate::types::Dunder::GetAttr).present())
+            {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let ver = cls.attr_version.get();
@@ -723,9 +741,16 @@ pub fn native_fn_id(b: &Rc<crate::object::BuiltinFn>) -> u64 {
 /// would invalidate the simple "dict slot" fast path. We bail out
 /// of LOAD_ATTR / STORE_ATTR specialization for these.
 pub(crate) fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
+    ty.lookup("__getattr__").is_some() || type_has_lookup_override(ty)
+}
+
+/// [`type_has_attr_override`] for a shape that holds only what the lookup
+/// found: a `__getattr__` doesn't matter there, as it answers only a miss,
+/// which the shape's guard sends down the generic path.
+fn type_has_lookup_override(ty: &Rc<TypeObject>) -> bool {
     // A `super` proxy resolves attributes along its target's MRO (CPython's
     // `super_getattro`), never its own class's.
-    if ty.lookup("__getattr__").is_some() || ty.is_super_proxy_type() {
+    if ty.is_super_proxy_type() {
         return true;
     }
     // `object.__getattribute__` lives in `object`'s dict as a sentinel, so a

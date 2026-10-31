@@ -554,6 +554,83 @@ Swap.__add__.__code__ = Swap.__sub__.__code__
 print(swap_method(o, N))
 '''
 
+CASES["release_order"] = r'''
+N = 600
+log = []
+
+
+class D:
+    def __init__(self, name):
+        self.name = name
+
+    def __del__(self):
+        log.append(self.name)
+
+
+def three_locals(i):
+    x = D("x")
+    y = D("y")
+    z = D("z")
+    return i
+
+
+def params_and_locals(a, b):
+    c = D("c")
+    d = D("d")
+    return 1
+
+
+def rebound(a, b):
+    a = b
+    b = D("new")
+    return 2
+
+
+class M:
+    def method(self, a, b):
+        c = D("c")
+        return 3
+
+
+def show(run):
+    seen = []
+    for i in range(N):
+        log.clear()
+        run(i)
+        if log not in seen:
+            seen.append(list(log))
+    print(seen)
+
+
+def run_locals(i):
+    three_locals(i)
+    log.append("caller")
+
+
+def run_params(i):
+    params_and_locals(D("a"), D("b"))
+    log.append("caller")
+
+
+def run_rebound(i):
+    rebound(D("a"), D("b"))
+    log.append("caller")
+
+
+m = M()
+
+
+def run_method(i):
+    m.method(D("a"), D("b"))
+    log.append("caller")
+
+
+show(run_locals)
+show(run_params)
+show(run_rebound)
+show(run_method)
+'''
+
 CASES["finalizers"] = r'''
 import gc
 import weakref
@@ -1844,6 +1921,7 @@ EXPECTED = {
     'monitoring_mid_loop': "360600\n360600\n[('start', 'body'), ('return', 1192), ('start', 'body'), ('return', 1194)]\n",
     'recursion_limit': "180900\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n[112, 113, 114, 115, 116, 117, 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded', 'maximum recursion depth exceeded']\n(180300, 2, 3)\n",
     'rebinding': "180900\n182700\nf() missing 1 required positional argument: 'b'\n180900\n359400\n188700\n-89099\n2400 3000 2400\n7800 3000\n61800\n24000\n19200\n3600\n1200 60600 1200\n1800\nname 'K' is not defined\n1800\n30000\n1800\nobject of type 'int' has no len()\n180900\n240300\n299700\n",
+    'release_order': "[['z', 'y', 'x', 'caller']]\n[['d', 'c', 'b', 'a', 'caller']]\n[['a', 'new', 'b', 'caller']]\n[['c', 'b', 'a', 'caller']]\n",
     'finalizers': "(179700, ['body', 'x', 'caller'])\n['in', 'a', 'caller']\n['in', 'caller', 'held']\n['in', 'caller', 'held']\n['before', 'arg', 'after', 'caller']\n['before', 'after', 'caller']\n['r', 'caller']\n['first', 'mid', 'second', 'caller']\n['dropped', 'popped', 'caller']\ndead\n['drops']\n",
     'values_and_arguments': '(658607465038423, 21267647932558653971072598982912901120)\n[-598, 597.5, 604, (True, True), None, \'constant\', 600, 1, 6.5]\n(72004026, [592, 593, 594, 595, 596, 597, 598, 599], {0: 1, 1: 1, 2: 1, 3: 1, 4: 1})\n["IndexError(\'list index out of range\')", \'TypeError("\\\'NoneType\\\' object is not subscriptable")\', "TypeError(\'list indices must be integers or slices, not str\')"]\n([0, 100, 200, 300], 6)\nnothing() missing 1 required positional argument: \'a\'\nnothing() takes 1 positional argument but 2 were given\nnothing() takes 1 positional argument but 2 were given\n540300\n729000\n((600, False, 1, \'yes\'), \'dunder-add\', \'dunder-eq\', (\'item\', 3), \'no\')\n(\'prop\', 3)\n',
     'deep_exits': "3006\n([('c', 26), ('b', 18), ('a', 14), ('run', 41), ('<module>', 48)], ['f', 'names', 'q', 'r', 'self'])\ntb 57\nd 32\n1200\n'NoneType' object is not subscriptable\n(<class 'KeyError'>, None)\n",

@@ -7032,7 +7032,7 @@ fn finish_deopted(
         agen_yielded_value: true,
         pc: 0,
         py_frame,
-        gen_owner: None,
+        gen_owner: crate::GenOwner::NONE,
         suppress_call_event: true,
         gen_first_resume: false,
         sent_consumed: false,
@@ -10082,7 +10082,15 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             ctx.raised = Some(err);
             4
         }
-        Ok(None) => 1,
+        Ok(None) => {
+            // What died with the source (a finished generator's locals) is
+            // finalized before the loop's next statement, as the interpreter's
+            // `FOR_ITER` does.
+            if runs_python && finalizer_queued() {
+                interp.run_pending_finalizers();
+            }
+            1
+        }
         Ok(Some(v)) => {
             // The step may have rebound a burned-in global (generator
             // bodies are arbitrary Python); the *next* burned
