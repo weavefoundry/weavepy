@@ -110,7 +110,9 @@ pub fn insert(name: &str, code: &CodeObject) {
 // layout revisions (and keep binaries of different formats from
 // rewriting each other's artifacts); the length + hash pair invalidates
 // when the embedded source itself changes (a rebuilt binary with edited
-// stdlib). Corrupt or mismatched artifacts are treated as misses.
+// stdlib). A truncated or mismatched artifact is treated as a miss. Function
+// bodies decode on first run, so a damaged one is found too late for that: the
+// run fails, and the cache is discarded so the next one recompiles.
 
 /// Header magic for frozen-cache artifacts (distinct from `.pyc`'s
 /// CPython magic: these files are WeavePy-internal).
@@ -198,6 +200,7 @@ pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> 
     // keep the contents just validated (a replaced or removed file keeps
     // them while mapped).
     let map = unsafe { memmap2::MmapOptions::new().map(&file) }.ok()?;
+    weavepy_compiler::set_corrupt_code_hook(discard_disk_cache);
     native_code::decode_lazily(
         weavepy_compiler::TableBuffer::new(Payload::new(map)),
         filename,
@@ -383,6 +386,15 @@ mod view {
 /// Persist a freshly-compiled frozen module to the disk cache.
 /// Best-effort: any I/O or marshal failure is silently ignored (a
 /// read-only cache dir must not fail the import).
+/// Remove the disk layer's artifacts, for a function body that turned out
+/// damaged (a process that has one mapped keeps its bytes); the next start
+/// compiles and writes them again.
+fn discard_disk_cache() {
+    if let Some(dir) = disk_dir() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
     let Some(path) = disk_path(name) else {
         return;

@@ -619,6 +619,18 @@ impl std::fmt::Debug for JitHint {
     }
 }
 
+/// What discards the code cache a damaged function body came from (see
+/// [`set_corrupt_code_hook`]).
+static CORRUPT_CODE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Set what runs when a function body in the code cache can't be decoded,
+/// just before the panic that reports it: bodies decode on their first run,
+/// too late to fall back to compiling, so this keeps the damage from failing
+/// every later run as well.
+pub fn set_corrupt_code_hook(discard: fn()) {
+    let _ = CORRUPT_CODE_HOOK.set(discard);
+}
+
 /// A compiled Python code object. Mirrors the subset of
 /// `PyCodeObject` we need to emulate.
 ///
@@ -920,11 +932,15 @@ impl CodeObject {
     #[cold]
     #[inline(never)]
     fn decode_body(&self) -> &CodeBody {
-        assert!(
-            self.body.try_decode(&self.filename),
-            "the code cache's copy of {} is corrupt",
-            self.filename
-        );
+        if !self.body.try_decode(&self.filename) {
+            if let Some(discard) = CORRUPT_CODE_HOOK.get() {
+                discard();
+            }
+            panic!(
+                "the code cache's copy of {} is corrupt (the cache was discarded: run again)",
+                self.filename
+            );
+        }
         // SAFETY: published just now; it lives as long as `self`.
         unsafe { &*self.body.body.load(std::sync::atomic::Ordering::Acquire) }
     }
