@@ -67,7 +67,10 @@ use crate::sync::Rc;
 use crate::{body_pcs, CodeConstObjects, FieldSlot, Interpreter};
 
 mod queue;
+mod records;
 pub(crate) use queue::quiesce as quiesce_compiler;
+use records::BindArgs;
+pub(crate) use records::DirectRecs;
 
 /// The core loop runs the instruction at `pc` itself.
 pub(crate) const INTERP: u32 = 0;
@@ -88,6 +91,11 @@ pub(crate) const DIRECT_RET: u32 = 5;
 /// started the coroutine, which returned (see [`gen_call_done`]): the
 /// await's `END_SEND` goes on, `[coroutine, result]` atop the stack.
 const AWAITED: u32 = 6;
+/// A record's callee (see [`records`]) returned, unregistered, its result
+/// alone on its stack, with nothing written to its state: its low byte, with
+/// the pc from bit 8 and one more than the last instruction (`0`: the state
+/// has it) from bit 20 (both below `MAX_INSTRUCTIONS`).
+const REC_RET: u32 = 9;
 /// A lazily resumed generator yielded (see [`lazy_gen_resume`]), its
 /// state synced to the `YIELD_VALUE` with the value atop its stack: the
 /// consumer finishes the yield.
@@ -277,6 +285,23 @@ pub(crate) struct State {
     /// caller's last-instruction slot, for its return to restore.
     pub(crate) lazy_depth: usize,
     pub(crate) lazy_last: *mut usize,
+    /// No direct call may start from this activation: a generator's fast
+    /// step (no switch), or a burst whose inline calls are off.
+    pub(crate) no_direct: bool,
+    /// The state is a record's (see [`records`]).
+    pub(crate) in_rec: bool,
+    /// The native code starts at its first instruction, the stack checked
+    /// (a record's callee: see the entry in `Lower::lower`).
+    pub(crate) at_start: bool,
+    /// A return hands back [`REC_RET`]: a record's callee, not registered,
+    /// and with nothing more for its return to do.
+    pub(crate) clean: bool,
+    /// While a native body runs from a lazily running activation (see
+    /// [`h_call_native`]), the `CALL`'s pc: registering it then enters it on
+    /// the pending list, as the body's run would have (`wait_pending`, for
+    /// the run to take out again). `usize::MAX` otherwise.
+    pub(crate) wait_pc: usize,
+    pub(crate) wait_pending: Option<usize>,
 }
 
 const S_LOCALS: i32 = 0;
@@ -293,6 +318,8 @@ const S_SW: i32 = std::mem::offset_of!(State, sw) as i32;
 const S_FRAME: i32 = std::mem::offset_of!(State, frame) as i32;
 const S_DIRECT: i32 = std::mem::offset_of!(State, direct) as i32;
 const S_GEN_LAZY: i32 = std::mem::offset_of!(State, gen_lazy) as i32;
+const S_AT_START: i32 = std::mem::offset_of!(State, at_start) as i32;
+const S_CLEAN: i32 = std::mem::offset_of!(State, clean) as i32;
 const _: () = {
     assert!(std::mem::offset_of!(State, locals) == S_LOCALS as usize);
     assert!(std::mem::offset_of!(State, stack) == S_STACK as usize);
@@ -356,8 +383,6 @@ struct Caches {
     /// The builtins the method kernels' calls address.
     held: Vec<Rc<crate::object::BuiltinFn>>,
     mods: Vec<Box<ModCache>>,
-    /// The leaf method calls' sites.
-    leaf_methods: Vec<Box<LeafMethodSite>>,
     /// The attribute reads' and method loads' sites.
     attrs: Vec<Box<AttrSite>>,
     method_sites: Vec<Box<MethodSite>>,
@@ -388,7 +413,6 @@ impl Caches {
         self.supers.append(&mut other.supers);
         self.held.append(&mut other.held);
         self.mods.append(&mut other.mods);
-        self.leaf_methods.append(&mut other.leaf_methods);
     }
 }
 
@@ -420,15 +444,19 @@ impl Native {
     /// [`Self::call`] for a body compiled in chunks.
     #[inline(never)]
     unsafe fn call_chunks(&self, st: &mut State) -> u32 {
-        loop {
+        // (A jump into another chunk re-enters where the state says.)
+        let at_start = std::mem::replace(&mut st.at_start, false);
+        let status = loop {
             let at = self.chunk_at.get(st.pc).copied().unwrap_or(0);
             // SAFETY: the caller's contract; every chunk is compiled from
             // the same code, for the same state.
             let status = unsafe { (self.chunks[at as usize])(st) };
             if status != CHAIN {
-                return status;
+                break status;
             }
-        }
+        };
+        st.at_start = at_start;
+        status
     }
 
     /// The stack capacity the code needs.
@@ -465,7 +493,9 @@ impl Native {
         let (len, cap) = (st.len, st.cap);
         // SAFETY: the caller's contract.
         let status = unsafe { self.call(st) };
-        if (status != DIRECT_RET && status != DIRECT_YIELD) || stats::enabled() {
+        if (status != DIRECT_RET && status != DIRECT_YIELD && status as u8 != REC_RET as u8)
+            || stats::enabled()
+        {
             self.ran(st, from, len, cap, usize::MAX, status);
         }
         status
@@ -1760,7 +1790,7 @@ unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
         if !droppable(&*slot) {
             return 1;
         }
-        crate::drop_hot(slot.read());
+        crate::drop_hot_at(slot);
     }
     0
 }
@@ -1820,7 +1850,7 @@ unsafe fn h_pop_slow(st: *mut State, site: SlotWord) -> u32 {
         if !droppable(&*at) {
             return left(st, site.pc(), site.last(), site.slot() + 1);
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         if (*(*st).maybe_dead).get() {
             return left_marked(st, site.pc(), site.slot());
         }
@@ -2571,7 +2601,7 @@ pub(crate) unsafe fn lazy_gen_resume(
     unsafe {
         let interp = &mut *st.interp.cast_mut();
         let sw = &mut *st.sw;
-        if interp.direct_calls.get() >= DIRECT_CALL_DEPTH
+        if interp.recs.full()
             || !sw.calls_ok
             || crate::hot_gates::loop_gen() != st.snap_gen
             || (*st.maybe_dead).get()
@@ -2775,13 +2805,13 @@ unsafe fn lazy_launch(
             chain,
         };
         let mut cst = lazy_state(st, callee, LazyGenRec::tagged(&mut rec), native.need());
-        let nested = interp.direct_calls.get();
-        interp.direct_calls.set(nested + 1);
+        let nested = interp.recs.top();
+        interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
         interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
         let status = native.run_direct(&mut cst, pc);
         interp.lazy_top.set(outer);
-        interp.direct_calls.set(nested);
+        interp.recs.set_top(nested);
         lazy_gen_done(st, callee, status, &mut cst, &mut rec)
     }
 }
@@ -2829,6 +2859,12 @@ unsafe fn lazy_state(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: true,
+            no_direct: false,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         }
     }
 }
@@ -3378,6 +3414,12 @@ pub(crate) unsafe fn core_lazy_resume(
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            no_direct: !sw.calls_ok,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
         let st = &mut st;
         let arg = frame.code.instructions[pc].arg;
@@ -4561,8 +4603,8 @@ unsafe extern "C" fn h_super_attr(
                 // moves into the shape the `CALL` expects, or binds.
                 let f = Object::Function(f.clone());
                 let self_v = base.add(len - 1).read();
-                crate::drop_hot(base.add(len - 2).read());
-                crate::drop_hot(base.add(len - 3).read());
+                crate::drop_hot_at(base.add(len - 2));
+                crate::drop_hot_at(base.add(len - 3));
                 if ins.arg & 1 != 0 {
                     base.add(len - 3).write(f);
                     base.add(len - 2).write(self_v);
@@ -4638,8 +4680,8 @@ unsafe extern "C" fn h_container(
                         .is_some_and(|d| d.get(&probe).is_none() && probe.miss_is_exact());
                     if missing {
                         let err = crate::error::key_error_object(k.clone());
-                        crate::drop_hot(st.stack.add(len - 1).read());
-                        crate::drop_hot(st.stack.add(len - 2).read());
+                        crate::drop_hot_at(st.stack.add(len - 1));
+                        crate::drop_hot_at(st.stack.add(len - 2));
                         st.len = len - 2;
                         st.pc = pc as usize + 1;
                         st.err = Some(err);
@@ -4665,9 +4707,9 @@ unsafe extern "C" fn h_container(
                 return u64::MAX;
             };
             crate::drop_hot(v);
-            crate::drop_hot(st.stack.add(len - 1).read());
-            crate::drop_hot(st.stack.add(len - 2).read());
-            crate::drop_hot(st.stack.add(len - 3).read());
+            crate::drop_hot_at(st.stack.add(len - 1));
+            crate::drop_hot_at(st.stack.add(len - 2));
+            crate::drop_hot_at(st.stack.add(len - 3));
             return (len - 3) as u64;
         }
         // An instance whose class's `__getitem__` is a native fast
@@ -4685,8 +4727,8 @@ unsafe extern "C" fn h_container(
         };
         #[cfg(test)]
         crate::NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
-        crate::drop_hot(st.stack.add(len - 1).read());
-        crate::drop_hot(st.stack.add(len - 2).read());
+        crate::drop_hot_at(st.stack.add(len - 1));
+        crate::drop_hot_at(st.stack.add(len - 2));
         st.stack.add(len - 2).write(v);
         (len - 1) as u64
     }
@@ -4704,8 +4746,8 @@ unsafe extern "C" fn h_contains(at: *mut Object) -> u32 {
         let Some(found) = Interpreter::leaf_contains(container, item) else {
             return 2;
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(found)
     }
 }
@@ -4728,10 +4770,10 @@ unsafe fn contains_fast(item: *const Object, cont: *const Object, owned: u32) ->
             return 2;
         };
         if owned & 2 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         if owned & 1 != 0 {
-            crate::drop_hot(item.read());
+            crate::drop_hot_at(item);
         }
         u32::from(found)
     }
@@ -4812,10 +4854,10 @@ unsafe fn subscr_fast(
             _ => return 1,
         };
         if owned & 2 != 0 {
-            crate::drop_hot(key.read());
+            crate::drop_hot_at(key);
         }
         if owned & 1 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         out.write(r);
         0
@@ -4982,10 +5024,10 @@ unsafe fn store_subscr_fast(
             _ => return 1,
         };
         if owned & 4 != 0 {
-            crate::drop_hot(key.read());
+            crate::drop_hot_at(key);
         }
         if owned & 2 != 0 {
-            crate::drop_hot(cont.read());
+            crate::drop_hot_at(cont);
         }
         crate::drop_hot(old);
         0
@@ -5213,8 +5255,8 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
         let Some(r) = r else {
             return 1;
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         at.write(r);
     }
     0
@@ -5285,8 +5327,8 @@ unsafe extern "C" fn h_compare(at: *mut Object, arg: u32) -> u32 {
                     Some(Ok(r)) if droppable(a) && droppable(b) => r,
                     _ => return 1,
                 };
-                crate::drop_hot(at.add(1).read());
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
                 at.write(r);
                 return 0;
             }
@@ -5348,8 +5390,8 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
             CompareKind::Gt => ord.is_gt(),
             CompareKind::GtE => ord.is_ge(),
         };
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(r)
     }
 }
@@ -5385,8 +5427,8 @@ unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u3
         let ptrs = [at.cast_const(), at.add(1).cast_const()];
         match (*(*st).interp).pure_leaf_eval::<false, false>(code, &f, &ptrs) {
             Some(Object::Bool(r)) => {
-                crate::drop_hot(at.add(1).read());
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
                 u32::from(r)
             }
             Some(v) => {
@@ -5515,7 +5557,7 @@ unsafe fn truth_release(st: *mut State, s: &TruthSite, at: *mut Object, b: bool)
         if !droppable(&*at) {
             return left(st, s.pc, s.last, s.slot as usize + 1);
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         if (*(*st).maybe_dead).get() {
             at.write(Object::Bool(b));
             return left_marked(st, s.pc, s.slot as usize + 1);
@@ -5553,7 +5595,7 @@ unsafe extern "C" fn h_truth(st: *mut State, at: *mut Object) -> u32 {
         if !droppable(v) {
             return 2;
         }
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at);
         u32::from(b)
     }
 }
@@ -5569,8 +5611,8 @@ unsafe extern "C" fn h_is(at: *mut Object, arg: u32) -> u32 {
             return 2;
         }
         let same = a.is_same(b);
-        crate::drop_hot(at.add(1).read());
-        crate::drop_hot(at.read());
+        crate::drop_hot_at(at.add(1));
+        crate::drop_hot_at(at);
         u32::from(same != (arg == 1))
     }
 }
@@ -5621,112 +5663,6 @@ unsafe extern "C" fn h_local_method(
                 RAISED
             }
         }
-    }
-}
-
-/// How many receiver class versions a [`LeafMethodSite`] keeps a callee
-/// for (an expression tree's `node.eval(env)` sees several classes).
-const LEAF_METHOD_WAYS: usize = 8;
-
-/// Declined calls after which a [`LeafMethodSite`] that never ran one is
-/// skipped.
-const LEAF_METHOD_MISSES: u32 = 64;
-
-/// Where the code finds a [`LeafMethodSite`]'s skip flag.
-const LMS_OFF: i32 = std::mem::offset_of!(LeafMethodSite, off) as i32;
-
-/// Count a call `site` declined (see [`LeafMethodSite::off`]).
-#[cold]
-fn leaf_method_miss(site: &LeafMethodSite) -> u32 {
-    let m = site.misses.get().saturating_add(1);
-    site.misses.set(m);
-    if m >= LEAF_METHOD_MISSES && site.hits.get() == 0 {
-        site.off.set(1);
-    }
-    1
-}
-
-/// What an `x.m(<simple arguments>)` site whose method runs as a frameless
-/// leaf settled when it was compiled (see [`h_leaf_method`]).
-#[repr(C)]
-pub(crate) struct LeafMethodSite {
-    /// Nonzero once the site declined [`LEAF_METHOD_MISSES`] calls without
-    /// running one: the code then skips the helper (a site that calls
-    /// methods of several classes only sometimes calls a leaf).
-    off: std::cell::Cell<u8>,
-    /// The calls it declined and ran (each saturating).
-    misses: std::cell::Cell<u32>,
-    hits: std::cell::Cell<u32>,
-    ext: *const CodeConstObjects,
-    /// The method load's pc and name.
-    attr_pc: usize,
-    name: u32,
-    /// The arguments after the receiver.
-    nargs: usize,
-    /// The receiver is a stack temporary (the result of the code before the
-    /// method load), which the call releases; otherwise a local's value.
-    owned: bool,
-    /// The leaf callees its last calls ran, by receiver class version
-    /// (see `Interpreter::leaf_method_callee`), the newest first.
-    callees: [std::cell::Cell<crate::LeafCallee>; LEAF_METHOD_WAYS],
-}
-
-/// `x.m(...)` at `site` with the receiver at `recv` and up to two
-/// arguments at `a` and `b` (borrowed: locals, constants or the scalars
-/// the code wrote): `0` with the method's result written to `out` (and an
-/// owned receiver released first) when the site's leaf callee ran it in
-/// place; anything else declined untouched.
-unsafe extern "C" fn h_leaf_method(
-    st: *mut State,
-    site: *const LeafMethodSite,
-    out: *mut Object,
-    recv: *mut Object,
-    a: *const Object,
-    b: *const Object,
-) -> u32 {
-    // SAFETY: the code passes its live state, its own site, a free stack
-    // slot (or the owned receiver's), and live operands.
-    unsafe {
-        let (st, site) = (&*st, &*site);
-        let args = [recv.cast_const(), a, b];
-        let args = args.get_unchecked(..=site.nargs);
-        let Object::Instance(inst) = &*recv else {
-            return leaf_method_miss(site);
-        };
-        let ver = inst.cls_raw().attr_version.get();
-        // The callee this site cached for the receiver's class version (read
-        // in place: only the matching entry is copied), or the one its
-        // method slot resolved, cached from here on. A version whose method
-        // is no such leaf is cached with no callee, and declined at once.
-        let c = match site.callees.iter().find(|c| (*c.as_ptr()).ver == ver) {
-            Some(c) => c.get(),
-            None => {
-                let Some(c) =
-                    Interpreter::leaf_method_callee(&*site.ext, site.attr_pc, site.name, &*recv)
-                else {
-                    return leaf_method_miss(site);
-                };
-                for k in (1..LEAF_METHOD_WAYS).rev() {
-                    site.callees[k].set(site.callees[k - 1].get());
-                }
-                site.callees[0].set(c);
-                c
-            }
-        };
-        if c.is_none() {
-            return leaf_method_miss(site);
-        }
-        let Some(v) = (*st.interp).leaf_method_run(&c, inst, args, st.depth_cell) else {
-            return leaf_method_miss(site);
-        };
-        if site.hits.get() == 0 {
-            site.hits.set(1);
-        }
-        if site.owned {
-            drop(recv.read());
-        }
-        out.write(v);
-        0
     }
 }
 
@@ -6272,7 +6208,7 @@ unsafe extern "C" fn h_load_method(
                 return 0;
             }
         };
-        crate::drop_hot(top.read());
+        crate::drop_hot_at(top);
         top.write(Object::Function(f));
         st.stack.add(len).write(Object::Unbound);
         0
@@ -7219,7 +7155,7 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
             return 1;
         }
         // The value moved in (its slot is a stand-in now).
-        crate::drop_hot(at.add(1).read());
+        crate::drop_hot_at(at.add(1));
         0
     }
 }
@@ -7344,8 +7280,8 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
         settle(st);
         let sw = &mut *st.sw;
         let interp = &*st.interp;
-        let nested = interp.direct_calls.get();
-        if nested >= DIRECT_CALL_DEPTH || crate::hot_gates::loop_gen() != st.snap_gen {
+        let nested = interp.recs.top();
+        if interp.recs.full_at(nested) || crate::hot_gates::loop_gen() != st.snap_gen {
             return false;
         }
         let cframe = &mut *sw.cur;
@@ -7387,10 +7323,16 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            no_direct: false,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
-        interp.direct_calls.set(nested + 1);
+        interp.recs.set_top(nested.add(1));
         let status = native.run(&mut cst);
-        interp.direct_calls.set(nested);
+        interp.recs.set_top(nested);
         settle(st);
         let sw = &mut *st.sw;
         if status == RELOAD {
@@ -7447,8 +7389,8 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
         let send_pc = crate::await_send_after(&caller.code, pc)?;
         let has_self = !matches!(&*base.add(start + 1), Object::Unbound);
         let nargs = len - start - 2 + usize::from(has_self);
-        let nested = interp.direct_calls.get();
-        if nested >= DIRECT_CALL_DEPTH
+        let nested = interp.recs.top();
+        if interp.recs.full_at(nested)
             || !sw.calls_ok
             || (*st.maybe_dead).get()
             || crate::hot_gates::loop_gen() != st.snap_gen
@@ -7532,13 +7474,19 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            no_direct: false,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
-        interp.direct_calls.set(nested + 1);
+        interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
         interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
         let status = native.run_direct(&mut cst, from);
         interp.lazy_top.set(outer);
-        interp.direct_calls.set(nested);
+        interp.recs.set_top(nested);
         Some(lazy_await_done(
             st, start, send_pc, callee, status, &mut cst,
         ))
@@ -7833,11 +7781,6 @@ pub(crate) struct DirectSite {
     /// Nonzero while the site has a body or a leaf to take: the native
     /// code tries the direct helper first then.
     hot: usize,
-    /// The activation slot the site's last clean direct return parked
-    /// here (see `Interpreter::inline_park_warm`), still holding its
-    /// callee's code: the next call of that code binds it without taking
-    /// a slot from the pool or a reference to the code.
-    act: Option<Box<crate::InlineAct>>,
 }
 
 /// A [`DirectSite`] key: `code`'s address, with `has_self` in its low bit
@@ -7854,13 +7797,6 @@ impl Drop for DirectSite {
                 // SAFETY: each holds the count a fill took.
                 unsafe { drop(Rc::from_raw(code as *const CodeObject)) };
             }
-        }
-        if let Some(act) = self.act.take() {
-            // SAFETY: a warm slot holds its code's count (see
-            // `Interpreter::inline_park_warm`); parked, its own drop then
-            // treats the field as stale.
-            unsafe { drop(std::ptr::read(&raw const act.frame.code)) };
-            drop(act);
         }
     }
 }
@@ -8127,7 +8063,7 @@ unsafe fn dunder_call(
             ];
             if let Some(v) = (*st.interp).pure_leaf_eval::<false, false>(code, &f, &ptrs[..n]) {
                 for k in (0..n).rev() {
-                    crate::drop_hot(at.add(k).read());
+                    crate::drop_hot_at(at.add(k));
                 }
                 if not_implemented(st, &v) {
                     crate::drop_hot(v);
@@ -8159,7 +8095,7 @@ unsafe fn dunder_call(
                 CALL_DECLINED
             }
             Some(0) if not_implemented(st, &*at) => {
-                crate::drop_hot(at.read());
+                crate::drop_hot_at(at);
                 RAISED
             }
             Some(r) => r,
@@ -8217,7 +8153,7 @@ unsafe extern "C" fn h_property(
             if let Some(v) = v {
                 let at = st.stack.add(slot);
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8244,7 +8180,7 @@ unsafe extern "C" fn h_property(
             {
                 let at = st.stack.add(slot);
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8270,7 +8206,7 @@ unsafe extern "C" fn h_property(
             let interp = &*st.interp;
             if let Some(v) = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv]) {
                 if local == 0 {
-                    crate::drop_hot(at.read());
+                    crate::drop_hot_at(at);
                 }
                 at.write(v);
                 return 0;
@@ -8296,7 +8232,7 @@ unsafe extern "C" fn h_property(
                     }
                 }
                 if local != 0 {
-                    crate::drop_hot(at.add(1).read());
+                    crate::drop_hot_at(at.add(1));
                 } else {
                     at.write(at.add(1).read());
                 }
@@ -8412,6 +8348,18 @@ unsafe extern "C" fn h_call_ctor(
         }
         if ctor_store_init(s, &*code, pc as usize, argc, len as usize) {
             return 0;
+        }
+        // (The site's first execution specializes it.)
+        if !matches!(
+            (&*code).caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Empty
+        ) && !s.sw.is_null()
+        {
+            let start = len as usize - argc - 2;
+            let call = records::CallAt::new(pc as usize, start, argc, None);
+            if let Some(r) = records::ctor_direct(s, call, len as usize) {
+                return r;
+            }
         }
         h_call(st, code, ext, pc, len)
     }
@@ -8650,6 +8598,7 @@ unsafe fn leaf_site_call(st: &mut State, start: usize, len: usize, missing: usiz
 /// just returned), and its lazy callers' states are live.
 #[cold]
 #[inline(never)]
+#[track_caller]
 pub(crate) unsafe fn register_lazy(st: &mut State) {
     // SAFETY: the caller's contract; the activation is the box
     // `direct_enter` leaked, owned by the switch from here on.
@@ -8664,6 +8613,26 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
             Some(rec) => (*rec).bind(interp, st.depth_cell),
             None => act,
         };
+        // A record's callee does what its call put off.
+        if st.in_rec {
+            records::commit(st, act);
+            crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT_REG);
+            if crate::burst_stats::enabled() {
+                let code = &(*st.frame).code;
+                let at = |pc: usize| code.instructions.get(pc).map(|i| i.op);
+                let from = std::panic::Location::caller();
+                crate::burst_stats::note_decline(
+                    &format!(
+                        "direct registered from {}:{} (last {:?}@{})",
+                        from.file().rsplit('/').next().unwrap_or(""),
+                        from.line(),
+                        at(st.last),
+                        st.last
+                    ),
+                    &code.qualname,
+                );
+            }
+        }
         // (The spine's own registration hook stays out of the way: this
         // links the callees in order itself.)
         let outer = interp.lazy_top.replace(0);
@@ -8716,7 +8685,23 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         sw.scratch = usize::MAX;
         sw.last = &raw mut sw.scratch;
         st.lazy_depth = (*sw.inl).len();
+        // A native body running from here: the activation waits on the
+        // pending list, as if it had registered first.
+        if st.wait_pc != usize::MAX {
+            sw.scratch = st.last;
+            st.wait_pending = interp.core_pending_enter_fast(sw, &mut *st.frame, st.wait_pc);
+        }
         interp.lazy_top.set(outer);
+    }
+}
+
+/// A function's old code after a `__code__` assignment, which this thread's
+/// lazily running callees no longer borrow (they settled first). Another
+/// thread's may: it stays alive for good once threads run, which so rare an
+/// assignment can afford.
+pub(crate) fn retire_code(code: Rc<CodeObject>) {
+    if crate::sync::rc_shared_flag().load(Ordering::Relaxed) {
+        std::mem::forget(code);
     }
 }
 
@@ -8727,6 +8712,7 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
 ///
 /// As [`register_lazy`]'s.
 #[inline(always)]
+#[track_caller]
 unsafe fn settle(st: &mut State) {
     if !st.lazy.is_null() {
         // SAFETY: the caller's contract.
@@ -8800,12 +8786,28 @@ unsafe fn direct_call<const CALL: bool>(
             (site.alt_native, site.alt_missing as usize)
         } else {
             let nargs = len - start - 2 + usize::from(has_self);
-            // A frameless leaf evaluates in place, which costs less than an
-            // activation (even one with a body): the site's two leaves,
-            // or any other (a site that calls several, as an operator
-            // table's lambdas, takes them all, caching the first two).
+            // A leaf's compiled body costs less than evaluating it frameless:
+            // one without a body evaluates in place until it gets one, as a
+            // callee of compiled code that switches does. (A site that calls
+            // several leaves, as an operator table's lambdas, takes them all,
+            // caching the first two.)
             let cached = CALL && (site.leaf_key == key || site.alt_leaf_key == key);
-            let leaf = if cached {
+            let body_first = CALL && {
+                let has = direct_body(f, code_rc, nargs).is_some();
+                if !has && crate::fn_is_leaf(f) {
+                    if let Some(ext) = crate::code_vm_ext(code_rc) {
+                        ext.frame_jit.warm_switched(
+                            code_rc,
+                            ext,
+                            code_rc.varnames.len().max(nargs),
+                        );
+                    }
+                }
+                has
+            };
+            let leaf = if body_first {
+                None
+            } else if cached {
                 Some(if site.leaf_key == key {
                     site.leaf_missing as usize
                 } else {
@@ -8869,13 +8871,17 @@ unsafe fn direct_call<const CALL: bool>(
             return None;
         }
         let native = &*(native as *const Native);
+        // (Compiled code goes straight in from here on.)
+        if CALL && code_rc.jit_hint.direct_entry() == 0 {
+            records::note_direct(code_rc, native, packed);
+        }
         let interp = &mut *st.interp.cast_mut();
-        let nested = interp.direct_calls.get();
+        let nested = interp.recs.top();
         let code: &CodeObject = code_rc;
         // (Native code runs only in a burst, which free-threaded mode
         // never starts.)
         // (Tier 2's compiled code is the commonest test's rare answer.)
-        if nested >= DIRECT_CALL_DEPTH
+        if interp.recs.full_at(nested)
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
             || !(*st.sw).calls_ok
@@ -8884,7 +8890,7 @@ unsafe fn direct_call<const CALL: bool>(
                 && !crate::tier2::jit_off_for_process())
         {
             crate::burst_stats::note_decline(
-                if nested >= DIRECT_CALL_DEPTH {
+                if interp.recs.full_at(nested) {
                     "nesting"
                 } else if crate::hot_gates::loop_gen() != st.snap_gen {
                     "loop gen"
@@ -8911,41 +8917,19 @@ unsafe fn direct_call<const CALL: bool>(
             cells,
             native,
             nested,
-            &raw mut *site,
             binop,
             lru,
         )
     }
 }
 
-/// How a direct call's arguments bind (see [`direct_enter`]).
-#[derive(Clone, Copy)]
-enum BindArgs {
-    /// Positionally, the last `missing` parameters taking defaults; with
-    /// `extended`, the code's `*args`, `**kwargs` and keyword-only
-    /// parameters too (see `Interpreter::fill_extended_raw`).
-    Positional { missing: usize, extended: bool },
-    /// A `CALL_KW`'s, through the site's verified `CallPyKwNames`
-    /// permutation (see [`direct_call_kw`]): `argc` positionals and `kwc`
-    /// keyword values, the names tuple atop the stack.
-    Keywords {
-        perm: u32,
-        covered: u32,
-        kwc: usize,
-        argc: usize,
-    },
-}
-
 /// The direct call ([`direct_call`], [`direct_call_kw`]) at `pc` (its
 /// operands from `start` up a `len`-deep stack) of the plain function
-/// `fp` running `code_rc`, its checks passed: the callee's activation
-/// bound as the core loop's arm binds one (its arguments as `args` says,
-/// its cells when `cells`), pushed and switched to, then run through its
-/// native body `native` from its start ([`direct_run`]). The activation
-/// is the call site's warm slot (`site`'s, which may still hold the
-/// callee's code; null for none) or one from the pool. `nested` is the
-/// direct-call depth, and `binop` an instance operator's (see
-/// [`direct_call`]). `None` touched nothing.
+/// `fp` running `code_rc`, its checks passed: the callee bound on the
+/// level's record ([`records::enter`]: its arguments as `args` says, its
+/// cells when `cells`), then run through its native body `native` from its
+/// start ([`records::run`]). `nested` is the direct-call depth, and `binop`
+/// an instance operator's (see [`direct_call`]). `None` touched nothing.
 ///
 /// # Safety
 ///
@@ -8963,179 +8947,30 @@ unsafe fn direct_enter(
     args: BindArgs,
     cells: bool,
     native: &Native,
-    nested: u32,
-    site: *mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    nested: *mut records::DirectRec,
+    binop: records::Binop<'_>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
     unsafe {
-        let interp = &mut *st.interp.cast_mut();
-        let sw = &mut *st.sw;
-        let dc = &*sw.depth_cell;
-        let depth = dc.get() + 1;
-        if depth > crate::recursion::recursion_limit() {
-            return None;
-        }
-        // Committed: the caller synced as the core loop's arm syncs it, and
-        // the callee's activation made the running one.
-        dc.set(depth);
-        let warm = if site.is_null() {
-            None
-        } else {
-            (*site).act.take()
-        };
-        let (mut act, held) = match warm {
-            Some(act) if std::ptr::eq(Rc::as_ptr(&act.frame.code), Rc::as_ptr(code_rc)) => {
-                (act, true)
-            }
-            Some(act) => {
-                // SAFETY: a warm slot holds its code's count.
-                drop(std::ptr::read(&raw const act.frame.code));
-                (act, false)
-            }
-            None => (interp.inline_slot(), false),
-        };
-        let caller = &mut *st.frame;
-        caller.pc = pc as u32 + 1;
-        let fr: &mut crate::Frame = &mut act.frame;
-        // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = fr.locals.storage();
-        let base = st.stack;
-        match args {
-            BindArgs::Positional {
-                missing,
-                extended: true,
-            } => {
-                // `*args`, `**kwargs` or keyword-only parameters: the
-                // arguments move in as `fill_extended_raw` binds them.
-                let first = if has_self { start + 1 } else { start + 2 };
-                Interpreter::fill_extended_raw(
-                    &*fp,
-                    code_rc,
-                    base.add(first),
-                    len - first,
-                    missing,
-                    locals,
-                );
-                crate::fill_unbound(locals, code_rc.varnames.len());
-            }
-            BindArgs::Positional { missing, .. } => {
-                // The arguments move into the locals, the defaults follow
-                // as copies, and the other locals start unbound.
-                let first = if has_self { start + 1 } else { start + 2 };
-                let nargs = len - first;
-                let total = code_rc.varnames.len().max(nargs + missing);
-                if locals.capacity() < total {
-                    locals.reserve(total);
-                }
-                let dst = locals.as_mut_ptr();
-                crate::move_objects(base.add(first), dst, nargs);
-                let mut k = nargs;
-                if missing > 0 {
-                    let defaults = &(*fp).defaults;
-                    for d in &defaults[defaults.len() - missing..] {
-                        dst.add(k).write(crate::clone_hot(d));
-                        k += 1;
-                    }
-                }
-                crate::fill_unbound_raw(dst.add(k), total - k);
-                locals.set_len(total);
-            }
-            BindArgs::Keywords {
-                perm,
-                covered,
-                kwc,
-                argc,
-            } => {
-                // The keywords take the slots the permutation names, the
-                // positionals the first ones, the rest their defaults.
-                caller.stack.set_len(len);
-                let names = caller.stack.pop().expect("the names tuple");
-                let items: &[Object] = match &names {
-                    Object::Tuple(t) => t,
-                    _ => &[],
-                };
-                Interpreter::kw_names_fill_locals(
-                    locals,
-                    &mut caller.stack,
-                    items,
-                    &*fp,
-                    code_rc,
-                    perm,
-                    covered,
-                    kwc,
-                    argc + usize::from(has_self),
-                );
-                crate::drop_hot(names);
-            }
-        }
-        // The callable moves out of its slot, and an empty self slot owns
-        // nothing. The parked slot's handles are stale copies, overwritten
-        // without a drop: the code owned (unless the warm slot holds it),
-        // the rest borrowed from the callable, which the slot holds.
-        std::ptr::write(&raw mut act.callable, base.add(start).read());
-        caller.stack.set_len(start);
-        if !held {
-            std::ptr::write(&raw mut fr.code, code_rc.clone());
-        }
-        std::ptr::write(&raw mut fr.globals, crate::borrowed_rc(&(*fp).globals));
-        std::ptr::write(&raw mut fr.builtins, crate::borrowed_rc(&(*fp).builtins));
-        act.owns_cells = cells && !code_rc.cellvars.is_empty();
-        let frame_cells = if act.owns_cells {
-            // (Its parameters that are cells move into them.)
-            crate::fresh_cells(&*fp, code_rc, locals)
-        } else if cells {
-            crate::borrowed_rc((*fp).lean_cells_ref(code_rc).expect("checked by the call"))
-        } else {
-            crate::borrowed_rc(crate::object::empty_cells_ref())
-        };
-        std::ptr::write(&raw mut fr.cells, frame_cells);
-        fr.pc = 0;
-        act.parked = false;
-        act.direct = true;
-        act.call_pc = pc;
-        act.exc_depth = interp.exc_info_len();
-        act.guard = Some(crate::recursion::Guard::adopt(dc));
-        // As for any inline activation: a hot body is compiled once.
-        let n = code_rc.jit_hint.bump_lean_entries();
-        if n <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
-            && n == crate::tier2::lean_warm_at()
-            && !crate::tier2::jit_off_for_process()
-            && !code_rc.jit_hint.is_not_jitable()
-        {
-            crate::tier2::warm_compile(interp, &mut act.frame);
-        }
-        // A `functools.lru_cache` miss's store goes with the activation.
-        if let Some(lru) = lru {
-            act.lru = lru.take();
-        }
-        let callee: *mut crate::Frame = &raw mut *act.frame;
-        crate::burst_stats::note_call(crate::burst_stats::CALL_DIRECT);
-        // The callee runs lazily (see `register_lazy`): the caller stays
-        // the switch's running activation, off the pending list, unless
-        // something needs the core loop's view of the callee.
-        act.lazy_caller = st;
-        let act = Box::into_raw(act);
-        Some(direct_run::<false>(
+        let bound = records::enter(
             st,
             pc,
             start,
-            callee,
-            act,
-            0,
-            native,
-            std::ptr::null_mut(),
+            len,
+            fp,
+            code_rc,
+            has_self,
+            args,
+            cells,
+            native.need(),
             nested,
-            binop,
-            0,
-            site,
-        ))
+            lru,
+        );
+        if !bound {
+            return None;
+        }
+        Some(records::run(st, nested, native, binop))
     }
 }
 
@@ -9176,8 +9011,8 @@ unsafe fn run_pushed_directly(
             return stats::declined("shape");
         }
         let interp = &*st.interp;
-        let nested = interp.direct_calls.get();
-        if nested >= DIRECT_CALL_DEPTH || crate::hot_gates::loop_gen() != st.snap_gen {
+        let nested = interp.recs.top();
+        if interp.recs.full_at(nested) || crate::hot_gates::loop_gen() != st.snap_gen {
             return stats::declined("depth or generation");
         }
         let cframe = &*callee;
@@ -9192,56 +9027,33 @@ unsafe fn run_pushed_directly(
             return stats::declined("no entry");
         }
         top.direct = true;
-        Some(direct_run::<true>(
-            st,
-            pc,
-            start,
-            callee,
-            std::ptr::null_mut(),
-            depth,
-            native,
-            saved_last,
-            nested,
-            None,
-            from,
-            std::ptr::null_mut(),
+        Some(direct_run_pushed(
+            st, pc, start, callee, depth, native, saved_last, nested, from,
         ))
     }
 }
 
-/// Run a direct call's callee (`callee`, marked `direct`) through its
+/// Run the activation the core loop's call paths bound and switched to
+/// (`callee`, marked `direct`: see [`run_pushed_directly`]) through its
 /// native code from `from`, and finish its return here: [`direct_call`]'s
-/// `Some` results. `PUSHED` for an activation the core loop's call paths
-/// bound and switched to (see [`run_pushed_directly`]), at `depth` with
-/// its caller's last-instruction slot `saved_last`, whose cells its clean
-/// return checks; one [`direct_enter`] bound otherwise, `lazy` (see
-/// [`register_lazy`]), whose clean return parks it in its call site's warm
-/// slot (`site`'s, when it has one free).
+/// `Some` results. It's at `depth` on the switch with its caller's
+/// last-instruction slot `saved_last`, whose cells its clean return checks.
 ///
 /// # Safety
 ///
-/// As [`direct_call`]'s, with the callee bound (and switched to, when
-/// pushed).
+/// As [`direct_call`]'s, with the callee bound and switched to.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn direct_run<const PUSHED: bool>(
+unsafe fn direct_run_pushed(
     st: &mut State,
     pc: usize,
     start: usize,
     callee: *mut crate::Frame,
-    lazy: *mut crate::InlineAct,
     depth: usize,
     native: &Native,
     saved_last: *mut usize,
-    nested: u32,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    nested: *mut records::DirectRec,
     from: usize,
-    site: *mut DirectSite,
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
@@ -9269,32 +9081,36 @@ unsafe fn direct_run<const PUSHED: bool>(
             sw: st.sw,
             gen_depth: 0,
             direct: true,
-            lazy,
+            lazy: std::ptr::null_mut(),
             lazy_depth: 0,
             lazy_last: std::ptr::null_mut(),
             gen_lazy: false,
+            no_direct: false,
+            in_rec: false,
+            at_start: false,
+            clean: false,
+            wait_pc: usize::MAX,
+            wait_pending: None,
         };
-        interp.direct_calls.set(nested + 1);
-        let outer = interp.lazy_top.get();
-        if !PUSHED {
-            interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
-        }
+        interp.recs.set_top(nested.add(1));
         let status = native.run_direct(&mut cst, from);
-        interp.lazy_top.set(outer);
-        interp.direct_calls.set(nested);
-        direct_done::<PUSHED>(
-            st, pc, start, callee, depth, saved_last, binop, site, status, &mut cst,
+        interp.recs.set_top(nested);
+        direct_done::<true>(
+            st, pc, start, callee, depth, saved_last, None, status, &mut cst,
         )
     }
 }
 
-/// The end of a direct call's run ([`direct_run`]) that returned `status`
-/// with the callee's state `cst`: its return finished here, or whatever
-/// it left synced for the core loop. The parameters are `direct_run`'s.
+/// The end of a direct call's run that returned `status` with the callee's
+/// state `cst`, not a record's clean return (see [`records::leave`]): its
+/// return finished here, or whatever it left synced for the core loop.
+/// `PUSHED` for an activation the core loop's call paths bound
+/// ([`direct_run_pushed`], whose parameters these are); otherwise one that
+/// registered, whose depth and caller's last-instruction slot are in `cst`.
 ///
 /// # Safety
 ///
-/// As [`direct_run`]'s, with the callee's native code just returned.
+/// As [`direct_run_pushed`]'s, with the callee's native code just returned.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn direct_done<const PUSHED: bool>(
@@ -9310,7 +9126,6 @@ unsafe fn direct_done<const PUSHED: bool>(
         &Rc<crate::types::TypeObject>,
         &Rc<crate::types::TypeObject>,
     )>,
-    site: *mut DirectSite,
     status: u32,
     cst: &mut State,
 ) -> u32 {
@@ -9320,67 +9135,6 @@ unsafe fn direct_done<const PUSHED: bool>(
         let caller = &mut *st.frame;
         let cframe = &mut *callee;
         let sw = &mut *st.sw;
-        if !PUSHED && !cst.lazy.is_null() {
-            if status == DIRECT_RET
-                && cst.len == 1
-                && !cframe.locals.is_shared()
-                && !interp.countdown_out(2)
-                && crate::hot_gates::loop_gen() == st.snap_gen
-            {
-                // A clean return of a callee that never registered: the
-                // caller is still the running activation, and its switch
-                // and pending list never saw the callee.
-                let v = cst.stack.read();
-                cframe.stack.set_len(0);
-                let mut done = Box::from_raw(cst.lazy);
-                crate::release_activation_locals(cframe, done.owns_cells);
-                drop(done.guard.take());
-                // A `functools.lru_cache` miss's function returned: its
-                // result is stored before the caller takes it.
-                if done.lru.is_some() {
-                    interp.lru_finish(&mut done.lru, &v);
-                }
-                // SAFETY: moved out once; the parked slot treats the field
-                // as stale (see `inline_deliver`).
-                let callable = std::ptr::read(&raw const done.callable);
-                if done.owns_cells {
-                    done.clean = true;
-                    interp.inline_park_clean(done);
-                } else if !site.is_null() && (*site).act.is_none() {
-                    (*site).act = Some(interp.inline_park_warm(done));
-                } else {
-                    interp.inline_park_direct(done);
-                }
-                st.stack.add(start).write(v);
-                caller.stack.set_len(start + 1);
-                match callable {
-                    Object::Function(f) if crate::rc::try_release_shared(Rc::as_ptr(&f)) => {
-                        std::mem::forget(f);
-                    }
-                    callable => interp.release(callable),
-                }
-                interp.gil_countdown -= 1;
-                if (*sw.maybe_dead).get() {
-                    // (The finalizers may run Python code: the caller's
-                    // view first.)
-                    settle(st);
-                    let mut tmp = None;
-                    let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
-                    interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
-                    if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
-                        sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
-                    }
-                }
-                if sw.pending.is_some() {
-                    return RELOAD;
-                }
-                st.len = start + 1;
-                return 0;
-            }
-            // Anything else is the core loop's to finish: the callee
-            // registers first.
-            register_lazy(cst);
-        }
         // A lazy callee that registered: where it went on the switch.
         let (depth, saved_last) = if PUSHED {
             (depth, saved_last)
@@ -9413,10 +9167,9 @@ unsafe fn direct_done<const PUSHED: bool>(
             let clean = cst.len == 1
                 && inl.last().is_some_and(|a| {
                     a.act.shell.is_none()
-                        && (!PUSHED
-                            || ((cframe.code.cellvars.is_empty() || a.owns_cells)
-                                && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
-                                && a.new_init.is_none()))
+                        && (cframe.code.cellvars.is_empty() || a.owns_cells)
+                        && (a.init_inst.is_none() || matches!(&*cst.stack, Object::None))
+                        && a.new_init.is_none()
                 })
                 && !cframe.locals.is_shared()
                 && !interp.countdown_out(2)
@@ -9431,11 +9184,7 @@ unsafe fn direct_done<const PUSHED: bool>(
                 if depth == sw.entry_depth {
                     sw.entry_dead = true;
                 }
-                let v = if PUSHED {
-                    done.init_inst.take().unwrap_or(v)
-                } else {
-                    v
-                };
+                let v = done.init_inst.take().unwrap_or(v);
                 crate::release_activation_locals(cframe, done.owns_cells);
                 drop(done.guard.take());
                 // A `functools.lru_cache` miss's function returned: its
@@ -9450,10 +9199,6 @@ unsafe fn direct_done<const PUSHED: bool>(
                 if done.owns_cells {
                     done.clean = true;
                     interp.inline_park_clean(done);
-                } else if !PUSHED && !site.is_null() && (*site).act.is_none() {
-                    // The slot stays with its call site, still bound to
-                    // the callee's code, for its next call.
-                    (*site).act = Some(interp.inline_park_warm(done));
                 } else {
                     interp.inline_park_direct(done);
                 }
@@ -10141,8 +9886,8 @@ unsafe extern "C" fn h_call(
                 },
                 _ => return CALL_DECLINED,
             };
-            crate::drop_hot(base.add(top - 1).read());
-            crate::drop_hot(base.add(top - 2).read());
+            crate::drop_hot_at(base.add(top - 1));
+            crate::drop_hot_at(base.add(top - 2));
             base.add(top - 2).write(result);
             st.len = top - 1;
             return 0;
@@ -10524,11 +10269,48 @@ unsafe extern "C" fn h_call_native(
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;
         frame.stack.set_len(lenu);
-        settle(s);
+        // A lazily running activation stays so unless something looks while
+        // the body runs, which a body that runs no Python code rarely makes
+        // happen. (Other threads can look without settling it: it registers
+        // first once there are any.)
+        let lazy = !s.lazy.is_null() && !crate::sync::rc_shared_flag().load(Ordering::Relaxed);
+        if !lazy {
+            settle(s);
+            *(*s.sw).last = s.last;
+        }
         let sw = &mut *s.sw;
-        *sw.last = s.last;
         let interp = &mut *s.interp.cast_mut();
-        let r = interp.core_native_body(sw, frame, pcu, start, site.f, site.via_call);
+        let r = interp.core_native_body(
+            sw,
+            frame,
+            pcu,
+            start,
+            site.f,
+            site.via_call,
+            if lazy {
+                std::ptr::from_mut(s)
+            } else {
+                std::ptr::null_mut()
+            },
+        );
+        if !s.lazy.is_null() {
+            if sw.pending.is_none() && crate::hot_gates::loop_gen() == s.snap_gen {
+                return match r {
+                    None => {
+                        s.len = start + 1;
+                        0
+                    }
+                    Some(e) => {
+                        s.len = start;
+                        s.pc = pcu + 1;
+                        s.err = Some(e);
+                        RAISED
+                    }
+                };
+            }
+            settle(s);
+        }
+        let sw = &mut *s.sw;
         let in_place = sw.pending.is_none()
             && std::ptr::eq(sw.cur, s.frame)
             && crate::hot_gates::loop_gen() == s.snap_gen;
@@ -10658,8 +10440,8 @@ unsafe fn direct_call_kw(
         let ext = crate::code_vm_ext(callee)?;
         let native = ext.frame_jit.get(callee.varnames.len())?;
         let interp = &mut *st.interp.cast_mut();
-        let nested = interp.direct_calls.get();
-        if nested >= DIRECT_CALL_DEPTH
+        let nested = interp.recs.top();
+        if interp.recs.full_at(nested)
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
             || !(*st.sw).calls_ok
@@ -10687,7 +10469,6 @@ unsafe fn direct_call_kw(
             !callee.freevars.is_empty() || !f.closure.is_empty(),
             native,
             nested,
-            std::ptr::null_mut(),
             None,
             None,
         )
@@ -10846,10 +10627,15 @@ unsafe fn spread_direct(
         };
         let len = start + 2 + n;
         let want = u32::try_from(n + 1).ok()?;
-        if len > st.cap || (site.spread != 0 && site.spread != want) {
+        if len > st.cap {
             return None;
         }
-        site.spread = want;
+        // (Its cached callees' defaults taken depend on the length.)
+        if site.spread != want {
+            site.spread = want;
+            site.key = 0;
+            site.alt_key = 0;
+        }
         let spread = base.add(start + 2).read();
         let items: &[Object] = match &spread {
             Object::Tuple(t) => t,
@@ -10872,6 +10658,34 @@ unsafe fn spread_direct(
                 base.add(start + 2).write(spread);
                 base.add(start + 3).write(Object::Unbound);
                 None
+            }
+        }
+    }
+}
+
+/// The `CALL_FUNCTION_EX` at `pc` (its operands from `start`, synced on the
+/// frame) when it needs nothing but the frame (see
+/// `Interpreter::core_ex_on_frame`): `h_call_ex`'s results. A finalizer it
+/// queued is the native code's own check's. `None` touched nothing.
+///
+/// # Safety
+///
+/// As `h_call_ex`'s.
+#[inline(never)]
+unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        match interp.core_ex_on_frame(&mut *st.frame, pc)? {
+            Ok(()) => {
+                st.len = start + 1;
+                Some(0)
+            }
+            Err(e) => {
+                st.len = start;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                Some(RAISED)
             }
         }
     }
@@ -10901,6 +10715,11 @@ unsafe extern "C" fn h_call_ex(
         let frame = &mut *st.frame;
         frame.stack.set_len(len);
         frame.pc = pc as u32;
+        // What's made or run on this frame alone: a lazily running
+        // activation stays lazy.
+        if let Some(r) = spread_on_frame(st, pc, start) {
+            return r;
+        }
         settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
@@ -10964,6 +10783,12 @@ unsafe extern "C" fn h_call_forward(
         {
             st.stack.add(len).write(Object::Unbound);
             if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
+                return r;
+            }
+            let frame = &mut *st.frame;
+            frame.stack.set_len(len + 1);
+            frame.pc = pc as u32 + 3;
+            if let Some(r) = spread_on_frame(st, pc + 3, start) {
                 return r;
             }
         }
@@ -12145,7 +11970,6 @@ fn lower_range(
                 supers: std::mem::take(&mut lower.supers),
                 held: std::mem::take(&mut lower.held),
                 mods: std::mem::take(&mut lower.mod_caches),
-                leaf_methods: std::mem::take(&mut lower.leaf_methods),
                 attrs: std::mem::take(&mut lower.attr_sites),
                 method_sites: std::mem::take(&mut lower.method_sites),
                 copies: std::mem::take(&mut lower.copies),
@@ -12641,6 +12465,8 @@ struct Lower<'a> {
     /// Dispatches on the state's pc and depth (the entry, and helpers that
     /// move the pc by a run-time amount).
     dispatch: Block,
+    /// [`records::h_direct_enter`]'s signature, once imported.
+    enter_sig: Option<SigRef>,
     /// The code's route table (see [`ROUTE_NONE`]): the code addresses it,
     /// and this lowering fills the entries of its range.
     route: *mut u32,
@@ -12679,9 +12505,6 @@ struct Lower<'a> {
     /// The method loads' module-attribute caches.
     #[allow(clippy::vec_box)]
     mod_caches: Vec<Box<ModCache>>,
-    /// The leaf method calls' sites (see [`LeafMethodSite`]).
-    #[allow(clippy::vec_box)]
-    leaf_methods: Vec<Box<LeafMethodSite>>,
     /// The attribute reads' sites (see [`AttrSite`]).
     #[allow(clippy::vec_box)]
     attr_sites: Vec<Box<AttrSite>>,
@@ -12897,7 +12720,6 @@ impl<'a> Lower<'a> {
             supers: Vec::new(),
             held: Vec::new(),
             mod_caches: Vec::new(),
-            leaf_methods: Vec::new(),
             attr_sites: Vec::new(),
             method_sites: Vec::new(),
             copies: Vec::new(),
@@ -12909,6 +12731,7 @@ impl<'a> Lower<'a> {
             plain_exits: Vec::new(),
             catch: None,
             leave_tail: None,
+            enter_sig: None,
         }
     }
 
@@ -13624,7 +13447,30 @@ impl<'a> Lower<'a> {
         // The entry: to the block at the state's pc, when the stack has the
         // block's depth.
         self.dispatch = self.b.create_block();
-        self.b.ins().jump(self.dispatch, &[]);
+        // A record's callee starts at its first instruction, the stack
+        // checked, with its locals past the parameters still to mark unbound.
+        // (A raise it catches goes on through the dispatch, and a chunk
+        // without that instruction finds it there too.)
+        let fresh = self.b.create_block();
+        let at_start = self.b.ins().uload8(types::I32, FLAGS, self.st, S_AT_START);
+        self.b.ins().brif(at_start, fresh, &[], self.dispatch, &[]);
+        self.b.switch_to_block(fresh);
+        let params = code.arg_count as usize
+            + code.kwonly_count as usize
+            + usize::from(code.has_varargs)
+            + usize::from(code.has_varkeywords);
+        if params < self.nlocals {
+            let unbound = self.b.ins().iconst(types::I8, i64::from(self.tags.unbound));
+            for i in params..self.nlocals {
+                self.b
+                    .ins()
+                    .store(FLAGS, unbound, self.locals, 16 * i as i32);
+            }
+        }
+        let first = self.blocks[0]
+            .filter(|_| !self.never_ran[0])
+            .unwrap_or(self.dispatch);
+        self.b.ins().jump(first, &[]);
         self.b.switch_to_block(self.dispatch);
         let pc = self.b.ins().load(types::I64, FLAGS, self.st, S_PC);
         let len = self.b.ins().load(types::I64, FLAGS, self.st, S_LEN);
@@ -14389,6 +14235,22 @@ impl<'a> Lower<'a> {
             }
             OpCode::ReturnValue if !self.is_gen() && self.depth > 0 => {
                 self.flush();
+                // A record's callee hands back a return nothing looked at
+                // without writing to its state (see `REC_RET`).
+                if self.depth == 1 && !stats::enabled() {
+                    let clean = self.b.ins().uload8(types::I32, FLAGS, self.st, S_CLEAN);
+                    let handed = self.b.create_block();
+                    let other = self.b.create_block();
+                    self.b.ins().brif(clean, handed, &[], other, &[]);
+                    self.b.switch_to_block(handed);
+                    let last = self.last_pc.map_or(0, |l| l as i64 + 1);
+                    let r = self.b.ins().iconst(
+                        types::I32,
+                        i64::from(REC_RET) | (pc as i64) << 8 | last << 20,
+                    );
+                    self.b.ins().return_(&[r]);
+                    self.b.switch_to_block(other);
+                }
                 self.store_last();
                 let pcv = self.b.ins().iconst(types::I64, pc as i64);
                 let len = self.b.ins().iconst(types::I64, self.depth as i64);
@@ -14456,7 +14318,6 @@ impl<'a> Lower<'a> {
                     && crate::method_site_in_place(self.ext, pc + 1)
                     && !self.native_body_call(pc + 2) =>
             {
-                self.leaf_method(pc + 1, false);
                 self.method_kernel(pc);
                 self.method_call(pc)
             }
@@ -14617,127 +14478,6 @@ impl<'a> Lower<'a> {
         let (depth, last) = (self.depth, self.last_pc);
         self.push(Item::Mem(slot));
         self.set_last(call_pc);
-        self.goto(call_pc + 1);
-        self.depth = depth;
-        self.last_pc = last;
-        self.vs.clear();
-        self.b.switch_to_block(declined);
-    }
-
-    /// `x.m(<up to two local, constant or small-int arguments>); CALL`
-    /// (`attr_pc` the method load) of a Python method the site runs as a
-    /// frameless leaf: [`h_leaf_method`] on the operands in place,
-    /// continuing after the `CALL`. The receiver is the local the
-    /// instruction before loads, or with `owned` the stack's top, which the
-    /// call consumes. Lowering continues (at the general method call) where
-    /// the helper declines; nothing is emitted for another site.
-    fn leaf_method(&mut self, attr_pc: usize, owned: bool) {
-        let code = self.code;
-        let ins = &code.instructions;
-        if self.is_gen() || (owned && self.depth == 0) {
-            return;
-        }
-        let mut args: Vec<(OpCode, u32)> = Vec::new();
-        let mut k = attr_pc + 1;
-        let call_pc = loop {
-            let Some(i) = ins.get(k) else {
-                return;
-            };
-            match i.op {
-                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {}
-                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {}
-                OpCode::LoadSmallInt => {}
-                OpCode::Call if i.arg as usize == args.len() => break k,
-                _ => return,
-            }
-            args.push((i.op, i.arg));
-            if args.len() > 2 {
-                return;
-            }
-            k += 1;
-        };
-        if call_pc + 1 >= ins.len()
-            || !self.starts.get(call_pc + 1).copied().unwrap_or(false)
-            || !crate::method_site_py(self.ext, attr_pc)
-        {
-            return;
-        }
-        self.flush();
-        // The result's slot: the receiver's own, or the free one above.
-        let slot = self.depth - usize::from(owned);
-        let declined = self.b.create_block();
-        let recv = if owned {
-            self.slot_addr(slot)
-        } else {
-            self.local_addr(ins[attr_pc - 1].arg)
-        };
-        let null = self.b.ins().iconst(self.ptr, 0);
-        let mut addrs = [null, null];
-        for (j, &(op, arg)) in args.iter().enumerate() {
-            addrs[j] = match op {
-                OpCode::LoadConst => self.const_addr(arg),
-                // A scalar in the slot the argument would take.
-                OpCode::LoadSmallInt => {
-                    let at = self.slot_addr(slot + 2 + j);
-                    self.write_tag(at, self.tags.int);
-                    let v = self.b.ins().iconst(types::I64, i64::from(arg));
-                    self.b.ins().store(FLAGS, v, at, 8);
-                    at
-                }
-                _ => {
-                    let at = self.local_addr(arg);
-                    if self.maybe_unbound[arg as usize] && !self.bound[arg as usize] {
-                        let t = self.tag_at(at);
-                        let unbound =
-                            self.b
-                                .ins()
-                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
-                        self.branch_out(unbound, declined);
-                    }
-                    at
-                }
-            };
-        }
-        let site = Box::new(LeafMethodSite {
-            off: std::cell::Cell::new(0),
-            misses: std::cell::Cell::new(0),
-            hits: std::cell::Cell::new(0),
-            ext: std::ptr::from_ref(self.ext),
-            attr_pc,
-            name: ins[attr_pc].arg,
-            nargs: args.len(),
-            owned,
-            callees: [const { std::cell::Cell::new(crate::LeafCallee::EMPTY) }; LEAF_METHOD_WAYS],
-        });
-        let sv = self.b.ins().iconst(
-            self.ptr,
-            std::ptr::from_ref::<LeafMethodSite>(&*site) as i64,
-        );
-        self.leaf_methods.push(site);
-        let off = self.b.ins().uload8(types::I64, FLAGS, sv, LMS_OFF);
-        self.branch_out(off, declined);
-        let out = self.slot_addr(slot);
-        self.store_last();
-        let r = self
-            .call(
-                h_leaf_method as *const () as usize,
-                &[self.st, sv, out, recv, addrs[0], addrs[1]],
-                true,
-            )
-            .expect("returns");
-        let ran = self.b.create_block();
-        self.b.ins().brif(r, declined, &[], ran, &[]);
-        // Ran: the result in the receiver's slot, as after the `CALL`.
-        self.b.switch_to_block(ran);
-        let (depth, last) = (self.depth, self.last_pc);
-        if owned {
-            self.pop();
-        }
-        self.push(Item::Mem(slot));
-        self.set_last(call_pc);
-        // (A temporary the leaf or the receiver's release freed may have
-        // queued a finalizer.)
-        self.check_released(call_pc + 1);
         self.goto(call_pc + 1);
         self.depth = depth;
         self.last_pc = last;
@@ -16330,7 +16070,6 @@ impl<'a> Lower<'a> {
             return false;
         }
         // A leaf method of the value on top, called in place.
-        self.leaf_method(pc, true);
         self.flush();
         let (builtin_recv, builtin) = match self.builtin_method_load(pc) {
             Some((want, f)) => {
@@ -16652,11 +16391,74 @@ impl<'a> Lower<'a> {
             .ins()
             .iconst(self.ptr, std::ptr::from_ref::<CallSite>(&site) as i64);
         self.call_sites.push(site);
+        // A function with a direct entry goes straight to it.
+        let joined = (helper == h_site_call as *const () as usize
+            && !stats::enabled()
+            && !crate::burst_stats::enabled())
+        .then(|| self.direct_native_call(pc, argc));
         let r = self.call(helper, &[self.st, c], true).expect("returns");
+        let r = match joined {
+            Some(joined) => {
+                self.b.ins().jump(joined, &[r.into()]);
+                self.b.switch_to_block(joined);
+                self.b.block_params(joined)[0]
+            }
+            None => r,
+        };
         self.after_helper(r);
         self.depth -= argc + 1;
         self.set_last(pc);
         true
+    }
+
+    /// The `CALL` at `pc` of `argc` arguments, straight to the callee's
+    /// native code (see [`records`]) when the callee is a function with a
+    /// direct entry. The block its status goes to, which takes it as a
+    /// parameter; lowering goes on for anything else.
+    fn direct_native_call(&mut self, pc: usize, argc: usize) -> Block {
+        let joined = self.b.create_block();
+        self.b.append_block_param(joined, types::I32);
+        let run = self.b.create_block();
+        let slow = self.b.create_block();
+        let start = self.depth - argc - 2;
+        let callee = self.slot_addr(start);
+        let sig = *self.enter_sig.get_or_insert_with(|| {
+            let mut sig = Signature::new(self.b.func.signature.call_conv);
+            sig.params.push(AbiParam::new(self.ptr));
+            sig.params.push(AbiParam::new(self.ptr));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(self.ptr));
+            sig.returns.push(AbiParam::new(self.ptr));
+            self.b.import_signature(sig)
+        });
+        let helper = self.b.ins().iconst(
+            self.ptr,
+            records::h_direct_enter as *const () as usize as i64,
+        );
+        let call = self.b.ins().iconst(
+            types::I64,
+            records::CallAt::new(pc, start, argc, self.last_pc).bits(),
+        );
+        let inst = self
+            .b
+            .ins()
+            .call_indirect(sig, helper, &[self.st, callee, call]);
+        let (cst, entry) = (self.b.inst_results(inst)[0], self.b.inst_results(inst)[1]);
+        self.b.ins().brif(cst, run, &[], slow, &[]);
+        self.b.switch_to_block(run);
+        let sig = self.sig(&[self.ptr], Some(types::I32));
+        let inst = self.b.ins().call_indirect(sig, entry, &[cst]);
+        let status = self.b.inst_results(inst)[0];
+        let r = self
+            .call(
+                records::h_direct_leave as *const () as usize,
+                &[self.st, cst, status],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().jump(joined, &[r.into()]);
+        self.b.switch_to_block(slow);
+        joined
     }
 
     /// `await f(...)`: a coroutine function's call starts it.

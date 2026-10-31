@@ -1025,10 +1025,6 @@ pub struct Interpreter {
     /// chains keep the ~[`crate::gil::GIL_CHECK_INTERVAL`]-opcode
     /// checkpoint cadence.
     gil_countdown: u32,
-    /// Compiled callees the frame JIT is running from inside a compiled
-    /// caller's `CALL` (see `frame_jit::run_callee_directly`), bounding
-    /// the native stack those nested runs take.
-    pub(crate) direct_calls: std::cell::Cell<u32>,
     /// While a lean resume runs on behalf of a consumer that drains the
     /// generator (`sum()`, `list()`, see [`FoldSink`]): the generator's
     /// frame (its address) and the consumer's sink. The core loop folds
@@ -1061,6 +1057,9 @@ pub struct Interpreter {
     /// the spine or reads it; `0` when none runs lazily. (An address, as
     /// for `lean_pending`.)
     pub(crate) lazy_top: std::cell::Cell<usize>,
+    /// The records direct calls between compiled functions run on (see
+    /// `frame_jit::DirectRecs`).
+    pub(crate) recs: frame_jit::DirectRecs,
     /// Spare [`ChainRec`]s (empty), boxed: a parked chain's levels point
     /// at their record.
     #[allow(clippy::vec_box)]
@@ -1314,7 +1313,6 @@ impl Default for Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
@@ -1323,6 +1321,7 @@ impl Default for Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             lazy_top: std::cell::Cell::new(0),
+            recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -1449,7 +1448,6 @@ impl Interpreter {
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
-            direct_calls: std::cell::Cell::new(0),
             sum_fold: None,
             fuse_off: false,
             quiet_off: crate::hot_gates::env_flags::no_quiet(),
@@ -1458,6 +1456,7 @@ impl Interpreter {
                 && !Self::locals_fast_off(),
             lean_pending: Vec::new(),
             lazy_top: std::cell::Cell::new(0),
+            recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
@@ -2658,10 +2657,7 @@ impl Interpreter {
         // counts) and no observer watches releases.
         if crate::sync::release_gates() == 0 {
             // SAFETY: `dropped` owns a reference to the live allocation.
-            let w = unsafe { &*word };
-            let c = w.load(std::sync::atomic::Ordering::Relaxed);
-            if c != 1 {
-                w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
+            if unsafe { crate::rc::plain_release(word) } {
                 return std::mem::forget(dropped);
             }
         }
@@ -7995,6 +7991,7 @@ impl Interpreter {
                 true,
                 snap_gen,
             );
+            self.sync_recs(&sw);
             let pc = frame.pc as usize;
             let mut st = frame_jit::State {
                 locals: frame.locals.as_mut_ptr(),
@@ -8018,6 +8015,12 @@ impl Interpreter {
                 lazy_depth: 0,
                 lazy_last: std::ptr::null_mut(),
                 gen_lazy: true,
+                no_direct: false,
+                in_rec: false,
+                at_start: false,
+                clean: false,
+                wait_pc: usize::MAX,
+                wait_pending: None,
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -8171,6 +8174,7 @@ impl Interpreter {
                         let calls_ok = self.inline_calls_ok();
                         let mut sw =
                             CoreSwitch::enter(roots, frame, shell, last, calls_ok, snap_gen);
+                        self.sync_recs(&sw);
                         let stop = self.leaf_burst(&mut sw, snap_gen);
                         if sw.switched() {
                             return FrameEv::Switched(stop);
@@ -8725,28 +8729,6 @@ impl Interpreter {
         if self.inline_pool.len() < INLINE_POOL_CAP {
             push_fast(&mut self.inline_pool, act);
         }
-    }
-
-    /// [`Self::inline_park_direct`] for a slot that stays with its direct
-    /// call's site (`frame_jit::DirectSite`) instead of the pool: parked,
-    /// but still holding its code's count, so the site's next call of the
-    /// same code binds it without one.
-    #[inline(always)]
-    pub(crate) fn inline_park_warm(&mut self, mut act: Box<InlineAct>) -> Box<InlineAct> {
-        debug_assert!(
-            act.frame.stack.is_empty()
-                && !act.owns_cells
-                && act.binop.is_none()
-                && !act.discard
-                && act.guard.is_none()
-                && act.init_inst.is_none()
-                && act.lru.is_none()
-                && act.act.shell.is_none()
-        );
-        act.parked = true;
-        act.direct = false;
-        act.caller_pending = None;
-        act
     }
 
     /// `FOR_ITER` over a suspended generator at `pc` of `frame`, as an
@@ -11081,11 +11063,22 @@ impl Interpreter {
         }
     }
 
+    /// Point the direct-call records at this thread (see
+    /// `frame_jit::DirectRecs::sync`), as a burst starts.
+    #[inline]
+    fn sync_recs(&mut self, sw: &CoreSwitch) {
+        let interp = std::ptr::from_ref(&*self);
+        let countdown = std::ptr::addr_of_mut!(self.gil_countdown);
+        self.recs
+            .sync(interp, countdown, sw.maybe_dead, sw.depth_cell);
+    }
+
     /// Register the lazily running direct callees (see
     /// `frame_jit::register_lazy`) before anything links onto the spine or
     /// reads it: they are older than whatever comes next, and a stack walk
     /// must find them.
     #[inline(always)]
+    #[track_caller]
     pub(crate) fn settle_lazy(&self) {
         if self.lazy_top.get() != 0 {
             self.settle_lazy_cold();
@@ -11094,6 +11087,7 @@ impl Interpreter {
 
     #[cold]
     #[inline(never)]
+    #[track_caller]
     fn settle_lazy_cold(&self) {
         // (Cleared first: registering links the callees onto the spine,
         // which mustn't come back here.)
@@ -12384,6 +12378,12 @@ impl Interpreter {
                             lazy_depth: 0,
                             lazy_last: std::ptr::null_mut(),
                             gen_lazy: false,
+                            no_direct: !sw.calls_ok,
+                            in_rec: false,
+                            at_start: false,
+                            clean: false,
+                            wait_pc: usize::MAX,
+                            wait_pending: None,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -12842,8 +12842,8 @@ impl Interpreter {
                         // SAFETY: both operands leave the stack (checked
                         // droppable above); the result takes the lower slot.
                         unsafe {
-                            drop_hot(base.add(len - 1).read());
-                            drop_hot(base.add(len - 2).read());
+                            drop_hot_at(base.add(len - 1));
+                            drop_hot_at(base.add(len - 2));
                             base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
@@ -12866,8 +12866,8 @@ impl Interpreter {
                         let r = if ins.arg == 1 { !found } else { found };
                         // SAFETY: as `IS_OP`.
                         unsafe {
-                            drop_hot(base.add(len - 1).read());
-                            drop_hot(base.add(len - 2).read());
+                            drop_hot_at(base.add(len - 1));
+                            drop_hot_at(base.add(len - 2));
                             base.add(len - 2).write(bool_hot(r));
                         }
                         len -= 1;
@@ -13028,7 +13028,7 @@ impl Interpreter {
                                     if grown {
                                         // The suffix leaves; the grown string is the
                                         // `STORE_FAST` (its local is now empty).
-                                        drop_hot(base.add(len - 1).read());
+                                        drop_hot_at(base.add(len - 1));
                                         lbase.add(li).write(base.add(len - 2).read());
                                         len -= 2;
                                         last = pc + 1;
@@ -13143,8 +13143,8 @@ impl Interpreter {
                                 // SAFETY: both operands leave by plain
                                 // decrements (checked).
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13170,8 +13170,8 @@ impl Interpreter {
                                 let r = core_bignum_op(a, b, kind);
                                 // SAFETY: ints leave by plain decrements.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13199,8 +13199,8 @@ impl Interpreter {
                                 // (or a tuple of them): releasing them runs no
                                 // code and frees nothing the collector tracks.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13227,8 +13227,8 @@ impl Interpreter {
                                 // SAFETY: both operand slots are initialized and
                                 // leave the stack; the result takes the first.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13268,8 +13268,8 @@ impl Interpreter {
                                 // leave the stack (a bytes or bytearray release
                                 // runs nothing); the result takes the first.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13350,8 +13350,8 @@ impl Interpreter {
                                 #[cfg(test)]
                                 NATIVE_FAST_SUBSCRIPTS.with(|calls| calls.set(calls.get() + 1));
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 2;
                                 match r {
@@ -13398,9 +13398,9 @@ impl Interpreter {
                                 // SAFETY: the operands leave by plain
                                 // decrements (checked above).
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
-                                    drop_hot(base.add(len - 3).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
+                                    drop_hot_at(base.add(len - 3));
                                 }
                                 len -= 3;
                                 match r {
@@ -13470,8 +13470,8 @@ impl Interpreter {
                                 // decrements (checked); the result takes the
                                 // lower one's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(r) };
@@ -13494,8 +13494,8 @@ impl Interpreter {
                                 // SAFETY: the operands leave; the result takes
                                 // the lower one's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                 }
                                 len -= 1;
                                 unsafe { base.add(len - 1).write(bool_hot(r)) };
@@ -15036,8 +15036,8 @@ impl Interpreter {
                                 // (count above one) leave by plain decrements;
                                 // the result takes the callee's slot.
                                 unsafe {
-                                    drop_hot(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 2).read());
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
                                     base.add(len - 2).write(result);
                                 }
                                 len -= 1;
@@ -15072,7 +15072,7 @@ impl Interpreter {
                                 // the result takes the callee's slot.
                                 unsafe {
                                     items.push(base.add(len - 1).read());
-                                    drop_hot(base.add(len - 3).read());
+                                    drop_hot_at(base.add(len - 3));
                                     base.add(len - 3).write(Object::None);
                                 }
                                 len -= 2;
@@ -15659,7 +15659,7 @@ impl Interpreter {
                         // SAFETY: `len < cap`; the class (count above one) is
                         // released in place of an empty self slot.
                         unsafe {
-                            drop_hot(top.read());
+                            drop_hot_at(top);
                             top.write(Object::Function(f));
                             base.add(len).write(Object::Unbound);
                         }
@@ -16665,7 +16665,9 @@ impl Interpreter {
                 _ => return false,
             };
         // SAFETY: the activation is synced, and the shape was checked.
-        match unsafe { self.core_native_body(sw, frame, pc, callee_at, b, via_call) } {
+        match unsafe {
+            self.core_native_body(sw, frame, pc, callee_at, b, via_call, std::ptr::null_mut())
+        } {
             // SAFETY: the running activation's last-pc slot.
             None => unsafe { *sw.last = pc },
             Some(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
@@ -16708,6 +16710,7 @@ impl Interpreter {
         start: usize,
         b: *const crate::object::BuiltinFn,
         via_call: bool,
+        lazy: *mut frame_jit::State,
     ) -> Option<RuntimeError> {
         let len = frame.stack.len();
         // SAFETY: the caller's contract: `start + 2 <= len`; the stack
@@ -16727,8 +16730,15 @@ impl Interpreter {
                 start + 1
             };
             frame.pc = pc as u32 + 1;
-            // The body may run Python code that looks up the stack.
-            let pending = self.core_pending_enter_fast(sw, frame, pc);
+            // The body may run Python code that looks up the stack: the
+            // activation waits on the pending list, or (`lazy`, running
+            // lazily) enters it if it registers (`register_lazy`).
+            let pending = if lazy.is_null() {
+                self.core_pending_enter_fast(sw, frame, pc)
+            } else {
+                (*lazy).wait_pc = pc;
+                None
+            };
             let args = std::slice::from_raw_parts(base.add(first), len - first);
             let result = if via_call {
                 let globals = frame.globals.clone();
@@ -16744,6 +16754,12 @@ impl Interpreter {
                     Some(call_kw) => call_kw(args, &[]),
                     None => (b.call)(args),
                 }
+            };
+            let pending = if lazy.is_null() {
+                pending
+            } else {
+                (*lazy).wait_pc = usize::MAX;
+                (*lazy).wait_pending.take()
             };
             self.core_pending_exit(sw, pending);
             // The operands leave the stack, then are released: the
@@ -17709,8 +17725,17 @@ impl Interpreter {
             // operands where they are.
             // SAFETY: the activation is synced, and the shape was checked;
             // the body reads `b` only when it isn't called through `call`.
-            let raised =
-                unsafe { self.core_native_body(sw, frame, pc, callee_at, std::ptr::null(), true) };
+            let raised = unsafe {
+                self.core_native_body(
+                    sw,
+                    frame,
+                    pc,
+                    callee_at,
+                    std::ptr::null(),
+                    true,
+                    std::ptr::null_mut(),
+                )
+            };
             match raised {
                 // SAFETY: the running activation's last-pc slot.
                 None => unsafe { *sw.last = pc },
@@ -18333,13 +18358,48 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
-        let n = frame.stack.len();
-        let Some(callee_slot) = n.checked_sub(4) else {
+        let Some(r) = self.builtin_ex_on_frame(frame, pc) else {
             return false;
         };
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        if let Err(e) = r {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e)));
+        }
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// The `CALL_FUNCTION_EX` at `pc` of `frame` (synced at it) when it runs
+    /// on the frame alone, needing neither the switch nor the spine: a
+    /// generator function's, whose generator is made in place, or a leaf
+    /// builtin's. `None` touched nothing; with `Err`, the operands are gone.
+    pub(crate) fn core_ex_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        if self.gen_ex_on_frame(frame, pc) || self.try_leaf_call_ex(frame, pc) {
+            return Some(Ok(()));
+        }
+        self.builtin_ex_on_frame(frame, pc)
+    }
+
+    /// [`Self::core_builtin_call_ex`] on `frame` alone (see
+    /// [`Self::core_ex_on_frame`]), `frame.pc` past the call.
+    fn builtin_ex_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        let n = frame.stack.len();
+        let callee_slot = n.checked_sub(4)?;
         let [Object::Builtin(b), Object::Unbound, spread, mapping] = &frame.stack[callee_slot..]
         else {
-            return false;
+            return None;
         };
         let empty_kw = match mapping {
             Object::Unbound => true,
@@ -18347,15 +18407,15 @@ impl Interpreter {
             _ => false,
         };
         if !empty_kw || b.binds_instance {
-            return false;
+            return None;
         }
         let items: Vec<Object> = match spread {
             Object::Tuple(t) => t.to_vec(),
             Object::List(l) => match l.try_borrow() {
                 Ok(l) => l.clone(),
-                Err(_) => return false,
+                Err(_) => return None,
             },
-            _ => return false,
+            _ => return None,
         };
         // As the core loop's `CALL` arm runs a leaf builtin.
         let r = match self.leaf_call_kind(b) {
@@ -18368,28 +18428,23 @@ impl Interpreter {
             }
             _ => None,
         };
-        let Some(r) = r else {
-            return false;
-        };
+        let r = r?;
         drop(items);
         // The operands leave the stack; one that dies queues its finalizer,
         // which runs before the next instruction.
         let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
         frame.pc = pc as u32 + 1;
-        // SAFETY: the running activation's last-pc slot.
-        unsafe { *sw.last = pc };
-        match r {
-            Ok(v) => frame.stack.push(v),
-            Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
-        }
+        let out = match r {
+            Ok(v) => {
+                frame.stack.push(v);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
         for o in ops {
             self.release(o);
         }
-        // SAFETY: the running thread's own flag (see `quiet_run`).
-        if sw.pending.is_none() && unsafe { (*sw.maybe_dead).get() } {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-        }
-        true
+        Some(out)
     }
 
     /// [`Self::core_gen_call`] for the `CALL_FUNCTION_EX` at `pc`:
@@ -18399,6 +18454,21 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
+        if !self.gen_ex_on_frame(frame, pc) {
+            return false;
+        }
+        // SAFETY: the running activation's last-pc slot.
+        unsafe { *sw.last = pc };
+        // SAFETY: the running thread's own flag (see `quiet_run`).
+        if unsafe { (*sw.maybe_dead).get() } {
+            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+        }
+        true
+    }
+
+    /// [`Self::core_gen_call_ex`] on `frame` alone (see
+    /// [`Self::core_ex_on_frame`]), `frame.pc` past the call.
+    fn gen_ex_on_frame(&mut self, frame: &mut Frame, pc: usize) -> bool {
         let n = frame.stack.len();
         let Some(callee_slot) = n.checked_sub(4) else {
             return false;
@@ -18441,12 +18511,6 @@ impl Interpreter {
         }
         frame.stack.push(gen);
         frame.pc = pc as u32 + 1;
-        // SAFETY: the running activation's last-pc slot.
-        unsafe { *sw.last = pc };
-        // SAFETY: the running thread's own flag (see `quiet_run`).
-        if unsafe { (*sw.maybe_dead).get() } {
-            sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-        }
         true
     }
 
@@ -19457,6 +19521,72 @@ impl Interpreter {
         true
     }
 
+    /// What [`Self::core_new_n`] runs on `frame` alone for a call of `ty`
+    /// with the plan `plan` (no Python `__new__`), its operands from `start`
+    /// on `frame`'s synced stack: the bare allocation, or a store-only or
+    /// leaf `__init__`, the instance in the class's slot. `false` touched
+    /// nothing.
+    pub(crate) fn core_init_on_frame(
+        &mut self,
+        frame: &mut Frame,
+        ty: &Rc<TypeObject>,
+        plan: &Rc<crate::types::InstancePlan>,
+        argc: usize,
+        start: usize,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> bool {
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
+                let (inst, tracked) = self.alloc_plain_instance_obj(ty);
+                frame.stack.truncate(start);
+                frame.stack.push(inst);
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
+            return false;
+        };
+        if !matches!(plan.native, crate::types::NativeKind::Plain)
+            // SAFETY: GIL-serialized raw read of the function's code cell;
+            // only the pointer is compared.
+            || !std::ptr::eq(
+                unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+                Rc::as_ptr(code),
+            )
+            || !Self::lean_code_ok(code)
+        {
+            return false;
+        }
+        let Some(missing) = Self::lean_init_missing(init, code, argc + 1) else {
+            return false;
+        };
+        self.core_store_init(
+            frame,
+            ty,
+            plan,
+            init,
+            code,
+            true,
+            argc,
+            missing,
+            start + 1,
+            start,
+            depth_cell,
+        ) || (!Self::has_extended_params(code)
+            && self.core_leaf_init(
+                frame,
+                ty,
+                init,
+                code,
+                argc,
+                missing,
+                start + 1,
+                start,
+                depth_cell,
+            ))
+    }
+
     /// [`Self::core_new_n`] (the `argc` arguments below the top of the
     /// running activation's stack, called by the instruction at `pc`) for
     /// a class `ty` whose `__new__` is the plain Python function `new_f`
@@ -20302,7 +20432,7 @@ impl Interpreter {
                 // SAFETY: the class (or tuple of classes) leaves the top
                 // slot; releasing it runs nothing.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
+                    drop_hot_at(base.add(len - 1));
                     base.add(len - 1).write(bool_hot(matched));
                 }
                 Some(len)
@@ -20487,8 +20617,8 @@ impl Interpreter {
         // `CALL` expects.
         unsafe {
             let self_v = base.add(len - 1).read();
-            drop_hot(base.add(len - 2).read());
-            drop_hot(base.add(len - 3).read());
+            drop_hot_at(base.add(len - 2));
+            drop_hot_at(base.add(len - 3));
             if ins.arg & 1 != 0 {
                 base.add(len - 3).write(f);
                 base.add(len - 2).write(self_v);
@@ -20805,8 +20935,8 @@ impl Interpreter {
                 // neither release runs code; the result takes the
                 // container's slot.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                     base.add(len - 2).write(r);
                 }
                 Some(len - 1)
@@ -20841,9 +20971,9 @@ impl Interpreter {
                 // SAFETY: the bounds are scalars and the container a
                 // shared value (checked); the result takes its slot.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
-                    drop_hot(base.add(len - 3).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
+                    drop_hot_at(base.add(len - 3));
                     base.add(len - 3).write(r);
                 }
                 Some(len - 2)
@@ -20917,8 +21047,8 @@ impl Interpreter {
                 // value slot was moved out above); each release is a scalar
                 // or a plain decrement.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                 }
                 drop_hot(old);
                 Some(len - 3)
@@ -20968,8 +21098,8 @@ impl Interpreter {
                 // SAFETY: both operand slots are initialized; each release
                 // is a scalar or a plain decrement.
                 unsafe {
-                    drop_hot(base.add(len - 1).read());
-                    drop_hot(base.add(len - 2).read());
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
                 }
                 drop_hot(removed);
                 drop_hot(key);
@@ -21075,7 +21205,7 @@ impl Interpreter {
                 // container (droppable).
                 unsafe {
                     for k in (len - 4..len).rev() {
-                        drop_hot(base.add(k).read());
+                        drop_hot_at(base.add(k));
                     }
                 }
                 Some(len - 4)
@@ -21199,7 +21329,7 @@ impl Interpreter {
                                 // droppable.
                                 unsafe {
                                     drop_hot(std::mem::replace(slot, v.read()));
-                                    drop_hot(k.read());
+                                    drop_hot_at(k);
                                 }
                             }
                             crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
@@ -22669,132 +22799,6 @@ impl Interpreter {
             Err(true) => SiteCall::Missed,
             Err(false) => SiteCall::Declined,
         }
-    }
-
-    /// What a frame-JIT method site keeps of the leaf callee its last call
-    /// of `x.m(...)` (at the method load `attr_pc` of `code`, whose
-    /// extension is `ext`) ran on `recv`, for [`Self::leaf_method_run`]:
-    /// the site's verified callee under the receiver's class version (see
-    /// [`LeafSite`]), when nothing but the receiver's own attributes, the
-    /// callee's code cell and the recursion depth can change from call to
-    /// call; [`LeafCallee::none`] when the method resolved is no such leaf,
-    /// and `None` while the site hasn't resolved it.
-    pub(crate) fn leaf_method_callee(
-        ext: &CodeConstObjects,
-        attr_pc: usize,
-        name_idx: u32,
-        recv: &Object,
-    ) -> Option<LeafCallee> {
-        let Object::Instance(inst) = recv else {
-            return None;
-        };
-        let cls = inst.cls_raw();
-        let ver = cls.attr_version.get();
-        // The plain function the site's method slot resolved under this
-        // class version (the class holds it).
-        let fp = ext.method_sites().get(attr_pc)?.peek_fn(ver)?;
-        // SAFETY: the class holds the function at this version.
-        let f = unsafe { &*fp };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let callee: &CodeObject = unsafe { &*f.code.as_ptr() };
-        let effect = !code_is_pure_leaf(callee);
-        // (A recursive effect leaf runs as an ordinary call from here.)
-        if (effect && (!code_is_effect_leaf(callee) || code_recurses(callee)))
-            || !Self::leaf_code_ok(callee)
-            || callee.kwonly_count != 0
-            || callee.has_varargs
-            || callee.has_varkeywords
-            || !Self::default_getattribute(cls)
-        {
-            return Some(LeafCallee::none(ver));
-        }
-        let i = name_idx as usize;
-        let (keys, limit) = match (cls.shared_keys.get(), ext.name_objs.get(i)) {
-            (Some(k), Some(Object::Str(n))) => ext.name_hashes.get(i).map_or((0, 0), |&h| {
-                (std::ptr::from_ref(k) as usize, k.names_before(n, h))
-            }),
-            _ => (0, 0),
-        };
-        Some(LeafCallee {
-            ver,
-            fp,
-            code: std::ptr::from_ref(callee),
-            cext: std::ptr::from_ref(code_vm_ext(callee)?),
-            keys,
-            limit,
-            effect,
-        })
-    }
-
-    /// `x.m(...)` with the leaf callee `c` a frame-JIT site cached (see
-    /// [`Self::leaf_method_callee`]) for `args[0]`'s class version: the
-    /// callee's tiny shape or compiled plan run directly. `None` (nothing
-    /// observable done) runs the call the general way.
-    ///
-    /// # Safety
-    ///
-    /// `args` are live; `args[0]` is an instance of the class `c` was
-    /// cached for, at that class version (so the class holds `c`'s
-    /// function, and the function its extension's code unless rebound).
-    #[inline(always)]
-    pub(crate) unsafe fn leaf_method_run(
-        &self,
-        c: &LeafCallee,
-        inst: &PyInstance,
-        args: &[*const Object],
-        depth_cell: *const std::cell::Cell<usize>,
-    ) -> Option<Object> {
-        // SAFETY: the caller's contract.
-        let (f, cext) = unsafe { (&*c.fp, &*c.cext) };
-        // SAFETY: GIL-serialized raw read of the function's code cell.
-        let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        // SAFETY: this thread's own depth cell.
-        let depth = unsafe { (*depth_cell).get() };
-        // (A leaf verdict withdrawn since, see `JitHint::note_leaf_miss`,
-        // sends the calls the ordinary way again.)
-        if !std::ptr::eq(Rc::as_ptr(code_rc), c.code)
-            || args.len() != code_rc.arg_count as usize
-            || depth >= crate::recursion::recursion_limit()
-            || inst.dict.published().is_some()
-            || !(code_is_pure_leaf(code_rc) || code_rc.jit_hint.effect_leaf())
-        {
-            return None;
-        }
-        // The receiver's own attributes can't shadow the method.
-        // SAFETY: a read between two instructions (see `GilCell::peek`).
-        let (keys, n) = unsafe { inst.dict.split_cell().peek() }?.keys_and_len();
-        if n != 0 && (keys != c.keys || keys == 0 || n > c.limit) {
-            return None;
-        }
-        let shape = cext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
-        if shape >= 3 {
-            if !Self::leaf_call_entry(code_rc) {
-                return None;
-            }
-            let r = if c.effect {
-                Self::leaf_tiny::<true>(code_rc, cext, shape, args)
-            } else {
-                Self::leaf_tiny::<false>(code_rc, cext, shape, args)
-            };
-            // (A miss is the general path's to count: it runs next.)
-            let r = r.flatten()?;
-            Self::leaf_call_exit(code_rc, true);
-            return Some(r);
-        }
-        // The plan's native code, or (not compiled yet) the shared frameless
-        // path, which compiles it once it is warm.
-        #[cfg(feature = "jit")]
-        {
-            let r = if c.effect {
-                self.leaf_site_native::<true>(code_rc, cext, f, args, depth)
-            } else {
-                self.leaf_site_native::<false>(code_rc, cext, f, args, depth)
-            };
-            if let Some(r) = r {
-                return r;
-            }
-        }
-        self.pure_leaf_call(code_rc, f, args, c.effect, depth)
     }
 
     /// [`Self::core_leaf_site_call`]'s evaluation, with `args` (the
@@ -49342,7 +49346,7 @@ impl Interpreter {
         (!folding
             && pc < ext.dispatch_len
             && native.enters_at(pc)
-            && self.direct_calls.get() < frame_jit::DIRECT_CALL_DEPTH)
+            && !self.recs.full())
         // SAFETY: the frame, which the step holds while the body runs, holds
         // the code and with it its native code.
         .then(|| unsafe { &*std::ptr::from_ref(native) })
@@ -53957,7 +53961,10 @@ impl Interpreter {
                         // The slots keep the names of the code the function
                         // was made from.
                         f.slots();
-                        *f.code.borrow_mut() = c;
+                        // (A lazily running callee's frame borrows its
+                        // function's code until it registers.)
+                        self.settle_lazy();
+                        crate::frame_jit::retire_code(f.code.replace(c));
                         f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {
@@ -58831,6 +58838,9 @@ impl Interpreter {
                 *cell.borrow_mut() = mapping;
             }
         }
+        // The body's cells, for after it has run (a finished frame releases
+        // its own).
+        let body_cells = Rc::clone(&frame.cells);
         let _ = self.run_frame(&mut frame)?;
 
         // PEP 3135: when the body created a `__class__` cell (a method
@@ -58845,7 +58855,7 @@ impl Interpreter {
             .cellvars
             .iter()
             .position(|c| c == "__class__")
-            .and_then(|i| frame.cells.get(i).cloned());
+            .and_then(|i| body_cells.get(i).cloned());
         if let Some(cell) = &class_cell {
             let cell_obj = Object::Cell(cell.clone());
             if let Some(obj) = &ns_obj {
@@ -59056,14 +59066,14 @@ impl Interpreter {
         // (RuntimeError), and one that creates a second class from the
         // same namespace re-points it (TypeError) — test_super
         // test___classcell___missing / test___classcell___wrong_cell.
-        Self::check_classcell_propagated(&frame, &body_fn, &name, &Object::Type(ty.clone()))?;
+        Self::check_classcell_propagated(&body_cells, &body_fn, &name, &Object::Type(ty.clone()))?;
         for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             // PEP 695: re-point `__classdict__` at the *type's* dict
             // (CPython `type_new` via `__classdictcell__`), so lazy
             // bounds/aliases see post-creation mutations like
             // `X.T = float` (test_modified_later).
             if cell_name == "__classdict__" {
-                if let Some(cell) = frame.cells.get(i) {
+                if let Some(cell) = body_cells.get(i) {
                     *cell.borrow_mut() = Object::Dict(ty.dict.clone());
                 }
             }
@@ -59075,7 +59085,7 @@ impl Interpreter {
     /// class body minted a `__class__` cell, it must now hold exactly the
     /// object being returned as the class.
     fn check_classcell_propagated(
-        frame: &Frame,
+        body_cells: &[Rc<RefCell<Object>>],
         body_fn: &Rc<PyFunction>,
         name: &str,
         cls: &Object,
@@ -59084,7 +59094,7 @@ impl Interpreter {
             if cell_name != "__class__" {
                 continue;
             }
-            let Some(cell) = frame.cells.get(i) else {
+            let Some(cell) = body_cells.get(i) else {
                 continue;
             };
             let current = cell.borrow().clone();
@@ -59201,6 +59211,9 @@ impl Interpreter {
                 *cell.borrow_mut() = mapping;
             }
         }
+        // The body's cells, for after it has run (a finished frame releases
+        // its own).
+        let body_cells = Rc::clone(&frame.cells);
         let _ = self.run_frame(&mut frame)?;
 
         // PEP 560: when `__mro_entries__` rewrote the bases, expose the
@@ -59235,7 +59248,7 @@ impl Interpreter {
         // returned, so zero-arg `super()` in methods doesn't dangle.
         for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             if cell_name == "__class__" {
-                if let Some(cell) = frame.cells.get(i) {
+                if let Some(cell) = body_cells.get(i) {
                     *cell.borrow_mut() = result.clone();
                 }
             }
@@ -72892,11 +72905,7 @@ pub(crate) unsafe fn release_run(base: *const Object, n: usize) {
             let at = base.add(k);
             if let Some(word) = (*at).strong_word() {
                 // While the bias holds this thread alone updates counts.
-                let w = &*word;
-                let c = w.load(std::sync::atomic::Ordering::Relaxed);
-                if c != 1 {
-                    w.store(c - 1, std::sync::atomic::Ordering::Relaxed);
-                } else {
+                if !crate::rc::plain_release(word) {
                     drop(at.read());
                 }
             }
@@ -73184,7 +73193,8 @@ mod burst_stats {
     pub(crate) const CALL_LAZY_GEN: usize = 10;
     pub(crate) const CALL_LAZY_GEN_REG: usize = 11;
     pub(crate) const CALL_INLINE_GEN: usize = 12;
-    const CALL_NAMES: [&str; 13] = [
+    pub(crate) const CALL_DIRECT_REG: usize = 13;
+    const CALL_NAMES: [&str; 14] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -73198,8 +73208,9 @@ mod burst_stats {
         "lazy generator resume",
         "lazy generator resume registered",
         "switched generator resume",
+        "frame-JIT direct call registered",
     ];
-    static CALLS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+    static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
@@ -79923,43 +79934,6 @@ struct LeafHit {
     limit: usize,
 }
 
-/// A frame-JIT method site's cached leaf callee (see
-/// `Interpreter::leaf_method_callee`): the receiver class version it was
-/// verified under (`0` none), the function and its code, the code's
-/// extension, the shadowing bound (see [`LeafSiteData::limit`]), and
-/// whether it is an effect leaf.
-#[derive(Clone, Copy)]
-pub(crate) struct LeafCallee {
-    pub(crate) ver: u64,
-    fp: *const crate::object::PyFunction,
-    code: *const CodeObject,
-    cext: *const CodeConstObjects,
-    keys: usize,
-    limit: usize,
-    effect: bool,
-}
-
-impl LeafCallee {
-    pub(crate) const EMPTY: LeafCallee = LeafCallee {
-        ver: 0,
-        fp: std::ptr::null(),
-        code: std::ptr::null(),
-        cext: std::ptr::null(),
-        keys: 0,
-        limit: 0,
-        effect: false,
-    };
-
-    /// A version under which the site's method is no leaf to run in place.
-    pub(crate) const fn none(ver: u64) -> LeafCallee {
-        LeafCallee { ver, ..Self::EMPTY }
-    }
-
-    pub(crate) fn is_none(&self) -> bool {
-        self.fp.is_null()
-    }
-}
-
 impl LeafSiteData {
     #[inline(always)]
     fn hit(&self) -> LeafHit {
@@ -80168,17 +80142,6 @@ pub(crate) fn method_site_in_place(ext: &CodeConstObjects, pc: usize) -> bool {
                 unsafe { &(*slot.0.get()).1 },
                 MethodSlotFn::Builtin(_) | MethodSlotFn::Leaf(..)
             )
-        })
-}
-
-/// Whether the method-load site at `pc` last resolved a plain Python
-/// function (a leaf or not: a site that sees several classes calls both).
-#[cfg(feature = "jit")]
-pub(crate) fn method_site_py(ext: &CodeConstObjects, pc: usize) -> bool {
-    method_site_leaf(ext, pc)
-        || ext.method_slot(pc).is_some_and(|slot| {
-            // SAFETY: GIL-serialized; the borrow ends here.
-            matches!(unsafe { &(*slot.0.get()).1 }, MethodSlotFn::Py(_))
         })
 }
 
@@ -80502,6 +80465,24 @@ fn drop_hot(v: Object) {
         // here unless it's the last one.
         Some(word) if unsafe { crate::rc::try_release_word(word) } => std::mem::forget(v),
         Some(_) => drop(v),
+    }
+}
+
+/// [`drop_hot`] of the value at `at`, which leaves its slot: nothing is
+/// copied unless it's a last owner's.
+///
+/// # Safety
+///
+/// `at` holds an initialized value, which isn't used again.
+#[inline(always)]
+unsafe fn drop_hot_at(at: *const Object) {
+    // SAFETY: per the caller; a value owns a reference to its allocation.
+    unsafe {
+        if let Some(word) = (*at).strong_word() {
+            if !crate::rc::try_release_word(word) {
+                std::ptr::drop_in_place(at.cast_mut());
+            }
+        }
     }
 }
 
@@ -80957,10 +80938,7 @@ unsafe fn release_operands(interp: &Interpreter, p: *const Object, n: usize) {
             let Some(word) = (*at).strong_word() else {
                 continue;
             };
-            let c = (*word).load(std::sync::atomic::Ordering::Relaxed);
-            if plain && c > 1 {
-                (*word).store(c - 1, std::sync::atomic::Ordering::Relaxed);
-            } else {
+            if !(plain && crate::rc::plain_release(word)) {
                 interp.release(at.read());
             }
         }
@@ -85467,8 +85445,8 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
     let r = plain_compare(a, b, op)?;
     // SAFETY: the operands leave their slots, each releasing a plain count.
     unsafe {
-        drop_hot(at.add(1).read());
-        drop_hot(at.read());
+        drop_hot_at(at.add(1));
+        drop_hot_at(at);
     }
     Some(r)
 }

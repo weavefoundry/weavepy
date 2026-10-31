@@ -364,14 +364,16 @@ pub(crate) fn release_values(values: &mut Vec<Object>) {
 /// also holds through this vector (a frame object) stay, to go with it.
 ///
 /// `cells` must hold a count of its own: a lean activation's borrowed handle
-/// looks unique when its function is the only owner.
+/// looks unique when its function is the only owner. A frame with only free
+/// variables has nothing of its own here: its vector is its function's
+/// closure, which further calls still need.
 #[inline]
 pub(crate) fn release_cells_and_locals(
     code: &weavepy_compiler::CodeObject,
     cells: &mut FrameCells,
     locals: &mut Vec<Object>,
 ) {
-    if cells.is_empty() {
+    if cells.is_empty() || code.cellvars.is_empty() {
         release_values(locals);
     } else {
         release_held_cells_and_locals(code, cells, locals);

@@ -153,8 +153,10 @@ fn utf8_width(lead: u8) -> usize {
 /// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
 /// the variant's index in a tag byte at offset 0, and each payload at its
 /// natural alignment after it (every payload is one word or smaller).
-/// Every variant but the scalars holds one counted pointer in its second
-/// word, which `Clone` and [`Object::strong_word`] rely on.
+/// The scalars come first, so a tag below [`PLAIN_TAGS`] is one test for
+/// "owns nothing". Every other variant holds one counted pointer in its second
+/// word, addressing the strong count, which `Clone` and
+/// [`Object::strong_word`] rely on.
 #[repr(u8)]
 pub enum Object {
     None,
@@ -10656,13 +10658,16 @@ impl PyIterator {
 /// `Unbound`, `Bool`, `Int`, `Float`), the first of them all: one compare
 /// tells them apart from the rest, here and in compiled code.
 pub(crate) const PLAIN_TAGS: u8 = 5;
-const SCALAR_TAGS: u64 = (1 << PLAIN_TAGS) - 1;
 
-/// The variants whose pointer is a [`ThinArc`]'s (`Str`, `WStr`, `Tuple`,
-/// `Bytes`): it addresses the payload, 16 bytes past the strong count
-/// (every payload is aligned to at most 16). Every other counted variant
-/// holds an `Rc`, whose `Arc` addresses its `ArcInner`, strong count first.
-const THIN_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 27;
+/// The bytes from a counted variant's pointer to its payload: an `Rc`'s
+/// `Arc` and a [`ThinArc`] both address the allocation's start, strong
+/// count first, then the weak count, then the payload (aligned to at most
+/// 16).
+const PAYLOAD_OFFSET: usize = 16;
+
+/// The counted variants that hold no objects and have no weak handle the
+/// collector tracks them by (`Str`, `WStr`, `Bytes`), by tag.
+const TEXT_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 27;
 
 impl Clone for Object {
     /// A new owner: the strong count (if any) bumped in place and the two
@@ -10690,28 +10695,28 @@ impl Object {
     /// for a scalar.
     #[inline(always)]
     pub(crate) fn strong_word(&self) -> Option<*const std::sync::atomic::AtomicUsize> {
-        let tag = self.tag();
-        if tag < PLAIN_TAGS {
+        if self.tag() < PLAIN_TAGS {
             return None;
         }
-        // SAFETY: a counted variant's second word is its pointer.
-        let p = unsafe { *std::ptr::from_ref(self).cast::<*const u8>().add(1) };
-        let back = ((THIN_TAGS >> tag) & 1) as usize * 16;
-        Some(p.wrapping_sub(back).cast())
+        // SAFETY: a counted variant's second word is its pointer, at its
+        // allocation's strong count.
+        Some(unsafe {
+            *std::ptr::from_ref(self)
+                .cast::<*const std::sync::atomic::AtomicUsize>()
+                .add(1)
+        })
     }
 
     /// The address of a counted variant's payload (what `id()` reports):
-    /// a [`ThinArc`] points at it, and an `Rc`'s `ArcInner` holds it
-    /// after the two counts. `None` for a scalar.
+    /// its allocation holds it after the two counts. `None` for a scalar.
     #[inline(always)]
     pub(crate) fn payload_addr(&self) -> Option<usize> {
-        let tag = u64::from(self.tag());
-        if (SCALAR_TAGS >> tag) & 1 != 0 {
+        if self.tag() < PLAIN_TAGS {
             return None;
         }
         // SAFETY: a counted variant's second word is its pointer.
         let p = unsafe { *std::ptr::from_ref(self).cast::<usize>().add(1) };
-        Some(p + (((THIN_TAGS >> tag) & 1) ^ 1) as usize * 16)
+        Some(p + PAYLOAD_OFFSET)
     }
 
     /// Whether the value is one the cycle collector never holds as a
@@ -10719,8 +10724,8 @@ impl Object {
     /// handle to track them by).
     #[inline(always)]
     pub(crate) fn never_gc_candidate(&self) -> bool {
-        const NEVER: u64 = SCALAR_TAGS | (THIN_TAGS & !(1 << 9));
-        (NEVER >> self.tag()) & 1 != 0
+        let tag = self.tag();
+        tag < PLAIN_TAGS || (TEXT_TAGS >> tag) & 1 != 0
     }
 
     /// Whether the value can never (transitively) reference another

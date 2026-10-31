@@ -308,6 +308,11 @@ pub struct JitHint {
     /// The VM's tier-2 compiled a native entry at pc 0 that the
     /// interpreter's calls should take (not just its native callers).
     compiled: std::sync::atomic::AtomicBool,
+    /// The VM's direct entry into the code's compiled body, `0` for none
+    /// (see [`JitHint::set_direct`]), and what it needs to know to bind a
+    /// call, packed.
+    direct_entry: std::sync::atomic::AtomicUsize,
+    direct_shape: std::sync::atomic::AtomicU32,
     /// Back edges left before the next consultation of the tier-2 state
     /// (see [`JitHint::backedge_tick`]).
     backedge_countdown: std::sync::atomic::AtomicU8,
@@ -443,6 +448,31 @@ impl JitHint {
     pub fn mark_compiled(&self) {
         self.compiled
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The interpreter's calls and direct calls take tier 2's entry now.
+        self.direct_entry
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The VM's direct entry into the code's compiled body, `0` for none.
+    #[must_use]
+    #[inline(always)]
+    pub fn direct_entry(&self) -> usize {
+        self.direct_entry.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What goes with [`Self::direct_entry`].
+    #[must_use]
+    #[inline(always)]
+    pub fn direct_shape(&self) -> u32 {
+        self.direct_shape.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the VM's direct entry, and what goes with it.
+    pub fn set_direct(&self, entry: usize, shape: u32) {
+        self.direct_shape
+            .store(shape, std::sync::atomic::Ordering::Relaxed);
+        self.direct_entry
+            .store(entry, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Withdraw [`Self::mark_compiled`]: the interpreter's calls run the

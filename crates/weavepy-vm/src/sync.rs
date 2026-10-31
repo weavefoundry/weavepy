@@ -440,11 +440,10 @@ pub(crate) static RELEASE_GATES: ReleaseGates = ReleaseGates {
 #[inline(always)]
 pub(crate) fn release_gates() -> u32 {
     // SAFETY: `ReleaseGates` is four `AtomicBool`s, 4-aligned (`repr(C)`):
-    // its bytes are a valid `AtomicU32`, read (relaxed) as one word.
-    unsafe {
-        (*std::ptr::from_ref(&RELEASE_GATES).cast::<std::sync::atomic::AtomicU32>())
-            .load(Ordering::Relaxed)
-    }
+    // its bytes are a valid `u32`. A plain read, as `bias_held`'s (which
+    // says why that's sound): the observers' flags are set between
+    // operations, by the thread that then observes.
+    unsafe { std::ptr::from_ref(&RELEASE_GATES).cast::<u32>().read() }
 }
 
 /// The [`release_gates`] bits of the release observers alone (every flag
@@ -466,7 +465,13 @@ pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[inline(always)]
 pub(crate) fn bias_held() -> bool {
-    !RC_SHARED.load(Ordering::Relaxed)
+    // A plain read (one compare with memory, where a relaxed load is a load,
+    // a test and an address computation): the flag changes before a second
+    // thread touches an object, and that thread's GIL acquire orders the
+    // change before this thread's next read. Nothing can hold the value
+    // across a GIL release, which is a synchronizing call.
+    // SAFETY: a `bool` in a live static (see above for the ordering).
+    !unsafe { RC_SHARED.as_ptr().read() }
 }
 
 /// Make reference counting atomic before spawning a thread that will run
