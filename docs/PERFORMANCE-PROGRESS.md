@@ -387,6 +387,21 @@ slowdown in that run was the even-sized chunks, since fixed.
   `oo_patterns` and `unpack_sequence` 1.02. Wall time over `context_managers`,
   `deepcopy`, `go`, `mini_interpreter` and `raytrace` 0.856.
 
+- **Small callees in line** (`frame_jit/inline.rs`). A `CALL`, a fused method
+  call, an operator method or a property getter whose site settled on a small
+  callee lowers its body into the caller, the callee's frame on the caller's
+  operand stack, guarded by the callee's code or the receiver's class version.
+  Anything that needs a frame builds the real activations and leaves for the
+  core loop (`h_inline_exit`, `h_inline_left`), and a site that leaves too often
+  turns itself off. `WEAVEPY_FRAME_JIT_INLINE=0` turns it off. On top of records
+  (quick builds, off against on): instructions 0.974 (1.054 to 1.026 of
+  CPython), warm wall 0.975, whole-process cycles 0.988, peak memory 1.012.
+  `raytrace` 0.70 instructions and 0.73 wall, `oo_patterns` 0.95 and 0.87, `go`
+  0.86 and 0.91, `chaos` 0.91 and 0.91, `mini_interpreter` 0.89 and 0.95; the
+  others are within noise, and `mini_interpreter`'s memory grows 10%. Didn't pay:
+  a larger compile budget (320 against 160 instructions a caller), longer bodies
+  (100 against 64), and a recursive callee in line at a polymorphic site.
+
 ## What the measurements say
 
 - **The gap is spread thin.** A direct call costs about 480 instructions,

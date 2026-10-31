@@ -8015,6 +8015,8 @@ impl Interpreter {
                 lazy_depth: 0,
                 lazy_last: std::ptr::null_mut(),
                 gen_lazy: true,
+                inl_call: std::ptr::null(),
+                inl_gone: false,
                 no_direct: false,
                 in_rec: false,
                 at_start: false,
@@ -12378,6 +12380,8 @@ impl Interpreter {
                             lazy_depth: 0,
                             lazy_last: std::ptr::null_mut(),
                             gen_lazy: false,
+                            inl_call: std::ptr::null(),
+                            inl_gone: false,
                             no_direct: !sw.calls_ok,
                             in_rec: false,
                             at_start: false,
@@ -16349,6 +16353,8 @@ impl Interpreter {
                 // SAFETY: see `CoreSwitch`: the callee is the running
                 // activation now, and its caller lives below it.
                 unsafe { burst_stats::note_core_call(&*caller, &*sw.cur) };
+                // SAFETY: as above.
+                burst_stats::note_callee("core", unsafe { &(*sw.cur).code });
             }
             return true;
         }
@@ -16803,6 +16809,15 @@ impl Interpreter {
             if let Some(ext) = code_vm_ext_existing(&frame.code) {
                 if !instance_site(ext, pc) {
                     instance_site_note(ext, frame.code.instructions.len(), pc);
+                    if ins.op == OpCode::BinaryOp {
+                        // SAFETY: the compiler emits only `BinOpKind`s.
+                        let op: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                        let inplace = ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
+                        let (a, b) = (&frame.stack[n - 2], &frame.stack[n - 1]);
+                        if let Some(f) = Self::binop_instance_dunder(a, b, op, inplace) {
+                            dunder_note(ext, pc, &f, a, b);
+                        }
+                    }
                 }
             }
         }
@@ -23030,6 +23045,7 @@ impl Interpreter {
         // `PyFunction::code`), while the caller's stack keeps the function
         // alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        burst_stats::note_callee("siteleaf", code_rc);
         let pure = code_is_pure_leaf(code_rc);
         let effect = !pure && code_is_effect_leaf(code_rc);
         // (Unlike the core loop's, no warm-up gate: the evaluation's own
@@ -73177,6 +73193,7 @@ pub(crate) mod leaf_builtins {
 /// at shutdown. A tuning aid: the counts say where the burst's coverage
 /// ends.
 mod burst_stats {
+    use crate::sync::Rc;
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     /// The ways a Python function call runs (see [`note_call`]).
@@ -73194,7 +73211,8 @@ mod burst_stats {
     pub(crate) const CALL_LAZY_GEN_REG: usize = 11;
     pub(crate) const CALL_INLINE_GEN: usize = 12;
     pub(crate) const CALL_DIRECT_REG: usize = 13;
-    const CALL_NAMES: [&str; 14] = [
+    pub(crate) const CALL_INLINE_EXIT: usize = 14;
+    const CALL_NAMES: [&str; 15] = [
         "frame-JIT direct call",
         "core-loop inline call",
         "core-loop constructor",
@@ -73209,6 +73227,7 @@ mod burst_stats {
         "lazy generator resume registered",
         "switched generator resume",
         "frame-JIT direct call registered",
+        "frame-JIT inlined body's exit",
     ];
     static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
@@ -73347,6 +73366,110 @@ mod burst_stats {
         *a.get_or_insert_with(Default::default)
             .entry(format!("{why}: {callee}"))
             .or_insert(0) += 1;
+    }
+
+    static CALLEES: std::sync::Mutex<
+        Option<std::collections::HashMap<(usize, &'static str), u64>>,
+    > = std::sync::Mutex::new(None);
+    static CALLEE_CODES: std::sync::Mutex<Vec<Rc<weavepy_compiler::CodeObject>>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// A Python call's callee, by the path it ran on (a census for choosing
+    /// what compiled callers could inline).
+    #[inline(always)]
+    pub(crate) fn note_callee(path: &'static str, code: &Rc<weavepy_compiler::CodeObject>) {
+        if enabled() {
+            note_callee_slow(path, code);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_callee_slow(path: &'static str, code: &Rc<weavepy_compiler::CodeObject>) {
+        let at = Rc::as_ptr(code) as usize;
+        let mut a = CALLEES.lock().unwrap();
+        let a = a.get_or_insert_with(Default::default);
+        if !a.keys().any(|k| k.0 == at) {
+            CALLEE_CODES.lock().unwrap().push(code.clone());
+        }
+        *a.entry((at, path)).or_insert(0) += 1;
+    }
+
+    fn callee_rows(out: &mut String) {
+        use std::fmt::Write;
+        let codes = CALLEE_CODES.lock().unwrap();
+        let mut rows: Vec<((usize, &'static str), u64)> = CALLEES
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(k, c)| (*k, *c))
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+        out.push_str("\n## Callees\n\n");
+        for ((at, path), c) in rows.iter().take(60) {
+            let Some(code) = codes.iter().find(|x| Rc::as_ptr(x) as usize == *at) else {
+                continue;
+            };
+            use weavepy_compiler::OpCode as O;
+            let ins = &code.instructions;
+            let n = |f: &dyn Fn(O) -> bool| ins.iter().filter(|i| f(i.op)).count();
+            let mut others: Vec<&str> = Vec::new();
+            for i in ins {
+                let simple = matches!(
+                    i.op,
+                    O::Nop
+                        | O::NotTaken
+                        | O::Resume
+                        | O::LoadFast
+                        | O::LoadFastBorrow
+                        | O::LoadConst
+                        | O::LoadSmallInt
+                        | O::StoreFast
+                        | O::PopTop
+                        | O::BinaryOp
+                        | O::CompareOp
+                        | O::ToBool
+                        | O::PopJumpIfFalse
+                        | O::PopJumpIfTrue
+                        | O::PopJumpIfNone
+                        | O::PopJumpIfNotNone
+                        | O::JumpForward
+                        | O::LoadAttr
+                        | O::IsOp
+                        | O::CopyTop
+                        | O::Swap
+                        | O::BinarySubscr
+                        | O::StoreSubscr
+                        | O::LoadGlobal
+                        | O::PushNull
+                        | O::LoadMethodAttr
+                        | O::StoreAttr
+                        | O::ReturnValue
+                        | O::Call
+                );
+                if !simple && !others.contains(&i.op.name()) {
+                    others.push(i.op.name());
+                }
+            }
+            let _ = writeln!(
+                out,
+                "  {c:>9} {path:<8} {} len={} loc={} calls={} attr={} sattr={} global={} sub={} cells={}/{} args={} va={} other={:?}",
+                code.qualname,
+                ins.len(),
+                code.varnames.len(),
+                n(&|o| matches!(o, O::Call | O::CallKw | O::CallEx)),
+                n(&|o| matches!(o, O::LoadAttr | O::LoadMethodAttr)),
+                n(&|o| o == O::StoreAttr),
+                n(&|o| o == O::LoadGlobal),
+                n(&|o| matches!(o, O::BinarySubscr | O::StoreSubscr)),
+                code.cellvars.len(),
+                code.freevars.len(),
+                code.arg_count,
+                code.has_varargs || code.has_varkeywords || code.kwonly_count > 0,
+                others,
+            );
+        }
     }
 
     /// A core-loop inline call's caller and callee, each marked when it
@@ -73505,6 +73628,7 @@ mod burst_stats {
         for (k, c) in why.iter().take(40) {
             let _ = writeln!(out, "  direct declined {k}: {c}");
         }
+        callee_rows(&mut out);
         let mut generic: Vec<(String, u64)> = GENERIC
             .lock()
             .unwrap()
@@ -79221,6 +79345,9 @@ struct CodeConstObjects {
     /// operands and result on the stack (see `frame_jit::h_binop_dunder`);
     /// allocated on the first recorded one.
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
+    /// The `BINARY_OP` sites' Python operator methods (see
+    /// [`DunderSeen`]), allocated on the first recorded one.
+    dunders: std::sync::OnceLock<Box<DunderTable>>,
     /// Verified frameless method calls per method-load site (see
     /// [`LeafSite`]); allocated on the first recorded one.
     leaf_sites: SiteSlots<LeafSite>,
@@ -80061,6 +80188,118 @@ pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKi
     }
 }
 
+/// The live Python functions the `CALL` at `pc` has bound inline, latest
+/// first, and whether each one's self slot was filled.
+#[cfg(feature = "jit")]
+pub(crate) fn call_site_callees(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Vec<(Rc<crate::object::PyFunction>, bool)> {
+    let mut out = Vec::new();
+    if let Some(slot) = ext.call_slots.get(pc) {
+        // SAFETY: GIL-serialized; the borrows end here.
+        unsafe {
+            let shapes = (*slot.0.get()).iter().chain(
+                (*slot.1.get())
+                    .iter()
+                    .flat_map(|p| p.shapes.iter().flatten()),
+            );
+            for shape in shapes {
+                if let Some(f) = shape.func.upgrade() {
+                    out.push((f, shape.has_self));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The live Python functions the method load at `pc` has resolved for a
+/// receiver it passes as `self`, latest first.
+#[cfg(feature = "jit")]
+pub(crate) fn method_site_callees(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Vec<Rc<crate::object::PyFunction>> {
+    let mut out = Vec::new();
+    // SAFETY: GIL-serialized; the borrows end here.
+    unsafe {
+        if let Some(site) = ext.leaf_sites.get(pc) {
+            let entries = (*site.0.get()).iter().chain(
+                (*site.1.get())
+                    .iter()
+                    .flat_map(|p| p.entries.iter().flatten()),
+            );
+            for data in entries {
+                if let Some(f) = data.func.upgrade() {
+                    out.push(f);
+                }
+            }
+        }
+        if let Some(slot) = ext.method_slot(pc) {
+            if let (_, MethodSlotFn::Py(f)) = &*slot.0.get() {
+                out.extend(f.upgrade());
+            }
+            if let Some(poly) = (*slot.1.get()).as_ref() {
+                for (_, f, unbound) in &poly.entries {
+                    if !*unbound {
+                        out.extend(f.upgrade());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the code `ext` is the extension of has run often enough for a
+/// compiled caller to take it in line: activations and frameless leaf
+/// evaluations, or a body of its own.
+#[cfg(feature = "jit")]
+pub(crate) fn callee_warm(code: &CodeObject, ext: &CodeConstObjects) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    ext.frame_jit.compiled_nlocals().is_some()
+        || code.jit_hint.lean_entries() >= 24
+        || ext.leaf_tries.load(Relaxed) & u64::from(u32::MAX) >= 24
+}
+
+/// The `property` getter the `LOAD_ATTR` at `pc` last ran: the function, the
+/// receiver's class version it was resolved under, and where the property
+/// holds its getter, if all of it is alive.
+#[cfg(feature = "jit")]
+pub(crate) fn property_site_getter(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::PyFunction>, u64, *const Object)> {
+    let slot = ext.method_slot(pc)?;
+    // SAFETY: GIL-serialized; the borrows end here. The class holds the
+    // property while its version stands.
+    unsafe {
+        let (ver, MethodSlotFn::Getter { prop, .. }) = &*slot.0.get() else {
+            return None;
+        };
+        let (f, _) = slot.getter(*ver)?;
+        let cell = (*prop.as_ptr()).fget.as_ptr().cast_const();
+        Some((f, *ver, cell))
+    }
+}
+
+/// Whether the attribute or global site at `pc` has resolved anything
+/// beyond its inline cache.
+#[cfg(feature = "jit")]
+pub(crate) fn site_resolved(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.field_slot(pc).is_some_and(|s| s.get().0 != 0)
+        || ext.leaf_sites.get(pc).is_some_and(|s| {
+            // SAFETY: GIL-serialized; the borrow ends here.
+            unsafe { (*s.0.get()).is_some() }
+        })
+        || ext.method_slot(pc).is_some_and(|s| {
+            // SAFETY: as above.
+            unsafe { (*s.0.get()).0 != 0 }
+        })
+        || ext.stamp_slot(pc).is_some_and(|s| s.get()[0] != 0)
+}
+
 /// The builtin the `CALL` at `pc` last settled on: its leaf kind, or
 /// `None` and whether its body runs through `Interpreter::call` for a
 /// builtin whose body the core loop's lane runs (see
@@ -80345,6 +80584,87 @@ pub(crate) fn field_site(ext: &CodeConstObjects, pc: usize) -> bool {
 }
 
 /// Whether the operator at `pc` has run on a natively served operand.
+/// The Python operator method a `BINARY_OP` site ran, for the frame JIT to
+/// lower in line: the method, the left operand's class version it was
+/// resolved under, and the right operand's tag (`None` an instance of the
+/// same class).
+struct DunderSeen {
+    pc: usize,
+    func: crate::sync::Weak<crate::object::PyFunction>,
+    ver: u64,
+    right: Option<u8>,
+}
+
+/// A code's [`DunderSeen`]s.
+#[derive(Default)]
+struct DunderTable(std::cell::UnsafeCell<Vec<DunderSeen>>);
+
+// SAFETY: read and written only with the GIL held (the `MethodSlot`
+// invariant).
+unsafe impl Send for DunderTable {}
+unsafe impl Sync for DunderTable {}
+
+/// Record the Python method `a <op> b` (at the `BINARY_OP` at `pc`) runs, if
+/// its site has none yet and the method is decided by what a guard on the
+/// operands can check.
+#[cold]
+pub(crate) fn dunder_note(
+    ext: &CodeConstObjects,
+    pc: usize,
+    f: &Rc<crate::object::PyFunction>,
+    a: &Object,
+    b: &Object,
+) {
+    let Object::Instance(ai) = a else {
+        return;
+    };
+    let cls = ai.cls_raw();
+    if cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 || ai.native.get().is_some() {
+        return;
+    }
+    let right = match b {
+        Object::Instance(bi) if std::ptr::eq(bi.cls_raw(), cls) => None,
+        Object::Int(_) | Object::Float(_) => Some(b.tag()),
+        _ => return,
+    };
+    let table = ext.dunders.get_or_init(Box::default);
+    // SAFETY: GIL-serialized; the borrow ends here.
+    let seen = unsafe { &mut *table.0.get() };
+    if seen.iter().all(|d| d.pc != pc) {
+        seen.push(DunderSeen {
+            pc,
+            func: Rc::downgrade(f),
+            ver: cls.attr_version.get(),
+            right,
+        });
+    }
+}
+
+/// Whether the `BINARY_OP` at `pc` has recorded an operator method.
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn dunder_known(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.dunders.get().is_some_and(|table| {
+        // SAFETY: GIL-serialized; the borrow ends here.
+        unsafe { &*table.0.get() }.iter().any(|d| d.pc == pc)
+    })
+}
+
+/// The operator method the `BINARY_OP` at `pc` recorded (see
+/// [`dunder_note`]), if it's alive: the method, the left class's version
+/// and the right operand's tag.
+#[cfg(feature = "jit")]
+pub(crate) fn dunder_seen(
+    ext: &CodeConstObjects,
+    pc: usize,
+) -> Option<(Rc<crate::object::PyFunction>, u64, Option<u8>)> {
+    let table = ext.dunders.get()?;
+    // SAFETY: GIL-serialized; the borrow ends here.
+    let seen = unsafe { &*table.0.get() };
+    let d = seen.iter().find(|d| d.pc == pc)?;
+    Some((d.func.upgrade()?, d.ver, d.right))
+}
+
 /// Record that the `BINARY_OP` at `pc` ran on an instance operand (see
 /// [`CodeConstObjects::instance_sites`]).
 #[cold]
@@ -82673,6 +82993,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             call_slots: SiteSlots::new(),
             pure_leaf: std::sync::atomic::AtomicU8::new(0),
             leaf_tries: std::sync::atomic::AtomicU64::new(0),
+            dunders: std::sync::OnceLock::new(),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
             gen_start: std::sync::atomic::AtomicU32::new(0),

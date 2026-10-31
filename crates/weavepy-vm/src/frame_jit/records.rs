@@ -164,6 +164,8 @@ impl DirectRecs {
                     lazy: std::ptr::null_mut(),
                     lazy_depth: 0,
                     lazy_last: std::ptr::null_mut(),
+                    inl_call: std::ptr::null(),
+                    inl_gone: false,
                     no_direct: false,
                     in_rec: true,
                     at_start: true,
@@ -1098,7 +1100,9 @@ unsafe fn finish_rest(s: &mut State, rec: &mut DirectRec) -> u32 {
         interp.release(callable);
         interp.recs.set_top(std::ptr::from_mut(rec));
         interp.gil_countdown -= 1;
-        if (*s.maybe_dead).get() {
+        // (An inlined body's caller checks for itself, with its frames built
+        // by the exit that takes.)
+        if (*s.maybe_dead).get() && s.inl_call.is_null() {
             return finalizers_after(s, rec.call, interp);
         }
         s.len = start + 1;
