@@ -236,7 +236,12 @@ const ARENA_MAX_OBJECT_KIB: c_long = 2 * 1024;
 #[cfg(target_os = "linux")]
 const LEAN_ARENA: libc::size_t = 32 << 20;
 
-/// Give mimalloc a first arena on Linux that doesn't use transparent huge
+/// The part of the first arena on Linux without huge pages: about what a small
+/// program's heap takes (see [`reserve_lean_arena`]).
+#[cfg(target_os = "linux")]
+const LEAN_ARENA_SMALL: libc::size_t = 16 << 20;
+
+/// Give mimalloc a first arena on Linux that starts without transparent huge
 /// pages, unless the environment sets `MIMALLOC_ALLOW_THP`.
 ///
 /// mimalloc advises huge pages for its arenas, and the kernel then backs
@@ -245,8 +250,8 @@ const LEAN_ARENA: libc::size_t = 32 << 20;
 /// halves (`deltablue` 62 to 33 MB, `str_methods` 50 to 25 MB, `startup` 30
 /// to 20 MB) at the same speed. Large heaps do gain from huge pages (a
 /// program growing large deques ran 11% slower without them, with ten
-/// times the page faults), and they keep them: once this arena is full,
-/// mimalloc reserves its own arenas, with its usual advice.
+/// times the page faults), and they keep them: past [`LEAN_ARENA_SMALL`], and in
+/// the arenas mimalloc reserves once this one is full, with its usual advice.
 ///
 /// `madvise` applies to this mapping alone, where `prctl`'s
 /// `PR_SET_THP_DISABLE`, which is how mimalloc's `allow_thp` option turns
@@ -272,7 +277,12 @@ fn reserve_lean_arena() {
         if start == libc::MAP_FAILED {
             return;
         }
-        libc::madvise(start, size, libc::MADV_NOHUGEPAGE);
+        libc::madvise(start, LEAN_ARENA_SMALL, libc::MADV_NOHUGEPAGE);
+        libc::madvise(
+            start.cast::<u8>().add(LEAN_ARENA_SMALL).cast(),
+            size - LEAN_ARENA_SMALL,
+            libc::MADV_HUGEPAGE,
+        );
         if !manage_first_arena(start, size) {
             libc::munmap(start, size);
         }
