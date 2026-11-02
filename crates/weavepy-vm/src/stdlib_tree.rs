@@ -390,9 +390,9 @@ fn resolve() -> Option<PathBuf> {
     if lib.join(COMPLETE_MARKER).is_file() {
         // The cache tree is keyed on the build, not the binary's location,
         // so another copy of this same build (a probe under /tmp, a
-        // renamed artifact) may have written the exe-derived metadata
-        // (`BINDIR`, `base_interpreter`). Re-key it to *this* executable
-        // when it disagrees (`test_build_details.test_base_interpreter`).
+        // renamed artifact) may have written `base_interpreter`. Re-key it
+        // to *this* executable when it disagrees
+        // (`test_build_details.test_base_interpreter`).
         #[cfg(unix)]
         refresh_install_metadata(&prefix, &lib);
         return Some(lib);
@@ -400,8 +400,9 @@ fn resolve() -> Option<PathBuf> {
     materialize(&prefix).then_some(lib)
 }
 
-/// Rewrite the two exe-dependent metadata files under `lib` when
-/// `build-details.json` names a different interpreter than the running one.
+/// Rewrite `build-details.json` when it names a different interpreter than
+/// the running one. A symlink to the recorded interpreter is that interpreter
+/// (the test compares real paths), so it rewrites nothing.
 #[cfg(unix)]
 fn refresh_install_metadata(prefix: &Path, lib: &Path) {
     let Some(exe) = program_exe() else { return };
@@ -412,10 +413,17 @@ fn refresh_install_metadata(prefix: &Path, lib: &Path) {
             v.get("base_interpreter")
                 .and_then(|b| b.as_str().map(str::to_owned))
         });
-    if recorded.as_deref() == Some(exe.to_string_lossy().as_ref()) {
-        return;
+    if let Some(recorded) = recorded {
+        if recorded == exe.to_string_lossy()
+            || matches!(
+                (std::fs::canonicalize(&recorded), std::fs::canonicalize(&exe)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        {
+            return;
+        }
     }
-    let _ = write_install_json(lib, prefix);
+    let _ = write_build_details(lib, prefix);
 }
 
 /// Walk `exe`'s ancestors for the installed-layout landmark
@@ -754,7 +762,8 @@ fn write_install_metadata(
     tmp_lib: &Path,
     final_prefix: &Path,
 ) -> std::io::Result<()> {
-    write_install_json(tmp_lib, final_prefix)?;
+    write_sysconfig_vars(tmp_lib, final_prefix)?;
+    write_build_details(tmp_lib, final_prefix)?;
     let version_short = weavepy_version::SHORT;
     let pc_dir = tmp_prefix.join("lib").join("pkgconfig");
     std::fs::create_dir_all(&pc_dir)?;
@@ -787,11 +796,10 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The two exe-dependent JSON files in the stdlib dir:
-/// `_sysconfig_vars__*.json` and PEP 739's `build-details.json`, keyed on
-/// `final_prefix` and the running executable.
+/// The `_sysconfig_vars__*.json` file in the stdlib dir, keyed on
+/// `final_prefix` alone: every binary with this stdlib shares it.
 #[cfg(unix)]
-fn write_install_json(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()> {
+fn write_sysconfig_vars(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()> {
     use serde_json::{json, Map, Value};
 
     let version_short = weavepy_version::SHORT;
@@ -824,11 +832,7 @@ fn write_install_json(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()
         .join(&config_dir_name)
         .to_string_lossy()
         .into_owned();
-    let exe = program_exe();
-    let bindir = exe
-        .as_deref()
-        .and_then(Path::parent)
-        .map_or_else(|| join(&["bin"]), |d| d.to_string_lossy().into_owned());
+    let bindir = join(&["bin"]);
     let sys_platform = if cfg!(target_os = "macos") {
         "darwin"
     } else if cfg!(target_os = "linux") {
@@ -927,9 +931,27 @@ fn write_install_json(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()
     write_atomic(
         &tmp_lib.join(json_name),
         &serde_json::to_string_pretty(&Value::Object(vars)).unwrap_or_default(),
-    )?;
+    )
+}
 
-    // PEP 739 build details.
+/// PEP 739's `build-details.json` in the stdlib dir, keyed on `final_prefix`
+/// and the running executable.
+#[cfg(unix)]
+fn write_build_details(tmp_lib: &Path, final_prefix: &Path) -> std::io::Result<()> {
+    use serde_json::json;
+
+    let version_short = weavepy_version::SHORT;
+    let multiarch = crate::stdlib::sysconfig_native::MULTIARCH;
+    let prefix = final_prefix.to_string_lossy().into_owned();
+    let join = |parts: &[&str]| -> String {
+        let mut p = final_prefix.to_path_buf();
+        for part in parts {
+            p.push(part);
+        }
+        p.to_string_lossy().into_owned()
+    };
+    let includepy = join(&["include", &format!("python{version_short}")]);
+    let exe = program_exe();
     let version_info = json!({
         "major": weavepy_version::MAJOR,
         "minor": weavepy_version::MINOR,

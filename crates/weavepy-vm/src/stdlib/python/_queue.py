@@ -21,6 +21,7 @@ safe to run from a handler at any point of `get`.
 import _thread
 from collections import deque
 from time import monotonic as time
+from _weave_queue import simplequeue_pop as _pop
 
 __all__ = ['Empty', 'SimpleQueue']
 
@@ -66,27 +67,34 @@ class SimpleQueue:
         if timeout is not None and timeout < 0:
             raise ValueError("'timeout' must be a non-negative number")
         endtime = None
-        while not self._queue:
-            if not block:
-                raise Empty
-            if timeout is not None:
-                if endtime is None:
-                    endtime = time() + timeout
-                else:
-                    timeout = endtime - time()
-                    if timeout <= 0:
-                        raise Empty
-            # `simplequeue_get`: a non-blocking try first, then wait on
-            # the gate for the remaining budget. A `put` (from any
-            # thread, or from a handler that interrupts this wait)
-            # releases it; a wake with the queue still empty just loops.
-            if not self._lock.acquire(False):
-                if timeout is None:
-                    self._lock.acquire()
-                elif not self._lock.acquire(True, timeout):
+        while True:
+            while not self._queue:
+                if not block:
                     raise Empty
-            self._locked = True
-        return self._queue.popleft()
+                if timeout is not None:
+                    if endtime is None:
+                        endtime = time() + timeout
+                    else:
+                        timeout = endtime - time()
+                        if timeout <= 0:
+                            raise Empty
+                # `simplequeue_get`: a non-blocking try first, then wait on
+                # the gate for the remaining budget. A `put` (from any
+                # thread, or from a handler that interrupts this wait)
+                # releases it; a wake with the queue still empty just loops.
+                if not self._lock.acquire(False):
+                    if timeout is None:
+                        self._lock.acquire()
+                    elif not self._lock.acquire(True, timeout):
+                        raise Empty
+                self._locked = True
+            # Pops and opens the gate for the next parked getter. This body
+            # isn't atomic, so another getter may have taken the item since
+            # the test above: wait again.
+            try:
+                return _pop(self)
+            except IndexError:
+                pass
 
     def put_nowait(self, item):
         '''Put an item into the queue without blocking.

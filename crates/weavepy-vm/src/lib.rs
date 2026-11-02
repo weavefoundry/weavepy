@@ -23569,6 +23569,11 @@ impl Interpreter {
     /// it to the framed path instead.
     #[inline(always)]
     fn leaf_call_entry(code: &CodeObject) -> bool {
+        // An eval-frame probe logs every call at frame entry, so it needs a
+        // frame.
+        if crate::trace::eval_frame_record_active() {
+            return false;
+        }
         // A frameless call is an activation the JIT's warm-up never sees:
         // count it as a lean one, and credit each interval to the tier-2
         // counter. The call at which a compile falls due goes to the
@@ -28187,7 +28192,9 @@ impl Interpreter {
                     let Some(v) = locals.get_mut(slot) else {
                         break;
                     };
-                    if matches!(v, Object::Unbound) {
+                    // (A fixture observing deaths needs the full handler's
+                    // release, as in `StoreFast` above.)
+                    if matches!(v, Object::Unbound) || !Self::core_droppable(v) {
                         break;
                     }
                     drop(std::mem::replace(v, Object::Unbound));
