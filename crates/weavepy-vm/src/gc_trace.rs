@@ -106,7 +106,7 @@ pub const MAX_COLLECT_PASSES: usize = 16;
 /// `gc.DEBUG_SAVEALL`: instead of freeing unreachable objects, append them to
 /// `gc.garbage` so a debugging session can inspect what would have been
 /// collected. Mirrors CPython's `gc.set_debug(gc.DEBUG_SAVEALL)`.
-const DEBUG_SAVEALL: i64 = 0x20;
+pub(crate) const DEBUG_SAVEALL: i64 = 0x20;
 
 /// Walk all child references reachable through `obj`. Used by
 /// the GC's mark phase. Container types should implement this;
@@ -128,9 +128,14 @@ pub trait Finalize {
 /// hold, and the end of the free list.
 pub const NO_SLOT: u32 = u32::MAX;
 
-/// The registry slot an object of a kind that records its own (see
-/// [`Registry`]) carries: [`NO_SLOT`] while it isn't registered. A copy of
-/// the object is another object, so a clone starts unregistered.
+/// A [`GcSlot`] holding this bit (and not [`NO_SLOT`]) holds the object's
+/// position in its young set (see [`YoungSet`]) rather than a registry slot.
+const YOUNG_BIT: u32 = 1 << 31;
+
+/// Where the collector holds an object of a kind that records its own place
+/// (see [`Registry`]): a registry slot, its position in its young set, or
+/// [`NO_SLOT`] while it holds it nowhere. A copy of the object is another
+/// object, so a clone starts out held nowhere.
 #[derive(Debug)]
 pub struct GcSlot(crate::sync::Cell<u32>);
 
@@ -152,7 +157,14 @@ impl GcSlot {
     /// Whether the object has a registry entry.
     #[inline]
     pub fn is_registered(&self) -> bool {
-        self.get() != NO_SLOT
+        self.get() < YOUNG_BIT
+    }
+
+    /// Whether the object is in its young set.
+    #[inline]
+    pub fn is_young(&self) -> bool {
+        let s = self.get();
+        s >= YOUNG_BIT && s != NO_SLOT
     }
 }
 
@@ -299,6 +311,77 @@ fn clear_intrusive_slot(w: &WeakObject) {
     }
 }
 
+/// A kind whose young objects sit in a [`YoungSet`]: it records its place
+/// in its own [`GcSlot`].
+pub(crate) trait YoungKind: 'static {
+    fn young_slot(&self) -> &GcSlot;
+}
+
+impl YoungKind for crate::types::PyInstance {
+    #[inline(always)]
+    fn young_slot(&self) -> &GcSlot {
+        &self.gc_slot
+    }
+}
+
+impl YoungKind for crate::object::PyFunction {
+    #[inline(always)]
+    fn young_slot(&self) -> &GcSlot {
+        &self.gc_slot
+    }
+}
+
+impl YoungKind for crate::object::PyGenerator {
+    #[inline(always)]
+    fn young_slot(&self) -> &GcSlot {
+        &self.gc_slot
+    }
+}
+
+/// Objects born since the last collection, of a kind that records its place
+/// here in its own [`GcSlot`]: most die young, and registering one with the
+/// collector (an entry and a weak handle) costs far more than its life. A
+/// birth is a push and a death a swap with the last member, from the
+/// object's `Drop`, so the set holds exactly the live ones and takes no
+/// reference, strong or weak, of any of them.
+///
+/// Every access holds the cell. A member dying on a thread without the GIL
+/// waits for the cell in its `Drop`, its fields still intact, so a pointer
+/// read under the cell is always good to read through (its strong count may
+/// be 0 then, which a registry entry's weak handle tolerates). Nothing done
+/// under the cell may release a member.
+struct YoungSet<T>(Vec<*const T>);
+
+// SAFETY: the pointers are only followed under the cell (see above), and
+// the objects themselves are `Send + Sync`.
+unsafe impl<T> Send for YoungSet<T> {}
+// SAFETY: as above.
+unsafe impl<T> Sync for YoungSet<T> {}
+
+impl<T: YoungKind> YoungSet<T> {
+    const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Take the member at `pos` out, the set's last member moving there.
+    ///
+    /// # Safety
+    ///
+    /// `pos` holds a member, under the cell.
+    #[inline(always)]
+    unsafe fn remove_at(&mut self, pos: usize) {
+        // SAFETY: the caller's contract; the moved member is live (see
+        // [`YoungSet`]).
+        unsafe {
+            (*self.0[pos]).young_slot().set(NO_SLOT);
+            self.0.swap_remove(pos);
+            if let Some(&moved) = self.0.get(pos) {
+                (*moved).young_slot().set(YOUNG_BIT | pos as u32);
+            }
+        }
+    }
+}
+
 /// The registry of tracked objects: a slab of entries addressed by slot,
 /// one list of slots per generation (and one for the frozen set), and an
 /// id index for the kinds that don't record their own slot.
@@ -358,7 +441,7 @@ impl Registry {
     fn slot_of(&self, obj: &Object, filter: &crate::hot_filter::RebuildableBloom) -> Option<u32> {
         if let Some(cell) = intrusive_slot(obj) {
             let s = cell.get();
-            return (s != NO_SLOT).then_some(s);
+            return (s < YOUNG_BIT).then_some(s);
         }
         let key = obj.payload_addr()? as ObjectId;
         if !filter.may_contain(key) {
@@ -480,6 +563,10 @@ enum Hit {
     Temp(u32),
 }
 
+/// How many doublings of the young collection's wait a run of collections
+/// that found nothing can build up (see [`GcState::maybe_auto_collect`]).
+const MAX_IDLE: usize = 6;
+
 /// How many entries of the older generations each young collection or
 /// prune examines for dead objects, so a dead old object's allocation is
 /// released within a bounded number of young collections rather than at
@@ -512,6 +599,11 @@ pub struct GcState {
     /// Re-entrancy guard: a nested collection would see torn generation
     /// lists. Atomic so the whole `GcState` is `Sync`.
     collecting: AtomicBool,
+    /// A collection's `gc.callbacks` or finalizers are running (their Python
+    /// code can't start another collection, as under CPython's
+    /// `gcstate->collecting`). Apart from `collecting`, which also tells the
+    /// C boundary that only the collector's own marshalling is going on.
+    observed_span: AtomicBool,
     /// Per-generation thresholds. Gen 0's threshold is
     /// "allocations since last gen 0 collection"; gens 1 and 2
     /// are "collections of the previous gen since last
@@ -545,26 +637,25 @@ pub struct GcState {
     /// Consecutive automatic young collections that reclaimed nothing
     /// (see [`GcState::maybe_auto_collect`]).
     idle_collections: AtomicUsize,
-    /// Instances born since the last collection, held weakly: most die
-    /// young, and registering one with the collector (an index entry and
-    /// a handle) costs far more than its life. Their births count toward
-    /// the gen-0 threshold as eager registration's would, and every
-    /// collection, reflective API and finalization pass first hands the
-    /// collector the ones still alive ([`GcState::flush_young`]), so it
-    /// sees exactly the population eager tracking would have shown it.
-    young: RefCell<Vec<crate::sync::Weak<crate::types::PyInstance>>>,
-    /// Functions born since the last collection, held weakly as
+    /// Instances born since the last collection and still alive (see
+    /// [`YoungSet`]). Births count toward the gen-0 threshold and deaths
+    /// against it, as CPython's count does, and every collection, reflective
+    /// API and finalization pass first hands the collector the set
+    /// ([`GcState::flush_young`]), so it sees exactly the population eager
+    /// tracking would have shown it.
+    young: RefCell<YoungSet<crate::types::PyInstance>>,
+    /// Functions born since the last collection and still alive, as
     /// [`Self::young`] holds instances (a `def` or `lambda` run in a loop
-    /// makes one per pass). A flush also hands the collector each live
-    /// one's globals dict, which [`track`] would have tracked at birth.
-    young_fns: RefCell<Vec<crate::sync::Weak<crate::object::PyFunction>>>,
+    /// makes one per pass). A flush also hands the collector each one's
+    /// globals dict, which [`track`] would have tracked at birth.
+    young_fns: RefCell<YoungSet<crate::object::PyFunction>>,
     /// Generators, coroutines and async generators born since the last
-    /// collection, held weakly as [`Self::young`] holds instances: an
-    /// `await` of a coroutine function makes one per call, and most
+    /// collection and not yet finished, as [`Self::young`] holds instances:
+    /// an `await` of a coroutine function makes one per call, and most
     /// finish (holding no frame) and die before any collection.
-    young_gens: RefCell<Vec<crate::sync::Weak<crate::object::PyGenerator>>>,
+    young_gens: RefCell<YoungSet<crate::object::PyGenerator>>,
     /// Lists and dicts born since the last collection that could close a
-    /// cycle, held weakly as [`Self::young`] holds instances: a function
+    /// cycle, held weakly (they have no room to record a place): a function
     /// that builds and returns `[a, b]` or `{k: obj}` makes one per call,
     /// and most die before any collection.
     young_lists: RefCell<Vec<crate::sync::Weak<RefCell<Vec<Object>>>>>,
@@ -601,6 +692,7 @@ impl GcState {
             reg: RefCell::new(Registry::new()),
             tracked_filter: crate::hot_filter::RebuildableBloom::new(),
             collecting: AtomicBool::new(false),
+            observed_span: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
             gen0_gauge: AtomicU64::new(DEFAULT_THRESHOLDS[0] as u64),
@@ -609,9 +701,9 @@ impl GcState {
             deferred_limit: AtomicUsize::new(DEFERRED_FLOOR),
             old_deaths: AtomicUsize::new(0),
             idle_collections: AtomicUsize::new(0),
-            young: RefCell::new(Vec::new()),
-            young_fns: RefCell::new(Vec::new()),
-            young_gens: RefCell::new(Vec::new()),
+            young: RefCell::new(YoungSet::new()),
+            young_fns: RefCell::new(YoungSet::new()),
+            young_gens: RefCell::new(YoungSet::new()),
             young_lists: RefCell::new(Vec::new()),
             young_dicts: RefCell::new(Vec::new()),
             garbage: RefCell::new(Vec::new()),
@@ -658,6 +750,7 @@ impl GcState {
             RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
             // A peer may have vanished mid-collection with this set.
             (*this).collecting.store(false, Ordering::Release);
+            (*this).observed_span.store(false, Ordering::Release);
         }
     }
 
@@ -698,22 +791,22 @@ impl GcState {
         }
         match obj {
             Object::Instance(inst) => {
-                if self.nurse(&self.young, inst) {
+                if self.nurse_own(&self.young, inst) {
                     return;
                 }
             }
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-                if self.nurse(&self.young_gens, g) {
+                if self.nurse_own(&self.young_gens, g) {
                     return;
                 }
             }
             Object::List(l) => {
-                if self.nurse(&self.young_lists, l) {
+                if self.nurse_weak(&self.young_lists, l) {
                     return;
                 }
             }
             Object::Dict(d) => {
-                if self.nurse(&self.young_dicts, d) {
+                if self.nurse_weak(&self.young_dicts, d) {
                     return;
                 }
             }
@@ -725,16 +818,35 @@ impl GcState {
     /// [`Self::track`] for a function: young (see [`Self::young_fns`]), or
     /// registered at once together with its globals dict.
     fn track_function(&self, obj: &Object, f: &crate::Rc<crate::object::PyFunction>) {
-        if self.nurse(&self.young_fns, f) {
+        if self.nurse_own(&self.young_fns, f) {
             return;
         }
         self.track(&Object::Dict(f.globals.clone()));
         self.track_now(obj);
     }
 
-    /// Register a newborn instance (or function) in its young set (see
-    /// [`Self::young`]). `false` leaves it to eager registration.
-    fn nurse<T: 'static>(
+    /// Put a newborn object in its young set (see [`YoungSet`]), unless the
+    /// collector already holds it. `false` leaves it to eager registration.
+    #[inline]
+    fn nurse_own<T: YoungKind>(&self, set: &RefCell<YoungSet<T>>, obj: &crate::Rc<T>) -> bool {
+        // SAFETY: nothing below runs code while the set is borrowed.
+        let Some(young) = (unsafe { set.peek_mut() }) else {
+            // A flush is walking the set, or cells are shared.
+            return false;
+        };
+        let slot = obj.young_slot();
+        if slot.get() != NO_SLOT {
+            return true;
+        }
+        slot.set(YOUNG_BIT | young.0.len() as u32);
+        young.0.push(crate::Rc::as_ptr(obj));
+        self.note_gen0_alloc();
+        true
+    }
+
+    /// Put a newborn list or dict in its young set, held weakly. `false`
+    /// leaves it to eager registration.
+    fn nurse_weak<T: 'static>(
         &self,
         set: &RefCell<Vec<crate::sync::Weak<T>>>,
         obj: &crate::Rc<T>,
@@ -765,68 +877,146 @@ impl GcState {
         true
     }
 
-    /// Register the young objects still alive with the collector.
-    fn flush_young(&self) {
-        if let Ok(mut fns) = self.young_fns.try_borrow_mut() {
-            if !fns.is_empty() {
-                let fns = std::mem::take(&mut *fns);
-                for w in fns {
-                    if let Some(f) = w.upgrade() {
-                        self.track(&Object::Dict(f.globals.clone()));
-                        self.register(&Object::Function(f));
+    /// `obj`, a member of its young set `set` that is dying or leaving, is
+    /// taken out: it no longer counts toward the young collection.
+    #[inline]
+    fn young_leave<T: YoungKind>(&self, set: &RefCell<YoungSet<T>>, obj: *const T) {
+        // SAFETY: `obj` is live (it's dying at most: see `YoungSet`), and
+        // nothing below runs code while the set is borrowed.
+        unsafe {
+            match set.peek_mut() {
+                Some(young) => {
+                    let s = (*obj).young_slot().get();
+                    young.remove_at((s & !YOUNG_BIT) as usize);
+                }
+                None => {
+                    // (Shared cells: a flush on another thread may have
+                    // taken it meanwhile.)
+                    let mut young = set.borrow_mut();
+                    if (*obj).young_slot().is_young() {
+                        let s = (*obj).young_slot().get();
+                        young.remove_at((s & !YOUNG_BIT) as usize);
                     }
                 }
             }
         }
-        if let Ok(mut gens) = self.young_gens.try_borrow_mut() {
-            if !gens.is_empty() {
-                let gens = std::mem::take(&mut *gens);
-                for w in gens {
-                    if let Some(g) = w.upgrade() {
-                        // It outlived its young set: trim its frame.
-                        crate::compact_generator_frame(&g);
-                        let obj = match g.kind {
-                            crate::object::CoroutineKind::Generator => Object::Generator(g),
-                            crate::object::CoroutineKind::Coroutine => Object::Coroutine(g),
-                            crate::object::CoroutineKind::AsyncGenerator => {
-                                Object::AsyncGenerator(g)
-                            }
-                        };
-                        self.register(&obj);
-                    }
-                }
-            }
-        }
-        self.flush_set(&self.young_lists, WeakObject::List);
-        self.flush_set(&self.young_dicts, WeakObject::Dict);
-        self.flush_set(&self.young, WeakObject::Instance);
+        self.uncount_young();
     }
 
-    /// The young instances and functions still alive (the dead ones are
-    /// dropped).
+    /// One object off the young collection's count.
+    #[inline]
+    fn uncount_young(&self) {
+        // SAFETY: nothing runs code while the view lives.
+        match unsafe { self.counts.peek_mut() } {
+            Some(counts) => {
+                counts[0] = counts[0].saturating_sub(1);
+                self.sync_gen0_gauge(counts[0], None);
+            }
+            None => {
+                let mut counts = self.counts.borrow_mut();
+                counts[0] = counts[0].saturating_sub(1);
+                self.sync_gen0_gauge(counts[0], None);
+            }
+        }
+    }
+
+    /// Take `obj` out of its young set, if it's in one.
+    fn leave_young_set(&self, obj: &Object) {
+        match obj {
+            Object::Instance(i) if i.gc_slot.is_young() => {
+                self.young_leave(&self.young, crate::Rc::as_ptr(i));
+            }
+            Object::Function(f) if f.gc_slot.is_young() => {
+                self.young_leave(&self.young_fns, crate::Rc::as_ptr(f));
+            }
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)
+                if g.gc_slot.is_young() =>
+            {
+                self.young_leave(&self.young_gens, crate::Rc::as_ptr(g));
+            }
+            _ => {}
+        }
+    }
+
+    /// Register the young objects still alive with the collector.
+    fn flush_young(&self) {
+        self.flush_own(
+            &self.young_fns,
+            |f| {
+                self.track(&Object::Dict(f.globals.clone()));
+            },
+            |_, w| WeakObject::Function(w),
+        );
+        self.flush_own(
+            &self.young_gens,
+            // It outlived its young set: trim its frame.
+            crate::compact_generator_frame,
+            |g, w| match g.kind {
+                crate::object::CoroutineKind::Generator => WeakObject::Generator(w),
+                crate::object::CoroutineKind::Coroutine => WeakObject::Coroutine(w),
+                crate::object::CoroutineKind::AsyncGenerator => WeakObject::AsyncGenerator(w),
+            },
+        );
+        self.flush_set(&self.young_lists, WeakObject::List);
+        self.flush_set(&self.young_dicts, WeakObject::Dict);
+        self.flush_own(&self.young, |_| {}, |_, w| WeakObject::Instance(w));
+    }
+
+    /// Register the members of `set` (see [`YoungSet`]) under one registry
+    /// borrow, keeping the set's allocation for the next generation of
+    /// young. `first` runs on each before the registry is borrowed, and
+    /// `wrap` names its handle's kind.
+    fn flush_own<T: YoungKind>(
+        &self,
+        set: &RefCell<YoungSet<T>>,
+        first: impl Fn(&T),
+        wrap: impl Fn(&T, crate::sync::Weak<T>) -> WeakObject,
+    ) {
+        let Ok(mut young) = set.try_borrow_mut() else {
+            return;
+        };
+        if young.0.is_empty() {
+            return;
+        }
+        for &p in &young.0 {
+            // SAFETY: a member (see `YoungSet`), which `first` doesn't release.
+            first(unsafe { &*p });
+        }
+        let added = young.0.len();
+        {
+            let mut reg = self.reg.borrow_mut();
+            for p in young.0.drain(..) {
+                // SAFETY: a member, whose handle a view takes (the view takes
+                // no reference and is never dropped).
+                unsafe {
+                    (*p).young_slot().set(NO_SLOT);
+                    let view = std::mem::ManuallyDrop::new(crate::Rc::from_raw(p));
+                    let weak = wrap(&*p, crate::Rc::downgrade(&view));
+                    self.enter(&mut reg, weak);
+                }
+            }
+        }
+        serial_add(&self.tracked_count, added);
+        serial_add(&self.tracked_version, 1);
+    }
+
+    /// The young objects still alive (the dead ones are dropped).
     fn young_live(&self) -> usize {
-        let fns = self.young_fns.try_borrow_mut().map_or(0, |mut fns| {
-            fns.retain(|w| w.strong_count() > 0);
-            fns.len()
-        }) + self.young_gens.try_borrow_mut().map_or(0, |mut gens| {
-            gens.retain(|w| w.strong_count() > 0);
-            gens.len()
-        }) + self.young_lists.try_borrow_mut().map_or(0, |mut lists| {
+        // (An object with a place of its own leaves its set as it dies.)
+        let own = self.young.try_borrow().map_or(0, |y| y.0.len())
+            + self.young_fns.try_borrow().map_or(0, |y| y.0.len())
+            + self.young_gens.try_borrow().map_or(0, |y| y.0.len());
+        own + self.young_lists.try_borrow_mut().map_or(0, |mut lists| {
             lists.retain(|w| w.strong_count() > 0);
             lists.len()
         }) + self.young_dicts.try_borrow_mut().map_or(0, |mut dicts| {
             dicts.retain(|w| w.strong_count() > 0);
             dicts.len()
-        });
-        let Ok(mut young) = self.young.try_borrow_mut() else {
-            return fns;
-        };
-        young.retain(|w| w.strong_count() > 0);
-        young.len() + fns
+        })
     }
 
-    /// Whether the object `id` is in a young set.
-    fn is_young(&self, id: ObjectId) -> bool {
+    /// Whether `obj` is in a young set.
+    fn is_young(&self, obj: &Object) -> bool {
         fn holds<T: 'static>(set: &RefCell<Vec<crate::sync::Weak<T>>>, id: ObjectId) -> bool {
             set.try_borrow().is_ok_and(|young| {
                 young
@@ -834,11 +1024,12 @@ impl GcState {
                     .any(|w| w.as_ptr() as usize as ObjectId == id && w.strong_count() > 0)
             })
         }
-        holds(&self.young, id)
-            || holds(&self.young_fns, id)
-            || holds(&self.young_gens, id)
-            || holds(&self.young_lists, id)
-            || holds(&self.young_dicts, id)
+        match (intrusive_slot(obj), obj) {
+            (Some(slot), _) => slot.is_young(),
+            (None, Object::List(_)) => holds(&self.young_lists, id_of(obj)),
+            (None, Object::Dict(_)) => holds(&self.young_dicts, id_of(obj)),
+            _ => false,
+        }
     }
 
     /// [`Self::track`] for a container its builder knows holds only
@@ -1019,6 +1210,7 @@ impl GcState {
     /// Enter `obj` in the registry's generation 0 (`false`: it was already
     /// there, or has no heap allocation of its own).
     fn register(&self, obj: &Object) -> bool {
+        self.leave_young_set(obj);
         {
             let mut reg = self.reg.borrow_mut();
             // An entry whose object died can't sit at this address: its
@@ -1091,9 +1283,9 @@ impl GcState {
         slot
     }
 
-    /// Register the young objects of `set` still alive (see
-    /// [`Self::young`]) under one registry borrow, keeping the set's
-    /// allocation for the next generation of young.
+    /// Register the young lists or dicts of `set` still alive under one
+    /// registry borrow, keeping the set's allocation for the next generation
+    /// of young.
     fn flush_set<T: 'static>(
         &self,
         set: &RefCell<Vec<crate::sync::Weak<T>>>,
@@ -1113,16 +1305,10 @@ impl GcState {
                     continue;
                 }
                 let weak = wrap(w);
-                // SAFETY (both): the object is alive (counted above, and
-                // nothing has run since).
-                let registered = match unsafe { weak_intrusive_slot(&weak) } {
-                    Some(own) => own.is_registered(),
-                    None => {
-                        let key = weak.addr() as ObjectId;
-                        self.tracked_filter.may_contain(key) && reg.index.contains_key(&key)
-                    }
-                };
-                if !registered {
+                let key = weak.addr() as ObjectId;
+                if !(self.tracked_filter.may_contain(key) && reg.index.contains_key(&key)) {
+                    // SAFETY: the object is alive (counted above, and nothing
+                    // has run since).
                     unsafe { self.enter(&mut reg, weak) };
                     added += 1;
                 }
@@ -1188,6 +1374,10 @@ impl GcState {
     /// Stop tracking `obj`. Backs the explicit `gc._untrack(obj)` extension
     /// and the C-API `PyObject_GC_UnTrack`.
     pub fn untrack(&self, obj: &Object) {
+        if intrusive_slot(obj).is_some_and(GcSlot::is_young) {
+            self.leave_young_set(obj);
+            return;
+        }
         let slot = self.reg.borrow().slot_of(obj, &self.tracked_filter);
         match slot {
             Some(slot) => self.untrack_slot(slot, id_of(obj), true),
@@ -1270,15 +1460,26 @@ impl GcState {
                 None => false,
             }
         }
-        if remove(&self.young_fns, id)
-            || remove(&self.young, id)
-            || remove(&self.young_gens, id)
+        fn remove_own<T: YoungKind>(set: &RefCell<YoungSet<T>>, id: ObjectId) -> bool {
+            let Ok(mut young) = set.try_borrow_mut() else {
+                return false;
+            };
+            match young.0.iter().rposition(|&p| p as usize as ObjectId == id) {
+                Some(i) => {
+                    // SAFETY: `i` holds a member, under the cell.
+                    unsafe { young.remove_at(i) };
+                    true
+                }
+                None => false,
+            }
+        }
+        if remove_own(&self.young_fns, id)
+            || remove_own(&self.young, id)
+            || remove_own(&self.young_gens, id)
             || remove(&self.young_lists, id)
             || remove(&self.young_dicts, id)
         {
-            let mut counts = self.counts.borrow_mut();
-            counts[0] = counts[0].saturating_sub(1);
-            self.sync_gen0_gauge(counts[0], None);
+            self.uncount_young();
         }
     }
 
@@ -1383,7 +1584,7 @@ impl GcState {
     /// [`Self::is_tracked_obj`] for an object that may be young (an
     /// instance, function, generator, list or dict).
     pub fn is_tracked_instance(&self, obj: &Object) -> bool {
-        self.is_tracked_obj(obj) || self.is_young(id_of(obj))
+        self.is_tracked_obj(obj) || self.is_young(obj)
     }
 
     /// Snapshot every live tracked object that still carries an unrun
@@ -1431,6 +1632,7 @@ impl GcState {
     }
 
     pub fn set_thresholds(&self, t: [usize; N_GENERATIONS]) {
+        self.idle_collections.store(0, Ordering::Relaxed);
         *self.thresholds.borrow_mut() = t;
         self.sync_gen0_gauge(self.counts.borrow()[0], Some(t[0]));
     }
@@ -1537,7 +1739,7 @@ impl GcState {
         }
         // How many collections in a row have found nothing (see `wanted`
         // below).
-        let idle = self.idle_collections.load(Ordering::Relaxed).min(3);
+        let idle = self.idle_collections.load(Ordering::Relaxed).min(MAX_IDLE);
         let (due, eligible, threshold0) = {
             let counts = self.counts.borrow();
             let thresholds = self.thresholds.borrow();
@@ -1549,9 +1751,12 @@ impl GcState {
             // next older one waits for, up to eight times the threshold (an
             // older collection rescans every survivor promoted since the
             // last, so a program whose objects live on, as a pending task
-            // tree does, pays for it again and again).
+            // tree does, pays for it again and again). Past that, each young
+            // collection covers twice the allocations (see `wanted`), so
+            // half as many keep the older ones' period where it got to.
+            let older_shift = if idle <= 3 { idle } else { 6 - idle };
             let mut gen = 0;
-            if counts[1] + 1 >= thresholds[1].saturating_mul(1 << idle) {
+            if counts[1] + 1 >= thresholds[1].saturating_mul(1 << older_shift) {
                 gen = 1;
                 if counts[2] + 1 >= thresholds[2] {
                     gen = 2;
@@ -1559,7 +1764,7 @@ impl GcState {
             }
             (counts[0] >= thresholds[0], gen, thresholds[0])
         };
-        if !due {
+        if !due || self.observed_span.load(Ordering::Acquire) {
             return false;
         }
         // The older objects found dead (a slice of the older generations
@@ -1575,9 +1780,10 @@ impl GcState {
         // A program whose young collections keep finding no cycles (its
         // objects die by reference count, or live on) collects less often:
         // each idle one doubles the survivors the next waits for, up to
-        // eight thresholds' worth, and any that reclaims something resets
-        // the pace. (A young collection costs far more per object than
-        // CPython's, whose candidates sit on intrusive lists.)
+        // [`MAX_IDLE`] doublings, and any that reclaims something resets the
+        // pace, as does an explicit collection. (A young collection costs
+        // far more per object than CPython's, whose candidates sit on
+        // intrusive lists.)
         let wanted = if eligible == 0 {
             (threshold0 / 2) << idle
         } else {
@@ -1597,8 +1803,14 @@ impl GcState {
             return false;
         }
         // Automatic young collection: a single pass (see `collect_impl`'s
-        // `exact` discussion).
-        let collected = self.collect_impl(eligible, false);
+        // `exact` discussion), with whatever observes collections around it.
+        let collected = match crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: this thread's interpreter. Every poll is at a safe
+            // point where the caller goes on to run Python code (the
+            // finalizers this collection queues).
+            Some(interp) => unsafe { (*interp).automatic_collection(eligible) },
+            None => self.collect_impl(eligible, false),
+        };
         if collected == 0 {
             self.idle_collections.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1678,7 +1890,32 @@ impl GcState {
     /// full sweep. The re-entrancy guard still applies — a collection
     /// triggered from inside a collection is a no-op.
     pub fn collect(&self, upto: usize) -> usize {
+        // (Someone wants garbage found: the automatic pace starts over.)
+        self.idle_collections.store(0, Ordering::Relaxed);
         self.collect_impl(upto, true)
+    }
+
+    /// One automatic collection's single pass (see
+    /// [`Self::maybe_auto_collect`]).
+    pub(crate) fn collect_automatic_pass(&self, gen: usize) -> usize {
+        self.collect_impl(gen, false)
+    }
+
+    /// Claim the span of a collection's Python code (its callbacks and
+    /// finalizers), returning whether this call did: nested in another's
+    /// span, it isn't this call's to end.
+    pub(crate) fn enter_observed_span(&self) -> bool {
+        !self.observed_span.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn exit_observed_span(&self) {
+        self.observed_span.store(false, Ordering::Release);
+    }
+
+    /// Whether a collection's Python code is running: `gc.collect()` does
+    /// nothing then, and an allocation starts no collection.
+    pub(crate) fn in_observed_span(&self) -> bool {
+        self.observed_span.load(Ordering::Acquire)
     }
 
     /// Run the cycle collector's mark phase across all generations and fire
@@ -2305,7 +2542,7 @@ impl Visit for Tally<'_> {
         }
         if let Some(cell) = intrusive_slot(child) {
             let s = cell.get();
-            if s != NO_SLOT {
+            if s < YOUNG_BIT {
                 if self.reg.entry(s).has(F_CAND) {
                     self.tally(s);
                     return;
@@ -2374,10 +2611,48 @@ impl Tally<'_> {
                 if may_be_temporary(child)
                     && promotes_temporarily(child, self.parent_is_iter, self.parent_is_frame)
                 {
+                    if self.inline_sole(child) {
+                        return;
+                    }
                     self.found.push(child.clone());
                 }
             }
         }
+    }
+
+    /// Walk `child`, an untracked bound method or cell the walked object
+    /// alone holds (an event loop handle's callback, say), as part of it:
+    /// nothing else can reach it, so as a node of its own it would only ever
+    /// pass on its holder's reachability. A collection's temporaries are the
+    /// costliest nodes it has (an index entry, a counted handle, a second
+    /// walk). `false` leaves any other to become a temporary, as it does a
+    /// weakly referenced one, which must outlive the clearing of the dead
+    /// (a weak reference's callback that dies with the cycle isn't called).
+    fn inline_sole(&mut self, child: &Object) -> bool {
+        if crate::weakref_registry::may_have_weakrefs(id_of(child)) {
+            return false;
+        }
+        let (parent_iter, parent_frame) = (self.parent_is_iter, self.parent_is_frame);
+        match child {
+            Object::BoundMethod(b) if crate::sync::Rc::strong_count(b) == 1 => {
+                self.parent_is_iter = false;
+                self.parent_is_frame = false;
+                self.visit(&b.function);
+                self.visit(&b.receiver);
+            }
+            Object::Cell(c) if crate::sync::Rc::strong_count(c) == 1 => {
+                let Ok(v) = c.try_borrow() else {
+                    return false;
+                };
+                self.parent_is_iter = false;
+                self.parent_is_frame = false;
+                self.visit(&v);
+            }
+            _ => return false,
+        }
+        self.parent_is_iter = parent_iter;
+        self.parent_is_frame = parent_frame;
+        true
     }
 }
 
@@ -2447,7 +2722,7 @@ impl<'a> Finder<'a> {
     fn find(&self, child: &Object) -> Option<Hit> {
         if let Some(cell) = intrusive_slot(child) {
             let s = cell.get();
-            if s != NO_SLOT {
+            if s < YOUNG_BIT {
                 if self.reg.entry(s).has(F_CAND) {
                     return Some(Hit::Real(s));
                 }
@@ -3512,14 +3787,14 @@ pub fn track(obj: &Object) {
 }
 
 /// [`track`] for a fresh generator, coroutine or async generator: it joins
-/// its young set (see [`GcState::nurse`]), or is registered at once.
+/// its young set (see [`GcState::nurse_own`]), or is registered at once.
 pub fn track_generator(obj: &Object) {
     let (Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)) = obj else {
         track(obj);
         return;
     };
     with_state(|s| {
-        if !s.nurse(&s.young_gens, g) {
+        if !s.nurse_own(&s.young_gens, g) {
             s.track_now(obj);
         }
     });
@@ -3637,11 +3912,34 @@ pub fn untrack(obj: &Object) {
     with_state(|s| s.untrack(obj));
 }
 
-/// Drop the registry entry of the instance at `addr`, which is dying and
-/// recorded registry slot `slot` (see [`GcState::forget_instance`]).
+/// Drop the collector's hold on the instance `inst`, which is dying and
+/// recorded `slot` (not [`NO_SLOT`]): its place in the young set, or its
+/// registry entry (see [`GcState::forget_instance`]).
 #[inline]
-pub fn forget_instance(slot: u32, addr: usize) {
-    with_state(|s| s.forget_instance(slot, addr));
+pub fn forget_instance(inst: &crate::types::PyInstance, slot: u32) {
+    with_state(|s| {
+        if slot >= YOUNG_BIT {
+            s.young_leave(&s.young, std::ptr::from_ref(inst));
+        } else {
+            s.forget_instance(slot, std::ptr::from_ref(inst) as usize);
+        }
+    });
+}
+
+/// Take the dying function `f` out of the young set, if it's there.
+#[inline]
+pub(crate) fn forget_dying_function(f: &crate::object::PyFunction) {
+    if f.gc_slot.is_young() {
+        with_state(|s| s.young_leave(&s.young_fns, std::ptr::from_ref(f)));
+    }
+}
+
+/// Take the dying generator `g` out of the young set, if it's there.
+#[inline]
+pub(crate) fn forget_dying_generator(g: &crate::object::PyGenerator) {
+    if g.gc_slot.is_young() {
+        with_state(|s| s.young_leave(&s.young_gens, std::ptr::from_ref(g)));
+    }
 }
 
 /// [`untrack`] for a registered generator only: one still in a young set
@@ -3651,7 +3949,7 @@ pub fn forget_instance(slot: u32, addr: usize) {
 /// dropped at the next flush.
 pub fn untrack_generator(g: &crate::Rc<crate::object::PyGenerator>) {
     let slot = g.gc_slot.get();
-    if slot != NO_SLOT {
+    if slot < YOUNG_BIT {
         let id = crate::Rc::as_ptr(g) as usize as ObjectId;
         with_state(|s| s.untrack_slot(slot, id, false));
     }
@@ -3659,27 +3957,10 @@ pub fn untrack_generator(g: &crate::Rc<crate::object::PyGenerator>) {
 
 /// Let go of `g`, a finished generator in the young set (see
 /// `Interpreter::release_finished_gen`): holding no frame, it can close no
-/// cycle, and its entry would keep its allocation until the set dropped
-/// it. Only the set's last few entries are searched (a generator that
-/// finishes young is usually among them); the set drops any other once it
-/// is dead. Its birth still counts toward the young collection, as a dead
-/// entry's does.
+/// cycle.
+#[inline]
 pub fn forget_young_generator(g: &crate::Rc<crate::object::PyGenerator>) {
-    with_state(|s| {
-        // SAFETY: nothing below runs code while the set is borrowed (the
-        // removed entry's release only adjusts a weak count: `g` is alive).
-        let Some(young) = (unsafe { s.young_gens.peek_mut() }) else {
-            return;
-        };
-        let p = crate::Rc::as_ptr(g);
-        let n = young.len();
-        if let Some(i) = (n.saturating_sub(4)..n)
-            .rev()
-            .find(|&i| young[i].as_ptr() == p)
-        {
-            young.swap_remove(i);
-        }
-    });
+    with_state(|s| s.young_leave(&s.young_gens, crate::Rc::as_ptr(g)));
 }
 
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
@@ -3741,8 +4022,9 @@ fn root_debug() -> bool {
 /// sweep's fixed cost outweighs what it reclaims.
 const DEFERRED_FLOOR: usize = 4096;
 
-/// How many young instances wait before the set is handed to the
-/// collector regardless (collections normally flush it well before).
+/// How many young lists or dicts wait before their sets are handed to the
+/// collector regardless (a weak handle holds a dead one's allocation until
+/// then; collections normally flush them well before).
 const YOUNG_CAP: usize = 8192;
 
 /// How many containers may stay deferred at once. Past this the sweep

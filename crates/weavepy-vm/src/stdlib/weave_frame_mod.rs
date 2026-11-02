@@ -188,11 +188,11 @@ fn frame_new(args: &[Object]) -> Result<Object, RuntimeError> {
         lasti: Cell::new(0),
         back: RefCell::new(None),
         locals_cache: RefCell::new(None),
-        cells: Rc::new(
+        cells: RefCell::new(Rc::new(
             (0..ncells)
                 .map(|_| Rc::new(RefCell::new(Object::Unbound)))
                 .collect(),
-        ),
+        )),
         class_namespace: None,
         class_namespace_obj: None,
         is_module_scope: false,

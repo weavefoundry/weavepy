@@ -23,6 +23,7 @@ class IrVerifies(unittest.TestCase):
         env = dict(os.environ)
         env["WEAVEPY_PLAN_VERIFY"] = "1"
         env["WEAVEPY_FRAME_JIT_VERIFY"] = "1"
+        env["WEAVEPY_JIT_SYNC"] = "1"
         proc = subprocess.run(
             [sys.executable, script],
             capture_output=True,

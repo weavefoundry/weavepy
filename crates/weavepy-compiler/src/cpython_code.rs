@@ -2808,8 +2808,12 @@ mod tests {
 
     fn code_of(instrs: Vec<Instruction>) -> CodeObject {
         let mut c = CodeObject {
-            linetable: vec![1u32; instrs.len()].into(),
-            instructions: instrs,
+            body: crate::CodeBody {
+                linetable: vec![1u32; instrs.len()].into(),
+                instructions: instrs,
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         // Give a couple of locals so LOAD_FAST vs LOAD_CLOSURE disambiguates.
@@ -3098,16 +3102,20 @@ mod tests {
         // A code object exercising locals/cells/frees, a forward jump, an
         // exception handler, and a multi-line linetable.
         let mut code = CodeObject {
-            instructions: vec![
-                Instruction::new(OpCode::Resume, 0),
-                Instruction::new(OpCode::LoadFast, 0),
-                Instruction::new(OpCode::PopJumpIfFalse, 2),
-                Instruction::new(OpCode::LoadFast, 1),
-                Instruction::new(OpCode::ReturnValue, 0),
-                Instruction::new(OpCode::LoadConst, 0),
-                Instruction::new(OpCode::ReturnValue, 0),
-            ],
-            linetable: vec![1, 2, 2, 3, 3, 4, 4].into(),
+            body: crate::CodeBody {
+                instructions: vec![
+                    Instruction::new(OpCode::Resume, 0),
+                    Instruction::new(OpCode::LoadFast, 0),
+                    Instruction::new(OpCode::PopJumpIfFalse, 2),
+                    Instruction::new(OpCode::LoadFast, 1),
+                    Instruction::new(OpCode::ReturnValue, 0),
+                    Instruction::new(OpCode::LoadConst, 0),
+                    Instruction::new(OpCode::ReturnValue, 0),
+                ],
+                linetable: vec![1, 2, 2, 3, 3, 4, 4].into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         code.varnames = vec!["a".into(), "b".into()];
@@ -3143,8 +3151,12 @@ mod tests {
         // Re-encoding the decoded form must reproduce the wire bytes
         // exactly — a strong end-to-end inverse invariant.
         let mut code2 = CodeObject {
-            instructions: dc.instructions,
-            linetable: dc.linetable.into(),
+            body: crate::CodeBody {
+                instructions: dc.instructions,
+                linetable: dc.linetable.into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         code2.varnames = dc.varnames.iter().map(crate::Name::from).collect();

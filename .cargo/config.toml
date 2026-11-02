@@ -16,3 +16,15 @@ xbench = "run --release -p weavepy-bench --"
 [build]
 # Faster incremental builds for local dev. CI overrides via env if needed.
 # rustflags = []
+
+# Link the host targets through `scripts/link-ordered.sh`, which remaps the
+# `weavepy` binary's symbol order file (crates/weavepy-cli/weavepy.order)
+# onto the link's own symbols before running `cc` (see the script).
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/link-ordered.sh"
+
+[target.x86_64-apple-darwin]
+linker = "scripts/link-ordered.sh"
+
+[target.aarch64-apple-darwin]
+linker = "scripts/link-ordered.sh"

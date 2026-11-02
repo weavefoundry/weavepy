@@ -41,7 +41,14 @@ pub unsafe trait ThinPayload: sealed::Sealed {
     fn view(&self) -> &Self::View;
 }
 
-/// A single-word strong owner of a length-prefixed Arc payload.
+/// The words from an `Arc` allocation's start (its strong count) to the
+/// payload: the two counts. Every thin payload is aligned to at most 16.
+const COUNT_WORDS: usize = 2;
+
+/// A single-word strong owner of a length-prefixed Arc payload. Its word
+/// addresses the allocation's start, the strong count, as an `Rc`'s does:
+/// every counted `Object` variant finds its count at its pointer (see
+/// `Object::strong_word`).
 pub struct ThinArc<T: ?Sized + ThinPayload> {
     data: NonNull<usize>,
     ownership: PhantomData<Arc<T>>,
@@ -72,20 +79,30 @@ impl<T: ?Sized + ThinPayload> fmt::Debug for ThinWeak<T> {
 
 impl<T: ?Sized + ThinPayload> ThinArc<T> {
     pub(crate) fn from_arc(arc: Arc<T>) -> Self {
+        debug_assert!(std::mem::align_of_val::<T>(&arc) <= 2 * size_of::<usize>());
         let data = Arc::into_raw(arc).cast::<usize>().cast_mut();
         Self {
-            // SAFETY: Arc::into_raw returns a non-null live allocation pointer.
-            data: unsafe { NonNull::new_unchecked(data) },
+            // SAFETY: Arc::into_raw returns the payload of a live allocation,
+            // which follows the two counts (`ArcInner` is `repr(C)`).
+            data: unsafe { NonNull::new_unchecked(data.sub(COUNT_WORDS)) },
             ownership: PhantomData,
         }
     }
 
+    /// The payload's address, whose first word is its length.
+    #[inline(always)]
+    fn payload(&self) -> *mut usize {
+        // SAFETY: the payload follows the counts in the live allocation.
+        unsafe { self.data.as_ptr().add(COUNT_WORDS) }
+    }
+
     #[inline]
     fn raw(&self) -> *const T {
+        let data = self.payload();
         // SAFETY: this owner retains a strong reference. ThinPayload guarantees
         // an initialized, immutable length word throughout that lifetime.
-        let len = unsafe { self.data.as_ptr().read() };
-        T::pointer(self.data.as_ptr(), len)
+        let len = unsafe { data.read() };
+        T::pointer(data, len)
     }
 
     #[inline]
@@ -140,11 +157,11 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
 }
 
 impl<T: ?Sized + ThinPayload> Clone for ThinArc<T> {
-    #[inline]
+    #[inline(always)]
     fn clone(&self) -> Self {
         // SAFETY: this owner keeps the payload alive; the copy accounts for
         // the added strong reference.
-        unsafe { crate::rc::increment_strong(self.raw()) };
+        unsafe { crate::rc::increment_word(self.data.as_ptr().cast()) };
         Self {
             data: self.data,
             ownership: PhantomData,
@@ -153,12 +170,12 @@ impl<T: ?Sized + ThinPayload> Clone for ThinArc<T> {
 }
 
 impl<T: ?Sized + ThinPayload> Drop for ThinArc<T> {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: release this owner's one strong reference exactly once.
         // Arc drops the payload and handles remaining weak references normally.
         unsafe {
-            if crate::rc::try_release_shared(self.raw()) {
+            if crate::rc::try_release_word(self.data.as_ptr().cast()) {
                 return;
             }
             // Text and byte payloads have no destructor: their last owner
@@ -237,8 +254,8 @@ impl<T: ?Sized + ThinPayload> ThinWeak<T> {
         ManuallyDrop::new(unsafe { Weak::from_raw(T::pointer(self.data.as_ptr(), len)) })
     }
 
-    /// The payload's address, as [`ThinArc::addr`] reports it for a strong
-    /// owner of the same allocation.
+    /// The payload's address, as `Object::payload_addr` reports it for a
+    /// strong owner of the same allocation.
     pub fn addr(&self) -> usize {
         self.data.as_ptr() as usize
     }
@@ -254,7 +271,8 @@ impl<T: ?Sized + ThinPayload> ThinWeak<T> {
     /// view must never be dropped (it owns no reference to release).
     pub(crate) unsafe fn borrowed_arc(&self) -> ManuallyDrop<ThinArc<T>> {
         ManuallyDrop::new(ThinArc {
-            data: self.data,
+            // SAFETY: the counts precede the payload in the live allocation.
+            data: unsafe { NonNull::new_unchecked(self.data.as_ptr().sub(COUNT_WORDS)) },
             ownership: PhantomData,
         })
     }
@@ -551,7 +569,7 @@ impl ThinArc<StrStorage> {
             return false;
         }
         // SAFETY: a live strong owner's length word.
-        let old_len = unsafe { this.data.as_ptr().read() };
+        let old_len = unsafe { this.payload().read() };
         let Some(new_len) = old_len.checked_add(extra.len()) else {
             return false;
         };
@@ -579,7 +597,8 @@ impl ThinArc<StrStorage> {
         // payload, whose eventual `Arc` drop computes the new layout from
         // the new length.
         unsafe {
-            let base = this.data.as_ptr().cast::<u8>().sub(offset);
+            debug_assert_eq!(offset, COUNT_WORDS * size_of::<usize>());
+            let base = this.data.as_ptr().cast::<u8>();
             let grown = std::alloc::realloc(base, old_inner, new_inner.size());
             if grown.is_null() {
                 return false;
@@ -591,7 +610,7 @@ impl ThinArc<StrStorage> {
             (*raw).chars.store(new_chars, Ordering::Relaxed);
             let dst = ptr::addr_of_mut!((*raw).bytes).cast::<u8>();
             ptr::copy_nonoverlapping(extra.as_ptr(), dst.add(old_len), extra.len());
-            this.data = NonNull::new_unchecked(data);
+            this.data = NonNull::new_unchecked(grown.cast::<usize>());
         }
         true
     }
@@ -606,7 +625,7 @@ impl SharedStr {
     /// The allocation's address: equal for every strong and weak owner of
     /// the same string, and never reused while one exists.
     pub fn addr(this: &Self) -> usize {
-        this.0.data.as_ptr() as usize
+        this.0.payload() as usize
     }
     pub fn as_ptr(this: &Self) -> *const str {
         ptr::from_ref(&**this)

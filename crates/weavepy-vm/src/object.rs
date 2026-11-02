@@ -153,8 +153,10 @@ fn utf8_width(lead: u8) -> usize {
 /// `repr(u8)` fixes the layout native code relies on (see `frame_jit`):
 /// the variant's index in a tag byte at offset 0, and each payload at its
 /// natural alignment after it (every payload is one word or smaller).
-/// Every variant but the scalars holds one counted pointer in its second
-/// word, which `Clone` and [`Object::strong_word`] rely on.
+/// The scalars come first, so a tag below [`PLAIN_TAGS`] is one test for
+/// "owns nothing". Every other variant holds one counted pointer in its second
+/// word, addressing the strong count, which `Clone` and
+/// [`Object::strong_word`] rely on.
 #[repr(u8)]
 pub enum Object {
     None,
@@ -166,12 +168,12 @@ pub enum Object {
     Unbound,
     Bool(bool),
     Int(i64),
+    Float(f64),
     /// Arbitrary-precision integer (RFC 0019). Created on i64 overflow,
     /// large literals, or explicit `int.from_bytes(...)` /
     /// `int(...)` parsing of large strings. `Object::int_from_bigint`
     /// auto-demotes to `Int(i64)` when the value fits.
     Long(Rc<BigInt>),
-    Float(f64),
     /// Complex number with rectangular components (RFC 0019).
     Complex(Rc<PyComplex>),
     Str(SharedStr),
@@ -486,7 +488,7 @@ pub struct PyFrame {
     /// per-call provider *closure* with these plain fields: the
     /// closure was a separate allocation capturing seven `Rc` clones
     /// on every Python call.
-    pub cells: Rc<Vec<Rc<RefCell<Object>>>>,
+    pub cells: RefCell<Rc<Vec<Rc<RefCell<Object>>>>>,
     /// Class-body namespace (see `Frame::class_namespace`): when set,
     /// `f_locals` is this dict rather than a fast-locals snapshot.
     pub class_namespace: Option<Rc<RefCell<DictData>>>,
@@ -600,6 +602,47 @@ impl fmt::Debug for PyFrame {
     }
 }
 
+impl PyFrame {
+    /// Release the values this frame object holds, in the order a finished
+    /// frame releases them (see
+    /// [`crate::frame_slots::release_cells_and_locals`]): the locals' live
+    /// storage and the cells, then a snapshot the frame took ownership of as
+    /// it returned, the last entry first. (The snapshot lists the locals,
+    /// then the cells that aren't arguments and the free variables, as a
+    /// frame's slots are laid out; it holds the cells' values, so the cells
+    /// can go first.) Storage or a snapshot something else also holds is left
+    /// to its other holder, unless `shared_too` (`frame.clear()`) empties it
+    /// in place for everyone.
+    pub(crate) fn release_held_values(&self, shared_too: bool) {
+        let mut cells = self.cells.replace(empty_cells());
+        let mirror = self.locals_mirror.borrow().clone();
+        if let Some(mirror) = mirror {
+            // (This clone and the object's handle.)
+            if shared_too || Rc::strong_count(&mirror) == 2 {
+                // Out of the cell first: no borrow is held while they go.
+                let mut values = mirror.try_borrow_mut().map(|mut v| std::mem::take(&mut *v));
+                if let Ok(values) = &mut values {
+                    crate::frame_slots::release_cells_and_locals(&self.code, &mut cells, values);
+                }
+            }
+        }
+        drop(cells);
+        let cache = self.locals_cache.borrow().clone();
+        if let Some(Object::Dict(d)) = cache {
+            // (This clone and the object's handle.)
+            if shared_too || Rc::strong_count(&d) == 2 {
+                loop {
+                    // (Bound first: the borrow ends before the entry goes.)
+                    let entry = d.borrow_mut().pop();
+                    if entry.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Drop for PyFrame {
     fn drop(&mut self) {
         // A dead frame's locals die with its frame object, and CPython's
@@ -607,20 +650,7 @@ impl Drop for PyFrame {
         // down, before `f_back`: finalizers observe that order (the
         // innermost frame of a dropped traceback frees its last local
         // first).
-        if let Some(locals) = self.locals_mirror.get_mut().take() {
-            if Rc::strong_count(&locals) == 1 {
-                if let Ok(mut values) = locals.try_borrow_mut() {
-                    while let Some(value) = values.pop() {
-                        drop(values);
-                        drop(value);
-                        values = match locals.try_borrow_mut() {
-                            Ok(values) => values,
-                            Err(_) => break,
-                        };
-                    }
-                }
-            }
-        }
+        self.release_held_values(false);
         // Iteratively tear down the `back` chain. A plain recursive drop
         // would drop this frame's `back` Arc, whose own drop drops the
         // *next* frame's `back`, and so on — one native stack frame per
@@ -741,7 +771,7 @@ impl PyFrame {
             }
             if matches!(value, Object::Unbound) {
                 if let Some(idx) = cell_names.iter().position(|c| *c == name) {
-                    if let Some(cell) = self.cells.get(idx) {
+                    if let Some(cell) = self.cells.borrow().get(idx) {
                         let v = cell.borrow().clone();
                         if !matches!(v, Object::Unbound) {
                             d.insert(DictKey(Object::from_str(name.clone())), v);
@@ -762,7 +792,7 @@ impl PyFrame {
             if varnames.iter().any(|v| v == *name) {
                 continue;
             }
-            if let Some(cell) = self.cells.get(i) {
+            if let Some(cell) = self.cells.borrow().get(i) {
                 let v = cell.borrow().clone();
                 if !matches!(v, Object::Unbound) {
                     d.insert(DictKey(Object::from_str((*name).clone())), v);
@@ -829,7 +859,7 @@ impl PyFrame {
             .chain(self.code.freevars.iter())
             .position(|n| n == name)
         {
-            let v = self.cells.get(idx)?.borrow().clone();
+            let v = self.cells.borrow().get(idx)?.borrow().clone();
             return match v {
                 Object::Unbound => None,
                 other => Some(other),
@@ -864,7 +894,7 @@ impl PyFrame {
             .chain(self.code.freevars.iter())
             .position(|n| n == name)
         {
-            if let Some(cell) = self.cells.get(idx) {
+            if let Some(cell) = self.cells.borrow().get(idx) {
                 *cell.borrow_mut() = value;
                 return true;
             }
@@ -1196,6 +1226,15 @@ impl<T> FrameSlot<T> {
         }
     }
 
+    /// The value, if this slot holds a count on it.
+    fn owned_mut(&mut self) -> Option<&mut T> {
+        if *self.owned.get_mut() {
+            self.value.as_deref_mut()
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         if let Some(mut value) = self.value.take() {
             if *self.owned.get_mut() {
@@ -1240,11 +1279,38 @@ impl Drop for FrameShell {
         // not read through a dead link.
         if let Some(py) = self.materialized.get_mut().take() {
             py.unlink_live(self);
+            // The object may be the frame's last holder but for these, and
+            // releases its values in order as it dies (a traceback's entry
+            // that kept the shell).
+            self.cells.clear();
+            self.locals.clear();
+            return;
         }
+        self.release_departed_values();
     }
 }
 
 impl FrameShell {
+    /// A departed activation's values (see [`Self::depart`]), when this
+    /// shell turned out to be their last holder, as the frame object it
+    /// stood for would have released them.
+    fn release_departed_values(&mut self) {
+        let Some(locals) = self.locals.owned_mut() else {
+            return;
+        };
+        if Rc::strong_count(locals) != 1 {
+            return;
+        }
+        // SAFETY: the last handle: nothing else reaches the vector.
+        let values = unsafe { &mut *locals.as_ptr() };
+        match (self.code.value.as_deref(), self.cells.owned_mut()) {
+            (Some(code), Some(cells)) => {
+                crate::frame_slots::release_cells_and_locals(code, cells, values);
+            }
+            _ => crate::frame_slots::release_values(values),
+        }
+    }
+
     /// Make every borrowed slot own its value (see [`FrameSlot`]).
     pub(crate) fn upgrade_slots(&self) {
         self.code.upgrade();
@@ -1265,7 +1331,7 @@ impl FrameShell {
                     .clone()
                     .unwrap_or_else(|| Rc::new(RefCell::new(Vec::new()))),
             ),
-            cells: FrameSlot::new(py.cells.clone()),
+            cells: FrameSlot::new(py.cells.borrow().clone()),
             globals: FrameSlot::new(py.globals.clone()),
             builtins: FrameSlot::new(py.builtins.clone()),
             builtins_obj: None,
@@ -1322,7 +1388,7 @@ impl FrameShell {
             lasti: Cell::new(self.lasti.load(std::sync::atomic::Ordering::Relaxed)),
             back: RefCell::new(back),
             locals_cache: RefCell::new(None),
-            cells: self.cells.clone(),
+            cells: RefCell::new(self.cells.clone()),
             class_namespace: self.class_namespace.clone(),
             class_namespace_obj: self.class_namespace_obj.clone(),
             is_module_scope: self.code.name == "<module>",
@@ -5146,7 +5212,7 @@ pub struct PyFunction {
     /// current code's own interned names (see [`Self::code_names_kept`]).
     /// Cleared when `__code__` is rebound.
     pub names_kept: crate::sync::Cell<u64>,
-    /// The function's slot in the cycle collector's registry (see
+    /// Where the cycle collector holds the function (see
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,
 }
@@ -5159,7 +5225,15 @@ pub struct LazySlots(pub Option<Object>);
 /// A dying PyFunction clears the weak references watching it.
 impl Drop for PyFunction {
     fn drop(&mut self) {
+        crate::gc_trace::forget_dying_function(self);
         crate::weakref_registry::on_death(std::ptr::from_ref(self) as usize as u64);
+        // The closure goes the last cell first, as CPython's tuple does.
+        if !self.closure.is_empty() {
+            drop(self.closure_cells.take());
+            while let Some(cell) = self.closure.pop() {
+                drop(cell);
+            }
+        }
     }
 }
 
@@ -5628,8 +5702,8 @@ pub struct PyGenerator {
     /// finalizer (e.g. a PEP 525 hook that declined to close it) is
     /// not resurrected and re-finalized forever on the next drop.
     pub finalize_ran: crate::sync::Cell<bool>,
-    /// The generator's slot in the cycle collector's registry (see
-    /// [`crate::gc_trace::GcSlot`]); unregistered while it is still in a
+    /// Where the cycle collector holds the generator (see
+    /// [`crate::gc_trace::GcSlot`]): its registry slot, or its place in its
     /// young set.
     pub gc_slot: crate::gc_trace::GcSlot,
     /// Not yet handed to the collector: a coroutine an `await` started
@@ -5883,7 +5957,7 @@ pub(crate) fn recycle_generator(
         || std::sync::Arc::weak_count(&g) != 0
         || g.kind == CoroutineKind::AsyncGenerator
         || g.chain.get() != 0
-        || g.gc_slot.is_registered()
+        || g.gc_slot.get() != crate::gc_trace::NO_SLOT
         || crate::weakref_registry::may_have_weakrefs(std::sync::Arc::as_ptr(&g) as usize as u64)
     {
         return Err(g);
@@ -5921,7 +5995,7 @@ pub(crate) fn pooled_generator(
     let Some(g) = (unsafe { &mut *GEN_POOL.0.get() }).pop() else {
         return Err((code, frame));
     };
-    frame.gen_owner = Some(Rc::downgrade(&g));
+    frame.gen_owner = crate::GenOwner::of(&g);
     // SAFETY: a pooled generator is unique (see `recycle_generator`), and
     // the backlink just made can't be used before the generator is
     // returned.
@@ -5939,6 +6013,7 @@ pub(crate) fn pooled_generator(
 
 impl Drop for PyGenerator {
     fn drop(&mut self) {
+        crate::gc_trace::forget_dying_generator(self);
         // A suspended generator's `close()` (and a never-awaited
         // coroutine's warning) already ran: `rc::Rc`'s `Drop` queued the
         // generator for it at its last release. A created or suspended
@@ -6044,7 +6119,19 @@ fn defer_generator_state_drop(state: GeneratorState) {
         loop {
             let next = GEN_DROP_QUEUE.with(|q| q.borrow_mut().pop());
             match next {
-                Some(s) => drop(s),
+                Some(
+                    GeneratorState::Created(frame)
+                    | GeneratorState::Suspended(frame)
+                    | GeneratorState::Delegating(frame),
+                ) => {
+                    // (A parked native activation's values go as a frame's.)
+                    #[allow(unused_mut)]
+                    let mut frame = frame;
+                    #[cfg(feature = "jit")]
+                    crate::tier2::materialize_parked(&mut frame);
+                    crate::Interpreter::retire_detached_frame(frame);
+                }
+                Some(_) => {}
                 None => break,
             }
         }
@@ -10568,14 +10655,19 @@ impl PyIterator {
 // ---------- behavior ----------
 
 /// The variants whose second word is not a counted pointer (`None`,
-/// `Unbound`, `Bool`, `Int`, `Float`), by tag.
-const SCALAR_TAGS: u64 = 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 5;
+/// `Unbound`, `Bool`, `Int`, `Float`), the first of them all: one compare
+/// tells them apart from the rest, here and in compiled code.
+pub(crate) const PLAIN_TAGS: u8 = 5;
 
-/// The variants whose pointer is a [`ThinArc`]'s (`Str`, `WStr`, `Tuple`,
-/// `Bytes`): it addresses the payload, 16 bytes past the strong count
-/// (every payload is aligned to at most 16). Every other counted variant
-/// holds an `Rc`, whose `Arc` addresses its `ArcInner`, strong count first.
-const THIN_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 27;
+/// The bytes from a counted variant's pointer to its payload: an `Rc`'s
+/// `Arc` and a [`ThinArc`] both address the allocation's start, strong
+/// count first, then the weak count, then the payload (aligned to at most
+/// 16).
+const PAYLOAD_OFFSET: usize = 16;
+
+/// The counted variants that hold no objects and have no weak handle the
+/// collector tracks them by (`Str`, `WStr`, `Bytes`), by tag.
+const TEXT_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 27;
 
 impl Clone for Object {
     /// A new owner: the strong count (if any) bumped in place and the two
@@ -10603,28 +10695,28 @@ impl Object {
     /// for a scalar.
     #[inline(always)]
     pub(crate) fn strong_word(&self) -> Option<*const std::sync::atomic::AtomicUsize> {
-        let tag = u64::from(self.tag());
-        if (SCALAR_TAGS >> tag) & 1 != 0 {
+        if self.tag() < PLAIN_TAGS {
             return None;
         }
-        // SAFETY: a counted variant's second word is its pointer.
-        let p = unsafe { *std::ptr::from_ref(self).cast::<*const u8>().add(1) };
-        let back = ((THIN_TAGS >> tag) & 1) as usize * 16;
-        Some(p.wrapping_sub(back).cast())
+        // SAFETY: a counted variant's second word is its pointer, at its
+        // allocation's strong count.
+        Some(unsafe {
+            *std::ptr::from_ref(self)
+                .cast::<*const std::sync::atomic::AtomicUsize>()
+                .add(1)
+        })
     }
 
     /// The address of a counted variant's payload (what `id()` reports):
-    /// a [`ThinArc`] points at it, and an `Rc`'s `ArcInner` holds it
-    /// after the two counts. `None` for a scalar.
+    /// its allocation holds it after the two counts. `None` for a scalar.
     #[inline(always)]
     pub(crate) fn payload_addr(&self) -> Option<usize> {
-        let tag = u64::from(self.tag());
-        if (SCALAR_TAGS >> tag) & 1 != 0 {
+        if self.tag() < PLAIN_TAGS {
             return None;
         }
         // SAFETY: a counted variant's second word is its pointer.
         let p = unsafe { *std::ptr::from_ref(self).cast::<usize>().add(1) };
-        Some(p + (((THIN_TAGS >> tag) & 1) ^ 1) as usize * 16)
+        Some(p + PAYLOAD_OFFSET)
     }
 
     /// Whether the value is one the cycle collector never holds as a
@@ -10632,8 +10724,8 @@ impl Object {
     /// handle to track them by).
     #[inline(always)]
     pub(crate) fn never_gc_candidate(&self) -> bool {
-        const NEVER: u64 = SCALAR_TAGS | (THIN_TAGS & !(1 << 9));
-        (NEVER >> self.tag()) & 1 != 0
+        let tag = self.tag();
+        tag < PLAIN_TAGS || (TEXT_TAGS >> tag) & 1 != 0
     }
 
     /// Whether the value can never (transitively) reference another
@@ -12948,9 +13040,9 @@ fn fresh_nan_bits(v: f64) -> f64 {
 pub fn fresh_float(v: f64) -> Object {
     // Built as two whole words: the enum's constructor writes the tag as
     // a byte, and the 16-byte move that reads the value back stalls on
-    // store forwarding. `repr(u8)`: `Float` is variant 5, its payload in
+    // store forwarding. `repr(u8)`: `Float` is variant 4, its payload in
     // the second word.
-    const FLOAT_TAG: u64 = 5;
+    const FLOAT_TAG: u64 = 4;
     // SAFETY: two initialized words in exactly `Object::Float`'s layout.
     unsafe { std::mem::transmute::<[u64; 2], Object>([FLOAT_TAG, tag_nan(v).to_bits()]) }
 }
@@ -13288,15 +13380,59 @@ struct SipMemoEntry {
 
 const SIP_MEMO_SLOTS: usize = 512;
 
+/// A thread's SipHash memo, allocated when first used: every thread gets a
+/// copy of every thread-local's storage, whether it runs Python or not.
+struct SipMemo(std::cell::Cell<*mut SipMemoEntry>);
+
+impl SipMemo {
+    /// The memo's `SIP_MEMO_SLOTS` entries, or null when out of memory.
+    #[inline]
+    fn entries(&self) -> *mut SipMemoEntry {
+        let entries = self.0.get();
+        if entries.is_null() {
+            return self.allocate();
+        }
+        entries
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn allocate(&self) -> *mut SipMemoEntry {
+        // SAFETY: the layout has a non-zero size, and zeroed bytes are empty
+        // entries (`len` is `0`).
+        // (The layout is the entries' own, so the block is aligned for them.)
+        #[allow(clippy::cast_ptr_alignment)]
+        let entries = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<[SipMemoEntry; SIP_MEMO_SLOTS]>())
+        }
+        .cast::<SipMemoEntry>();
+        self.0.set(entries);
+        entries
+    }
+}
+
+impl Drop for SipMemo {
+    fn drop(&mut self) {
+        let entries = self.0.get();
+        if !entries.is_null() {
+            // SAFETY: allocated in `allocate` with this layout.
+            unsafe {
+                std::alloc::dealloc(
+                    entries.cast(),
+                    std::alloc::Layout::new::<[SipMemoEntry; SIP_MEMO_SLOTS]>(),
+                );
+            }
+        }
+    }
+}
+
 thread_local! {
     /// A direct-mapped memo of the SipHash of short byte strings, by
     /// content. With the seed pinned, a name hashed from a `&str` (a
     /// probe of a large dict by `StrKey`, a fresh string's first hash)
     /// costs a short compare instead of a SipHash run on a repeat; CPython
     /// gets the same effect from the hash cached in each interned name.
-    static SIP_MEMO: std::cell::UnsafeCell<[SipMemoEntry; SIP_MEMO_SLOTS]> = const {
-        std::cell::UnsafeCell::new([SipMemoEntry { len: 0, hash: 0, bytes: [0; SIP_MEMO_MAX] }; SIP_MEMO_SLOTS])
-    };
+    static SIP_MEMO: SipMemo = const { SipMemo(std::cell::Cell::new(std::ptr::null_mut())) };
 }
 
 /// `compute(bytes)`, remembered per thread for `bytes` of 1 to
@@ -13321,21 +13457,20 @@ fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
     let slot = ((fold ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize;
     // SAFETY (both accesses): this thread's memo, borrowed only for the
     // statement (nothing inside runs code that could reach it).
-    let hit = SIP_MEMO.try_with(|memo| {
-        let e = unsafe { &(*memo.get())[slot] };
-        (usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]))
-            .then_some(e.hash)
-    });
-    if let Ok(Some(h)) = hit {
-        return h;
+    let entries = SIP_MEMO
+        .try_with(SipMemo::entries)
+        .unwrap_or(std::ptr::null_mut());
+    if entries.is_null() {
+        return compute(bytes);
+    }
+    let e = unsafe { &mut *entries.add(slot) };
+    if usize::from(e.len) == n && crate::dictmap::key_bytes_eq(bytes, &e.bytes[..n]) {
+        return e.hash;
     }
     let h = compute(bytes);
-    let _ = SIP_MEMO.try_with(|memo| {
-        let e = unsafe { &mut (*memo.get())[slot] };
-        e.len = n as u8;
-        e.hash = h;
-        e.bytes[..n].copy_from_slice(bytes);
-    });
+    e.len = n as u8;
+    e.hash = h;
+    e.bytes[..n].copy_from_slice(bytes);
     h
 }
 
@@ -14630,7 +14765,7 @@ mod tests {
             (Object::Unbound, 1),
             (Object::Bool(true), 2),
             (Object::Int(7), 3),
-            (Object::Float(1.5), 5),
+            (Object::Float(1.5), 4),
             (Object::from_str("a fresh string".to_owned()), 7),
             (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
             (Object::new_bytes(vec![1, 2, 3]), 27),
@@ -14638,7 +14773,7 @@ mod tests {
             (Object::new_dict(), 11),
             (
                 Object::int_from_bigint(num_bigint::BigInt::from(1u8) << 100),
-                4,
+                5,
             ),
         ];
         for (v, tag) in &tags {

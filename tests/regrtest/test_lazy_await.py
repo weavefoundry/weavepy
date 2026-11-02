@@ -25,7 +25,7 @@ import unittest
 # The bodies compile after a few calls (WeavePy's frame JIT), so each case
 # reaches the lazily run body quickly.
 if sys.implementation.name == "weavepy" and "WEAVEPY_FRAME_JIT_HOT" not in os.environ:
-    env = dict(os.environ, WEAVEPY_FRAME_JIT_HOT="50")
+    env = dict(os.environ, WEAVEPY_FRAME_JIT_HOT="50", WEAVEPY_JIT_SYNC="1")
     sys.exit(subprocess.run([sys.executable, __file__, *sys.argv[1:]], env=env).returncode)
 
 WARM = 3000

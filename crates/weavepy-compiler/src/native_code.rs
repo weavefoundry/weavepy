@@ -8,15 +8,19 @@
 //! mismatch or malformed input as a cache miss.
 //!
 //! Filenames aren't stored: every code object in a cached module shares
-//! the module's filename, which the reader supplies. A module's name
-//! tables refer to its distinct identifiers by number after their first
-//! appearance, so the reader decodes and pools each identifier once.
+//! the module's filename, which the reader supplies. Code refers to its
+//! identifiers by number, in a section of the module's distinct identifiers.
 //!
-//! The layout: the version byte, the offset of the table section as four
-//! little-endian bytes, the module's code object, then the table section,
-//! which holds every code object's line, column and wire-mark tables in
-//! the order the code records their lengths. A reader copies the section
-//! whole and decodes a table only when something reads it.
+//! The layout: the version byte, the offsets of the table section and the
+//! identifier section as four little-endian bytes each, the module's code
+//! object, then those two sections. A code object is its header (what a
+//! function made from it needs), its body's length, and its body, which holds
+//! its nested code objects; a reader skips a body until something reads it
+//! (see `LazyBody`). The identifier section is the identifier count, the end
+//! of each identifier's text (all four little-endian bytes), and the text. The
+//! table section holds every code object's line, column and wire-mark tables,
+//! which a body refers to by offset and length; those decode when something
+//! reads them.
 
 use std::sync::Arc;
 
@@ -24,7 +28,7 @@ use crate::bytecode::{CacheTable, Instruction, OpCode};
 use crate::{CodeObject, ColSpan, Constant, ExcHandler, Name};
 
 /// The layout revision; bump it whenever the encoding changes.
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 8;
 
 /// Encode `code` (and its nested code objects). `None` for a code object
 /// the format doesn't carry: one with raw CPython wire overrides, or with
@@ -32,15 +36,21 @@ pub const VERSION: u8 = 7;
 pub fn encode(code: &CodeObject) -> Option<Vec<u8>> {
     let mut w = Writer::new(Vec::with_capacity(4096));
     w.byte(VERSION);
-    // The table section's offset, filled in below.
-    w.0.extend_from_slice(&[0; 4]);
+    // The sections' offsets, filled in below.
+    w.0.extend_from_slice(&[0; 8]);
     w.code(code)?;
-    let at = u32::try_from(w.0.len()).ok()?;
-    w.0[1..5].copy_from_slice(&at.to_le_bytes());
+    let names_at = u32::try_from(w.0.len()).ok()?;
+    w.0[5..9].copy_from_slice(&names_at.to_le_bytes());
+    w.name_section()?;
+    let tables_at = u32::try_from(w.0.len()).ok()?;
+    w.0[1..5].copy_from_slice(&tables_at.to_le_bytes());
     let tables = std::mem::take(&mut w.2);
     w.0.extend_from_slice(&tables);
     Some(w.0)
 }
+
+/// The length of what precedes the module's code object.
+const PREAMBLE: usize = 9;
 
 /// The most instructions a code object's position tables may describe:
 /// a run-length encoded table could otherwise ask for any length.
@@ -105,91 +115,208 @@ pub(crate) fn decode_wire_marks(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Decode what [`encode`] wrote, stamping `filename` on every code
 /// object. `None` for input it didn't write (or a different version's).
 ///
-/// The code objects share one copy of the filename, and one buffer
-/// holds all their line and column tables and wire marks (see
-/// `LineTable`).
+/// This reads every body to check it, keeping none (a body decodes again
+/// when read). [`decode_lazily`] takes the input on trust instead.
 pub fn decode(bytes: &[u8], filename: &str) -> Option<CodeObject> {
-    let at = tables_at(bytes)?;
-    let tables = crate::TableBuffer::new(Box::<[u8]>::from(bytes.get(at..)?));
-    decode_split(&bytes[..at], tables, filename)
+    let decoded = decode_lazily(crate::TableBuffer::new(Box::<[u8]>::from(bytes)), filename)?;
+    check_nested(&decoded)?;
+    Some(decoded)
 }
 
-/// Where the table section of what [`encode`] wrote starts, from its
-/// first five bytes (or more); `None` for input it didn't write.
-pub fn tables_at(bytes: &[u8]) -> Option<usize> {
-    if bytes.first() != Some(&VERSION) {
-        return None;
+/// Check every nested body of `code`, whose own body is decoded.
+fn check_nested(code: &CodeObject) -> Option<()> {
+    fn check_constant(k: &Constant) -> Option<()> {
+        match k {
+            Constant::Code(c) => {
+                c.body.try_decode(&c.filename).then_some(())?;
+                check_nested(c)
+            }
+            Constant::Tuple(items) | Constant::FrozenSet(items) => {
+                items.iter().try_for_each(check_constant)
+            }
+            Constant::Slice(parts) => {
+                check_constant(&parts.0)?;
+                check_constant(&parts.1)?;
+                check_constant(&parts.2)
+            }
+            _ => Some(()),
+        }
     }
-    let at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
-    (at >= 5).then_some(at)
+    code.constants.iter().try_for_each(check_constant)
 }
 
-/// [`decode`] for input split at [`tables_at`]: `code` is what comes
-/// before the table section and `tables` holds the section, which the
-/// decoded code objects keep, reading a table from it only when
-/// something asks for that table.
-pub fn decode_split(code: &[u8], tables: crate::TableBuffer, filename: &str) -> Option<CodeObject> {
-    if tables_at(code)? != code.len() {
-        return None;
-    }
-    let tables_len = tables.bytes().len();
+/// Decode what [`encode`] wrote from `buffer`, which the code objects keep:
+/// the module's own body now, as it's about to run, and each nested one when
+/// something first reads it. `None` for input it didn't write, as far as this
+/// reads it. A later body that doesn't decode is a fatal error (see
+/// `CodeObject::decode_body`), so `buffer` must hold a whole artifact of this
+/// version, unchanged since it was written.
+pub fn decode_lazily(buffer: crate::TableBuffer, filename: &str) -> Option<CodeObject> {
+    let buffer = Arc::new(buffer);
+    let mut decoded = None;
+    buffer.read(&mut |bytes| decoded = decode_root(&buffer, bytes, filename));
+    decoded
+}
+
+fn decode_root(
+    buffer: &Arc<crate::TableBuffer>,
+    bytes: &[u8],
+    filename: &str,
+) -> Option<CodeObject> {
+    let module = Module::new(buffer, bytes, Arc::from(filename))?;
     let mut r = Reader {
-        bytes: &code[5..],
-        pos: 0,
+        bytes,
+        pos: PREAMBLE,
     };
-    let mut module = Module {
-        filename: Arc::from(filename),
-        buffer: Arc::new(tables),
-        tables_len,
-        next: 0,
-        names: Vec::new(),
+    let root = r.code(&module, 0)?;
+    if r.pos != module.names_at {
+        return None;
+    }
+    let body = match &root.body.source {
+        Some((_, at)) => {
+            let mut r = Reader {
+                bytes,
+                pos: *at as usize,
+            };
+            r.body(&module)?
+        }
+        None => return None,
     };
-    let decoded = r.code(&mut module, 0)?;
-    (r.pos == r.bytes.len() && module.next == tables_len).then_some(decoded)
+    Some(CodeObject {
+        body: body.into(),
+        ..root
+    })
 }
 
-/// What the code objects of one module decoded by [`decode`] share.
-struct Module {
+/// Decode the body at `at` of the module `buffer` holds (see `LazyBody`).
+pub(crate) fn decode_body(
+    buffer: &Arc<crate::TableBuffer>,
+    at: u32,
+    filename: &Arc<str>,
+) -> Option<crate::CodeBody> {
+    let mut decoded = None;
+    buffer.read(&mut |bytes| {
+        decoded = Module::new(buffer, bytes, filename.clone()).and_then(|module| {
+            let mut r = Reader {
+                bytes,
+                pos: at as usize,
+            };
+            r.body(&module)
+        });
+    });
+    decoded
+}
+
+/// What the code objects of one module share.
+struct Module<'a> {
     filename: Arc<str>,
-    /// The table section (see the module docs).
-    buffer: Arc<crate::TableBuffer>,
-    /// The section's length, and where its next table starts.
-    tables_len: usize,
-    next: usize,
-    /// The module's identifiers so far, in order of first appearance
-    /// (see [`Writer::names`]).
-    names: Vec<Name>,
+    buffer: &'a Arc<crate::TableBuffer>,
+    /// The bytes being read (`buffer`'s, perhaps through a view of them).
+    bytes: &'a [u8],
+    /// Where the sections start, and the input's whole length.
+    names_at: usize,
+    tables_at: usize,
+    len: usize,
 }
 
-impl Module {
-    /// The table section's next `len` bytes.
-    fn table(&mut self, len: usize) -> Option<crate::Encoded> {
-        let start = self.next;
-        let end = start
-            .checked_add(len)
-            .filter(|&end| end <= self.tables_len)?;
-        self.next = end;
+impl<'a> Module<'a> {
+    fn new(
+        buffer: &'a Arc<crate::TableBuffer>,
+        bytes: &'a [u8],
+        filename: Arc<str>,
+    ) -> Option<Self> {
+        if bytes.first() != Some(&VERSION) {
+            return None;
+        }
+        let tables_at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
+        let names_at = u32::from_le_bytes(bytes.get(5..9)?.try_into().ok()?) as usize;
+        (PREAMBLE <= names_at && names_at <= tables_at && tables_at <= bytes.len()).then_some(
+            Module {
+                filename,
+                buffer,
+                bytes,
+                names_at,
+                tables_at,
+                len: bytes.len(),
+            },
+        )
+    }
+
+    /// The table of `len` bytes at `start` in the table section.
+    fn table(&self, start: usize, len: usize) -> Option<crate::Encoded> {
+        let begin = start.checked_add(self.tables_at)?;
+        let end = begin.checked_add(len).filter(|&end| end <= self.len)?;
         Some(crate::Encoded::new(
             self.buffer.clone(),
-            u32::try_from(start).ok()?,
+            u32::try_from(begin).ok()?,
             u32::try_from(end).ok()?,
         ))
     }
+
+    /// The text of the identifier numbered `i` (see the module docs).
+    fn identifier(&self, i: usize) -> Option<&'a str> {
+        let bytes = self.bytes;
+        let word = |at: usize| -> Option<usize> {
+            let b = bytes.get(at..at.checked_add(4)?)?;
+            Some(u32::from_le_bytes(b.try_into().ok()?) as usize)
+        };
+        let count = word(self.names_at)?;
+        if i >= count {
+            return None;
+        }
+        let ends = self.names_at + 4;
+        let text = ends.checked_add(count.checked_mul(4)?)?;
+        let start = if i == 0 { 0 } else { word(ends + (i - 1) * 4)? };
+        let end = word(ends + i * 4)?;
+        let range = text.checked_add(start)?..text.checked_add(end)?;
+        if range.end > self.tables_at {
+            return None;
+        }
+        std::str::from_utf8(bytes.get(range)?).ok()
+    }
 }
 
-/// The output, the number of each identifier written so far (see
-/// [`Writer::names`]), and the table section (see the module docs).
-struct Writer(Vec<u8>, std::collections::HashMap<String, u32>, Vec<u8>);
+/// The output, the identifiers written so far in order, with the number of
+/// each (see [`Writer::names`]), and the table section (see the module docs).
+struct Writer(
+    Vec<u8>,
+    std::collections::HashMap<String, u32>,
+    Vec<u8>,
+    Vec<String>,
+);
 
 impl Writer {
     fn new(out: Vec<u8>) -> Self {
-        Writer(out, std::collections::HashMap::new(), Vec::new())
+        Writer(
+            out,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
-    /// Move a table into the table section, recording its length.
+    /// Move a table into the table section, recording where it went.
     fn table(&mut self, table: Vec<u8>) {
+        self.uint(self.2.len() as u64);
         self.uint(table.len() as u64);
         self.2.extend_from_slice(&table);
+    }
+
+    /// Write the identifier section (see the module docs).
+    fn name_section(&mut self) -> Option<()> {
+        let names = std::mem::take(&mut self.3);
+        self.0
+            .extend_from_slice(&u32::try_from(names.len()).ok()?.to_le_bytes());
+        let mut end = 0usize;
+        for name in &names {
+            end += name.len();
+            self.0
+                .extend_from_slice(&u32::try_from(end).ok()?.to_le_bytes());
+        }
+        for name in &names {
+            self.0.extend_from_slice(name.as_bytes());
+        }
+        Some(())
     }
 
     fn byte(&mut self, b: u8) {
@@ -223,14 +350,16 @@ impl Writer {
     /// An identifier: its number plus one when the module wrote it
     /// before, else a zero and its text (which gives it the next number).
     fn name(&mut self, s: &Name) {
-        if let Some(&i) = self.1.get(s.as_str()) {
-            self.uint(u64::from(i) + 1);
-        } else {
-            let i = self.1.len() as u32;
-            self.1.insert(s.as_str().to_owned(), i);
-            self.uint(0);
-            self.bytes(s.as_bytes());
-        }
+        let i = match self.1.get(s.as_str()) {
+            Some(&i) => i,
+            None => {
+                let i = self.3.len() as u32;
+                self.1.insert(s.as_str().to_owned(), i);
+                self.3.push(s.as_str().to_owned());
+                i
+            }
+        };
+        self.uint(u64::from(i));
     }
 
     /// A name table: its length, then its identifiers (see [`Self::name`]).
@@ -301,6 +430,40 @@ impl Writer {
         }
         self.name(&c.name);
         self.name(&c.qualname);
+        self.uint(u64::from(c.arg_count));
+        self.uint(u64::from(c.posonly_count));
+        self.uint(u64::from(c.kwonly_count));
+        let flags = [
+            c.has_varargs,
+            c.has_varkeywords,
+            c.is_class_body,
+            c.is_generator,
+            c.is_coroutine,
+            c.is_async_generator,
+            c.is_iterable_coroutine,
+            c.has_docstring,
+            c.is_method,
+            c.is_nested,
+            c.annotate_scope,
+        ];
+        let bits = flags
+            .iter()
+            .enumerate()
+            .fold(0u64, |acc, (i, &f)| acc | (u64::from(f) << i));
+        self.uint(bits);
+        self.uint(u64::from(c.future_flags));
+        self.uint(c.stacksize.map_or(0, |s| u64::from(s) + 1));
+        // The body, with its length first (the reader's way past it).
+        let outer = std::mem::take(&mut self.0);
+        let written = self.body(c);
+        let body = std::mem::replace(&mut self.0, outer);
+        written?;
+        self.uint(body.len() as u64);
+        self.0.extend_from_slice(&body);
+        Some(())
+    }
+
+    fn body(&mut self, c: &CodeObject) -> Option<()> {
         self.uint(c.instructions.len() as u64);
         for ins in &c.instructions {
             self.byte(ins.op as u8);
@@ -329,29 +492,6 @@ impl Writer {
         let mut cols = Writer::new(Vec::new());
         cols.col_runs(&c.coltable)?;
         self.table(cols.0);
-        self.uint(u64::from(c.arg_count));
-        self.uint(u64::from(c.posonly_count));
-        self.uint(u64::from(c.kwonly_count));
-        let flags = [
-            c.has_varargs,
-            c.has_varkeywords,
-            c.is_class_body,
-            c.is_generator,
-            c.is_coroutine,
-            c.is_async_generator,
-            c.is_iterable_coroutine,
-            c.has_docstring,
-            c.is_method,
-            c.is_nested,
-            c.annotate_scope,
-        ];
-        let bits = flags
-            .iter()
-            .enumerate()
-            .fold(0u64, |acc, (i, &f)| acc | (u64::from(f) << i));
-        self.uint(bits);
-        self.uint(u64::from(c.future_flags));
-        self.uint(c.stacksize.map_or(0, |s| u64::from(s) + 1));
         self.u32s(c.no_interrupt_jumps());
         // (No table at all for code without marks.)
         let mut marks = Writer::new(Vec::new());
@@ -510,25 +650,13 @@ impl Reader<'_> {
     }
 
     /// An identifier [`Writer::name`] wrote.
-    fn name(&mut self, module: &mut Module) -> Option<Name> {
-        self.name_as(module, Name::new)
-    }
-
-    /// An identifier [`Writer::name`] wrote, made with `make` (pooled or
-    /// not) if this is its first appearance.
-    fn name_as(&mut self, module: &mut Module, make: fn(&str) -> Name) -> Option<Name> {
-        Some(match self.uint()? {
-            0 => {
-                let name = make(std::str::from_utf8(self.raw()?).ok()?);
-                module.names.push(name.clone());
-                name
-            }
-            i => module.names.get(usize::try_from(i - 1).ok()?)?.clone(),
-        })
+    fn name(&mut self, module: &Module) -> Option<Name> {
+        let i = usize::try_from(self.uint()?).ok()?;
+        Some(Name::new(module.identifier(i)?))
     }
 
     /// A name table [`Writer::names`] wrote.
-    fn names(&mut self, module: &mut Module) -> Option<Vec<Name>> {
+    fn names(&mut self, module: &Module) -> Option<Vec<Name>> {
         let n = self.len()?;
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
@@ -569,11 +697,12 @@ impl Reader<'_> {
         Some(())
     }
 
-    /// The next table of the module's table section (see the module
-    /// docs), left encoded.
-    fn table(&mut self, module: &mut Module) -> Option<crate::Encoded> {
+    /// A table of the module's table section (see the module docs), left
+    /// encoded.
+    fn table(&mut self, module: &Module) -> Option<crate::Encoded> {
+        let start = usize::try_from(self.uint()?).ok()?;
         let len = usize::try_from(self.uint()?).ok()?;
-        module.table(len)
+        module.table(start, len)
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -582,13 +711,57 @@ impl Reader<'_> {
         Some(f64::from_bits(u64::from_le_bytes(b.try_into().ok()?)))
     }
 
-    fn code(&mut self, module: &mut Module, depth: u32) -> Option<CodeObject> {
+    /// A code object's header; its body stays encoded.
+    fn code(&mut self, module: &Module, depth: u32) -> Option<CodeObject> {
         if depth > MAX_NESTING {
             return None;
         }
-        let name = self.name(module)?;
+        let name_at = usize::try_from(self.uint()?).ok()?;
+        let name = Name::new(module.identifier(name_at)?);
         // (A qualified name other than a plain name is seldom shared.)
-        let qualname = self.name_as(module, Name::unpooled)?;
+        let qualname_at = usize::try_from(self.uint()?).ok()?;
+        let qualname = if qualname_at == name_at {
+            name.clone()
+        } else {
+            Name::unpooled(module.identifier(qualname_at)?)
+        };
+        let arg_count = self.u32()?;
+        let posonly_count = self.u32()?;
+        let kwonly_count = self.u32()?;
+        let bits = self.uint()?;
+        let flag = |i: u32| bits & (1 << i) != 0;
+        let future_flags = self.u32()?;
+        let stacksize = self.u32()?.checked_sub(1);
+        let body_len = self.len()?;
+        let at = u32::try_from(self.pos).ok()?;
+        self.pos += body_len;
+        Some(CodeObject {
+            name,
+            qualname,
+            filename: module.filename.clone(),
+            arg_count,
+            posonly_count,
+            kwonly_count,
+            has_varargs: flag(0),
+            has_varkeywords: flag(1),
+            is_class_body: flag(2),
+            is_generator: flag(3),
+            is_coroutine: flag(4),
+            is_async_generator: flag(5),
+            is_iterable_coroutine: flag(6),
+            has_docstring: flag(7),
+            is_method: flag(8),
+            is_nested: flag(9),
+            annotate_scope: flag(10),
+            future_flags,
+            stacksize,
+            body: crate::LazyBody::encoded(module.buffer.clone(), at),
+            ..CodeObject::default()
+        })
+    }
+
+    /// A code object's body.
+    fn body(&mut self, module: &Module) -> Option<crate::CodeBody> {
         let n = self.len()?;
         let mut instructions = Vec::with_capacity(n);
         for _ in 0..n {
@@ -598,7 +771,7 @@ impl Reader<'_> {
         let n = self.len()?;
         let mut constants = Vec::with_capacity(n);
         for _ in 0..n {
-            constants.push(self.constant(module, depth)?);
+            constants.push(self.constant(module, 0)?);
         }
         let names = self.names(module)?;
         let varnames = self.names(module)?;
@@ -617,13 +790,6 @@ impl Reader<'_> {
         }
         let linetable = crate::LineTable::encoded(self.table(module)?);
         let coltable = crate::ColTable::encoded(self.table(module)?);
-        let arg_count = self.u32()?;
-        let posonly_count = self.u32()?;
-        let kwonly_count = self.u32()?;
-        let bits = self.uint()?;
-        let flag = |i: u32| bits & (1 << i) != 0;
-        let future_flags = self.u32()?;
-        let stacksize = self.u32()?.checked_sub(1);
         let no_interrupt_jumps = self.u32s()?;
         let marks = self.table(module)?;
         let wire_marks = if marks.is_empty() {
@@ -637,10 +803,7 @@ impl Reader<'_> {
             hidden_locals: self.strs()?,
             const_identifiers: self.strs()?,
         });
-        Some(CodeObject {
-            name,
-            qualname,
-            filename: module.filename.clone(),
+        Some(crate::CodeBody {
             caches: CacheTable::with_len(instructions.len()),
             instructions,
             constants,
@@ -651,29 +814,13 @@ impl Reader<'_> {
             exception_table,
             linetable,
             coltable,
-            arg_count,
-            posonly_count,
-            kwonly_count,
-            has_varargs: flag(0),
-            has_varkeywords: flag(1),
-            is_class_body: flag(2),
-            is_generator: flag(3),
-            is_coroutine: flag(4),
-            is_async_generator: flag(5),
-            is_iterable_coroutine: flag(6),
-            has_docstring: flag(7),
-            is_method: flag(8),
-            is_nested: flag(9),
-            annotate_scope: flag(10),
-            future_flags,
-            stacksize,
             wire_marks,
             rare,
-            ..CodeObject::default()
+            ..crate::CodeBody::default()
         })
     }
 
-    fn constant(&mut self, module: &mut Module, depth: u32) -> Option<Constant> {
+    fn constant(&mut self, module: &Module, depth: u32) -> Option<Constant> {
         Some(match self.byte()? {
             0 => Constant::None,
             1 => Constant::Bool(false),
@@ -719,55 +866,63 @@ mod tests {
             name: "f".into(),
             qualname: "C.f".into(),
             filename: "m.py".into(),
-            instructions: vec![
-                Instruction::new(OpCode::Resume, 0),
-                Instruction::new(OpCode::LoadConst, 300),
-                Instruction::new(OpCode::ReturnValue, 0),
-            ],
-            constants: vec![Constant::Int(-5)],
-            varnames: vec!["x".into()],
-            linetable: vec![1, 2, 2].into(),
-            coltable: vec![ColSpan::default(); 3].into(),
             arg_count: 1,
             is_generator: true,
             is_nested: true,
             stacksize: Some(3),
+            body: crate::CodeBody {
+                instructions: vec![
+                    Instruction::new(OpCode::Resume, 0),
+                    Instruction::new(OpCode::LoadConst, 300),
+                    Instruction::new(OpCode::ReturnValue, 0),
+                ],
+                constants: vec![Constant::Int(-5)],
+                varnames: vec!["x".into()],
+                linetable: vec![1, 2, 2].into(),
+                coltable: vec![ColSpan::default(); 3].into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         let mut code = CodeObject {
             name: "<module>".into(),
             qualname: "<module>".into(),
             filename: "m.py".into(),
-            instructions: vec![Instruction::new(OpCode::Nop, 0)],
-            constants: vec![
-                Constant::None,
-                Constant::Bool(true),
-                Constant::Int(i64::MIN),
-                Constant::BigInt(num_bigint::BigInt::from(-1) << 100),
-                Constant::Float(-0.0),
-                Constant::Complex(1.5, f64::INFINITY),
-                Constant::Str("héllo".to_owned()),
-                Constant::WStr(vec![0x61, 0xd800]),
-                Constant::Bytes(vec![0, 255]),
-                Constant::Tuple(vec![Constant::Ellipsis, Constant::Str(String::new())]),
-                Constant::FrozenSet(vec![Constant::Int(1)]),
-                Constant::Slice(Box::new((
-                    Constant::Int(1),
-                    Constant::None,
-                    Constant::Int(-1),
-                ))),
-                Constant::Code(Arc::new(inner)),
-            ],
-            names: vec!["print".into()],
-            exception_table: vec![ExcHandler {
-                start: 0,
-                end: 1,
-                handler: 1,
-                depth: 2,
-                push_lasti: true,
-            }],
-            wire_marks: vec![0, 3].into(),
             future_flags: 0x100,
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0)],
+                constants: vec![
+                    Constant::None,
+                    Constant::Bool(true),
+                    Constant::Int(i64::MIN),
+                    Constant::BigInt(num_bigint::BigInt::from(-1) << 100),
+                    Constant::Float(-0.0),
+                    Constant::Complex(1.5, f64::INFINITY),
+                    Constant::Str("héllo".to_owned()),
+                    Constant::WStr(vec![0x61, 0xd800]),
+                    Constant::Bytes(vec![0, 255]),
+                    Constant::Tuple(vec![Constant::Ellipsis, Constant::Str(String::new())]),
+                    Constant::FrozenSet(vec![Constant::Int(1)]),
+                    Constant::Slice(Box::new((
+                        Constant::Int(1),
+                        Constant::None,
+                        Constant::Int(-1),
+                    ))),
+                    Constant::Code(Arc::new(inner)),
+                ],
+                names: vec!["print".into()],
+                exception_table: vec![ExcHandler {
+                    start: 0,
+                    end: 1,
+                    handler: 1,
+                    depth: 2,
+                    push_lasti: true,
+                }],
+                wire_marks: vec![0, 3].into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         code.rare.set(crate::RareFields {
@@ -789,10 +944,14 @@ mod tests {
     #[test]
     fn encoded_tables_clone_and_mutate_independently() {
         let code = CodeObject {
-            instructions: vec![Instruction::new(OpCode::Nop, 0); 3],
-            linetable: vec![1, 2, 2].into(),
-            coltable: vec![ColSpan::default(); 3].into(),
-            wire_marks: vec![0, 3, 0].into(),
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0); 3],
+                linetable: vec![1, 2, 2].into(),
+                coltable: vec![ColSpan::default(); 3].into(),
+                wire_marks: vec![0, 3, 0].into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         let back = decode(&encode(&code).expect("encodable"), "m.py").expect("decodable");
@@ -838,10 +997,14 @@ mod tests {
         ];
         let marks = vec![0, 3, 8, 0, 0, 1, 15, 0, 2];
         let code = CodeObject {
-            instructions: vec![Instruction::new(OpCode::Nop, 0); lines.len()],
-            linetable: lines.clone().into(),
-            coltable: cols.clone().into(),
-            wire_marks: marks.clone().into(),
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0); lines.len()],
+                linetable: lines.clone().into(),
+                coltable: cols.clone().into(),
+                wire_marks: marks.clone().into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         let back = decode(&encode(&code).expect("encodable"), "m.py").expect("decodable");
@@ -850,18 +1013,72 @@ mod tests {
         assert_eq!(*back.wire_marks, marks);
         // A mark wider than four bits has no encoding.
         let wide = CodeObject {
-            wire_marks: vec![16].into(),
+            body: crate::CodeBody {
+                wire_marks: vec![16].into(),
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         assert!(encode(&wide).is_none());
     }
 
     #[test]
+    fn nested_bodies_decode_when_first_read() {
+        let inner = CodeObject {
+            name: "f".into(),
+            qualname: "f".into(),
+            arg_count: 2,
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0)],
+                varnames: vec!["a".into(), "b".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..CodeObject::default()
+        };
+        let code = CodeObject {
+            name: "<module>".into(),
+            body: crate::CodeBody {
+                constants: vec![Constant::Code(Arc::new(inner.clone()))],
+                ..Default::default()
+            }
+            .into(),
+            ..CodeObject::default()
+        };
+        let bytes = encode(&code).expect("encodable");
+        let buffer = crate::TableBuffer::new(bytes.into_boxed_slice());
+        let root = decode_lazily(buffer, "m.py").expect("decodable");
+        assert!(root.body_decoded());
+        let Some(Constant::Code(nested)) = root.constants.first() else {
+            panic!("nested code object expected");
+        };
+        // A function needs only the header.
+        assert_eq!(nested.name, "f");
+        assert!(Arc::ptr_eq(&root.filename, &nested.filename));
+        assert_eq!(nested.arg_count, 2);
+        assert!(!nested.body_decoded());
+        // A clone decodes on its own.
+        let clone = (**nested).clone();
+        assert!(!clone.body_decoded());
+        assert_eq!(clone.varnames.len(), 2);
+        assert!(clone.body_decoded() && !nested.body_decoded());
+        // The first read of a body field decodes the body.
+        assert_eq!(nested.instructions.len(), 1);
+        assert!(nested.body_decoded());
+        assert_eq!(nested.varnames, inner.varnames);
+    }
+
+    #[test]
     fn rejects_truncated_or_foreign_input() {
         let code = CodeObject {
             name: "<module>".into(),
-            instructions: vec![Instruction::new(OpCode::Nop, 0)],
-            constants: vec![Constant::Str("x".repeat(40))],
+            body: crate::CodeBody {
+                instructions: vec![Instruction::new(OpCode::Nop, 0)],
+                constants: vec![Constant::Str("x".repeat(40))],
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         };
         let bytes = encode(&code).expect("encodable");
@@ -872,7 +1089,11 @@ mod tests {
         other[0] = VERSION + 1;
         assert!(decode(&other, "").is_none());
         assert!(encode(&CodeObject {
-            constants: vec![Constant::Unmarshallable],
+            body: crate::CodeBody {
+                constants: vec![Constant::Unmarshallable],
+                ..Default::default()
+            }
+            .into(),
             ..CodeObject::default()
         })
         .is_none());

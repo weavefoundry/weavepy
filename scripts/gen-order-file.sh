@@ -5,6 +5,9 @@
 # crates/weavepy-cli/build.rs hands the file to the macOS linker
 # (`-order_file`), so start-up touches a few contiguous megabytes of
 # code instead of pages scattered across the whole text segment.
+# (scripts/extend-order-file.py then adds what callgrind profiles of
+# start-up and the workloads run, which also serves Linux; the linker
+# wrapper, scripts/link-ordered.py, remaps the names onto each build's.)
 #
 # Needs the `llvm-tools` rustup component and python3. Takes one
 # instrumented release build (in target/order/, kept apart from

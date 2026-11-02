@@ -1741,36 +1741,43 @@ impl<'a> MarshalReader<'a> {
             name: co_name.into(),
             qualname: co_qualname.into(),
             filename: string_of(&filename, "co_filename")?.into(),
-            caches: CacheTable::with_len(decoded.instructions.len()),
+            body: weavepy_compiler::CodeBody {
+                caches: CacheTable::with_len(decoded.instructions.len()),
+                instructions: decoded.instructions,
+                constants,
+                names: tuple_of_strings(&names, "co_names")?
+                    .iter()
+                    .map(weavepy_compiler::Name::from)
+                    .collect(),
+                varnames: decoded
+                    .varnames
+                    .iter()
+                    .map(weavepy_compiler::Name::from)
+                    .collect(),
+                freevars: decoded
+                    .freevars
+                    .iter()
+                    .map(weavepy_compiler::Name::from)
+                    .collect(),
+                cellvars: decoded
+                    .cellvars
+                    .iter()
+                    .map(weavepy_compiler::Name::from)
+                    .collect(),
+                exception_table: decoded.exception_table,
+                linetable: decoded.linetable.into(),
+                // PEP-657 columns recovered from long-form location entries
+                // (RFC 0056 WS4): traceback caret underlines survive the
+                // `.pyc` round-trip.
+                coltable: decoded.coltable.into(),
+                cp_cache: cpython_code::CpCache::default(),
+                wire: None,
+                wire_marks: decoded.wire_marks.into(),
+                rare: weavepy_compiler::CodeRare::default(),
+            }
+            .into(),
             vm_ext: weavepy_compiler::VmExt::default(),
             jit_hint: weavepy_compiler::JitHint::default(),
-            instructions: decoded.instructions,
-            constants,
-            names: tuple_of_strings(&names, "co_names")?
-                .iter()
-                .map(weavepy_compiler::Name::from)
-                .collect(),
-            varnames: decoded
-                .varnames
-                .iter()
-                .map(weavepy_compiler::Name::from)
-                .collect(),
-            freevars: decoded
-                .freevars
-                .iter()
-                .map(weavepy_compiler::Name::from)
-                .collect(),
-            cellvars: decoded
-                .cellvars
-                .iter()
-                .map(weavepy_compiler::Name::from)
-                .collect(),
-            exception_table: decoded.exception_table,
-            linetable: decoded.linetable.into(),
-            // PEP-657 columns recovered from long-form location entries
-            // (RFC 0056 WS4): traceback caret underlines survive the
-            // `.pyc` round-trip.
-            coltable: decoded.coltable.into(),
             arg_count,
             posonly_count,
             kwonly_count,
@@ -1785,11 +1792,7 @@ impl<'a> MarshalReader<'a> {
             is_method: flags & CO_METHOD != 0,
             is_nested: flags & CO_NESTED != 0,
             future_flags: flags & weavepy_compiler::flags::PYCF_MASK,
-            cp_cache: cpython_code::CpCache::default(),
-            wire: None,
             stacksize: u32::try_from(stacksize).ok(),
-            wire_marks: decoded.wire_marks.into(),
-            rare: weavepy_compiler::CodeRare::default(),
             annotate_scope: false,
         };
         co.rare.set(weavepy_compiler::RareFields {

@@ -427,9 +427,9 @@ impl Registry {
     }
 }
 
-fn registry() -> &'static parking_lot::Mutex<Registry> {
-    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<Registry>> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| parking_lot::Mutex::new(Registry::default()))
+fn registry() -> &'static RefCell<Registry> {
+    static REGISTRY: std::sync::OnceLock<RefCell<Registry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| RefCell::new(Registry::default()))
 }
 
 /// The hidden slot holding an instance's registry handle. Slot storage
@@ -442,7 +442,7 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
         this: Rc::downgrade(inst),
         ..FutState::default()
     }));
-    let handle = registry().lock().insert(st.clone());
+    let handle = registry().borrow_mut().insert(st.clone());
     inst.slots
         .borrow_mut()
         .insert(HANDLE_KEY, Object::Int(handle));
@@ -478,7 +478,12 @@ fn handle_of(inst: &PyInstance) -> Option<i64> {
 /// creating one. Safe to call from GC callbacks.
 fn existing_state_of(inst: &PyInstance) -> Option<Rc<RefCell<FutState>>> {
     let h = handle_of(inst)?;
-    registry().lock().get(h).cloned()
+    let reg = registry();
+    // SAFETY: a read that runs no code.
+    match unsafe { reg.peek() } {
+        Some(r) => r.get(h).cloned(),
+        None => reg.borrow().get(h).cloned(),
+    }
 }
 
 /// The state cell for a Future/Task instance, creating a default
@@ -619,7 +624,7 @@ fn release_state(inst: &PyInstance) {
             *slot = Object::None;
         }
     }
-    let released = registry().lock().remove(h);
+    let released = registry().borrow_mut().remove(h);
     drop(released);
 }
 
@@ -982,7 +987,7 @@ fn unregister_eager_task_impl(interp: &mut Interp, task: &Object) -> Result<(), 
 
 /// The registered native tasks that are still alive (eager ones first).
 fn registered_native_tasks() -> Vec<Object> {
-    let states: Vec<Rc<RefCell<FutState>>> = registry().lock().values().cloned().collect();
+    let states: Vec<Rc<RefCell<FutState>>> = registry().borrow().values().cloned().collect();
     let mut eager = Vec::new();
     let mut scheduled = Vec::new();
     for st in states {

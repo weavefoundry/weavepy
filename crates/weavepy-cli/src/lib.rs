@@ -761,6 +761,12 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
         pcprof::start();
+        weavepy::vm::malloc_stats::set_allocator_hooks(weavepy::vm::malloc_stats::AllocatorHooks {
+            release_free_memory: alloc::release_free_memory,
+            enter_compile_heap: alloc::enter_compile_heap,
+            restore_heap: alloc::restore_heap,
+            collect_compile_heap: alloc::collect_compile_heap,
+        });
         #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
         alloc_profile::start();
         let code = entry();
@@ -2337,6 +2343,12 @@ fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) 
 }
 
 fn init_tracing() {
+    // Nothing in the interpreter logs through `tracing`, only a few
+    // dependencies: without `WEAVEPY_LOG`, a run needn't parse a filter,
+    // build a registry, or page in the code that does.
+    if std::env::var_os("WEAVEPY_LOG").is_none() {
+        return;
+    }
     let filter = EnvFilter::try_from_env("WEAVEPY_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

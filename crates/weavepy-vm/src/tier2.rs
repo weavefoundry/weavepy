@@ -903,16 +903,18 @@ pub(crate) fn prewarm_at_startup() {
 static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
-/// Wait for the code generator's warm-up to finish, before `fork()`: the
-/// child then inherits no thread partway through it (holding a lock the
-/// child would wait on forever), and `os.fork` doesn't count it as a
-/// thread of a multi-threaded process.
+/// Wait for the code generator's warm-up, and the background frame
+/// compiler's queued jobs, to finish before `fork()`: the child then
+/// inherits no thread partway through either (holding a lock the child
+/// would wait on forever), and `os.fork` doesn't count them as threads of
+/// a multi-threaded process.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn join_codegen_prewarm() {
     let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle {
         let _ = handle.join();
     }
+    crate::frame_jit::quiesce_compiler();
 }
 
 /// Compile, on a throwaway engine, a small counted loop of the shape hot
@@ -1785,6 +1787,7 @@ impl JitState {
             (r, callees.into_inner(), methods.into_inner(), obj_names)
         };
         let (res, callees, methods, obj_names) = {
+            let _compile_heap = crate::malloc_stats::CompileHeap::enter();
             let first = run(false);
             if matches!(
                 first.0,
@@ -7030,7 +7033,7 @@ fn finish_deopted(
         agen_yielded_value: true,
         pc: 0,
         py_frame,
-        gen_owner: None,
+        gen_owner: crate::GenOwner::NONE,
         suppress_call_event: true,
         gen_first_resume: false,
         sent_consumed: false,
@@ -10080,7 +10083,15 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             ctx.raised = Some(err);
             4
         }
-        Ok(None) => 1,
+        Ok(None) => {
+            // What died with the source (a finished generator's locals) is
+            // finalized before the loop's next statement, as the interpreter's
+            // `FOR_ITER` does.
+            if runs_python && finalizer_queued() {
+                interp.run_pending_finalizers();
+            }
+            1
+        }
         Ok(Some(v)) => {
             // The step may have rebound a burned-in global (generator
             // bodies are arbitrary Python); the *next* burned
