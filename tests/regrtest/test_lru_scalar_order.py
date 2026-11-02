@@ -216,7 +216,7 @@ if sys.implementation.name == 'weavepy':
     pinned.cache_clear()
     assert pinned.cache_info() == (0, 0, 2, 0)
     assert pinned(0) == 0
-    assert pinned(b'0') == b'0'
+    assert pinned(0j) == 0j
     assert not native(pinned)
     pinned.cache_clear()
     assert pinned(0) == 0 and not native(pinned)

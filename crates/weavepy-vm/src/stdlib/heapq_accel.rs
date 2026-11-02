@@ -102,6 +102,26 @@ fn heap_arg(args: &[Object]) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> {
     }
 }
 
+/// `heap[i] < heap[j]`: in place for a pair of `int`s, `float`s or `str`s
+/// (which runs no code, so the heap can't change under it), else on
+/// copies through the full comparison.
+#[inline]
+fn heap_lt(
+    interp: &mut crate::Interpreter,
+    heap: &Rc<RefCell<Vec<Object>>>,
+    i: usize,
+    j: usize,
+) -> Result<bool, RuntimeError> {
+    let (a, b) = {
+        let h = heap.borrow();
+        if let Some(lt) = crate::native_scalar_compare(&h[i], &h[j], CompareKind::Lt) {
+            return Ok(lt);
+        }
+        (h[i].clone(), h[j].clone())
+    };
+    interp.op_compare(&a, &b, CompareKind::Lt)
+}
+
 /// `siftdown` (CPython's confusingly named "move toward the root"): the item
 /// at `pos` bubbles up past larger parents until it fits. `max_heap` flips the
 /// comparison direction so the `_*_max` helpers build a max-heap.
@@ -118,15 +138,11 @@ fn siftdown(
     }
     while pos > startpos {
         let parentpos = (pos - 1) >> 1;
-        let (cur, parent) = {
-            let h = heap.borrow();
-            (h[pos].clone(), h[parentpos].clone())
-        };
         // min-heap: `cur < parent`; max-heap: `parent < cur`.
         let cmp = if max_heap {
-            interp.op_compare(&parent, &cur, CompareKind::Lt)?
+            heap_lt(interp, heap, parentpos, pos)?
         } else {
-            interp.op_compare(&cur, &parent, CompareKind::Lt)?
+            heap_lt(interp, heap, pos, parentpos)?
         };
         if heap.borrow().len() != size {
             return Err(runtime_error("list changed size during iteration"));
@@ -157,16 +173,12 @@ fn siftup(
     while pos < limit {
         let mut childpos = 2 * pos + 1;
         if childpos + 1 < endpos {
-            let (left, right) = {
-                let h = heap.borrow();
-                (h[childpos].clone(), h[childpos + 1].clone())
-            };
             // Pick the smaller child (min) / larger child (max); ties go right,
             // matching CPython's `childpos += (cmp ^ 1)`.
             let cmp = if max_heap {
-                interp.op_compare(&right, &left, CompareKind::Lt)?
+                heap_lt(interp, heap, childpos + 1, childpos)?
             } else {
-                interp.op_compare(&left, &right, CompareKind::Lt)?
+                heap_lt(interp, heap, childpos, childpos + 1)?
             };
             childpos += usize::from(!cmp);
             if heap.borrow().len() != endpos {

@@ -7,6 +7,34 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on October 28, 2026, at `e4112942` (PR #101,
+`perf/beat-cpython-everywhere`), on the macOS x86-64 development host
+(Intel Core i9-9980HK), against CPython 3.14.8, with both WeavePy binaries
+profile-guided and every run interleaved with CPython's in one session (the
+machine idle). The base is `main` at `5cfae8d9`. Ratios are WeavePy over
+CPython; below 1.00 means WeavePy is faster or smaller.
+
+| Measure | Base `5cfae8d9` | PR #101 |
+| --- | ---: | ---: |
+| Warm time, 33 workloads (geomean) | 1.208 | 1.104 |
+| Cold time (first call, including compilation) | 1.447 | 1.359 |
+| Peak resident memory | 1.751 | 1.639 |
+| Instructions (quick build) | 1.245 | 1.157 |
+
+Against the base, warm time is 0.914, cold time 0.939 and peak memory
+0.936. CPython's own peak memory moves between sessions (this session's
+base measured 1.751 times it, an earlier one 1.648), so memory is best
+compared with the base in the same run. Twelve workloads beat CPython's
+warm time (`pickle_roundtrip` 0.60, `json_roundtrip` and `scimark` 0.67,
+`decimal_telco` 0.71, `unpack_sequence` 0.74, `xml_etree` 0.79,
+`float_points`, `regex_mix` and `sqlite_queries` 0.84, `graph_search` 0.92,
+`raytrace` 0.93, `sorting` 0.96) and `bytes_codecs` is even. The worst are
+`async_tree` 1.92, `context_managers` 1.89, `stdlib_utils` 1.78, `deepcopy`
+1.65, `logging_mix` 1.52, `tomllib_loads` 1.46, and `go` and
+`class_creation` 1.44.
+
+The earlier checkpoint follows.
+
 Measured on October 20, 2026, at `4a2ca7f` (`main`), on the macOS x86-64
 development host (Intel Core i9-9980HK), against CPython 3.14.8. The WeavePy
 binary is profile-guided (`tools/pgo/build.sh`). Ratios are WeavePy over
@@ -230,6 +258,64 @@ this host moves by several percent between runs, so only the instruction
 counts (about 0.95 of `main`) and RSS are firm. `tomllib_loads`' 12%
 slowdown in that run was the even-sized chunks, since fixed.
 
+- **PR #101, `perf/beat-cpython-everywhere`** (October 2026). Instructions
+  1.245 to 1.157 times CPython's (0.929 of the base); the largest moves
+  are `sqlite_queries` 1.39 to 0.92, `coroutines` 1.45 to 1.13, `sorting`
+  1.26 to 1.03, `mini_interpreter` 1.78 to 1.50, `stdlib_utils` 2.16 to
+  1.86, `deepcopy` 1.70 to 1.49, `raytrace` 1.36 to 1.18, `chaos` 1.11 to
+  1.00. In order of effect:
+  - *Lazily awaited coroutines.* `await f(...)` of a plain coroutine
+    function runs its body as a lazy direct call from a parked frame box;
+    the coroutine object is made only if the body suspends, raises or is
+    observed (`frame_jit::lazy_await`, `Interpreter::lazy_coro_materialize`).
+    An await costs about 900 instructions against CPython's 1,007 (2,093
+    before).
+  - *Native libraries.* Every prepared sqlite3 statement is cached (a
+    cursor used to finalize its own, so `executemany` reparsed per row);
+    tuple sort keys, bisect and heapq compare in place; base64 a group at a
+    time; regex alternatives that can't start are skipped; one-pass
+    printf flags; ASCII translate; struct and int/bytes without staging;
+    bytes keys stay native in dicts and `lru_cache`.
+  - *Calls.* Leaf methods run in place from compiled code at about
+    CPython's cost (`h_leaf_method`); leaf callees run in place at every
+    frame-JIT site; keyword calls collect `**kwargs` and `dict(k=v)` from
+    the names tuple; spread and empty-`**kwargs` forwarding calls bind as
+    direct calls; `type(x)` and `LIST_EXTEND` stay in compiled code;
+    callees of compiled code compile after about 500 switched calls.
+  - *Construction.* Proven store-only classes construct from the call
+    site (`h_call_ctor`); a Python `__new__` and its `__init__` run as
+    inline activations; native methods called through their class, `super()`
+    sites and `object.__new__` take lanes.
+  - *Attributes and dunders.* Python `__getitem__`, comparisons and binary
+    operators are called directly from compiled code; class attributes are
+    read through instances in line; the class leaf-attribute cache places
+    keys independently of build layout, and its special-method keys no
+    longer evict each other; the type cache reads without a borrowed
+    thread-local; always-true instances answer truth tests in line.
+  - *Tier 2.* No compiles that run nothing natively; pair loops of
+    objects with little typed work go to the frame JIT (scalar pairs and
+    arithmetic-heavy ones stay); repeatedly failing entries hand calls
+    back; cheaper string index, tuple builds and sequence steps.
+  - *Generators.* A generator expression's generator is made at its
+    `MAKE_FUNCTION`; `itertools.chain` of sequences drains in one pass.
+  - *Memory and start-up.* mimalloc maps its 4 MiB pages and large objects
+    from the OS (peak RSS 1.694 to 1.648 times CPython's on a quick build;
+    `async_tree` rises); regalloc2 is vendored with tighter capacity hints
+    (heap peak about 1 MB lower on JIT-heavy workloads); the code
+    generator warms when the first code gets halfway hot (`-c pass` peak
+    RSS 14.0 to 11.4 MB).
+  - *Correctness, found along the way* (each with a regression test): a
+    tier-2 constructor that skipped a Python `__new__`; `object.__init__`
+    and `object.__new__` checks called unbound; built-in subclass reprs in
+    containers; a class's truth ignoring its metaclass; late `__del__` after
+    attribute reads and truth tests; tier-2 pins outliving weak references;
+    a warm pure leaf given a surplus positional; a cached class attribute
+    that was an instance's shadowing value (`test_tarfile`); compiled list
+    `+=` building a new list. `tests/regrtest/test_override_fast_paths.py`
+    and `test_value_fast_paths.py` are differential harnesses that run
+    overrides and values hot under five JIT settings against CPython's
+    output.
+
 ## What the measurements say
 
 - **The gap is spread thin.** A direct call costs about 480 instructions,
@@ -295,21 +381,46 @@ slowdown in that run was the even-sized chunks, since fixed.
   worth a second training pass in the PGO build. Ordering by total
   profile counts made it worse (large hot functions first).
 
+- **RFC 0078 stage 3 was measured and dropped.** A lane for a warm site's
+  callee (`h_call_warm`, positional arguments, no defaults or cells) costs
+  447 instructions a call against the general path's 455: removing
+  branches buys nothing, since the cost is the work (guards 34, entry and
+  decode 26, spills 23, binding 52, `State` 31, `direct_done` 33,
+  moves and reference counts about 120, locals 42, `strong_word` 25). A
+  full compiled entry would leave about 330 (roughly 2% on `go`) for 150
+  to 200 more IR instructions at every call site, and wouldn't reach lean
+  bodies' calls (267,000 per `go` call) or recursive ones (150,000).
+- **Suspending generators and coroutines are protocol-bound.** Making,
+  yielding once and exhausting a generator costs 2,682 instructions against
+  CPython's 1,107, each `yield from` level about 3,700 more, spread over
+  about 40 functions; turning chain collapse off makes `generators_tree`
+  3.7 times slower. Closing it needs a lighter resume and yield protocol.
+- **Compiles are a third of `stdlib_utils`' and `logging_mix`' gap in
+  `run.py`'s window.** The frame JIT emits 20 to 35 IR instructions per
+  bytecode instruction and Cranelift spends about 11,000 host instructions
+  per IR instruction. A single-pass allocator, lean lowering everywhere and
+  other thresholds each trade warm time for cold.
+- **Tried and dropped in PR #101**: instance values in the instance's own
+  allocation (the object-heavy workloads hold 300 to 650 live instances at
+  their peak); mimalloc v2 (mixed, instructions up); opt-level `s` for
+  Cranelift (compiles 4% to 7% slower); an indexed young set for
+  generators (below noise).
+
 ## Next
 
-1. RFC 0078 stage 3: compiled code guards a warm direct call's site, binds
-   into its persistent record and enters the callee in line.
-2. Generator expressions without a throwaway function object (about 5% on
+1. A lighter generator resume and yield protocol: no `InlineAct` push and
+   pop, pending-list entry or core-loop reload per switch, and a
+   generator pooled with its frame box (`generators_tree`, `async_tree`,
    `nqueens`).
-3. Cheaper chunk crossings, so the compile limit can come down to about
-   1,200 IR instructions (about 1 MB more off the peak).
-4. Code objects: about 2 MiB for `tomllib_loads`' 2,100.
-5. Frame-compile cost in the first warm repetitions (`stdlib_utils`,
-   `logging_mix`): Cranelift spends about 7,400 host instructions per IR
-   instruction, and about 20% of the compiled bytecode still never ran.
-6. Immortal shared objects (one-character strings, interned names), whose
-   reference counts CPython never touches: about 100 instructions per
-   string helper in `tomllib_loads` are reference counting.
+2. Cold time: a much cheaper baseline compiler (fewer IR instructions per
+   operation) or compiled code kept across processes.
+3. Peak memory: the binary's touched pages (12 to 13 MiB against
+   CPython's 6.4), now the largest share of RSS.
+4. Builtins take keywords as `&[(String, Object)]`, so every keyword call
+   of one allocates a `String` per keyword; a calling convention over the
+   names tuple would remove it.
+5. Tier 2 holds an object that already has weak references, read through
+   an attribute, until its activation exits.
 
 ## Measurement notes
 

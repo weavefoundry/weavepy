@@ -1084,6 +1084,12 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     }
 
+    // A script or module is likely to compile: warm the JIT's code
+    // generator from start-up (`-c` code and the REPL wait for hot code).
+    if cli.module.is_some() || cli.script.as_deref().is_some_and(|p| p.as_os_str() != "-") {
+        weavepy::vm::Interpreter::warm_jit_at_startup();
+    }
+
     if let Some(module) = cli.module.clone() {
         let extra = cli.args.clone();
         run_module(&module, extra, &flags, &extra_path)?;

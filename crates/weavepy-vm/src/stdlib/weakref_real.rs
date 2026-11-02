@@ -1089,6 +1089,21 @@ fn new_proxy(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(make_ref_object(target, callback, k))
 }
 
+thread_local! {
+    /// How many weak references this thread has made (see
+    /// [`weakref_epoch`]).
+    static WEAKREF_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A count of the weak references this thread has made, which moves with
+/// each one: compiled code that keeps objects alive past their last use
+/// (tier 2's pins) leaves for the interpreter after a call that made one,
+/// so the referent dies when CPython's would.
+#[inline]
+pub(crate) fn weakref_epoch() -> u64 {
+    WEAKREF_EPOCH.with(std::cell::Cell::get)
+}
+
 fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Object {
     make_ref_object_with_class(target, callback, kind_tag, None)
 }
@@ -1103,6 +1118,7 @@ fn make_ref_object_with_class(
     kind_tag: u8,
     class_override: Option<Rc<TypeObject>>,
 ) -> Object {
+    WEAKREF_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
     let target_id = id_of(&target);
     // A weakly referenced instance may die in a cycle, and only a
     // collection can find that, so a deferred instance is tracked from

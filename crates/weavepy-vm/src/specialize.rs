@@ -932,6 +932,11 @@ pub fn format_stats_markdown(snap: &Stats) -> String {
     let _ = writeln!(out, "## VM dispatch stats");
     let _ = writeln!(out);
     let _ = writeln!(out, "Total dispatches: **{}**", snap.total_dispatches);
+    let _ = writeln!(
+        out,
+        "Class leaf-attribute cache fills: **{}**",
+        crate::types::LEAF_ATTR_FILLS.load(std::sync::atomic::Ordering::Relaxed)
+    );
     let _ = writeln!(out);
     let _ = writeln!(
         out,

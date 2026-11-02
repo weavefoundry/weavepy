@@ -481,9 +481,7 @@ pub(crate) fn abc_instance_cached(cls: &TypeObject, inst_cls: &Rc<TypeObject>) -
 /// attribute version.
 fn instancecheck_hook(meta: &TypeObject) -> Option<Object> {
     use crate::types::LeafAttrKind as K;
-    /// The cache key (an address no interned name has).
-    static HOOK_KEY: u8 = 0;
-    let key = std::ptr::addr_of!(HOOK_KEY) as usize;
+    let key = crate::types::AttrKey::vm(crate::types::vm_key::ABC_HOOK);
     let ver = meta.attr_version.get();
     match meta.leaf_attrs.get(key, ver) {
         Some(K::Value(hook)) => Some(hook.clone()),
@@ -504,9 +502,7 @@ fn instancecheck_hook(meta: &TypeObject) -> Option<Object> {
 /// `__class__` descriptor, remembered under the class's attribute version.
 fn default_class_attr(cls: &TypeObject) -> bool {
     use crate::types::LeafAttrKind as K;
-    /// The cache key (an address no interned name has).
-    static CLASS_KEY: u8 = 0;
-    let key = std::ptr::addr_of!(CLASS_KEY) as usize;
+    let key = crate::types::AttrKey::vm(crate::types::vm_key::ABC_CLASS);
     let ver = cls.attr_version.get();
     match cls.leaf_attrs.get(key, ver) {
         Some(K::InstanceOnly) => true,
