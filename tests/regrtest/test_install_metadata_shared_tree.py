@@ -16,13 +16,14 @@ import sysconfig
 import tempfile
 import types
 import unittest
+from sysconfig.__main__ import _get_json_data_name
 
 
 class InstallMetadataTests(unittest.TestCase):
     def data_files(self):
         stdlib = sys._stdlib_dir
         return (
-            os.path.join(stdlib, sysconfig._get_json_data_name()),
+            os.path.join(stdlib, _get_json_data_name()),
             os.path.join(stdlib, "build-details.json"),
         )
 
@@ -47,13 +48,16 @@ class InstallMetadataTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
-    def test_symlink_rewrites_nothing(self):
-        before = [self.read(path) for path in self.data_files()]
+    def test_symlink_leaves_sysconfig_data_alone(self):
+        # Only the sysconfig data: a copy running in a parallel sweep may
+        # legitimately rewrite build-details.json meanwhile.
+        path = self.data_files()[0]
+        before = self.read(path)
         with tempfile.TemporaryDirectory() as tmp:
             link = os.path.join(tmp, "python-link")
             os.symlink(os.path.realpath(sys.executable), link)
             subprocess.run([link, "-I", "-S", "-c", "pass"], check=True)
-        self.assertEqual([self.read(path) for path in self.data_files()], before)
+        self.assertEqual(self.read(path), before)
 
     def test_copy_leaves_sysconfig_data_alone(self):
         path = self.data_files()[0]

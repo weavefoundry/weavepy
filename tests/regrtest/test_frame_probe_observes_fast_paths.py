@@ -4,7 +4,8 @@
 frameless leaf calls and generator fast steps have to take real frames while
 it's installed, even in code that warmed up without it. A dict or function
 watcher sees the death of what `del` releases, even if the instruction is the
-core loop's to skip.
+core loop's to skip, and a dict watcher sees every store to a watched instance
+`__dict__`, even once the store's site has specialized.
 """
 
 import _testcapi
@@ -113,6 +114,23 @@ class DeathObserverTests(unittest.TestCase):
                 self.assertIsInstance(cm.unraisable.exc_value, MyError)
         finally:
             _testcapi.clear_func_watcher(wid)
+
+    def test_warm_store_to_watched_instance_dict(self):
+        class C:
+            pass
+
+        o = C()
+        wid = _testcapi.add_dict_watcher(0)  # the watcher that logs events
+        try:
+            _testcapi.watch_dict(wid, o.__dict__)
+            for _ in range(100):
+                o.foo = "bar"
+            self.assertEqual(
+                _testcapi.get_dict_watcher_events(),
+                ["new:foo:bar"] + ["mod:foo:bar"] * 99,
+            )
+        finally:
+            _testcapi.clear_dict_watcher(wid)
 
 
 if __name__ == "__main__":

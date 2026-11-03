@@ -134,47 +134,36 @@ if hook is not None:
     /// would fall back through `sys._baserepl`, which the basic REPL doesn't
     /// need, being this module.)
     fn run_pyrepl(&mut self, pythonstartup: bool) -> bool {
-        let pyrepl = match self.interpreter.import_path("_pyrepl.main") {
-            Ok(module) => module,
-            Err(e) => {
-                self.report_error(e);
-                return false;
-            }
-        };
-        let can_use = self
-            .interpreter
-            .load_attr_public(&pyrepl, "CAN_USE_PYREPL")
-            .is_ok_and(|v| v.is_truthy());
-        if !can_use {
-            if let Ok(reason) = self.interpreter.load_attr_public(&pyrepl, "FAIL_REASON") {
-                if let Object::Str(reason) = &reason {
-                    let _ = writeln!(io::stderr(), "{}", reason.as_str());
-                }
-            }
-            return false;
-        }
         let startup = if pythonstartup { "True" } else { "False" };
-        self.exec_private(
+        let globals = self.exec_private(
             &format!(
-                "import __main__\n\
-                 from _pyrepl.main import interactive_console\n\
-                 interactive_console(mainmodule=__main__, pythonstartup={startup})\n"
+                "import __main__, sys\n\
+                 from _pyrepl.main import CAN_USE_PYREPL, FAIL_REASON, interactive_console\n\
+                 if CAN_USE_PYREPL:\n    \
+                     interactive_console(mainmodule=__main__, pythonstartup={startup})\n\
+                 else:\n    \
+                     print(FAIL_REASON, file=sys.stderr)\n"
             ),
             "<pyrepl>",
         );
-        true
+        globals.is_some_and(|g| {
+            g.borrow()
+                .get(&DictKey(Object::from_static("CAN_USE_PYREPL")))
+                .is_some_and(Object::is_truthy)
+        })
     }
 
     /// Run `source` in a namespace of its own, so that `__main__` stays as
-    /// the prompt should find it. A `SystemExit` ends the session; anything
-    /// else is reported.
-    fn exec_private(&mut self, source: &str, filename: &str) {
+    /// the prompt should find it, and return the namespace. A `SystemExit`
+    /// ends the session; anything else is reported, and leaves whatever
+    /// the namespace had by then.
+    fn exec_private(&mut self, source: &str, filename: &str) -> Option<Rc<RefCell<DictData>>> {
         let module = match parser::parse_module_with_warnings_flags(source, false).0 {
             Ok(module) => module,
             Err(e) => {
                 let e = weavepy::Error::Parse(e).format(source, filename);
                 let _ = io::stderr().write_all(e.as_bytes());
-                return;
+                return None;
             }
         };
         let code = match compiler::compile_owned_module_with_options(
@@ -187,7 +176,7 @@ if hook is not None:
             Err(e) => {
                 let e = weavepy::Error::Compile(e).format(source, filename);
                 let _ = io::stderr().write_all(e.as_bytes());
-                return;
+                return None;
             }
         };
         let globals = Rc::new(RefCell::new(DictData::default()));
@@ -195,9 +184,10 @@ if hook is not None:
             DictKey(Object::from_static("__builtins__")),
             Object::Dict(self.interpreter.builtins_dict()),
         );
-        if let Err(e) = self.interpreter.exec_module_in(&code, globals) {
+        if let Err(e) = self.interpreter.exec_module_in(&code, globals.clone()) {
             self.report_error(e);
         }
+        Some(globals)
     }
 
     /// Print an exception that ended a step outside any prompt's input.
@@ -509,11 +499,11 @@ fn build_main_module(interpreter: &Interpreter) -> Rc<PyModule> {
         Object::from_static("__main__"),
     );
     d.insert(DictKey(Object::from_static("__doc__")), Object::None);
-    d.insert(
-        DictKey(Object::from_static("__package__")),
-        Object::from_static(""),
-    );
-    d.insert(DictKey(Object::from_static("__file__")), Object::None);
+    // (`__file__` is missing at the prompt, and `__package__` is `None`, as
+    // in CPython's `__main__`.)
+    d.insert(DictKey(Object::from_static("__package__")), Object::None);
+    d.insert(DictKey(Object::from_static("__loader__")), Object::None);
+    d.insert(DictKey(Object::from_static("__spec__")), Object::None);
     d.insert(
         DictKey(Object::from_static("__builtins__")),
         Object::Dict(interpreter.builtins_dict()),

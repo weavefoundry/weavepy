@@ -18,12 +18,9 @@ except ImportError:
     pty = None
 
 TIMEOUT = 60.0
-PROBE = (
-    "import sys\n"
-    "print('pyrepl' if hasattr(sys.modules['__main__'], '__file__') else 'basic')\n"
-    "print(6 * 7)\n"
-    "exit()\n"
-)
+PROBE = "print(6 * 7)\nprint(7 * 8)\nexit()\n"
+# `_pyrepl` turns on bracketed paste; the basic REPL leaves the terminal alone.
+BRACKETED_PASTE = "\x1b[?2004h"
 
 
 @unittest.skipIf(pty is None or sys.platform == "win32", "needs a pseudo-terminal")
@@ -63,26 +60,41 @@ class TerminalReplTests(unittest.TestCase):
     def test_pyrepl_is_the_default(self):
         output, code = self.run_repl(PROBE)
         self.assertEqual(code, 0, output)
-        self.assertIn("pyrepl\r\n", output)
+        self.assertIn(BRACKETED_PASTE, output)
         self.assertIn("42\r\n", output)
+        self.assertIn("56\r\n", output)
 
     def test_basic_repl_keeps_typed_ahead_lines(self):
         output, code = self.run_repl(PROBE, {"PYTHON_BASIC_REPL": "1"}, ("-i", "-u"))
         self.assertEqual(code, 0, output)
-        self.assertIn("basic\r\n", output)
+        self.assertNotIn(BRACKETED_PASTE, output)
         self.assertIn("42\r\n", output)
+        self.assertIn("56\r\n", output)
 
     def test_ignored_environment_ignores_the_basic_request(self):
         output, code = self.run_repl(PROBE, {"PYTHON_BASIC_REPL": "1"}, ("-i", "-u", "-E"))
         self.assertEqual(code, 0, output)
-        self.assertIn("pyrepl\r\n", output)
+        self.assertIn(BRACKETED_PASTE, output)
 
     def test_dumb_terminal_falls_back_with_a_warning(self):
         output, code = self.run_repl(PROBE, {"TERM": "dumb"})
         self.assertEqual(code, 0, output)
-        self.assertIn("warning: can't use pyrepl", output)
-        self.assertIn("basic\r\n", output)
+        self.assertIn("warning: can't use pyrepl: ", output)
+        self.assertNotIn("running interpreter", output)
+        self.assertNotIn(BRACKETED_PASTE, output)
+        self.assertIn("56\r\n", output)
         self.assertNotIn("Traceback", output)
+
+    def test_failing_excepthook_shows_both_errors(self):
+        script = "import sys\nsys.excepthook = 1\n1/0\nexit()\n"
+        for env in ({}, {"PYTHON_BASIC_REPL": "1"}):
+            with self.subTest(env=env):
+                output, code = self.run_repl(script, env, ("-i", "-u"))
+                self.assertEqual(code, 0, output)
+                self.assertIn("Error in sys.excepthook:", output)
+                self.assertEqual(output.count("'int' object is not callable"), 1)
+                self.assertIn("Original exception was:", output)
+                self.assertIn("division by zero", output)
 
     def test_exit_code_and_clean_globals(self):
         output, code = self.run_repl(

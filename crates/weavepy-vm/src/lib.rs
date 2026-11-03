@@ -3770,13 +3770,14 @@ impl Interpreter {
                 Ok(_) => return true,
                 Err(err) => {
                     // CPython: "Error in sys.excepthook:" then both
-                    // tracebacks. Render the hook failure plainly and
-                    // fall through to the default rendering.
-                    let mut stderr = std::io::stderr().lock();
+                    // tracebacks, the original one from the fall-through
+                    // below.
                     use std::io::Write;
-                    let _ = writeln!(stderr, "Error in sys.excepthook:");
-                    drop(stderr);
-                    let _ = err;
+                    let _ = writeln!(std::io::stderr(), "Error in sys.excepthook:");
+                    if let RuntimeError::PyException(hook_exc) = &err {
+                        self.print_exception_via_traceback(&hook_exc.instance);
+                    }
+                    let _ = writeln!(std::io::stderr(), "\nOriginal exception was:");
                 }
             }
         }
@@ -52600,10 +52601,12 @@ impl Interpreter {
         match cache {
             IC::StoreAttrInstance { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
+                    // (A watched `__dict__` hears of the store on the slow
+                    // path, as in the fast lanes.)
                     let guard_ok = {
                         let cls = inst.class.borrow();
                         cls.attr_version.get() == ver
-                    };
+                    } && !crate::capi_watchers::dicts_active();
                     if guard_ok {
                         // Validate the cached index still holds *this* name:
                         // a `del` on an earlier attribute shift-renumbers

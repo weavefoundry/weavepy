@@ -1172,6 +1172,22 @@ _reslist = [r for r in _res.split(",") if r] if _res else [
 try:
     import test.support as _support
     _support.use_resources = _reslist
+    # test_pyrepl reads `_pyrepl/__main__.py` from the `STDLIB_DIR` it imports.
+    # A tree holding only `Lib/test` has none; the running stdlib is the one
+    # the REPL uses. Swap it in only while that module imports: package
+    # discovery still needs the tree's own `STDLIB_DIR` as its top level, and
+    # reuses the module imported here.
+    if {name:?}.split(".")[0] == "test_pyrepl" and not os.path.isdir(
+        os.path.join(_support.STDLIB_DIR, "_pyrepl")
+    ):
+        _tree_stdlib = _support.STDLIB_DIR
+        _support.STDLIB_DIR = sys._stdlib_dir
+        try:
+            import test.test_pyrepl.test_pyrepl
+        except Exception:
+            pass
+        finally:
+            _support.STDLIB_DIR = _tree_stdlib
 except Exception:
     pass
 # libregrtest's `setup_process()` guarantees a non-ASCII env var is present
