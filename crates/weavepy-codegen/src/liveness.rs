@@ -11,12 +11,8 @@ pub(crate) struct Analysis {
     /// The reachable blocks in emission order: the hot ones in layout
     /// order, then the cold ones.
     pub order: Vec<Block>,
-    /// Each block's position in `order` (`NO_BLOCK`: unreachable).
-    pub pos: Vec<u32>,
     /// Each instruction's block.
     pub inst_block: Vec<u32>,
-    /// How many edges enter each block.
-    pub preds: Vec<u32>,
     /// The block whose only edge enters each block, when a single-edge block
     /// takes its register state from it (see [`Analysis::inherits`]).
     pub single_pred: Vec<u32>,
@@ -34,18 +30,13 @@ pub(crate) struct Analysis {
 }
 
 impl Analysis {
-    pub fn live_in(&self, b: Block) -> &[u64] {
+    pub(crate) fn live_in(&self, b: Block) -> &[u64] {
         let at = b.index() * self.words;
         &self.live_in[at..at + self.words]
     }
 
-    pub fn is_live_in(&self, b: Block, v: Value) -> bool {
-        let g = self.gidx[v.index()];
-        g != u32::MAX && self.live_in(b)[g as usize / 64] >> (g % 64) & 1 != 0
-    }
-
     /// Whether `b` starts from its only predecessor's register state.
-    pub fn inherits(&self, b: Block) -> bool {
+    pub(crate) fn inherits(&self, b: Block) -> bool {
         self.single_pred[b.index()] != NO_BLOCK
     }
 }
@@ -101,7 +92,7 @@ fn is_const(func: &Function, v: Value) -> bool {
     match func.dfg.values[v.index()].def {
         ValueDef::Result(inst, 0) => matches!(
             func.dfg.insts[inst.index()].op,
-            Op::Iconst(_) | Op::Fconst(_)
+            Op::Iconst(_) | Op::Fconst(_) | Op::StackAddr(..)
         ),
         _ => false,
     }
@@ -188,6 +179,7 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
     let def_block = |v: Value| match dfg.values[v.index()].def {
         ValueDef::Result(inst, _) => inst_block[inst.index()],
         ValueDef::Param(b, _) => b.0,
+        ValueDef::Var => NO_BLOCK,
     };
     let mut gidx = vec![u32::MAX; dfg.values.len()];
     let mut globals = Vec::new();
@@ -256,9 +248,7 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
 
     Analysis {
         order,
-        pos,
         inst_block,
-        preds,
         single_pred,
         uses,
         gidx,

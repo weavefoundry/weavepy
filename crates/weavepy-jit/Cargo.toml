@@ -14,11 +14,7 @@ publish = false
 
 [dependencies]
 weavepy-compiler   = { workspace = true }
-cranelift-codegen  = { workspace = true }
-cranelift-frontend = { workspace = true }
-cranelift-jit      = { workspace = true }
-cranelift-module   = { workspace = true }
-cranelift-native   = { workspace = true }
+weavepy-codegen    = { workspace = true }
 
 [dev-dependencies]
 # Analyzer tests parse + compile real Python shapes (RFC 0058 WS4).

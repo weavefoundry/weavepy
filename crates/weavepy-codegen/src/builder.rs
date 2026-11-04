@@ -1,9 +1,12 @@
 //! Building a [`Function`], with Cranelift's `FunctionBuilder` names.
 
+use std::collections::HashMap;
+
 use crate::ir::{
     condcodes::{FloatCC, IntCC},
-    types, Alu, Block, BlockArg, BlockData, Edge, Div, Ext, Fop, Function, Inst, InstData,
-    JumpTable, JumpTableData, MemFlags, Op, Overflow, SigRef, Signature, Type, Value, ValueDef,
+    types, Alu, Block, BlockArg, BlockData, Div, Edge, Ext, ExtFuncData, Fop, FuncRef, Function,
+    Inst, InstData, JumpTable, JumpTableData, MemFlags, Op, Overflow, SigRef, Signature,
+    StackSlot, StackSlotData, Type, Value, ValueDef, Variable,
 };
 
 /// Builds a function's blocks and instructions.
@@ -11,11 +14,55 @@ use crate::ir::{
 pub struct FunctionBuilder<'a> {
     pub func: &'a mut Function,
     cur: Option<Block>,
+    /// Variables: their types, each block's last definition of each, and
+    /// the reads made before a definition in their block (resolved when
+    /// the blocks are sealed).
+    var_types: Vec<Type>,
+    defs: HashMap<(u32, u32), Value>,
+    reads: Vec<(Value, Block, Variable)>,
 }
 
 impl<'a> FunctionBuilder<'a> {
     pub fn new(func: &'a mut Function) -> Self {
-        FunctionBuilder { func, cur: None }
+        FunctionBuilder {
+            func,
+            cur: None,
+            var_types: Vec::new(),
+            defs: HashMap::new(),
+            reads: Vec::new(),
+        }
+    }
+
+    pub fn declare_var(&mut self, ty: Type) -> Variable {
+        self.var_types.push(ty);
+        Variable(self.var_types.len() as u32 - 1)
+    }
+
+    pub fn def_var(&mut self, var: Variable, v: Value) {
+        let b = self.cur.expect("a definition outside a block");
+        self.defs.insert((b.0, var.0), v);
+    }
+
+    pub fn use_var(&mut self, var: Variable) -> Value {
+        let b = self.cur.expect("a read outside a block");
+        if let Some(&v) = self.defs.get(&(b.0, var.0)) {
+            return v;
+        }
+        let ty = self.var_types[var.index()];
+        let v = self.func.dfg.make_value(ty, ValueDef::Var);
+        self.defs.insert((b.0, var.0), v);
+        self.reads.push((v, b, var));
+        v
+    }
+
+    pub fn create_sized_stack_slot(&mut self, data: StackSlotData) -> StackSlot {
+        self.func.dfg.stack_slots.push(data);
+        StackSlot(self.func.dfg.stack_slots.len() as u32 - 1)
+    }
+
+    pub fn import_function(&mut self, data: ExtFuncData) -> FuncRef {
+        self.func.dfg.funcs.push(data);
+        FuncRef(self.func.dfg.funcs.len() as u32 - 1)
     }
 
     pub fn create_block(&mut self) -> Block {
@@ -67,9 +114,18 @@ impl<'a> FunctionBuilder<'a> {
 
     pub fn seal_block(&mut self, _block: Block) {}
 
-    pub fn seal_all_blocks(&mut self) {}
+    /// Resolve the variables' reads: every block's blocks are final.
+    pub fn seal_all_blocks(&mut self) {
+        if self.reads.is_empty() {
+            return;
+        }
+        crate::ssa::resolve(self.func, &self.var_types, &self.defs, &self.reads);
+        self.reads.clear();
+    }
 
-    pub fn finalize(self) {}
+    pub fn finalize(mut self) {
+        self.seal_all_blocks();
+    }
 
     pub fn import_signature(&mut self, sig: Signature) -> SigRef {
         if let Some(i) = self.func.dfg.sigs.iter().position(|s| *s == sig) {
@@ -371,6 +427,39 @@ impl FuncInstBuilder<'_, '_> {
 
     pub fn fcvt_from_sint(self, ty: Type, x: Value) -> Value {
         self.b.push1(Op::FcvtFromSint, &[x], ty)
+    }
+
+    pub fn call(self, f: FuncRef, args: &[Value]) -> Inst {
+        let sig = self.b.func.dfg.funcs[f.index()].sig;
+        let rets: Vec<Type> = self.b.func.dfg.sigs[sig.index()]
+            .returns
+            .iter()
+            .map(|r| r.value_type)
+            .collect();
+        self.b.push(Op::Call(f), args, &rets)
+    }
+
+    pub fn stack_addr(self, ty: Type, slot: StackSlot, off: i32) -> Value {
+        self.b.push1(Op::StackAddr(slot, off), &[], ty)
+    }
+
+    pub fn stack_store(self, x: Value, slot: StackSlot, off: i32) -> Inst {
+        let at = self.b.push1(Op::StackAddr(slot, 0), &[], types::I64);
+        let bytes = self.b.ty(x).bytes() as u8;
+        self.b.push(Op::Store { bytes, off }, &[x, at], &[])
+    }
+
+    pub fn stack_load(self, ty: Type, slot: StackSlot, off: i32) -> Value {
+        let at = self.b.push1(Op::StackAddr(slot, 0), &[], types::I64);
+        self.b.push1(
+            Op::Load {
+                bytes: ty.bytes() as u8,
+                ext: Ext::None,
+                off,
+            },
+            &[at],
+            ty,
+        )
     }
 
     pub fn call_indirect(self, sig: SigRef, callee: Value, args: &[Value]) -> Inst {

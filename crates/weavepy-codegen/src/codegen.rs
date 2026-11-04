@@ -18,7 +18,7 @@
 
 use crate::asm::{bit, is_float, Abi, Asm, Cond, Frame, Label, Opnd, Reg, NOREG};
 use crate::ir::{
-    condcodes::FloatCC, Alu, Block, CallConv, Function, Inst, Op, Type, Value, ValueDef,
+    condcodes::FloatCC, Alu, Block, Function, Inst, Op, Type, Value, ValueDef,
 };
 use crate::liveness::{analyze, each_use, successors, Analysis, NO_BLOCK};
 use crate::Error;
@@ -67,7 +67,6 @@ struct Gen<'f, A: Asm> {
     an: Analysis,
     a: A,
     abi: &'static Abi,
-    conv: CallConv,
     // By value.
     reg_of: Vec<Reg>,
     home_ok: Vec<bool>,
@@ -77,7 +76,11 @@ struct Gen<'f, A: Asm> {
     pin: Vec<Reg>,
     /// Values that are a pinned value plus a constant (recomputed where
     /// used, and folded into addresses): the pinned value and the constant.
-    lea: Vec<Option<(Value, i64)>>,
+    lea: Vec<Option<(Reg, i64)>>,
+    /// The explicit stack slots' offsets above the stack pointer, and the
+    /// bytes they take.
+    slot_offs: Vec<i32>,
+    explicit: u32,
     /// The values in registers or slots, in no order.
     live: Vec<Value>,
     holds: [u32; 64],
@@ -143,7 +146,6 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         f,
         a,
         abi,
-        conv,
         reg_of: vec![NOREG; nv],
         home_ok: vec![false; nv],
         next: vec![NONE; nv],
@@ -151,6 +153,8 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         tracked: vec![false; nv],
         pin: vec![NOREG; nv],
         lea: vec![None; nv],
+        slot_offs: Vec::new(),
+        explicit: 0,
         live: Vec::new(),
         holds: [NONE; 64],
         pinned: 0,
@@ -181,6 +185,7 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         an,
     };
     g.out = g.outgoing_area()?;
+    g.layout_slots();
     g.choose_pins();
     g.find_leas();
     g.entry()?;
@@ -195,7 +200,7 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
     g.a.bind(g.epi);
     let frame = Frame {
         saved: g.used & g.callee_saved,
-        slots: g.nslots * 8,
+        slots: g.explicit + g.nslots * 8,
         out: g.out,
     };
     g.a.epilogue(&frame);
@@ -215,7 +220,12 @@ impl<A: Asm> Gen<'_, A> {
         let mut most = 0;
         for &b in &self.an.order {
             for &inst in &self.f.dfg.blocks[b.index()].insts {
-                if let Op::CallIndirect(sig) = self.f.dfg.insts[inst.index()].op {
+                let sig = match self.f.dfg.insts[inst.index()].op {
+                    Op::CallIndirect(sig) => Some(sig),
+                    Op::Call(fr) => Some(self.f.dfg.funcs[fr.index()].sig),
+                    _ => None,
+                };
+                if let Some(sig) = sig {
                     let sig = &self.f.dfg.sigs[sig.index()];
                     let abi = A::abi(sig.call_conv)
                         .ok_or(Error::Unsupported("a callee's calling convention"))?;
@@ -266,12 +276,33 @@ impl<A: Asm> Gen<'_, A> {
         }
     }
 
+    /// Place the explicit stack slots above the outgoing area.
+    fn layout_slots(&mut self) {
+        let mut at = self.out;
+        for s in &self.f.dfg.stack_slots {
+            let align = 1u32 << s.align_shift.min(4);
+            at = at.next_multiple_of(align.max(8));
+            self.slot_offs.push(at as i32);
+            at += s.size;
+        }
+        self.explicit = at.next_multiple_of(8) - self.out;
+    }
+
     /// Find the values that are a pinned value plus a constant.
     fn find_leas(&mut self) {
         let f = self.f;
         for &b in &self.an.order {
             for &inst in &f.dfg.blocks[b.index()].insts {
                 let d = &f.dfg.insts[inst.index()];
+                if let Op::StackAddr(slot, off) = d.op {
+                    let v = f.dfg.slice(d.results)[0];
+                    if self.pin[v.index()] == NOREG {
+                        let at = i64::from(self.slot_offs[slot.index()]) + i64::from(off);
+                        self.lea[v.index()] = Some((A::SP, at));
+                        self.an.remat[v.index()] = true;
+                    }
+                    continue;
+                }
                 let Op::AluImm(Alu::Add, c) = d.op else { continue };
                 let v = f.dfg.slice(d.results)[0];
                 if d.ty.bits() != 64 || self.pin[v.index()] != NOREG {
@@ -279,7 +310,7 @@ impl<A: Asm> Gen<'_, A> {
                 }
                 let x = f.dfg.slice(d.args)[0];
                 let base = if self.pin[x.index()] != NOREG {
-                    Some((x, 0))
+                    Some((self.pin[x.index()], 0))
                 } else {
                     self.lea[x.index()]
                 };
@@ -310,11 +341,12 @@ impl<A: Asm> Gen<'_, A> {
             return Err(Error::Unsupported("stack parameters"));
         }
         let dsts = self.param_regs(entry, 0);
-        let moves = dsts
-            .iter()
-            .zip(&locs)
-            .map(|(&d, &s)| (Dst::R(d), Src::R(s)))
-            .collect();
+        let params = self.f.dfg.blocks[entry.index()].params.clone();
+        let mut moves = Vec::with_capacity(dsts.len());
+        for ((&d, &s), &p) in dsts.iter().zip(&locs).zip(&params) {
+            let dst = if d == NOREG { Dst::Sp(self.slot(p)) } else { Dst::R(d) };
+            moves.push((dst, Src::R(s)));
+        }
         self.moves(moves);
         Ok(())
     }
@@ -351,7 +383,7 @@ impl<A: Asm> Gen<'_, A> {
             self.live.swap_remove(p);
         }
         // A value of one block gives its slot back.
-        if self.an.gidx[i] == u32::MAX && self.slot_of[i] != NONE {
+        if self.recyclable(v) && self.slot_of[i] != NONE {
             self.free_slots.push(self.slot_of[i]);
             self.slot_of[i] = NONE;
         }
@@ -388,7 +420,7 @@ impl<A: Asm> Gen<'_, A> {
     fn slot(&mut self, v: Value) -> i32 {
         let i = v.index();
         if self.slot_of[i] == NONE {
-            self.slot_of[i] = if self.an.gidx[i] == u32::MAX {
+            self.slot_of[i] = if self.recyclable(v) {
                 self.free_slots.pop()
             } else {
                 None
@@ -398,7 +430,15 @@ impl<A: Asm> Gen<'_, A> {
                 self.nslots - 1
             });
         }
-        (self.out + 8 * self.slot_of[i]) as i32
+        (self.out + self.explicit + 8 * self.slot_of[i]) as i32
+    }
+
+    /// Whether `v`'s slot goes back for reuse when it dies: a value of one
+    /// block that an instruction defines (a parameter's slot is where
+    /// edges into its block write it).
+    fn recyclable(&self, v: Value) -> bool {
+        self.an.gidx[v.index()] == u32::MAX
+            && matches!(self.f.dfg.values[v.index()].def, ValueDef::Result(..))
     }
 
     fn is_remat(&self, v: Value) -> bool {
@@ -406,8 +446,8 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn const_of(&self, v: Value) -> Option<Src> {
-        if let Some((p, off)) = self.lea[v.index()] {
-            return Some(Src::Lea(self.pin[p.index()], off));
+        if let Some((base, off)) = self.lea[v.index()] {
+            return Some(Src::Lea(base, off));
         }
         let ValueDef::Result(inst, 0) = self.f.dfg.values[v.index()].def else {
             return None;
@@ -533,7 +573,7 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn lea_into(&mut self, r: Reg, base: Reg, off: i64) {
-        if off == 0 {
+        if off == 0 && base != A::SP {
             self.a.mov(r, base);
         } else {
             self.a.alu(Alu::Add, crate::ir::types::I64, r, base, Opnd::I(off));
@@ -544,9 +584,9 @@ impl<A: Asm> Gen<'_, A> {
     /// with the constant folded in, for a pinned value plus a constant.
     fn address(&mut self, v: Value, off: i32) -> Result<(Reg, i32), Error> {
         if !self.in_reg(v) {
-            if let Some((p, o)) = self.lea[v.index()] {
+            if let Some((base, o)) = self.lea[v.index()] {
                 if let Ok(o) = i32::try_from(o + i64::from(off)) {
-                    return Ok((self.pin[p.index()], o));
+                    return Ok((base, o));
                 }
             }
         }
@@ -600,6 +640,7 @@ impl<A: Asm> Gen<'_, A> {
         let r = match prefer {
             Some(p)
                 if self.holds[p as usize] == NONE
+                    && (A::INT_REGS.contains(&p) || A::FLOAT_REGS.contains(&p))
                     && self.pinned & bit(p) == 0
                     && is_float(p) == float
                     && (!across || self.callee_saved & bit(p) != 0) =>
@@ -652,8 +693,9 @@ impl<A: Asm> Gen<'_, A> {
                     .iter()
                     .copied()
                     .find(|&r| taken & bit(r) == 0 && self.callee_saved & bit(r) == 0)
-                    .or_else(|| pool.iter().copied().find(|&r| taken & bit(r) == 0))
-                    .expect("a register for a block parameter");
+                    .or_else(|| pool.iter().copied().find(|&r| taken & bit(r) == 0));
+                // (Past the registers, a parameter arrives in its slot.)
+                let Some(r) = r else { return NOREG };
                 taken |= bit(r);
                 r
             })
@@ -714,7 +756,7 @@ impl<A: Asm> Gen<'_, A> {
             }
             // The first call after `k`.
             self.calls_after[k] = call;
-            if matches!(f.dfg.insts[inst.index()].op, Op::CallIndirect(_)) {
+            if matches!(f.dfg.insts[inst.index()].op, Op::CallIndirect(_) | Op::Call(_)) {
                 call = k as u32;
             }
             occ.clear();
@@ -779,7 +821,8 @@ impl<A: Asm> Gen<'_, A> {
             for (&p, &r) in params.iter().zip(&regs) {
                 let n = self.first_use(p);
                 if n != NONE || self.pin[p.index()] != NOREG {
-                    self.track(p, r, false, n);
+                    // (A parameter with no register is in its slot.)
+                    self.track(p, r, r == NOREG, n);
                 }
             }
             for v in self.pinned_into(b) {
@@ -849,7 +892,7 @@ impl<A: Asm> Gen<'_, A> {
         let args = f.dfg.slice(d.args);
         let dn = |g: &Self, j: usize| g.def_next[rat + j];
         match &d.op {
-            Op::Iconst(_) | Op::Fconst(_) => {
+            Op::Iconst(_) | Op::Fconst(_) | Op::StackAddr(..) => {
                 // Materialized where used.
                 self.consume(inst, at);
             }
@@ -1094,7 +1137,11 @@ impl<A: Asm> Gen<'_, A> {
                 self.a.fcvt_from_sint(from, d.ty, r, a);
                 self.unused(v, dn(self, 0));
             }
-            Op::CallIndirect(sig) => self.call(inst, k, at, rat, *sig)?,
+            Op::CallIndirect(sig) => self.call(inst, k, at, rat, *sig, None)?,
+            Op::Call(fr) => {
+                let data = f.dfg.funcs[fr.index()];
+                self.call(inst, k, at, rat, data.sig, Some(data.target))?;
+            }
             Op::Jump(e) => {
                 // (The edge reads its arguments before their uses end.)
                 let moves = self.edge(e.block, f.dfg.slice(e.args))?;
@@ -1229,16 +1276,14 @@ impl<A: Asm> Gen<'_, A> {
         k: usize,
         at: &mut usize,
         rat: usize,
-        sig: crate::ir::SigRef,
+        sig_ref: crate::ir::SigRef,
+        direct: Option<crate::ir::FuncTarget>,
     ) -> Result<(), Error> {
         let f = self.f;
-        let sig = &f.dfg.sigs[sig.index()];
+        let sig = &f.dfg.sigs[sig_ref.index()];
         let abi = A::abi(sig.call_conv).ok_or(Error::Unsupported("a calling convention"))?;
         let args = f.dfg.args(inst);
-        let si = match &f.dfg.insts[inst.index()].op {
-            Op::CallIndirect(s) => s.index(),
-            _ => unreachable!(),
-        };
+        let si = sig_ref.index();
         if self.sig_locs[si].is_none() {
             let tys: Vec<Type> = sig.params.iter().map(|p| p.value_type).collect();
             self.sig_locs[si] = Some(arg_locs(abi, &tys));
@@ -1246,6 +1291,13 @@ impl<A: Asm> Gen<'_, A> {
         // The operands' locations, before anything moves.
         let mut srcs = std::mem::take(&mut self.srcs);
         srcs.clear();
+        // (The callee first: an address, or nothing for the function
+        // itself.)
+        match direct {
+            Some(crate::ir::FuncTarget::Addr(a)) => srcs.push(Src::I(a as i64)),
+            Some(crate::ir::FuncTarget::SelfFn) => srcs.push(Src::I(0)),
+            None => {}
+        }
         for &v in args {
             srcs.push(self.src(v)?);
         }
@@ -1308,7 +1360,9 @@ impl<A: Asm> Gen<'_, A> {
         self.tmp2 = survivors;
         // The arguments, and the callee.
         let mut moves: Vec<Mv> = Vec::with_capacity(srcs.len());
-        moves.push((Dst::R(A::CALL_REG), srcs[0]));
+        if direct != Some(crate::ir::FuncTarget::SelfFn) {
+            moves.push((Dst::R(A::CALL_REG), srcs[0]));
+        }
         let locs = &self.sig_locs[si].as_ref().expect("computed").0;
         for (loc, src) in locs.iter().zip(&srcs[1..]) {
             let dst = match *loc {
@@ -1337,7 +1391,11 @@ impl<A: Asm> Gen<'_, A> {
                 }
             }
         }
-        self.a.call(A::CALL_REG);
+        if direct == Some(crate::ir::FuncTarget::SelfFn) {
+            self.a.call_self();
+        } else {
+            self.a.call(A::CALL_REG);
+        }
         let results = f.dfg.results(inst);
         let (mut ni, mut nf) = (0, 0);
         for (j, &v) in results.iter().enumerate() {
@@ -1439,12 +1497,7 @@ impl<A: Asm> Gen<'_, A> {
             }
             self.canon[t.index()] = Some(canon);
             let regs = self.param_regs(t, avoid);
-            for (&v, &r) in args.iter().zip(&regs) {
-                let src = self.src(v)?;
-                if src != Src::R(r) {
-                    moves.push((Dst::R(r), src));
-                }
-            }
+            self.param_moves(t, &regs, args, &mut moves)?;
             return Ok(moves);
         }
         let canon = self.canon[t.index()].take().unwrap_or_default();
@@ -1467,13 +1520,33 @@ impl<A: Asm> Gen<'_, A> {
         }
         self.canon[t.index()] = Some(canon);
         let regs = self.param_regs(t, 0);
-        for (&v, &r) in args.iter().zip(&regs) {
+        self.param_moves(t, &regs, args, &mut moves)?;
+        Ok(moves)
+    }
+
+    /// The moves of an edge's arguments to `t`'s parameters: their
+    /// registers, or their slots past the registers.
+    fn param_moves(
+        &mut self,
+        t: Block,
+        regs: &[Reg],
+        args: &[Value],
+        moves: &mut Vec<Mv>,
+    ) -> Result<(), Error> {
+        let f = self.f;
+        let params = &f.dfg.blocks[t.index()].params;
+        for ((&v, &r), &p) in args.iter().zip(regs).zip(params) {
             let src = self.src(v)?;
-            if src != Src::R(r) {
+            if r == NOREG {
+                let off = self.slot(p);
+                if src != Src::Slot(off, self.ty(p).is_float()) {
+                    moves.push((Dst::Sp(off), src));
+                }
+            } else if src != Src::R(r) {
                 moves.push((Dst::R(r), src));
             }
         }
-        Ok(moves)
+        Ok(())
     }
 
     /// The values live into `t` that a state keeps: neither pinned nor
@@ -1551,13 +1624,7 @@ impl<A: Asm> Gen<'_, A> {
             Ok(c) => g.a.jcc(c, l),
             Err(cc) => g.a.fjcc(cc, l),
         };
-        let invertible = match c {
-            Ok(_) => true,
-            Err(cc) => matches!(
-                cc,
-                FloatCC::Equal | FloatCC::NotEqual | FloatCC::Ordered | FloatCC::Unordered
-            ),
-        };
+        let invertible = true;
         let inverse = |c: Result<Cond, FloatCC>| match c {
             Ok(c) => Ok(c.inverse()),
             Err(cc) => Err(cc.inverse()),
@@ -1589,6 +1656,29 @@ impl<A: Asm> Gen<'_, A> {
     /// Make `moves` as one parallel assignment.
     fn moves(&mut self, mut moves: Vec<Mv>) {
         moves.retain(|&(d, s)| !matches!((d, s), (Dst::R(r), Src::R(q)) if r == q));
+        // A slot this assignment writes and also reads (parameters in their
+        // slots, swapped by a loop's back edge): read through a copy, made
+        // before anything is written.
+        let written: Vec<i32> = moves
+            .iter()
+            .filter_map(|&(d, _)| match d {
+                Dst::Sp(off) => Some(off),
+                Dst::R(_) => None,
+            })
+            .collect();
+        if !written.is_empty() {
+            for m in &mut moves {
+                if let Src::Slot(off, float) = m.1 {
+                    if written.contains(&off) {
+                        self.nslots += 1;
+                        let t = (self.out + self.explicit + 8 * (self.nslots - 1)) as i32;
+                        self.a.ld_sp(A::FSCRATCH, off);
+                        self.a.st_sp(A::FSCRATCH, t);
+                        m.1 = Src::Slot(t, float);
+                    }
+                }
+            }
+        }
         // Into memory first, while every source is in place.
         for &(d, s) in &moves {
             let Dst::Sp(off) = d else { continue };

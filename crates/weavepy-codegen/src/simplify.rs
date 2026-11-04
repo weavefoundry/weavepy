@@ -29,6 +29,7 @@ fn pure(op: &Op) -> bool {
         op,
         Op::Store { .. }
             | Op::CallIndirect(_)
+            | Op::Call(_)
             | Op::Jump(_)
             | Op::Brif(..)
             | Op::BrTable(_)

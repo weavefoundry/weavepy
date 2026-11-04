@@ -54,16 +54,25 @@ fn cc(c: Cond) -> u32 {
     }
 }
 
-fn fcc(c: FloatCC) -> u32 {
+/// A float condition's flag test after `fcmp`, as one condition code or
+/// as either of two.
+fn fcc(c: FloatCC) -> (u32, Option<u32>) {
     match c {
-        FloatCC::Equal => 0,
-        FloatCC::NotEqual => 1,
-        FloatCC::LessThan => 4,
-        FloatCC::Unordered => 6,
-        FloatCC::Ordered => 7,
-        FloatCC::LessThanOrEqual => 9,
-        FloatCC::GreaterThanOrEqual => 10,
-        FloatCC::GreaterThan => 12,
+        FloatCC::Equal => (0, None),
+        FloatCC::NotEqual => (1, None),
+        FloatCC::LessThan => (4, None),
+        FloatCC::Unordered => (6, None),
+        FloatCC::Ordered => (7, None),
+        FloatCC::LessThanOrEqual => (9, None),
+        FloatCC::GreaterThanOrEqual => (10, None),
+        FloatCC::GreaterThan => (12, None),
+        FloatCC::UnorderedOrLessThan => (11, None),
+        FloatCC::UnorderedOrLessThanOrEqual => (13, None),
+        FloatCC::UnorderedOrGreaterThan => (8, None),
+        FloatCC::UnorderedOrGreaterThanOrEqual => (2, None),
+        // mi or gt; eq or vs.
+        FloatCC::OrderedNotEqual => (4, Some(12)),
+        FloatCC::UnorderedOrEqual => (0, Some(6)),
     }
 }
 
@@ -135,6 +144,8 @@ pub(crate) struct A64 {
     labels: Vec<u32>,
     fixups: Vec<(u32, Fix)>,
     tables: Vec<(Label, Vec<Label>)>,
+    /// Calls of the function itself, to the prologue.
+    self_calls: Vec<u32>,
 }
 
 fn r(x: Reg) -> u32 {
@@ -302,6 +313,12 @@ impl Asm for A64 {
     const SCRATCH: Reg = X16;
     const FSCRATCH: Reg = v(31);
     const CALL_REG: Reg = X16;
+    const SP: Reg = SP;
+
+    fn call_self(&mut self) {
+        self.self_calls.push(self.buf.len() as u32);
+        self.put(0x9400_0000);
+    }
 
     fn callee_saved(_conv: CallConv) -> u64 {
         mask(19, 28)
@@ -320,6 +337,7 @@ impl Asm for A64 {
             labels: Vec::new(),
             fixups: Vec::new(),
             tables: Vec::new(),
+            self_calls: Vec::new(),
         }
     }
 
@@ -330,10 +348,6 @@ impl Asm for A64 {
 
     fn bind(&mut self, l: Label) {
         self.labels[l.0 as usize] = self.buf.len() as u32;
-    }
-
-    fn offset(&self) -> usize {
-        self.buf.len() * 4
     }
 
     fn mov(&mut self, dst: Reg, src: Reg) {
@@ -500,7 +514,12 @@ impl Asm for A64 {
                             self.put(0x5100_0000 | sf | sh << 22 | imm << 10 | r(a) << 5 | r(dst));
                         } else {
                             self.movimm(X17, i);
-                            self.rrr(add, ty, dst, a, X17);
+                            if a == SP {
+                                // (The extended form reads 31 as sp.)
+                                self.put(0x8B20_6000 | r(X17) << 16 | r(SP) << 5 | r(dst));
+                            } else {
+                                self.rrr(add, ty, dst, a, X17);
+                            }
                         }
                     }
                     Opnd::R(m) => self.rrr(if op == Alu::Add { add } else { sub }, ty, dst, a, m),
@@ -744,11 +763,21 @@ impl Asm for A64 {
     }
 
     fn fsetcc(&mut self, c: FloatCC, dst: Reg) {
-        self.put(0x1A9F_07E0 | (fcc(c) ^ 1) << 12 | r(dst));
+        let (a, b) = fcc(c);
+        self.put(0x1A9F_07E0 | (a ^ 1) << 12 | r(dst));
+        if let Some(b) = b {
+            // cset w17, b; orr dst, dst, x17
+            self.put(0x1A9F_07E0 | (b ^ 1) << 12 | r(X17));
+            self.put(0xAA00_0000 | r(X17) << 16 | r(dst) << 5 | r(dst));
+        }
     }
 
     fn fjcc(&mut self, c: FloatCC, l: Label) {
-        self.b_cond(fcc(c), l);
+        let (a, b) = fcc(c);
+        self.b_cond(a, l);
+        if let Some(b) = b {
+            self.b_cond(b, l);
+        }
     }
 
     fn jmp(&mut self, l: Label) {
@@ -859,6 +888,11 @@ impl Asm for A64 {
         pro.sub_sp(size);
         for (i, reg) in Self::saved_regs(frame).into_iter().enumerate() {
             pro.str64(reg, SP, save + 8 * i as i32);
+        }
+        let p = pro.buf.len() as i64;
+        for &at in &self.self_calls {
+            let d = -(p + i64::from(at));
+            self.buf[at as usize] |= (d as u32) & 0x03ff_ffff;
         }
         let mut out = Vec::with_capacity(4 * (pro.buf.len() + self.buf.len()));
         for w in pro.buf.iter().chain(&self.buf) {

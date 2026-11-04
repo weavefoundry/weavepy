@@ -21,15 +21,17 @@ pub mod ir;
 mod liveness;
 mod mem;
 mod simplify;
+mod ssa;
 #[cfg(target_arch = "x86_64")]
 mod x64;
 
 pub use builder::{FuncInstBuilder, FunctionBuilder};
 pub use ir::{
-    types, AbiParam, Block, BlockArg, BlockCall, CallConv, Function, Inst, JumpTable,
-    JumpTableData, MemFlags, SigRef, Signature, Type, Value,
+    types, AbiParam, Block, BlockArg, BlockCall, CallConv, ExtFuncData, FuncRef, FuncTarget,
+    Function, Inst, JumpTable, JumpTableData, MemFlags, SigRef, Signature, StackSlot,
+    StackSlotData, StackSlotKind, Type, Value, Variable,
 };
-pub use mem::mapped_bytes;
+pub use mem::{mapped_bytes, CodeArena};
 
 /// Why a function didn't compile.
 #[derive(Debug, Clone, PartialEq, Eq)]

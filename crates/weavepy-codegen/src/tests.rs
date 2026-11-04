@@ -151,8 +151,8 @@ fn calls_keep_values() {
         let a = entry(b);
         let s3 = sig(b, 3, 1, CallConv::host());
         let s8 = sig(b, 8, 1, CallConv::host());
-        let h3 = b.ins().iconst(types::I64, helper3 as usize as i64);
-        let h8 = b.ins().iconst(types::I64, helper8 as usize as i64);
+        let h3 = b.ins().iconst(types::I64, helper3 as *const () as usize as i64);
+        let h8 = b.ins().iconst(types::I64, helper8 as *const () as usize as i64);
         let x = b.ins().iadd_imm(a[0], 1);
         let y = b.ins().iadd_imm(a[1], 2);
         let z = b.ins().imul(x, y);
@@ -190,7 +190,7 @@ fn two_returns() {
             CallConv::host()
         };
         let s = sig(b, 1, 2, conv);
-        let h = b.ins().iconst(types::I64, pair_sysv as usize as i64);
+        let h = b.ins().iconst(types::I64, pair_sysv as *const () as usize as i64);
         let c = b.ins().call_indirect(s, h, &[a[0]]);
         let (x, y) = (b.inst_results(c)[0], b.inst_results(c)[1]);
         let r = b.ins().isub(y, x);
@@ -213,7 +213,7 @@ fn pressure() {
     let p = build(&[types::I64], &[types::I64], |b| {
         let a = entry(b);
         let s1 = sig(b, 1, 1, CallConv::host());
-        let h = b.ins().iconst(types::I64, id as usize as i64);
+        let h = b.ins().iconst(types::I64, id as *const () as usize as i64);
         let vals: Vec<_> = (0..30).map(|i| b.ins().iadd_imm(a[0], i * 3 + 1)).collect();
         let c = b.ins().call_indirect(s1, h, &[vals[7]]);
         let mut acc = b.inst_results(c)[0];
@@ -355,6 +355,12 @@ fn floats() {
             FloatCC::GreaterThanOrEqual,
             FloatCC::Unordered,
             FloatCC::Ordered,
+            FloatCC::OrderedNotEqual,
+            FloatCC::UnorderedOrEqual,
+            FloatCC::UnorderedOrLessThan,
+            FloatCC::UnorderedOrLessThanOrEqual,
+            FloatCC::UnorderedOrGreaterThan,
+            FloatCC::UnorderedOrGreaterThanOrEqual,
         ]
         .into_iter()
         .enumerate()
@@ -377,6 +383,12 @@ fn floats() {
             x >= y,
             x.is_nan() || y.is_nan(),
             !(x.is_nan() || y.is_nan()),
+            !(x.is_nan() || y.is_nan()) && x != y,
+            x.is_nan() || y.is_nan() || x == y,
+            x.is_nan() || y.is_nan() || x < y,
+            x.is_nan() || y.is_nan() || x <= y,
+            x.is_nan() || y.is_nan() || x > y,
+            x.is_nan() || y.is_nan() || x >= y,
         ];
         bits.iter()
             .enumerate()
@@ -475,7 +487,7 @@ fn state_machine() {
             s.returns.push(AbiParam::new(types::I32));
             b.import_signature(s)
         };
-        let h = b.ins().iconst(types::I64, h_step as usize as i64);
+        let h = b.ins().iconst(types::I64, h_step as *const () as usize as i64);
         let c = b.ins().call_indirect(sig, h, &[st, i]);
         let r = b.inst_results(c)[0];
         let next = b.create_block();
@@ -512,4 +524,163 @@ fn state_machine() {
     }
     want[0] += 1000;
     assert_eq!(stack, want);
+}
+
+#[test]
+fn variables_loop() {
+    // sum of i * i over 0..n, with variables for i and the sum.
+    let p = build(&[types::I64], &[types::I64], |b| {
+        let a = entry(b);
+        let i = b.declare_var(types::I64);
+        let s = b.declare_var(types::I64);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(i, zero);
+        b.def_var(s, zero);
+        let head = b.create_block();
+        let body = b.create_block();
+        let exit = b.create_block();
+        b.ins().jump(head, &[]);
+        b.switch_to_block(head);
+        let iv = b.use_var(i);
+        let c = b.ins().icmp(IntCC::SignedLessThan, iv, a[0]);
+        b.ins().brif(c, body, &[], exit, &[]);
+        b.switch_to_block(body);
+        let iv = b.use_var(i);
+        let sv = b.use_var(s);
+        let sq = b.ins().imul(iv, iv);
+        let s2 = b.ins().iadd(sv, sq);
+        b.def_var(s, s2);
+        let i2 = b.ins().iadd_imm(iv, 1);
+        b.def_var(i, i2);
+        b.ins().jump(head, &[]);
+        b.switch_to_block(exit);
+        let sv = b.use_var(s);
+        b.ins().return_(&[sv]);
+        b.seal_all_blocks();
+    });
+    let f: F1 = unsafe { std::mem::transmute(p) };
+    assert_eq!(f(10), (0..10).map(|i| i * i).sum::<i64>());
+    assert_eq!(f(0), 0);
+}
+
+#[test]
+fn self_call_fib() {
+    let p = build(&[types::I64], &[types::I64], |b| {
+        let a = entry(b);
+        let mut s = Signature::new(CallConv::host());
+        s.params.push(AbiParam::new(types::I64));
+        s.returns.push(AbiParam::new(types::I64));
+        let sig = b.import_signature(s);
+        let me = b.import_function(crate::ExtFuncData {
+            target: crate::FuncTarget::SelfFn,
+            sig,
+        });
+        let small = b.create_block();
+        let big = b.create_block();
+        let c = b.ins().icmp_imm(IntCC::SignedLessThan, a[0], 2);
+        b.ins().brif(c, small, &[], big, &[]);
+        b.switch_to_block(small);
+        b.ins().return_(&[a[0]]);
+        b.switch_to_block(big);
+        let n1 = b.ins().iadd_imm(a[0], -1);
+        let c1 = b.ins().call(me, &[n1]);
+        let r1 = b.inst_results(c1)[0];
+        let n2 = b.ins().iadd_imm(a[0], -2);
+        let c2 = b.ins().call(me, &[n2]);
+        let r2 = b.inst_results(c2)[0];
+        let r = b.ins().iadd(r1, r2);
+        b.ins().return_(&[r]);
+    });
+    let f: F1 = unsafe { std::mem::transmute(p) };
+    assert_eq!(f(20), 6765);
+}
+
+extern "C" fn sum_buf(p: *const i64, n: i64) -> i64 {
+    (0..n as usize).map(|i| unsafe { *p.add(i) }).sum()
+}
+
+#[test]
+fn stack_slots_and_direct_calls() {
+    let p = build(&[types::I64], &[types::I64], |b| {
+        let a = entry(b);
+        let slot = b.create_sized_stack_slot(crate::StackSlotData::new(
+            crate::StackSlotKind::ExplicitSlot,
+            64,
+            3,
+        ));
+        for k in 0..8 {
+            let v = b.ins().imul_imm(a[0], k + 1);
+            let at = b.ins().stack_addr(types::I64, slot, 8 * k as i32);
+            b.ins().store(F, v, at, 0);
+        }
+        let mut s = Signature::new(CallConv::host());
+        s.params.push(AbiParam::new(types::I64));
+        s.params.push(AbiParam::new(types::I64));
+        s.returns.push(AbiParam::new(types::I64));
+        let sig = b.import_signature(s);
+        let callee = b.import_function(crate::ExtFuncData {
+            target: crate::FuncTarget::Addr(sum_buf as *const () as usize),
+            sig,
+        });
+        let base = b.ins().stack_addr(types::I64, slot, 0);
+        let n = b.ins().iconst(types::I64, 8);
+        let c = b.ins().call(callee, &[base, n]);
+        let r = b.inst_results(c)[0];
+        let back = b.ins().load(types::I64, F, base, 56);
+        let out = b.ins().iadd(r, back);
+        b.ins().return_(&[out]);
+    });
+    let f: F1 = unsafe { std::mem::transmute(p) };
+    assert_eq!(f(3), 3 * 36 + 24);
+}
+
+#[test]
+fn many_rotating_variables() {
+    // 16 variables rotated each iteration: the loop header's parameters
+    // outnumber the registers and swap through their slots.
+    const N: usize = 16;
+    let p = build(&[types::I64], &[types::I64], |b| {
+        let a = entry(b);
+        let vars: Vec<_> = (0..N).map(|_| b.declare_var(types::I64)).collect();
+        for (k, &v) in vars.iter().enumerate() {
+            let c = b.ins().iconst(types::I64, k as i64 + 1);
+            b.def_var(v, c);
+        }
+        let i = b.declare_var(types::I64);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(i, zero);
+        let head = b.create_block();
+        let body = b.create_block();
+        let exit = b.create_block();
+        b.ins().jump(head, &[]);
+        b.switch_to_block(head);
+        let iv = b.use_var(i);
+        let c = b.ins().icmp(IntCC::SignedLessThan, iv, a[0]);
+        b.ins().brif(c, body, &[], exit, &[]);
+        b.switch_to_block(body);
+        let cur: Vec<_> = vars.iter().map(|&v| b.use_var(v)).collect();
+        for k in 0..N {
+            b.def_var(vars[k], cur[(k + 1) % N]);
+        }
+        let iv = b.use_var(i);
+        let i2 = b.ins().iadd_imm(iv, 1);
+        b.def_var(i, i2);
+        b.ins().jump(head, &[]);
+        b.switch_to_block(exit);
+        let mut acc = b.ins().iconst(types::I64, 0);
+        for (k, &v) in vars.iter().enumerate() {
+            let x = b.use_var(v);
+            let m = b.ins().imul_imm(x, k as i64 + 1);
+            acc = b.ins().iadd(acc, m);
+        }
+        b.ins().return_(&[acc]);
+        b.seal_all_blocks();
+    });
+    let f: F1 = unsafe { std::mem::transmute(p) };
+    for n in [0i64, 1, 5, 16, 37] {
+        let want: i64 = (0..N)
+            .map(|k| ((k + n as usize) % N + 1) as i64 * (k as i64 + 1))
+            .sum();
+        assert_eq!(f(n), want, "n = {n}");
+    }
 }

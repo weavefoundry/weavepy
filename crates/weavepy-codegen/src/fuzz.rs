@@ -80,7 +80,13 @@ const INT_CCS: [IntCC; 10] = [
     IntCC::UnsignedLessThanOrEqual,
 ];
 
-const FLOAT_CCS: [FloatCC; 8] = [
+const FLOAT_CCS: [FloatCC; 14] = [
+    FloatCC::OrderedNotEqual,
+    FloatCC::UnorderedOrEqual,
+    FloatCC::UnorderedOrLessThan,
+    FloatCC::UnorderedOrLessThanOrEqual,
+    FloatCC::UnorderedOrGreaterThan,
+    FloatCC::UnorderedOrGreaterThanOrEqual,
     FloatCC::Equal,
     FloatCC::NotEqual,
     FloatCC::LessThan,
@@ -106,7 +112,13 @@ fn generate(seed: u64) -> Function {
         let mut params: Vec<Vec<Value>> = vec![Vec::new(); nblocks];
         b.append_block_params_for_function_params(blocks[0]);
         for (i, &bl) in blocks.iter().enumerate().skip(1) {
-            for _ in 0..rng.below(3) {
+            // (Now and then more parameters than registers.)
+            let n = if rng.below(6) == 0 {
+                10 + rng.below(12)
+            } else {
+                rng.below(3)
+            };
+            for _ in 0..n {
                 params[i].push(b.append_block_param(bl, types::I64));
             }
             if rng.below(4) == 0 {
@@ -305,7 +317,7 @@ fn generate(seed: u64) -> Function {
                 b.ins().return_(&[r]);
                 continue;
             }
-            let mut edge = |rng: &mut Rng, t: usize| -> (Block, Vec<crate::BlockArg>) {
+            let edge = |rng: &mut Rng, t: usize| -> (Block, Vec<crate::BlockArg>) {
                 let args = params[t].iter().map(|_| rng.pick(&ints).into()).collect();
                 (blocks[t], args)
             };
@@ -445,6 +457,12 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
                         FloatCC::GreaterThanOrEqual => x >= y,
                         FloatCC::Ordered => !uno,
                         FloatCC::Unordered => uno,
+                        FloatCC::OrderedNotEqual => !uno && x != y,
+                        FloatCC::UnorderedOrEqual => uno || x == y,
+                        FloatCC::UnorderedOrLessThan => uno || x < y,
+                        FloatCC::UnorderedOrLessThanOrEqual => uno || x <= y,
+                        FloatCC::UnorderedOrGreaterThan => uno || x > y,
+                        FloatCC::UnorderedOrGreaterThanOrEqual => uno || x >= y,
                     }))
                 }
                 Op::Alu(op) | Op::AluImm(op, _) => {
@@ -542,6 +560,7 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
                     break;
                 }
                 Op::Return => return arg(0),
+                Op::Call(_) | Op::StackAddr(..) => unreachable!("not generated"),
             };
             if let Some(x) = out {
                 vals[res[0].index()] = x;

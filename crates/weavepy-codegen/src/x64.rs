@@ -81,6 +81,8 @@ const CC_E: u8 = 0x4;
 const CC_NE: u8 = 0x5;
 const CC_A: u8 = 0x7;
 const CC_AE: u8 = 0x3;
+const CC_B: u8 = 0x2;
+const CC_BE: u8 = 0x6;
 
 /// An instruction's r/m operand.
 #[derive(Copy, Clone)]
@@ -110,6 +112,8 @@ pub(crate) struct X64 {
     pool: Vec<u64>,
     /// Jump tables: their labels and entries.
     tables: Vec<(Label, Vec<Label>)>,
+    /// Calls of the function itself: their rel32s, to the prologue.
+    self_calls: Vec<u32>,
 }
 
 impl std::fmt::Debug for Fix {
@@ -351,6 +355,13 @@ impl Asm for X64 {
     #[cfg(windows)]
     const FSCRATCH: Reg = xmm(5);
     const CALL_REG: Reg = R11;
+    const SP: Reg = RSP;
+
+    fn call_self(&mut self) {
+        self.byte(0xe8);
+        self.self_calls.push(self.buf.len() as u32);
+        self.d32(0);
+    }
 
     fn callee_saved(conv: CallConv) -> u64 {
         match conv {
@@ -374,6 +385,7 @@ impl Asm for X64 {
             fixups: Vec::new(),
             pool: Vec::new(),
             tables: Vec::new(),
+            self_calls: Vec::new(),
         }
     }
 
@@ -384,10 +396,6 @@ impl Asm for X64 {
 
     fn bind(&mut self, l: Label) {
         self.labels[l.0 as usize] = self.buf.len() as u32;
-    }
-
-    fn offset(&self) -> usize {
-        self.buf.len()
     }
 
     fn mov(&mut self, dst: Reg, src: Reg) {
@@ -827,7 +835,10 @@ impl Asm for X64 {
 
     fn fcmp(&mut self, cc: FloatCC, ty: Type, a: Reg, b: Reg) {
         let (x, y) = match cc {
-            FloatCC::LessThan | FloatCC::LessThanOrEqual => (b, a),
+            FloatCC::LessThan
+            | FloatCC::LessThanOrEqual
+            | FloatCC::UnorderedOrGreaterThan
+            | FloatCC::UnorderedOrGreaterThanOrEqual => (b, a),
             _ => (a, b),
         };
         let pre: &[u8] = if ty.bits() == 32 { &[] } else { &[0x66] };
@@ -848,9 +859,21 @@ impl Asm for X64 {
                 self.setcc_raw(CC_P, R11);
                 self.emit(&[], false, &[0x08], R11, Rm::R(dst), true);
             }
+            FloatCC::OrderedNotEqual => {
+                self.setcc_raw(CC_NE, dst);
+                self.setcc_raw(CC_NP, R11);
+                self.emit(&[], false, &[0x20], R11, Rm::R(dst), true);
+            }
+            FloatCC::UnorderedOrEqual => self.setcc_raw(CC_E, dst),
             FloatCC::GreaterThan | FloatCC::LessThan => self.setcc_raw(CC_A, dst),
             FloatCC::GreaterThanOrEqual | FloatCC::LessThanOrEqual => {
                 self.setcc_raw(CC_AE, dst);
+            }
+            FloatCC::UnorderedOrLessThan | FloatCC::UnorderedOrGreaterThan => {
+                self.setcc_raw(CC_B, dst);
+            }
+            FloatCC::UnorderedOrLessThanOrEqual | FloatCC::UnorderedOrGreaterThanOrEqual => {
+                self.setcc_raw(CC_BE, dst);
             }
         }
     }
@@ -869,8 +892,21 @@ impl Asm for X64 {
                 self.jcc_raw(CC_P, l);
                 self.jcc_raw(CC_NE, l);
             }
+            FloatCC::OrderedNotEqual => {
+                let skip = self.new_label();
+                self.jcc_raw(CC_P, skip);
+                self.jcc_raw(CC_NE, l);
+                self.bind(skip);
+            }
+            FloatCC::UnorderedOrEqual => self.jcc_raw(CC_E, l),
             FloatCC::GreaterThan | FloatCC::LessThan => self.jcc_raw(CC_A, l),
             FloatCC::GreaterThanOrEqual | FloatCC::LessThanOrEqual => self.jcc_raw(CC_AE, l),
+            FloatCC::UnorderedOrLessThan | FloatCC::UnorderedOrGreaterThan => {
+                self.jcc_raw(CC_B, l);
+            }
+            FloatCC::UnorderedOrLessThanOrEqual | FloatCC::UnorderedOrGreaterThanOrEqual => {
+                self.jcc_raw(CC_BE, l);
+            }
         }
     }
 
@@ -971,6 +1007,12 @@ impl Asm for X64 {
         }
         if size > 0 {
             pro.alu_ri(5, true, RSP, i64::from(size));
+        }
+        let p = pro.buf.len() as i64;
+        for &at in &self.self_calls {
+            // The prologue is `p` bytes before the body.
+            let rel = -(p + i64::from(at) + 4);
+            self.buf[at as usize..at as usize + 4].copy_from_slice(&(rel as i32).to_le_bytes());
         }
         let mut out = pro.buf;
         out.extend_from_slice(&self.buf);

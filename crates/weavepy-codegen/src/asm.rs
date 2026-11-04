@@ -42,7 +42,7 @@ pub(crate) enum Cond {
 }
 
 impl Cond {
-    pub fn from_int(cc: crate::ir::condcodes::IntCC) -> Cond {
+    pub(crate) fn from_int(cc: crate::ir::condcodes::IntCC) -> Cond {
         use crate::ir::condcodes::IntCC::*;
         match cc {
             Equal => Cond::Eq,
@@ -58,7 +58,7 @@ impl Cond {
         }
     }
 
-    pub fn inverse(self) -> Cond {
+    pub(crate) fn inverse(self) -> Cond {
         match self {
             Cond::Eq => Cond::Ne,
             Cond::Ne => Cond::Eq,
@@ -75,7 +75,7 @@ impl Cond {
         }
     }
 
-    pub fn swapped(self) -> Cond {
+    pub(crate) fn swapped(self) -> Cond {
         match self {
             Cond::Slt => Cond::Sgt,
             Cond::Sgt => Cond::Slt,
@@ -144,7 +144,6 @@ pub(crate) trait Asm {
     fn new() -> Self;
     fn new_label(&mut self) -> Label;
     fn bind(&mut self, l: Label);
-    fn offset(&self) -> usize;
 
     // Moves.
     fn mov(&mut self, dst: Reg, src: Reg);
@@ -219,4 +218,8 @@ pub(crate) trait Asm {
     /// The register an indirect call's target goes in (not an argument
     /// register; may be `SCRATCH`).
     const CALL_REG: Reg;
+    /// The stack pointer, as an address base.
+    const SP: Reg;
+    /// Call the function being compiled.
+    fn call_self(&mut self);
 }

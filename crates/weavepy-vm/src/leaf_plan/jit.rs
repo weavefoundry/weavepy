@@ -24,15 +24,11 @@ use super::{
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
 use crate::{CodeConstObjects, Interpreter};
-use cranelift_codegen::ir::{
-    condcodes::{FloatCC, IntCC},
-    types, AbiParam, Block, InstBuilder, MemFlags, SigRef, Signature, StackSlotData, StackSlotKind,
-    Value,
+use weavepy_codegen::ir::condcodes::{FloatCC, IntCC};
+use weavepy_codegen::{
+    types, AbiParam, Block, Function, FunctionBuilder, MemFlags, SigRef, Signature, StackSlotData,
+    StackSlotKind, Value, Variable,
 };
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind};
 
 /// Evaluations of a plan (per effect mode) before it is compiled. A
@@ -905,65 +901,26 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
 /// process: plans are shared between threads, and their code is never
 /// freed.
 struct Engine {
-    module: JITModule,
-    ctx: cranelift_codegen::Context,
-    fbctx: FunctionBuilderContext,
+    func: Function,
     ptr: types::Type,
-    next: u32,
 }
-
-// SAFETY: the engine is only used under its mutex.
-unsafe impl Send for Engine {}
 
 static ENGINE: std::sync::Mutex<Option<Option<Engine>>> = std::sync::Mutex::new(None);
 
 impl Engine {
-    /// Drop the function and builder contexts for empty ones (see the
-    /// frame compiler's `Engine::release`).
+    /// Drop the function for an empty one (see the frame compiler's
+    /// `Engine::release`).
     fn release(&mut self) {
-        self.ctx = self.module.make_context();
-        self.fbctx = FunctionBuilderContext::new();
+        self.func = Function::new();
     }
 
     fn new() -> Option<Engine> {
-        if !tags_match() {
+        if !tags_match() || !weavepy_codegen::SUPPORTED {
             return None;
         }
-        let mut flags = settings::builder();
-        flags.set("use_colocated_libcalls", "false").ok()?;
-        flags.set("is_pic", "false").ok()?;
-        // No mid-end optimization: a plan's lowering emits the code it
-        // wants, and the pass cost more to run than it saved.
-        // `WEAVEPY_JIT_OPT=1` turns it on.
-        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "1") {
-            "speed"
-        } else {
-            "none"
-        };
-        flags.set("opt_level", opt).ok()?;
-        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
-            flags.set("opt_level", "none").ok()?;
-            flags.set("regalloc_algorithm", "single_pass").ok()?;
-        }
-        if !cfg!(debug_assertions) && !verify() {
-            flags.set("enable_verifier", "false").ok()?;
-        }
-        let isa = cranelift_native::builder()
-            .ok()?
-            .finish(settings::Flags::new(flags))
-            .ok()?;
-        let module = JITModule::new(JITBuilder::with_isa(
-            isa,
-            cranelift_module::default_libcall_names(),
-        ));
-        let ptr = module.target_config().pointer_type();
-        let ctx = module.make_context();
         Some(Engine {
-            module,
-            ctx,
-            fbctx: FunctionBuilderContext::new(),
-            ptr,
-            next: 0,
+            func: Function::new(),
+            ptr: types::I64,
         })
     }
 }
@@ -1010,20 +967,14 @@ fn compile_with(
     f: &Rc<PyFunction>,
     effect: bool,
 ) -> Option<Native> {
-    engine.module.clear_context(&mut engine.ctx);
+    engine.func.clear();
     let ptr = engine.ptr;
-    let sig = &mut engine.ctx.func.signature;
+    let sig = &mut engine.func.signature;
     sig.params.push(AbiParam::new(ptr));
     sig.params.push(AbiParam::new(ptr));
     sig.returns.push(AbiParam::new(types::I32));
-    let name = format!("wpplan_{}", engine.next);
-    engine.next += 1;
-    let id = engine
-        .module
-        .declare_function(&name, Linkage::Local, &engine.ctx.func.signature)
-        .ok()?;
     let lowered = {
-        let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
+        let b = FunctionBuilder::new(&mut engine.func);
         let mut lower = Lower {
             b,
             effect,
@@ -1059,19 +1010,20 @@ fn compile_with(
         engine.release();
         return None;
     };
-    let defined = engine.module.define_function(id, &mut engine.ctx);
+    let mut func = std::mem::take(&mut engine.func);
+    let defined =
+        weavepy_codegen::compile(&mut func).and_then(|bytes| weavepy_codegen::install(&bytes));
     if let (Err(e), true) = (&defined, verify()) {
         eprintln!(
-            "weavepy: plan for {:?} failed to compile: {e:?}",
+            "weavepy: plan for {:?} failed to compile: {e}",
             code.qualname
         );
     }
     engine.release();
-    defined.ok()?;
-    engine.module.finalize_definitions().ok()?;
-    let func = engine.module.get_finalized_function(id);
-    // SAFETY: `func` is a finalized function with exactly the signature
-    // declared above, and the module (never dropped) keeps it alive.
+    let func = defined.ok()?;
+    // SAFETY: `func` is the entry of machine code generated for exactly
+    // the signature declared above, in the process's code arena (never
+    // freed).
     let func = unsafe { std::mem::transmute::<*const u8, NativeFn>(func) };
     Some(Native {
         func,

@@ -37,9 +37,6 @@ default-members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-# RFC 0032 — the tier-2 Cranelift JIT (`weavepy-jit`, behind the `jit`
-# feature) pulls in Cranelift 0.132, whose MSRV is 1.93. The JIT ships
-# in default builds (RFC 0067), so the workspace floor moves with it.
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/weavefoundry/weavepy"
@@ -186,15 +183,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
-# `jit` feature is enabled (on by default since RFC 0067); CI exercises it via
-# `--all-features`. MSRV floor for these is Rust 1.93.
-cranelift-codegen     = "0.132"
-cranelift-frontend    = "0.132"
-cranelift-jit         = "0.132"
-cranelift-module      = "0.132"
-cranelift-native      = "0.132"
-
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
 proptest    = "1.5"
@@ -207,16 +195,8 @@ proptest    = "1.5"
 # patch only flips on the already-compiled coders; the crate is otherwise byte-
 # for-byte lzma-sys 0.1.20 (heavy non-compiled trees like docs/po/tests/cli are
 # trimmed). The override applies transitively, so `xz2` picks it up too.
-#
-# It also vendors `regalloc2` 0.15.1, Cranelift's register allocator (see
-# `vendor/regalloc2`), with smaller capacity hints for its per-compile
-# tables. Upstream reserves four live ranges and three block-parameter
-# entries an instruction, about four times what the frame JIT's bodies use,
-# and that reserved memory set the process's peak during a compile. The
-# hints are the only change (each marked `WeavePy:` in `src/ion`).
 [patch.crates-io]
 lzma-sys = { path = "vendor/lzma-sys" }
-regalloc2 = { path = "vendor/regalloc2" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

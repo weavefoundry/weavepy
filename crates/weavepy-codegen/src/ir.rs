@@ -76,7 +76,8 @@ macro_rules! entity {
                 self.0
             }
 
-            pub(crate) fn index(self) -> usize {
+            /// The entity's number (Cranelift's `EntityRef::index`).
+            pub fn index(self) -> usize {
                 self.0 as usize
             }
         }
@@ -100,6 +101,47 @@ entity!(Block, "block");
 entity!(Inst, "inst");
 entity!(SigRef, "sig");
 entity!(JumpTable, "jt");
+entity!(Variable, "var");
+entity!(StackSlot, "ss");
+entity!(FuncRef, "fn");
+
+/// What a stack slot is for (only explicit slots exist here).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StackSlotKind {
+    ExplicitSlot,
+}
+
+/// A stack slot's size and alignment (`1 << align_shift` bytes).
+#[derive(Copy, Clone, Debug)]
+pub struct StackSlotData {
+    pub kind: StackSlotKind,
+    pub size: u32,
+    pub align_shift: u8,
+}
+
+impl StackSlotData {
+    pub fn new(kind: StackSlotKind, size: u32, align_shift: u8) -> Self {
+        StackSlotData {
+            kind,
+            size,
+            align_shift,
+        }
+    }
+}
+
+/// A directly called function: code at a known address, or the function
+/// being compiled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FuncTarget {
+    Addr(usize),
+    SelfFn,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ExtFuncData {
+    pub target: FuncTarget,
+    pub sig: SigRef,
+}
 
 /// Memory access flags: accepted for Cranelift's signature, and ignored
 /// (every access the frame JIT makes is aligned and can't trap).
@@ -176,10 +218,16 @@ pub mod condcodes {
         Unordered,
         Equal,
         NotEqual,
+        OrderedNotEqual,
+        UnorderedOrEqual,
         LessThan,
         LessThanOrEqual,
         GreaterThan,
         GreaterThanOrEqual,
+        UnorderedOrLessThan,
+        UnorderedOrLessThanOrEqual,
+        UnorderedOrGreaterThan,
+        UnorderedOrGreaterThanOrEqual,
     }
 
     impl FloatCC {
@@ -190,11 +238,16 @@ pub mod condcodes {
                 Unordered => Ordered,
                 Equal => NotEqual,
                 NotEqual => Equal,
-                // (`!(a < b)` holds when unordered: no plain ordering is
-                // its inverse.)
-                LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => {
-                    unreachable!("an ordering has no FloatCC inverse")
-                }
+                OrderedNotEqual => UnorderedOrEqual,
+                UnorderedOrEqual => OrderedNotEqual,
+                LessThan => UnorderedOrGreaterThanOrEqual,
+                LessThanOrEqual => UnorderedOrGreaterThan,
+                GreaterThan => UnorderedOrLessThanOrEqual,
+                GreaterThanOrEqual => UnorderedOrLessThan,
+                UnorderedOrLessThan => GreaterThanOrEqual,
+                UnorderedOrLessThanOrEqual => GreaterThan,
+                UnorderedOrGreaterThan => LessThanOrEqual,
+                UnorderedOrGreaterThanOrEqual => LessThan,
             }
         }
     }
@@ -369,16 +422,13 @@ pub(crate) enum Op {
     FcvtFromSint,
     /// `args[0]` is the callee.
     CallIndirect(SigRef),
+    Call(FuncRef),
+    /// The address of a stack slot plus an offset.
+    StackAddr(StackSlot, i32),
     Jump(Edge),
     Brif(Edge, Edge),
     BrTable(JumpTable),
     Return,
-}
-
-impl Op {
-    pub(crate) fn is_terminator(&self) -> bool {
-        matches!(self, Op::Jump(_) | Op::Brif(..) | Op::BrTable(_) | Op::Return)
-    }
 }
 
 /// A branch's target and its arguments (a range of the pool).
@@ -402,7 +452,11 @@ pub(crate) struct InstData {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum ValueDef {
     Result(Inst, u32),
+    #[allow(dead_code)]
     Param(Block, u32),
+    /// A variable's read, resolved (and replaced) when the blocks are
+    /// sealed.
+    Var,
 }
 
 #[derive(Clone, Debug)]
@@ -430,6 +484,8 @@ pub struct DataFlowGraph {
     pub(crate) tables: Vec<JumpTableData>,
     /// Instruction operands, results and branch arguments.
     pub(crate) pool: Vec<Value>,
+    pub(crate) stack_slots: Vec<StackSlotData>,
+    pub(crate) funcs: Vec<ExtFuncData>,
 }
 
 impl DataFlowGraph {
@@ -512,6 +568,8 @@ impl Function {
         self.dfg.sigs.clear();
         self.dfg.tables.clear();
         self.dfg.pool.clear();
+        self.dfg.stack_slots.clear();
+        self.dfg.funcs.clear();
         self.layout.clear();
     }
 

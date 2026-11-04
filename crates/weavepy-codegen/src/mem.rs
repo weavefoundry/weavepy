@@ -1,27 +1,15 @@
-//! Executable memory: one arena the process never frees, its functions
-//! packed together (so their code shares pages and cache lines).
+//! Executable memory: arenas whose functions are packed together (so
+//! their code shares pages and cache lines). The process-wide arena is
+//! never freed; a [`CodeArena`] unmaps its chunks when dropped.
 
 use std::sync::Mutex;
 
 use crate::Error;
 
-/// The arena grows by chunks at least this large.
+/// The process-wide arena grows by chunks at least this large; a
+/// [`CodeArena`] starts smaller and doubles.
 const CHUNK: usize = 1 << 20;
-
-struct Arena {
-    /// The current chunk's next free byte and its end.
-    at: usize,
-    end: usize,
-    /// Whether chunks are writable and executable at once; otherwise each
-    /// function gets pages of its own, made executable once written.
-    rwx: bool,
-}
-
-static ARENA: Mutex<Arena> = Mutex::new(Arena {
-    at: 0,
-    end: 0,
-    rwx: true,
-});
+const FIRST_OWN_CHUNK: usize = 64 << 10;
 
 /// Bytes mapped for code, for statistics.
 static MAPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -30,48 +18,110 @@ pub fn mapped_bytes() -> usize {
     MAPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Copy `code` into executable memory: its address.
-pub fn install(code: &[u8]) -> Result<*const u8, Error> {
-    let mut arena = ARENA
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let len = code.len().max(1);
-    if arena.rwx {
-        let start = (arena.at + 15) & !15;
-        if arena.at == 0 || start + len > arena.end {
-            let size = len.next_multiple_of(CHUNK);
-            match sys::map(size, true) {
-                Some(p) => {
-                    MAPPED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-                    arena.at = p as usize;
-                    arena.end = p as usize + size;
+/// Code memory: chunks mapped writable and executable at once (or, where
+/// the system refuses that, a mapping per function, made executable once
+/// written), packed from the newest chunk.
+#[derive(Debug)]
+pub struct CodeArena {
+    /// The current chunk's next free byte and its end.
+    at: usize,
+    end: usize,
+    rwx: bool,
+    /// Every mapping, for the drop.
+    maps: Vec<(usize, usize)>,
+    /// The next chunk's size.
+    next: usize,
+}
+
+static GLOBAL: Mutex<CodeArena> = Mutex::new(CodeArena {
+    at: 0,
+    end: 0,
+    rwx: true,
+    maps: Vec::new(),
+    next: CHUNK,
+});
+
+impl Default for CodeArena {
+    fn default() -> Self {
+        CodeArena::new()
+    }
+}
+
+impl CodeArena {
+    pub const fn new() -> Self {
+        CodeArena {
+            at: 0,
+            end: 0,
+            rwx: true,
+            maps: Vec::new(),
+            next: FIRST_OWN_CHUNK,
+        }
+    }
+
+    /// Copy `code` into executable memory: its address, valid until the
+    /// arena drops.
+    pub fn install(&mut self, code: &[u8]) -> Result<*const u8, Error> {
+        let len = code.len().max(1);
+        if self.rwx {
+            let start = (self.at + 15) & !15;
+            if self.at == 0 || start + len > self.end {
+                let size = len.max(self.next).next_multiple_of(sys::page());
+                match sys::map(size, true) {
+                    Some(p) => {
+                        MAPPED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                        self.maps.push((p as usize, size));
+                        self.at = p as usize;
+                        self.end = p as usize + size;
+                        self.next = (self.next * 2).min(CHUNK);
+                    }
+                    None => self.rwx = false,
                 }
-                None => arena.rwx = false,
+            }
+            if self.rwx {
+                let start = (self.at + 15) & !15;
+                self.at = start + len;
+                let p = start as *mut u8;
+                // SAFETY: `p..p + len` is in a writable chunk this arena
+                // owns, handed out once.
+                unsafe { sys::write(p, code) };
+                return Ok(p);
             }
         }
-        if arena.rwx {
-            let start = (arena.at + 15) & !15;
-            arena.at = start + len;
-            let p = start as *mut u8;
-            // SAFETY: `p..p + len` is in a writable chunk this arena owns,
-            // handed out once.
-            unsafe { sys::write(p, code) };
-            return Ok(p);
+        // Pages of its own, written and then made executable.
+        let size = len.next_multiple_of(sys::page());
+        let p = sys::map(size, false).ok_or(Error::Memory)?;
+        MAPPED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        self.maps.push((p as usize, size));
+        // SAFETY: a fresh writable mapping of `size >= len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
+        }
+        if !sys::protect_exec(p, size) {
+            return Err(Error::Memory);
+        }
+        sys::flush(p, len);
+        Ok(p)
+    }
+}
+
+impl Drop for CodeArena {
+    fn drop(&mut self) {
+        for &(p, size) in &self.maps {
+            // SAFETY: a mapping this arena made; its code is no longer
+            // entered (the owner's contract).
+            unsafe { sys::unmap(p as *mut u8, size) };
+            MAPPED.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    // Pages of its own, written and then made executable.
-    let size = len.next_multiple_of(sys::page());
-    let p = sys::map(size, false).ok_or(Error::Memory)?;
-    MAPPED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: a fresh writable mapping of `size >= len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
-    }
-    if !sys::protect_exec(p, size) {
-        return Err(Error::Memory);
-    }
-    sys::flush(p, len);
-    Ok(p)
+}
+
+/// Copy `code` into the process-wide arena: its address, valid for the
+/// process.
+pub(crate) fn install(code: &[u8]) -> Result<*const u8, Error> {
+    GLOBAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .install(code)
 }
 
 #[cfg(unix)]
@@ -89,6 +139,7 @@ mod sys {
     /// Map `size` bytes, executable as well as writable if `exec`.
     pub(super) fn map(size: usize, exec: bool) -> Option<*mut u8> {
         let mut prot = libc::PROT_READ | libc::PROT_WRITE;
+        #[allow(unused_mut)]
         let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
         if exec {
             prot |= libc::PROT_EXEC;
@@ -104,6 +155,13 @@ mod sys {
         } else {
             Some(p.cast())
         }
+    }
+
+    /// # Safety
+    /// `p..p + size` must be a mapping this module made.
+    pub(super) unsafe fn unmap(p: *mut u8, size: usize) {
+        // SAFETY: per the caller.
+        unsafe { libc::munmap(p.cast(), size) };
     }
 
     pub(super) fn protect_exec(p: *mut u8, size: usize) -> bool {
@@ -152,8 +210,8 @@ mod sys {
 #[cfg(windows)]
 mod sys {
     use windows_sys::Win32::System::Memory::{
-        VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ,
-        PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
     };
 
     pub(super) fn page() -> usize {
@@ -173,6 +231,13 @@ mod sys {
         } else {
             Some(p.cast())
         }
+    }
+
+    /// # Safety
+    /// `p` must be an allocation this module made.
+    pub(super) unsafe fn unmap(p: *mut u8, _size: usize) {
+        // SAFETY: per the caller.
+        unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
     }
 
     pub(super) fn protect_exec(p: *mut u8, size: usize) -> bool {

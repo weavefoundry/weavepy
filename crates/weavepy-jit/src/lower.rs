@@ -11,13 +11,11 @@
 //! locals + spilled stack back into the [`JitFrame`] and returns
 //! [`JitStatus::Deopt`] so the interpreter resumes at the exact pc.
 
-use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
-    StackSlot, StackSlotData, StackSlotKind, Type, Value,
+use weavepy_codegen::ir::condcodes::{FloatCC, IntCC};
+use weavepy_codegen::{
+    types, AbiParam, Block, BlockArg, FuncRef, Function, FunctionBuilder, MemFlags, SigRef,
+    Signature, StackSlot, StackSlotData, StackSlotKind, Type, Value, Variable,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::engine::{FieldAt, InlineMethod};
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
@@ -88,14 +86,13 @@ struct SiteCall {
 /// discarded).
 pub(crate) fn build_function(
     func: &mut Function,
-    fbctx: &mut FunctionBuilderContext,
     tfunc: &TFunc,
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
     inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
 ) -> bool {
-    let mut builder = FunctionBuilder::new(func, fbctx);
+    let mut builder = FunctionBuilder::new(func);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
     lc.self_func = self_func;
     lc.leaves = leaves;

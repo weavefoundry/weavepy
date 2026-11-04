@@ -839,103 +839,6 @@ struct JitState {
 /// of a thread-local borrow.
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process: as start-up begins for a script
-/// or module (see [`prewarm_at_startup`]), or else when the first code
-/// object is halfway to its frame-JIT compile (see [`prewarm_on_heat`]) or
-/// to its tier-2 threshold.
-fn spawn_codegen_prewarm() {
-    static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(handle) = std::thread::Builder::new()
-        .name("weavepy-jit-warm".to_owned())
-        .spawn(prewarm_codegen)
-    {
-        if let Ok(mut slot) = PREWARM_THREAD.lock() {
-            *slot = Some(handle);
-        }
-    }
-}
-
-/// Whether [`prewarm_at_startup`] should start the warm-up as start-up
-/// begins (see [`warm_codegen_at_startup`]).
-static PREWARM_AT_STARTUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Ask for the code generator's warm-up to start with start-up, for a
-/// program (a script or `-m` module) likely to compile. A hot loop gets
-/// from its first iterations to its compile in far less time than the
-/// warm-up takes (about 0.7 ms), so a warm-up started on the way there
-/// leaves the first compile paying most of the cold start: short hot
-/// programs ran 6% to 18% slower. `-c` code and the REPL keep the warm-up
-/// for when code gets halfway hot, sparing a process that never compiles
-/// the code generator's pages.
-pub(crate) fn warm_codegen_at_startup() {
-    PREWARM_AT_STARTUP.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Start the code generator's warm-up as start-up begins, when
-/// [`warm_codegen_at_startup`] asked for it and the JIT may run.
-pub(crate) fn prewarm_at_startup() {
-    if PREWARM_AT_STARTUP.load(std::sync::atomic::Ordering::Relaxed) && !jit_off_for_process() {
-        spawn_codegen_prewarm();
-    }
-}
-
-/// The warm-up thread [`spawn_codegen_prewarm`] started, until joined.
-static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
-
-/// Wait for the code generator's warm-up, and the background frame
-/// compiler's queued jobs, to finish before `fork()`: the child then
-/// inherits no thread partway through either (holding a lock the child
-/// would wait on forever), and `os.fork` doesn't count them as threads of
-/// a multi-threaded process.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn join_codegen_prewarm() {
-    let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(handle) = handle {
-        let _ = handle.join();
-    }
-}
-
-/// Compile, on a throwaway engine, a small counted loop of the shape hot
-/// code takes, and discard it. A process's first compile otherwise pays
-/// the code generator's cold start (its code paged in and its tables
-/// built: about 0.7 ms on the development host, most of the first
-/// compile) on the thread that needs the compiled code. Touches no
-/// interpreter state.
-fn prewarm_codegen() {
-    const SOURCE: &str =
-        "def f(n):\n    t = 0\n    for i in range(n):\n        t = t + i * 2\n    return t\n";
-    let _ = std::panic::catch_unwind(|| {
-        let Ok(module) = weavepy_parser::parse_module(SOURCE) else {
-            return;
-        };
-        let Ok(code) = weavepy_compiler::compile_module(&module) else {
-            return;
-        };
-        let Some(f) = code.constants.iter().find_map(|c| match c {
-            weavepy_compiler::Constant::Code(f) => Some(f.clone()),
-            _ => None,
-        }) else {
-            return;
-        };
-        let Some(mut engine) = JitEngine::new() else {
-            return;
-        };
-        let _ = engine.compile(&f, &mut |name| {
-            if name == "range" {
-                weavepy_jit::ResolvedGlobal::RangeBuiltin
-            } else {
-                weavepy_jit::ResolvedGlobal::Opaque
-            }
-        });
-    });
-}
-
 /// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
 fn jit_enabled_by_config() -> bool {
     // RFC 0067 WS3 — the tier-2 JIT is on by default; `WEAVEPY_JIT=0`
@@ -1386,18 +1289,6 @@ impl JitState {
                     if entry_pc == 0 {
                         entry.calls = entry.calls.wrapping_add(1);
                     }
-                    // Halfway to the work this phase admits a compile at
-                    // (start-up and imports need far more first). (The
-                    // phase is read only at the two counts it can be.)
-                    let half = self.threshold / 2;
-                    if (entry.counter == half
-                        || entry.counter
-                            == self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR) / 2)
-                        && entry.counter == admit_at(self.threshold) / 2
-                        && self.engine.is_none()
-                    {
-                        spawn_codegen_prewarm();
-                    }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                         || entry.counter < import_size_budget(code, admit_at(self.threshold))
@@ -1771,7 +1662,6 @@ impl JitState {
             (r, callees.into_inner(), methods.into_inner(), obj_names)
         };
         let (res, callees, methods, obj_names) = {
-            let _compile_heap = crate::malloc_stats::CompileHeap::enter();
             let first = run(false);
             if matches!(
                 first.0,

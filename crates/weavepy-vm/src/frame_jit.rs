@@ -746,7 +746,6 @@ impl Slot {
             return;
         }
         let t0 = stats::enabled().then(std::time::Instant::now);
-        let _compile_heap = crate::malloc_stats::CompileHeap::enter();
         let Some(lowered) = compile(code, ext, nlocals, at) else {
             let _ = self.native.set(None);
             return;
