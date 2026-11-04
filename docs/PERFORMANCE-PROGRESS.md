@@ -771,9 +771,19 @@ slowdown in that run was the even-sized chunks, since fixed.
    instance about 300). A raise out of a compiled callee costs 6,431 against
    2,536: the caller switches to the callee rather than calling it directly,
    so the raise unwinds through the core loop and the caller's handler runs
-   interpreted. Unwinding the callee where `run_switched_directly` sees it
-   raise, and returning the error to the caller's compiled code, is the
-   structural fix.
+   interpreted. That case now unwinds where the call helper sees the raise
+   and the caller's compiled code catches it (6,049 instructions); the
+   suite's raises come from inside handlers, whose cleanup covers them, so
+   they still take the long way. But instructions aren't where most of the
+   time goes: against CPython, `exceptions` retires 1.19 times the
+   instructions, `context_managers` 1.29 and `deepcopy` 1.23, yet each takes
+   about twice the time. Cachegrind (32 KB 8-way L1i) puts `exceptions` at a
+   7.99% instruction-cache miss rate against CPython's 3.12% (239 million
+   misses against 77 million), spread over hundreds of functions (the core
+   loop's `quiet_run` and `leaf_burst`, `handle_exception_with`, compiled
+   code, `Object`'s drop glue, `h_call`); the data cache misses 3.2% against
+   1.2%. Footprint, through layout (a profile-guided hot/cold split) and
+   fewer distinct paths for the same operation, is the larger lever.
 2. `async_tree` and `context_managers`, the two worst workloads: mostly general
    calls, attribute stores and asyncio's own loop now, not generator mechanics.
    Exits that register a call and its whole chain of callers (`Rect.__init__`'s
