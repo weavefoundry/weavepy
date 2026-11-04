@@ -581,3 +581,27 @@ fn random_functions() {
         }
     }
 }
+
+/// Compile speed over random functions: `WPCG_BENCH=1 cargo test --release
+/// compile_speed -- --nocapture`.
+#[test]
+fn compile_speed() {
+    if std::env::var_os("WPCG_BENCH").is_none() {
+        return;
+    }
+    let funcs: Vec<Function> = (0..2000).map(generate).collect();
+    let insts: usize = funcs.iter().map(|f| f.dfg.num_insts()).sum();
+    let rounds: usize = std::env::var("WPCG_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    for round in 0..rounds {
+        let t = std::time::Instant::now();
+        let mut bytes = 0;
+        for f in &funcs {
+            bytes += crate::compile(&mut f.clone()).unwrap().len();
+        }
+        let e = t.elapsed();
+        eprintln!(
+            "round {round}: {insts} insts in {e:?}: {:.0} ns/inst, {bytes} bytes",
+            e.as_nanos() as f64 / insts as f64
+        );
+    }
+}

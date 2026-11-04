@@ -81,15 +81,15 @@ pub(crate) fn simplify(f: &mut Function) {
         .flat_map(|b| f.dfg.blocks[b.index()].insts.clone())
         .collect();
     for &inst in &insts {
-        let d = f.dfg.insts[inst.index()].clone();
-        let mut ranges = vec![d.args];
-        match &d.op {
-            Op::Jump(e) => ranges.push(e.args),
-            Op::Brif(t, e) => {
-                ranges.push(t.args);
-                ranges.push(e.args);
-            }
-            Op::BrTable(jt) => {
+        let d = &f.dfg.insts[inst.index()];
+        let none = (0, 0);
+        let ranges = match &d.op {
+            Op::Jump(e) => [d.args, e.args, none],
+            Op::Brif(t, e) => [d.args, t.args, e.args],
+            _ => [d.args, none, none],
+        };
+        if let Op::BrTable(jt) = d.op {
+            {
                 let t = &mut f.dfg.tables[jt.index()];
                 for v in t.default.args.iter_mut() {
                     *v = resolve(&alias, *v);
@@ -100,7 +100,6 @@ pub(crate) fn simplify(f: &mut Function) {
                     }
                 }
             }
-            _ => {}
         }
         for (s, e) in ranges {
             for i in s as usize..e as usize {
@@ -171,8 +170,9 @@ pub(crate) fn simplify(f: &mut Function) {
             continue;
         }
         dead[inst.index()] = true;
-        let args: Vec<Value> = f.dfg.args(inst).to_vec();
-        for v in args {
+        let (s, e) = f.dfg.insts[inst.index()].args;
+        for i in s as usize..e as usize {
+            let v = f.dfg.pool[i];
             uses[v.index()] -= 1;
             if uses[v.index()] == 0 {
                 if let ValueDef::Result(def, _) = f.dfg.values[v.index()].def {

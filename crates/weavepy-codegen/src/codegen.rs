@@ -92,6 +92,12 @@ struct Gen<'f, A: Asm> {
     labels: Vec<Label>,
     params: Vec<Vec<Reg>>,
     snaps: Vec<Option<Snap>>,
+    /// Each merge block's entry state, once fixed (by the first edge into
+    /// it, or by the block itself when no edge came first): where each
+    /// value live into it is, and whether its slot holds it. Every other
+    /// edge into the block moves values to match.
+    canon: Vec<Option<Vec<(Value, Reg, bool)>>>,
+    done: Vec<bool>,
     stubs: Vec<(Label, Vec<Mv>, Label)>,
     epi: Label,
     // The block being generated.
@@ -102,6 +108,12 @@ struct Gen<'f, A: Asm> {
     stamp: u32,
     calls_after: Vec<u32>,
     pending: Option<Pending>,
+    /// Scratch buffers, kept to save allocations.
+    tmp: Vec<Value>,
+    tmp2: Vec<Value>,
+    srcs: Vec<Src>,
+    /// Each signature's argument locations and stack slots, once computed.
+    sig_locs: Vec<Option<(Vec<Reg>, u32)>>,
 }
 
 /// Whether to print each compile's phase times (`WPCG_TIME`, a tuning
@@ -151,6 +163,8 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         labels,
         params: vec![Vec::new(); nb],
         snaps: vec![None; nb],
+        canon: vec![None; nb],
+        done: vec![false; nb],
         stubs: Vec::new(),
         epi,
         arg_next: Vec::new(),
@@ -160,6 +174,10 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         stamp: 0,
         calls_after: Vec::new(),
         pending: None,
+        tmp: Vec::new(),
+        tmp2: Vec::new(),
+        srcs: Vec::new(),
+        sig_locs: vec![None; f.dfg.sigs.len()],
         an,
     };
     g.out = g.outgoing_area()?;
@@ -291,7 +309,7 @@ impl<A: Asm> Gen<'_, A> {
         if stack > 0 {
             return Err(Error::Unsupported("stack parameters"));
         }
-        let dsts = self.param_regs(entry);
+        let dsts = self.param_regs(entry, 0);
         let moves = dsts
             .iter()
             .zip(&locs)
@@ -548,7 +566,8 @@ impl<A: Asm> Gen<'_, A> {
     /// Take inst `k`'s uses (its operands' next uses), freeing the
     /// registers of values that die here: `at` indexes the block's uses.
     fn consume(&mut self, inst: Inst, at: &mut usize) {
-        let mut dead: Vec<Value> = Vec::new();
+        let mut dead = std::mem::take(&mut self.tmp);
+        dead.clear();
         let f = self.f;
         each_use(f, inst, |v| {
             let n = self.arg_next[*at];
@@ -560,11 +579,12 @@ impl<A: Asm> Gen<'_, A> {
                 }
             }
         });
-        for v in dead {
+        for &v in &dead {
             if self.tracked[v.index()] && self.next[v.index()] == NONE {
                 self.untrack(v);
             }
         }
+        self.tmp = dead;
     }
 
     /// A register for the result `v`, defined at `k` with its next use
@@ -594,12 +614,13 @@ impl<A: Asm> Gen<'_, A> {
 
     // ---- blocks ----
 
-    /// The registers `b`'s parameters arrive in.
-    fn param_regs(&mut self, b: Block) -> Vec<Reg> {
+    /// The registers `b`'s parameters arrive in (chosen, the first time,
+    /// from those not in `avoid`).
+    fn param_regs(&mut self, b: Block, avoid: u64) -> Vec<Reg> {
         if !self.params[b.index()].is_empty() || self.f.dfg.blocks[b.index()].params.is_empty() {
             return self.params[b.index()].clone();
         }
-        let mut taken = self.pinned;
+        let mut taken = self.pinned | avoid;
         // The entry's parameters stay where the caller put them.
         let entry_locs = if b == self.an.order[0] {
             let tys: Vec<Type> = self.f.signature.params.iter().map(|p| p.value_type).collect();
@@ -680,7 +701,7 @@ impl<A: Asm> Gen<'_, A> {
         let mut at = nuses;
         let mut rat = nres;
         let mut call = NONE;
-        let mut occ: Vec<Value> = Vec::new();
+        let mut occ = std::mem::take(&mut self.tmp2);
         for (k, &inst) in insts.iter().enumerate().rev() {
             let res = f.dfg.results(inst);
             rat -= res.len();
@@ -711,6 +732,7 @@ impl<A: Asm> Gen<'_, A> {
                 self.nu_stamp[v.index()] = stamp;
             }
         }
+        self.tmp2 = occ;
     }
 
     /// The first use of `v` in the block `next_uses` ran over.
@@ -736,34 +758,36 @@ impl<A: Asm> Gen<'_, A> {
         } else {
             debug_assert!(!self.an.inherits(b), "an inheriting block without a state");
             self.reset();
-            let regs = self.param_regs(b);
-            let params = self.f.dfg.blocks[b.index()].params.clone();
+            // The state the first edge fixed, or else every value in its
+            // slot (and the edges still to come store them).
+            let canon = match self.canon[b.index()].take() {
+                Some(c) => c,
+                None => self
+                    .live_into(b)
+                    .into_iter()
+                    .map(|v| (v, NOREG, true))
+                    .collect(),
+            };
+            for &(v, r, home) in &canon {
+                let n = self.first_use(v);
+                self.track(v, r, home, n);
+            }
+            self.canon[b.index()] = Some(canon);
+            let regs = self.param_regs(b, 0);
+            let f = self.f;
+            let params = &f.dfg.blocks[b.index()].params;
             for (&p, &r) in params.iter().zip(&regs) {
                 let n = self.first_use(p);
                 if n != NONE || self.pin[p.index()] != NOREG {
                     self.track(p, r, false, n);
                 }
             }
-            let words = self.an.live_in(b).to_vec();
-            for (w, &word) in words.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let i = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let v = self.an.globals[w * 64 + i];
-                    if self.is_remat(v) {
-                        continue;
-                    }
-                    let n = self.first_use(v);
-                    let pr = self.pin[v.index()];
-                    if pr != NOREG {
-                        self.track(v, pr, false, n);
-                    } else {
-                        self.track(v, NOREG, true, n);
-                    }
-                }
+            for v in self.pinned_into(b) {
+                let n = self.first_use(v);
+                self.track(v, self.pin[v.index()], false, n);
             }
         }
+        self.done[b.index()] = true;
         self.a.bind(self.labels[b.index()]);
         let f = self.f;
         let insts = &f.dfg.blocks[b.index()].insts;
@@ -1211,15 +1235,23 @@ impl<A: Asm> Gen<'_, A> {
         let sig = &f.dfg.sigs[sig.index()];
         let abi = A::abi(sig.call_conv).ok_or(Error::Unsupported("a calling convention"))?;
         let args = f.dfg.args(inst);
-        let tys: Vec<Type> = sig.params.iter().map(|p| p.value_type).collect();
-        let (locs, _) = arg_locs(abi, &tys);
+        let si = match &f.dfg.insts[inst.index()].op {
+            Op::CallIndirect(s) => s.index(),
+            _ => unreachable!(),
+        };
+        if self.sig_locs[si].is_none() {
+            let tys: Vec<Type> = sig.params.iter().map(|p| p.value_type).collect();
+            self.sig_locs[si] = Some(arg_locs(abi, &tys));
+        }
         // The operands' locations, before anything moves.
-        let mut srcs = Vec::with_capacity(args.len());
+        let mut srcs = std::mem::take(&mut self.srcs);
+        srcs.clear();
         for &v in args {
             srcs.push(self.src(v)?);
         }
         // Take the uses: what dies here needn't survive the call.
-        let mut dead = Vec::new();
+        let mut dead = std::mem::take(&mut self.tmp);
+        dead.clear();
         each_use(f, inst, |v| {
             let n = self.arg_next[*at];
             *at += 1;
@@ -1232,20 +1264,17 @@ impl<A: Asm> Gen<'_, A> {
         });
         // Save what lives on in the registers the call clobbers: in a free
         // callee-saved register, or in its slot.
-        let survivors: Vec<Value> = self
-            .live
-            .iter()
-            .copied()
-            .filter(|&v| {
-                let r = self.reg_of[v.index()];
-                r != NOREG
-                    && abi.clobbers & bit(r) != 0
-                    && self.pin[v.index()] == NOREG
-                    && self.next[v.index()] != NONE
-            })
-            .collect();
-        let mut stored = Vec::new();
-        for v in survivors {
+        let mut survivors = std::mem::take(&mut self.tmp2);
+        survivors.clear();
+        survivors.extend(self.live.iter().copied().filter(|&v| {
+            let r = self.reg_of[v.index()];
+            r != NOREG
+                && abi.clobbers & bit(r) != 0
+                && self.pin[v.index()] == NOREG
+                && self.next[v.index()] != NONE
+        }));
+        let mut stored: Vec<Value> = Vec::new();
+        for &v in &survivors {
             let r = self.reg_of[v.index()];
             let float = is_float(r);
             let to = (if float { A::FLOAT_REGS } else { A::INT_REGS })
@@ -1276,8 +1305,11 @@ impl<A: Asm> Gen<'_, A> {
                 }
             }
         }
+        self.tmp2 = survivors;
         // The arguments, and the callee.
-        let mut moves: Vec<Mv> = vec![(Dst::R(A::CALL_REG), srcs[0])];
+        let mut moves: Vec<Mv> = Vec::with_capacity(srcs.len());
+        moves.push((Dst::R(A::CALL_REG), srcs[0]));
+        let locs = &self.sig_locs[si].as_ref().expect("computed").0;
         for (loc, src) in locs.iter().zip(&srcs[1..]) {
             let dst = match *loc {
                 l if l < 64 => Dst::R(l),
@@ -1285,16 +1317,18 @@ impl<A: Asm> Gen<'_, A> {
             };
             moves.push((dst, *src));
         }
+        self.srcs = srcs;
         self.moves(moves);
         // The clobbered registers' values are gone (saved, or dead).
         for v in stored {
             self.drop_reg(v);
         }
-        for v in dead {
+        for &v in &dead {
             if self.tracked[v.index()] && self.next[v.index()] == NONE {
                 self.untrack(v);
             }
         }
+        self.tmp = dead;
         for r in 0..64u8 {
             if abi.clobbers & bit(r) != 0 && self.holds[r as usize] != NONE {
                 let v = Value(self.holds[r as usize]);
@@ -1359,25 +1393,80 @@ impl<A: Asm> Gen<'_, A> {
             return Ok(Vec::new());
         }
         let mut moves = Vec::new();
-        let words = self.an.live_in(t).to_vec();
-        for (w, &word) in words.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let i = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let v = self.an.globals[w * 64 + i];
-                if self.is_remat(v) || self.pin[v.index()] != NOREG || self.home_ok[v.index()] {
-                    continue;
+        let live = self.live_into(t);
+        if self.canon[t.index()].is_none() && !self.done[t.index()] {
+            // The first edge in: the block starts in this edge's state.
+            let mut avoid = 0;
+            let mut canon = Vec::with_capacity(live.len());
+            for v in live {
+                if !self.tracked[v.index()] {
+                    return Err(Error::Internal("a live value with no location"));
                 }
                 let r = self.reg_of[v.index()];
-                if !self.tracked[v.index()] || r == NOREG {
+                if r != NOREG {
+                    avoid |= bit(r);
+                }
+                canon.push((v, r, self.home_ok[v.index()]));
+            }
+            // Room for the parameters: values beyond it start in their slots.
+            for float in [false, true] {
+                let pool = if float { A::FLOAT_REGS } else { A::INT_REGS };
+                let need = self.f.dfg.blocks[t.index()]
+                    .params
+                    .iter()
+                    .filter(|&&p| self.ty(p).is_float() == float && self.pin[p.index()] == NOREG)
+                    .count();
+                let mut free = pool
+                    .iter()
+                    .filter(|&&r| (avoid | self.pinned) & bit(r) == 0)
+                    .count();
+                for e in canon.iter_mut() {
+                    if free >= need {
+                        break;
+                    }
+                    let (v, r, home) = *e;
+                    if r == NOREG || is_float(r) != float {
+                        continue;
+                    }
+                    if !home {
+                        let off = self.slot(v);
+                        moves.push((Dst::Sp(off), Src::R(r)));
+                    }
+                    *e = (v, NOREG, true);
+                    avoid &= !bit(r);
+                    free += 1;
+                }
+            }
+            self.canon[t.index()] = Some(canon);
+            let regs = self.param_regs(t, avoid);
+            for (&v, &r) in args.iter().zip(&regs) {
+                let src = self.src(v)?;
+                if src != Src::R(r) {
+                    moves.push((Dst::R(r), src));
+                }
+            }
+            return Ok(moves);
+        }
+        let canon = self.canon[t.index()].take().unwrap_or_default();
+        for &(v, r, home) in &canon {
+            let i = v.index();
+            if home && !self.home_ok[i] {
+                let cur = self.reg_of[i];
+                if !self.tracked[i] || cur == NOREG {
                     return Err(Error::Internal("a live value with no location"));
                 }
                 let off = self.slot(v);
-                moves.push((Dst::Sp(off), Src::R(r)));
+                moves.push((Dst::Sp(off), Src::R(cur)));
+            }
+            if r != NOREG {
+                let src = self.src(v)?;
+                if src != Src::R(r) {
+                    moves.push((Dst::R(r), src));
+                }
             }
         }
-        let regs = self.param_regs(t);
+        self.canon[t.index()] = Some(canon);
+        let regs = self.param_regs(t, 0);
         for (&v, &r) in args.iter().zip(&regs) {
             let src = self.src(v)?;
             if src != Src::R(r) {
@@ -1385,6 +1474,41 @@ impl<A: Asm> Gen<'_, A> {
             }
         }
         Ok(moves)
+    }
+
+    /// The values live into `t` that a state keeps: neither pinned nor
+    /// recomputed where used.
+    fn live_into(&self, t: Block) -> Vec<Value> {
+        let mut out = Vec::new();
+        for (w, &word) in self.an.live_in(t).iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let v = self.an.globals[w * 64 + i];
+                if !self.is_remat(v) && self.pin[v.index()] == NOREG {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// The pinned values live into `t`.
+    fn pinned_into(&self, t: Block) -> Vec<Value> {
+        let mut out = Vec::new();
+        for (w, &word) in self.an.live_in(t).iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let v = self.an.globals[w * 64 + i];
+                if self.pin[v.index()] != NOREG {
+                    out.push(v);
+                }
+            }
+        }
+        out
     }
 
     /// The label a branch to `t` jumps to: `t`'s own, or a stub's that does
