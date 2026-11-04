@@ -15982,9 +15982,9 @@ impl Interpreter {
                                 Some(Object::from_static(if *b { "True" } else { "False" }))
                             }
                             (1 | 2, Object::None) => Some(Object::from_static("None")),
-                            (1 | 2, Object::Float(f)) => {
-                                Some(Object::Str(SharedStr::from(crate::object::float_repr(*f).as_str())))
-                            }
+                            (1 | 2, Object::Float(f)) => Some(Object::Str(SharedStr::from(
+                                crate::object::float_repr(*f).as_str(),
+                            ))),
                             (2, Object::Str(_)) => {
                                 // SAFETY: as above.
                                 let r = unsafe { &*top }.repr();
@@ -19394,13 +19394,7 @@ impl Interpreter {
             // and that `__init__`'s `args` (and a `StopIteration`'s
             // `value`).
             if plan.exc_native_init {
-                let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
-                let mut init_args = Vec::with_capacity(argc + 1);
-                init_args.push(inst.clone());
-                init_args.extend(frame.stack.drain(self_slot + 1..));
-                // (An instance's `__init__` stores can't fail.)
-                let _ = builtin_types::exc_init(&init_args);
-                drop(init_args);
+                let (inst, tracked) = self.alloc_exc_native(&ty, frame, self_slot + 1);
                 frame.stack.truncate(callee_slot);
                 frame.stack.push(inst);
                 frame.pc = pc as u32 + 1;
@@ -19568,6 +19562,15 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> bool {
         let Some((init, code)) = plan.lean_init.as_ref() else {
+            if plan.exc_native_init {
+                let (inst, tracked) = self.alloc_exc_native(ty, frame, start + 2);
+                frame.stack.truncate(start);
+                frame.stack.push(inst);
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
             if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
                 let (inst, tracked) = self.alloc_plain_instance_obj(ty);
                 frame.stack.truncate(start);
@@ -19586,7 +19589,9 @@ impl Interpreter {
             }
             return false;
         };
-        if !matches!(plan.native, crate::types::NativeKind::Plain)
+        // (Neither path below seeds an exception's `args`.)
+        if plan.seeds_exception_args
+            || !matches!(plan.native, crate::types::NativeKind::Plain)
             // SAFETY: GIL-serialized raw read of the function's code cell;
             // only the pointer is compared.
             || !std::ptr::eq(
@@ -37603,8 +37608,9 @@ impl Interpreter {
         holder: &Rc<crate::types::PyInstance>,
         target: &Rc<crate::types::PyInstance>,
     ) {
+        use crate::types::ExcTail;
         fn ctx_of(inst: &Rc<crate::types::PyInstance>) -> Option<Rc<crate::types::PyInstance>> {
-            match inst.slot_get("__context__") {
+            match inst.exc_tail_get(ExcTail::Context) {
                 Some(Object::Instance(i)) => Some(i),
                 _ => None,
             }
@@ -37615,13 +37621,13 @@ impl Interpreter {
             // Advance `fast` two steps, severing a link to `target`.
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.slot_set("__context__", Object::None);
+                drop(fast.exc_tail_set(ExcTail::Context, Object::None));
                 return;
             }
             fast = next;
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.slot_set("__context__", Object::None);
+                drop(fast.exc_tail_set(ExcTail::Context, Object::None));
                 return;
             }
             fast = next;
@@ -60771,7 +60777,30 @@ impl Interpreter {
     /// `BaseException_new`'s seeding of a fresh exception instance's
     /// `args` from the constructor's positionals, which holds even when the
     /// class's `__init__` never calls `super().__init__`.
-    fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
+    /// `E(*args)` for a class whose plan is
+    /// [`InstancePlan::exc_native_init`], its arguments `frame`'s stack from
+    /// `from` up (drained): the allocation, and `BaseException.__init__`'s
+    /// `args` (and a `StopIteration`'s `value`). The flag reports whether
+    /// the instance is tracked.
+    ///
+    /// [`InstancePlan::exc_native_init`]: crate::types::InstancePlan::exc_native_init
+    fn alloc_exc_native(
+        &self,
+        ty: &Rc<TypeObject>,
+        frame: &mut Frame,
+        from: usize,
+    ) -> (Object, bool) {
+        let (inst, tracked) = self.alloc_plain_instance_obj(ty);
+        let value = (exc_family_flags(ty) & EXC_FAM_STOP_ITERATION != 0)
+            .then(|| frame.stack.get(from).cloned().unwrap_or(Object::None));
+        Self::seed_exception_args(&inst, frame.stack.drain(from..));
+        if let (Some(value), Object::Instance(i)) = (value, &inst) {
+            i.slot_set("value", value);
+        }
+        (inst, tracked)
+    }
+
+    pub(crate) fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
         if let Object::Instance(i) = inst {
             let args = Object::tuple_from_exact(args);
             if i.slots.borrow().is_empty_default() {

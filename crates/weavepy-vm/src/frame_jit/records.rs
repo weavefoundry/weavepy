@@ -696,7 +696,7 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
         // SAFETY: a guard-free read of the memoized plan; nothing runs
         // before its last use.
         let (ver, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
-        if *ver != ty.attr_version.get() || plan.user_new.is_some() || plan.seeds_exception_args {
+        if *ver != ty.attr_version.get() || plan.user_new.is_some() {
             return None;
         }
         // What runs on the frame alone (a store-only or leaf `__init__`, the
@@ -746,6 +746,10 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
         let (ty, plan) = (ty.clone(), plan.clone());
         let (init, _) = plan.lean_init.as_ref().expect("checked above");
         let (inst, tracked) = interp.alloc_lean_instance_obj(&ty, &plan.native);
+        if plan.seeds_exception_args {
+            let args = std::slice::from_raw_parts(slot.add(2), argc);
+            Interpreter::seed_exception_args(&inst, args.iter().cloned());
+        }
         if tracked && crate::gc_trace::maybe_auto_collect() {
             interp.run_pending_finalizers();
         }

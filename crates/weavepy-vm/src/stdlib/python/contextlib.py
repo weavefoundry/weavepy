@@ -141,7 +141,10 @@ class _GeneratorContextManager(
     def __enter__(self):
         # do not keep args and kwds alive unnecessarily
         # they are only needed for recreation, which is not possible anymore
-        del self.args, self.kwds, self.func
+        # WeavePy: cleared rather than deleted, which releases them as
+        # well; a deletion takes the instance off its class's shared
+        # attribute layout, so each later `self.gen` read missed.
+        self.args = self.kwds = self.func = None
         try:
             return next(self.gen)
         except StopIteration:
@@ -216,7 +219,10 @@ class _AsyncGeneratorContextManager(
     async def __aenter__(self):
         # do not keep args and kwds alive unnecessarily
         # they are only needed for recreation, which is not possible anymore
-        del self.args, self.kwds, self.func
+        # WeavePy: cleared rather than deleted, which releases them as
+        # well; a deletion takes the instance off its class's shared
+        # attribute layout, so each later `self.gen` read missed.
+        self.args = self.kwds = self.func = None
         try:
             return await anext(self.gen)
         except StopAsyncIteration:

@@ -245,6 +245,31 @@ branch and pull request.
 
 ## Done
 
+- **`contextmanager`, exception construction and `len()` in compiled code**
+  (PR #107). Instructions a call on Linux (callgrind), before and after:
+  - A `with` of a `contextlib.contextmanager` function: 13,458 to 11,410.
+    `__enter__` deleted three attributes (`del self.args, self.kwds,
+    self.func`), and a deletion gives the instance private attribute names
+    (an allocation each), so every later `self.gen` read missed the compiled
+    code's layout guard (about 1,300 instructions of misses a `with`). Our
+    `contextlib` now clears them to `None`, which releases them as early.
+    `del` on an instance attribute stays this costly elsewhere (see Next).
+  - `E("m")` of a Python exception subclass with neither `__init__` nor
+    `__new__`: 2,486 to 1,816 (CPython 3.13 about 1,200); one whose
+    `__init__` calls `super().__init__()`: 4,940 to 4,149. Compiled code's
+    constructor call declined exception classes and fell back to the generic
+    call, which reached the same native construction through four more
+    layers. It now builds the instance and its `args` in place, and seeds
+    `args` before entering a Python `__init__`.
+  - `len(local)` in frame-JIT code (a generator body, say): the site fused
+    the call but never filled its global cache, so every execution missed
+    into the full load (about 330 instructions). The cache now remembers the
+    fused shape, and the guard's hit computes the length.
+
+  Over the suite the release build retires 0.992 of the instructions it did
+  before (`unpack_sequence` 0.87, `context_managers` 0.92, `sudoku` 0.96,
+  `exceptions` 0.98), and no workload more.
+
 - **Slow paths found by timing everyday operations against CPython** (PR #107).
   Instructions a call, before and after, with CPython 3.14's:
   - Reading an attribute of an instance whose class defines `__setattr__` (a
@@ -773,6 +798,14 @@ slowdown in that run was the even-sized chunks, since fixed.
   What remains of the heap is thin: `PyFunction` (216 bytes, about 1,300 to
   3,300 of them), code stubs, the VM's per-code extension (672 bytes), the
   type cache and the collector's tracked list are 100 to 300 KB each.
+- **Tried and dropped again (November 4)**: allocating a code object's inline
+  cache table only when one of its instructions asks for a cache a second
+  time, so run-once code never allocates it (174 KB of `import re, json`'s 399
+  KB of tables). Peak RSS fell 0.9% over the suite, but a site whose first
+  write was the only one it ever made stayed empty for good: a leaf body's
+  attribute site served afterward from its field slot left `oo_patterns`
+  compiled generically (2% more instructions), and blocks that ran once before
+  a compile counted as never run (`nqueens` 35% more until fixed).
 - **Tried and dropped in the memory work**: delaying inline cache storage until
   a code object's second activation or a run of writes (0.8% less RSS, but
   `closures_decorators` 56% more instructions: compiles and leaf plans read
@@ -902,6 +935,24 @@ slowdown in that run was the even-sized chunks, since fixed.
    (38 us an event), a bound method read without a call 153 ns against 61,
    `SimpleNamespace` attributes 128 against 45, and `Enum("E", "A B C")` 2.1
    times CPython's instructions.
+14. `del obj.attr` takes the instance off its class's shared attribute names:
+   the instance gets a private copy of them (`SplitValues::remove_str`), and
+   every compiled or cached read of it misses from then on. CPython leaves
+   the value's place empty and keeps the shared keys. Doing that here means
+   every reader of split values, the JITs' in-line loads among them, treating
+   an `Unbound` value as absent.
+15. Memory, by subsystem. After `import re, json` the live heap is 2.2 MB
+   above start-up, against CPython's whole 1.8 MB rise in RSS; the rest of
+   ours is touched code pages. The largest heap parts: the VM's per-code
+   extension (about 700 bytes for each code object that runs, plus its
+   constants and names as objects, so string constants are held twice), code
+   stubs and decoding (550 KB), inline cache tables (340 KB, 16 bytes an
+   instruction of any code that runs, module bodies included), function
+   objects (270 KB) and type objects (220 KB). The per-instance costs are
+   larger than CPython's too: an empty instance takes 129 bytes (81), one
+   with five attributes 224 (about 113), an empty list 112 (64) and an empty
+   dict 159 (64); the collector's side tables cost a tracked list or dict
+   about 64 bytes, where CPython's header is 16.
 
 ## Measurement notes
 

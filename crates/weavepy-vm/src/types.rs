@@ -3704,6 +3704,26 @@ impl SlotStorage {
         }
     }
 
+    /// [`Self::get`] of the exception pseudo-slot `which`: by its laid-out
+    /// place (see [`Self::exc_tail_mut`]) when the storage has an
+    /// exception layout, without comparing names.
+    #[inline]
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<&Object> {
+        if let SlotData::Fixed { layout, values } = &self.data {
+            if let Some(i) = layout.len().checked_sub(EXC_TAIL_LEN) {
+                let i = i + which as usize;
+                if let (Object::Str(laid), Object::Str(key)) =
+                    (&layout[i].0, &common_slot_keys()[1 + which as usize])
+                {
+                    if crate::shared_value::SharedStr::ptr_eq(laid, key) {
+                        return values.get(i).filter(|v| !matches!(v, Object::Unbound));
+                    }
+                }
+            }
+        }
+        self.get(which.name())
+    }
+
     /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
     /// [`Self::exc_tail_mut`] when the storage has an exception layout.
     #[inline]
@@ -4028,6 +4048,12 @@ impl SlotStorage {
     #[inline]
     pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
         self.get_mut(which.name())
+    }
+
+    /// The populated pseudo-slot `which` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<&Object> {
+        self.get(which.name())
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
@@ -4565,6 +4591,12 @@ impl PyInstance {
     /// writes it), so the allocation-free probe is authoritative.
     pub fn slot_get(&self, name: &str) -> Option<Object> {
         self.slots.borrow().get(name).cloned()
+    }
+
+    /// [`Self::slot_get`] of an exception pseudo-slot (see
+    /// `SlotStorage::exc_tail_get`).
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<Object> {
+        self.slots.borrow().exc_tail_get(which).cloned()
     }
 
     /// Write slot `name` into the side table.

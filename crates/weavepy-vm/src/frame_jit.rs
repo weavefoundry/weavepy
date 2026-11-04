@@ -5693,6 +5693,22 @@ unsafe extern "C" fn h_load_global(
                     _ => None,
                 };
                 if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                    // The cache remembers the shape, so `h_global` runs it
+                    // while the namespaces hold (see `GlobalCache::len_of`).
+                    let c = &mut *cache;
+                    c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
+                    c.gstamp = g_stamp;
+                    c.gdata = gdict as u64;
+                    (c.builtins, c.bstamp, c.bdata) = if builtin {
+                        let b = std::ptr::addr_of!((*st.frame).builtins)
+                            .cast::<u64>()
+                            .read();
+                        (b, b_stamp, bdict as u64)
+                    } else {
+                        (0, 0, 0)
+                    };
+                    c.value = std::ptr::from_ref(v) as u64;
+                    c.len_of = ins[pc + 2].arg + 1;
                     return fused(st, Object::Int(n), pc + 3);
                 }
             }
@@ -5744,6 +5760,7 @@ unsafe extern "C" fn h_load_global(
         let c = &mut *cache;
         // (A namespace handle's bits: one pointer-sized word.)
         c.value = 0;
+        c.len_of = 0;
         c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
         c.gstamp = g_stamp;
         c.gdata = gdict as u64;
@@ -5789,12 +5806,50 @@ unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
                     && stamp(site.bdata) == site.bstamp
                     && !(*(*st).interp).globals_missing_any.get()))
         {
+            if site.len_of != 0 {
+                return global_len_of(st, c);
+            }
             let v = &*(site.value as *const Object);
             (*st)
                 .stack
                 .add(site.len as usize)
                 .write(crate::clone_hot(v));
             return PUSHED;
+        }
+        global_miss(st, c)
+    }
+}
+
+/// [`h_global`] at a site whose cache holds the fused `len(local)` (see
+/// [`GlobalCache::len_of`]), the namespaces matching: the length of a
+/// list, tuple, str or dict straight off the local, as `h_load_global`
+/// fuses it; anything else through the miss, which tries the rest.
+#[inline(never)]
+unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
+    // SAFETY: as `h_global`'s; `len_of` names one of the code's locals.
+    unsafe {
+        let site = &*c;
+        let st_ref = &mut *st;
+        if !st_ref.depth_cell.is_null() {
+            let n = match &*st_ref.locals.add(site.len_of as usize - 1) {
+                Object::List(l) => l.try_borrow().ok().map(|l| l.len()),
+                Object::Tuple(t) => Some(t.len()),
+                Object::Str(s) => Some(crate::object::str_char_len(s)),
+                Object::Dict(d) => d.try_borrow().ok().map(|d| d.len()),
+                _ => None,
+            };
+            if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
+                let len = site.len as usize;
+                st_ref.stack.add(len).write(Object::Int(n));
+                st_ref.len = len + 1;
+                st_ref.last = site.pc as usize + 3;
+                st_ref.pc = site.pc as usize + 4;
+                return if (*st_ref.maybe_dead).get() {
+                    LEFT_MARKED
+                } else {
+                    LEFT_DISPATCH
+                };
+            }
         }
         global_miss(st, c)
     }
@@ -5858,6 +5913,9 @@ pub(crate) struct GlobalCache {
     nlocals: u32,
     len: u64,
     last: u32,
+    /// A `len(local)` the site fuses (see `h_load_global`): the local's
+    /// index plus one, or `0`.
+    len_of: u32,
 }
 
 /// Where the frame's namespaces, the interpreter's missing-globals flag
