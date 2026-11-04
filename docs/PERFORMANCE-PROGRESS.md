@@ -7,13 +7,18 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
-Measured on November 4, 2026, at `68eb753c` (PR #107), a PGO build against
-CPython 3.14 on the same host, interleaved in one session: warm time 0.992
-(geomean of 33 workloads), cold time 1.124, peak memory 1.282. The worst warm
-times are `async_tree` 1.68, `context_managers` 1.58, `deepcopy` 1.50,
-`class_creation` 1.41, `logging_mix` 1.31, `stdlib_utils` and `exceptions`
-1.30; the best are `pickle_roundtrip` 0.60, `scimark` 0.63, `unpack_sequence`
-0.68 and `json_roundtrip` 0.69.
+Measured on November 4, 2026, at `fde9136e` (PR #107), a PGO build against
+CPython 3.14 on the same host, interleaved in one session: warm time 1.001
+(geomean of 33 workloads), cold time 1.117, peak memory 1.288. Against the
+same day's PGO build of `68eb753c` it reads 1.010 with every workload's
+instructions unchanged (the day's fixes are paths the suite barely runs), so
+the difference is layout noise. The worst warm times are `async_tree` 1.59,
+`context_managers` 1.54, `class_creation` 1.42, `stdlib_utils` 1.39,
+`deepcopy` 1.38, `logging_mix` 1.37 and `exceptions` 1.36; the best are
+`pickle_roundtrip` 0.59, `scimark` 0.62, `json_roundtrip` 0.66,
+`unpack_sequence` 0.68 and `decimal_telco` 0.73. Instructions alone don't
+explain the worst: `oo_patterns` retires 1.05 times CPython's instructions
+and takes 1.18 times its time, `stdlib_utils` 1.20 and 1.39.
 
 Measured on November 3, 2026, at `197a820f` (PR #107, `perf/beyond-parity`),
 on the same host and CPython, both WeavePy binaries profile-guided and
