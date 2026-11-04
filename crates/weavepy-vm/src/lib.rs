@@ -73522,7 +73522,7 @@ mod burst_stats {
         "frame-JIT direct call registered",
         "frame-JIT inlined body's exit",
     ];
-    static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    static CALLS: [AtomicU64; CALL_NAMES.len()] = [const { AtomicU64::new(0) }; CALL_NAMES.len()];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)

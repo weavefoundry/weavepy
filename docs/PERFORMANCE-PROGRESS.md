@@ -630,7 +630,10 @@ slowdown in that run was the even-sized chunks, since fixed.
   million against 0.77 million) and 3.2 times the data-cache misses, spread
   over about 200 helpers at 0.2% to 0.5% each. Each call walks that many
   distinct functions, each with its own prologue and specialized code, so the
-  lever is fewer distinct paths, not where they sit.
+  lever is fewer distinct paths, not where they sit. Nor is it code size alone:
+  a release build at `opt-level = "s"` (14% less text, 0.6 MB fewer resident
+  code pages) ran 1.076 times the `opt-level = 3` build's warm time, slower on
+  nearly every workload.
 
 - **RFC 0078 stage 3 was measured and dropped.** A lane for a warm site's
   callee (`h_call_warm`, positional arguments, no defaults or cells) costs
@@ -874,7 +877,21 @@ slowdown in that run was the even-sized chunks, since fixed.
    `fget`), and a `__getattr__` miss 375 against 107. Compiled code calling
    the same method directly takes 8.6 ns (CPython 29), so the cost is the
    protocol, not the call.
-12. Smaller gaps measured and left: `import decimal` costs 83 million
+12. Tier 2 takes small loops that compiled callers then can't call
+   directly. A function whose only loop is a filtered comprehension
+   (`[x for x in s.split("/") if x]`, `pathlib`'s `_parse_path`) never gets a
+   frame-JIT body: its callers' declines count heat only for leaves, call
+   heat defers code with a loop to tier 2, and a callee tier 2 compiled is
+   declined anyway. Each call then goes out to the core loop and the general
+   frame run into tier 2: 11,100 instructions a call against CPython's
+   2,700, and 4,500 with tier 2 off (`WEAVEPY_TIER2=0`). Tier 2 still pays
+   for itself (off, the suite runs 1.051 times as long: `scimark` 1.59,
+   `tomllib_loads` 1.43, `deepcopy` 1.25). Counting every declined call and
+   letting compiled callers call such code directly halved those calls but
+   was neutral on the suite (1.003; `raytrace` retired 10% more
+   instructions, as loops tier 2 runs better moved to the frame JIT): the
+   choice wants a loop's iterations per entry, which nothing records yet.
+13. Smaller gaps measured and left: `import decimal` costs 83 million
    instructions against 14 (CPython's `_decimal` is C; ours executes a
    6,700-line module), `cProfile` runs about 90 times slower than CPython's
    (38 us an event), a bound method read without a call 153 ns against 61,
