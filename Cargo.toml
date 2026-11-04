@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/weavepy",
     "crates/weavepy-bench",
+    "crates/weavepy-codegen",
     "crates/weavepy-capi",
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
@@ -52,6 +53,7 @@ categories = ["compilers", "development-tools", "parser-implementations"]
 # Internal crates (path deps so the workspace builds without publishing).
 weavepy             = { path = "crates/weavepy",             version = "0.0.0" }
 weavepy-capi        = { path = "crates/weavepy-capi",        version = "0.0.0" }
+weavepy-codegen     = { path = "crates/weavepy-codegen",     version = "0.0.0" }
 weavepy-cli         = { path = "crates/weavepy-cli",         version = "0.0.0" }
 weavepy-compiler    = { path = "crates/weavepy-compiler",    version = "0.0.0" }
 weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }

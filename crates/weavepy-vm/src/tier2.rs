@@ -859,21 +859,6 @@ fn spawn_codegen_prewarm() {
     }
 }
 
-/// Start the code generator's warm-up when the first code object is
-/// halfway to its frame-JIT compile (the first compile most programs
-/// make), when the JIT may run. Starting it with start-up instead spares
-/// a short hot program's first compile some of the cold start (about
-/// 0.7 ms) but keeps the code generator's pages resident in every
-/// process, about 2.4 MB for one that never compiles and 0.2 to 0.5 MB
-/// for one that does (the warm-up touches code no frame compile uses).
-#[cold]
-#[inline(never)]
-pub(crate) fn prewarm_on_heat() {
-    if !jit_off_for_process() {
-        spawn_codegen_prewarm();
-    }
-}
-
 /// Whether [`prewarm_at_startup`] should start the warm-up as start-up
 /// begins (see [`warm_codegen_at_startup`]).
 static PREWARM_AT_STARTUP: std::sync::atomic::AtomicBool =
@@ -914,7 +899,6 @@ pub(crate) fn join_codegen_prewarm() {
     if let Some(handle) = handle {
         let _ = handle.join();
     }
-    crate::frame_jit::quiesce_compiler();
 }
 
 /// Compile, on a throwaway engine, a small counted loop of the shape hot

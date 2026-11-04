@@ -1,0 +1,22 @@
+[package]
+name = "weavepy-codegen"
+description = "A small, fast machine-code generator for WeavePy's frame JIT."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

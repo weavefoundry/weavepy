@@ -572,9 +572,9 @@ pub(super) use h_direct_enter as h_direct_enter_regs;
 
 /// The convention compiled code calls [`h_direct_enter_regs`] with (`None`:
 /// its own).
-pub(super) const ENTER_CONV: Option<cranelift_codegen::isa::CallConv> =
+pub(super) const ENTER_CONV: Option<weavepy_codegen::CallConv> =
     if cfg!(all(windows, target_arch = "x86_64")) {
-        Some(cranelift_codegen::isa::CallConv::SystemV)
+        Some(weavepy_codegen::CallConv::SystemV)
     } else {
         None
     };

@@ -2716,6 +2716,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "weavepy-codegen"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weavepy-compiler"
 version = "0.0.0"
 dependencies = [
@@ -2851,6 +2859,7 @@ dependencies = [
  "stacker",
  "thiserror 2.0.18",
  "tracing",
+ "weavepy-codegen",
  "weavepy-compiler",
  "weavepy-jit",
  "weavepy-lexer",
