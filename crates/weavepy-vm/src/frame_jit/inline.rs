@@ -52,10 +52,10 @@ use super::{
     direct_call, droppable, field_hit, h_call_kw, h_for_iter, h_stack_store_attr, kernel_for, left,
     left_marked, maybe_unbound_locals, never_ran_blocks, plain_release, settle, stats, truth_at,
     type_of_call, AttrSite, BinOpKind, Block, BuiltinSite, Cell, CodeConstObjects, CodeObject,
-    DirectSite, FieldSlot, GlobalCache, IntCC, Interpreter, Item, Lower, Object,
-    OpCode, PyIterator, Rc, SlotWord, State, TruthSite, Value, CALL_DECLINED, DICT_STAMP,
-    EXIT_LAST_SHIFT, EXIT_PC_SHIFT, FLAGS, INTERP, LEFT_MARKED, MARKED, NO_LAST, RAISED, RELOAD,
-    S_LAST, S_SNAP, S_SW,
+    DirectSite, FieldSlot, GlobalCache, IntCC, Interpreter, Item, Lower, Object, OpCode,
+    PyIterator, Rc, SlotWord, State, TruthSite, Value, CALL_DECLINED, DICT_STAMP, EXIT_LAST_SHIFT,
+    EXIT_PC_SHIFT, FLAGS, INTERP, LEFT_MARKED, MARKED, NO_LAST, RAISED, RELOAD, S_LAST, S_SNAP,
+    S_SW,
 };
 use super::{fill_method_cache, MethodCache, MC_VER};
 use weavepy_codegen::types;

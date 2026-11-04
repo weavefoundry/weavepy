@@ -8,9 +8,7 @@
 
 use std::mem;
 
-use weavepy_codegen::{
-    types, AbiParam, ExtFuncData, FuncRef, FuncTarget, Function, Type,
-};
+use weavepy_codegen::{types, AbiParam, ExtFuncData, FuncRef, FuncTarget, Function, Type};
 
 use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
@@ -968,8 +966,7 @@ impl JitEngine {
         let t0 = stats.then(std::time::Instant::now);
         let n_insts = self.func.dfg.num_insts();
         let mut func = mem::take(&mut self.func);
-        let built =
-            weavepy_codegen::compile(&mut func).and_then(|bytes| self.code.install(&bytes));
+        let built = weavepy_codegen::compile(&mut func).and_then(|bytes| self.code.install(&bytes));
         self.func = func;
         self.release();
         let code_ptr = built.map_err(|_| JitVerdict::NotConverged)?;

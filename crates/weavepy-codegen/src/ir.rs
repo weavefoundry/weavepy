@@ -395,9 +395,16 @@ pub(crate) enum Op {
     Iconst(i64),
     Fconst(u64),
     /// `[args[0] + off]`, `bytes` wide, extended to the result type.
-    Load { bytes: u8, ext: Ext, off: i32 },
+    Load {
+        bytes: u8,
+        ext: Ext,
+        off: i32,
+    },
     /// `[args[1] + off] = args[0]`, as wide as `bytes`.
-    Store { bytes: u8, off: i32 },
+    Store {
+        bytes: u8,
+        off: i32,
+    },
     Icmp(IntCC),
     IcmpImm(IntCC, i64),
     Fcmp(FloatCC),
@@ -613,7 +620,11 @@ impl fmt::Display for DisplayFunction<'_> {
             )?;
             for &inst in &bd.insts {
                 let d = &dfg.insts[inst.index()];
-                let res: Vec<String> = dfg.slice(d.results).iter().map(|r| format!("{r}")).collect();
+                let res: Vec<String> = dfg
+                    .slice(d.results)
+                    .iter()
+                    .map(|r| format!("{r}"))
+                    .collect();
                 let args: Vec<String> = dfg.slice(d.args).iter().map(|a| format!("{a}")).collect();
                 let lhs = if res.is_empty() {
                     String::new()
@@ -626,7 +637,12 @@ impl fmt::Display for DisplayFunction<'_> {
                     Op::BrTable(jt) => {
                         let t = &dfg.tables[jt.index()];
                         let tab: Vec<String> = t.table.iter().map(call).collect();
-                        format!("br_table {}, {}, [{}]", args[0], call(&t.default), tab.join(", "))
+                        format!(
+                            "br_table {}, {}, [{}]",
+                            args[0],
+                            call(&t.default),
+                            tab.join(", ")
+                        )
                     }
                     op => format!("{op:?}.{} {}", d.ty, args.join(", ")),
                 };

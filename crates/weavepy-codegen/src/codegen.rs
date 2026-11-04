@@ -17,9 +17,7 @@
 //! whole function.
 
 use crate::asm::{bit, is_float, Abi, Asm, Cond, Frame, Label, Opnd, Reg, NOREG};
-use crate::ir::{
-    condcodes::FloatCC, Alu, Block, Function, Inst, Op, Type, Value, ValueDef,
-};
+use crate::ir::{condcodes::FloatCC, Alu, Block, Function, Inst, Op, Type, Value, ValueDef};
 use crate::liveness::{analyze, each_use, successors, Analysis, NO_BLOCK};
 use crate::Error;
 
@@ -195,7 +193,14 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
     }
     let t_gen = t0.elapsed();
     if timing() {
-        eprintln!("wpcg: {} insts {} blocks {} globals: analyze {:?} gen {:?}", f.dfg.insts.len(), f.dfg.blocks.len(), g.an.globals.len(), t_an, t_gen - t_an);
+        eprintln!(
+            "wpcg: {} insts {} blocks {} globals: analyze {:?} gen {:?}",
+            f.dfg.insts.len(),
+            f.dfg.blocks.len(),
+            g.an.globals.len(),
+            t_an,
+            t_gen.saturating_sub(t_an)
+        );
     }
     g.a.bind(g.epi);
     let frame = Frame {
@@ -303,7 +308,9 @@ impl<A: Asm> Gen<'_, A> {
                     }
                     continue;
                 }
-                let Op::AluImm(Alu::Add, c) = d.op else { continue };
+                let Op::AluImm(Alu::Add, c) = d.op else {
+                    continue;
+                };
                 let v = f.dfg.slice(d.results)[0];
                 if d.ty.bits() != 64 || self.pin[v.index()] != NOREG {
                     continue;
@@ -344,7 +351,11 @@ impl<A: Asm> Gen<'_, A> {
         let params = self.f.dfg.blocks[entry.index()].params.clone();
         let mut moves = Vec::with_capacity(dsts.len());
         for ((&d, &s), &p) in dsts.iter().zip(&locs).zip(&params) {
-            let dst = if d == NOREG { Dst::Sp(self.slot(p)) } else { Dst::R(d) };
+            let dst = if d == NOREG {
+                Dst::Sp(self.slot(p))
+            } else {
+                Dst::R(d)
+            };
             moves.push((dst, Src::R(s)));
         }
         self.moves(moves);
@@ -487,9 +498,8 @@ impl<A: Asm> Gen<'_, A> {
 
     fn free_reg(&self, float: bool, prefer_saved: bool) -> Option<Reg> {
         let regs = if float { A::FLOAT_REGS } else { A::INT_REGS };
-        let avail = |r: Reg| {
-            self.holds[r as usize] == NONE && (self.pinned | self.locked) & bit(r) == 0
-        };
+        let avail =
+            |r: Reg| self.holds[r as usize] == NONE && (self.pinned | self.locked) & bit(r) == 0;
         if prefer_saved {
             if let Some(&r) = regs
                 .iter()
@@ -583,7 +593,8 @@ impl<A: Asm> Gen<'_, A> {
         if off == 0 && base != A::SP {
             self.a.mov(r, base);
         } else {
-            self.a.alu(Alu::Add, crate::ir::types::I64, r, base, Opnd::I(off));
+            self.a
+                .alu(Alu::Add, crate::ir::types::I64, r, base, Opnd::I(off));
         }
     }
 
@@ -671,7 +682,13 @@ impl<A: Asm> Gen<'_, A> {
         let mut taken = self.pinned | avoid;
         // The entry's parameters stay where the caller put them.
         let entry_locs = if b == self.an.order[0] {
-            let tys: Vec<Type> = self.f.signature.params.iter().map(|p| p.value_type).collect();
+            let tys: Vec<Type> = self
+                .f
+                .signature
+                .params
+                .iter()
+                .map(|p| p.value_type)
+                .collect();
             arg_locs(self.abi, &tys).0
         } else {
             Vec::new()
@@ -767,7 +784,10 @@ impl<A: Asm> Gen<'_, A> {
             }
             // The first call after `k`.
             self.calls_after[k] = call;
-            if matches!(f.dfg.insts[inst.index()].op, Op::CallIndirect(_) | Op::Call(_)) {
+            if matches!(
+                f.dfg.insts[inst.index()].op,
+                Op::CallIndirect(_) | Op::Call(_)
+            ) {
                 call = k as u32;
             }
             occ.clear();
@@ -918,12 +938,10 @@ impl<A: Asm> Gen<'_, A> {
             Op::Store { bytes, off } => {
                 let (base, off) = self.address(args[1], *off)?;
                 let off = &off;
-                let stored = match self.imm_of(args[0]) {
-                    Some(i) if !self.in_reg(args[0]) && self.a.store_imm(*bytes, i, base, *off) => {
-                        true
-                    }
-                    _ => false,
-                };
+                let stored = matches!(
+                    self.imm_of(args[0]),
+                    Some(i) if !self.in_reg(args[0]) && self.a.store_imm(*bytes, i, base, *off)
+                );
                 if !stored {
                     let x = self.use_reg(args[0])?;
                     self.a.store(*bytes, x, base, *off);
@@ -1099,8 +1117,7 @@ impl<A: Asm> Gen<'_, A> {
                 self.consume(inst, at);
                 let v = self.res(inst, 0);
                 let r = self.def(v, k, dn(self, 0), Some(a))?;
-                self.a
-                    .extend(matches!(d.op, Op::Sextend), from, d.ty, r, a);
+                self.a.extend(matches!(d.op, Op::Sextend), from, d.ty, r, a);
                 self.unused(v, dn(self, 0));
             }
             Op::Overflow(op) => {
@@ -1175,7 +1192,12 @@ impl<A: Asm> Gen<'_, A> {
                         Ok(Cond::Ne)
                     }
                 };
-                self.branch(pos, c, (t.block, f.dfg.slice(t.args)), (e.block, f.dfg.slice(e.args)))?;
+                self.branch(
+                    pos,
+                    c,
+                    (t.block, f.dfg.slice(t.args)),
+                    (e.block, f.dfg.slice(e.args)),
+                )?;
                 self.consume(inst, at);
             }
             Op::BrTable(jt) => {
@@ -1196,10 +1218,18 @@ impl<A: Asm> Gen<'_, A> {
                 for &v in args {
                     let dst = if self.ty(v).is_float() {
                         nf += 1;
-                        *self.abi.float_rets.get(nf - 1).ok_or(Error::Unsupported("returns"))?
+                        *self
+                            .abi
+                            .float_rets
+                            .get(nf - 1)
+                            .ok_or(Error::Unsupported("returns"))?
                     } else {
                         ni += 1;
-                        *self.abi.int_rets.get(ni - 1).ok_or(Error::Unsupported("returns"))?
+                        *self
+                            .abi
+                            .int_rets
+                            .get(ni - 1)
+                            .ok_or(Error::Unsupported("returns"))?
                     };
                     moves.push((Dst::R(dst), self.src(v)?));
                 }
@@ -1412,10 +1442,14 @@ impl<A: Asm> Gen<'_, A> {
         for (j, &v) in results.iter().enumerate() {
             let r = if self.ty(v).is_float() {
                 nf += 1;
-                *abi.float_rets.get(nf - 1).ok_or(Error::Unsupported("returns"))?
+                *abi.float_rets
+                    .get(nf - 1)
+                    .ok_or(Error::Unsupported("returns"))?
             } else {
                 ni += 1;
-                *abi.int_rets.get(ni - 1).ok_or(Error::Unsupported("returns"))?
+                *abi.int_rets
+                    .get(ni - 1)
+                    .ok_or(Error::Unsupported("returns"))?
             };
             let n = self.def_next[rat + j];
             let pinned = self.pin[v.index()];

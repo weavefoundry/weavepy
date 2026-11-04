@@ -123,6 +123,7 @@ extern "C" fn helper8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h:
     a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h
 }
 
+#[cfg(not(windows))]
 extern "C" fn pair(a: i64) -> Pair {
     Pair { a: a + 1, b: a * 2 }
 }
@@ -151,15 +152,21 @@ fn calls_keep_values() {
         let a = entry(b);
         let s3 = sig(b, 3, 1, CallConv::host());
         let s8 = sig(b, 8, 1, CallConv::host());
-        let h3 = b.ins().iconst(types::I64, helper3 as *const () as usize as i64);
-        let h8 = b.ins().iconst(types::I64, helper8 as *const () as usize as i64);
+        let h3 = b
+            .ins()
+            .iconst(types::I64, helper3 as *const () as usize as i64);
+        let h8 = b
+            .ins()
+            .iconst(types::I64, helper8 as *const () as usize as i64);
         let x = b.ins().iadd_imm(a[0], 1);
         let y = b.ins().iadd_imm(a[1], 2);
         let z = b.ins().imul(x, y);
         let c1 = b.ins().call_indirect(s3, h3, &[x, y, z]);
         let r1 = b.inst_results(c1)[0];
         let one = b.ins().iconst(types::I64, 1);
-        let c2 = b.ins().call_indirect(s8, h8, &[x, y, z, r1, one, a[0], a[1], x]);
+        let c2 = b
+            .ins()
+            .call_indirect(s8, h8, &[x, y, z, r1, one, a[0], a[1], x]);
         let r2 = b.inst_results(c2)[0];
         let t = b.ins().iadd(r2, z);
         let u = b.ins().iadd(t, x);
@@ -190,7 +197,9 @@ fn two_returns() {
             CallConv::host()
         };
         let s = sig(b, 1, 2, conv);
-        let h = b.ins().iconst(types::I64, pair_sysv as *const () as usize as i64);
+        let h = b
+            .ins()
+            .iconst(types::I64, pair_sysv as *const () as usize as i64);
         let c = b.ins().call_indirect(s, h, &[a[0]]);
         let (x, y) = (b.inst_results(c)[0], b.inst_results(c)[1]);
         let r = b.ins().isub(y, x);
@@ -278,10 +287,10 @@ fn memory_and_narrow() {
         word: 100,
         small: 0xffff_ffff,
     };
-    assert_eq!(f(&mut s as *mut S as i64), 100 + 0xffff_ffff);
+    assert_eq!(f((&raw mut s) as i64), 100 + 0xffff_ffff);
     assert_eq!(s.tag, 4);
     assert_eq!(s.word, 100 + 0xffff_ffff);
-    assert_eq!(f(&mut s as *mut S as i64), -1);
+    assert_eq!(f((&raw mut s) as i64), -1);
     let _ = s.pad;
 }
 
@@ -394,8 +403,18 @@ fn floats() {
             .enumerate()
             .fold(0i64, |acc, (i, &b)| acc | (i64::from(b) << i))
     };
-    for (x, y) in [(1.0, 2.0), (2.0, 1.0), (1.0, 1.0), (f64::NAN, 1.0), (1.0, f64::NAN)] {
-        assert_eq!(f(x.to_bits() as i64, y.to_bits() as i64), r(x, y), "{x} {y}");
+    for (x, y) in [
+        (1.0, 2.0),
+        (2.0, 1.0),
+        (1.0, 1.0),
+        (f64::NAN, 1.0),
+        (1.0, f64::NAN),
+    ] {
+        assert_eq!(
+            f(x.to_bits() as i64, y.to_bits() as i64),
+            r(x, y),
+            "{x} {y}"
+        );
     }
 }
 
@@ -406,7 +425,10 @@ fn br_table() {
         let blocks: Vec<_> = (0..5).map(|_| b.create_block()).collect();
         let dflt = b.create_block();
         let idx = b.ins().ireduce(types::I32, a[0]);
-        let calls: Vec<_> = blocks.iter().map(|&bl| b.func.dfg.block_call(bl, &[])).collect();
+        let calls: Vec<_> = blocks
+            .iter()
+            .map(|&bl| b.func.dfg.block_call(bl, &[]))
+            .collect();
         let def = b.func.dfg.block_call(dflt, &[]);
         let jt = b.create_jump_table(crate::JumpTableData::new(def, &calls));
         b.ins().br_table(idx, jt);
@@ -487,7 +509,9 @@ fn state_machine() {
             s.returns.push(AbiParam::new(types::I32));
             b.import_signature(s)
         };
-        let h = b.ins().iconst(types::I64, h_step as *const () as usize as i64);
+        let h = b
+            .ins()
+            .iconst(types::I64, h_step as *const () as usize as i64);
         let c = b.ins().call_indirect(sig, h, &[st, i]);
         let r = b.inst_results(c)[0];
         let next = b.create_block();
@@ -515,7 +539,7 @@ fn state_machine() {
         stack: stack.as_mut_ptr(),
         n: 0,
     };
-    assert_eq!(f(&mut st), 3);
+    assert_eq!(f(&raw mut st), 3);
     assert_eq!(st.n, 1001);
     assert_eq!(locals[0], (0..1000).sum::<i64>());
     let mut want = [0i64; 4];

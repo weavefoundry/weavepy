@@ -251,9 +251,7 @@ impl A64 {
     }
 
     fn saved_regs(frame: &Frame) -> Vec<Reg> {
-        (0..64)
-            .filter(|&r| frame.saved & bit(r) != 0)
-            .collect()
+        (0..64).filter(|&r| frame.saved & bit(r) != 0).collect()
     }
 
     fn frame_size(frame: &Frame) -> u32 {
@@ -504,7 +502,11 @@ impl Asm for A64 {
                 let (add, sub) = (0x0B00_0000, 0x4B00_0000);
                 match b {
                     Opnd::I(i) => {
-                        let (i, neg) = if op == Alu::Sub { (i.wrapping_neg(), true) } else { (i, false) };
+                        let (i, neg) = if op == Alu::Sub {
+                            (i.wrapping_neg(), true)
+                        } else {
+                            (i, false)
+                        };
                         let _ = neg;
                         let ty64 = bits == 64;
                         let i = if ty64 { i } else { i64::from(i as i32) };
@@ -544,7 +546,11 @@ impl Asm for A64 {
                 match b {
                     Opnd::I(i) => {
                         let w = if bits == 64 { 64 } else { 32 };
-                        let u = if w == 32 { i as u64 & 0xffff_ffff } else { i as u64 };
+                        let u = if w == 32 {
+                            i as u64 & 0xffff_ffff
+                        } else {
+                            i as u64
+                        };
                         match logical_imm(u, w) {
                             Some(enc) => self.put(imm | sf | enc << 10 | r(a) << 5 | r(dst)),
                             None if u == 0 => match op {
@@ -629,7 +635,9 @@ impl Asm for A64 {
             match b {
                 Opnd::I(i) => self.movimm(X17, ((i as u32) << s) as i32 as i64),
                 Opnd::R(m) => {
-                    self.put(0x5300_0000 | (32 - s) % 32 << 16 | (31 - s) << 10 | r(m) << 5 | r(X17));
+                    self.put(
+                        0x5300_0000 | (32 - s) % 32 << 16 | (31 - s) << 10 | r(m) << 5 | r(X17),
+                    );
                 }
             }
             self.put(0x6B00_001F | r(X17) << 16 | r(X16) << 5);
@@ -672,7 +680,11 @@ impl Asm for A64 {
 
     fn csel(&mut self, c: Cond, ty: Type, dst: Reg, x: Reg, y: Reg) {
         if ty.is_float() {
-            let op = if ty.bits() == 32 { 0x1E20_0C00 } else { 0x1E60_0C00 };
+            let op = if ty.bits() == 32 {
+                0x1E20_0C00
+            } else {
+                0x1E60_0C00
+            };
             self.put(op | r(y) << 16 | cc(c) << 12 | r(x) << 5 | r(dst));
         } else {
             self.put(0x9A80_0000 | r(y) << 16 | cc(c) << 12 | r(x) << 5 | r(dst));
@@ -710,7 +722,11 @@ impl Asm for A64 {
     }
 
     fn fop(&mut self, op: Fop, ty: Type, dst: Reg, a: Reg, b: Reg) {
-        let base = if ty.bits() == 32 { 0x1E20_0000 } else { 0x1E60_0000 };
+        let base = if ty.bits() == 32 {
+            0x1E20_0000
+        } else {
+            0x1E60_0000
+        };
         let code = match op {
             Fop::Add => 0x2800,
             Fop::Sub => 0x3800,
@@ -721,17 +737,29 @@ impl Asm for A64 {
     }
 
     fn fneg(&mut self, ty: Type, dst: Reg, a: Reg) {
-        let op = if ty.bits() == 32 { 0x1E21_4000 } else { 0x1E61_4000 };
+        let op = if ty.bits() == 32 {
+            0x1E21_4000
+        } else {
+            0x1E61_4000
+        };
         self.put(op | r(a) << 5 | r(dst));
     }
 
     fn fabs(&mut self, ty: Type, dst: Reg, a: Reg) {
-        let op = if ty.bits() == 32 { 0x1E20_C000 } else { 0x1E60_C000 };
+        let op = if ty.bits() == 32 {
+            0x1E20_C000
+        } else {
+            0x1E60_C000
+        };
         self.put(op | r(a) << 5 | r(dst));
     }
 
     fn fsqrt(&mut self, ty: Type, dst: Reg, a: Reg) {
-        let op = if ty.bits() == 32 { 0x1E21_C000 } else { 0x1E61_C000 };
+        let op = if ty.bits() == 32 {
+            0x1E21_C000
+        } else {
+            0x1E61_C000
+        };
         self.put(op | r(a) << 5 | r(dst));
     }
 
@@ -758,7 +786,11 @@ impl Asm for A64 {
     }
 
     fn fcmp(&mut self, _cc: FloatCC, ty: Type, a: Reg, b: Reg) {
-        let op = if ty.bits() == 32 { 0x1E20_2000 } else { 0x1E60_2000 };
+        let op = if ty.bits() == 32 {
+            0x1E20_2000
+        } else {
+            0x1E60_2000
+        };
         self.put(op | r(b) << 16 | r(a) << 5);
     }
 
@@ -858,7 +890,9 @@ impl Asm for A64 {
                 }
                 Fix::B19(l) => {
                     let d = i64::from(self.labels[l.0 as usize]) - i64::from(at);
-                    if self.labels[l.0 as usize] == u32::MAX || !(-(1 << 18)..(1 << 18)).contains(&d) {
+                    if self.labels[l.0 as usize] == u32::MAX
+                        || !(-(1 << 18)..(1 << 18)).contains(&d)
+                    {
                         return Err(Error::Unsupported("a branch out of range"));
                     }
                     *w |= ((d as u32) & 0x7ffff) << 5;

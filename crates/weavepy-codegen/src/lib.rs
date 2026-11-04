@@ -10,7 +10,11 @@
 //!
 //! Supported targets: x86-64 (System V and Win64) and AArch64.
 
-#![allow(clippy::new_without_default, clippy::wrong_self_convention)]
+#![allow(
+    clippy::new_without_default,
+    clippy::wrong_self_convention,
+    clippy::enum_glob_use
+)]
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

@@ -61,7 +61,8 @@ pub(crate) fn simplify(f: &mut Function) {
                 }
                 Op::Alu(op) if a1 - a0 == 2 => {
                     let (x, y) = (f.dfg.pool[a0], f.dfg.pool[a0 + 1]);
-                    let commutes = matches!(op, Alu::Add | Alu::Mul | Alu::And | Alu::Or | Alu::Xor);
+                    let commutes =
+                        matches!(op, Alu::Add | Alu::Mul | Alu::And | Alu::Or | Alu::Xor);
                     if commutes && const_int(f, x).is_some() && const_int(f, y).is_none() {
                         f.dfg.pool.swap(a0, a0 + 1);
                     }
@@ -189,8 +190,6 @@ pub(crate) fn simplify(f: &mut Function) {
         }
     }
     for b in f.layout.clone() {
-        f.dfg.blocks[b.index()]
-            .insts
-            .retain(|i| !dead[i.index()]);
+        f.dfg.blocks[b.index()].insts.retain(|i| !dead[i.index()]);
     }
 }

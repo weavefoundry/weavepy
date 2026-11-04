@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::ir::{
     condcodes::{FloatCC, IntCC},
     types, Alu, Block, BlockArg, BlockData, Div, Edge, Ext, ExtFuncData, Fop, FuncRef, Function,
-    Inst, InstData, JumpTable, JumpTableData, MemFlags, Op, Overflow, SigRef, Signature,
-    StackSlot, StackSlotData, Type, Value, ValueDef, Variable,
+    Inst, InstData, JumpTable, JumpTableData, MemFlags, Op, Overflow, SigRef, Signature, StackSlot,
+    StackSlotData, Type, Value, ValueDef, Variable,
 };
 
 /// Builds a function's blocks and instructions.
@@ -246,8 +246,7 @@ impl FuncInstBuilder<'_, '_> {
     }
 
     pub fn f64const(self, x: f64) -> Value {
-        self.b
-            .push1(Op::Fconst(x.to_bits()), &[], types::F64)
+        self.b.push1(Op::Fconst(x.to_bits()), &[], types::F64)
     }
 
     pub fn load(self, ty: Type, _flags: MemFlags, p: Value, off: impl Into<i32>) -> Value {

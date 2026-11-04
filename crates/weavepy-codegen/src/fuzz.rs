@@ -137,9 +137,12 @@ fn generate(seed: u64) -> Function {
                 let x = rng.pick(&ints);
                 let y = rng.pick(&ints);
                 let v = match rng.below(20) {
-                    0 => b.ins().iconst(types::I64, rng.next() as i64 >> rng.below(64)),
+                    0 => b
+                        .ins()
+                        .iconst(types::I64, rng.next() as i64 >> rng.below(64)),
                     1 => {
-                        let op = rng.pick(&[Alu::Add, Alu::Sub, Alu::Mul, Alu::And, Alu::Or, Alu::Xor]);
+                        let op =
+                            rng.pick(&[Alu::Add, Alu::Sub, Alu::Mul, Alu::And, Alu::Or, Alu::Xor]);
                         match op {
                             Alu::Add => b.ins().iadd(x, y),
                             Alu::Sub => b.ins().isub(x, y),
@@ -176,7 +179,11 @@ fn generate(seed: u64) -> Function {
                         b.ins().uextend(types::I64, c)
                     }
                     5 => {
-                        let c = b.ins().icmp_imm(rng.pick(&INT_CCS), x, rng.next() as i64 >> rng.below(64));
+                        let c = b.ins().icmp_imm(
+                            rng.pick(&INT_CCS),
+                            x,
+                            rng.next() as i64 >> rng.below(64),
+                        );
                         let z = rng.pick(&ints);
                         b.ins().select(c, y, z)
                     }
@@ -195,10 +202,13 @@ fn generate(seed: u64) -> Function {
                         if rng.below(2) == 0 {
                             let c = b.ins().icmp(rng.pick(&INT_CCS), r, xn);
                             b.ins().uextend(types::I64, c)
-                        } else if rng.below(2) == 0 {
-                            b.ins().uextend(types::I64, r)
                         } else {
-                            b.ins().sextend(types::I64, r)
+                            let signed = rng.below(2) == 0;
+                            if signed {
+                                b.ins().sextend(types::I64, r)
+                            } else {
+                                b.ins().uextend(types::I64, r)
+                            }
                         }
                     }
                     7 => {
@@ -224,7 +234,9 @@ fn generate(seed: u64) -> Function {
                         };
                         match rng.below(5) {
                             0 => b.ins().load(types::I64, F, mem, off),
-                            1 => b.ins().uload8(types::I64, F, mem, off + rng.below(8) as i32),
+                            1 => b
+                                .ins()
+                                .uload8(types::I64, F, mem, off + rng.below(8) as i32),
                             2 => b.ins().uload32(F, mem, off),
                             3 => b.ins().sload32(F, mem, off + 4),
                             _ => {
@@ -503,7 +515,11 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
                 Op::Bnot => Some(norm(rt, !arg(0))),
                 Op::Ineg => Some(norm(rt, arg(0).wrapping_neg())),
                 Op::Smulhi => Some(((i128::from(arg(0)) * i128::from(arg(1))) >> 64) as i64),
-                Op::Select => Some(if zext(ty(a[0]), arg(0)) != 0 { arg(1) } else { arg(2) }),
+                Op::Select => Some(if zext(ty(a[0]), arg(0)) != 0 {
+                    arg(1)
+                } else {
+                    arg(2)
+                }),
                 Op::Ireduce => Some(norm(rt, arg(0))),
                 Op::Uextend => Some(zext(ty(a[0]), arg(0)) as i64),
                 Op::Sextend => Some(norm(ty(a[0]), arg(0))),
@@ -657,7 +673,10 @@ fn random_functions() {
         };
         // SAFETY: compiled for exactly this signature.
         let jit: extern "C" fn(i64, i64, *mut u8) -> i64 = unsafe { std::mem::transmute(p) };
-        for (k, &(a, b)) in [(3i64, -7i64), (1 << 40, 12345), (-1, i64::MIN), (0, 0)].iter().enumerate() {
+        for (k, &(a, b)) in [(3i64, -7i64), (1 << 40, 12345), (-1, i64::MIN), (0, 0)]
+            .iter()
+            .enumerate()
+        {
             let mut m1 = [0u8; MEM];
             for (i, x) in m1.iter_mut().enumerate() {
                 *x = (i as u8).wrapping_mul(37).wrapping_add(k as u8);
@@ -673,7 +692,11 @@ fn random_functions() {
                     std::fs::write(path, crate::compile(&mut f.clone()).unwrap()).unwrap();
                 }
             }
-            assert!(saved, "seed {seed}: a callee-saved register changed\n{}", f.display());
+            assert!(
+                saved,
+                "seed {seed}: a callee-saved register changed\n{}",
+                f.display()
+            );
             assert_eq!(again, got, "seed {seed}: the checked call differs");
             assert!(
                 got == want && m1 == m2,
@@ -694,7 +717,10 @@ fn compile_speed() {
     }
     let funcs: Vec<Function> = (0..2000).map(generate).collect();
     let insts: usize = funcs.iter().map(|f| f.dfg.num_insts()).sum();
-    let rounds: usize = std::env::var("WPCG_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let rounds: usize = std::env::var("WPCG_BENCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     for round in 0..rounds {
         let t = std::time::Instant::now();
         let mut bytes = 0;

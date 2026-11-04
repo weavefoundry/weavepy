@@ -39,7 +39,16 @@ const ALL_XMM: u64 = 0xffff_u64 << FLOAT;
 
 static SYSV: Abi = Abi {
     int_args: &[RDI, RSI, RDX, RCX, R8, R9],
-    float_args: &[xmm(0), xmm(1), xmm(2), xmm(3), xmm(4), xmm(5), xmm(6), xmm(7)],
+    float_args: &[
+        xmm(0),
+        xmm(1),
+        xmm(2),
+        xmm(3),
+        xmm(4),
+        xmm(5),
+        xmm(6),
+        xmm(7),
+    ],
     positional: false,
     int_rets: &[RAX, RDX],
     float_rets: &[xmm(0), xmm(1)],
@@ -168,9 +177,8 @@ impl X64 {
             Rm::Idx8(base, idx) => ((base & 15) >> 3, (idx & 15) >> 3),
             Rm::Pool(_) => (0, 0),
         };
-        let force = byte
-            && ((4..8).contains(&reg)
-                || matches!(rm, Rm::R(r) if (4..8).contains(&(r & 15))));
+        let force =
+            byte && ((4..8).contains(&reg) || matches!(rm, Rm::R(r) if (4..8).contains(&(r & 15))));
         let rex = 0x40 | (u8::from(w) << 3) | ((reg >> 3) << 2) | (x << 1) | b;
         if rex != 0x40 || force {
             self.byte(rex);
@@ -235,7 +243,14 @@ impl X64 {
 
     fn movaps(&mut self, dst: Reg, src: Reg) {
         if dst != src {
-            self.emit(&[], false, &[0x0f, 0x28], dst - FLOAT, Rm::R(src - FLOAT), false);
+            self.emit(
+                &[],
+                false,
+                &[0x0f, 0x28],
+                dst - FLOAT,
+                Rm::R(src - FLOAT),
+                false,
+            );
         }
     }
 
@@ -314,7 +329,7 @@ impl X64 {
     fn frame_size(frame: &Frame) -> u32 {
         let pushed = 8 * Self::saved_regs(frame).len() as u32;
         let mut size = frame.slots + frame.out;
-        if (pushed + size) % 16 != 0 {
+        if !(pushed + size).is_multiple_of(16) {
             size += 8;
         }
         size
@@ -437,7 +452,14 @@ impl Asm for X64 {
     fn fimm(&mut self, dst: Reg, bits: u64, ty: Type) {
         if bits == 0 {
             // (`xorps` leaves the integer flags alone.)
-            self.emit(&[], false, &[0x0f, 0x57], dst - FLOAT, Rm::R(dst - FLOAT), false);
+            self.emit(
+                &[],
+                false,
+                &[0x0f, 0x57],
+                dst - FLOAT,
+                Rm::R(dst - FLOAT),
+                false,
+            );
             return;
         }
         let i = self.pool_entry(bits);
@@ -742,7 +764,11 @@ impl Asm for X64 {
 
     fn overflow(&mut self, op: Overflow, ty: Type, dst: Reg, a: Reg, b: Reg) -> Cond {
         let w = ty.bits() == 64;
-        let ty = if ty.bits() < 32 { crate::ir::types::I32 } else { ty };
+        let ty = if ty.bits() < 32 {
+            crate::ir::types::I32
+        } else {
+            ty
+        };
         let run = |s: &mut Self, d: Reg, src: Reg| match op {
             Overflow::Add => s.alu_rr(0x01, ty, d, src),
             Overflow::Sub => s.alu_rr(0x29, ty, d, src),
@@ -788,11 +814,22 @@ impl Asm for X64 {
     }
 
     fn fneg(&mut self, ty: Type, dst: Reg, a: Reg) {
-        let m = if ty.bits() == 32 { 0x8000_0000 } else { 1 << 63 };
+        let m = if ty.bits() == 32 {
+            0x8000_0000
+        } else {
+            1 << 63
+        };
         let i = self.pool_entry(m);
         self.sse(0xf2, 0x10, Self::FSCRATCH, Rm::Pool(i));
         self.movaps(dst, a);
-        self.emit(&[0x66], false, &[0x0f, 0x57], dst - FLOAT, Rm::R(Self::FSCRATCH - FLOAT), false);
+        self.emit(
+            &[0x66],
+            false,
+            &[0x0f, 0x57],
+            dst - FLOAT,
+            Rm::R(Self::FSCRATCH - FLOAT),
+            false,
+        );
     }
 
     fn fabs(&mut self, ty: Type, dst: Reg, a: Reg) {
@@ -804,7 +841,14 @@ impl Asm for X64 {
         let i = self.pool_entry(m);
         self.sse(0xf2, 0x10, Self::FSCRATCH, Rm::Pool(i));
         self.movaps(dst, a);
-        self.emit(&[0x66], false, &[0x0f, 0x54], dst - FLOAT, Rm::R(Self::FSCRATCH - FLOAT), false);
+        self.emit(
+            &[0x66],
+            false,
+            &[0x0f, 0x54],
+            dst - FLOAT,
+            Rm::R(Self::FSCRATCH - FLOAT),
+            false,
+        );
     }
 
     fn fsqrt(&mut self, ty: Type, dst: Reg, a: Reg) {
@@ -819,9 +863,23 @@ impl Asm for X64 {
             a
         };
         // (A fresh register breaks the dependence on dst's old value.)
-        self.emit(&[], false, &[0x0f, 0x57], dst - FLOAT, Rm::R(dst - FLOAT), false);
+        self.emit(
+            &[],
+            false,
+            &[0x0f, 0x57],
+            dst - FLOAT,
+            Rm::R(dst - FLOAT),
+            false,
+        );
         let pre = if to.bits() == 32 { 0xf3 } else { 0xf2 };
-        self.emit(&[pre], from.bits() == 64, &[0x0f, 0x2a], dst - FLOAT, Rm::R(src), false);
+        self.emit(
+            &[pre],
+            from.bits() == 64,
+            &[0x0f, 0x2a],
+            dst - FLOAT,
+            Rm::R(src),
+            false,
+        );
     }
 
     fn bitcast(&mut self, ty: Type, dst: Reg, a: Reg) {
@@ -842,7 +900,14 @@ impl Asm for X64 {
             _ => (a, b),
         };
         let pre: &[u8] = if ty.bits() == 32 { &[] } else { &[0x66] };
-        self.emit(pre, false, &[0x0f, 0x2e], x - FLOAT, Rm::R(y - FLOAT), false);
+        self.emit(
+            pre,
+            false,
+            &[0x0f, 0x2e],
+            x - FLOAT,
+            Rm::R(y - FLOAT),
+            false,
+        );
     }
 
     fn fsetcc(&mut self, cc: FloatCC, dst: Reg) {
@@ -955,7 +1020,7 @@ impl Asm for X64 {
 
     fn finish(mut self, frame: &Frame) -> Result<Vec<u8>, Error> {
         // The pool and the tables after the code, 8-byte aligned.
-        while self.buf.len() % 8 != 0 {
+        while !self.buf.len().is_multiple_of(8) {
             self.byte(0xcc);
         }
         let pool_at = self.buf.len() as u32;
@@ -983,7 +1048,7 @@ impl Asm for X64 {
                 Fix::Rel(l) => label(&self, l)?,
                 Fix::Pool(i) => pool_at + 8 * i,
             };
-            let rel = target as i64 - (i64::from(at) + 4);
+            let rel = i64::from(target) - (i64::from(at) + 4);
             self.buf[at as usize..at as usize + 4].copy_from_slice(&(rel as i32).to_le_bytes());
         }
         for (at, tl, l) in entries {
