@@ -1,18 +1,16 @@
 //! Interactive REPL for `weavepy`.
 //!
 //! This is the user-visible "type `weavepy` at a shell, get a Python
-//! prompt" experience. Built on `rustyline` for line editing, history,
-//! and Ctrl-C / Ctrl-D handling. Each top-level input is parsed; if it
+//! prompt" experience. On a terminal it's CPython's `_pyrepl`, as in
+//! `pymain_run_python`. This module owns what happens around it, and the
+//! basic REPL for everything else: `PYTHON_BASIC_REPL`, a terminal
+//! `_pyrepl` can't drive (`TERM=dumb`), and piped stdin under `-i`.
+//!
+//! The basic REPL reads plain lines. Each top-level input is parsed; if it
 //! looks incomplete (unclosed bracket, dangling `:`-suite, unterminated
 //! string) we re-prompt with `ps2` ("... ") until the user finishes the
 //! statement. Successful evaluations of bare expressions print their
 //! `repr()` and rebind `_` to the result, mirroring CPython.
-//!
-//! Persistent history lives at `$WEAVEPY_HISTORY`, falling back to
-//! `$XDG_DATA_HOME/weavepy/history` (Linux), `~/Library/Application
-//! Support/weavepy/history` (macOS), `%APPDATA%/weavepy/history`
-//! (Windows), or `~/.weavepy_history` if none of those resolve. Read
-//! on startup, appended on every accepted input.
 //!
 //! `PYTHONSTARTUP` runs once before the first prompt. The REPL also
 //! injects a fresh `__main__` module whose globals persist across
@@ -20,15 +18,12 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use weavepy_vm::shared_value::SharedStr;
 use weavepy_vm::sync::Rc;
 use weavepy_vm::sync::RefCell;
 
 use anyhow::Result;
-use rustyline::error::ReadlineError;
-use rustyline::history::FileHistory;
-use rustyline::{Config, EditMode, Editor};
 use weavepy::vm::{
     object::{DictData, DictKey, Object, PyModule},
     Interpreter,
@@ -41,13 +36,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`Repl::run`].
 pub(crate) struct Repl {
     interpreter: Interpreter,
-    editor: Editor<(), FileHistory>,
     main_module: Rc<PyModule>,
-    history_path: Option<PathBuf>,
-    /// Whether stdin is a terminal. When it isn't (piped input), lines
-    /// are read directly rather than through rustyline, so EOF
-    /// handling can match CPython's `PyOS_StdioReadline`.
+    /// Whether stdin is a terminal.
     stdin_tty: bool,
+    /// `-E`: `PYTHON_BASIC_REPL` doesn't count.
+    ignore_env: bool,
     quiet: bool,
     /// `CO_FUTURE_*` bits accumulated from executed inputs, so a
     /// `from __future__ import …` typed at one prompt affects every
@@ -60,18 +53,7 @@ impl Repl {
     /// interpreter's `__main__` module is created and registered into
     /// `sys.modules` so subsequent inputs can reach each other via
     /// `globals()`.
-    pub(crate) fn new(interpreter: Interpreter, quiet: bool) -> Result<Self> {
-        let config = Config::builder()
-            .history_ignore_dups(true)
-            .map_err(io_err)?
-            .edit_mode(EditMode::Emacs)
-            .auto_add_history(true)
-            .build();
-        let mut editor: Editor<(), FileHistory> = Editor::with_config(config).map_err(io_err)?;
-        let history_path = history_file_path();
-        if let Some(p) = history_path.as_ref() {
-            let _ = editor.load_history(p);
-        }
+    pub(crate) fn new(interpreter: Interpreter, quiet: bool, ignore_env: bool) -> Result<Self> {
         // `-i` / `PYTHONINSPECT`: a program already ran and left its
         // `__main__` behind — the REPL continues in that namespace
         // (CPython's `pymain_repl`), so `python -i -m timeit` sees
@@ -88,10 +70,9 @@ impl Repl {
         };
         Ok(Self {
             interpreter,
-            editor,
             main_module,
-            history_path,
             stdin_tty: std::io::IsTerminal::is_terminal(&io::stdin()),
+            ignore_env,
             quiet,
             future_flags: 0,
         })
@@ -104,12 +85,120 @@ impl Repl {
         if !self.quiet {
             self.print_banner();
         }
-        self.warn_dumb_terminal();
         if let Some(p) = startup {
             self.run_startup(p);
         }
+        self.enter(false)
+    }
+
+    /// `pymain_repl`: the prompt after a `-i` program, which is where
+    /// `_pyrepl` itself runs `PYTHONSTARTUP`.
+    pub(crate) fn run_inspect(mut self) -> Result<()> {
+        self.enter(true)
+    }
+
+    /// `_pymain_run_repl`: `_pyrepl` on a terminal, unless `PYTHON_BASIC_REPL`
+    /// asks for the basic REPL or `_pyrepl` can't run here.
+    fn enter(&mut self, pythonstartup: bool) -> Result<()> {
+        if self.stdin_tty {
+            self.run_interactive_hook();
+            if (self.ignore_env || !basic_repl_requested()) && self.run_pyrepl(pythonstartup) {
+                self.finalize_interpreter();
+                return Ok(());
+            }
+        }
         self.install_prompts();
         self.run_loop()
+    }
+
+    /// `pymain_run_interactive_hook`: `site`'s readline and history setup.
+    fn run_interactive_hook(&mut self) {
+        const SOURCE: &str = "\
+import sys
+hook = getattr(sys, '__interactivehook__', None)
+if hook is not None:
+    sys.audit('cpython.run_interactivehook', hook)
+    try:
+        hook()
+    except SystemExit:
+        raise
+    except BaseException:
+        print('Failed calling sys.__interactivehook__', file=sys.stderr)
+        sys.excepthook(*sys.exc_info())
+";
+        self.exec_private(SOURCE, "<interactivehook>");
+    }
+
+    /// `pymain_run_pyrepl`: `false` when `_pyrepl` can't run here, having
+    /// said why, for the basic REPL to take over. (`interactive_console`
+    /// would fall back through `sys._baserepl`, which the basic REPL doesn't
+    /// need, being this module.)
+    fn run_pyrepl(&mut self, pythonstartup: bool) -> bool {
+        let startup = if pythonstartup { "True" } else { "False" };
+        let globals = self.exec_private(
+            &format!(
+                "import __main__, sys\n\
+                 from _pyrepl.main import CAN_USE_PYREPL, FAIL_REASON, interactive_console\n\
+                 if CAN_USE_PYREPL:\n    \
+                     interactive_console(mainmodule=__main__, pythonstartup={startup})\n\
+                 else:\n    \
+                     print(FAIL_REASON, file=sys.stderr)\n"
+            ),
+            "<pyrepl>",
+        );
+        globals.is_some_and(|g| {
+            g.borrow()
+                .get(&DictKey(Object::from_static("CAN_USE_PYREPL")))
+                .is_some_and(Object::is_truthy)
+        })
+    }
+
+    /// Run `source` in a namespace of its own, so that `__main__` stays as
+    /// the prompt should find it, and return the namespace. A `SystemExit`
+    /// ends the session; anything else is reported, and leaves whatever
+    /// the namespace had by then.
+    fn exec_private(&mut self, source: &str, filename: &str) -> Option<Rc<RefCell<DictData>>> {
+        let module = match parser::parse_module_with_warnings_flags(source, false).0 {
+            Ok(module) => module,
+            Err(e) => {
+                let e = weavepy::Error::Parse(e).format(source, filename);
+                let _ = io::stderr().write_all(e.as_bytes());
+                return None;
+            }
+        };
+        let code = match compiler::compile_owned_module_with_options(
+            module,
+            source,
+            filename,
+            compiler::CompileOptions::default(),
+        ) {
+            Ok(code) => code,
+            Err(e) => {
+                let e = weavepy::Error::Compile(e).format(source, filename);
+                let _ = io::stderr().write_all(e.as_bytes());
+                return None;
+            }
+        };
+        let globals = Rc::new(RefCell::new(DictData::default()));
+        globals.borrow_mut().insert(
+            DictKey(Object::from_static("__builtins__")),
+            Object::Dict(self.interpreter.builtins_dict()),
+        );
+        if let Err(e) = self.interpreter.exec_module_in(&code, globals.clone()) {
+            self.report_error(e);
+        }
+        Some(globals)
+    }
+
+    /// Print an exception that ended a step outside any prompt's input.
+    fn report_error(&mut self, e: weavepy::vm::RuntimeError) {
+        self.exit_if_system_exit(&e);
+        if let weavepy::vm::RuntimeError::PyException(exc) = &e {
+            if self.interpreter.print_uncaught_exception(exc) {
+                return;
+            }
+        }
+        let _ = writeln!(io::stderr(), "{e}");
     }
 
     /// CPython's `PyRun_InteractiveLoop` defines `sys.ps1` / `sys.ps2`
@@ -126,24 +215,6 @@ impl Repl {
             if !d.contains_key(&key) {
                 d.insert(key, Object::Str(SharedStr::from(value.as_str())));
             }
-        }
-    }
-
-    /// 3.14's `_pyrepl.main.interactive_console`: on a tty whose
-    /// terminfo lacks the capabilities pyrepl needs (`TERM=dumb`), it
-    /// warns once on stderr and falls back to the basic REPL, unless
-    /// `PYTHON_BASIC_REPL` asked for that explicitly. Our line editor is
-    /// native, but the fallback notice is part of the observable contract
-    /// (test_pyrepl `TestDumbTerminal`).
-    fn warn_dumb_terminal(&self) {
-        if !self.stdin_tty || std::env::var_os("PYTHON_BASIC_REPL").is_some() {
-            return;
-        }
-        if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
-            let _ = writeln!(
-                io::stderr(),
-                "warning: can't use pyrepl: (5, \"terminal doesn't have the required clear capability\"); TERM=dumb"
-            );
         }
     }
 
@@ -190,13 +261,13 @@ impl Repl {
             let prompt = if buffer.is_empty() { ps1() } else { ps2() };
             let line = match self.read_input(&prompt) {
                 Ok(l) => l,
-                Err(ReadlineError::Interrupted) => {
+                Err(ReadError::Interrupted) => {
                     let mut stderr = io::stderr().lock();
                     let _ = writeln!(stderr, "KeyboardInterrupt");
                     buffer.clear();
                     continue;
                 }
-                Err(ReadlineError::Eof) => {
+                Err(ReadError::Eof) => {
                     {
                         // Terminates the prompt, which lives on stderr.
                         let mut stderr = io::stderr().lock();
@@ -215,13 +286,10 @@ impl Repl {
                         }
                         continue;
                     }
-                    if let Some(p) = self.history_path.as_ref() {
-                        let _ = self.editor.save_history(p);
-                    }
                     self.finalize_interpreter();
                     return Ok(());
                 }
-                Err(e) => {
+                Err(ReadError::Io(e)) => {
                     let mut stderr = io::stderr().lock();
                     let _ = writeln!(stderr, "weavepy: input error: {e}");
                     return Ok(());
@@ -243,19 +311,13 @@ impl Repl {
                 let mut stderr = io::stderr().lock();
                 let _ = stderr.write_all(e.as_bytes());
             }
-            if let Some(p) = self.history_path.as_ref() {
-                let _ = self.editor.save_history(p);
-            }
         }
     }
 
-    /// One line of input. A terminal goes through rustyline (editing,
-    /// history, Ctrl-C/Ctrl-D); piped stdin reads plainly, writing the
-    /// prompt to stdout the way CPython's `PyOS_StdioReadline` does.
-    fn read_input(&mut self, prompt: &str) -> rustyline::Result<String> {
-        if self.stdin_tty {
-            return self.editor.readline(prompt);
-        }
+    /// One line of input, writing the prompt the way CPython's
+    /// `PyOS_StdioReadline` does. A terminal's lines come straight from its
+    /// line discipline, so input typed ahead stays there for the next prompt.
+    fn read_input(&mut self, prompt: &str) -> Result<String, ReadError> {
         // Piped-stdin prompts go to *stderr*, like CPython's
         // `PyOS_StdioReadline` (stdout must carry only program output —
         // `test_cmd_line_script.test_repl_stdout_flush_separate_stderr`).
@@ -265,8 +327,14 @@ impl Repl {
             let _ = out.flush();
         }
         let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) => Err(ReadlineError::Eof),
+        let read = if self.stdin_tty {
+            self.read_tty_line(&mut line)
+        } else {
+            io::stdin().read_line(&mut line)
+        };
+        match read {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ReadError::Interrupted),
+            Ok(0) => Err(ReadError::Eof),
             Ok(_) => {
                 if let Some(stripped) = line.strip_suffix('\n') {
                     Ok(stripped.to_owned())
@@ -283,8 +351,46 @@ impl Repl {
                     Ok(line)
                 }
             }
-            Err(e) => Err(ReadlineError::Io(e)),
+            Err(e) => Err(ReadError::Io(e)),
         }
+    }
+
+    /// A line from a terminal, unbuffered and running signal handlers when a
+    /// signal interrupts the read: `ErrorKind::Interrupted` when one raises
+    /// (`my_fgets`'s `KeyboardInterrupt` at the prompt).
+    #[cfg(unix)]
+    fn read_tty_line(&mut self, line: &mut String) -> io::Result<usize> {
+        let mut bytes = Vec::new();
+        let mut byte = 0_u8;
+        loop {
+            // SAFETY: reads at most one byte into `byte`, a live local.
+            let n = unsafe { libc::read(0, (&raw mut byte).cast(), 1) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+                if let Err(raised) = self.interpreter.run_pending_signals_public() {
+                    self.exit_if_system_exit(&raised);
+                    return Err(e);
+                }
+                continue;
+            }
+            if n == 0 {
+                break;
+            }
+            bytes.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        line.push_str(&String::from_utf8_lossy(&bytes));
+        Ok(bytes.len())
+    }
+
+    #[cfg(not(unix))]
+    fn read_tty_line(&mut self, line: &mut String) -> io::Result<usize> {
+        io::stdin().read_line(line)
     }
 
     /// Run one accepted prompt input the way CPython's REPL does:
@@ -350,9 +456,6 @@ impl Repl {
     fn exit_if_system_exit(&mut self, e: &weavepy::vm::RuntimeError) {
         if let weavepy::vm::RuntimeError::PyException(exc) = e {
             if let Some(code) = exc.system_exit_code() {
-                if let Some(p) = self.history_path.clone() {
-                    let _ = self.editor.save_history(&p);
-                }
                 self.finalize_interpreter();
                 crate::exit_with_system_exit(code);
             }
@@ -396,11 +499,11 @@ fn build_main_module(interpreter: &Interpreter) -> Rc<PyModule> {
         Object::from_static("__main__"),
     );
     d.insert(DictKey(Object::from_static("__doc__")), Object::None);
-    d.insert(
-        DictKey(Object::from_static("__package__")),
-        Object::from_static(""),
-    );
-    d.insert(DictKey(Object::from_static("__file__")), Object::None);
+    // (`__file__` is missing at the prompt, and `__package__` is `None`, as
+    // in CPython's `__main__`.)
+    d.insert(DictKey(Object::from_static("__package__")), Object::None);
+    d.insert(DictKey(Object::from_static("__loader__")), Object::None);
+    d.insert(DictKey(Object::from_static("__spec__")), Object::None);
     d.insert(
         DictKey(Object::from_static("__builtins__")),
         Object::Dict(interpreter.builtins_dict()),
@@ -569,19 +672,9 @@ fn ps2() -> String {
     std::env::var("WEAVEPY_PS2").unwrap_or_else(|_| "... ".to_owned())
 }
 
-fn history_file_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("WEAVEPY_HISTORY") {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(dir) = dirs::data_dir() {
-        let p = dir.join("weavepy").join("history");
-        let _ = fs::create_dir_all(p.parent().unwrap_or(&p));
-        return Some(p);
-    }
-    if let Some(home) = dirs::home_dir() {
-        return Some(home.join(".weavepy_history"));
-    }
-    None
+/// `PYTHON_BASIC_REPL` (`_Py_GetEnv`: set and not empty).
+fn basic_repl_requested() -> bool {
+    std::env::var_os("PYTHON_BASIC_REPL").is_some_and(|v| !v.is_empty())
 }
 
 fn host_platform() -> &'static str {
@@ -596,6 +689,9 @@ fn host_platform() -> &'static str {
     }
 }
 
-fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::other(e.to_string())
+/// Why [`Repl::read_input`] has no line.
+enum ReadError {
+    Interrupted,
+    Eof,
+    Io(io::Error),
 }

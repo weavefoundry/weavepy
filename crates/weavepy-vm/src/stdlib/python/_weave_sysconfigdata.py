@@ -26,10 +26,10 @@ _exec_prefix = (
     getattr(sys, "base_exec_prefix", "") or getattr(sys, "exec_prefix", _prefix) or _prefix
 )
 _version_short = "%d.%d" % sys.version_info[:2]
-_base_executable = getattr(sys, "_base_executable", "") or getattr(
-    sys, "executable", ""
-)
-_bindir = os.path.dirname(_base_executable) or os.path.join(_prefix, "bin")
+# Like the other configure-time paths, `BINDIR` names the installation, not
+# the running executable: every binary with this stdlib shares one tree, and
+# `{stdlib}/_sysconfig_vars_*.json` must agree with it for all of them.
+_bindir = os.path.join(_prefix, "bin")
 # RFC 0055 WS1 — ABI identity. WeavePy's binary ABI loads stock
 # CPython 3.14 extensions, so EXT_SUFFIX/SOABI carry CPython's tags
 # (they must equal `_imp.extension_suffixes()[0]` — asserted by

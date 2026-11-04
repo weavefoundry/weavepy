@@ -2489,6 +2489,17 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: None,
             })),
         );
+        // CPython's frozen `Modules/getpath.py`, which test_getpath runs
+        // against mock hosts when no source tree sits beside its `Lib`.
+        d.insert(
+            DictKey(Object::from_static("get_getpath_codeobject")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "get_getpath_codeobject",
+                binds_instance: false,
+                call: Box::new(get_getpath_codeobject),
+                call_kw: None,
+            })),
+        );
         // `_PyInterpreterState_SetEvalFrameFunc` probes: install/remove the
         // recording frame evaluator. Both count as a `set_eval_frame_func`
         // rare event, exactly like CPython's C helpers.
@@ -2561,6 +2572,30 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// `get_getpath_codeobject()` — `Modules/getpath.py` (verbatim from CPython
+/// 3.14.7), compiled. WeavePy computes its paths in Rust, so the script runs
+/// nowhere else; it stays out of the frozen table because its top level needs
+/// the globals getpath's host injects, so it can't be imported as a module.
+fn get_getpath_codeobject(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let interp = crate::builtins::reentrant_interp()?;
+    let builtins = interp.builtins_dict();
+    let compile = builtins
+        .borrow()
+        .get(&DictKey(Object::from_static("compile")))
+        .cloned()
+        .ok_or_else(|| crate::error::runtime_error("builtins.compile is missing"))?;
+    interp.call(
+        &compile,
+        &[
+            Object::from_static(include_str!("python/getpath.py")),
+            Object::from_static("<frozen getpath>"),
+            Object::from_static("exec"),
+        ],
+        &[],
+        &builtins,
+    )
 }
 
 /// `set_eval_frame_record(list)` — install the recording frame evaluator:

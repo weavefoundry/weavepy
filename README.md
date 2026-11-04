@@ -18,7 +18,7 @@ are how it measures progress.
 
 | Area | Result | Measured |
 | --- | --- | --- |
-| CPython test suite | 459 of 468 `Lib/test` entries pass | November 1, 2026, on macOS |
+| CPython test suite | 464 of 468 `Lib/test` entries pass | November 2, 2026, on macOS |
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
 | Warm speed | 1.00 to 1.01 times CPython's time | October 30, 2026, over 33 workloads |
 | Peak memory | 1.43 to 1.46 times CPython's | October 30, 2026, over 33 workloads |
@@ -72,19 +72,17 @@ target/release/weavepy -m venv .venv
 
 Two test lanes grade WeavePy, each against a checked-in baseline.
 
-**CPython's test suite.** A full local sweep at commit `666e32b6` scheduled 468
-`Lib/test` entries, and 459 passed. Of the other nine:
+**CPython's test suite.** A full local sweep at commit `b16a51a7` scheduled 468
+`Lib/test` entries, and 464 passed, with no failures or timeouts. Of the other
+four:
 
-- **Two are deliberate divergences.** `test_marshal` and `test_embed` have
-  enumerated cases that WeavePy doesn't aim to satisfy. For example, unboxed
-  integers and floats don't have distinct `id()` values.
+- **Three are deliberate divergences.** `test_capi`, `test_embed`, and
+  `test_marshal` have enumerated cases that WeavePy doesn't aim to satisfy. For
+  example, unboxed integers and floats don't have distinct `id()` values.
 - **One is skipped,** as CPython skips it: `test_multiprocessing_fork` on macOS.
-- **Three fail:** `test_capi`, `test_getpath`, and `test_sysconfig`.
-- **Three hit their time limits:** `test_multiprocessing_spawn`,
-  `test_multiprocessing_forkserver`, and `test_pyrepl`.
 
 This sweep needs a CPython source tree, so it runs locally. CI gates every change
-on WeavePy's 460 bundled regression tests instead.
+on WeavePy's 464 bundled regression tests instead.
 
 **Real packages.** The ecosystem lane creates a virtual environment for each
 package, installs it, and runs a behavior check. All 48 rows pass on macOS and

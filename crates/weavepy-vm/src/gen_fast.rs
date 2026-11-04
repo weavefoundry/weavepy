@@ -420,6 +420,8 @@ impl Interpreter {
             || (first && start == CODE_NO)
             || frame.py_frame.is_some()
             || frame.has_saved_exc_info()
+            // An eval-frame probe logs every resume at frame entry.
+            || crate::trace::eval_frame_record_active()
             || frame.pc == 0
             || frame
                 .shell_cache

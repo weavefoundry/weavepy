@@ -1007,7 +1007,9 @@ impl Interpreter {
         args: &[*const Object],
         depth: usize,
     ) -> Option<Option<Object>> {
-        if code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP {
+        if code.jit_hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
+            || crate::trace::eval_frame_record_active()
+        {
             return None;
         }
         let plan = ext.leaf_plan.get()?.as_deref()?;

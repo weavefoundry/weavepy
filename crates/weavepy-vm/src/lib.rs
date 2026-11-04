@@ -3770,13 +3770,14 @@ impl Interpreter {
                 Ok(_) => return true,
                 Err(err) => {
                     // CPython: "Error in sys.excepthook:" then both
-                    // tracebacks. Render the hook failure plainly and
-                    // fall through to the default rendering.
-                    let mut stderr = std::io::stderr().lock();
+                    // tracebacks, the original one from the fall-through
+                    // below.
                     use std::io::Write;
-                    let _ = writeln!(stderr, "Error in sys.excepthook:");
-                    drop(stderr);
-                    let _ = err;
+                    let _ = writeln!(std::io::stderr(), "Error in sys.excepthook:");
+                    if let RuntimeError::PyException(hook_exc) = &err {
+                        self.print_exception_via_traceback(&hook_exc.instance);
+                    }
+                    let _ = writeln!(std::io::stderr(), "\nOriginal exception was:");
                 }
             }
         }
@@ -23569,6 +23570,11 @@ impl Interpreter {
     /// it to the framed path instead.
     #[inline(always)]
     fn leaf_call_entry(code: &CodeObject) -> bool {
+        // An eval-frame probe logs every call at frame entry, so it needs a
+        // frame.
+        if crate::trace::eval_frame_record_active() {
+            return false;
+        }
         // A frameless call is an activation the JIT's warm-up never sees:
         // count it as a lean one, and credit each interval to the tier-2
         // counter. The call at which a compile falls due goes to the
@@ -28187,7 +28193,9 @@ impl Interpreter {
                     let Some(v) = locals.get_mut(slot) else {
                         break;
                     };
-                    if matches!(v, Object::Unbound) {
+                    // (A fixture observing deaths needs the full handler's
+                    // release, as in `StoreFast` above.)
+                    if matches!(v, Object::Unbound) || !Self::core_droppable(v) {
                         break;
                     }
                     drop(std::mem::replace(v, Object::Unbound));
@@ -52593,10 +52601,12 @@ impl Interpreter {
         match cache {
             IC::StoreAttrInstance { key_idx, ver } => {
                 if let Object::Instance(inst) = &receiver {
+                    // (A watched `__dict__` hears of the store on the slow
+                    // path, as in the fast lanes.)
                     let guard_ok = {
                         let cls = inst.class.borrow();
                         cls.attr_version.get() == ver
-                    };
+                    } && !crate::capi_watchers::dicts_active();
                     if guard_ok {
                         // Validate the cached index still holds *this* name:
                         // a `del` on an earlier attribute shift-renumbers

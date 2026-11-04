@@ -126,10 +126,6 @@ rust_decimal = "1.36"
 # (see vendor/expat-sys/README.md). Backs the rewritten native `pyexpat`.
 expat-sys   = { path = "vendor/expat-sys" }
 
-# RFC 0020 — interactive REPL + CLI surface.
-rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }
-dirs        = "5.0"
-
 # RFC 0022 — C-API foundation (dlopen + cc-driven extension build harness).
 libloading  = "0.8"
 cc          = "1.0"

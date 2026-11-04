@@ -2160,8 +2160,8 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
             }
         }
         // No banner in inspect mode (CPython goes straight to `>>>`).
-        let repl = repl::Repl::new(interpreter, true)?;
-        return repl.run(None);
+        let repl = repl::Repl::new(interpreter, true, opts.flags.ignore_environment)?;
+        return repl.run_inspect();
     }
     match weavepy::run_source_with_options(source, &opts) {
         Ok(()) => Ok(()),
@@ -2338,7 +2338,7 @@ fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) 
         let _ = interpreter.run_site();
     }
     interpreter.note_startup_finished();
-    let repl = repl::Repl::new(interpreter, flags.quiet)?;
+    let repl = repl::Repl::new(interpreter, flags.quiet, flags.ignore_environment)?;
     repl.run(startup)
 }
 

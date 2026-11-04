@@ -665,7 +665,7 @@ reason = "measured: passes end-to-end after vendoring CPython's `getopt` verbati
 
 [tests."cpython/Lib/test/test_getpath.py"]
 status = "pass"
-reason = "measured (RFC 0075 WS6): CPython's `Modules/getpath.py` is now vendored verbatim under `vendor/cpython/Modules/`, and the test's source-tree probe (`__file__/../../../Modules/getpath.py`) finds it — including under the harness's sanitized lib mirror, whose v4 layout reproduces the checkout's Lib/Modules siblinghood (entries under `Lib/`, `Modules/getpath.py` symlinked beside them). All 25 mock-host path-computation cases pass in <1s — pure Python, graded on its own merits."
+reason = "measured (CPython 3.14.7): all 25 mock-host path-computation cases pass in <1s, on any tree. A tree with `Modules/getpath.py` beside its `Lib` serves that file (the harness's lib mirror keeps the siblinghood); any other, including a `Lib/test`-only one, takes the test's installed-Python route, `_testinternalcapi.get_getpath_codeobject()`, which compiles the verbatim copy WeavePy carries for it."
 
 [tests."cpython/Lib/test/test_gettext.py"]
 status = "pass"
@@ -909,7 +909,7 @@ reason_windows = "POSIX-only start method (the fork start method does not exist 
 [tests."cpython/Lib/test/test_multiprocessing_forkserver.py"]
 status = "pass"
 timeout_seconds = 600
-reason = "measured (RFC 0040 WS5): passes end-to-end as a unit — 413 run, 0 fail / 0 error, 69 skip. The `forkserver` start method (the fork-server control process spawned via `_spawn_child`, the `SCM_RIGHTS` fd hand-off of the inheritable semaphore/pipe descriptors, and the per-request `fork`) round-trips the full package alongside the spawn variant; the same WS5 manager/sync/finalizer fixes apply. (Graded with socket permissions; the SyncManager `AF_UNIX` listener can't bind under the conformance sandbox.)"
+reason = "measured (CPython 3.14.7): ~2 minutes alone; the old budget timeouts were `SimpleQueue` getters left parked over a non-empty queue, which hung `ThreadPool.join()`. Measured (RFC 0040 WS5): passes end-to-end as a unit — 413 run, 0 fail / 0 error, 69 skip. The `forkserver` start method (the fork-server control process spawned via `_spawn_child`, the `SCM_RIGHTS` fd hand-off of the inheritable semaphore/pipe descriptors, and the per-request `fork`) round-trips the full package alongside the spawn variant; the same WS5 manager/sync/finalizer fixes apply. (Graded with socket permissions; the SyncManager `AF_UNIX` listener can't bind under the conformance sandbox.)"
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
 status = "pass"
@@ -918,8 +918,8 @@ reason = "RFC 0040 WS5: 39/39 pass — all three start-method classes run on mac
 
 [tests."cpython/Lib/test/test_multiprocessing_spawn.py"]
 status = "pass"
-timeout_seconds = 1200
-reason = "correct but slow (~400s idle, spawn-heavy); budget raised for parallel-load headroom"
+timeout_seconds = 600
+reason = "measured (CPython 3.14.7): ~2 minutes alone, spawn-heavy, with the budget left for parallel-load headroom; the old budget timeouts were `SimpleQueue` getters left parked over a non-empty queue, which hung `ThreadPool.join()`."
 
 [tests."cpython/Lib/test/test_named_expressions.py"]
 status = "pass"
@@ -1083,6 +1083,11 @@ timeout_seconds = 180
 [tests."cpython/Lib/test/test_pyexpat.py"]
 status = "pass"
 reason = "measured (RFC 0056 WS3): 60 run, 0 fail, 14 skip — pyexpat is now bindings over vendored expat 2.6.4 (full 22-slot handler table, buffering, subparsers, unknown-encoding handler, live position/error attributes). test_error_path_no_crash skips via the _testcapi.set_nomemory stub (WeavePy has no allocation-failure injection seam)."
+
+[tests."cpython/Lib/test/test_pyrepl.py"]
+status = "pass"
+timeout_seconds = 180
+reason = "measured (CPython 3.14.7): ~10s alone, 245 run. A terminal's prompt is `_pyrepl`, as in CPython, so the PTY-driven `TestMain` legs run for real; before that a native line editor discarded every typed-ahead line, and each of those legs sat out its 30s wait."
 
 [tests."cpython/Lib/test/test_queue.py"]
 status = "pass"
@@ -1310,7 +1315,7 @@ timeout_seconds = 300
 
 [tests."cpython/Lib/test/test_sysconfig.py"]
 status = "pass"
-reason = "measured (RFC 0055 WS1): passes end-to-end over the verbatim sysconfig + native _sysconfig module (config vars, install schemes, EXT_SUFFIX/SOABI, user schemes)."
+reason = "measured (RFC 0055 WS1): passes end-to-end over the verbatim sysconfig + native _sysconfig module (config vars, install schemes, EXT_SUFFIX/SOABI, user schemes). `BINDIR` names the installation, so `test_sysconfigdata_json` holds however many binaries share the stdlib tree; it used to follow the last executable to start, including this file's own `test_symlink`."
 
 [tests."cpython/Lib/test/test_tabnanny.py"]
 status = "pass"

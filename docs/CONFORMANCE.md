@@ -161,12 +161,21 @@ suite happens to observe. The bar is strict:
   row regressing.
 - `divergence` is counted separately from `fail` in the sweep summary.
 
-The budget is deliberately tiny — **one row**: `test_marshal`, whose
-`InstancingTestCase.testInt`/`testFloat` assert that version-2 marshal
-loads create `id()`-distinct instances. WeavePy's unboxed int/float
-representation (the RFC 0058+ performance arc) derives `id()` from the
-value, so two equal unboxed ints *are* the same object identity-wise;
-abandoning unboxing to satisfy two identity asserts is rejected.
+The budget is deliberately small: three rows, each with an enumerated
+list of ids.
+
+- `test_marshal`: `InstancingTestCase.testInt` and `testFloat` assert
+  that version-2 marshal loads create `id()`-distinct instances.
+  WeavePy's unboxed int and float representation (the RFC 0058+
+  performance arc) derives `id()` from the value, so two equal unboxed
+  ints *are* the same object. Abandoning unboxing to satisfy two
+  identity asserts is rejected.
+- `test_capi`: `SubinterpreterTest.test_py_config_isoloated_per_interpreter`
+  asserts that `PyConfig_Get` returns a new int object on each call,
+  the same unboxed-int identity as `test_marshal`.
+- `test_embed`: the `_testembed` config-dump commands print CPython's
+  build-specific `PyConfig` defaults, which a Rust interpreter doesn't
+  have.
 
 ```bash
 # Run the curated allowlist against a vendored CPython 3.14 Lib/test/,
@@ -198,18 +207,19 @@ subprocess sweep reports `unexpected 0`. Each `cpython/Lib/test/*` row
 carries a `reason` that, where the file fails, quotes the measured first
 failure so the gap is concrete.
 
-As of RFC 0068 the burn is complete: the whole-suite sweep grades
-**fail 0, error 0, timeout 0, unexpected 0** across all 550 labels —
-**546 pass**, three principled skips (`test_embed` and `test_getpath`
-exercise CPython build artifacts that don't exist for a Rust
-interpreter; `test_multiprocessing_fork` is skipped on macOS exactly
-as CPython does), and one `divergence` row (`test_marshal`: two
-enumerated `InstancingTestCase` ids assert that version-2 loads mint
-*new* int/float objects by `id()`, unsatisfiable under WeavePy's
-unboxed numeric model — see the status description above). The
-ecosystem lane stands at **36/36 passing rows** offline (pandas and
-FastAPI capstones included, self-tests green); the `gevent` stretch
-row stays a measured fail per RFC 0066.
+The latest full sweep (November 2, 2026, on macOS, CPython 3.14.7's
+`Lib/test`, `--all-cpython --jobs 4`) grades **fail 0, error 0,
+timeout 0, unexpected 0** across 932 labels. Of the 468 `Lib/test`
+entries, **464 pass**, three are the `divergence` rows above
+(`test_capi`, `test_embed`, and `test_marshal`), and one is skipped:
+`test_multiprocessing_fork`, which CPython also skips on macOS. All 464
+bundled regression tests pass.
+
+That sweep needs `PYTHONDONTWRITEBYTECODE` unset, since some tests
+need bytecode caches. A `Lib/test`-only tree works: the harness's lib
+mirror supplies what those tests expect beside it, and `test_getpath`
+reads CPython's `getpath.py` from the interpreter itself. The package
+lane is graded separately against `tests/ecosystem/expectations.toml`.
 
 ## CI integration
 
