@@ -1036,7 +1036,9 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::GetAwaitable
             | OpCode::GetYieldFromIter
             | OpCode::Send
-            | OpCode::EndSend => false,
+            | OpCode::EndSend
+            | OpCode::BuildSet
+            | OpCode::SetUpdate => false,
             _ => true,
         };
         Some(if in_line { 2 } else { 1 })
@@ -7073,6 +7075,44 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
 /// the leaf arm builds it: only for keys whose hashing and equality are
 /// native (`str`, `int`, `bool`, `None`). `0` built, anything else
 /// declined with the slots untouched.
+/// `BUILD_SET` of the `n` items at `at`, as the core loop builds it, when
+/// each item's hash and comparisons are native: `0` the set in the first
+/// item's slot; `1` declines, touching nothing.
+unsafe extern "C" fn h_build_set(at: *mut Object, n: u64) -> u32 {
+    let n = n as usize;
+    // SAFETY: the code passes `n` initialized stack slots (a set's slot
+    // when `n` is zero).
+    unsafe {
+        if crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::gc_trace::auto_collect_due()
+            || !(0..n).all(|j| {
+                matches!(
+                    &*at.add(j),
+                    Object::Str(_)
+                        | Object::Int(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Float(_)
+                )
+            })
+        {
+            return 1;
+        }
+        // (As the core loop inserts them; these keys' comparisons are
+        // native and cannot raise.)
+        let mut data = crate::object::SetData::default();
+        for j in 0..n {
+            let item = crate::object::DictKey(at.add(j).read());
+            let _ = crate::object::key_cmp_scope(|| data.insert(item));
+        }
+        let obj = Object::Set(Rc::new(crate::sync::RefCell::new(data)));
+        crate::gc_trace::track(&obj);
+        at.write(obj);
+    }
+    0
+}
+
 unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
     let n = n as usize;
     // SAFETY: the code passes `2n` initialized stack slots.
@@ -12565,6 +12605,8 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::GetYieldFromIter
             | OpCode::Send
             | OpCode::EndSend
+            | OpCode::BuildSet
+            | OpCode::SetUpdate
     )
 }
 
@@ -13874,9 +13916,12 @@ impl<'a> Lower<'a> {
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
-            OpCode::ListAppend | OpCode::ListExtend | OpCode::SetAdd | OpCode::MapAdd => {
-                return self.container(pc)
-            }
+            OpCode::ListAppend
+            | OpCode::ListExtend
+            | OpCode::SetAdd
+            | OpCode::MapAdd
+            | OpCode::SetUpdate => return self.container(pc),
+            OpCode::BuildSet => return self.build_set(pc, ins.arg as usize),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
             OpCode::LoadAttr => return self.load_attr(pc, ins.arg),
             OpCode::LoadGlobal => return self.load_global(pc),
@@ -16831,6 +16876,26 @@ impl<'a> Lower<'a> {
     }
 
     /// `BUILD_MAP` of `n` pairs through [`h_build_map`].
+    /// `BUILD_SET` of the top `n` items, through [`h_build_set`] (the core
+    /// loop's when it declines).
+    fn build_set(&mut self, pc: usize, n: usize) -> bool {
+        if n > self.depth {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let at = self.slot_addr(self.depth - n);
+        let nv = self.b.ins().iconst(types::I64, n as i64);
+        let r = self
+            .call(h_build_set as *const () as usize, &[at, nv], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth = self.depth - n + 1;
+        self.set_last(pc);
+        true
+    }
+
     fn build_map(&mut self, pc: usize, n: usize) -> bool {
         if 2 * n > self.depth {
             self.exit(INTERP, pc);

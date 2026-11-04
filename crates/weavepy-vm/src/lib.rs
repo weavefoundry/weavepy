@@ -21399,6 +21399,45 @@ impl Interpreter {
                 drop(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
             }
+            // A set literal's update from its folded constant: an exact
+            // frozenset's or set's keys into the literal's empty set (no
+            // comparison runs), the source released by a plain decrement.
+            OpCode::SetUpdate => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let (Object::Set(target), src) =
+                    (unsafe { (&*base.add(len - 1 - depth), &*base.add(len - 1)) })
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(src) {
+                    return None;
+                }
+                let items = match src {
+                    Object::FrozenSet(s) => (**s).clone(),
+                    // SAFETY: a read between two instructions.
+                    Object::Set(s) if !Rc::ptr_eq(s, target) => unsafe { s.peek() }?.clone(),
+                    _ => return None,
+                };
+                if items
+                    .iter()
+                    .any(|k| crate::object::dict_key_is_reentrant(&k.0))
+                {
+                    return None;
+                }
+                // SAFETY: a store between two instructions.
+                let t = unsafe { target.peek_mut() }?;
+                if !t.is_empty() {
+                    return None;
+                }
+                *t = items;
+                // SAFETY: the source leaves the stack (droppable).
+                drop(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
             _ => None,
         }
     }
@@ -22180,7 +22219,7 @@ impl Interpreter {
             if std::ptr::eq(ic, Rc::as_ptr(cls)) {
                 return Some(Ok(Object::Bool(true)));
             }
-            if !cls.metaclass_is_type() {
+            if !checks_like_type(cls, "__instancecheck__") {
                 return crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
                     .map(|b| Ok(Object::Bool(b)));
             }
@@ -22221,7 +22260,7 @@ impl Interpreter {
             let Object::Type(cls) = cls else {
                 return None;
             };
-            if !cls.metaclass_is_type() {
+            if !checks_like_type(cls, "__instancecheck__") {
                 // An ABC answers here only when its verdict is known.
                 let known = match (obj, builtin_cls) {
                     (Object::Instance(inst), _)
@@ -32399,7 +32438,7 @@ impl Interpreter {
         let name = code.names.get(name_idx as usize)?.as_str();
         if !matches!(
             name,
-            "__name__" | "__qualname__" | "__mro__" | "__bases__" | "__module__"
+            "__name__" | "__qualname__" | "__mro__" | "__bases__" | "__module__" | "__class__"
         ) || crate::capi_watchers::types_active()
         {
             return None;
@@ -32407,16 +32446,22 @@ impl Interpreter {
         if !Self::plain_metaclass(cls) {
             // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
             let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            // (`__class__` is `object`'s getset.)
+            let bt = builtin_types();
             if meta.c_ext_ptr.get() != 0
                 || !Self::default_getattribute(meta)
-                || meta
-                    .lookup_with_owner(name)
-                    .is_some_and(|(_, owner)| !Rc::ptr_eq(&owner, &builtin_types().type_))
+                || meta.lookup_with_owner(name).is_some_and(|(_, owner)| {
+                    !Rc::ptr_eq(&owner, &bt.type_)
+                        && !(name == "__class__" && Rc::ptr_eq(&owner, &bt.object_))
+                })
             {
                 return None;
             }
         }
         match name {
+            // The metaclass (`object.__class__`, a data descriptor on the
+            // metatype, ahead of the class's own entries).
+            "__class__" => return Some(Object::Type(cls.metaclass_or_type())),
             // (`type_mro_get`: a class still being made has none, which the
             // full path answers.)
             "__mro__" => {
@@ -32526,7 +32571,8 @@ impl Interpreter {
         // data descriptor, which yields to the class's own (CPython's
         // `type_getattro`) when the class's MRO has the name (its own leaf
         // attribute cache remembers the walk per version).
-        match Self::leaf_class_attr(code, meta, name_idx)? {
+        let meta_attr = Self::leaf_class_attr(code, meta, name_idx)?;
+        match &meta_attr {
             LeafAttr::InstanceOnly
             | LeafAttr::Method(_)
             | LeafAttr::ClassMethod(_)
@@ -32542,6 +32588,17 @@ impl Interpreter {
             _ => return None,
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
+            // Only the metaclass has it: a plain function there binds to
+            // the class, as an instance's method binds to the instance
+            // (`enum_class._add_member_(...)`).
+            LeafAttr::InstanceOnly => match meta_attr {
+                LeafAttr::Method(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                    Object::Type(cls.clone()),
+                    Object::Function(f),
+                )))),
+                // (Any other metaclass entry is the full path's to build.)
+                _ => None,
+            },
             LeafAttr::Method(f) => Some(Object::Function(f)),
             LeafAttr::Value(v) => Some(v),
             LeafAttr::ClassMethod(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
@@ -32550,9 +32607,7 @@ impl Interpreter {
             )))),
             LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
             LeafAttr::Property(p) => Some(Object::Property(p)),
-            // (A metaclass entry then binds to the class: the full path's
-            // to build.)
-            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
+            LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -44977,6 +45032,17 @@ impl Interpreter {
         {
             return Ok(args[2].clone());
         }
+        // A builtin class's miss, remembered per class version, as
+        // `hasattr` remembers it.
+        let builtin_type = match &args[0] {
+            Object::Type(t) if t.flags.is_builtin => Some(t),
+            _ => None,
+        };
+        if let Some(t) = builtin_type {
+            if t.verdict_cached(crate::types::Verdict::TypeAttrMissing, &name) == Some(true) {
+                return Ok(args[2].clone());
+            }
+        }
         let value_class = builtin_value_class(&args[0]);
         if let Some(c) = &value_class {
             if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
@@ -44986,6 +45052,9 @@ impl Interpreter {
         match self.load_attr(&args[0], &name) {
             Ok(v) => Ok(v),
             Err(e) if self.is_attribute_error(&e) => {
+                if let Some(t) = builtin_type {
+                    t.verdict_record(crate::types::Verdict::TypeAttrMissing, &name, true);
+                }
                 if let Some(c) = value_class {
                     c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
                 }
@@ -58525,6 +58594,17 @@ impl Interpreter {
         kwds: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        // `type.__prepare__` itself (built in, so unchangeable) returns a
+        // fresh empty dict whatever it is passed: nothing to observe.
+        let ty = &builtin_types().type_;
+        if Rc::ptr_eq(metaclass, ty)
+            || (metaclass.metaclass_is_type()
+                && metaclass
+                    .lookup_with_owner("__prepare__")
+                    .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, ty)))
+        {
+            return Ok(None);
+        }
         let bases_tuple =
             Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
         self.call_metaclass_prepare_tuple(metaclass, name, &bases_tuple, kwds, globals)
@@ -59862,7 +59942,7 @@ impl Interpreter {
                     .retain(|w| w.upgrade().is_none_or(|t| !Rc::ptr_eq(&t, ty)));
             }
             for b in &new_bases {
-                b.subclasses.borrow_mut().push(Rc::downgrade(ty));
+                b.add_subclass(ty);
             }
         }
         ty.invalidate_getattribute_cache();
@@ -60213,12 +60293,15 @@ impl Interpreter {
     /// Invoke `__set_name__(cls, name)` for every descriptor in the
     /// freshly-built class namespace that defines it. PEP 487.
     fn invoke_set_name_hooks(&mut self, ty: &Rc<TypeObject>) -> Result<(), RuntimeError> {
-        let entries: Vec<(String, Object)> = ty
+        // (Only a property or an instance can have the hook.)
+        let entries: Vec<(SharedStr, Object)> = ty
             .dict
             .borrow()
             .iter()
-            .filter_map(|(k, v)| match &k.0 {
-                Object::Str(s) => Some((s.to_string(), v.clone())),
+            .filter_map(|(k, v)| match (&k.0, v) {
+                (Object::Str(s), Object::Property(_) | Object::Instance(_)) => {
+                    Some((s.clone(), v.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -60228,13 +60311,13 @@ impl Interpreter {
             // exact type short-circuits here; subclass instances run the
             // full hook below.
             if let Object::Property(p) = &value {
-                *p.name.borrow_mut() = Some(Object::from_str(&attr_name));
+                *p.name.borrow_mut() = Some(Object::Str(attr_name));
                 continue;
             }
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
                     let owner = Object::Type(ty.clone());
-                    let name = Object::from_str(&attr_name);
+                    let name = Object::Str(attr_name.clone());
                     let builtins = self.builtins.clone();
                     // A plain function takes the descriptor as its first
                     // argument, with no bound method to build.
@@ -60374,6 +60457,18 @@ impl Interpreter {
         let Some(hook) = hook else {
             return Ok(());
         };
+        // `object.__init_subclass__()` does nothing (with keywords it
+        // raises, so those still make the call).
+        if subclass_kwargs.is_empty()
+            && builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("__init_subclass__")))
+                .is_some_and(|object_hook| object_hook.is_same(&hook))
+        {
+            return Ok(());
+        }
         // CPython treats __init_subclass__ as an implicit classmethod
         // regardless of how it was defined.
         let callable = match hook {
@@ -71774,6 +71869,20 @@ impl LeafKind {
 /// `issubclass(cls, classinfo)` for a class against classes (or a flat
 /// tuple of them) whose metaclass is `type`: the MRO alone answers, with
 /// no `__subclasscheck__` to run. `None` for anything else.
+/// Whether `type(cls).<hook>` (`__instancecheck__`, `__subclasscheck__`)
+/// is `type`'s own: an `EnumType` class checks as any class does, an ABC
+/// doesn't.
+fn checks_like_type(cls: &TypeObject, hook: &str) -> bool {
+    if cls.metaclass_is_type() {
+        return true;
+    }
+    let meta = cls.metaclass_or_type();
+    meta.c_ext_ptr.get() == 0
+        && meta
+            .lookup_with_owner(hook)
+            .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_))
+}
+
 fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Type(cls), spec] = args else {
         return None;
@@ -71787,7 +71896,7 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         let Object::Type(c) = c else {
             return None;
         };
-        if !c.metaclass_is_type() {
+        if !checks_like_type(c, "__subclasscheck__") {
             return None;
         }
         // (`os.PathLike` answers structurally, as the full call does.)
@@ -74395,7 +74504,33 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
 /// such names).
 fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
     use crate::types::Dunder;
-    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+    if name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    // (The dunders `load_attr_type` answers outside any dictionary.)
+    let dunder = name.starts_with("__");
+    if dunder
+        && matches!(
+            name,
+            "__name__"
+                | "__qualname__"
+                | "__bases__"
+                | "__base__"
+                | "__mro__"
+                | "__class__"
+                | "__type_params__"
+                | "__dict__"
+                | "__flags__"
+                | "__itemsize__"
+                | "__basicsize__"
+                | "__subclasses__"
+                | "__module__"
+                | "__dir__"
+                | "__abstractmethods__"
+                | "__text_signature__"
+                | "__doc__"
+        )
+    {
         return false;
     }
     let object = &builtin_types().object_;
@@ -74415,7 +74550,14 @@ fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
     {
         return false;
     }
-    t.lookup(name).is_none() && meta.lookup(name).is_none()
+    if t.lookup(name).is_some() || meta.lookup(name).is_some() {
+        return false;
+    }
+    // A dunder may still be a builtin base's slot wrapper (`object.__repr__`)
+    // or a synthesized class method.
+    !dunder
+        || (crate::builtins::builtin_classmethod(&t.name, name).is_none()
+            && builtin_slot_wrapper(t, name).is_none())
 }
 
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`

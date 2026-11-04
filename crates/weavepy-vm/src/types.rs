@@ -1668,7 +1668,7 @@ impl TypeObject {
         // Register the new class as a (weak) direct subclass of each of
         // its bases so `base.__subclasses__()` reports it.
         for base in &bases {
-            base.subclasses.borrow_mut().push(Rc::downgrade(&ty));
+            base.add_subclass(&ty);
         }
         // RFC 0024: user classes join the cycle collector. Every class
         // is born in a self-cycle (its own `mro` holds an `Rc` to
@@ -2264,6 +2264,19 @@ impl TypeObject {
             t.has_del.set(0);
             queue.extend(t.subclasses());
         }
+    }
+
+    /// Register `sub` as a direct subclass. A dead entry still holds its
+    /// class's memory, so they are dropped whenever the list fills, with
+    /// room left for as many again (`object` gets every class).
+    pub fn add_subclass(&self, sub: &Rc<TypeObject>) {
+        let mut subs = self.subclasses.borrow_mut();
+        if subs.len() == subs.capacity() {
+            subs.retain(|w| w.strong_count() > 0);
+            let room = subs.len().max(4);
+            subs.reserve(room);
+        }
+        subs.push(Rc::downgrade(sub));
     }
 
     /// Live direct subclasses, in registration order. Dead weak refs
