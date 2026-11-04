@@ -23,6 +23,8 @@ struct Ssa<'a> {
     defs: &'a HashMap<(u32, u32), Value>,
     preds: Vec<Vec<(Block, EdgeRef)>>,
     entry: HashMap<(u32, u32), Value>,
+    /// The block parameters made for merges, by block.
+    phis: Vec<(Block, Value)>,
 }
 
 pub(crate) fn resolve(
@@ -59,12 +61,14 @@ pub(crate) fn resolve(
         defs,
         preds,
         entry: HashMap::new(),
+        phis: Vec::new(),
     };
     let mut alias: HashMap<Value, Value> = HashMap::new();
     for &(p, b, var) in reads {
         let v = s.read_entry(b, var);
         alias.insert(p, v);
     }
+    s.remove_trivial_phis(&mut alias);
     let resolve = |mut v: Value| {
         for _ in 0..64 {
             match alias.get(&v) {
@@ -121,11 +125,127 @@ impl Ssa<'_> {
         let phi = self.f.dfg.make_value(ty, ValueDef::Param(b, n));
         self.f.dfg.blocks[b.index()].params.push(phi);
         self.entry.insert((b.0, var.0), phi);
+        self.phis.push((b, phi));
         for (pred, edge) in preds {
             let v = self.read_end(pred, var);
             self.append_arg(edge, v);
         }
         phi
+    }
+
+    /// Drop the merge parameters every edge passes the same value (or the
+    /// parameter itself) to, the value taking their place, until none is
+    /// left: a variable a loop never assigns has a parameter at the loop's
+    /// head otherwise.
+    fn remove_trivial_phis(&mut self, alias: &mut HashMap<Value, Value>) {
+        let resolve = |alias: &HashMap<Value, Value>, mut v: Value| {
+            for _ in 0..64 {
+                match alias.get(&v) {
+                    Some(&n) if n != v => v = n,
+                    _ => break,
+                }
+            }
+            v
+        };
+        let mut live: Vec<(Block, Value)> = std::mem::take(&mut self.phis);
+        loop {
+            let mut changed = false;
+            let mut i = 0;
+            while i < live.len() {
+                let (b, phi) = live[i];
+                let Some(at) = self.f.dfg.blocks[b.index()]
+                    .params
+                    .iter()
+                    .position(|&p| p == phi)
+                else {
+                    live.swap_remove(i);
+                    continue;
+                };
+                let mut same: Option<Value> = None;
+                let mut trivial = true;
+                for &(_, edge) in &self.preds[b.index()] {
+                    let arg = resolve(alias, self.edge_arg(edge, at));
+                    if arg == phi || Some(arg) == same {
+                        continue;
+                    }
+                    if same.is_some() {
+                        trivial = false;
+                        break;
+                    }
+                    same = Some(arg);
+                }
+                if !trivial {
+                    i += 1;
+                    continue;
+                }
+                let to = match same {
+                    Some(v) => v,
+                    None => self.zero_at_entry(self.f.dfg.value_type(phi)),
+                };
+                alias.insert(phi, to);
+                self.f.dfg.blocks[b.index()].params.remove(at);
+                for (_, edge) in self.preds[b.index()].clone() {
+                    self.remove_arg(edge, at);
+                }
+                live.swap_remove(i);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn edge_arg(&self, edge: EdgeRef, at: usize) -> Value {
+        let dfg = &self.f.dfg;
+        match edge {
+            EdgeRef::Inst(inst, first) => match &dfg.insts[inst.index()].op {
+                Op::Jump(e) => dfg.slice(e.args)[at],
+                Op::Brif(t, _) if first => dfg.slice(t.args)[at],
+                Op::Brif(_, e) => dfg.slice(e.args)[at],
+                _ => unreachable!("an edge of a branch"),
+            },
+            EdgeRef::Table(jt, i) => {
+                let t = &dfg.tables[jt.index()];
+                if i == u32::MAX {
+                    t.default.args[at]
+                } else {
+                    t.table[i as usize].args[at]
+                }
+            }
+        }
+    }
+
+    fn remove_arg(&mut self, edge: EdgeRef, at: usize) {
+        let dfg = &mut self.f.dfg;
+        match edge {
+            EdgeRef::Inst(inst, first) => {
+                let shrink = |dfg: &mut crate::ir::DataFlowGraph, e: Edge| -> Edge {
+                    let mut args = dfg.slice(e.args).to_vec();
+                    args.remove(at);
+                    Edge {
+                        block: e.block,
+                        args: dfg.intern(&args),
+                    }
+                };
+                let op = dfg.insts[inst.index()].op.clone();
+                let op = match op {
+                    Op::Jump(e) => Op::Jump(shrink(dfg, e)),
+                    Op::Brif(t, e) if first => Op::Brif(shrink(dfg, t), e),
+                    Op::Brif(t, e) => Op::Brif(t, shrink(dfg, e)),
+                    other => other,
+                };
+                dfg.insts[inst.index()].op = op;
+            }
+            EdgeRef::Table(jt, i) => {
+                let t = &mut dfg.tables[jt.index()];
+                if i == u32::MAX {
+                    t.default.args.remove(at);
+                } else {
+                    t.table[i as usize].args.remove(at);
+                }
+            }
+        }
     }
 
     fn append_arg(&mut self, edge: EdgeRef, v: Value) {

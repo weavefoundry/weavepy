@@ -21,6 +21,7 @@ mod aarch64;
 mod asm;
 mod builder;
 mod codegen;
+mod fold;
 pub mod ir;
 mod liveness;
 mod mem;

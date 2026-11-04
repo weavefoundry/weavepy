@@ -48,6 +48,8 @@ pub(crate) fn simplify(f: &mut Function) {
         }
         v
     };
+    crate::fold::fold(f, &mut alias);
+    let nv = f.dfg.values.len();
     // Identities, and constants to the right.
     for b in f.layout.clone() {
         for &inst in &f.dfg.blocks[b.index()].insts {

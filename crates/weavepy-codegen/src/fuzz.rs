@@ -309,6 +309,49 @@ fn generate(seed: u64) -> Function {
                             b.ins().bitcast(types::I64, F, r)
                         }
                     }
+                    14 if rng.below(2) == 0 => {
+                        // Division by a constant, at 64 or 32 bits.
+                        let dv = rng.pick(&[
+                            2i64,
+                            3,
+                            5,
+                            7,
+                            10,
+                            16,
+                            1 << 20,
+                            641,
+                            12345,
+                            -2,
+                            -3,
+                            -7,
+                            -16,
+                            1,
+                        ]);
+                        let narrow = rng.below(2) == 0;
+                        let ty = if narrow { types::I32 } else { types::I64 };
+                        let xv = if narrow {
+                            b.ins().ireduce(types::I32, x)
+                        } else {
+                            x
+                        };
+                        let k = b.ins().iconst(ty, dv);
+                        let r = match rng.below(4) {
+                            0 => b.ins().sdiv(xv, k),
+                            1 => b.ins().srem(xv, k),
+                            2 if dv > 0 && dv.count_ones() == 1 => b.ins().udiv(xv, k),
+                            3 if dv > 0 && dv.count_ones() == 1 => b.ins().urem(xv, k),
+                            _ => {
+                                let q = b.ins().sdiv(xv, k);
+                                let m = b.ins().srem(xv, k);
+                                b.ins().bxor(q, m)
+                            }
+                        };
+                        if narrow {
+                            b.ins().sextend(types::I64, r)
+                        } else {
+                            r
+                        }
+                    }
                     14 => b.ins().bnot(x),
                     15 => b.ins().ineg(x),
                     16 => {
