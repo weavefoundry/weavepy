@@ -20,6 +20,7 @@ mod codegen;
 pub mod ir;
 mod liveness;
 mod mem;
+mod simplify;
 #[cfg(target_arch = "x86_64")]
 mod x64;
 
@@ -57,7 +58,7 @@ impl std::error::Error for Error {}
 pub const SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
 
 /// The machine code for `func`, position-independent.
-pub fn compile(func: &Function) -> Result<Vec<u8>, Error> {
+pub fn compile(func: &mut Function) -> Result<Vec<u8>, Error> {
     #[cfg(target_arch = "x86_64")]
     {
         codegen::compile::<x64::X64>(func)
@@ -73,14 +74,25 @@ pub fn compile(func: &Function) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Write `code` to `$WPCG_DUMP_DIR/<n>.bin`, when set (a debugging aid).
+fn dump(code: &[u8]) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if let Some(dir) = DIR.get_or_init(|| std::env::var_os("WPCG_DUMP_DIR").map(Into::into)) {
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::write(dir.join(format!("{n}.bin")), code);
+    }
+}
+
 /// Compile `func` and copy its code into executable memory: its entry.
-pub fn compile_and_install(func: &Function) -> Result<*const u8, Error> {
+pub fn compile_and_install(func: &mut Function) -> Result<*const u8, Error> {
     let code = compile(func)?;
     mem::install(&code)
 }
 
 /// Copy machine code into executable memory: its address.
 pub fn install(code: &[u8]) -> Result<*const u8, Error> {
+    dump(code);
     mem::install(code)
 }
 

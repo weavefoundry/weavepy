@@ -24,10 +24,10 @@ fn build(params: &[Type], rets: &[Type], body: impl FnOnce(&mut FunctionBuilder<
         body(&mut b);
     }
     if let Ok(path) = std::env::var("WPCG_DUMP") {
-        std::fs::write(path, crate::compile(&f).unwrap()).unwrap();
+        std::fs::write(path, crate::compile(&mut f.clone()).unwrap()).unwrap();
         eprintln!("{}", f.display());
     }
-    match compile_and_install(&f) {
+    match compile_and_install(&mut f.clone()) {
         Ok(p) => p,
         Err(e) => panic!("{e}\n{}", f.display()),
     }

@@ -35,6 +35,8 @@ enum Src {
     Slot(i32, bool),
     I(i64),
     F(u64, Type),
+    /// A pinned register plus a constant.
+    Lea(Reg, i64),
 }
 
 /// Where a move writes to.
@@ -73,6 +75,9 @@ struct Gen<'f, A: Asm> {
     slot_of: Vec<u32>,
     tracked: Vec<bool>,
     pin: Vec<Reg>,
+    /// Values that are a pinned value plus a constant (recomputed where
+    /// used, and folded into addresses): the pinned value and the constant.
+    lea: Vec<Option<(Value, i64)>>,
     /// The values in registers or slots, in no order.
     live: Vec<Value>,
     holds: [u32; 64],
@@ -106,10 +111,12 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("WPCG_TIME").is_some())
 }
 
-pub(crate) fn compile<A: Asm>(f: &Function) -> Result<Vec<u8>, Error> {
+pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
     if f.layout.is_empty() {
         return Err(Error::Unsupported("an empty function"));
     }
+    crate::simplify::simplify(f);
+    let f = &*f;
     let conv = f.signature.call_conv;
     let abi = A::abi(conv).ok_or(Error::Unsupported("the function's calling convention"))?;
     let t0 = std::time::Instant::now();
@@ -131,6 +138,7 @@ pub(crate) fn compile<A: Asm>(f: &Function) -> Result<Vec<u8>, Error> {
         slot_of: vec![NONE; nv],
         tracked: vec![false; nv],
         pin: vec![NOREG; nv],
+        lea: vec![None; nv],
         live: Vec::new(),
         holds: [NONE; 64],
         pinned: 0,
@@ -156,6 +164,7 @@ pub(crate) fn compile<A: Asm>(f: &Function) -> Result<Vec<u8>, Error> {
     };
     g.out = g.outgoing_area()?;
     g.choose_pins();
+    g.find_leas();
     g.entry()?;
     for i in 0..g.an.order.len() {
         let b = g.an.order[i];
@@ -236,6 +245,34 @@ impl<A: Asm> Gen<'_, A> {
             self.pin[v.index()] = r;
             self.pinned |= bit(r);
             self.used |= bit(r);
+        }
+    }
+
+    /// Find the values that are a pinned value plus a constant.
+    fn find_leas(&mut self) {
+        let f = self.f;
+        for &b in &self.an.order {
+            for &inst in &f.dfg.blocks[b.index()].insts {
+                let d = &f.dfg.insts[inst.index()];
+                let Op::AluImm(Alu::Add, c) = d.op else { continue };
+                let v = f.dfg.slice(d.results)[0];
+                if d.ty.bits() != 64 || self.pin[v.index()] != NOREG {
+                    continue;
+                }
+                let x = f.dfg.slice(d.args)[0];
+                let base = if self.pin[x.index()] != NOREG {
+                    Some((x, 0))
+                } else {
+                    self.lea[x.index()]
+                };
+                if let Some((p, o)) = base {
+                    let off = o.wrapping_add(c);
+                    if i32::try_from(off).is_ok() {
+                        self.lea[v.index()] = Some((p, off));
+                        self.an.remat[v.index()] = true;
+                    }
+                }
+            }
         }
     }
 
@@ -351,6 +388,9 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn const_of(&self, v: Value) -> Option<Src> {
+        if let Some((p, off)) = self.lea[v.index()] {
+            return Some(Src::Lea(self.pin[p.index()], off));
+        }
         let ValueDef::Result(inst, 0) = self.f.dfg.values[v.index()].def else {
             return None;
         };
@@ -462,6 +502,7 @@ impl<A: Asm> Gen<'_, A> {
                 Src::I(imm) => self.a.imm(r, imm),
                 Src::F(bits, ty) => self.a.fimm(r, bits, ty),
                 Src::Slot(off, _) => self.a.ld_sp(r, off),
+                Src::Lea(base, off) => self.lea_into(r, base, off),
                 Src::R(_) => unreachable!(),
             }
             let home = self.tracked[i] && self.home_ok[i];
@@ -471,6 +512,27 @@ impl<A: Asm> Gen<'_, A> {
         };
         self.locked |= bit(r);
         Ok(r)
+    }
+
+    fn lea_into(&mut self, r: Reg, base: Reg, off: i64) {
+        if off == 0 {
+            self.a.mov(r, base);
+        } else {
+            self.a.alu(Alu::Add, crate::ir::types::I64, r, base, Opnd::I(off));
+        }
+    }
+
+    /// The register and offset that address `[v + off]`: a pinned register
+    /// with the constant folded in, for a pinned value plus a constant.
+    fn address(&mut self, v: Value, off: i32) -> Result<(Reg, i32), Error> {
+        if !self.in_reg(v) {
+            if let Some((p, o)) = self.lea[v.index()] {
+                if let Ok(o) = i32::try_from(o + i64::from(off)) {
+                    return Ok((self.pin[p.index()], o));
+                }
+            }
+        }
+        Ok((self.use_reg(v)?, off))
     }
 
     /// `v` as an operand that may be an immediate `ok` accepts.
@@ -724,13 +786,28 @@ impl<A: Asm> Gen<'_, A> {
         self.f.dfg.results(inst)[j]
     }
 
-    /// Whether `v`'s only use is as the condition of `next`, a `brif`.
+    /// Whether `v`'s only use is as the condition of the `brif` after
+    /// `next` and any constants (which emit nothing) before it.
     fn fuses(&self, v: Value, next: Option<Inst>) -> bool {
         let Some(next) = next else { return false };
-        let d = &self.f.dfg.insts[next.index()];
-        matches!(d.op, Op::Brif(..))
-            && self.f.dfg.slice(d.args)[0] == v
-            && self.an.uses[v.index()] == 1
+        if self.an.uses[v.index()] != 1 {
+            return false;
+        }
+        let f = self.f;
+        let b = self.an.inst_block[next.index()];
+        let insts = &f.dfg.blocks[b as usize].insts;
+        let Some(at) = insts.iter().position(|&i| i == next) else {
+            return false;
+        };
+        for &i in &insts[at..] {
+            let d = &f.dfg.insts[i.index()];
+            match d.op {
+                Op::Iconst(_) | Op::Fconst(_) => {}
+                Op::Brif(..) => return f.dfg.slice(d.args)[0] == v,
+                _ => return false,
+            }
+        }
+        false
     }
 
     #[allow(clippy::too_many_lines)]
@@ -753,15 +830,16 @@ impl<A: Asm> Gen<'_, A> {
                 self.consume(inst, at);
             }
             Op::Load { bytes, ext, off } => {
-                let base = self.use_reg(args[0])?;
+                let (base, off) = self.address(args[0], *off)?;
                 self.consume(inst, at);
                 let v = self.res(inst, 0);
                 let r = self.def(v, k, dn(self, 0), Some(base))?;
-                self.a.load(*bytes, *ext, d.ty, r, base, *off);
+                self.a.load(*bytes, *ext, d.ty, r, base, off);
                 self.unused(v, dn(self, 0));
             }
             Op::Store { bytes, off } => {
-                let base = self.use_reg(args[1])?;
+                let (base, off) = self.address(args[1], *off)?;
+                let off = &off;
                 let stored = match self.imm_of(args[0]) {
                     Some(i) if !self.in_reg(args[0]) && self.a.store_imm(*bytes, i, base, *off) => {
                         true
@@ -1405,6 +1483,10 @@ impl<A: Asm> Gen<'_, A> {
                     self.a.fimm(A::FSCRATCH, bits, ty);
                     self.a.st_sp(A::FSCRATCH, off);
                 }
+                Src::Lea(base, o) => {
+                    self.lea_into(A::SCRATCH, base, o);
+                    self.a.st_sp(A::SCRATCH, off);
+                }
             }
         }
         // Register to register, in an order that reads each source before
@@ -1448,6 +1530,7 @@ impl<A: Asm> Gen<'_, A> {
                 Src::Slot(off, _) => self.a.ld_sp(r, off),
                 Src::I(i) => self.a.imm(r, i),
                 Src::F(bits, ty) => self.a.fimm(r, bits, ty),
+                Src::Lea(base, o) => self.lea_into(r, base, o),
             }
         }
     }

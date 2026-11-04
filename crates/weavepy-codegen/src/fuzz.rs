@@ -201,6 +201,15 @@ fn generate(seed: u64) -> Function {
                     }
                     8 => {
                         let off = 8 * rng.below(MEM / 8 - 1) as i32;
+                        let (mem, off) = if rng.below(2) == 0 {
+                            // A derived address, offset back.
+                            let k = 8 * rng.below(4) as i64;
+                            let p = b.ins().iadd_imm(mem, k);
+                            let p = b.ins().iadd_imm(p, 8);
+                            (p, off - k as i32 - 8)
+                        } else {
+                            (mem, off)
+                        };
                         match rng.below(5) {
                             0 => b.ins().load(types::I64, F, mem, off),
                             1 => b.ins().uload8(types::I64, F, mem, off + rng.below(8) as i32),
@@ -214,6 +223,12 @@ fn generate(seed: u64) -> Function {
                     }
                     9 => {
                         let off = 8 * rng.below(MEM / 8 - 1) as i32;
+                        let (mem, off) = if rng.below(2) == 0 {
+                            let p = b.ins().iadd_imm(mem, 16);
+                            (p, off - 16)
+                        } else {
+                            (mem, off)
+                        };
                         match rng.below(3) {
                             0 => {
                                 b.ins().store(F, x, mem, off);
@@ -396,7 +411,7 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
                 Op::Iconst(i) => Some(*i),
                 Op::Fconst(b) => Some(*b as i64),
                 Op::Load { bytes, ext, off } => {
-                    let at = (arg(0) - mem.as_ptr() as i64) as usize + *off as usize;
+                    let at = (arg(0) - mem.as_ptr() as i64 + i64::from(*off)) as usize;
                     let mut raw = [0u8; 8];
                     raw[..*bytes as usize].copy_from_slice(&mem[at..at + *bytes as usize]);
                     let u = u64::from_le_bytes(raw);
@@ -411,7 +426,7 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
                     Some(norm(rt, x))
                 }
                 Op::Store { bytes, off } => {
-                    let at = (arg(1) - mem.as_ptr() as i64) as usize + *off as usize;
+                    let at = (arg(1) - mem.as_ptr() as i64 + i64::from(*off)) as usize;
                     let raw = arg(0).to_le_bytes();
                     mem[at..at + *bytes as usize].copy_from_slice(&raw[..*bytes as usize]);
                     None
@@ -543,7 +558,7 @@ fn random_functions() {
         .unwrap_or(3000);
     for seed in 0..n {
         let f = generate(seed);
-        let p = match compile_and_install(&f) {
+        let p = match compile_and_install(&mut f.clone()) {
             Ok(p) => p,
             Err(e) => panic!("seed {seed}: {e}\n{}", f.display()),
         };

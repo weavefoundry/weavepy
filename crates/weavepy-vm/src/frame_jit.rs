@@ -11975,9 +11975,9 @@ fn define(
 /// objects, the code's own among them).
 fn install(parts: Parts, units: Vec<Unit>) -> Result<Native, Box<Parts>> {
     let mut funcs = Vec::with_capacity(units.len());
-    for unit in units {
+    for mut unit in units {
         let t1 = unit.lowered.map(|_| std::time::Instant::now());
-        let built = weavepy_codegen::compile(&unit.func).and_then(|bytes| {
+        let built = weavepy_codegen::compile(&mut unit.func).and_then(|bytes| {
             let n = bytes.len();
             weavepy_codegen::install(&bytes).map(|p| (p, n))
         });
