@@ -61,6 +61,7 @@ impl CodeArena {
     /// Copy `code` into executable memory: its address, valid until the
     /// arena drops.
     pub fn install(&mut self, code: &[u8]) -> Result<*const u8, Error> {
+        crate::dump(code);
         let len = code.len().max(1);
         if self.rwx {
             let start = (self.at + 15) & !15;

@@ -82,7 +82,7 @@ pub fn compile(func: &mut Function) -> Result<Vec<u8>, Error> {
 }
 
 /// Write `code` to `$WPCG_DUMP_DIR/<n>.bin`, when set (a debugging aid).
-fn dump(code: &[u8]) {
+pub(crate) fn dump(code: &[u8]) {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if let Some(dir) = DIR.get_or_init(|| std::env::var_os("WPCG_DUMP_DIR").map(Into::into)) {
@@ -99,7 +99,6 @@ pub fn compile_and_install(func: &mut Function) -> Result<*const u8, Error> {
 
 /// Copy machine code into executable memory: its address.
 pub fn install(code: &[u8]) -> Result<*const u8, Error> {
-    dump(code);
     mem::install(code)
 }
 

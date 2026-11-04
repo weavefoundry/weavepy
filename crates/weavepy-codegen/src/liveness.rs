@@ -117,17 +117,43 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
             });
         }
     }
+    // Cold: what the builder marked, and exits: blocks that return, entered
+    // only by one side of one conditional branch (a guard's deopt, an error
+    // path), whose code would otherwise sit between a loop's hot blocks.
+    let mut edges = vec![0u32; nblocks];
+    let mut by_brif = vec![0u32; nblocks];
+    for &b in &func.layout {
+        if let Some(&last) = dfg.blocks[b.index()].insts.last() {
+            let brif = matches!(dfg.insts[last.index()].op, Op::Brif(..));
+            successors(func, last, |s| {
+                edges[s.index()] += 1;
+                by_brif[s.index()] += u32::from(brif);
+            });
+        }
+    }
+    let cold = |b: Block| {
+        let bd = &dfg.blocks[b.index()];
+        b != entry
+            && (bd.cold
+                || (edges[b.index()] == 1
+                    && by_brif[b.index()] == 1
+                    && bd.insts.len() > 1
+                    && bd
+                        .insts
+                        .last()
+                        .is_some_and(|l| matches!(dfg.insts[l.index()].op, Op::Return))))
+    };
     let mut order: Vec<Block> = func
         .layout
         .iter()
         .copied()
-        .filter(|b| reach[b.index()] && (*b == entry || !dfg.blocks[b.index()].cold))
+        .filter(|&b| reach[b.index()] && !cold(b))
         .collect();
     order.extend(
         func.layout
             .iter()
             .copied()
-            .filter(|b| reach[b.index()] && *b != entry && dfg.blocks[b.index()].cold),
+            .filter(|&b| reach[b.index()] && cold(b)),
     );
     let mut pos = vec![NO_BLOCK; nblocks];
     for (i, b) in order.iter().enumerate() {

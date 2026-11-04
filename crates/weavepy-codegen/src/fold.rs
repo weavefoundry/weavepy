@@ -76,6 +76,58 @@ fn icmp(cc: IntCC, ty: Type, x: i64, y: i64) -> bool {
     }
 }
 
+/// `x op k` when `k` decides it whatever `x` is.
+fn annihilated(op: Alu, ty: Type, k: i64) -> Option<i64> {
+    match (op, canon_imm(ty, k)) {
+        (Alu::And | Alu::Mul, 0) => Some(0),
+        (Alu::Or, -1) => Some(canon_imm(ty, -1)),
+        _ => None,
+    }
+}
+
+/// For a branch on, or a test against zero of, a zero-extended value: the
+/// value before the extension.
+fn widened(f: &Function, args: &[Value], op: &Op) -> Option<Value> {
+    if !matches!(
+        op,
+        Op::Brif(..) | Op::IcmpImm(IntCC::Equal | IntCC::NotEqual, 0)
+    ) {
+        return None;
+    }
+    let ValueDef::Result(def, 0) = f.dfg.values[args.first()?.index()].def else {
+        return None;
+    };
+    let d = &f.dfg.insts[def.index()];
+    matches!(d.op, Op::Uextend).then(|| f.dfg.slice(d.args)[0])
+}
+
+/// Whether `v` is a comparison's 0 or 1.
+fn is_bool(f: &Function, v: Value) -> bool {
+    match f.dfg.values[v.index()].def {
+        ValueDef::Result(def, 0) => matches!(
+            f.dfg.insts[def.index()].op,
+            Op::Icmp(_) | Op::IcmpImm(..) | Op::Fcmp(_)
+        ),
+        _ => false,
+    }
+}
+
+/// The comparison `v` is, inverted.
+fn negate(e: &mut Emit<'_>, v: Value) -> Value {
+    let ValueDef::Result(def, 0) = e.f.dfg.values[v.index()].def else {
+        unreachable!("a comparison");
+    };
+    let d = e.f.dfg.insts[def.index()].clone();
+    let args = e.f.dfg.slice(d.args).to_vec();
+    let op = match d.op {
+        Op::Icmp(cc) => Op::Icmp(cc.inverse()),
+        Op::IcmpImm(cc, k) => Op::IcmpImm(cc.inverse(), k),
+        Op::Fcmp(cc) => Op::Fcmp(cc.inverse()),
+        _ => unreachable!("a comparison"),
+    };
+    e.push(op, &args, types::I8)
+}
+
 /// The magic multiplier and shift for signed division by `d` (`|d| >= 2`)
 /// at `bits` (32 or 64): Hacker's Delight's `magic`, in `bits`-bit
 /// unsigned arithmetic.
@@ -215,7 +267,7 @@ pub(crate) fn fold(f: &mut Function, alias: &mut Vec<Value>) {
     }
 }
 
-fn fold_one(e: &mut Emit<'_>, _b: Block, inst: Inst, quotients: &mut HashMap<(Value, i64), Value>) {
+fn fold_one(e: &mut Emit<'_>, b: Block, inst: Inst, quotients: &mut HashMap<(Value, i64), Value>) {
     let d = e.f.dfg.insts[inst.index()].clone();
     let args: Vec<Value> =
         e.f.dfg
@@ -228,9 +280,12 @@ fn fold_one(e: &mut Emit<'_>, _b: Block, inst: Inst, quotients: &mut HashMap<(Va
     let folded: Option<i64> = match &d.op {
         Op::Alu(op) if ty.is_int() => match (c(e, 0), c(e, 1)) {
             (Some(x), Some(y)) => Some(alu(*op, ty, x, y)),
+            (Some(k), None) | (None, Some(k)) => annihilated(*op, ty, k),
             _ => None,
         },
-        Op::AluImm(op, y) if ty.is_int() => c(e, 0).map(|x| alu(*op, ty, x, *y)),
+        Op::AluImm(op, y) if ty.is_int() => c(e, 0)
+            .map(|x| alu(*op, ty, x, *y))
+            .or_else(|| annihilated(*op, ty, *y)),
         Op::Icmp(cc) => {
             let aty = e.f.dfg.value_type(args[0]);
             match (c(e, 0), c(e, 1)) {
@@ -261,6 +316,48 @@ fn fold_one(e: &mut Emit<'_>, _b: Block, inst: Inst, quotients: &mut HashMap<(Va
         insn.args = (0, 0);
         e.out.push(inst);
         return;
+    }
+    // A compare with a constant takes it as its immediate.
+    if let Op::Icmp(cc) = d.op {
+        let (k0, k1) = (c(e, 0), c(e, 1));
+        let swap = match (k0, k1) {
+            (None, Some(k)) => Some((cc, args[0], k)),
+            (Some(k), None) => Some((cc.swapped(), args[1], k)),
+            _ => None,
+        };
+        if let Some((cc, x, k)) = swap {
+            let aty = e.f.dfg.value_type(x);
+            let a = e.f.dfg.intern(&[x]);
+            let insn = &mut e.f.dfg.insts[inst.index()];
+            insn.op = Op::IcmpImm(cc, canon_imm(aty, k));
+            insn.args = a;
+            return fold_one(e, b, inst, quotients);
+        }
+    }
+    // Booleans widened only to be tested: test them as they are.
+    if let Some(src) = widened(e.f, &args, &d.op) {
+        match &d.op {
+            Op::Brif(..) => {
+                let a = e.f.dfg.intern(&[src]);
+                e.f.dfg.insts[inst.index()].args = a;
+                return fold_one(e, b, inst, quotients);
+            }
+            Op::IcmpImm(cc, 0) => {
+                let r = e.f.dfg.slice(d.results)[0];
+                if e.f.dfg.value_type(src) == types::I8 && is_bool(e.f, src) {
+                    let v = if *cc == IntCC::NotEqual {
+                        src
+                    } else {
+                        negate(e, src)
+                    };
+                    e.alias[r.index()] = v;
+                    return;
+                }
+                let a = e.f.dfg.intern(&[src]);
+                e.f.dfg.insts[inst.index()].args = a;
+            }
+            _ => {}
+        }
     }
     match &d.op {
         Op::Select => {
