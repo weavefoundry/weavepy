@@ -7264,7 +7264,17 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
         if status == MARKED {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
         } else if let Some(e) = cst.err.take() {
-            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            // A raise past the callee's handlers: its exit here, the error
+            // then its caller's (see `Interpreter::core_raise_return`).
+            let interp = &mut *st.interp.cast_mut();
+            let e = if std::ptr::eq(sw.cur, cst.frame) {
+                interp.core_raise_return(sw, e).err()
+            } else {
+                Some(e)
+            };
+            if let Some(e) = e {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            }
         }
         false
     }
@@ -7639,6 +7649,39 @@ unsafe extern "C" fn h_call_await(
 /// # Safety
 ///
 /// `st` is a live state whose switch is non-null.
+/// After a call's activation ran: this code's activation running again
+/// with the callee's raise pending (its operands gone from `start`, its
+/// pc past the call): the error moved to the state for this code's
+/// handlers (`RAISED`, see [`h_catch`]). `false` touches nothing.
+///
+/// # Safety
+///
+/// As [`finished_in_place`]'s, after it.
+unsafe fn raised_in_place(st: &mut State, start: usize) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let sw = &mut *st.sw;
+        if !std::ptr::eq(sw.cur, st.frame)
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || (*st.frame).stack.len() != start
+            || (*sw.maybe_dead).get()
+            || !matches!(
+                sw.pending,
+                Some(crate::CoreExit::Stop(crate::LeafStop::Raised(_)))
+            )
+        {
+            return false;
+        }
+        let Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e))) = sw.pending.take() else {
+            return false;
+        };
+        st.err = Some(e);
+        st.len = start;
+        st.pc = (*st.frame).pc as usize;
+        true
+    }
+}
+
 unsafe fn finished_in_place(st: &mut State, start: usize) -> bool {
     // SAFETY: the caller's contract.
     unsafe {
@@ -9219,7 +9262,18 @@ unsafe fn direct_done<const PUSHED: bool>(
         if status == MARKED {
             sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
         } else if let Some(e) = cst.err.take() {
-            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            // A raise past the callee's handlers: its exit here, the error
+            // then this caller's to catch (see `run_switched_directly`).
+            let e = if std::ptr::eq(sw.cur, cst.frame) {
+                interp.core_raise_return(sw, e).err()
+            } else {
+                Some(e)
+            };
+            match e {
+                Some(e) => sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e))),
+                None if raised_in_place(st, start) => return RAISED,
+                None => {}
+            }
         }
         RELOAD
     }
@@ -9927,6 +9981,9 @@ unsafe fn call_activation(st: &mut State, pc: usize, start: usize, len: usize, p
         }
         if switched && finished_in_place(st, start) {
             return 0;
+        }
+        if switched && raised_in_place(st, start) {
+            return RAISED;
         }
         RELOAD
     }

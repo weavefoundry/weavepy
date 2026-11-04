@@ -25287,6 +25287,82 @@ impl Interpreter {
     /// a raise) is left in `sw.pending`. `false` touches nothing (the
     /// quiet loop's own return path takes it).
     #[inline(never)]
+    /// The running inline activation's `err`, raised past its own handlers
+    /// (none covers the raise) while nothing observes frames: its
+    /// exceptional exit (`inline_finish`'s unwind, the shell pushed first
+    /// as its general arm pushes one) delivered to its caller, which runs
+    /// next with the error pending, as [`Self::core_return`] delivers a
+    /// return. `Err(err)` declines, having changed nothing.
+    pub(crate) fn core_raise_return(
+        &mut self,
+        sw: &mut CoreSwitch,
+        err: RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        // SAFETY: see `CoreSwitch`.
+        let inl = unsafe { &mut *sw.inl };
+        let depth = inl.len();
+        let plain = inl.last_mut().is_some_and(|top| {
+            top.gen.is_none()
+                && !top.direct
+                && !top.lazy_coro
+                && std::ptr::eq(&raw mut *top.frame, sw.cur)
+        });
+        if !plain
+            || !matches!(err, RuntimeError::PyException(_))
+            || crate::trace::any_observers_active()
+        {
+            return Err(err);
+        }
+        // SAFETY: the running activation is the top one.
+        let frame = unsafe { &mut *sw.cur };
+        let raise_pc = frame.pc.wrapping_sub(1);
+        if find_handler(&frame.code.exception_table, raise_pc).is_some() {
+            return Err(err);
+        }
+        let mut done = inl.pop().expect("checked above");
+        if depth == sw.entry_depth {
+            sw.entry_dead = true;
+        }
+        if done.act.shell.is_none() {
+            self.flush_pending_callers();
+            let shell = self.push_lean_shell(&done.frame, done.frame.pc);
+            done.act.shell = Some(shell);
+        }
+        let result = self.inline_finish(
+            &mut done,
+            QuietExit::Outcome {
+                stepped: Err(err),
+                cur_pc: raise_pc as usize,
+            },
+        );
+        done.clean = false;
+        let mut tmp = None;
+        // SAFETY: the caller is the innermost remaining activation.
+        let (cframe, clast, _) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        let entry = unsafe { self.inline_deliver(&mut *cframe, done, result) };
+        sw.cur = cframe;
+        sw.last = if clast == &raw mut sw.scratch {
+            sw.scratch = usize::MAX;
+            &raw mut sw.scratch
+        } else {
+            clast
+        };
+        match entry {
+            QuietEntry::Raised { err, .. } => {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(err)));
+            }
+            // (An error delivered is raised; kept total.)
+            QuietEntry::Returned { cur_pc } => {
+                // SAFETY: as above.
+                unsafe { *sw.last = cur_pc };
+            }
+            QuietEntry::Stop(stop) => sw.pending = Some(CoreExit::Stop(stop)),
+            QuietEntry::Fresh => {}
+        }
+        Ok(())
+    }
+
     fn core_return(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
         // SAFETY: see `CoreSwitch`.
         let inl = unsafe { &mut *sw.inl };
