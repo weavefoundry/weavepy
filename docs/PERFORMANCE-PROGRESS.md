@@ -232,6 +232,26 @@ branch and pull request.
 
 ## Done
 
+- **`ast.parse` without the spec, and cheaper class creation** (PR #107).
+  `compile(..., PyCF_ONLY_AST)` built a tree of spec dicts that
+  `ast._from_spec` then walked, calling `cls.__new__` (a Python frame) and
+  `setattr` per node and field: 78% of `ast.parse`. While the `ast` module,
+  its builder and its node classes are as defined, the parse now builds the
+  instances itself, with the same attributes in the same order, and anything
+  patched (a class's `__new__` or `__setattr__`, a data descriptor, a
+  finalizer, the registry, a tracer) still sees every call through the spec
+  path. Boxing `Arguments` in `Lambda` brought `Expr` from over 200 bytes to
+  72. `ast.parse` of CPython's `ast.py` went from 16.6 ms to 1.75 ms (CPython
+  3.32 ms), and of a three-line source from 108 us to 14.5 us (CPython 17.3
+  us). For classes: `type.__prepare__` and a no-op `object.__init_subclass__`
+  aren't called; a metaclass's function read through a class, `cls.__class__`
+  and `isinstance`/`issubclass` under a metaclass that keeps `type`'s hooks
+  take leaf paths; `getattr(cls, '__dunder__', default)` proves a miss without
+  building an `AttributeError`; and the frame JIT runs set literals. A class's
+  base kept a dead `Weak` for every discarded subclass, which pinned each
+  `TypeObject`'s memory; those are now pruned. `class K: pass` went from 7.9
+  us to 4.7 us (CPython 5.8 us).
+
 - **A code generator of our own** (PR #107, `perf/beyond-parity`). The frame
   JIT ran Cranelift at `opt_level=none`, paying about 11,000 host instructions
   and a kilobyte of working memory per IR instruction for register allocation,
@@ -743,32 +763,51 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Next
 
-1. `async_tree` and `context_managers`, the two worst workloads: mostly general
+1. Exceptions, which explain most of `exceptions`, `context_managers` and
+   `collections_mix` (140,000, 80,000 and 20,000 raises a call). A raise
+   caught in its own frame costs 2,377 instructions against CPython 3.13's
+   1,407, spread over a dozen helpers (`handle_exception_with` about 270,
+   the exception-info ops through `h_container` about 260, building the
+   instance about 300). A raise out of a compiled callee costs 6,431 against
+   2,536: the caller switches to the callee rather than calling it directly,
+   so the raise unwinds through the core loop and the caller's handler runs
+   interpreted. Unwinding the callee where `run_switched_directly` sees it
+   raise, and returning the error to the caller's compiled code, is the
+   structural fix.
+2. `async_tree` and `context_managers`, the two worst workloads: mostly general
    calls, attribute stores and asyncio's own loop now, not generator mechanics.
    Exits that register a call and its whole chain of callers (`Rect.__init__`'s
    polymorphic stores, `DictUpdate`, `PushExcInfo`) want helper fallbacks.
-2. Cold time: the lowering left on the interpreter's thread (a third of a
+3. Cold time: the lowering left on the interpreter's thread (a third of a
    compile) and the time a body runs interpreted before its code is
    ready; a much cheaper baseline compiler or compiled code kept across
    processes.
-3. Peak memory: the file-backed pages (3.5 MB over CPython's: the
+4. Peak memory: the file-backed pages (3.5 MB over CPython's: the
    interpreter's code is spread over many large functions, so hot-cold
    splitting with a profile is the next thing to try), and dropping a body
    again when its code stopped running (bodies, VM extensions and inline
    caches of code run at import are about 2 MB).
-4. Builtins take keywords as `&[(String, Object)]`, so every keyword call
+5. Builtins take keywords as `&[(String, Object)]`, so every keyword call
    of one allocates a `String` per keyword; a calling convention over the
    names tuple would remove it.
-5. Tier 2 holds an object that already has weak references, read through
+6. Tier 2 holds an object that already has weak references, read through
    an attribute, until its activation exits.
-6. In-line reference counts in compiled code, now a compare, a flag test and an
+7. In-line reference counts in compiled code, now a compare, a flag test and an
    `inc` (the compile-cost rewrite took them out of line, and a count is about
    1.5% of the suite in `h_clone`), and freelists, which weren't reached.
-7. The code cache has no checksum: a damaged artifact that still decodes gives
+8. The code cache has no checksum: a damaged artifact that still decodes gives
    wrong names or errors until it's replaced, and a function body that doesn't
    decode fails its run (the cache is then discarded). Reading every page to
    check one works against decoding bodies lazily.
-8. Divergences from CPython found and left: a tuple or list dropped outside the
+9. Smaller gaps measured and left: `enum.Enum("E", "A B C")` takes 200 us
+   (CPython 63 us), with no single cause (`EnumType.__prepare__` 11.5 us
+   against 2.0, `EnumDict()` 1.4 us against 0.3, a dict subclass's
+   `super().__init__()` 0.8 us against 0.1); `hash()` of a builtin function
+   190 ns against 55; and an operand loaded from a global loses the in-line
+   paths a local gets (`d[i] = i` 56 ns against 20). An in-line
+   `LOAD_GLOBAL` hit path cost as many instructions as `h_global` and made
+   the suite 1.4% slower through code size.
+10. Divergences from CPython found and left: a tuple or list dropped outside the
    tuple freelist releases its items forward (CPython's go in reverse), as do
    operands of some native calls (`D("a") == D("b")`); closing a generator while
    its frame object is held unwinds its stack at once; an instance holding only
