@@ -504,6 +504,13 @@ impl<A: Asm> Gen<'_, A> {
     /// A register for a new value: a free one, or one emptied by evicting
     /// the value used furthest ahead.
     fn alloc(&mut self, float: bool, prefer_saved: bool) -> Result<Reg, Error> {
+        let r = self.alloc_any(float, prefer_saved)?;
+        // (Temporaries too: a callee-saved register written is saved.)
+        self.used |= bit(r);
+        Ok(r)
+    }
+
+    fn alloc_any(&mut self, float: bool, prefer_saved: bool) -> Result<Reg, Error> {
         if let Some(r) = self.free_reg(float, prefer_saved) {
             return Ok(r);
         }
@@ -681,6 +688,7 @@ impl<A: Asm> Gen<'_, A> {
                 if let Some(&r) = entry_locs.get(i) {
                     if r < 64 && pool_has(r) && taken & bit(r) == 0 {
                         taken |= bit(r);
+                        self.used |= bit(r);
                         return r;
                     }
                 }
@@ -697,6 +705,9 @@ impl<A: Asm> Gen<'_, A> {
                 // (Past the registers, a parameter arrives in its slot.)
                 let Some(r) = r else { return NOREG };
                 taken |= bit(r);
+                // (Edges write it even where the block never reads it: a
+                // callee-saved one must be saved.)
+                self.used |= bit(r);
                 r
             })
             .collect();

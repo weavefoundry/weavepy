@@ -569,13 +569,87 @@ fn interpret(f: &Function, args: &[i64], mem: &mut [u8; MEM]) -> i64 {
     }
 }
 
+/// Call `f(a, b, mem)` with the callee-saved registers set to known
+/// values: the result, and whether they all came back unchanged.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn call_checked(f: *const u8, a: i64, b: i64, mem: *mut u8) -> (i64, bool) {
+    let ret: i64;
+    let bad: u64;
+    // SAFETY: `f` is compiled code of `(i64, i64, ptr) -> i64`; the asm
+    // saves and restores every register it seeds.
+    #[cfg(all(target_arch = "x86_64", not(windows)))]
+    unsafe {
+        std::arch::asm!(
+            "push rbx", "push r12", "push r13", "push r14", "push r15", "push rbp",
+            "mov rbx, 0x1111", "mov r12, 0x2222", "mov r13, 0x3333",
+            "mov r14, 0x4444", "mov r15, 0x5555",
+            "call {f}",
+            "xor ecx, ecx", "xor edx, edx",
+            "cmp rbx, 0x1111", "setne cl", "or rdx, rcx",
+            "cmp r12, 0x2222", "setne cl", "or rdx, rcx",
+            "cmp r13, 0x3333", "setne cl", "or rdx, rcx",
+            "cmp r14, 0x4444", "setne cl", "or rdx, rcx",
+            "cmp r15, 0x5555", "setne cl", "or rdx, rcx",
+            "pop rbp", "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx",
+            f = in(reg) f,
+            in("rdi") a, in("rsi") b, in("rdx") mem,
+            lateout("rax") ret, lateout("rdx") bad,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "stp x19, x20, [sp, #-16]!", "stp x21, x22, [sp, #-16]!",
+            "stp x23, x24, [sp, #-16]!", "stp x25, x26, [sp, #-16]!",
+            "stp x27, x28, [sp, #-16]!",
+            "mov x19, #19", "mov x20, #20", "mov x21, #21", "mov x22, #22", "mov x23, #23",
+            "mov x24, #24", "mov x25, #25", "mov x26, #26", "mov x27, #27", "mov x28, #28",
+            "blr {f}",
+            "mov x9, #0",
+            "cmp x19, #19", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x20, #20", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x21, #21", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x22, #22", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x23, #23", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x24, #24", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x25, #25", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x26, #26", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x27, #27", "cset x10, ne", "orr x9, x9, x10",
+            "cmp x28, #28", "cset x10, ne", "orr x9, x9, x10",
+            "ldp x27, x28, [sp], #16", "ldp x25, x26, [sp], #16",
+            "ldp x23, x24, [sp], #16", "ldp x21, x22, [sp], #16",
+            "ldp x19, x20, [sp], #16",
+            f = in(reg) f,
+            in("x0") a, in("x1") b, in("x2") mem,
+            lateout("x0") ret, out("x9") bad,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(all(target_arch = "x86_64", windows))]
+    {
+        let jit: extern "C" fn(i64, i64, *mut u8) -> i64 = unsafe { std::mem::transmute(f) };
+        ret = jit(a, b, mem);
+        bad = 0;
+    }
+    (ret, bad == 0)
+}
+
 #[test]
 fn random_functions() {
     let n: u64 = std::env::var("WPCG_FUZZ")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
-    for seed in 0..n {
+    let from: u64 = std::env::var("WPCG_FUZZ_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let trace = std::env::var_os("WPCG_FUZZ_TRACE").is_some();
+    for seed in from..n {
+        if trace {
+            eprintln!("seed {seed}");
+        }
         let f = generate(seed);
         let p = match compile_and_install(&mut f.clone()) {
             Ok(p) => p,
@@ -589,8 +663,18 @@ fn random_functions() {
                 *x = (i as u8).wrapping_mul(37).wrapping_add(k as u8);
             }
             let mut m2 = m1;
+            let mut m3 = m1;
             let want = interpret(&f, &[a, b, m1.as_mut_ptr() as i64], &mut m1);
             let got = jit(a, b, m2.as_mut_ptr());
+            // SAFETY: as `jit`.
+            let (again, saved) = unsafe { call_checked(p, a, b, m3.as_mut_ptr()) };
+            if !saved {
+                if let Ok(path) = std::env::var("WPCG_FUZZ_DUMP") {
+                    std::fs::write(path, crate::compile(&mut f.clone()).unwrap()).unwrap();
+                }
+            }
+            assert!(saved, "seed {seed}: a callee-saved register changed\n{}", f.display());
+            assert_eq!(again, got, "seed {seed}: the checked call differs");
             assert!(
                 got == want && m1 == m2,
                 "seed {seed} args ({a}, {b}): got {got}, want {want}, memory {}\n{}",
