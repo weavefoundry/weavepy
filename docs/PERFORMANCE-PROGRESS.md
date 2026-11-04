@@ -7,6 +7,29 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 3, 2026, at `197a820f` (PR #107, `perf/beyond-parity`),
+on the same host and CPython, both WeavePy binaries profile-guided and
+interleaved with CPython in one session. The base is `main`'s PGO build
+(`24afc77b`, PR #102).
+
+| Measure | `main` | PR #107 | PR #107 / `main` |
+| --- | ---: | ---: | ---: |
+| Warm time, 33 workloads (geomean) | 1.023 | 1.015 | 0.992 |
+| Cold time (first call, including compilation) | 1.211 | 1.134 | 0.937 |
+| Peak resident memory | 1.492 | 1.275 | 0.855 |
+
+The JITs generate code through `weavepy-codegen`, WeavePy's own one-pass code
+generator, in place of Cranelift (see "Done"). Peak memory falls on every
+workload, by 2 to 3 MB on most. The worst warm times are `class_creation`
+1.74, `context_managers` 1.57, `async_tree` 1.47, `deepcopy` 1.43,
+`logging_mix` 1.39, `stdlib_utils` 1.36 and `exceptions` 1.32; the best are
+`pickle_roundtrip` 0.58, `scimark` 0.65, `json_roundtrip` 0.66, `unpack_sequence`
+0.73 and `raytrace` 0.74. `class_creation` read 1.17 times `main`'s in this run
+though its instructions are even. On the CI bench gate's fixtures the PR's
+suite geomean is 0.912 of its merge base's on Ubuntu.
+
+The earlier checkpoints follow.
+
 Measured on October 30, 2026, at `24afc77b` (PR #102, `perf/step-change`,
 stacked on PR #101), on the same host and CPython, both WeavePy binaries
 profile-guided and interleaved with CPython in one idle session. The base is
@@ -208,6 +231,25 @@ branch and pull request.
    `logging_mix`, `class_creation`).
 
 ## Done
+
+- **A code generator of our own** (PR #107, `perf/beyond-parity`). The frame
+  JIT ran Cranelift at `opt_level=none`, paying about 11,000 host instructions
+  and a kilobyte of working memory per IR instruction for register allocation,
+  and tier 2's optimizer no longer paid for itself (scimark 309M instructions a
+  call with it, 317M without). `crates/weavepy-codegen` takes the same SSA
+  input through Cranelift's builder names and emits x86-64 (System V and Win64)
+  or AArch64 code in one linear pass: block-local register allocation, register
+  state carried down single-predecessor chains, merge blocks entered in the
+  first edge's state, a few values pinned in callee-saved registers, and guard
+  exits laid out of line. A simplification pass folds constants, divides by
+  constants with magic numbers, drops trivial phis and identities, and threads
+  jumps through empty blocks. All three JITs use it, so Cranelift and the
+  vendored regalloc2 are gone (the binary is 6 MB smaller), as are the
+  background compile queue, the Cranelift warm-up thread and the separate
+  compile heap. Compiles cost about a quarter of what they did, so the frame
+  JIT's threshold falls from 2,000 to 500 heat per instruction. A differential
+  fuzzer compiles random functions, compares them with an IR interpreter, and
+  checks that callee-saved registers survive each call.
 
 - **One bind for every direct call** (PR #86, `perf/cheap-calls`). A call
   between compiled functions, positional or keyword, with defaults or

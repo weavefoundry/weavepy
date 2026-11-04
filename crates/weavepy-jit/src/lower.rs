@@ -1,9 +1,9 @@
-//! Lower the typed IR ([`TFunc`]) to a Cranelift function.
+//! Lower the typed IR ([`TFunc`]) to a `weavepy-codegen` function.
 //!
-//! Locals become Cranelift *variables* (the SSA builder inserts phis at
+//! Locals become *variables* (the SSA builder inserts phis at
 //! merges); the operand stack is an explicit `Vec` of SSA values.
 //! Cross-block operand values (RFC 0069 WS2 — ternaries, short-circuit
-//! chains) are carried as Cranelift *block parameters*: each block
+//! chains) are carried as *block parameters*: each block
 //! declares one param per [`crate::ir::TBlock::entry_stack`] lane and
 //! every jump/branch passes the live stack as block arguments. Integer
 //! arithmetic is emitted with explicit overflow / divide-by-zero checks
@@ -81,7 +81,7 @@ struct SiteCall {
     gaps: u32,
 }
 
-/// Build the Cranelift function body for `tfunc` into `func`; `false` when
+/// Build the function body for `tfunc` into `func`; `false` when
 /// the body assigned a local the write-back plan missed (the build must be
 /// discarded).
 pub(crate) fn build_function(
@@ -108,7 +108,7 @@ struct Lowerer<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     tfunc: &'a TFunc,
     ptr_ty: Type,
-    /// One Cranelift block per (reachable) TBlock.
+    /// One block per (reachable) TBlock.
     cl_blocks: Vec<Block>,
     /// One variable per managed local slot (others unused).
     vars: Vec<Option<Variable>>,
@@ -381,7 +381,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CALL_TAGS);
         }
 
-        // One Cranelift block per TBlock, with one block parameter per
+        // One block per TBlock, with one block parameter per
         // entry-stack lane (RFC 0069 WS2).
         self.cl_blocks = Vec::with_capacity(self.tfunc.blocks.len());
         for tb in &self.tfunc.blocks {

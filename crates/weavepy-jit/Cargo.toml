@@ -1,6 +1,6 @@
 [package]
 name = "weavepy-jit"
-description = "RFC 0032 — tier-2 Cranelift JIT for WeavePy's unboxed numeric frames."
+description = "RFC 0032 — tier-2 JIT for WeavePy's unboxed numeric frames."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

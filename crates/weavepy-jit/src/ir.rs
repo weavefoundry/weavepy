@@ -3,14 +3,14 @@
 //! It is a *stack machine* mirroring the bytecode, but with every
 //! operation resolved to a concrete [`JitType`] lane and every local
 //! resolved to a slot index. Keeping a tiny IR between bytecode and
-//! Cranelift means [`crate::analyze`] can be unit-tested without a
+//! the code generator means [`crate::analyze`] can be unit-tested without a
 //! codegen backend and [`crate::lower`] stays a straight syntax-directed
 //! translation.
 //!
-//! Cross-block operand-stack values are carried as Cranelift *block
+//! Cross-block operand-stack values are carried as *block
 //! parameters* in lowering; [`TBlock::entry_stack`] records their static
 //! types so the lowerer can declare the right params. Locals become
-//! Cranelift *variables*, so merges are handled by the SSA builder
+//! *variables*, so merges are handled by the SSA builder
 //! without explicit phis.
 
 use crate::value::JitType;
@@ -67,7 +67,7 @@ pub enum CmpKind {
 }
 
 /// RFC 0069 WS2 — the math-module intrinsics the JIT burns in as
-/// native instructions. `Sqrt` lowers to Cranelift's `sqrt`; `Sin`/
+/// native instructions. `Sqrt` lowers to the code generator's `sqrt`; `Sin`/
 /// `Cos` call the registered libm-backed helpers (bit-identical to
 /// what the interpreter's `math` module computes); `Fabs` lowers to
 /// `fabs`. Domain surprises (negative `sqrt` operand, non-finite
@@ -855,7 +855,7 @@ pub enum TTerm {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TBlock {
     /// Types of the operand-stack values live on entry (lowered to
-    /// Cranelift block parameters), bottom-to-top.
+    /// block parameters), bottom-to-top.
     pub entry_stack: Vec<JitType>,
     pub stmts: Vec<TStmt>,
     pub term: TTerm,

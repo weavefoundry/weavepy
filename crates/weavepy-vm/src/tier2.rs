@@ -1,4 +1,4 @@
-//! RFC 0032 — the VM side of the tier-2 Cranelift JIT.
+//! RFC 0032 — the VM side of the tier-2 JIT.
 //!
 //! This module is compiled only with the `jit` feature. It owns a
 //! per-thread [`weavepy_jit::JitEngine`] and a hot-counter cache keyed by

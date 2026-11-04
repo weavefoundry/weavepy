@@ -83,7 +83,7 @@ pub mod stdlib;
 pub mod stdlib_tree;
 pub mod sync;
 pub mod thread_registry;
-/// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
+/// RFC 0032 — tier-2 JIT integration. Present only under the
 /// `jit` feature; the dispatch loop calls into it behind `#[cfg]` gates.
 #[cfg(feature = "jit")]
 mod tier2;
