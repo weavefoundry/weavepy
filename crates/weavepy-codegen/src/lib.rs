@@ -12,6 +12,8 @@
 
 #![allow(clippy::new_without_default, clippy::wrong_self_convention)]
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 mod asm;
 mod builder;
 mod codegen;
@@ -52,7 +54,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Whether this target has a code generator.
-pub const SUPPORTED: bool = cfg!(target_arch = "x86_64");
+pub const SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
 
 /// The machine code for `func`, position-independent.
 pub fn compile(func: &Function) -> Result<Vec<u8>, Error> {
@@ -60,7 +62,11 @@ pub fn compile(func: &Function) -> Result<Vec<u8>, Error> {
     {
         codegen::compile::<x64::X64>(func)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        codegen::compile::<aarch64::A64>(func)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = func;
         Err(Error::Unsupported("this target"))
@@ -80,3 +86,6 @@ pub fn install(code: &[u8]) -> Result<*const u8, Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fuzz;

@@ -732,7 +732,7 @@ impl Asm for X64 {
         }
     }
 
-    fn overflow(&mut self, op: Overflow, ty: Type, dst: Reg, a: Reg, b: Reg) {
+    fn overflow(&mut self, op: Overflow, ty: Type, dst: Reg, a: Reg, b: Reg) -> Cond {
         let w = ty.bits() == 64;
         let ty = if ty.bits() < 32 { crate::ir::types::I32 } else { ty };
         let run = |s: &mut Self, d: Reg, src: Reg| match op {
@@ -754,6 +754,7 @@ impl Asm for X64 {
             self.mov64(dst, a);
             run(self, dst, b);
         }
+        Cond::O
     }
 
     fn fop(&mut self, op: Fop, ty: Type, dst: Reg, a: Reg, b: Reg) {

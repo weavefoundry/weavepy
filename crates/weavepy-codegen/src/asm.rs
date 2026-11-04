@@ -182,8 +182,9 @@ pub(crate) trait Asm {
     fn setcc(&mut self, c: Cond, dst: Reg);
     /// `dst = c ? x : y` from the flags `cmp` or `test` set.
     fn csel(&mut self, c: Cond, ty: Type, dst: Reg, x: Reg, y: Reg);
-    /// `dst = a op b`, setting the overflow condition.
-    fn overflow(&mut self, op: Overflow, ty: Type, dst: Reg, a: Reg, b: Reg);
+    /// `dst = a op b`, setting flags: the condition that holds on signed
+    /// overflow.
+    fn overflow(&mut self, op: Overflow, ty: Type, dst: Reg, a: Reg, b: Reg) -> Cond;
 
     // Floats.
     fn fop(&mut self, op: Fop, ty: Type, dst: Reg, a: Reg, b: Reg);

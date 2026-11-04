@@ -184,7 +184,12 @@ fn calls_keep_values() {
 fn two_returns() {
     let p = build(&[types::I64], &[types::I64], |b| {
         let a = entry(b);
-        let s = sig(b, 1, 2, CallConv::SystemV);
+        let conv = if cfg!(all(windows, target_arch = "x86_64")) {
+            CallConv::SystemV
+        } else {
+            CallConv::host()
+        };
+        let s = sig(b, 1, 2, conv);
         let h = b.ins().iconst(types::I64, pair_sysv as usize as i64);
         let c = b.ins().call_indirect(s, h, &[a[0]]);
         let (x, y) = (b.inst_results(c)[0], b.inst_results(c)[1]);

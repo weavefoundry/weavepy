@@ -955,12 +955,12 @@ impl<A: Asm> Gen<'_, A> {
                 let (v, flag) = (self.res(inst, 0), self.res(inst, 1));
                 let r = self.def(v, k, dn(self, 0), Some(a))?;
                 if self.fuses(flag, next) {
-                    self.a.overflow(*op, ty, r, a, b);
-                    self.pending = Some(Pending::Int(Cond::O, flag));
+                    let c = self.a.overflow(*op, ty, r, a, b);
+                    self.pending = Some(Pending::Int(c, flag));
                 } else {
                     let fr = self.def(flag, k, dn(self, 1), None)?;
-                    self.a.overflow(*op, ty, r, a, b);
-                    self.a.setcc(Cond::O, fr);
+                    let c = self.a.overflow(*op, ty, r, a, b);
+                    self.a.setcc(c, fr);
                     self.unused(flag, dn(self, 1));
                 }
                 self.unused(v, dn(self, 0));
