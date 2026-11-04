@@ -66244,14 +66244,36 @@ impl Interpreter {
         // the tokenizer sees the escape before any later hard error.
         let (_, warnings) = weavepy_lexer::tokenize_with_escapes(source);
         self.emit_escape_warnings(source, filename, &warnings)?;
-        let spec = crate::stdlib::ast_mod::parse(&[
+        let args = [
             Object::from_str(source.to_owned()),
             Object::from_str(filename.to_owned()),
             Object::from_str(mode.to_owned()),
             Object::Bool(type_comments),
             Object::Bool(flufl),
-        ])?;
-        let ast_module = self.do_import("ast", &Object::None, 0, outer_globals)?;
+        ];
+        // With `ast` loaded and unchanged, build its nodes while parsing:
+        // the tree `_from_spec` would build from the spec.
+        let loaded = self.cache.get("ast");
+        let direct = loaded
+            .as_ref()
+            .and_then(|module| crate::stdlib::ast_build::direct(self, module));
+        let mut imported = None;
+        if let (Some(loaded), Some(direct)) = (loaded, direct) {
+            let (tree, direct) = crate::stdlib::ast_mod::parse_with(&args, direct);
+            let tree = tree?;
+            if !direct.failed() {
+                let module = self.do_import("ast", &Object::None, 0, outer_globals)?;
+                if module.is_same(&loaded) {
+                    return Ok(tree);
+                }
+                imported = Some(module);
+            }
+        }
+        let spec = crate::stdlib::ast_mod::parse(&args)?;
+        let ast_module = match imported {
+            Some(module) => module,
+            None => self.do_import("ast", &Object::None, 0, outer_globals)?,
+        };
         let builder = self.load_attr(&ast_module, "_from_spec")?;
         self.call(&builder, &[spec], &[], outer_globals)
     }

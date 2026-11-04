@@ -5905,7 +5905,7 @@ impl Compiler {
         // is a nested zero-argument thunk.
         let thunk = |e: &Expr| Expr {
             kind: ExprKind::TypeParamFn {
-                args: AstArguments::default(),
+                args: Box::default(),
                 body: Box::new(e.clone()),
             },
             span: e.span,
@@ -6344,7 +6344,7 @@ impl Compiler {
         let display = self.display_name(name).to_owned();
         let thunk = |e: &Expr| Expr {
             kind: ExprKind::TypeParamFn {
-                args: AstArguments::default(),
+                args: Box::default(),
                 body: Box::new(e.clone()),
             },
             span: e.span,

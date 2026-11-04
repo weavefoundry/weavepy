@@ -782,7 +782,7 @@ impl Conv<'_> {
                 }
             }
             "Lambda" => past::ExprKind::Lambda {
-                args: self.arguments(&self.req_node(&inst, "args", "Lambda")?)?,
+                args: Box::new(self.arguments(&self.req_node(&inst, "args", "Lambda")?)?),
                 body: Box::new(self.expr(&self.req_node(&inst, "body", "Lambda")?)?),
             },
             "Call" => past::ExprKind::Call {

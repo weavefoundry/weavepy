@@ -1170,6 +1170,12 @@ def _from_spec(spec):
     return _ast._build(spec, _build, _BUILD_STATE)
 
 
+# What lets `compile(..., PyCF_ONLY_AST)` build the nodes natively while it
+# parses: while `_from_spec` and `AST.__new__` are these, and the builder
+# above is unchanged, its result is the one `_from_spec` would build.
+_DIRECT_STATE = (_from_spec.__code__, AST.__dict__["__new__"], AST.__new__.__code__)
+
+
 # ---------------------------------------------------------------------------
 # AST validation — port of CPython's PyAST_obj2ast checks (Python-ast.c)
 # followed by _PyAST_Validate (Python/ast.c). Called by the native
