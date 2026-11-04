@@ -12896,10 +12896,44 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `*dst = (*src).clone()`: a scalar by value, anything else through
-    /// its clone.
+    /// `*dst = (*src).clone()`, in line: a scalar's two words copied, a
+    /// counted value's count bumped first while one thread owns every
+    /// count (see `crate::rc`), and anything else through `h_clone`.
     fn copy_value(&mut self, dst: Value, src: Value) {
+        if cfg!(debug_assertions) {
+            // (A debug build's counts are atomic throughout.)
+            self.call(h_clone as *const () as usize, &[dst, src], false);
+            return;
+        }
+        let counted = self.b.create_block();
+        let bump = self.b.create_block();
+        let copy = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        let tag = self.tag_at(src);
+        let scalar = self.is_scalar(tag);
+        self.b.ins().brif(scalar, copy, &[], counted, &[]);
+        self.b.switch_to_block(counted);
+        let flag = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+        );
+        let shared = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+        self.b.ins().brif(shared, slow, &[], bump, &[]);
+        self.b.switch_to_block(bump);
+        let word = self.b.ins().load(self.ptr, FLAGS, src, 8);
+        let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+        let n = self.b.ins().iadd_imm(n, 1);
+        self.b.ins().store(FLAGS, n, word, 0);
+        self.b.ins().jump(copy, &[]);
+        self.b.switch_to_block(copy);
+        self.copy16(dst, src);
+        self.b.ins().jump(done, &[]);
+        self.b.set_cold_block(slow);
+        self.b.switch_to_block(slow);
         self.call(h_clone as *const () as usize, &[dst, src], false);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
     /// Write the whole virtual stack to the frame's.
