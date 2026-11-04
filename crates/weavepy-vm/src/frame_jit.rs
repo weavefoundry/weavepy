@@ -35,8 +35,8 @@
 //! store) start at their `LOAD_FAST`, so the native code takes those at
 //! it too.
 //!
-//! Compiling costs far more than interpreting a few iterations (some 15 to
-//! 25 microseconds per instruction), and every hand-over to the core loop
+//! Compiling costs far more than interpreting a few iterations (some 5 to
+//! 15 microseconds per instruction), and every hand-over to the core loop
 //! costs a round trip, so a code object compiles once its interpreting has
 //! cost about what compiling would (see `Slot::warm`), and only if the
 //! loop that got hot, or for a call of loop-free code its body, runs
@@ -101,14 +101,17 @@ pub(crate) const DIRECT_YIELD: u32 = 8;
 const CHAIN: u32 = 7;
 
 /// The heat per instruction of a code object at which it compiles (see
-/// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid).
+/// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid). With
+/// the code generator a quarter of Cranelift's cost, 500 takes 8% off the
+/// cold calls of compile-heavy workloads against 2,000; 250 makes
+/// `class_creation` compile code it then runs too little.
 fn hot() -> u32 {
     static HOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *HOT.get_or_init(|| {
         std::env::var("WEAVEPY_FRAME_JIT_HOT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2000)
+            .unwrap_or(500)
     })
 }
 
