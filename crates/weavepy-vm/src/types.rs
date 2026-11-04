@@ -1337,6 +1337,11 @@ pub struct InstancePlan {
     /// and not a module or generic-alias subclass (whose allocators
     /// differ).
     pub bare_alloc: bool,
+    /// `C()` with no arguments of a `dict`, `list` or `set` subclass that
+    /// keeps its base's allocator and `__init__`, not abstract: the
+    /// allocation with an empty payload (the base's `__init__` without
+    /// arguments leaves the container empty).
+    pub empty_container: bool,
     /// `object.__new__(cls)` (just the class) is a plain allocation: no
     /// native payload or abstract methods, not an exception, built-in,
     /// `type`, module or generic-alias class (see

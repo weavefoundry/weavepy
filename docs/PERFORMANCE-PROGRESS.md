@@ -7,6 +7,14 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 4, 2026, at `68eb753c` (PR #107), a PGO build against
+CPython 3.14 on the same host, interleaved in one session: warm time 0.992
+(geomean of 33 workloads), cold time 1.124, peak memory 1.282. The worst warm
+times are `async_tree` 1.68, `context_managers` 1.58, `deepcopy` 1.50,
+`class_creation` 1.41, `logging_mix` 1.31, `stdlib_utils` and `exceptions`
+1.30; the best are `pickle_roundtrip` 0.60, `scimark` 0.63, `unpack_sequence`
+0.68 and `json_roundtrip` 0.69.
+
 Measured on November 3, 2026, at `197a820f` (PR #107, `perf/beyond-parity`),
 on the same host and CPython, both WeavePy binaries profile-guided and
 interleaved with CPython in one session. The base is `main`'s PGO build
@@ -231,6 +239,23 @@ branch and pull request.
    `logging_mix`, `class_creation`).
 
 ## Done
+
+- **Slow paths found by timing everyday operations against CPython** (PR #107).
+  Instructions a call, before and after, with CPython 3.14's:
+  - Reading an attribute of an instance whose class defines `__setattr__` (a
+    frozen dataclass, say): 692 to 83 (244). The specializer treated a custom
+    `__setattr__` as overriding reads too, so every such read missed its
+    cache; only a custom `__getattribute__` (or a `super` proxy) now keeps a
+    read off the cached shapes.
+  - `D()` for a `dict`, `list` or `set` subclass that keeps its base's
+    allocator and `__init__`: 4,169 to 1,756 (1,168). The instance plan now
+    knows that call is the allocation with an empty payload, where it built a
+    bound `dict.__init__` and called it with no arguments.
+  - `f"{s!r}{x!r}"` of a string and a float: 3,787 to 1,729 (3,503). The core
+    loop converted ints in line but sent strings and floats to the full step.
+  - `import decimal` no longer imports `_pydecimal` for its rounding-mode
+    strings, which the compiler interns anyway (87 to 83 million), and the
+    intern table hashes with Fx rather than SipHash.
 
 - **`ast.parse` without the spec, and cheaper class creation** (PR #107).
   `compile(..., PyCF_ONLY_AST)` built a tree of spec dicts that
@@ -591,6 +616,22 @@ slowdown in that run was the even-sized chunks, since fixed.
   worth a second training pass in the PGO build. Ordering by total
   profile counts made it worse (large hot functions first).
 
+- **Layout doesn't fix the instruction-cache misses** (PGO builds, November
+  4). Hot-cold splitting (`-Cllvm-args=-hot-cold-split=true`) on top of the
+  profile measured 0.994 of the plain PGO build's warm time, inside this
+  machine's noise, and left the resident code pages where they were (7.1 MB
+  after importing a dozen common modules, against CPython's 4.7 MB). Putting
+  the functions a sampling profile of all 33 workloads found hot ahead of the
+  start-up order took the resident pages to 7.5 MB. Building the core loop's
+  two copies (`leaf_core::<true>` and `<false>`) as one cut `exceptions`'s
+  simulated misses by 2%. The misses aren't in a few functions that layout
+  could pack: `deepcopy` retires the same instructions as CPython 3.13 (58.0
+  million a call against 59.8 million) but takes 4.3 times the misses (3.34
+  million against 0.77 million) and 3.2 times the data-cache misses, spread
+  over about 200 helpers at 0.2% to 0.5% each. Each call walks that many
+  distinct functions, each with its own prologue and specialized code, so the
+  lever is fewer distinct paths, not where they sit.
+
 - **RFC 0078 stage 3 was measured and dropped.** A lane for a warm site's
   callee (`h_call_warm`, positional arguments, no defaults or cells) costs
   447 instructions a call against the general path's 455: removing
@@ -822,6 +863,23 @@ slowdown in that run was the even-sized chunks, since fixed.
    operands of some native calls (`D("a") == D("b")`); closing a generator while
    its frame object is held unwinds its stack at once; an instance holding only
    scalars doesn't count toward a collection.
+11. Calls from native code into Python are the widest remaining gap in
+   everyday operations: a dict lookup keyed by an instance with a Python
+   `__hash__` costs 341 ns against CPython's 60 (3,590 instructions, through
+   `specialized_binary_subscr`, the reentrant probe and `pure_leaf_call`),
+   `if x:` with a Python `__bool__` 286 against 54, `hash(x)` of a frozen
+   dataclass 4,048 instructions against 1,736 (its `__hash__` runs in a nested
+   interpreter: `call_python_bound`, `run_frame_lean`, `quiet_run`), an enum
+   member's `.value` 336 ns against 132 (two inline calls, `__get__` then
+   `fget`), and a `__getattr__` miss 375 against 107. Compiled code calling
+   the same method directly takes 8.6 ns (CPython 29), so the cost is the
+   protocol, not the call.
+12. Smaller gaps measured and left: `import decimal` costs 83 million
+   instructions against 14 (CPython's `_decimal` is C; ours executes a
+   6,700-line module), `cProfile` runs about 90 times slower than CPython's
+   (38 us an event), a bound method read without a call 153 ns against 61,
+   `SimpleNamespace` attributes 128 against 45, and `Enum("E", "A B C")` 2.1
+   times CPython's instructions.
 
 ## Measurement notes
 

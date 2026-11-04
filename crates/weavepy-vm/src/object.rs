@@ -14488,11 +14488,11 @@ impl Object {
     /// stored string with stable identity — e.g. `cls.__name__`, which
     /// `inspect.classify_class_attrs` compares with `is`.
     pub fn interned_str(s: &str) -> Self {
-        use std::collections::HashSet;
+        use crate::fasthash::FxHashSet;
         use std::sync::{Mutex, OnceLock};
         // The canonical string is also the key; don't duplicate its text.
-        static TABLE: OnceLock<Mutex<HashSet<SharedStr>>> = OnceLock::new();
-        let table = TABLE.get_or_init(|| Mutex::new(HashSet::new()));
+        static TABLE: OnceLock<Mutex<FxHashSet<SharedStr>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(FxHashSet::default()));
         let mut t = table.lock().unwrap();
         if let Some(rc) = t.get(s) {
             return Object::Str(rc.clone());

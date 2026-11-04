@@ -37,10 +37,11 @@
 //! link through `scripts/link-ordered.sh` (see `.cargo/config.toml`),
 //! which remaps the file onto the link's own symbols; names it can't
 //! place are dropped, so a stale file costs only the layout benefit.
-//! `WEAVEPY_NO_ORDER_FILE` opts out.
+//! `WEAVEPY_NO_ORDER_FILE` opts out, and `WEAVEPY_ORDER_FILE` names
+//! another order file (to try a layout).
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const WINDOWS_STACK_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -51,8 +52,11 @@ fn main() {
     if target_os == "linux" || target_os == "freebsd" || target_os == "android" {
         println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");
     }
-    let order =
-        Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order");
+    println!("cargo:rerun-if-env-changed=WEAVEPY_ORDER_FILE");
+    let order = match env::var_os("WEAVEPY_ORDER_FILE") {
+        Some(path) => PathBuf::from(path),
+        None => Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order"),
+    };
     println!("cargo:rerun-if-changed={}", order.display());
     if order.exists() && env::var_os("WEAVEPY_NO_ORDER_FILE").is_none() {
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();

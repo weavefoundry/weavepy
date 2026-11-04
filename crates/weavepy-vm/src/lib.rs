@@ -15964,8 +15964,8 @@ impl Interpreter {
                     }
                     // An f-string's pieces over the exact scalars and strings
                     // whose conversion and formatting run no Python: `!s` (a
-                    // string is itself), `!r` of an int, no spec, and the
-                    // join.
+                    // string is itself), `!r` of a scalar or a string, no
+                    // spec, and the join.
                     OpCode::ConvertValue => {
                         if len == 0 {
                             break None;
@@ -15982,11 +15982,21 @@ impl Interpreter {
                                 Some(Object::from_static(if *b { "True" } else { "False" }))
                             }
                             (1 | 2, Object::None) => Some(Object::from_static("None")),
+                            (1 | 2, Object::Float(f)) => {
+                                Some(Object::Str(SharedStr::from(crate::object::float_repr(*f).as_str())))
+                            }
+                            (2, Object::Str(_)) => {
+                                // SAFETY: as above.
+                                let r = unsafe { &*top }.repr();
+                                Some(Object::Str(SharedStr::from(r.as_str())))
+                            }
                             _ => break None,
                         };
                         if let Some(v) = v {
-                            // SAFETY: the replaced scalar owes no drop.
-                            unsafe { top.write(v) };
+                            // SAFETY: the replaced value is a scalar, which owes
+                            // no drop, or a string, released here (its repr
+                            // ran no Python, and nothing else reads the slot).
+                            unsafe { top.replace(v) };
                         }
                         last = pc;
                         pc += 1;
@@ -16003,6 +16013,11 @@ impl Interpreter {
                                 let mut buf = itoa::Buffer::new();
                                 // SAFETY: the replaced int owes no drop.
                                 unsafe { top.write(Object::Str(SharedStr::from(buf.format(*i)))) };
+                            }
+                            Object::Float(f) => {
+                                let r = SharedStr::from(crate::object::float_repr(*f).as_str());
+                                // SAFETY: the replaced float owes no drop.
+                                unsafe { top.write(Object::Str(r)) };
                             }
                             _ => break None,
                         }
@@ -19408,6 +19423,17 @@ impl Interpreter {
                 // in the same activation.
                 return true;
             }
+            if argc == 0 {
+                if let Some((inst, _)) = self.alloc_empty_container(&ty, &plan) {
+                    // SAFETY: as above (the finalizers that ran left this
+                    // activation's frame where it was).
+                    let frame = unsafe { &mut *sw.cur };
+                    frame.stack.truncate(callee_slot);
+                    frame.stack.push(inst);
+                    frame.pc = pc as u32 + 1;
+                    return true;
+                }
+            }
             return false;
         };
         // SAFETY: GIL-serialized raw read of the function's code cell;
@@ -19550,6 +19576,13 @@ impl Interpreter {
                     self.run_pending_finalizers();
                 }
                 return true;
+            }
+            if argc == 0 {
+                if let Some((inst, _)) = self.alloc_empty_container(ty, plan) {
+                    frame.stack.truncate(start);
+                    frame.stack.push(inst);
+                    return true;
+                }
             }
             return false;
         };
@@ -60682,6 +60715,32 @@ impl Interpreter {
         }
     }
 
+    /// `C()` for a class whose plan is [`InstancePlan::empty_container`]:
+    /// a fresh instance carrying its empty payload, tracked at once, as
+    /// the full constructor makes it. The flag reports whether pending
+    /// finalizers ran. `None` for any other plan, or under the
+    /// `_testcapi.set_nomemory` injection window.
+    ///
+    /// [`InstancePlan::empty_container`]: crate::types::InstancePlan::empty_container
+    fn alloc_empty_container(
+        &mut self,
+        cls: &Rc<TypeObject>,
+        plan: &crate::types::InstancePlan,
+    ) -> Option<(Object, bool)> {
+        if !plan.empty_container || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails() {
+            return None;
+        }
+        let payload = Self::lean_payload(&plan.native)?;
+        let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), payload)));
+        gc_trace::track(&inst);
+        let mut ran = false;
+        if gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+            ran = true;
+        }
+        Some((inst, ran))
+    }
+
     /// The empty native payload a fresh instance of a `dict`, `list` or
     /// `set` subclass with its own `__init__` starts with (that `__init__`
     /// owns the filling, as in [`Self::native_value_payload`]); `None` for
@@ -61023,6 +61082,27 @@ impl Interpreter {
             && matches!(native, NativeKind::Plain)
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
+        let empty_container = user_new.is_none()
+            && abstract_error.is_none()
+            && !seeds_exception_args
+            && !cls.is_type_subclass()
+            && match &native {
+                NativeKind::Value {
+                    base,
+                    mutable: true,
+                } if Rc::ptr_eq(base, &bt.dict_)
+                    || Rc::ptr_eq(base, &bt.list_)
+                    || Rc::ptr_eq(base, &bt.set_) =>
+                {
+                    let own = base
+                        .dict
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__init__")))
+                        .cloned();
+                    matches!((&init_fn, own), (Some(a), Some(b)) if a.is_same(&b))
+                }
+                _ => false,
+            };
         let object_new_plain = !seeds_exception_args
             && abstract_error.is_none()
             && matches!(native, NativeKind::Plain)
@@ -61044,6 +61124,7 @@ impl Interpreter {
             lean_init,
             tuple_new,
             bare_alloc,
+            empty_container,
             object_new_plain,
             store_init: std::sync::atomic::AtomicU8::new(0),
             slot_members: std::sync::OnceLock::new(),
@@ -61528,6 +61609,11 @@ impl Interpreter {
         // resolution, native payload classification — comes from the
         // memoised per-class plan (invalidated by `attr_version`).
         let plan = self.instance_plan(&cls);
+        if args.is_empty() && kwargs.is_empty() {
+            if let Some((inst, _)) = self.alloc_empty_container(&cls, &plan) {
+                return Ok(inst);
+            }
+        }
 
         // PEP 3119: refuse to instantiate a class that still carries
         // unimplemented abstract methods. CPython enforces this inside
