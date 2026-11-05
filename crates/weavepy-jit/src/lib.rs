@@ -35,8 +35,8 @@ pub use analyze::{
     PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
 pub use engine::{
-    admit_generic_loops, CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix,
-    NO_HOST_ENGINE,
+    admit_generic_loops, generic_loops_admitted, CompiledFrame, DirectLeaf, FieldAt, InlineMethod,
+    JitEngine, OpMix, NO_HOST_ENGINE,
 };
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,

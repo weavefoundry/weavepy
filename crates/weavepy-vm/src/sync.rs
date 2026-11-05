@@ -519,18 +519,20 @@ fn biased_here() -> bool {
     if cells_shared() {
         return false;
     }
-    // Debug builds -- which is what the unit-test binary is -- keep the
-    // identity check as a *steer*: that binary runs many VM threads at
-    // once with no GIL between them (every test is its own interpreter),
-    // so the invariant above does not hold there, and only the first
-    // registered thread may take the lock-free path. A release build has
-    // one VM thread under the GIL and pays nothing.
-    #[cfg(debug_assertions)]
+    // Debug and test builds keep the identity check as a *steer*: the
+    // unit-test binary (optimized or not) runs many VM threads at once
+    // with no GIL between them (every test is its own interpreter), so the
+    // invariant above does not hold there, and only the first registered
+    // thread may take the lock-free path. (Without it, two threads' plain
+    // updates of `SOLE_GUARDS` can lose one, and the next thread to
+    // register spins in `revoke_bias` forever, holding the GIL.) A release
+    // build has one VM thread under the GIL and pays nothing.
+    #[cfg(any(debug_assertions, test))]
     {
         let first = FIRST.load(Ordering::Relaxed);
         first != 0 && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, test)))]
     {
         true
     }

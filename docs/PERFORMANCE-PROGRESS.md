@@ -256,6 +256,50 @@ branch and pull request.
 
 ## Done
 
+- **Polymorphic attribute sites, yields folded in place, and call-dense
+  loops back to the frame JIT** (PR #107). Instructions on Linux unless
+  noted.
+  - Tier 2 counts a framed call of a loop-free callee toward its
+    call-density judgment, so a loop dense with method calls, constructors
+    or calls taking objects retires to the frame JIT, whose direct calls
+    run them about 3 times cheaper. On macOS, `o.setx(i)` went from 950 to
+    321 instructions (CPython 497), `h(o, i)` from 1,281 to 361 (CPython
+    513) and `O(i, 2)` from 2,251 to 1,576 (CPython 1,232).
+  - A base-class method that reads the fields of several subclasses'
+    instances misses its site's one-class field cache every time the class
+    changes. Compiled reads now check the core loop's polymorphic entries
+    for the site, and keep a second class's field beside the first.
+  - A class constant read through the class (`Cls.CONST`) is answered from
+    its site's stamp, in an inlined body as in a plain one, and a fused
+    global read remembers the shape instead of looking the global up again.
+  - Together, these took `deltablue` from 24.5 million instructions an
+    iteration to 20.5 million (CPython 3.13: 17.1 million).
+  - A class's `dict`, `list` or `set` read through an instance
+    (`self.PREC`) is cached as the site's class entry, as a tuple was:
+    `mini_interpreter` 6% fewer.
+  - Compiled reads also take the site's instance-dict hint for a published
+    dict (`LogRecord`'s, once `record.__dict__` is read) and a frame's or
+    code object's fields (`f.f_back`, `co.co_name`) before the general
+    path.
+  - A generator's compiled body hands each yield its draining consumer
+    takes (`list()`, `tuple()`, `set()`, `sum()`, `all()`, `any()`) to the
+    consumer's sink and goes on, where it used to leave its native code at
+    every yield. `set()` of an eight-item genexp went from 8,857 to 7,982,
+    and `nqueens` 6% fewer.
+  - An instance released through the last-release hook (compiled code's
+    releases) goes back to the instance pool, as one the core loop releases
+    does: `P()` of a slotted class went from 1,313 to 1,111.
+  - The VM's unit tests, built optimized, hung in about one run in three
+    on macOS. Every test thread took the cells' lock-free path, which only
+    debug builds limited to the first registered thread. Two threads'
+    plain updates of its guard count could lose one, and the next thread
+    to register then spun forever, holding the GIL. Test builds now limit
+    it too (12 runs out of 12 clean).
+  - Measured and left: an in-line field read in plain compiled bodies
+    (the inlined bodies' own) didn't pay for its code, and materializing
+    `f_back` for `logging`'s `findCaller` stays about 742 instructions a
+    frame (CPython builds a frame object too, for less).
+
 - **Python `__hash__` and `__bool__` in place, and an earlier frame JIT**
   (PR #107). Calls from native code into Python stay the widest everyday
   gap (see "Next", item 11), measured again on macOS: a dict lookup keyed by

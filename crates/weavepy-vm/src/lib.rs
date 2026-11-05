@@ -8015,6 +8015,7 @@ impl Interpreter {
                 wait_pc: usize::MAX,
                 wait_pending: None,
                 outer_lazy: 0,
+                fold: std::ptr::null(),
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -12388,6 +12389,7 @@ impl Interpreter {
                             wait_pc: usize::MAX,
                             wait_pending: None,
                             outer_lazy: 0,
+                            fold: std::ptr::null(),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -82167,13 +82169,18 @@ fn class_attr_fill_via(
         Object::Bool(b) => (CLASS_ATTR_BOOL, u64::from(*b)),
         Object::None => (CLASS_ATTR_NONE, 0),
         // A value no access can bind or call `__get__` on, however its
-        // class changes later, read through an instance.
+        // class changes later, read through an instance: an exact
+        // container's too (a table like `PREC = {...}`; the entry is read
+        // again at each hit, so its contents may change).
         Object::Str(_)
         | Object::Bytes(_)
         | Object::Long(_)
         | Object::Tuple(_)
         | Object::FrozenSet(_)
         | Object::Module(_)
+        | Object::Dict(_)
+        | Object::List(_)
+        | Object::Set(_)
             if via == CLASS_ATTR_VIA_INSTANCE =>
         {
             return class_entry_fill(code, cls, pc, v, via);
@@ -87872,6 +87879,8 @@ assert loop(2000) == 1999000
             }
             return;
         }
+        // Its loops are call-dense, which tier 2 would otherwise retire.
+        weavepy_jit::admit_generic_loops();
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {

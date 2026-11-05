@@ -328,6 +328,10 @@ pub(crate) struct State {
     /// one first, so the older activations' pending entries stay below
     /// the newer ones'.
     pub(crate) outer_lazy: usize,
+    /// In a generator's fast step, the draining consumer's sink (see
+    /// `FoldSink`): a yield it takes resumes the body in place, without
+    /// leaving the native code. Null for none.
+    pub(crate) fold: *const crate::FoldSink,
 }
 
 const S_LOCALS: i32 = 0;
@@ -346,6 +350,7 @@ const S_DIRECT: i32 = std::mem::offset_of!(State, direct) as i32;
 const S_GEN_LAZY: i32 = std::mem::offset_of!(State, gen_lazy) as i32;
 const S_AT_START: i32 = std::mem::offset_of!(State, at_start) as i32;
 const S_CLEAN: i32 = std::mem::offset_of!(State, clean) as i32;
+const S_FOLD: i32 = std::mem::offset_of!(State, fold) as i32;
 const _: () = {
     assert!(std::mem::offset_of!(State, locals) == S_LOCALS as usize);
     assert!(std::mem::offset_of!(State, stack) == S_STACK as usize);
@@ -2745,6 +2750,7 @@ unsafe fn lazy_state(
             wait_pc: usize::MAX,
             wait_pending: None,
             outer_lazy: 0,
+            fold: std::ptr::null(),
         }
     }
 }
@@ -3303,6 +3309,7 @@ pub(crate) unsafe fn core_lazy_resume(
             wait_pc: usize::MAX,
             wait_pending: None,
             outer_lazy: 0,
+            fold: std::ptr::null(),
         };
         let st = &mut st;
         let arg = frame.code.instructions[pc].arg;
@@ -5754,6 +5761,7 @@ unsafe extern "C" fn h_load_global(
                     };
                     c.value = std::ptr::from_ref(v) as u64;
                     c.len_of = ins[pc + 2].arg + 1;
+                    c.cls_attr = false;
                     return fused(st, Object::Int(n), pc + 3);
                 }
             }
@@ -5788,11 +5796,28 @@ unsafe extern "C" fn h_load_global(
             // `Cls.CONST`: a plain class's scalar attribute straight off
             // the `LOAD_ATTR` site's stamp.
             Object::Type(cls) if op_at(pc + 1) == Some(OpCode::LoadAttr) => {
-                if let Some(c) = ext
+                if let Some(r) = ext
                     .stamp_slot(pc + 1)
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
-                    return fused(st, c, pc + 1);
+                    // The cache remembers the shape, so `h_global` reads the
+                    // stamp while the namespaces hold (`global_cls_attr`).
+                    let c = &mut *cache;
+                    c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
+                    c.gstamp = g_stamp;
+                    c.gdata = gdict as u64;
+                    (c.builtins, c.bstamp, c.bdata) = if builtin {
+                        let b = std::ptr::addr_of!((*st.frame).builtins)
+                            .cast::<u64>()
+                            .read();
+                        (b, b_stamp, bdict as u64)
+                    } else {
+                        (0, 0, 0)
+                    };
+                    c.value = std::ptr::from_ref(v) as u64;
+                    c.len_of = 0;
+                    c.cls_attr = true;
+                    return fused(st, r, pc + 1);
                 }
             }
             _ => {}
@@ -5806,6 +5831,7 @@ unsafe extern "C" fn h_load_global(
         // (A namespace handle's bits: one pointer-sized word.)
         c.value = 0;
         c.len_of = 0;
+        c.cls_attr = false;
         c.globals = std::ptr::addr_of!((*st.frame).globals).cast::<u64>().read();
         c.gstamp = g_stamp;
         c.gdata = gdict as u64;
@@ -5854,6 +5880,9 @@ unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
             if site.len_of != 0 {
                 return global_len_of(st, c);
             }
+            if site.cls_attr {
+                return global_cls_attr(st, c);
+            }
             let v = &*(site.value as *const Object);
             (*st)
                 .stack
@@ -5889,6 +5918,38 @@ unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
                 st_ref.len = len + 1;
                 st_ref.last = site.pc as usize + 3;
                 st_ref.pc = site.pc as usize + 4;
+                return if (*st_ref.maybe_dead).get() {
+                    LEFT_MARKED
+                } else {
+                    LEFT_DISPATCH
+                };
+            }
+        }
+        global_miss(st, c)
+    }
+}
+
+/// [`h_global`] at a site whose cache holds a fused `Cls.CONST` (see
+/// [`GlobalCache::cls_attr`]), the namespaces matching: the constant the
+/// `LOAD_ATTR`'s stamp holds for the class at its version, past that
+/// instruction; anything else through the miss.
+#[inline(never)]
+unsafe fn global_cls_attr(st: *mut State, c: *mut GlobalCache) -> u32 {
+    // SAFETY: as `h_global`'s; the cached value is the class, unmoved.
+    unsafe {
+        let site = &*c;
+        let st_ref = &mut *st;
+        if let Object::Type(cls) = &*(site.value as *const Object) {
+            let ext = &*(site.ext as *const CodeConstObjects);
+            if let Some(v) = ext
+                .stamp_slot(site.pc as usize + 1)
+                .and_then(|s| crate::class_attr_hit(s, cls))
+            {
+                let len = site.len as usize;
+                st_ref.stack.add(len).write(v);
+                st_ref.len = len + 1;
+                st_ref.last = site.pc as usize + 1;
+                st_ref.pc = site.pc as usize + 2;
                 return if (*st_ref.maybe_dead).get() {
                     LEFT_MARKED
                 } else {
@@ -5961,6 +6022,9 @@ pub(crate) struct GlobalCache {
     /// A `len(local)` the site fuses (see `h_load_global`): the local's
     /// index plus one, or `0`.
     len_of: u32,
+    /// The site fuses the class's `Cls.CONST` its `LOAD_ATTR` reads (see
+    /// `h_load_global`).
+    cls_attr: bool,
 }
 
 /// Where the frame's namespaces, the interpreter's missing-globals flag
@@ -6612,6 +6676,10 @@ pub(crate) struct AttrSite {
     property: bool,
     /// The site's field cache, if the code has any.
     field: *const FieldSlot,
+    /// A second receiver class's field, as `field` holds one: a split
+    /// instance's position for the class version (`0`, none), which the
+    /// site's polymorphic entries proved (see [`attr_hit`]).
+    field2: Cell<(u64, u32)>,
     /// A property's direct call's cache, when nothing virtual lies below
     /// the receiver (the call can raise or switch); null otherwise.
     direct: *mut DirectSite,
@@ -6664,6 +6732,100 @@ unsafe fn attr_hit<'a>(site: &'a AttrSite, recv: &'a Object) -> Option<&'a Objec
     }
 }
 
+/// An instance's field `attr_hit` doesn't find, read through the site's
+/// other entries: a polymorphic site's other classes (see `AttrPoly`; an
+/// entry for this class version says the name lives in the instance's
+/// dict, at the position whose key it checks), whose split position then
+/// becomes the site's second field, or the site's own instance-dict hint
+/// (`LoadAttrInstance`, as the core loop's read takes it: a dict the
+/// instance published, `vars(obj)` or `obj.__dict__`, too).
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+unsafe fn field_hit_slow<'a>(
+    site: &AttrSite,
+    inst: &'a crate::types::PyInstance,
+) -> Option<&'a Object> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let ver = inst.cls_raw().attr_version.get();
+        if ver == 0 {
+            return None;
+        }
+        let code = &*site.code;
+        let name = code.instructions[site.pc as usize].arg;
+        if let Some(ix) = (*site.ext)
+            .attr_poly_slot(site.pc as usize)
+            .and_then(|p| p.index(ver))
+        {
+            if let Some((k, v)) = inst.attr_peek_index(ix as usize) {
+                if crate::slot_name_matches(code, name, k) {
+                    // A split instance's position is its class's name's,
+                    // for every instance at this version.
+                    if inst.dict.published().is_none()
+                        && inst
+                            .split_field(ix as usize)
+                            .is_some_and(|f| std::ptr::eq(f, v))
+                    {
+                        site.field2.set((ver, ix));
+                    }
+                    return Some(v);
+                }
+            }
+        }
+        // (A split instance's fields are the field caches' own.)
+        if inst.dict.published().is_none() {
+            return None;
+        }
+        if let weavepy_compiler::InlineCache::LoadAttrInstance { key_idx, ver: want } =
+            code.caches.get(site.pc)
+        {
+            if want == ver {
+                if let Some((k, v)) = inst.attr_peek_index(key_idx as usize) {
+                    if crate::slot_name_matches(code, name, k) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The reads [`attr_miss`] tries before the core loop's: a class's
+/// attribute its site's stamp holds (`Cls.CONST`, which only a global
+/// read fuses), as `type_attr` reads it; an instance's field through the
+/// site's other entries (see [`field_hit_slow`]); and a frame's or code
+/// object's plain field (`f.f_back`, `co.co_name`), as `h_local_attr`
+/// reads it. A stack receiver (`local` false) must leave by a release
+/// that runs no code, as `attr_stack_slow`'s hit releases it.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+#[inline(always)]
+unsafe fn attr_miss_quick(site: &AttrSite, recv: &Object, local: bool) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match recv {
+            Object::Type(cls) if local || Rc::strong_count(cls) > 1 => (*site.ext)
+                .stamp_slot(site.pc as usize)
+                .and_then(|s| crate::class_attr_hit(s, cls)),
+            Object::Instance(inst) if local || droppable(recv) => {
+                field_hit_slow(site, inst).map(|v| crate::clone_hot(v))
+            }
+            Object::Frame(_) | Object::Code(_) if local || droppable(recv) => {
+                let code = &*site.code;
+                code.names
+                    .get(code.instructions[site.pc as usize].arg as usize)
+                    .and_then(|name| Interpreter::frame_plain_attr(recv, name, None))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// [`attr_hit`] missed for the receiver at `at`: a property's cached
 /// getter first at a site that has run one, then the core loop's cached
 /// reads, then a property's getter (the code's `0`, a status to return, or
@@ -6677,6 +6839,14 @@ unsafe fn attr_hit<'a>(site: &'a AttrSite, recv: &'a Object) -> Option<&'a Objec
 unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: bool) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
+        if let Some(v) = attr_miss_quick(site, &*at, local) {
+            if local {
+                (*st).stack.add(site.slot as usize).write(v);
+            } else {
+                crate::drop_hot(std::mem::replace(&mut *at, v));
+            }
+            return 0;
+        }
         let (pc, slot) = (u64::from(site.pc), u64::from(site.slot));
         if site.property && !site.direct.is_null() {
             let flags = PROPERTY_ONLY | u64::from(local);
@@ -6717,10 +6887,15 @@ unsafe fn field_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> 
     // the code does.
     unsafe {
         let (want, idx) = (*site.field).get();
-        if want != inst.cls_raw().attr_version.get() || want == 0 || idx & crate::SLOT_FIELD != 0 {
-            return None;
+        let ver = inst.cls_raw().attr_version.get();
+        if want == ver && want != 0 && idx & crate::SLOT_FIELD == 0 {
+            return inst.split_field(idx as usize);
         }
-        inst.split_field(idx as usize)
+        let (want, idx) = site.field2.get();
+        if want == ver && want != 0 {
+            return inst.split_field(idx as usize);
+        }
+        None
     }
 }
 
@@ -7371,6 +7546,7 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             wait_pc: usize::MAX,
             wait_pending: None,
             outer_lazy: 0,
+            fold: std::ptr::null(),
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run(&mut cst);
@@ -7535,6 +7711,7 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             wait_pc: usize::MAX,
             wait_pending: None,
             outer_lazy: 0,
+            fold: std::ptr::null(),
         };
         interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
@@ -9286,6 +9463,7 @@ unsafe fn direct_run_pushed(
             wait_pc: usize::MAX,
             wait_pending: None,
             outer_lazy: 0,
+            fold: std::ptr::null(),
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run_direct(&mut cst, from);
@@ -11355,17 +11533,52 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
     }
 }
 
+/// `YIELD_VALUE` in a generator's fast step whose draining consumer's
+/// sink is `fold`: the value at `top` folded into the sink, the sent
+/// `None` in its slot (`1`), or `0` for the step to hand it back.
+unsafe extern "C" fn h_fold_yield(fold: *const crate::FoldSink, top: *mut Object) -> u32 {
+    // SAFETY: the step's sink, live while it runs, and the stack's top
+    // slot, initialized; a folded value moved out (or is a scalar).
+    unsafe {
+        if (*fold).fold(top) {
+            top.write(Object::None);
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// `YIELD_VALUE` at `pc` of the running activation, an inline generator
 /// resume (its stack `len` deep, the value on top), as the core loop's arm
 /// runs it: the generator parks and its consumer, the value delivered, is
-/// switched to (`RELOAD`); declined untouched for a generator's fast step,
-/// a root activation (a draining consumer's fold is the arm's), or a yield
-/// the switch doesn't take.
+/// switched to (`RELOAD`); for a root activation, folded into its draining
+/// consumer's sink ([`GEN_FOLDED`]); declined untouched for a generator's
+/// fast step, any other root activation, or a yield the switch doesn't
+/// take.
+/// [`h_gen_yield`]'s status for a yield the draining consumer's sink took:
+/// the body goes on, the sent `None` in the value's slot.
+const GEN_FOLDED: u32 = 2;
+
 unsafe extern "C" fn h_gen_yield(st: *mut State, pc: u64, len: u64) -> u32 {
     // SAFETY: the code passes its live state and its stack depth.
     unsafe {
         let st = &mut *st;
-        if st.sw.is_null() || (*(*st.sw).inl).is_empty() {
+        if st.sw.is_null() {
+            return 1;
+        }
+        if (*(*st.sw).inl).is_empty() {
+            // A draining consumer driving this frame: the yield folds into
+            // its sink, as the core loop's arm folds it.
+            if let Some((ff, sink)) = (*st.interp).sum_fold {
+                if ff == (*st.sw).cur as usize && len > 0 {
+                    let top = st.stack.add(len as usize - 1);
+                    if sink.fold(top) {
+                        top.write(Object::None);
+                        return GEN_FOLDED;
+                    }
+                }
+            }
             return 1;
         }
         settle(st);
@@ -14549,7 +14762,29 @@ impl<'a> Lower<'a> {
                 let sw = self.b.ins().load(self.ptr, FLAGS, self.st, S_SW);
                 let out = self.exit_with(pc, &[], INTERP);
                 let none = self.b.ins().icmp_imm(IntCC::Equal, sw, 0);
-                self.branch_out(none, out);
+                // A yield its draining consumer's sink takes (a fast step's,
+                // `h_fold_yield`, or a root activation's, `h_gen_yield`)
+                // resumes the body in place, the sent `None` in the value's
+                // slot.
+                let folded = (ins.op == OpCode::YieldValue).then(|| self.b.create_block());
+                if let Some(folded) = folded {
+                    let step = self.b.create_block();
+                    let switched = self.b.create_block();
+                    self.b.ins().brif(none, step, &[], switched, &[]);
+                    self.b.switch_to_block(step);
+                    let fold = self.b.ins().load(self.ptr, FLAGS, self.st, S_FOLD);
+                    let sink = self.b.create_block();
+                    self.b.ins().brif(fold, sink, &[], out, &[]);
+                    self.b.switch_to_block(sink);
+                    let top = self.slot_addr(self.depth - 1);
+                    let r = self
+                        .call(h_fold_yield as *const () as usize, &[fold, top], true)
+                        .expect("returns");
+                    self.b.ins().brif(r, folded, &[], out, &[]);
+                    self.b.switch_to_block(switched);
+                } else {
+                    self.branch_out(none, out);
+                }
                 self.store_last();
                 let pcv = self.b.ins().iconst(types::I64, pc as i64);
                 let len = self.b.ins().iconst(types::I64, self.depth as i64);
@@ -14591,9 +14826,24 @@ impl<'a> Lower<'a> {
                     .expect("returns");
                 let switched = self.b.create_block();
                 let reload = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RELOAD));
-                self.b.ins().brif(reload, switched, &[], out, &[]);
+                let other = match folded {
+                    Some(_) => self.b.create_block(),
+                    None => out,
+                };
+                self.b.ins().brif(reload, switched, &[], other, &[]);
                 self.b.switch_to_block(switched);
                 self.b.ins().return_(&[r]);
+                if let Some(folded) = folded {
+                    self.b.switch_to_block(other);
+                    let took = self
+                        .b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, r, i64::from(GEN_FOLDED));
+                    self.b.ins().brif(took, folded, &[], out, &[]);
+                    self.b.switch_to_block(folded);
+                    self.set_last(pc);
+                    self.goto(pc + 1);
+                }
                 return false;
             }
             OpCode::EndSend if self.depth >= 2 => {
@@ -16444,6 +16694,7 @@ impl<'a> Lower<'a> {
             last: self.last_pc.map_or(NO_LAST, |l| l as u32),
             property: !in_line && crate::property_site(self.ext, pc),
             field: field.map_or(std::ptr::null(), std::ptr::from_ref),
+            field2: Cell::new((0, 0)),
             direct,
             cache: SlotCache::default(),
         });

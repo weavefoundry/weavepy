@@ -1242,6 +1242,12 @@ pub fn admit_generic_loops() {
     GENERIC_LOOPS_ADMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether [`admit_generic_loops`] ran: the VM then keeps call-dense
+/// loops native too, for the tests of its native calls.
+pub fn generic_loops_admitted() -> bool {
+    GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether `tfunc` loops (a rewritten loop, or a backward jump).
 fn has_loop(tfunc: &TFunc) -> bool {
     !tfunc.range_loops.is_empty()

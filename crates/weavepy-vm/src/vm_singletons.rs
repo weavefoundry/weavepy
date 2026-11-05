@@ -148,6 +148,12 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             && !crate::stdlib::asyncio_mod::finalizer_is_noop(&inst);
         if owes {
             try_push_pending_finalizer(Object::Instance(Rc::from_arc(inst)));
+        } else if Arc::weak_count(&inst) == 0 && inst.dies_by_plain_drop() {
+            // Back to the pool, as `Interpreter::release` sends one (see
+            // `PyInstance::try_recycle`), for the next instance's allocation.
+            if let Err(inst) = PyInstance::recycle(Rc::from_arc(inst)) {
+                crate::rc::drop_arc(Rc::into_arc(inst));
+            }
         } else {
             crate::rc::drop_arc(inst);
         }

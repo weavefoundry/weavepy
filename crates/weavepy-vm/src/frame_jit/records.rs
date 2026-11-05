@@ -173,6 +173,7 @@ impl DirectRecs {
                     wait_pc: usize::MAX,
                     wait_pending: None,
                     outer_lazy: 0,
+                    fold: std::ptr::null(),
                 },
                 frame: std::ptr::null_mut(),
                 locals: std::ptr::null_mut(),

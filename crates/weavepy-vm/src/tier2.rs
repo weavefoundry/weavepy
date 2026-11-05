@@ -6045,6 +6045,14 @@ unsafe fn try_native_call(
             }
         }
     }
+    // A loop-free body (a method, an `__init__`, a helper taking
+    // objects) costs several times less as a frame-JIT direct call than
+    // as the framed call below (3x for a one-call loop): a loop dense
+    // with them belongs to tier 1 too. (A pure leaf was charged above;
+    // the tests of these calls keep them native.)
+    if !pure_leaf && nc.code.jit_hint.loop_free(&nc.code) && call_dense_retires() {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
+    }
     // Keep disjoint regions in one pooled owner per element width, as
     // direct native entry does. Owners stay live through every native or
     // materialized continuation; no pool borrow crosses the call.
@@ -7720,6 +7728,24 @@ fn retire_native_driver(ctx: &CallCtx) {
     // SAFETY: the activation's code object outlives the activation (see
     // the field docs).
     unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+}
+
+/// Whether a framed call of a loop-free callee counts toward the
+/// call-density judgment (see `try_native_call`): not for the tests of
+/// those calls, which keep them native.
+#[inline(always)]
+fn call_dense_retires() -> bool {
+    #[cfg(test)]
+    if KEEP_CALL_DENSE.with(std::cell::Cell::get) {
+        return false;
+    }
+    !weavepy_jit::generic_loops_admitted()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by `force_enable_for_test` on its thread.
+    static KEEP_CALL_DENSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Recompiles one code object may take after cold exits (see
@@ -16203,6 +16229,8 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
 /// test builds so it never reaches release binaries.
 #[cfg(test)]
 pub(crate) fn force_enable_for_test(threshold: u32) {
+    // (Its tests check that their calls run natively.)
+    KEEP_CALL_DENSE.with(|k| k.set(true));
     JIT_PROCESS_GATE.store(1, std::sync::atomic::Ordering::Relaxed);
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
