@@ -22,6 +22,7 @@ mod asm;
 mod builder;
 mod codegen;
 mod fold;
+pub mod fxhash;
 pub mod ir;
 mod liveness;
 mod mem;

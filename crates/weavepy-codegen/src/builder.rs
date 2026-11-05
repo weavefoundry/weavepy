@@ -1,6 +1,6 @@
 //! Building a [`Function`], with Cranelift's `FunctionBuilder` names.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap as HashMap;
 
 use crate::ir::{
     condcodes::{FloatCC, IntCC},
@@ -28,7 +28,7 @@ impl<'a> FunctionBuilder<'a> {
             func,
             cur: None,
             var_types: Vec::new(),
-            defs: HashMap::new(),
+            defs: HashMap::default(),
             reads: Vec::new(),
         }
     }

@@ -7,7 +7,7 @@
 //! same operands. The frame JIT's and tier 2's guards against zero and
 //! overflowing divisors fold away with the constants they test.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap as HashMap;
 
 use crate::builder::canon_imm;
 use crate::ir::{
@@ -258,7 +258,7 @@ pub(crate) fn fold(f: &mut Function, alias: &mut Vec<Value>) {
             out: Vec::with_capacity(insts.len()),
         };
         // Quotients made in this block, by dividend and divisor.
-        let mut quotients: HashMap<(Value, i64), Value> = HashMap::new();
+        let mut quotients: HashMap<(Value, i64), Value> = HashMap::default();
         for inst in insts {
             fold_one(&mut e, b, inst, &mut quotients);
         }

@@ -7,6 +7,17 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured later on November 4, 2026, at `11c639e5` (PR #107) with the
+iterator drain on top, a PGO build against CPython 3.14 on the same host,
+interleaved in one session: warm time 0.994 (geomean of 33 workloads), cold
+time 1.125, peak memory 1.252, and 0.987 of the morning's PGO build's warm
+time (`unpack_sequence` 0.88, `exceptions` 0.90, `context_managers` 0.93,
+`sudoku` 0.94). The worst warm times are `async_tree` 1.62,
+`context_managers` 1.46, `class_creation` 1.43, `logging_mix` 1.36,
+`deepcopy` 1.35, `stdlib_utils` 1.31 and `exceptions` 1.30; the best are
+`pickle_roundtrip` 0.58, `scimark` 0.60, `unpack_sequence` 0.62,
+`json_roundtrip` 0.67 and `raytrace` 0.71.
+
 Measured on November 4, 2026, at `fde9136e` (PR #107), a PGO build against
 CPython 3.14 on the same host, interleaved in one session: warm time 1.001
 (geomean of 33 workloads), cold time 1.117, peak memory 1.288. Against the
@@ -266,7 +277,13 @@ branch and pull request.
   - `list(d.items())` of 20 entries: 15,521 to 7,591 (Linux; CPython 3.14
     about 7,200 on macOS). Draining a view stepped its iterator, with the
     mutation guards, an item at a time; nothing runs that could change the
-    dict while a view drains, so the entries copy over in one pass.
+    dict while a view drains, so the entries copy over in one pass. A
+    native iterator drains under one borrow too (`list(enumerate(xs))` 6.6%
+    fewer instructions).
+  - Compiles: the code generator's SSA tables and the tier-2 analyzer's maps,
+    all keyed by small integers, hashed with SipHash (2.5% of a cold
+    `stdlib_utils` call); they now use an Fx hash. A cold call of
+    `class_creation` retires 3.8% fewer instructions, `stdlib_utils` 1.8%.
 
 - **`contextmanager`, exception construction and `len()` in compiled code**
   (PR #107). Instructions a call on Linux (callgrind), before and after:

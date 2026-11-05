@@ -44271,6 +44271,15 @@ impl Interpreter {
                 // re-implement range/dict/str iteration here.
                 let it = self.make_iter(other, globals)?;
                 let mut out = Vec::new();
+                // A native iterator's step runs no code: one borrow for the
+                // whole drain, as `iter_next` takes one a step.
+                if let Object::Iter(cell) = &it {
+                    let mut it = cell.borrow_mut();
+                    while let Some(x) = it.next_value_checked()? {
+                        out.push(x);
+                    }
+                    return Ok(out);
+                }
                 while let Some(x) = self.iter_next(&it, globals)? {
                     out.push(x);
                 }

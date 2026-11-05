@@ -3,7 +3,7 @@
 //! the variable takes its predecessor's value, or, where edges merge, a
 //! new block parameter that each edge passes its value to.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap as HashMap;
 
 use crate::ir::{
     Block, Edge, Function, Inst, InstData, JumpTable, Op, Type, Value, ValueDef, Variable,
@@ -60,10 +60,10 @@ pub(crate) fn resolve(
         tys,
         defs,
         preds,
-        entry: HashMap::new(),
+        entry: HashMap::default(),
         phis: Vec::new(),
     };
-    let mut alias: HashMap<Value, Value> = HashMap::new();
+    let mut alias: HashMap<Value, Value> = HashMap::default();
     for &(p, b, var) in reads {
         let v = s.read_entry(b, var);
         alias.insert(p, v);

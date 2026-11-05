@@ -18,7 +18,8 @@
 //! 5. **Emission** — once types converge, re-walk and emit [`TStmt`]s /
 //!    [`TBlock`]s into a [`TFunc`].
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
+use weavepy_codegen::fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use weavepy_compiler::{
     BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind, BINARY_OP_INPLACE_FLAG,
@@ -886,7 +887,7 @@ fn analyze_impl(
     // its uses — including a `CALL` through the opaque-call lane —
     // admit. Each retry demotes one more name; the budget bounds
     // pathological frames (every retry is a full re-analysis).
-    let mut demote: HashSet<u32> = HashSet::new();
+    let mut demote: HashSet<u32> = HashSet::default();
     // Typed `[]` accumulators are a prediction: any failure under them
     // re-analyzes with the literal on the object lane, as before.
     let mut lane_lists = has_empty_list_store(code);
@@ -896,7 +897,7 @@ fn analyze_impl(
     // excludes that loop and every loop around it, and the loops nested
     // in an excluded loop compile on their own as OSR-only regions (see
     // `Carve`). Each step re-analyzes, so the steps are budgeted.
-    let mut cold: HashSet<usize> = HashSet::new();
+    let mut cold: HashSet<usize> = HashSet::default();
     let mut carve = Carve::default();
     let forest = loop_forest(code);
     let mut steps = 0usize;
@@ -1109,8 +1110,8 @@ fn numeric_slots(code: &CodeObject) -> HashSet<u32> {
             OpCode::LoadFast | OpCode::LoadConst | OpCode::LoadSmallInt
         )
     };
-    let mut num: HashSet<u32> = HashSet::new();
-    let mut none_tested: HashSet<u32> = HashSet::new();
+    let mut num: HashSet<u32> = HashSet::default();
+    let mut none_tested: HashSet<u32> = HashSet::default();
     for i in 0..ins.len() {
         match ins[i].op {
             OpCode::BinaryOp | OpCode::CompareOp => {
@@ -1414,7 +1415,7 @@ fn analyze_once(
 
     // Compact block ids over reachable blocks (entry first is convenient
     // but not required — we record the entry id explicitly).
-    let mut compact: HashMap<usize, BlockId> = HashMap::new();
+    let mut compact: HashMap<usize, BlockId> = HashMap::default();
     for (idx, &bi) in reachable.iter().enumerate() {
         compact.insert(bi, idx);
     }
@@ -1440,9 +1441,9 @@ fn analyze_once(
         math_spans: Vec::new(),
         null_spans: Vec::new(),
         max_call_args: 0,
-        loop_depths: HashMap::new(),
-        comp_saved: HashMap::new(),
-        range_depths: HashMap::new(),
+        loop_depths: HashMap::default(),
+        comp_saved: HashMap::default(),
+        range_depths: HashMap::default(),
     };
     let mut emit_entries: Vec<Option<Vec<ESlot>>> = vec![None; raw.len()];
     for &r in &roots {
@@ -1514,7 +1515,7 @@ fn analyze_once(
     // into their synthetic slots). RFC 0069 WS2 — a target carrying
     // boundary values is simply not OSR-enterable.
     let mut osr_entries: Vec<OsrEntry> = Vec::new();
-    let mut osr_seen: HashSet<usize> = HashSet::new();
+    let mut osr_seen: HashSet<usize> = HashSet::default();
     for (i, ins) in code.instructions.iter().enumerate() {
         if matches!(ins.op, OpCode::JumpBackward) {
             let t = backward_target(i, ins.arg).ok_or(JitVerdict::BadJumpTarget)?;
@@ -1912,7 +1913,7 @@ fn plan_rewrite(
 
     // All jump-landing pcs, to reject jumps into the middle of a
     // recognized `range(...)` prefix.
-    let mut targets: HashSet<usize> = HashSet::new();
+    let mut targets: HashSet<usize> = HashSet::default();
     for (i, item) in ins.iter().enumerate() {
         match item.op {
             OpCode::PopJumpIfFalse
@@ -2287,7 +2288,7 @@ fn plan_rewrite(
         // normal flow (a reachable RERAISE block is rejected by the
         // abstract pass), so the JIT never compiles it: an in-loop
         // raise deopts and the interpreter runs the cleanup.
-        let mut handler_stores: HashSet<usize> = HashSet::new();
+        let mut handler_stores: HashSet<usize> = HashSet::default();
         for (h, c) in &comps {
             for eh in &code.exception_table {
                 let hp = eh.handler as usize;
@@ -2389,8 +2390,8 @@ fn plan_rewrite(
             + code.kwonly_count
             + u32::from(code.has_varargs)
             + u32::from(code.has_varkeywords);
-        let mut sites: HashMap<u32, Vec<usize>> = HashMap::new();
-        let mut other_store: HashSet<u32> = HashSet::new();
+        let mut sites: HashMap<u32, Vec<usize>> = HashMap::default();
+        let mut other_store: HashSet<u32> = HashSet::default();
         for i in 0..n {
             match ins[i].op {
                 OpCode::StoreFast => {
@@ -3025,8 +3026,8 @@ fn block_index_at(raw: &[RawBlock], pc: usize) -> usize {
 fn entry_unassigned_reads(blocks: &[TBlock], entry: BlockId) -> Vec<u32> {
     // `ins[b]` = definitely-assigned at block entry (None = unvisited).
     let mut ins: Vec<Option<HashSet<u32>>> = vec![None; blocks.len()];
-    let mut reads: HashSet<u32> = HashSet::new();
-    ins[entry] = Some(HashSet::new());
+    let mut reads: HashSet<u32> = HashSet::default();
+    ins[entry] = Some(HashSet::default());
     let mut work: Vec<usize> = vec![entry];
     while let Some(b) = work.pop() {
         let mut cur = ins[b].clone().unwrap_or_default();
@@ -3238,7 +3239,7 @@ fn compute_livein(
                 param_slots.clone()
             } else if preds[b].is_empty() {
                 // Unreachable-but-listed guard; treat as empty.
-                HashSet::new()
+                HashSet::default()
             } else {
                 let mut acc: Option<HashSet<u32>> = None;
                 for &p in &preds[b] {
@@ -3261,7 +3262,7 @@ fn compute_livein(
     }
 
     // Collect live-in: a load of a slot not definitely assigned yet.
-    let mut livein = HashSet::new();
+    let mut livein = HashSet::default();
     for &b in reachable {
         let mut cur = assigned_in[b].clone();
         for i in raw[b].start..raw[b].end {
@@ -3307,7 +3308,7 @@ fn root_livein(
         let mut changed = false;
         for &b in reachable {
             let new_in = if roots.contains(&b) {
-                HashSet::new()
+                HashSet::default()
             } else if b == entry {
                 params.clone()
             } else {
