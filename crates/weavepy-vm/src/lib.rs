@@ -8014,6 +8014,7 @@ impl Interpreter {
                 clean: false,
                 wait_pc: usize::MAX,
                 wait_pending: None,
+                outer_lazy: 0,
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -11102,6 +11103,13 @@ impl Interpreter {
             // Still pending means nothing flushed; a flush drains the list.
             if self.lean_pending.last() == Some(&addr) {
                 self.lean_pending.pop();
+            } else {
+                // (Newer entries above it would leave this one behind, its
+                // activation gone: see `State::outer_lazy`.)
+                debug_assert!(
+                    !self.lean_pending.contains(&addr),
+                    "pending entry left behind"
+                );
             }
         }
     }
@@ -12379,6 +12387,7 @@ impl Interpreter {
                             clean: false,
                             wait_pc: usize::MAX,
                             wait_pending: None,
+                            outer_lazy: 0,
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -16251,6 +16260,10 @@ impl Interpreter {
         frame: &mut Frame,
         pc: usize,
     ) -> Option<usize> {
+        // (Registered first, as `core_pending_enter` does: a lazy callee
+        // registering later would push its entries above this one, which
+        // then stays behind when its call returns.)
+        self.settle_lazy();
         // SAFETY: as `core_pending_enter`.
         unsafe {
             let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
@@ -21445,6 +21458,47 @@ impl Interpreter {
                     _ => return None,
                 }
                 Some(len - operands)
+            }
+            // `{**a}` and `f(**kw)`'s merge, as the core loop's arm runs
+            // it: a plain dictionary into a plain dictionary, every key a
+            // `str` (native hashing and equality, so no Python runs). A
+            // call's merge that would repeat a keyword raises in the full
+            // handler.
+            OpCode::DictUpdate => {
+                let depth = (ins.arg >> 1) as usize + 1;
+                if len < depth + 1 {
+                    return None;
+                }
+                // SAFETY: `len > depth`, so both slots are initialized.
+                let (Object::Dict(target), Object::Dict(src)) =
+                    (unsafe { &*base.add(len - 1 - depth) }, unsafe {
+                        &*base.add(len - 1)
+                    })
+                else {
+                    return None;
+                };
+                if crate::capi_watchers::dicts_active() || Rc::ptr_eq(target, src) {
+                    return None;
+                }
+                // (Through the borrows, as the core loop's arm: the target's
+                // write barrier sees the merge.)
+                let (Ok(mut t), Ok(s)) = (target.try_borrow_mut(), src.try_borrow()) else {
+                    return None;
+                };
+                let str_keys = |d: &DictData| d.keys().all(|k| matches!(k.0, Object::Str(_)));
+                if !str_keys(&s)
+                    || !str_keys(&t)
+                    || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
+                {
+                    return None;
+                }
+                for (k, v) in s.iter() {
+                    t.insert(k.clone(), v.clone());
+                }
+                drop((t, s));
+                // SAFETY: the source leaves the stack.
+                unsafe { drop_hot(base.add(len - 1).read()) };
+                Some(len - 1)
             }
             OpCode::ListAppend => {
                 let depth = ins.arg as usize;
@@ -41540,6 +41594,15 @@ impl Interpreter {
                 // User-defined descriptor: invoke its `__get__` if
                 // present, otherwise pass the descriptor through.
                 if let Some(get_method) = user_get.or_else(|| inner_inst.cls().lookup("__get__")) {
+                    // A plain function: called as the bound method would
+                    // call it, and evaluated frameless when it's a warm
+                    // leaf (`enum.property.__get__`).
+                    if let Object::Function(f) = &get_method {
+                        return self.call_dunder_function(
+                            f.clone(),
+                            &[attr.clone(), instance.clone(), owner.clone()],
+                        );
+                    }
                     let bound =
                         Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), get_method)));
                     return self.call(
@@ -79342,7 +79405,33 @@ fn is_c_profiled_callable(obj: &Object) -> bool {
 /// comparisons. Shared with the CALL inline caches (RFC 0058 WS3),
 /// whose native fast paths must never bypass this chain.
 #[inline]
-pub(crate) fn builtin_needs_interp(name: &str) -> bool {
+pub(crate) fn builtin_needs_interp(name: &'static str) -> bool {
+    use std::cell::Cell;
+    /// Memoized answers by the name's address and length (builtin names
+    /// are `'static`, so an address names one string for good): the list
+    /// below is about 65 comparisons, and every builtin call through the
+    /// generic dispatch asks.
+    const WAYS: usize = 256;
+    thread_local! {
+        static MEMO: [Cell<(usize, u32)>; WAYS] =
+            const { [const { Cell::new((0, 0)) }; WAYS] };
+    }
+    let key = name.as_ptr() as usize;
+    let len = name.len() as u32;
+    let i = ((key >> 3) ^ (key >> 11) ^ len as usize) % WAYS;
+    MEMO.with(|m| {
+        // The length's top bit holds the answer, the next one validity.
+        let (k, l) = m[i].get();
+        if k == key && l & !(3 << 30) == len && l & (1 << 30) != 0 {
+            return l & (1 << 31) != 0;
+        }
+        let r = builtin_needs_interp_uncached(name);
+        m[i].set((key, len | (1 << 30) | (u32::from(r) << 31)));
+        r
+    })
+}
+
+fn builtin_needs_interp_uncached(name: &str) -> bool {
     name.starts_with("__vm:")
         || name.starts_with(".u.")
         || name == builtins::BUILD_CLASS_NAME
@@ -79435,7 +79524,7 @@ pub(crate) fn builtin_needs_interp(name: &str) -> bool {
 /// of the tail-position special cases (`__getitem__`'s `__missing__`
 /// dispatch, the `fspath` coercion family, zero-arg `super`).
 #[inline]
-pub(crate) fn native_call_ic_safe(name: &str) -> bool {
+pub(crate) fn native_call_ic_safe(name: &'static str) -> bool {
     !name.starts_with('.')
         && name != "__getitem__"
         && name != "super"
@@ -82878,6 +82967,59 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
 
 /// The pcs a call runs through on its ordinary paths: from the entry
 /// along fall-throughs and jumps (not into the exception handlers).
+/// The pcs of `body` (see [`body_pcs`]) every path from which reaches a
+/// `RAISE_VARARGS` before any return: a path that will raise. (A loop
+/// counts only if every way out of it raises.)
+fn raise_bound_pcs(code: &CodeObject, body: &[usize]) -> Vec<bool> {
+    let ins = &code.instructions;
+    let n = ins.len();
+    let mut doomed = vec![false; n];
+    if !body.iter().any(|&pc| ins[pc].op == OpCode::RaiseVarargs) {
+        return doomed;
+    }
+    let mut in_body = vec![false; n];
+    for &pc in body {
+        in_body[pc] = true;
+    }
+    let succ = |pc: usize| -> ([usize; 2], usize) {
+        let i = ins[pc];
+        let next = pc + 1;
+        match i.op {
+            OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => ([0, 0], 0),
+            OpCode::JumpForward => ([next + i.arg as usize, 0], 1),
+            OpCode::JumpBackward => ([next.saturating_sub(i.arg as usize), 0], 1),
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => ([next + i.arg as usize, next], 2),
+            _ => ([next, 0], 1),
+        }
+    };
+    for &pc in body {
+        if ins[pc].op == OpCode::RaiseVarargs {
+            doomed[pc] = true;
+        }
+    }
+    // Grow the set to a fixed point: a pc whose successors all raise.
+    loop {
+        let mut grew = false;
+        for &pc in body {
+            if doomed[pc] {
+                continue;
+            }
+            let (s, k) = succ(pc);
+            if k > 0 && s[..k].iter().all(|&t| t < n && in_body[t] && doomed[t]) {
+                doomed[pc] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            return doomed;
+        }
+    }
+}
+
 pub(crate) fn body_pcs(code: &CodeObject) -> Vec<usize> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -82976,14 +83118,23 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     // Only the ordinary paths count: an exception handler runs only after
     // something raised, and an evaluation that meets a raise declines (the
     // ordinary call then runs the handler).
-    let body: Vec<&weavepy_compiler::Instruction> = if structural {
+    // (A path bound for a `raise` declines at the first instruction the
+    // plan can't express, before anything it does is seen, and the
+    // ordinary call then raises: those paths needn't be pure, so a body
+    // guarded by `if bad: raise ...` still evaluates frameless.)
+    let pcs = if structural {
         body_pcs(code)
-            .into_iter()
-            .map(|pc| &code.instructions[pc])
-            .collect()
     } else {
         Vec::new()
     };
+    let doomed = raise_bound_pcs(code, &pcs);
+    let body: Vec<&weavepy_compiler::Instruction> = pcs
+        .iter()
+        .filter(|&&pc| !doomed[pc])
+        .map(|&pc| &code.instructions[pc])
+        .collect();
+    // (A body that always raises has nothing to evaluate.)
+    let structural = structural && !body.is_empty();
     let ok = structural && body.iter().all(|i| pure_op(i));
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see

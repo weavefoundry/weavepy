@@ -256,6 +256,54 @@ branch and pull request.
 
 ## Done
 
+- **Fewer registered direct calls, and frameless bodies with raise guards**
+  (PR #107). A frame-JIT direct callee runs lazily until something needs
+  the core loop's view, and then it registers with every lazy caller above
+  it; `WEAVEPY_BURST_STATS` counts those per workload (`deepcopy` 103,000 a
+  call, `exceptions` 79,000, `logging_mix` 69,000, `closures_decorators`
+  68,000) and names each site. Fixed here (instructions on Linux):
+  - `deepcopy`: `copy._reconstruct` spread a generator of the arguments'
+    copies into the constructor (`func(*(deepcopy(a) for a in args))`), and
+    draining a generator whose body runs Python code registers. Our `copy`
+    builds a list in the same order instead: 10.6% fewer instructions.
+  - `logging`: `StreamHandler.flush`'s `if self.stream:` left compiled code
+    for a `StringIO` (a native object the compiled truth test didn't know),
+    registering the four-frame handler chain once a record; it now answers
+    native objects that are always true. A `warning()` call: 5.9% fewer.
+  - `f(*args, **kwargs)` forwarding a non-empty `kwargs` to a frameless leaf
+    (`closures_decorators`' decorated `area(i, h=2, scale=0.5)`) binds the
+    keywords on the frame instead of registering.
+  - `x.__class__` of a receiver no class can override (a coroutine in
+    `asyncio.isfuture`) reads its type in the compiled code.
+  - A body whose only impure instructions sit on paths bound for a `raise`
+    (`if bad: raise ValueError(...)`) is a frameless leaf now: such a path
+    declines before anything it does is seen, and the ordinary call raises.
+    `sorted(xs, key=k)` with a guarded `k`: 43,024 to 17,283 instructions
+    (an unguarded key 14,543).
+  - The generic dispatch's check whether a builtin needs the interpreter (65
+    name comparisons) is memoized by the name's address.
+  - Compiled code builds tuples of up to 16 items (it left for the core loop
+    past three: `findCaller`'s `return co.co_filename, f.f_lineno, ...`,
+    another 1.8% off a `warning()`), and runs `DICT_UPDATE` (`{**a, **b}`
+    32% fewer instructions, a closure's `cb(*args, **kwds)` 10%, an
+    `ExitStack` with a callback 3%).
+  - Tried and dropped: evaluating an `enum.property` `__get__` frameless
+    from the core loop's descriptor lane (its evaluations declined, and that
+    lane doesn't count declines toward giving up: 4.7% more on
+    `Color.RED.value`).
+  - A memory-safety fix the `__class__` read uncovered: with `isfuture` no
+    longer leaving compiled code, `test_eager_task_factory` crashed (on
+    Linux, at exit in mimalloc's free lists; valgrind found reads of a
+    returned native frame's `LeanAct` from the pending list). A lazily
+    running activation whose native body runs Python code (`create_task`
+    starting an eager task) registered only once that code's own compiled
+    calls were done, so its pending entries went on top of newer ones, and
+    a newer entry's exit, finding someone else's on top, left its own
+    behind. A state now remembers the lazy activation that was running when
+    it took `lazy_top` (`State::outer_lazy`), and registering it registers
+    that one first. The same crash followed any binary of the branch once
+    `isfuture` ran to its end in compiled code.
+
 - **Calls into builtins from frameless code and `functools.partial`** (PR
   #107). Found by a sweep of about 70 everyday operations against CPython
   3.14 (instructions on macOS, before and after, with CPython's):

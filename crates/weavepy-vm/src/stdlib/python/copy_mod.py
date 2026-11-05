@@ -230,7 +230,10 @@ def _reconstruct(x, memo, func, args,
                  *, deepcopy=deepcopy):
     deep = memo is not None
     if deep and args:
-        args = (deepcopy(arg, memo) for arg in args)
+        # WeavePy: a list rather than CPython's generator, made in the
+        # same order before the call; spreading a generator whose body
+        # runs Python code takes the call off the compiled fast path.
+        args = [deepcopy(arg, memo) for arg in args]
     y = func(*args)
     if deep:
         memo[id(x)] = y

@@ -172,6 +172,7 @@ impl DirectRecs {
                     clean: true,
                     wait_pc: usize::MAX,
                     wait_pending: None,
+                    outer_lazy: 0,
                 },
                 frame: std::ptr::null_mut(),
                 locals: std::ptr::null_mut(),
@@ -341,6 +342,7 @@ impl DirectRec {
             self.st.pc = 0;
             self.st.last = usize::MAX;
             self.outer = interp.lazy_top.get();
+            self.st.outer_lazy = self.outer;
             interp
                 .lazy_top
                 .set(std::ptr::from_mut(&mut self.st) as usize);

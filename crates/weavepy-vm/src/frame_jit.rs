@@ -320,6 +320,12 @@ pub(crate) struct State {
     /// the run to take out again). `usize::MAX` otherwise.
     pub(crate) wait_pc: usize,
     pub(crate) wait_pending: Option<usize>,
+    /// The state that was `Interpreter::lazy_top` when this one took it
+    /// (a lazily running activation further out, whose native body runs
+    /// this one's code), 0 for none: registering this one registers that
+    /// one first, so the older activations' pending entries stay below
+    /// the newer ones'.
+    pub(crate) outer_lazy: usize,
 }
 
 const S_LOCALS: i32 = 0;
@@ -2671,6 +2677,7 @@ unsafe fn lazy_launch(
         let nested = interp.recs.top();
         interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
+        cst.outer_lazy = outer;
         interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
         let status = native.run_direct(&mut cst, pc);
         interp.lazy_top.set(outer);
@@ -2730,6 +2737,7 @@ unsafe fn lazy_state(
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
         }
     }
 }
@@ -3287,6 +3295,7 @@ pub(crate) unsafe fn core_lazy_resume(
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
         };
         let st = &mut st;
         let arg = frame.code.instructions[pc].arg;
@@ -5357,6 +5366,20 @@ unsafe fn truth_at(st: *mut State, v: &Object, site: &TruthSite) -> Option<bool>
                 }
                 truth_instance(st, v, site)?
             }
+            // Native objects with neither `__bool__` nor `__len__` (a
+            // `StringIO` handler stream, a function, a module): true. (A
+            // class isn't here: its metaclass may define either.)
+            Object::File(_)
+            | Object::Function(_)
+            | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Module(_)
+            | Object::Code(_)
+            | Object::Iter(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::Frame(_)
+            | Object::Traceback(_) => true,
             _ => return None,
         })
     }
@@ -6863,6 +6886,23 @@ unsafe extern "C" fn h_contains_hot<const OWNED: u32>(a: *const Object, b: *cons
 /// stack slot `at`, as the core loop's arm runs it (and, for an instance
 /// or module, the leaf arm's cached reads): `0` the value in place of the
 /// receiver (released), anything else declined untouched.
+/// `x.__class__` of a receiver no class can give a `__class__` of its own
+/// (anything but an instance, a class or an extension's object): its
+/// type, as `object`'s descriptor answers, where the full handler would
+/// leave the compiled code (`asyncio.isfuture`'s `obj.__class__` of a
+/// coroutine). `None` for any other name or receiver.
+#[inline(never)]
+fn plain_class_attr(code: &CodeObject, arg: u32, recv: &Object) -> Option<Object> {
+    if matches!(
+        recv,
+        Object::Instance(_) | Object::Type(_) | Object::Foreign(_) | Object::Unbound
+    ) {
+        return None;
+    }
+    (code.names.get(arg as usize)?.as_str() == "__class__")
+        .then(|| Object::Type(crate::builtins::class_of(recv)))
+}
+
 unsafe extern "C" fn h_stack_attr(
     code: *const CodeObject,
     ext: *const CodeConstObjects,
@@ -6938,7 +6978,7 @@ unsafe extern "C" fn h_stack_attr(
             Object::Function(_) => {
                 return u32::from(!Interpreter::core_function_load(code, arg, at))
             }
-            _ => None,
+            _ => plain_class_attr(code, arg, recv),
         };
         let Some(v) = v else {
             return 1;
@@ -7038,7 +7078,7 @@ unsafe extern "C" fn h_local_attr(
                     None => 1,
                 };
             }
-            _ => None,
+            _ => plain_class_attr(code, arg, recv),
         };
         match v {
             Some(v) => {
@@ -7096,6 +7136,10 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
 /// `BUILD_TUPLE n` (`list` false) or `BUILD_LIST n` of the `n` values
 /// from stack slot `at` up, as the core loop's arms run them: `0` the
 /// container at `at`, anything else declined untouched.
+/// The longest `BUILD_TUPLE` native code builds (through [`h_build`]): a
+/// longer one leaves for the core loop.
+const MAX_NATIVE_TUPLE: usize = 16;
+
 unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32) -> u32 {
     // SAFETY: the code passes its live state and `n` initialized stack
     // slots (or, for `n == 0`, a free one).
@@ -7122,6 +7166,8 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
             1 => interp.alloc_tuple_array([at.read()]),
             2 => interp.alloc_tuple_array([at.read(), at.add(1).read()]),
             3 => interp.alloc_tuple_array([at.read(), at.add(1).read(), at.add(2).read()]),
+            // (As the core loop's arm builds a longer one.)
+            4..=MAX_NATIVE_TUPLE => interp.alloc_tuple((0..n).map(|j| at.add(j).read()).collect()),
             _ => return 1,
         };
         at.write(t);
@@ -7302,6 +7348,7 @@ unsafe fn run_switched_directly(st: &mut State) -> bool {
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run(&mut cst);
@@ -7465,9 +7512,11 @@ unsafe fn lazy_await(st: &mut State, pc: usize, start: usize, len: usize) -> Opt
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
         };
         interp.recs.set_top(nested.add(1));
         let outer = interp.lazy_top.get();
+        cst.outer_lazy = outer;
         interp.lazy_top.set(std::ptr::from_mut(&mut cst) as usize);
         let status = native.run_direct(&mut cst, from);
         interp.lazy_top.set(outer);
@@ -8630,6 +8679,15 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
         if act.is_null() {
             return;
         }
+        // An older lazily running activation, whose native body runs this
+        // one, registers first: the entries it pushes on the pending list
+        // belong below this one's (and anything pushed since its body
+        // began), or a newer entry's exit finds them on top and leaves its
+        // own behind.
+        let outer = st.outer_lazy as *mut State;
+        if !outer.is_null() {
+            register_lazy(&mut *outer);
+        }
         let interp = &mut *st.interp.cast_mut();
         // A lazily resumed generator's record gets its activation now.
         let act = match LazyGenRec::untag(act) {
@@ -9122,6 +9180,7 @@ unsafe fn direct_run_pushed(
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
         };
         interp.recs.set_top(nested.add(1));
         let status = native.run_direct(&mut cst, from);
@@ -10872,6 +10931,25 @@ unsafe extern "C" fn h_call_forward(
             frame.pc = pc as u32 + 3;
             if let Some(r) = spread_on_frame(st, pc + 3, start) {
                 return r;
+            }
+        } else if len < st.cap {
+            // Keywords to forward: the merge into the call's fresh mapping
+            // is a copy of `kwargs` alone, so `kwargs` itself stands in for
+            // a callee that only reads it (a frameless leaf, see
+            // `Interpreter::try_leaf_call_ex`), which runs on the frame and
+            // keeps a lazily running activation lazy.
+            if let Some(Object::Dict(d)) = kw.map(|k| &*st.locals.add(k)) {
+                st.stack.add(len).write(Object::Dict(d.clone()));
+                let frame = &mut *st.frame;
+                frame.stack.set_len(len + 1);
+                frame.pc = pc as u32 + 3;
+                if let Some(r) = spread_on_frame(st, pc + 3, start) {
+                    return r;
+                }
+                // Declined: the stand-in leaves the stack.
+                let frame = &mut *st.frame;
+                frame.stack.set_len(len);
+                drop(st.stack.add(len).read());
             }
         }
         let frame = &mut *st.frame;
@@ -12687,6 +12765,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::ListExtend
             | OpCode::SetAdd
             | OpCode::MapAdd
+            | OpCode::DictUpdate
             | OpCode::UnpackSequence
             | OpCode::ContainsOp
             | OpCode::LoadGlobal
@@ -12730,7 +12809,7 @@ fn native_op(op: OpCode) -> bool {
 fn native_at(code: &CodeObject, pc: usize) -> bool {
     let ins = code.instructions[pc];
     match ins.op {
-        OpCode::BuildTuple => (1..=3).contains(&ins.arg),
+        OpCode::BuildTuple => (1..=MAX_NATIVE_TUPLE as u32).contains(&ins.arg),
         OpCode::BuildMap => (0..=8).contains(&ins.arg),
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
@@ -14035,6 +14114,7 @@ impl<'a> Lower<'a> {
             | OpCode::ListExtend
             | OpCode::SetAdd
             | OpCode::MapAdd
+            | OpCode::DictUpdate
             | OpCode::SetUpdate => return self.container(pc),
             OpCode::BuildSet => return self.build_set(pc, ins.arg as usize),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
@@ -14050,7 +14130,7 @@ impl<'a> Lower<'a> {
             OpCode::LoadMethodAttr => return self.load_method(pc),
             OpCode::StoreAttr => return self.stack_store_attr(pc),
             OpCode::DeleteAttr => return self.delete_attr(pc),
-            OpCode::BuildTuple if (1..=3).contains(&ins.arg) => {
+            OpCode::BuildTuple if (1..=MAX_NATIVE_TUPLE as u32).contains(&ins.arg) => {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
