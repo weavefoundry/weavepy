@@ -256,6 +256,38 @@ branch and pull request.
 
 ## Done
 
+- **Python `__hash__` and `__bool__` in place, and an earlier frame JIT**
+  (PR #107). Calls from native code into Python stay the widest everyday
+  gap (see "Next", item 11), measured again on macOS: a dict lookup keyed by
+  an instance with a Python `__hash__` 2,659 instructions against CPython's
+  1,033, `if x:` with a Python `__bool__` 2,748 against 1,002.
+  - A class's Python `__bool__` that evaluates as a pure leaf answers the
+    truth test in place, as a `__len__` did (`if x:` 2,567 to 400 on
+    Linux), and a dict read of an instance key whose `__hash__` is a pure
+    leaf hashes it in place and finds the key itself, as CPython's probe
+    tries identity before `__eq__` (2,611 to 1,699; any other key with that
+    hash takes the full path, which compares).
+  - The same pure-leaf `__hash__` serves `hash(x)` (a frozen dataclass's
+    2,898 to 2,109), `x in d` and `x in s`, and `d[x]` from compiled code
+    and tier 2 (1,709 to 1,111).
+  - The frame JIT's threshold is 200 times a code's length, from 500: over
+    the suite 0.996 of the instructions (`class_creation` 0.94,
+    `collections_mix` 0.93, `async_tree` 1.02) and 0.995 of the warm time.
+    100 and 50 gave 0.996 and 0.995, with `async_tree` or `generators_tree`
+    4% worse.
+  - A lowering reserves its IR tables from the body's length (the function
+    goes to code generation, so each lowering started from empty tables and
+    grew them by doubling): 0.3% off a short `go` run.
+  - Compiled code tests `bytes`, `bytearray`, sets, frozensets and big ints
+    for truth, and concatenates two `bytes`, in place.
+  - Measured and left: with both JITs off the core loop retires 1.45 times
+    CPython's instructions (`go` 2.95, `mini_interpreter` 2.46), so code
+    that runs before it compiles pays that; a generator's item costs 1.3 to
+    1.45 times CPython's (`gen_fast_resume` and `gen_native_yield` about 310
+    instructions a resume, spread over checks, the frame's move out of its
+    state and back, and the native state's set-up); and a native caller's
+    callback through tier 2's entry about 3,000 instructions.
+
 - **Methods cached in locals, and `re`'s opcodes as ints** (PR #107).
   Compiling a regular expression (`re._parser.parse`) retired 2.5 times
   CPython's instructions (998,000 against 395,000 for a number pattern);

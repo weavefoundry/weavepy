@@ -21035,10 +21035,16 @@ impl Interpreter {
                         Object::from_char(c)
                     }
                     (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
-                        let probe = crate::object::LeafProbe::new(k)?;
-                        // SAFETY: as above.
-                        let d = unsafe { d.peek() }?;
-                        clone_hot(d.get(&probe)?)
+                        match crate::object::LeafProbe::new(k) {
+                            Some(probe) => {
+                                // SAFETY: as above.
+                                let d = unsafe { d.peek() }?;
+                                clone_hot(d.get(&probe)?)
+                            }
+                            // A Python `__hash__` that evaluates as a pure
+                            // leaf: the key found as itself.
+                            None => crate::object::leaf_hashed_instance_get(d, k)??,
+                        }
                     }
                     // `seq[a:b:c]` with plain int (or omitted) bounds: the
                     // full handler's own slicing, out of line (a bad step
@@ -29614,6 +29620,26 @@ impl Interpreter {
                 Object::Str(needle) => Some(crate::builtins::substr_find(hay, needle).is_some()),
                 _ => None,
             },
+            // A key whose Python `__hash__` evaluates as a pure leaf, found
+            // only as itself (any other key with its hash declines).
+            Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
+                if matches!(item, Object::Instance(_)) && !Self::leaf_hash_native(item) =>
+            {
+                // SAFETY: the running thread's interpreter, under the GIL;
+                // the evaluation runs no Python and takes no frame.
+                let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+                let probe =
+                    crate::object::LeafProbe::with_hash(item, interp.leaf_instance_hash(item)?);
+                let found = match container {
+                    // SAFETY: as below (the probe runs no code).
+                    Object::Dict(d) => unsafe { d.peek() }?.get_index_of(&probe).is_some(),
+                    // SAFETY: as below.
+                    Object::Set(st) => unsafe { st.peek() }?.get_index_of(&probe).is_some(),
+                    Object::FrozenSet(fs) => fs.get_index_of(&probe).is_some(),
+                    _ => return None,
+                };
+                (found || probe.miss_is_exact()).then_some(found)
+            }
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
                 if Self::leaf_hash_native(item) =>
             {
@@ -30333,6 +30359,49 @@ impl Interpreter {
         self.call(&Object::Function(f), args, &[], &g)
     }
 
+    /// `hash(v)` of an instance whose class's `__hash__` is a Python
+    /// function that evaluates as a pure leaf (`return self.v`), as
+    /// CPython's `slot_tp_hash` takes its result: the int itself, `-1`
+    /// made `-2`. `None` for anything else (another answer, a big int,
+    /// a native payload), which the full path hashes.
+    pub(crate) fn leaf_instance_hash(&self, v: &Object) -> Option<i64> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        if inst.native.get().is_some() || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let Some(Object::Function(f)) = inst.cls_raw().lookup("__hash__") else {
+            return None;
+        };
+        let code = f.code();
+        if !code_is_pure_leaf(&code)
+            || !pure_leaf_warm(&code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        // (A `__hash__` that hashes another such instance nests here; one
+        // that hashes itself would never end, which the full path reports
+        // as a RecursionError.)
+        thread_local! {
+            static NEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        }
+        let nest = NEST.with(std::cell::Cell::get);
+        if nest >= 8 {
+            return None;
+        }
+        NEST.with(|n| n.set(nest + 1));
+        let r = self.pure_leaf_eval::<false, false>(&code, &f, &[std::ptr::from_ref(v)]);
+        NEST.with(|n| n.set(nest));
+        match r? {
+            Object::Int(-1) => Some(-2),
+            Object::Int(r) => Some(r),
+            Object::Bool(b) => Some(i64::from(b)),
+            _ => None,
+        }
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -30357,6 +30426,7 @@ impl Interpreter {
                     NativeTruth::Bool(b, op) => Ok((Rc::as_ptr(b), false, *op)),
                     NativeTruth::Len(b) => Ok((Rc::as_ptr(b), true, 0)),
                     NativeTruth::PyLen => Ok((std::ptr::null(), true, PY_LEN_TRUTH)),
+                    NativeTruth::PyBool(_) => Ok((std::ptr::null(), false, PY_BOOL_TRUTH)),
                     NativeTruth::Decline => Err(false),
                 }
             };
@@ -30382,6 +30452,25 @@ impl Interpreter {
         if op == PY_LEN_TRUTH {
             return match self.leaf_instance_len(v)? {
                 Object::Int(n) => Some(n != 0),
+                _ => None,
+            };
+        }
+        // Likewise a Python `__bool__` (any answer but a `bool` is the full
+        // path's, which raises).
+        if op == PY_BOOL_TRUTH {
+            let f = match &*self.core_truth.borrow() {
+                Some((_, NativeTruth::PyBool(f))) => f.clone(),
+                _ => return None,
+            };
+            let code = f.code();
+            if !code_is_pure_leaf(&code)
+                || !pure_leaf_warm(&code)
+                || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+            {
+                return None;
+            }
+            return match self.pure_leaf_eval::<false, false>(&code, &f, &[std::ptr::from_ref(v)])? {
+                Object::Bool(b) => Some(b),
                 _ => None,
             };
         }
@@ -30443,6 +30532,7 @@ impl Interpreter {
                     };
                 }
                 Some(Object::Function(_)) if is_len => return NativeTruth::PyLen,
+                Some(Object::Function(f)) => return NativeTruth::PyBool(f),
                 Some(_) => return NativeTruth::Decline,
             }
         }
@@ -84049,12 +84139,16 @@ enum NativeTruth {
     /// No `__bool__`, and a Python `__len__` (`re`'s `SubPattern`): its
     /// result when it evaluates as a pure leaf (see `leaf_instance_len`).
     PyLen,
+    /// A Python `__bool__`: its result when it evaluates as a pure leaf.
+    PyBool(Rc<crate::object::PyFunction>),
     /// Anything else: the full path decides.
     Decline,
 }
 
 /// [`NativeTruth::PyLen`]'s stand-in operation in `leaf_instance_truth`.
 const PY_LEN_TRUTH: u8 = u8::MAX;
+/// [`NativeTruth::PyBool`]'s.
+const PY_BOOL_TRUTH: u8 = u8::MAX - 1;
 
 /// [`inst_may_shadow`] first settled by a leaf site's bound (see
 /// [`LeafSiteData::limit`]): values laid over the class's names `keys`

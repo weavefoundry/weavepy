@@ -1843,6 +1843,14 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
     let [x] = args else {
         return None;
     };
+    // An instance whose Python `__hash__` evaluates as a pure leaf (a frozen
+    // dataclass's `hash((self.a, self.b))`).
+    if let Object::Instance(_) = x {
+        // SAFETY: the running thread's interpreter, under the GIL; the
+        // evaluation runs no Python and takes no frame.
+        let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+        return interp.leaf_instance_hash(x).map(|h| Ok(Object::Int(h)));
+    }
     let native = match x {
         Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
         // (A NaN hashes by identity.)

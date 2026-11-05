@@ -580,6 +580,17 @@ impl Function {
         self.layout.clear();
     }
 
+    /// Make room for about `insts` instructions in `blocks` blocks, so a
+    /// function lowered into an empty one doesn't grow its tables by
+    /// doubling (copying each) as it goes.
+    pub fn reserve(&mut self, insts: usize, blocks: usize) {
+        self.dfg.insts.reserve(insts);
+        self.dfg.values.reserve(insts);
+        self.dfg.pool.reserve(insts * 2);
+        self.dfg.blocks.reserve(blocks);
+        self.layout.reserve(blocks);
+    }
+
     pub fn display(&self) -> impl fmt::Display + '_ {
         DisplayFunction(self)
     }

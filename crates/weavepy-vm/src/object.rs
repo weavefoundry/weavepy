@@ -4646,6 +4646,9 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    if let Some(found) = leaf_hashed_instance_get(d, key) {
+        return Ok(found);
+    }
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
@@ -4655,6 +4658,32 @@ pub(crate) fn dict_reentrant_get(
                 .map(|(_, v)| v.clone()))
         }
         None => Ok(None),
+    }
+}
+
+/// [`dict_reentrant_get`] of an instance whose class's Python `__hash__`
+/// evaluates as a pure leaf (see `Interpreter::leaf_instance_hash`), found
+/// only as itself, as CPython's probe tries identity before `__eq__`: the
+/// stored value, or (`Some(None)`) none when no stored key shared its hash.
+/// `None` when another key with that hash would need `__eq__`, or the hash
+/// isn't settled natively.
+pub(crate) fn leaf_hashed_instance_get(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Option<Option<Object>> {
+    if !matches!(key, Object::Instance(_)) {
+        return None;
+    }
+    // SAFETY: the running thread's interpreter, under the GIL; the
+    // evaluation runs no Python and takes no frame.
+    let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+    let hash = interp.leaf_instance_hash(key)?;
+    let probe = LeafProbe::with_hash(key, hash);
+    let m = d.try_borrow().ok()?;
+    match m.get_index_of(&probe) {
+        Some(i) => Some(m.get_index(i).map(|(_, v)| v.clone())),
+        None if probe.miss_is_exact() => Some(None),
+        None => None,
     }
 }
 

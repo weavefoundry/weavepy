@@ -12999,6 +12999,11 @@ unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
             xs.get(at(*i, xs.len())?).map(super::clone_hot)
         }
         (Object::Tuple(t), Object::Int(i)) => t.get(at(*i, t.len())?).map(super::clone_hot),
+        // A key whose Python `__hash__` is a pure leaf, found as itself (a
+        // miss is the full path's to raise).
+        (Object::Dict(d), Object::Instance(_)) if crate::object::LeafProbe::new(key).is_none() => {
+            crate::object::leaf_hashed_instance_get(d, key)?
+        }
         (Object::Dict(d), _) => {
             let probe = crate::object::LeafProbe::new(key)?;
             // SAFETY: as above.

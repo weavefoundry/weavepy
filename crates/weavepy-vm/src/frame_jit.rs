@@ -102,16 +102,18 @@ const CHAIN: u32 = 7;
 
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid). With
-/// the code generator a quarter of Cranelift's cost, 500 takes 8% off the
-/// cold calls of compile-heavy workloads against 2,000; 250 makes
-/// `class_creation` compile code it then runs too little.
+/// the code generator a quarter of Cranelift's cost, 500 took 8% off the
+/// cold calls of compile-heavy workloads against 2,000; with the cheaper
+/// lowering since, 200 retires 0.996 of 500's instructions over the suite
+/// (`class_creation` 0.94, `collections_mix` 0.93) and 0.995 of its warm
+/// time.
 fn hot() -> u32 {
     static HOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *HOT.get_or_init(|| {
         std::env::var("WEAVEPY_FRAME_JIT_HOT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(500)
+            .unwrap_or(200)
     })
 }
 
@@ -5125,6 +5127,16 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             {
                 Interpreter::core_seq_concat(a, b)
             }
+            // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
+            // immutable, so `+=` is the same).
+            (Object::Bytes(x), Object::Bytes(y))
+                if kind == BinOpKind::Add && droppable(a) && droppable(b) =>
+            {
+                let mut out = Vec::with_capacity(x.len() + y.len());
+                out.extend_from_slice(x);
+                out.extend_from_slice(y);
+                Some(Object::new_bytes(out))
+            }
             (Object::Instance(i), _) if i.cls_raw().native_kind.get() != 0 => {
                 match Interpreter::core_native_binop(kind, a, b) {
                     Some(Ok(r)) if droppable(a) && droppable(b) => Some(r),
@@ -5364,6 +5376,11 @@ unsafe fn truth_at(st: *mut State, v: &Object, site: &TruthSite) -> Option<bool>
             Object::Tuple(t) => !t.is_empty(),
             Object::List(l) => !l.peek()?.is_empty(),
             Object::Dict(d) => !d.peek()?.is_empty(),
+            Object::Bytes(b) => !b.is_empty(),
+            Object::ByteArray(b) => !b.peek()?.is_empty(),
+            Object::Set(set) => !set.peek()?.is_empty(),
+            Object::FrozenSet(set) => !set.is_empty(),
+            Object::Long(b) => b.sign() != num_bigint::Sign::NoSign,
             Object::Instance(inst) => {
                 let ver = inst.cls_raw().attr_version.get();
                 if ver != 0 && site.ver.get() == ver {
@@ -12201,6 +12218,11 @@ fn lower_range(
     need: usize,
 ) -> Option<Lowered> {
     engine.func.clear();
+    // (About 18 IR instructions and 4 blocks per instruction lowered: the
+    // function is handed to code generation, so each lowering starts from
+    // empty tables.)
+    let span = range.len().min(code.instructions.len());
+    engine.func.reserve(span * 18, span * 4);
     let ptr = engine.ptr;
     let sig = &mut engine.func.signature;
     sig.params.push(AbiParam::new(ptr));
