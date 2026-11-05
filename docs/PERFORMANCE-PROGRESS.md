@@ -278,9 +278,13 @@ branch and pull request.
     (`self.PREC`) is cached as the site's class entry, as a tuple was:
     `mini_interpreter` 6% fewer.
   - Compiled reads also take the site's instance-dict hint for a published
-    dict (`LogRecord`'s, once `record.__dict__` is read) and a frame's or
-    code object's fields (`f.f_back`, `co.co_name`) before the general
-    path.
+    dict (`LogRecord`'s, once `record.__dict__` is read), a named tuple's
+    field from its site's stamp, and a frame's or code object's fields
+    (`f.f_back`, `co.co_name`) before the general path. The named tuple's
+    field took `collections_mix` 5% under its instructions before this
+    work, and `urlsplit` 2%. A read the site has nothing for leaves after
+    two loads, which kept the checks from costing a miss more than they
+    save.
   - A generator's compiled body hands each yield its draining consumer
     takes (`list()`, `tuple()`, `set()`, `sum()`, `all()`, `any()`) to the
     consumer's sink and goes on, where it used to leave its native code at

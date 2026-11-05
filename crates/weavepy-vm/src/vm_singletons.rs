@@ -148,7 +148,11 @@ pub(crate) fn finalize_on_last_release<T: ?Sized + 'static>(arc: std::sync::Arc<
             && !crate::stdlib::asyncio_mod::finalizer_is_noop(&inst);
         if owes {
             try_push_pending_finalizer(Object::Instance(Rc::from_arc(inst)));
-        } else if Arc::weak_count(&inst) == 0 && inst.dies_by_plain_drop() {
+        } else if Arc::weak_count(&inst) == 0
+            // (One with a native payload, a named tuple's, never pools.)
+            && inst.native.get().is_none()
+            && inst.dies_by_plain_drop()
+        {
             // Back to the pool, as `Interpreter::release` sends one (see
             // `PyInstance::try_recycle`), for the next instance's allocation.
             if let Err(inst) = PyInstance::recycle(Rc::from_arc(inst)) {

@@ -6749,16 +6749,19 @@ unsafe fn field_hit_slow<'a>(
 ) -> Option<&'a Object> {
     // SAFETY: the caller's contract.
     unsafe {
+        // (Most misses have neither: a named tuple's field, a class's.)
+        let poly = (*site.ext).attr_poly_slot(site.pc as usize);
+        let published = inst.dict.published().is_some();
+        if poly.is_none() && !published {
+            return None;
+        }
         let ver = inst.cls_raw().attr_version.get();
         if ver == 0 {
             return None;
         }
         let code = &*site.code;
         let name = code.instructions[site.pc as usize].arg;
-        if let Some(ix) = (*site.ext)
-            .attr_poly_slot(site.pc as usize)
-            .and_then(|p| p.index(ver))
-        {
+        if let Some(ix) = poly.and_then(|p| p.index(ver)) {
             if let Some((k, v)) = inst.attr_peek_index(ix as usize) {
                 if crate::slot_name_matches(code, name, k) {
                     // A split instance's position is its class's name's,
@@ -6775,7 +6778,7 @@ unsafe fn field_hit_slow<'a>(
             }
         }
         // (A split instance's fields are the field caches' own.)
-        if inst.dict.published().is_none() {
+        if !published {
             return None;
         }
         if let weavepy_compiler::InlineCache::LoadAttrInstance { key_idx, ver: want } =
@@ -6795,8 +6798,9 @@ unsafe fn field_hit_slow<'a>(
 
 /// The reads [`attr_miss`] tries before the core loop's: a class's
 /// attribute its site's stamp holds (`Cls.CONST`, which only a global
-/// read fuses), as `type_attr` reads it; an instance's field through the
-/// site's other entries (see [`field_hit_slow`]); and a frame's or code
+/// read fuses), as `type_attr` reads it; a named tuple's field from the
+/// stamp, or an instance's field through the site's other entries (see
+/// [`field_hit_slow`]); and a frame's or code
 /// object's plain field (`f.f_back`, `co.co_name`), as `h_local_attr`
 /// reads it. A stack receiver (`local` false) must leave by a release
 /// that runs no code, as `attr_stack_slow`'s hit releases it.
@@ -6813,6 +6817,14 @@ unsafe fn attr_miss_quick(site: &AttrSite, recv: &Object, local: bool) -> Option
                 .stamp_slot(site.pc as usize)
                 .and_then(|s| crate::class_attr_hit(s, cls)),
             Object::Instance(inst) if local || droppable(recv) => {
+                // A named tuple's field (a data descriptor: no instance
+                // shadows it), as the core loop's resolution reads it.
+                if let Some(v) = (*site.ext)
+                    .stamp_slot(site.pc as usize)
+                    .and_then(|s| crate::tuple_field_hit(s, inst))
+                {
+                    return Some(v);
+                }
                 field_hit_slow(site, inst).map(|v| crate::clone_hot(v))
             }
             Object::Frame(_) | Object::Code(_) if local || droppable(recv) => {
