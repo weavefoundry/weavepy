@@ -1090,7 +1090,7 @@ struct LazyTable<T> {
 
 /// The encoding of a module in the code cache's native form (see
 /// `native_code`): its own bytes, or, say, a mapping of the cache file.
-pub struct TableBuffer(Box<dyn CodeBytes>);
+pub struct TableBuffer(Box<dyn CodeBytes>, std::sync::atomic::AtomicU8);
 
 /// Where a [`TableBuffer`] gets its bytes.
 pub trait CodeBytes: Send + Sync + 'static {
@@ -1113,7 +1113,19 @@ impl CodeBytes for Box<[u8]> {
 
 impl TableBuffer {
     pub fn new(bytes: impl CodeBytes) -> Self {
-        TableBuffer(Box::new(bytes))
+        TableBuffer(Box::new(bytes), std::sync::atomic::AtomicU8::new(0))
+    }
+
+    /// Whether the module's identifier text is UTF-8, as its first read
+    /// found (`0` not yet checked, `1` it is, `2` it isn't): checked once
+    /// rather than at each identifier's every read.
+    pub(crate) fn names_utf8(&self) -> u8 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_names_utf8(&self, ok: bool) {
+        self.1
+            .store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn bytes(&self) -> &[u8] {

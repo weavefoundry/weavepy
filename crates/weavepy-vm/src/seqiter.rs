@@ -1712,6 +1712,15 @@ fn scan_items(args: &[Object], multi: bool) -> Option<Vec<Object>> {
 fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, RuntimeError>> {
     let items = scan_items(args, true)?;
     let (first, rest) = items.split_first()?;
+    // Ints, big ints and `int` subclasses that keep `int`'s ordering
+    // (`re`'s `min(hi, MAXWIDTH)`, its widths against `1 << 64`): by value,
+    // the first of equal ones winning.
+    if items
+        .iter()
+        .any(|x| matches!(x, Object::Instance(_) | Object::Long(_)))
+    {
+        return min_max_integers(&items, want_max).map(Ok);
+    }
     let mut best = first;
     match first {
         Object::Int(_) if rest.iter().all(|x| matches!(x, Object::Int(_))) => {
@@ -1761,6 +1770,39 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
         _ => return None,
     }
     Some(Ok(best.clone()))
+}
+
+/// [`min_max_fast`] over integers: machine ints, big ints, and instances
+/// of `int` subclasses that keep `int`'s ordering (see
+/// `object::int_order_value`). `None` if any item is anything else.
+fn min_max_integers(items: &[Object], want_max: bool) -> Option<Object> {
+    use std::cmp::Ordering;
+    enum Key<'a> {
+        Small(i64),
+        Big(&'a num_bigint::BigInt),
+    }
+    fn key(o: &Object) -> Option<Key<'_>> {
+        match o {
+            Object::Long(b) => Some(Key::Big(b)),
+            _ => crate::object::int_order_value(o).map(Key::Small),
+        }
+    }
+    let cmp = |a: &Key<'_>, b: &Key<'_>| match (a, b) {
+        (Key::Small(x), Key::Small(y)) => x.cmp(y),
+        (Key::Small(x), Key::Big(y)) => num_bigint::BigInt::from(*x).cmp(y),
+        (Key::Big(x), Key::Small(y)) => (*x).cmp(&num_bigint::BigInt::from(*y)),
+        (Key::Big(x), Key::Big(y)) => x.cmp(y),
+    };
+    let (first, rest) = items.split_first()?;
+    let mut best = (first, key(first)?);
+    for x in rest {
+        let k = key(x)?;
+        let ord = cmp(&k, &best.1);
+        if (want_max && ord == Ordering::Greater) || (!want_max && ord == Ordering::Less) {
+            best = (x, k);
+        }
+    }
+    Some(best.0.clone())
 }
 
 /// `int(text)` for plain decimal text (ASCII digits, an optional sign,

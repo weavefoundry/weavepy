@@ -1376,6 +1376,8 @@ struct Tags {
     instance: u8,
     /// A Python function's (see [`direct_call`]).
     function: u8,
+    /// A bound method's (see [`h_unpack_bound`]).
+    bound: u8,
     /// A list's tag.
     list: u8,
     /// Where a frame's cells are (see [`CellLayout`]).
@@ -1445,6 +1447,9 @@ fn tags() -> Option<Tags> {
         cell: tag(&cell),
         instance: tag(&inst),
         function: tag(&func),
+        bound: tag(&Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::new(Object::None, func.clone()),
+        ))),
         list: tag(&Object::new_list(Vec::new())),
         cell_layout: cell_layout(),
         rc_counted: if cfg!(debug_assertions) {
@@ -1477,7 +1482,7 @@ fn tags() -> Option<Tags> {
         return None;
     }
     let all = [
-        t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance, t.function,
+        t.none, t.unbound, t.boolean, t.int, t.float, t.cell, t.instance, t.function, t.bound,
     ];
     let distinct = all
         .iter()
@@ -8074,6 +8079,53 @@ unsafe extern "C" fn h_subscr_dunder(
     }
 }
 
+/// `BINARY_SLICE` (the `pc`th instruction of `code`) of the plain instance
+/// at stack slot `slot` and the bounds above it, which `h_container`
+/// declined, whose class's `__getitem__` is a plain Python function
+/// (`re`'s `subpattern[-1:]`): the slice built and the method called
+/// directly, as [`h_subscr_dunder`] calls it for a subscript, the result at
+/// `slot`. Returns as `h_subscr_dunder` does (a decline leaves the
+/// operands as they were).
+unsafe extern "C" fn h_slice_dunder(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `BINARY_SLICE`s, the operands' slot (nothing virtual below them),
+    // and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*at) else {
+            return CALL_DECLINED;
+        };
+        let (start, stop) = (at.add(1).read(), at.add(2).read());
+        at.add(1)
+            .write(Object::Slice(Rc::new(crate::object::PySlice {
+                start,
+                stop,
+                step: Object::None,
+            })));
+        let r = dunder_call(st, pc, slot, 2, f, site, None);
+        if r == CALL_DECLINED {
+            // The bounds back in their slots.
+            let Object::Slice(s) = at.add(1).read() else {
+                unreachable!("a declined call leaves its operands");
+            };
+            at.add(1).write(s.start.clone());
+            at.add(2).write(s.stop.clone());
+        }
+        r
+    }
+}
+
 /// The `n` (at most three) operands from stack slot `slot` up, as the
 /// instruction at `pc` leaves them, called as `f(*operands)` for a class's
 /// Python special method `f` (an instance operator's, `binop` its
@@ -8581,10 +8633,42 @@ unsafe extern "C" fn h_call_direct(
     }
 }
 
+/// A bound method over a plain function in the callable's slot at
+/// `callee`, the self slot above it empty, made that function with the
+/// receiver as its self (CPython's `CALL_BOUND_METHOD_EXACT_ARGS`), as the
+/// core loop's `CALL` unpacks one (`Interpreter::unpack_bound_callee`): a
+/// method cached in a local (`get = source.get`) then calls as a method
+/// does. `0` done, anything else untouched.
+///
+/// # Safety
+///
+/// `callee` and the slot above it are initialized stack slots.
+pub(crate) unsafe extern "C" fn h_unpack_bound(callee: *mut Object) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::BoundMethod(bm) = &*callee else {
+            return 1;
+        };
+        if bm.redispatch_descriptor || !matches!(&*callee.add(1), Object::Unbound) {
+            return 1;
+        }
+        let Object::Function(f) = &bm.function else {
+            return 1;
+        };
+        let (f, receiver) = (Object::Function(f.clone()), bm.receiver.clone());
+        // (The method's own references are counted twice now: it goes with
+        // a plain decrement, its function and receiver staying alive.)
+        let bm = std::mem::replace(&mut *callee, f);
+        callee.add(1).write(receiver);
+        drop(bm);
+        0
+    }
+}
+
 /// `CALL` (see [`Lower::call_op`]): a Python function's call tries
 /// [`h_call_direct`] first, unless its site found the callee without a
 /// native body and has retries left to count down; anything else goes
-/// through [`h_call`].
+/// through [`h_call`]. A bound method over one calls as its function does.
 unsafe extern "C" fn h_call_site(
     st: *mut State,
     code: *const CodeObject,
@@ -8598,7 +8682,11 @@ unsafe extern "C" fn h_call_site(
     // below the arguments and its self slot, and `site` is this `CALL`'s
     // own cache.
     unsafe {
-        let callee = &*(*st).stack.add(len as usize - argc - 2);
+        let at = (*st).stack.add(len as usize - argc - 2);
+        if matches!(&*at, Object::BoundMethod(_)) {
+            h_unpack_bound(at);
+        }
+        let callee = &*at;
         if matches!(callee, Object::Function(_)) {
             let site = &mut *site;
             if site.hot != 0 || site.retry == 0 {
@@ -12766,6 +12854,7 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::SetAdd
             | OpCode::MapAdd
             | OpCode::DictUpdate
+            | OpCode::BuildSlice
             | OpCode::UnpackSequence
             | OpCode::ContainsOp
             | OpCode::LoadGlobal
@@ -14115,6 +14204,7 @@ impl<'a> Lower<'a> {
             | OpCode::SetAdd
             | OpCode::MapAdd
             | OpCode::DictUpdate
+            | OpCode::BuildSlice
             | OpCode::SetUpdate => return self.container(pc),
             OpCode::BuildSet => return self.build_set(pc, ins.arg as usize),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
@@ -15479,6 +15569,64 @@ impl<'a> Lower<'a> {
         };
         let declined = self.b.ins().icmp_imm(IntCC::Equal, n, -1);
         let out = self.exit_with(pc, &[], INTERP);
+        // A slice of an instance whose class's `__getitem__` is a Python
+        // function, at a site that has sliced one: the method, called
+        // directly (see `h_slice_dunder`).
+        if !self.inlining()
+            && self.code.instructions[pc].op == OpCode::BinarySlice
+            && self.depth >= 3
+            && crate::instance_site(self.ext, pc)
+        {
+            let dunder = self.b.create_block();
+            let fine = self.b.create_block();
+            self.b.ins().brif(declined, dunder, &[], fine, &[]);
+            self.b.switch_to_block(dunder);
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            let slotv = self.b.ins().iconst(types::I64, self.depth as i64 - 3);
+            let d = self
+                .call(
+                    h_slice_dunder as *const () as usize,
+                    &[self.st, code, pcv, slotv, site_at],
+                    true,
+                )
+                .expect("returns");
+            let done = self.b.create_block();
+            let other = self.b.create_block();
+            self.b.ins().brif(d, other, &[], done, &[]);
+            self.b.switch_to_block(other);
+            let no = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+            let leave = self.b.create_block();
+            self.b.ins().brif(no, out, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.leave(d);
+            self.b.switch_to_block(done);
+            self.depth = after as usize;
+            self.set_last(pc);
+            self.check_released(pc + 1);
+            let join = self.b.create_block();
+            self.b.ins().jump(join, &[]);
+            self.b.switch_to_block(fine);
+            let raised = self.b.ins().icmp_imm(IntCC::Equal, n, -2);
+            let raise_b = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(raised, raise_b, &[], ok, &[]);
+            self.b.switch_to_block(raise_b);
+            let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
+            self.leave(s);
+            self.b.switch_to_block(ok);
+            self.check_released(pc + 1);
+            self.b.ins().jump(join, &[]);
+            self.b.switch_to_block(join);
+            return true;
+        }
         self.branch_out(declined, out);
         let raised = self.b.ins().icmp_imm(IntCC::Equal, n, -2);
         let raise_b = self.b.create_block();

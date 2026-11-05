@@ -256,6 +256,60 @@ branch and pull request.
 
 ## Done
 
+- **Methods cached in locals, and `re`'s opcodes as ints** (PR #107).
+  Compiling a regular expression (`re._parser.parse`) retired 2.5 times
+  CPython's instructions (998,000 against 395,000 for a number pattern);
+  `-X importtime` blames such compiles for much of `json.scanner`'s,
+  `textwrap`'s and `tokenize`'s import time. Fixed (instructions on Linux,
+  964,000 to 659,000 a parse, `test_re` 16% faster; the suite is
+  unchanged, 1.001 of the instructions, as it barely compiles patterns):
+  - A method cached in a local (`sourceget = source.get`, as `re`, `json`
+    and `tokenize` do) went through the core loop's general call every
+    time from compiled code: a bound method wasn't a direct call's callee,
+    and an inlined body's guard wanted a function. Both unpack it into the
+    function and its receiver first, as CPython's
+    `CALL_BOUND_METHOD_EXACT_ARGS` does (8.8% fewer).
+  - `re`'s opcodes are an `int` subclass (`_NamedIntConstant`) that keeps
+    `int`'s hash, equality and ordering. Such an instance now hashes and
+    compares as its value in the native set and dict probes (`op in
+    _REPEATCODES` registered the whole call chain every time), and orders
+    as its value in `min` and `max`, which also take big ints now
+    (`min(hi, MAXWIDTH)`, `MAXWIDTH` being `1 << 64`).
+  - `hasattr(cls, name)` of a name a class with a builtin base doesn't have
+    (`asyncio.isfuture`'s `hasattr(type(obj), '_asyncio_future_blocking')`)
+    is remembered per class version, as it was for builtin classes only.
+  - Tried and dropped: compiling call-heated code whose loops never ran
+    (tier 2 takes loops by their back edges, so `parse` stayed interpreted
+    until about 5,400 calls). `raytrace`'s `Scene.trace` first sees rays
+    that miss and return before its loop, and compiled that early its hit
+    path left for the core loop for good: 10% more instructions.
+  - `_uniq`'s `list(dict.fromkeys(items))` runs in place: `dict.fromkeys`
+    over a list or tuple of keys the native probes settle is a leaf (as
+    `int.from_bytes` was), those probes take tuples of `None`, ints,
+    strings, bytes, `int`-like instances and such tuples (`(RANGE, (48,
+    57))`), and `list(d)` of an exact dict is its keys.
+  - An instance whose class has a Python `__len__` and no `__bool__`
+    (`not item` of a `SubPattern`) is tested natively, its `__len__`
+    evaluated as a pure leaf; `obj[a:b]` of an instance with a Python
+    `__getitem__` calls it directly from compiled code, as a subscript
+    did; and compiled code builds `x[a:b:c]`'s slice (`BUILD_SLICE` left
+    compiled code altogether). Parse: 774,000 to 659,000 instructions.
+  - `s * n` of a `str`, `bytes` or `bytearray` copied once per repeat;
+    doubling the copy takes 2.5% off importing a dozen common modules
+    (`b"\0" * 65536` was 65,536 calls), and reading a cached module's
+    identifiers checks their text as UTF-8 once instead of at every read
+    (0.9% more).
+  - A frameless leaf may build a tuple of up to three items (`return (x,
+    1)`, a sort key's `(-x, x)`): `map` over such a function cost 4.3
+    times CPython's instructions per item through tier 2's native entry,
+    and a third of that now. (A native caller's callback that isn't a
+    leaf still pays tier 2's entry, about six times a frame-JIT call's:
+    `statistics`' `_sum` over `map(_exact_ratio, ...)`, 1.8 times CPython.)
+  - Still open: `subpattern[-1] = ...` through a Python `__setitem__`
+    leaves compiled code (a switched call's result would need discarding,
+    which direct calls don't do), and a raise caught in compiled code
+    registers once a parse.
+
 - **Fewer registered direct calls, and frameless bodies with raise guards**
   (PR #107). A frame-JIT direct callee runs lazily until something needs
   the core loop's view, and then it registers with every lazy caller above

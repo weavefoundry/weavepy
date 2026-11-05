@@ -196,6 +196,9 @@ pub(crate) enum Verdict {
     /// awaits through (see `stdlib::asyncio_mod::behaves_native`); `name`
     /// unused.
     NativeFutureLike = 9,
+    /// The class's `__lt__`, `__le__`, `__gt__` and `__ge__` are `int`'s
+    /// (see `object::int_order_value`); `name` unused.
+    IntOrder = 10,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

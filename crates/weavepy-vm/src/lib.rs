@@ -20944,6 +20944,29 @@ impl Interpreter {
             )
         }
         match ins.op {
+            // `x[a:b:c]`'s slice (`range(n)[::-1]`): the bounds move in.
+            OpCode::BuildSlice if matches!(ins.arg, 2 | 3) && len >= ins.arg as usize => {
+                let n = ins.arg as usize;
+                let at = len - n;
+                // SAFETY: `len >= n`: the bounds leave their slots.
+                let (start, stop, step) = unsafe {
+                    (
+                        base.add(at).read(),
+                        base.add(at + 1).read(),
+                        if n == 3 {
+                            base.add(at + 2).read()
+                        } else {
+                            Object::None
+                        },
+                    )
+                };
+                // SAFETY: the first bound's slot takes the slice.
+                unsafe {
+                    base.add(at)
+                        .write(Object::Slice(Rc::new(PySlice { start, stop, step })));
+                }
+                Some(at + 1)
+            }
             OpCode::BinarySubscr => {
                 if len < 2 {
                     return None;
@@ -29696,8 +29719,9 @@ impl Interpreter {
                 .all(|x| matches!(x, Object::Int(_) | Object::Str(_))),
             Object::Type(t) => crate::object::type_hash_is_identity(t),
             Object::Instance(inst) => {
-                inst.native.get().is_none()
-                    && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
+                (inst.native.get().is_none()
+                    && inst.class_dunder(crate::types::Dunder::Hash).object_owner())
+                    || crate::object::int_like_value(inst).is_some()
             }
             _ => false,
         }
@@ -30332,6 +30356,7 @@ impl Interpreter {
                     NativeTruth::AlwaysTrue => Err(true),
                     NativeTruth::Bool(b, op) => Ok((Rc::as_ptr(b), false, *op)),
                     NativeTruth::Len(b) => Ok((Rc::as_ptr(b), true, 0)),
+                    NativeTruth::PyLen => Ok((std::ptr::null(), true, PY_LEN_TRUTH)),
                     NativeTruth::Decline => Err(false),
                 }
             };
@@ -30353,6 +30378,13 @@ impl Interpreter {
             Err(true) => return Some(true),
             Err(false) => return None,
         };
+        // A Python `__len__` evaluated in place, or the full path's.
+        if op == PY_LEN_TRUTH {
+            return match self.leaf_instance_len(v)? {
+                Object::Int(n) => Some(n != 0),
+                _ => None,
+            };
+        }
         // A deque's `__bool__`: its direct operation, without the call.
         if op == crate::stdlib::collections_native::OP_BOOL {
             if let Some(Object::Bool(b)) = crate::stdlib::collections_native::fast_op(op, v, None) {
@@ -30410,6 +30442,7 @@ impl Interpreter {
                         NativeTruth::Bool(b, op)
                     };
                 }
+                Some(Object::Function(_)) if is_len => return NativeTruth::PyLen,
                 Some(_) => return NativeTruth::Decline,
             }
         }
@@ -30850,6 +30883,20 @@ impl Interpreter {
                     );
                 }
             }
+            // And `dict.fromkeys` over a list or tuple of plain keys.
+            if let Some(Object::ClassMethod(cm)) = builtin_types()
+                .dict_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("fromkeys"))
+            {
+                if let Object::Builtin(f) = cm.func() {
+                    calls.insert(
+                        Rc::as_ptr(&f) as usize,
+                        LeafKind::Fast(crate::builtins::dict_fromkeys_leaf),
+                    );
+                }
+            }
             // `dict`'s subscript dunders, as a dict subclass that doesn't
             // override them inherits them (`defaultdict`, `Counter`,
             // `OrderedDict` reads): a present key reads, and a plain key
@@ -30968,6 +31015,8 @@ impl Interpreter {
                 }
                 [Object::List(l)] => l.try_borrow().ok()?.clone(),
                 [Object::Tuple(t)] => t.to_vec(),
+                // An exact dict's keys, in order (`list(dict.fromkeys(xs))`).
+                [Object::Dict(d)] => d.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect(),
                 _ => return None,
             };
             let obj = Object::new_list(items);
@@ -31421,7 +31470,7 @@ impl Interpreter {
             None => default
                 .filter(|_| {
                     type_attr_certainly_missing(cls, name)
-                        || (cls.flags.is_builtin
+                        || (type_miss_memo_ok(cls, name)
                             && cls.verdict_cached(crate::types::Verdict::TypeAttrMissing, name)
                                 == Some(true))
                 })
@@ -34404,6 +34453,16 @@ impl Interpreter {
                 let stop = frame.pop()?;
                 let start = frame.pop()?;
                 let container = frame.pop()?;
+                // (Compiled code calls an instance's Python `__getitem__`
+                // itself once its site has sliced one: see `h_slice_dunder`.)
+                if matches!(container, Object::Instance(_)) {
+                    if let Some(ext) = code_vm_ext(&frame.code) {
+                        let pc = frame.pc as usize - 1;
+                        if !instance_site(ext, pc) {
+                            instance_site_note(ext, frame.code.instructions.len(), pc);
+                        }
+                    }
+                }
                 let key = Object::Slice(Rc::new(PySlice {
                     start,
                     stop,
@@ -45311,10 +45370,10 @@ impl Interpreter {
         {
             return Ok(args[2].clone());
         }
-        // A builtin class's miss, remembered per class version, as
-        // `hasattr` remembers it.
+        // A class's miss, remembered per class version, as `hasattr`
+        // remembers it.
         let builtin_type = match &args[0] {
-            Object::Type(t) if t.flags.is_builtin => Some(t),
+            Object::Type(t) if type_miss_memo_ok(t, &name) => Some(t),
             _ => None,
         };
         if let Some(t) = builtin_type {
@@ -45371,11 +45430,11 @@ impl Interpreter {
         {
             return Ok(Object::Bool(false));
         }
-        // A builtin class's miss, remembered per class version (a
-        // struct-sequence class, whose attributes can be set, moves its
-        // version when they are).
+        // A class's miss, remembered per class version (a struct-sequence
+        // class, whose attributes can be set, moves its version when they
+        // are).
         let builtin_type = match &args[0] {
-            Object::Type(t) if t.flags.is_builtin => Some(t),
+            Object::Type(t) if type_miss_memo_ok(t, &name) => Some(t),
             _ => None,
         };
         if let Some(t) = builtin_type {
@@ -74851,6 +74910,22 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
 }
 
+/// Whether the full path may remember class `t`'s miss of `name` per class
+/// version (see [`crate::types::Verdict::TypeAttrMissing`]): a builtin
+/// class's, or a Python class's under plain `type` with no entry for the
+/// name anywhere on its MRO, which nothing but a change to one of those
+/// dictionaries (moving the version) can supply. That covers a class with
+/// a builtin base, which [`type_attr_certainly_missing`] can't vouch for
+/// (`hasattr(type(op), "_asyncio_future_blocking")` of `re`'s opcodes, an
+/// `int` subclass).
+fn type_miss_memo_ok(t: &TypeObject, name: &str) -> bool {
+    t.flags.is_builtin
+        || (Interpreter::plain_metaclass(t)
+            && t.c_ext_ptr.get() == 0
+            && t.native_kind.get() == 0
+            && t.lookup(name).is_none())
+}
+
 /// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
 /// in its `AttributeError` without running any code: a name that is no
 /// dunder (those have special and synthesized forms) and not `mro`, that
@@ -83071,9 +83146,13 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code.instructions.len() <= 64;
     let pure_op = |ins: &weavepy_compiler::Instruction| {
         // A fresh empty list or dict is unobservable until stored, so
-        // a declined evaluation that made one still did nothing.
+        // a declined evaluation that made one still did nothing; so is a
+        // fresh tuple (`return (x, 1)`, a key function's pair).
         if matches!(ins.op, OpCode::BuildList | OpCode::BuildMap) {
             return ins.arg == 0;
+        }
+        if ins.op == OpCode::BuildTuple {
+            return (1..=3).contains(&ins.arg);
         }
         matches!(
             ins.op,
@@ -83967,9 +84046,15 @@ enum NativeTruth {
     Bool(Rc<crate::object::BuiltinFn>, u8),
     /// A registered native `__len__`.
     Len(Rc<crate::object::BuiltinFn>),
+    /// No `__bool__`, and a Python `__len__` (`re`'s `SubPattern`): its
+    /// result when it evaluates as a pure leaf (see `leaf_instance_len`).
+    PyLen,
     /// Anything else: the full path decides.
     Decline,
 }
+
+/// [`NativeTruth::PyLen`]'s stand-in operation in `leaf_instance_truth`.
+const PY_LEN_TRUTH: u8 = u8::MAX;
 
 /// [`inst_may_shadow`] first settled by a leaf site's bound (see
 /// [`LeafSiteData::limit`]): values laid over the class's names `keys`
@@ -84248,6 +84333,21 @@ pub fn sequence_concat_native(a: &Object, b: &Object) -> Result<Object, RuntimeE
     binary_op(a, b, BinOpKind::Add)
 }
 
+/// `out` (empty) made `times` copies of `unit`, back to back, by doubling
+/// what it holds (a copy per repeat made `b"\0" * 65536` 65,536 calls).
+fn repeat_into<T: Copy>(out: &mut Vec<T>, unit: &[T], times: usize) {
+    let total = unit.len() * times;
+    if total == 0 {
+        return;
+    }
+    out.reserve(total);
+    out.extend_from_slice(unit);
+    while out.len() < total {
+        let n = out.len().min(total - out.len());
+        out.extend_from_within(..n);
+    }
+}
+
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
@@ -84431,9 +84531,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             };
             let times = checked_repeat_count(cps.len(), *n, "string")?;
             let mut out = Vec::with_capacity(cps.len().saturating_mul(times));
-            for _ in 0..times {
-                out.extend_from_slice(&cps);
-            }
+            repeat_into(&mut out, &cps, times);
             Ok(Object::str_from_codepoints(out))
         }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
@@ -84455,10 +84553,12 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                     crate::error::PyException::from_builtin("MemoryError", ""),
                 ));
             }
-            for _ in 0..times {
-                out.push_str(x);
-            }
-            Ok(Object::from_str(out))
+            let mut bytes = out.into_bytes();
+            repeat_into(&mut bytes, x.as_bytes(), times);
+            // SAFETY: copies of a whole `str`, back to back, are UTF-8.
+            Ok(Object::from_str(unsafe {
+                String::from_utf8_unchecked(bytes)
+            }))
         }
         (O::Str(template), v, B::Mod) => {
             if percent_args_need_bridge(v) {
@@ -84555,18 +84655,14 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             let times = checked_repeat_count(x.len(), *n, "bytes")?;
             let mut out = try_alloc_vec(x.len() * times)?;
-            for _ in 0..times {
-                out.extend_from_slice(x);
-            }
+            repeat_into(&mut out, x, times);
             Ok(Object::new_bytes(out))
         }
         (O::ByteArray(x), O::Int(n), B::Mult) | (O::Int(n), O::ByteArray(x), B::Mult) => {
             let body = x.borrow().clone();
             let times = checked_repeat_count(body.len(), *n, "bytearray")?;
             let mut out = try_alloc_vec(body.len() * times)?;
-            for _ in 0..times {
-                out.extend_from_slice(&body);
-            }
+            repeat_into(&mut out, &body, times);
             Ok(Object::new_bytearray(out))
         }
         // Set operators accept any mix of `set`/`frozenset` operands; the

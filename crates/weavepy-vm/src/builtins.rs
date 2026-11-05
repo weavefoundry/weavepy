@@ -14071,6 +14071,42 @@ pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 
 /// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
 /// `bytes` buffer.
+/// `dict.fromkeys(keys[, value])` for the exact `dict` over a list or a
+/// tuple whose keys hash and compare natively (see
+/// [`crate::object::LeafProbe`]): `re._parser._uniq`'s
+/// `list(dict.fromkeys(items))`, the dedup idiom. `None` for anything else
+/// (a key a probe can't settle among them), which the full path builds.
+pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(t), keys, rest @ ..] = args else {
+        return None;
+    };
+    if !Rc::ptr_eq(t, &builtin_types().dict_) {
+        return None;
+    }
+    let value = match rest {
+        [] => Object::None,
+        [v] => v.clone(),
+        _ => return None,
+    };
+    let keys: Vec<Object> = match keys {
+        Object::List(l) => l.try_borrow().ok()?.clone(),
+        Object::Tuple(t) => t.to_vec(),
+        _ => return None,
+    };
+    let mut d = DictData::default();
+    for k in &keys {
+        let probe = crate::object::LeafProbe::new(k)?;
+        match d.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(_) => {}
+            crate::dictmap::ProbeEntry::Vacant(v) if probe.miss_is_exact() => {
+                v.insert(DictKey(k.clone()), value.clone());
+            }
+            crate::dictmap::ProbeEntry::Vacant(_) => return None,
+        }
+    }
+    Some(Ok(Object::Dict(Rc::new(RefCell::new(d)))))
+}
+
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     // One to seven bytes in either order: the machine int, with no byte
     // order string or copy of the data built.

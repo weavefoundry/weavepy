@@ -1587,6 +1587,23 @@ impl<'a> Lower<'a> {
             }
             (None, None) => {
                 let at = self.slot_addr(start);
+                // A method cached in a local (`get = source.get`): its bound
+                // method unpacked first, as the call's own path unpacks it.
+                if plan.has_self {
+                    let tag = self.tag_at(at);
+                    let is_bound =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.bound));
+                    let unpack = self.b.create_block();
+                    let unpacked = self.b.create_block();
+                    self.b.ins().brif(is_bound, unpack, &[], unpacked, &[]);
+                    self.b.switch_to_block(unpack);
+                    self.call(super::h_unpack_bound as *const () as usize, &[at], true);
+                    self.b.ins().jump(unpacked, &[]);
+                    self.b.switch_to_block(unpacked);
+                }
+                let at = self.slot_addr(start);
                 let tag = self.tag_at(at);
                 let not_fn =
                     self.b
