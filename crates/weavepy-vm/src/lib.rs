@@ -16420,6 +16420,33 @@ impl Interpreter {
     /// leaf, its result in place, or as an inline activation switched to
     /// here. `false` touches nothing (the native `__call__` takes the call,
     /// its errors included).
+    /// [`Self::core_partial_call`] of a partial over a builtin with a leaf
+    /// half and no stored keywords: the result, for `ops` the partial
+    /// instance and the call's positionals, of the builtin's leaf half
+    /// over the stored positionals and those (four at most). `None` for
+    /// anything else, a decline or an error.
+    fn core_partial_builtin(&self, ops: &[Object]) -> Option<Object> {
+        let [Object::Instance(inst), args @ ..] = ops else {
+            return None;
+        };
+        let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
+        let (b, n) = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
+            let Object::Builtin(b) = func else {
+                return None;
+            };
+            let n = stored.len() + args.len();
+            if !kw.is_empty() || b.binds_instance || n > buf.len() {
+                return None;
+            }
+            for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
+                *slot = v.clone();
+            }
+            Some((b.clone(), n))
+        })?;
+        let kind = self.leaf_call_kind(&b)?;
+        self.leaf_builtin_call(kind, &b, &buf[..n])?.ok()
+    }
+
     #[inline(never)]
     fn core_partial_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
@@ -16462,6 +16489,22 @@ impl Interpreter {
         });
         if let Some(r) = r {
             // The operands leave the stack, the result in their place.
+            self.release_call_operands(&mut frame.stack, callee_slot);
+            frame.stack.push(r);
+            frame.pc = pc as u32 + 1;
+            // SAFETY: the running activation's last-pc slot.
+            unsafe { *sw.last = pc };
+            // SAFETY: the running thread's own flag (see `quiet_run`).
+            if unsafe { (*sw.maybe_dead).get() } {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            }
+            return true;
+        }
+        // A builtin with a leaf half over the merged arguments
+        // (`partial(operator.add, 1)`): its result in place. A decline or
+        // an error leaves the call to the native `__call__`, which repeats
+        // it (a leaf runs no code, so nothing is observed twice).
+        if let Some(r) = self.core_partial_builtin(&frame.stack[callee_slot + 1..]) {
             self.release_call_operands(&mut frame.stack, callee_slot);
             frame.stack.push(r);
             frame.pc = pc as u32 + 1;
@@ -21342,7 +21385,23 @@ impl Interpreter {
                         // SAFETY: a store between two instructions (the probe
                         // and the insert run no code).
                         let st = unsafe { st.peek_mut() }?;
-                        if st.get_index_of(&probe).is_some() {
+                        // One probe settles both outcomes when its miss is final
+                        // (as the probe found it): the key moves in, or the
+                        // duplicate leaves.
+                        if Self::core_droppable(key) {
+                            // SAFETY: the key leaves the stack exactly once,
+                            // into the set or dropped; the probe's last use
+                            // is before either.
+                            match st.insert_probe_if(
+                                &probe,
+                                |p| p.miss_is_exact(),
+                                || DictKey(unsafe { base.add(len - 1).read() }),
+                            ) {
+                                Some(true) => {}
+                                Some(false) => unsafe { drop_hot(base.add(len - 1).read()) },
+                                None => return None,
+                            }
+                        } else if st.get_index_of(&probe).is_some() {
                             if !Self::core_droppable(key) {
                                 return None;
                             }
@@ -23554,8 +23613,21 @@ impl Interpreter {
         let ext = code_vm_ext(code)?;
         let tries = ext.leaf_tries.load(std::sync::atomic::Ordering::Relaxed);
         let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
-        if bails >= LEAF_BAIL_LIMIT && bails > done {
-            return None;
+        let retry = bails >= LEAF_BAIL_LIMIT && bails > done;
+        if retry {
+            // Given up: the skipped calls count as bails, and one in
+            // `LEAF_RETRY_EVERY` tries again. The first attempts can come
+            // before the body's sites resolve (its global stamps fill as the
+            // core loop warms its site tables), and a retry that finishes
+            // starts the counts over.
+            let skips = bails + 1;
+            if skips >= u64::from(u32::MAX) || skips % LEAF_RETRY_EVERY != 0 {
+                if skips < u64::from(u32::MAX) {
+                    ext.leaf_tries
+                        .store(tries + (1 << 32), std::sync::atomic::Ordering::Relaxed);
+                }
+                return None;
+            }
         }
         let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         let r = 'eval: {
@@ -23596,6 +23668,11 @@ impl Interpreter {
                 self.pure_leaf_eval::<false, false>(code, f, args)
             }
         };
+        if retry && r.is_some() {
+            ext.leaf_tries
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            return r;
+        }
         // (Each half stops counting when full: the counts only steer the
         // decision above.)
         let bump = if r.is_some() { 1 } else { 1 << 32 };
@@ -44087,6 +44164,21 @@ impl Interpreter {
             Object::Tuple(items) => Ok(items.to_vec()),
             Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
             Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
+            // Draining a view runs no code (the entries' clones and the
+            // pairs' tuples), so the dict can't change under it: its entries
+            // in order, as its iterator would give them.
+            Object::DictView(view) => {
+                use crate::object::DictViewKind as K;
+                let d = view.dict.borrow();
+                Ok(match view.kind {
+                    K::Keys => d.keys().map(|k| k.0.clone()).collect(),
+                    K::Values => d.values().cloned().collect(),
+                    K::Items => d
+                        .iter()
+                        .map(|(k, v)| Object::new_tuple_array([k.0.clone(), v.clone()]))
+                        .collect(),
+                })
+            }
             Object::Generator(_) | Object::Instance(_) => {
                 // CPython presizes via `PyObject_LengthHint` when building a
                 // container from an arbitrary iterable: `len(obj)` first,
@@ -72102,8 +72194,9 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 17] = [
+    let pure: [leaf_builtins::Fast; 18] = [
         leaf_issubclass,
+        crate::seqiter::hash_fast,
         Interpreter::leaf_hasattr,
         crate::seqiter::min_fast,
         crate::seqiter::max_fast,
@@ -72121,7 +72214,9 @@ fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
         crate::builtins::bytes_decode_leaf,
         crate::builtins::dict_getitem_leaf,
     ];
-    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f)) || crate::stdlib::math::is_fast_half(f)
+    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f))
+        || crate::stdlib::math::is_fast_half(f)
+        || crate::stdlib::operator_accel::is_fast_half(f)
 }
 
 /// A receiver's builtin variant, for the method table.
@@ -83203,6 +83298,10 @@ fn pure_leaf_warm(code: &CodeObject) -> bool {
 /// the core loop stops trying them when they rarely finish (see
 /// `CodeConstObjects::leaf_tries`).
 const LEAF_BAIL_LIMIT: u64 = 64;
+
+/// How often a code object whose frameless evaluations gave up tries one
+/// again (see [`LEAF_BAIL_LIMIT`]): once in this many calls.
+const LEAF_RETRY_EVERY: u64 = 1024;
 
 /// Whether `f`'s code is a pure or an effect leaf (the core loop's
 /// frameless call candidates).

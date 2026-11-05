@@ -1702,6 +1702,27 @@ impl SetMap {
         }
     }
 
+    /// [`Self::insert_probe`] that adds the key only when `exact` says the
+    /// probe's miss is final (asked after the probe ran): `Some(true)` it was
+    /// added, `Some(false)` an equal key was present, `None` the miss can't
+    /// be trusted and nothing changed.
+    #[inline]
+    pub fn insert_probe_if<Q: Probe + ?Sized>(
+        &mut self,
+        key: &Q,
+        exact: impl FnOnce(&Q) -> bool,
+        make: impl FnOnce() -> DictKey,
+    ) -> Option<bool> {
+        match self.0.probe_entry(key) {
+            ProbeEntry::Occupied(_) => Some(false),
+            ProbeEntry::Vacant(v) if exact(key) => {
+                v.insert(make(), ());
+                Some(true)
+            }
+            ProbeEntry::Vacant(_) => None,
+        }
+    }
+
     /// The position of the key equal to `key`. The probe is hashed even
     /// when the table is empty (CPython hashes first, so a raising
     /// `__hash__` surfaces from `x in set()`).

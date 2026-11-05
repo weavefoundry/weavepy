@@ -245,6 +245,29 @@ branch and pull request.
 
 ## Done
 
+- **Calls into builtins from frameless code and `functools.partial`** (PR
+  #107). Found by a sweep of about 70 everyday operations against CPython
+  3.14 (instructions on macOS, before and after, with CPython's):
+  - `partial(operator.add, 1)(2)`: 3,944 to 977 (602). The core loop's
+    partial lane took only Python callees, so a builtin one went through
+    the generic call; it now runs a builtin's leaf half over the merged
+    arguments. `operator`'s arithmetic functions have leaf halves for two
+    plain ints or floats, so `operator.add(1, 2)` itself fell from 675 to
+    508 (473).
+  - `hash(obj)` with `def __hash__(self): return hash(self.x)`: 3,460 to
+    2,210 (966), and storing such an object as a dict key 5,463 to 4,238
+    (1,006). `hash`'s fast half wasn't on the list a frameless body may
+    call, so the body ran framed, through a nested interpreter loop. A body
+    whose first frameless evaluations all gave up (its global sites can
+    resolve only after those first calls) now retries one call in 1,024,
+    where it used to stop for good.
+  - `{x for x in xs}`: `SET_ADD` probed the set twice for a new key; a
+    comprehension of eight ints went from 5,820 to 5,272 (Linux).
+  - `list(d.items())` of 20 entries: 15,521 to 7,591 (Linux; CPython 3.14
+    about 7,200 on macOS). Draining a view stepped its iterator, with the
+    mutation guards, an item at a time; nothing runs that could change the
+    dict while a view drains, so the entries copy over in one pass.
+
 - **`contextmanager`, exception construction and `len()` in compiled code**
   (PR #107). Instructions a call on Linux (callgrind), before and after:
   - A `with` of a `contextlib.contextmanager` function: 13,458 to 11,410.
