@@ -285,10 +285,18 @@ branch and pull request.
     tables, which for a short input took more than the compression:
     `bytes_codecs` 4% faster (warm time on macOS; valgrind, which counts
     the zeroing a byte at a time, put it at 15%).
-  - Measured and left: a native caller's callback (`map(f, xs)` with a
-    Python `f` that isn't a leaf) costs 3.4 times CPython's. Running its
-    compiled body straight from the callback stops at its first call,
-    which needs an activation switch to raise through.
+  - A native caller's callback into a compiled function (`map(f, xs)`, a
+    sort key) enters the body's native code straight from its lean frame,
+    with an activation switch made for it, as a native caller's generator
+    step already did, instead of through a burst of the core loop. An
+    adapter also skips its pure-leaf attempt, and the item's peek, for a
+    callback whose code isn't a leaf. For `map(f, xs)` with an `f` that
+    isn't a leaf, that's 3,905 to 3,358 instructions an item (CPython
+    3.13: 1,191), and `statistics` 3% fewer.
+  - Measured and left: those callbacks still cost 2.8 times CPython's,
+    mostly in the adapter's step and the lean frame around the call. Running
+    a compiled body with no switch at all stops at its first call, which
+    needs one to raise through.
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless

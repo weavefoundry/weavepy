@@ -11488,7 +11488,20 @@ impl Interpreter {
             shell: None,
         };
         let mut prev_pc: Option<usize> = None;
-        let exit = self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc);
+        // A compiled body runs straight from here, its return handed back
+        // (a native caller's callback: `map(f, xs)`, a sort key), as a
+        // generator step's does (see `quiet_native_step`).
+        #[cfg(feature = "jit")]
+        let native = self.lean_entry_native(frame);
+        #[cfg(not(feature = "jit"))]
+        let native = None;
+        let exit = self.quiet_run_from(
+            frame,
+            QuietShell::Lazy(&mut act),
+            snap_gen,
+            &mut prev_pc,
+            native,
+        );
         Self::sync_lazy_tb_lasti(act.shell.as_deref(), &frame.code, &exit);
         let outcome = match (exit, act.shell) {
             // The whole activation ran without ever needing its shell.
@@ -49873,6 +49886,22 @@ impl Interpreter {
         // SAFETY: the frame, which the step holds while the body runs, holds
         // the code and with it its native code.
         .then(|| unsafe { &*std::ptr::from_ref(native) })
+    }
+
+    /// [`Self::gen_step_native`] for a fresh ordinary frame a lean run
+    /// starts: its code's compiled body, when that enters at its first
+    /// instruction.
+    #[cfg(feature = "jit")]
+    fn lean_entry_native(&self, frame: &Frame) -> Option<&'static frame_jit::Native> {
+        if frame.pc != 0 || !frame.stack.is_empty() || self.recs.full() {
+            return None;
+        }
+        let ext = code_vm_ext(&frame.code)?;
+        let native = ext.frame_jit.get(frame.locals.len())?;
+        (ext.dispatch_len > 0 && native.enters_at(0))
+            // SAFETY: as `gen_step_native`'s: the frame holds the code and
+            // with it its native code.
+            .then(|| unsafe { &*std::ptr::from_ref(native) })
     }
 
     /// A generator that just finished holds no frame, so it can neither

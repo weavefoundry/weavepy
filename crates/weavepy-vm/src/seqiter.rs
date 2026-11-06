@@ -2048,6 +2048,24 @@ fn cursor_advance(c: &Rc<RefCell<PyIterator>>) -> Option<()> {
     unsafe { c.peek_mut() }?.pure_skip().then_some(())
 }
 
+/// Whether [`Interpreter::pure_callback`] could run `func` at all: not a
+/// Python function (or a method over one) whose code isn't a pure leaf,
+/// one load where that verdict is recorded.
+#[inline]
+fn pure_callback_maybe(func: &Object) -> bool {
+    let f = match func {
+        Object::Function(f) => f,
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Function(f) => f,
+            _ => return true,
+        },
+        _ => return true,
+    };
+    // SAFETY: a function's code is only replaced under the GIL, and the
+    // reference ends here.
+    crate::code_is_pure_leaf(unsafe { &*f.code.as_ptr() })
+}
+
 impl Interpreter {
     /// `func(*args)` for an adapter's callback when the call runs no Python
     /// code: a warm pure-leaf function or a bound method over one (evaluated
@@ -2157,6 +2175,13 @@ impl Interpreter {
         // (pure callbacks call nothing); the view ends with this call.
         let st = unsafe { l.state.peek_mut() }?;
         match st {
+            // (A callback that can't run as a pure leaf, a Python function
+            // that isn't one say, skips the item's peek.)
+            LazyIterKind::Map { func, .. } | LazyIterKind::Filter { func, .. }
+                if !pure_callback_maybe(func) =>
+            {
+                None
+            }
             LazyIterKind::Map { func, iters, .. } => match iters.as_slice() {
                 [Object::Iter(c)] => {
                     let v = cursor_peek(c)?;
