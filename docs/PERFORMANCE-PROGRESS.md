@@ -297,6 +297,12 @@ branch and pull request.
     mostly in the adapter's step and the lean frame around the call. Running
     a compiled body with no switch at all stops at its first call, which
     needs one to raise through.
+  - A property whose Python setter is one store (`self._w = value`) runs
+    in place from compiled code too: where the plain attribute store
+    declines, a second helper runs the setter frameless, as the core loop
+    already did, instead of leaving the native code for the interpreter.
+    A property store costs 1,251 instructions instead of 2,078 (CPython
+    3.13: 1,379).
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless

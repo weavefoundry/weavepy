@@ -1,7 +1,10 @@
 """A property whose Python setter is one store (`self._w = value`), which
 runs without a frame, keeps CPython's results: the stored value, a
 slotted class's member, a constant stored, a setter replaced or
-deleted later, a subclass's override, and a setter that does more."""
+deleted later, a subclass's override, a setter that does more, and the
+references compiled stores give back (the value's, a receiver's from the
+stack, and a replaced value's finalizer)."""
+import sys
 
 
 class Box:
@@ -70,6 +73,30 @@ assert Counted.sets == 3000 and objs[3].width == 3001
 b = Box(0)
 b.flag = 5
 assert b.flag is True and b.__dict__ == {"_w": 0, "_f": True}
+
+
+class Dies:
+    died = 0
+
+    def __del__(self):
+        Dies.died += 1
+
+
+def refs(holders, v, n):
+    for i in range(n):
+        holders[0].width = v  # the receiver from the stack
+        h = holders[1]
+        h.width = v  # the receiver a local
+        h.width = Dies()  # the last value's owner, replaced next round
+
+
+holders = [Box(0), Box(0)]
+token = object()
+base = sys.getrefcount(token)
+for k in range(300):
+    refs(holders, token, 10)
+assert sys.getrefcount(token) == base + 1, (sys.getrefcount(token), base)
+assert holders[0].width is token and Dies.died == 2999, Dies.died
 
 # The setter replaced: later stores run the new one.
 Box.width = Box.width.setter(lambda self, v: setattr(self, "_w", -v))

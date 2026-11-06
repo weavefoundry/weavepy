@@ -5647,6 +5647,38 @@ unsafe extern "C" fn h_store_attr(
     }
 }
 
+/// A `STORE_ATTR` (the `pc`th instruction of `code`) whose plain store
+/// declined: `recv.name = *value` through a property's Python setter of
+/// the setter shape, frameless (see `Interpreter::leaf_setter_at`). `0`
+/// stored, the value released (and, with `release_recv`, the receiver's
+/// stack slot); anything else declined untouched.
+unsafe extern "C" fn h_setter_store(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    recv: *mut Object,
+    value: *mut Object,
+    release_recv: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and the
+    // operands' initialized slots (the receiver's a local's or the stack's).
+    unsafe {
+        let (r, v) = (&*recv, &*value);
+        if !matches!(r, Object::Instance(_)) || !droppable(v) || !droppable(r) {
+            return 1;
+        }
+        let interp = &mut *(*st).interp.cast_mut();
+        if !interp.leaf_setter_at(&*code, pc as usize, r, v) {
+            return 1;
+        }
+        crate::drop_hot_at(value);
+        if release_recv != 0 {
+            crate::drop_hot_at(recv);
+        }
+        0
+    }
+}
+
 /// `DELETE_ATTR` (the `pc`th instruction of `code`) of the instance atop a
 /// `len`-deep stack, as the core loop's arm runs it
 /// (`Interpreter::core_delete_attr`): `0` the attribute and the receiver
@@ -15281,7 +15313,8 @@ impl<'a> Lower<'a> {
             )
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
-        self.branch_out(r, out);
+        let store_pc = self.b.ins().iconst(types::I64, pc as i64 + 1);
+        self.setter_store(r, store_pc, local, slot, false, out);
         self.depth -= 1;
         self.set_last(pc + 1);
         self.check_released(pc + 2);
@@ -17093,11 +17126,51 @@ impl<'a> Lower<'a> {
         };
         let r = self.call(helper, &[code, pcv, at], true).expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
-        self.branch_out(r, out);
+        if self.inlining() {
+            self.branch_out(r, out);
+        } else {
+            // A property's setter of the setter shape, in place.
+            let recv = self
+                .b
+                .ins()
+                .iadd_imm(at, std::mem::size_of::<Object>() as i64);
+            self.setter_store(r, pcv, recv, at, true, out);
+        }
         self.depth -= 2;
         self.set_last(pc);
         self.check_released(pc + 1);
         true
+    }
+
+    /// Where a `STORE_ATTR`'s plain store declined (`declined` non-zero):
+    /// [`h_setter_store`] of `recv.name = *value` (the instruction at
+    /// `store_pc`), then `out` if that declines too; the current block
+    /// goes on after a store.
+    fn setter_store(
+        &mut self,
+        declined: Value,
+        store_pc: Value,
+        recv: Value,
+        value: Value,
+        release_recv: bool,
+        out: Block,
+    ) {
+        let tried = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(declined, tried, &[], done, &[]);
+        self.b.set_cold_block(tried);
+        self.b.switch_to_block(tried);
+        let code = self.code_ptr();
+        let rel = self.b.ins().iconst(types::I64, i64::from(release_recv));
+        let r = self
+            .call(
+                h_setter_store as *const () as usize,
+                &[self.st, code, store_pc, recv, value, rel],
+                true,
+            )
+            .expect("returns");
+        self.b.ins().brif(r, out, &[], done, &[]);
+        self.b.switch_to_block(done);
     }
 
     /// `TO_BOOL` of a local or the value on the stack through

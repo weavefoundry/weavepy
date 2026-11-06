@@ -10624,31 +10624,76 @@ impl Interpreter {
         f: &Rc<crate::object::PyFunction>,
         pc: usize,
     ) -> Option<Result<(), RuntimeError>> {
-        let code = f.code();
-        if code.arg_count != 2
-            || code.kwonly_count != 0
-            || code.has_varargs
-            || code.has_varkeywords
-            || !code_is_effect_leaf(&code)
-            || code_vm_ext(&code)?
-                .pure_leaf
-                .load(std::sync::atomic::Ordering::Relaxed)
-                != 16
-            || !pure_leaf_warm(&code)
-        {
+        let n = frame.stack.len();
+        if !self.leaf_setter_eval(f, &frame.stack[n - 1], &frame.stack[n - 2]) {
             return None;
         }
-        let n = frame.stack.len();
-        let args: [*const Object; 2] =
-            [&raw const frame.stack[n - 1], &raw const frame.stack[n - 2]];
-        let done = self.leaf_init_eval(&code, f, &args)?;
-        drop(done);
         let receiver = frame.stack.pop().expect("checked by the caller");
         let value = frame.stack.pop().expect("checked by the caller");
         frame.pc = pc as u32 + 1;
         self.release(receiver);
         self.release(value);
         Some(Ok(()))
+    }
+
+    /// A Python property setter `f` of the setter shape (see
+    /// `effect_setter_shape`) run frameless on `receiver` and `value`
+    /// (borrowed: the store takes its own reference): whether it ran (a
+    /// decline stored nothing).
+    fn leaf_setter_eval(
+        &mut self,
+        f: &Rc<crate::object::PyFunction>,
+        receiver: &Object,
+        value: &Object,
+    ) -> bool {
+        let code = f.code();
+        if code.arg_count != 2
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || !code_is_effect_leaf(&code)
+            || code_vm_ext(&code)
+                .is_none_or(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) != 16)
+            || !pure_leaf_warm(&code)
+        {
+            return false;
+        }
+        let args: [*const Object; 2] = [receiver, value];
+        self.leaf_init_eval(&code, f, &args).is_some()
+    }
+
+    /// `receiver.name = value` (the `STORE_ATTR` at `pc` of `code`) for a
+    /// property whose Python setter is the setter shape, as the core
+    /// loop's `try_leaf_setter` runs it (for compiled code, see
+    /// `frame_jit::h_setter_store`): whether it ran. The operands stay
+    /// where they are, for the caller to release.
+    pub(crate) fn leaf_setter_at(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        receiver: &Object,
+        value: &Object,
+    ) -> bool {
+        let Object::Instance(inst) = receiver else {
+            return false;
+        };
+        let Some(ins) = code.instructions.get(pc) else {
+            return false;
+        };
+        if ins.op != OpCode::StoreAttr || !Self::default_setattr(inst.cls_raw()) {
+            return false;
+        }
+        let Some(LeafAttr::Property(prop)) = Self::leaf_resolve_instance_attr(code, inst, ins.arg)
+        else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the setter cell; the clone is
+        // taken before anything else runs.
+        let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
+            return false;
+        };
+        let f = f.clone();
+        self.leaf_setter_eval(&f, receiver, value)
     }
 
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
