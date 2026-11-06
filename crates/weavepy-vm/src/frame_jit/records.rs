@@ -699,8 +699,11 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
         // SAFETY: a guard-free read of the memoized plan; nothing runs
         // before its last use.
         let (ver, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
-        if *ver != ty.attr_version.get() || plan.user_new.is_some() {
+        if *ver != ty.attr_version.get() {
             return None;
+        }
+        if plan.user_new.is_some() {
+            return new_direct(st, call, len);
         }
         // What runs on the frame alone (a store-only or leaf `__init__`, the
         // bare allocation): a lazily running activation stays lazy.
@@ -788,6 +791,120 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
         let rec_at = interp.recs.top();
         let rec = &mut *rec_at;
         std::ptr::write(&raw mut (*rec.st.lazy).init_inst, Some(inst));
+        rec.extra = true;
+        rec.st.clean = false;
+        Some(run(st, rec_at, native, None))
+    }
+}
+
+/// [`ctor_direct`] of a class with a plain Python `__new__` and `object`'s
+/// `__init__` (`fractions`' values) that has native code: `__new__` entered as a
+/// direct call of the class and the arguments, its activation carrying the
+/// rest of the construction (see `InlineAct::new_init`). A return of an
+/// instance of the class itself whose `__init__` is `object`'s finishes
+/// cleanly; any other goes through the core loop's return, which runs the
+/// `__init__` (`Interpreter::core_new_finish`). `None` touched nothing.
+///
+/// # Safety
+///
+/// As [`ctor_direct`]'s.
+#[inline(never)]
+unsafe fn new_direct(st: &mut State, call: CallAt, len: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let start = call.start();
+        let argc = call.argc();
+        let slot = st.stack.add(start);
+        let Object::Type(ty) = &*slot else {
+            return None;
+        };
+        let (_, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
+        let Some(Object::Function(new_f)) = &plan.user_new else {
+            return None;
+        };
+        // (The shapes `instantiate` treats before or around `__new__`, as
+        // `Interpreter::core_new_user` declines them; a named tuple's is
+        // its own lane's.)
+        // (One whose `__init__` runs too goes on through the core loop's
+        // return, which runs that `__init__` interpreted: the general path,
+        // which enters it natively, stays cheaper.)
+        if !plan.init_from_object
+            || plan.abstract_error.is_some()
+            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || plan.seeds_exception_args
+            || plan.tuple_new.is_some()
+            || ty.is_type_subclass()
+            || ty.native_kind.get() != 0
+            || ty.lazy_ctor.get() != 0
+            || ty.native_ext.get().is_some()
+        {
+            return None;
+        }
+        let code_rc: &Rc<CodeObject> = &*new_f.code.as_ptr();
+        let code: &CodeObject = code_rc;
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Interpreter::lean_code_ok(code)
+        {
+            return None;
+        }
+        let extended = Interpreter::has_extended_params(code);
+        let missing = Interpreter::lean_init_missing(new_f, code, argc + 1)?;
+        let cells = !code.cellvars.is_empty() || !code.freevars.is_empty();
+        if cells && code.cellvars.is_empty() && new_f.lean_cells_ref(code).is_none() {
+            return None;
+        }
+        let ext = crate::code_vm_ext(code)?;
+        let native: &super::Native = ext.frame_jit.get(code.varnames.len())?;
+        if !native.enters_at(0) {
+            return None;
+        }
+        let dc = &*st.depth_cell;
+        if dc.get() + 1 > crate::recursion::recursion_limit() {
+            return None;
+        }
+        // Committed: the frame as the core loop's arm has it at the call.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = call.pc();
+        let interp = &mut *st.interp.cast_mut();
+        let (ty, plan, new_f) = (ty.clone(), plan.clone(), new_f.clone());
+        // The class and the arguments, for the `__init__` a return that
+        // doesn't finish cleanly goes on to.
+        let mut ops = Vec::with_capacity(argc + 1);
+        ops.push(Object::Type(ty.clone()));
+        for k in 0..argc {
+            ops.push(crate::clone_hot(&*slot.add(2 + k)));
+        }
+        // The function takes the class's slot, and the class the empty
+        // self slot (`__new__`'s first argument).
+        let cls = slot.replace(Object::Function(new_f));
+        slot.add(1).write(cls);
+        let Object::Function(f) = &*slot else {
+            std::hint::unreachable_unchecked()
+        };
+        let bound = enter(
+            st,
+            call.pc() as usize,
+            start,
+            len,
+            Rc::as_ptr(f),
+            code_rc,
+            true,
+            BindArgs::Positional { missing, extended },
+            cells,
+            native.need(),
+            interp.recs.top(),
+            None,
+        );
+        assert!(bound, "the depth was checked above");
+        let rec_at = interp.recs.top();
+        let rec = &mut *rec_at;
+        std::ptr::write(
+            &raw mut (*rec.st.lazy).new_init,
+            Some(Box::new(crate::NewInit { ty, plan, ops })),
+        );
         rec.extra = true;
         rec.st.clean = false;
         Some(run(st, rec_at, native, None))
@@ -1229,6 +1346,9 @@ impl DirectRec {
             if let Some(inst) = act.init_inst.take() {
                 self.st.stack.write(inst);
             }
+            // A `__new__` whose instance needs no `__init__` (see
+            // `extra_allows_clean`): its result is the call's.
+            drop(act.new_init.take());
             // A `functools.lru_cache` miss's function returned: its result
             // is stored before the caller takes it.
             if act.lru.is_some() {
@@ -1253,7 +1373,17 @@ impl DirectRec {
     #[inline(never)]
     unsafe fn extra_allows_clean(&self) -> bool {
         // SAFETY: the caller's contract.
-        unsafe { (*self.st.lazy).init_inst.is_none() || matches!(&*self.st.stack, Object::None) }
+        unsafe {
+            let act = &*self.st.lazy;
+            let made = &*self.st.stack;
+            (act.init_inst.is_none() || matches!(made, Object::None))
+                && act.new_init.as_ref().is_none_or(|ni| {
+                    // An instance of the class itself whose `__init__` is
+                    // `object`'s, which a `__new__` override skips.
+                    ni.plan.init_from_object
+                        && matches!(made, Object::Instance(i) if std::ptr::eq(i.cls_raw(), Rc::as_ptr(&ni.ty)))
+                })
+        }
     }
 
     /// `status` as [`leave`] takes it: a clean return's ([`super::REC_RET`]

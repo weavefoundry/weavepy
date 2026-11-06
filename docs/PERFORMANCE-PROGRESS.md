@@ -345,6 +345,20 @@ branch and pull request.
     6,667 (CPython 3.13: 4,360), the benchmark's `guarded` miss 16,411
     instead of 17,418, and the method spread 1,286 instead of 2,144
     (CPython: 996).
+  - `super(C, cls).name` with a class for the receiver (a class method's,
+    `__new__`'s, as `fractions` makes its values) resolves in place from
+    compiled code, the attribute unbound, cached per site for the
+    receiver's version, instead of leaving for the interpreter. An
+    operator between two instances of one class calls the forward method
+    directly even when the class defines the reflected one too, which
+    CPython never tries for operands of one type. A class with a Python
+    `__new__` and `object`'s `__init__` is constructed by entering
+    `__new__`'s native body directly, and a class called with a spread
+    tuple or list (`type(self)(*segments)`) as a `CALL` of the items. A
+    generator's body inlines its small callees, as a function's does.
+    `Fraction(1, 3) + Fraction(2, 7)` costs 7,625 instructions instead of
+    15,591, `Fraction(i)` 4,717 instead of 9,565, and a genexp whose body
+    calls a small function 9,672 instead of 10,846 for eight items.
   - Measured and left: a user `__new__` (`pathlib`'s paths) still runs as
     two interpreter activations, at 2.1 times CPython's cost, and
     `super().__new__(cls)` at 3.4 times.

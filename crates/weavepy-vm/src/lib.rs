@@ -20781,6 +20781,31 @@ impl Interpreter {
         if !is_super_callable(g) || !Self::core_droppable(g) || !Self::core_droppable(cls_obj) {
             return None;
         }
+        // `super(C, cls).name` with a subclass of `C` for the receiver (a
+        // class method's, `__new__`'s): the attribute unbound, the self slot
+        // empty in the method form.
+        if let (Object::Type(c), Object::Type(k)) = (cls_obj, self_obj) {
+            if k.is_subclass_of(c) {
+                let f = Self::leaf_super_type_attr(code, c, k, pc as u32, ins.arg >> 2)?;
+                // SAFETY: all three operands leave the stack, the receiver
+                // too (a class, held by its module or its caller's frame
+                // besides): each was checked droppable or is plain.
+                unsafe {
+                    if !Self::core_droppable(&*base.add(len - 1)) {
+                        return None;
+                    }
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
+                    drop_hot_at(base.add(len - 3));
+                    base.add(len - 3).write(f);
+                    if ins.arg & 1 != 0 {
+                        base.add(len - 2).write(Object::Unbound);
+                        return Some(len - 1);
+                    }
+                    return Some(len - 2);
+                }
+            }
+        }
         let f = Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)?;
         // SAFETY: all three operands leave the stack; the two released ones
         // were checked droppable, and `self` moves into the shape the
@@ -30321,7 +30346,10 @@ impl Interpreter {
         let mixed = !matches!(b, Object::Instance(_));
         let cls = ai.cls_raw();
         let k = op as usize;
-        let (dunder, rdunder) = binop_dunders(op);
+        let (dunder, _) = binop_dunders(op);
+        // (Two instances of one class never try its reflected method: the
+        // forward one's result stands, `NotImplemented` its `TypeError`, as
+        // CPython's `SLOT1BINFULL` has it.)
         if !same
             || ai.native.get().is_some()
             || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
@@ -30330,12 +30358,6 @@ impl Interpreter {
                     cls,
                     crate::types::AttrKey::vm(crate::types::vm_key::IBINOP + k as u32),
                     op.inplace_dunder(),
-                ))
-            || (!mixed
-                && !Self::class_lacks(
-                    cls,
-                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
-                    rdunder,
                 ))
         {
             return None;
@@ -33226,6 +33248,91 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// `super(cls, k).name` for `k` a subclass of `cls`, as the proxy's
+    /// lookup answers it: the first entry past `cls` on `k`'s MRO, through
+    /// its descriptor with no instance (a plain function as it is, a static
+    /// method's function, a builtin that binds nothing), remembered per
+    /// site for `k`'s version. `None` for anything else (a class method, a
+    /// property, an entry only the full lookup synthesizes).
+    fn leaf_super_type_attr(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        k: &TypeObject,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let ver = k.attr_version.get();
+        let cls_id = Rc::as_ptr(cls) as usize as u64;
+        let slot = code_method_slot(code, cache_pc);
+        let stamp = code_stamp_slot(code, cache_pc);
+        // (The kinds past the instance receivers' 1 and 2.)
+        match stamp.map(|s| s.get()) {
+            Some([c, v, 3]) if c == cls_id && v == ver => {
+                if let Some(f) = slot.and_then(|s| s.get(ver)) {
+                    return Some(Object::Function(f));
+                }
+            }
+            Some([c, v, 4]) if c == cls_id && v == ver => {
+                if let Some(b) = slot.and_then(|s| s.get_inst_builtin(ver)) {
+                    return Some(Object::Builtin(b));
+                }
+            }
+            _ => {}
+        }
+        // (The lookup walks `k`'s MRO alone: its metaclass takes no part.)
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let name = code.names.get(name_idx as usize)?;
+        if name == "__class__" {
+            return None;
+        }
+        let dunder = name.starts_with("__") && name != "__new__";
+        let mro = k.mro.try_borrow().ok()?;
+        let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+        let key = crate::object::StrKey(name.as_str());
+        let mut found = None;
+        for owner in &mro[start..] {
+            if owner.c_ext_ptr.get() != 0 {
+                return None;
+            }
+            let d = owner.dict.try_borrow().ok()?;
+            if let Some(v) = d.get(&key) {
+                if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                    return None;
+                }
+                found = Some(v.clone());
+                break;
+            }
+            if dunder && owner.flags.is_builtin {
+                return None;
+            }
+        }
+        let f = match found? {
+            Object::StaticMethod(sm) => match sm.func() {
+                f @ Object::Function(_) => f,
+                _ => return None,
+            },
+            f @ Object::Function(_) => f,
+            Object::Builtin(b) if !b.binds_instance => Object::Builtin(b),
+            _ => return None,
+        };
+        if let (Some(s), Some(st)) = (slot, stamp) {
+            match &f {
+                Object::Function(func) => {
+                    s.set(ver, func);
+                    st.set([cls_id, ver, 3]);
+                }
+                Object::Builtin(b) => {
+                    s.set_inst_builtin(ver, b);
+                    st.set([cls_id, ver, 4]);
+                }
+                _ => {}
+            }
+        }
+        Some(f)
     }
 
     /// The leaf half of `load_method_ic_hit`: the plain function (or the

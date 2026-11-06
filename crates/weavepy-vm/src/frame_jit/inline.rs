@@ -469,8 +469,9 @@ pub(super) fn plan(
     budget: usize,
 ) -> Plans {
     let mut plans = Plans::default();
+    // (A generator's body inlines its callees too: an exit registers the
+    // lazily running generator before its levels bind, see `bind_levels`.)
     if !enabled()
-        || code.is_generator
         || code.is_coroutine
         || code.is_async_generator
         || depths.len() != code.instructions.len()
@@ -482,8 +483,14 @@ pub(super) fn plan(
         .iter()
         .enumerate()
         .filter(|&(pc, i)| {
-            (i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
-                || (i.op == OpCode::LoadAttr && depths[pc] >= 1 && crate::property_site(ext, pc))
+            // (A generator's body takes its calls in line, not a property's
+            // getter or an operator's method.)
+            let plain = !code.is_generator;
+            (plain && i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
+                || (plain
+                    && i.op == OpCode::LoadAttr
+                    && depths[pc] >= 1
+                    && crate::property_site(ext, pc))
                 || (matches!(i.op, OpCode::Call | OpCode::CallKw)
                     && call_start(code, ext, pc, depths[pc]) >= 0
                     && crate::await_send_after(code, pc).is_none())

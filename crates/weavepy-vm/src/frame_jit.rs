@@ -11337,6 +11337,11 @@ unsafe fn spread_direct(
         if !matches!(&*base.add(start + 3), Object::Unbound) {
             return None;
         }
+        // A class over a tuple or a list (`type(self)(*segments)`): its
+        // construction as a `CALL` of the items would run it.
+        if let (Object::Type(_), Object::Unbound) = (&*base.add(start), &*base.add(start + 1)) {
+            return spread_ctor(st, pc, start);
+        }
         // A bound method of a plain function (`f = obj.method`) spreads
         // as its function with the receiver in the self slot, as a `CALL`
         // expands it; a decline puts the method back.
@@ -11360,6 +11365,62 @@ unsafe fn spread_direct(
             drop(base.add(start + 1).replace(Object::Unbound));
         }
         r
+    }
+}
+
+/// [`spread_direct`] of a class: the items spread over the operands and
+/// the construction run as `records::ctor_direct` runs a `CALL`'s; a
+/// decline puts the spread back.
+///
+/// # Safety
+///
+/// As [`spread_direct`]'s.
+#[inline(never)]
+unsafe fn spread_ctor(st: &mut State, pc: usize, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract: four initialized operand slots.
+    unsafe {
+        let base = st.stack;
+        // (A class `ctor_direct` declines up front costs no spread: one
+        // with a `__new__` and an `__init__` of its own, or no plan yet.)
+        let Object::Type(ty) = &*base.add(start) else {
+            return None;
+        };
+        let (_, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
+        if plan.user_new.is_some() && !plan.init_from_object {
+            return None;
+        }
+        let n = match &*base.add(start + 2) {
+            Object::Tuple(t) => t.len(),
+            Object::List(l) => l.try_borrow().ok()?.len(),
+            _ => return None,
+        };
+        let len = start + 2 + n;
+        if len > st.cap || st.sw.is_null() {
+            return None;
+        }
+        let spread = base.add(start + 2).read();
+        let items: &[Object] = match &spread {
+            Object::Tuple(t) => t,
+            Object::List(l) => &(*l.as_ptr()),
+            _ => unreachable!("checked above"),
+        };
+        for (k, v) in items.iter().enumerate() {
+            base.add(start + 2 + k).write(crate::clone_hot(v));
+        }
+        match records::ctor_direct(st, records::CallAt::new(pc, start, n, None), len) {
+            Some(r) => {
+                drop(spread);
+                Some(r)
+            }
+            None => {
+                for k in 0..n {
+                    drop(base.add(start + 2 + k).read());
+                }
+                base.add(start + 2).write(spread);
+                base.add(start + 3).write(Object::Unbound);
+                None
+            }
+        }
     }
 }
 
