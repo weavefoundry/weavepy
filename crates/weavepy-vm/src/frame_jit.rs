@@ -7784,7 +7784,7 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
 
 /// How deep compiled callees may run inside their compiled callers' calls
 /// (each level holds two native frames and the helpers between them).
-pub(crate) const DIRECT_CALL_DEPTH: u32 = 48;
+pub(crate) const DIRECT_CALL_DEPTH: u32 = 128;
 
 /// Run the activation a compiled caller's `CALL` just switched to, the
 /// callee, through its own native code, from the caller's call helper:

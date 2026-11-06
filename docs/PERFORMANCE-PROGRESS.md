@@ -7,6 +7,15 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured later on November 6, 2026, at `02c5de6e` (PR #107), a PGO build
+against CPython 3.14 on the same host, interleaved in one session: warm time
+0.934, cold time 1.049, peak memory 1.278. Since `d07a0969` the moves are
+`context_managers` 1.40 to 1.25, `logging_mix` 1.23 to 1.16, `deepcopy` 1.21
+to 1.17, `oo_patterns` 1.02 to 0.95 and `chaos` 0.89 to 0.84. The worst warm
+times are `async_tree` 1.61, `class_creation` 1.31, `context_managers` 1.25,
+`tomllib_loads` and `deepcopy` 1.17, `logging_mix` 1.16 and `stdlib_utils`
+1.14.
+
 Measured on November 6, 2026, at `d07a0969` (PR #107), a PGO build against
 CPython 3.14 on the same host, interleaved in one session: warm time 0.948
 (geomean of 33 workloads), cold time 1.059, peak memory 1.262, and 0.961 of
@@ -497,6 +506,17 @@ branch and pull request.
     run) cut `stdlib_utils` by 1.2%, but `raytrace`'s `Scene.trace` meets
     the test too (its first rays miss the scene and return before the
     light loop), and taking it from tier 2 cost `raytrace` 8.4%.
+  - Compiled callees run directly inside their compiled callers' calls up
+    to 128 levels deep instead of 48 (the main thread reserves 1 GiB of
+    stack and a worker 64 MiB), so a recursion through `lru_cache`
+    misses or a solver's search stays native longer before publishing
+    its levels for the core loop: `go` takes 0.6% fewer instructions,
+    `closures_decorators` and `sudoku` 0.5%.
+  - Measured and left: not inlining a recursive call at all, instead of
+    once (`go`'s `Square.find` exits its unrolled level whenever the chain
+    runs deeper, binding every level for the core loop, 5,779 times a
+    call), cost `go` 3% more instructions: the frames the unrolled level
+    saves outweigh the exits.
   - Measured and left: tracking an untracked instance through a small
     helper when an in-line store puts a heap value in it (the write
     barrier), instead of leaving the store to the full helper, changed
