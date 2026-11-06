@@ -825,11 +825,7 @@ unsafe fn new_direct(st: &mut State, call: CallAt, len: usize) -> Option<u32> {
         // (The shapes `instantiate` treats before or around `__new__`, as
         // `Interpreter::core_new_user` declines them; a named tuple's is
         // its own lane's.)
-        // (One whose `__init__` runs too goes on through the core loop's
-        // return, which runs that `__init__` interpreted: the general path,
-        // which enters it natively, stays cheaper.)
-        if !plan.init_from_object
-            || plan.abstract_error.is_some()
+        if plan.abstract_error.is_some()
             || !matches!(plan.native, crate::types::NativeKind::Plain)
             || plan.seeds_exception_args
             || plan.tuple_new.is_some()
@@ -1304,12 +1300,154 @@ unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, binop: Binop<'
         {
             return finish_clean(st, rec, interp);
         }
+        // A `__new__` that made an instance of its class, whose `__init__`
+        // has native code: that runs next, straight from here.
+        if status == super::DIRECT_RET
+            && rec.extra
+            && !rec.st.lazy.is_null()
+            && rec.st.len == 1
+            && !(*rec.frame).locals.is_shared()
+            && !interp.countdown_out(2)
+            && crate::hot_gates::loop_gen() == rec.st.snap_gen
+        {
+            if let Some(r) = chain_init(st, rec, interp) {
+                return r;
+            }
+        }
         // Anything else is the core loop's to finish: the callee registers
         // first. (The record stays this level's until that's done: anything
         // the core loop's paths run nests above it.)
         let r = left_uncleanly(st, rec, status, binop);
         interp.recs.set_top(rec_at);
         r
+    }
+}
+
+/// [`leave`] of a `__new__` entered by [`new_direct`] that returned an
+/// instance of its class itself, whose `__init__` has native code: the
+/// return finished cleanly, and the `__init__` entered on the call's
+/// operands rebuilt from what the construction kept (the instance in the
+/// self slot), as [`ctor_direct`] enters one. A stop that finishing calls
+/// for (a finalizer to run first) leaves the `__init__` to the core loop's
+/// continuation (`Interpreter::core_new_finish`). `None` touched nothing.
+///
+/// # Safety
+///
+/// As [`leave`]'s, the record's return clean but for its construction.
+#[inline(never)]
+unsafe fn chain_init(st: &mut State, rec: &mut DirectRec, interp: &mut Interpreter) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let act = &mut *rec.st.lazy;
+        if act.init_inst.is_some() || act.lru.is_some() {
+            return None;
+        }
+        let ni: &crate::NewInit = act.new_init.as_deref()?;
+        if ni.plan.init_from_object {
+            return None;
+        }
+        let Object::Instance(made) = &*rec.st.stack else {
+            return None;
+        };
+        if !std::ptr::eq(made.cls_raw(), Rc::as_ptr(&ni.ty)) {
+            return None;
+        }
+        // (The plan's `__init__` as `Interpreter::core_push_init` takes it:
+        // a class with its own `__new__` keeps no lean form of it.)
+        let Some(Object::Function(init)) = &ni.plan.init_fn else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code: &CodeObject = &*init.code.as_ptr();
+        if code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Interpreter::lean_code_ok(code)
+        {
+            return None;
+        }
+        let argc = ni.ops.len() - 1;
+        let extended = Interpreter::has_extended_params(code);
+        let missing = Interpreter::lean_init_missing(init, code, argc + 1)?;
+        let cells = !code.cellvars.is_empty() || !code.freevars.is_empty();
+        if cells && code.cellvars.is_empty() && init.lean_cells_ref(code).is_none() {
+            return None;
+        }
+        let ext = crate::code_vm_ext(code)?;
+        let native: &super::Native = ext.frame_jit.get(code.varnames.len())?;
+        if !native.enters_at(0) {
+            return None;
+        }
+        // (The function holds its code, and so its native code, from here.)
+        let native: *const super::Native = native;
+        let init = Rc::clone(init);
+        let (start, pc) = (rec.call.start(), rec.call.pc());
+        let len = start + 2 + argc;
+        if len > st.cap {
+            return None;
+        }
+        // Committed: `__new__`'s return finishes.
+        let ni = act.new_init.take().expect("checked above");
+        let native = &*native;
+        if finish_clean(st, rec, interp) != 0 {
+            // (The caller's frame is synced, the instance atop its stack.)
+            let frame = &mut *st.frame;
+            let made = frame.stack.pop().expect("the new instance");
+            let sw = &mut *st.sw;
+            match interp.core_new_finish(sw, pc as usize, *ni, made) {
+                None => {}
+                Some(Ok(v)) => (*sw.cur).stack.push(v),
+                Some(Err(e)) => {
+                    sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)))
+                }
+            }
+            return Some(super::RELOAD);
+        }
+        // The `__init__` takes the function's slot, the instance the self
+        // slot, and the arguments their places again.
+        let slot = st.stack.add(start);
+        let inst = slot.read();
+        slot.write(Object::Function(init));
+        slot.add(1).write(inst.clone());
+        let crate::NewInit { mut ops, .. } = *ni;
+        for (k, v) in ops.drain(1..).enumerate() {
+            slot.add(2 + k).write(v);
+        }
+        drop(ops);
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc;
+        let Object::Function(f) = &*slot else {
+            std::hint::unreachable_unchecked()
+        };
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        let dc = &*st.depth_cell;
+        if dc.get() + 1 > crate::recursion::recursion_limit() {
+            // (The depth `__new__` used is free again: this can't happen
+            // unless the limit moved.)
+            unreachable!("the depth `__new__` ran at");
+        }
+        let bound = enter(
+            st,
+            pc as usize,
+            start,
+            len,
+            Rc::as_ptr(f),
+            code_rc,
+            true,
+            BindArgs::Positional { missing, extended },
+            cells,
+            native.need(),
+            interp.recs.top(),
+            None,
+        );
+        assert!(bound, "the depth was checked above");
+        let rec_at = interp.recs.top();
+        let rec = &mut *rec_at;
+        std::ptr::write(&raw mut (*rec.st.lazy).init_inst, Some(inst));
+        rec.extra = true;
+        rec.st.clean = false;
+        Some(run(st, rec_at, native, None))
     }
 }
 

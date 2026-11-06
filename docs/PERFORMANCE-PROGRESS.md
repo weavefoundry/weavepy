@@ -359,9 +359,49 @@ branch and pull request.
     `Fraction(1, 3) + Fraction(2, 7)` costs 7,625 instructions instead of
     15,591, `Fraction(i)` 4,717 instead of 9,565, and a genexp whose body
     calls a small function 9,672 instead of 10,846 for eight items.
-  - Measured and left: a user `__new__` (`pathlib`'s paths) still runs as
-    two interpreter activations, at 2.1 times CPython's cost, and
-    `super().__new__(cls)` at 3.4 times.
+  - A method call of a value an instance holds itself (`self.fn(x)`, a
+    function set per instance) remembers the value's position in the
+    instance's values under the class's version, instead of resolving the
+    name again each time; and `==` or `!=` of two strings in compiled code
+    settles without an ordering. `mini_interpreter` takes 1% fewer
+    instructions.
+  - Measured and left: widening a method site's polymorphic entries from
+    three to seven made `mini_interpreter` slightly slower.
+  - A class with a Python `__new__` and its own `__init__` (`pathlib`'s
+    paths) runs that `__init__` straight from `__new__`'s native return,
+    on the call's operands rebuilt, instead of through the core loop's
+    continuation; `C(i, 2)` of such a class costs 4,972 instructions
+    instead of 5,758.
+  - Compiled code runs `WITH_EXCEPT_START` (a `with` block whose body
+    raised) as a direct call of the manager's Python `__exit__`, instead
+    of leaving for the interpreter at the handler; a bytearray's `+=` of
+    bytes extends it in place from compiled code, as the core loop does.
+    `with suppress(KeyError): {}[i]` costs 7,286 instructions instead of
+    8,416 (CPython 3.13: 5,117), and `bytes_codecs` takes 1.3% fewer.
+  - Measured and left: compiling code in the frame JIT whose loops tier 2
+    has left alone for three hot spells (`pathlib`'s `_parse_path`, whose
+    probes keep missing) cut the `pathlib` loop by 4% and enum creation by
+    4.5%, but it also took float loops that tier 2 compiles better from
+    it: `scimark` took 19% more instructions and `raytrace` 8% more.
+  - Measured and left: a builtin that takes keywords and calls back into
+    Python (`sorted(xs, key=f)`) through the core loop's call lane from
+    compiled code costs more than leaving for the interpreter there.
+  - A `BINARY_OP` between two locals that the core loop has run to a
+    string (`path += sep + b`) compiles to the helper with its result on
+    the stack, instead of expecting a number in line and leaving for the
+    interpreter on every other result. `posixpath.join`'s loop of three
+    parts costs 4,182 instructions instead of 5,417 (CPython 3.13: 4,016),
+    and `path = a; path += sep + b` 1,136 instead of 2,743 (CPython:
+    1,478).
+  - Fixed: a call from compiled code that spread more arguments than the
+    caller's stack had room for, through the core loop's lane, grew the
+    stack's buffer under the compiled code, which had loaded its address
+    on entry and went on writing to the freed one (`test_pathlib`'s deep
+    `glob`, once `posixpath.join` stopped leaving compiled code). Such a
+    call now leaves the rest of the activation to the core loop.
+  - Measured and left: a `pathlib` path's `base / name` still costs about
+    twice CPython's (15,309 instructions against 7,673), spread over the
+    calls `__truediv__`, `with_segments`, `__new__` and `__init__` make.
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless

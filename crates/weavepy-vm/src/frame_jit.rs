@@ -5173,6 +5173,24 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
                 out.extend_from_slice(y);
                 Some(Object::new_bytes(out))
             }
+            // A bytearray's `+=` of bytes extends it in place (unless a
+            // buffer export pins its size), and is the bytearray itself.
+            (Object::ByteArray(x), Object::Bytes(y))
+                if inplace
+                    && kind == BinOpKind::Add
+                    && droppable(a)
+                    && droppable(b)
+                    && !crate::object::bytearray_is_exported(x) =>
+            {
+                match x.try_borrow_mut() {
+                    Ok(mut xs) => {
+                        xs.extend_from_slice(y);
+                        drop(xs);
+                        Some(a.clone())
+                    }
+                    Err(_) => None,
+                }
+            }
             (Object::Instance(i), _) if i.cls_raw().native_kind.get() != 0 => {
                 match Interpreter::core_native_binop(kind, a, b) {
                     Some(Ok(r)) if droppable(a) && droppable(b) => Some(r),
@@ -5300,6 +5318,19 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
                 Some(o) => o,
                 None => return 2,
             },
+            // (Equality needs no order: one string, or two lengths, or
+            // the short-key compare the dicts use, settles it.)
+            (Object::Str(x), Object::Str(y))
+                if matches!(kind, CompareKind::Eq | CompareKind::NotEq) =>
+            {
+                let eq = crate::shared_value::SharedStr::ptr_eq(x, y)
+                    || crate::dictmap::key_bytes_eq(x.as_bytes(), y.as_bytes());
+                if eq {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
             (Object::Str(x), Object::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
             _ => {
                 return match crate::core_plain_compare(at, kind) {
@@ -6378,8 +6409,12 @@ pub(crate) struct MethodCache {
     head: u64,
     /// The site's other receiver classes (a polymorphic call), checked by
     /// the helper before its general path, most recent first.
-    poly: [MethodEntry; 3],
+    poly: [MethodEntry; METHOD_POLY],
 }
+
+/// The polymorphic entries a method site keeps past its first (an
+/// evaluator's `node.eval(env)` sees a class per kind of node).
+const METHOD_POLY: usize = 3;
 
 /// A method load's site of compiled code: its caches and what
 /// [`h_method`] needs of the code, so that the code passes one pointer.
@@ -6398,6 +6433,10 @@ pub(crate) struct MethodSite {
     /// method's two words (the code holds it).
     builtin_recv: u8,
     builtin: [u64; 2],
+    /// A value of the receiver's own (`self.fn(...)` of a function an
+    /// instance holds): its class's version, its values' shared names and
+    /// the value's position among them (`0` versions: none yet).
+    own: (u64, u64, u32),
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -6447,6 +6486,36 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
     // SAFETY: as `h_method`'s.
     unsafe {
         let s = &mut *site;
+        let top = (*st).stack.add(s.len as usize - 1);
+        // The instance's own value the site found last, at its position
+        // among the instance's names while the class version holds (no
+        // data descriptor of the name has come since): it and an empty
+        // self slot, the receiver released.
+        let recv = match &*top {
+            Object::Instance(inst) => {
+                let (ver, keys, idx) = s.own;
+                if ver != 0
+                    && ver == inst.cls_raw().attr_version.get()
+                    && inst.dict.published().is_none()
+                    && droppable(&*top)
+                {
+                    if let Some(v) = inst
+                        .dict
+                        .split_peek()
+                        .and_then(|split| split.get_over(keys as *const _, idx as usize))
+                    {
+                        if !matches!(v, Object::Unbound) {
+                            let v = crate::clone_hot(v);
+                            crate::drop_hot(std::mem::replace(&mut *top, v));
+                            (*st).stack.add(s.len as usize).write(Object::Unbound);
+                            return 0;
+                        }
+                    }
+                }
+                Some(inst.clone())
+            }
+            _ => None,
+        };
         let r = h_load_method(
             st,
             s.code,
@@ -6458,6 +6527,34 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         );
         if r != 0 {
             return left(st, s.pc, s.last, s.len as usize);
+        }
+        // A value of the instance's own: where it sits, for the next time.
+        // (Only under the default lookup: a class's own `__getattribute__`
+        // runs every time.)
+        if let (Some(inst), Object::Unbound) = (recv, &*(*st).stack.add(s.len as usize)) {
+            if !Interpreter::default_getattribute(inst.cls_raw()) {
+                if (*(*st).maybe_dead).get() {
+                    return left_marked(st, s.pc, s.len as usize + 1);
+                }
+                return 0;
+            }
+            let code = &*s.code;
+            let name = code
+                .names
+                .get(code.instructions[s.pc as usize].arg as usize);
+            if let (Some(name), None, Some(split)) =
+                (name, inst.dict.published(), inst.dict.split_peek())
+            {
+                let (keys, _) = split.keys_and_len();
+                if let Some(idx) = split.position_str(name) {
+                    let found = &*(*st).stack.add(s.len as usize - 1);
+                    if split.get_over(keys as *const _, idx).is_some_and(|v| {
+                        v.strong_word().is_some() && v.strong_word() == found.strong_word()
+                    }) {
+                        s.own = (inst.cls_raw().attr_version.get(), keys as u64, idx as u32);
+                    }
+                }
+            }
         }
         if (*(*st).maybe_dead).get() {
             return left_marked(st, s.pc, s.len as usize + 1);
@@ -6528,7 +6625,7 @@ fn fill_method_cache(
     let [head, word] = unsafe { std::ptr::from_ref(f).cast::<[u64; 2]>().read() };
     // The entry it replaces moves down the polymorphic list.
     if cache.ver != 0 && cache.ver != ver {
-        cache.poly.copy_within(0..2, 1);
+        cache.poly.copy_within(0..METHOD_POLY - 1, 1);
         cache.poly[0] = MethodEntry {
             ver: cache.ver,
             obj: [cache.head, cache.func],
@@ -11385,10 +11482,7 @@ unsafe fn spread_ctor(st: &mut State, pc: usize, start: usize) -> Option<u32> {
         let Object::Type(ty) = &*base.add(start) else {
             return None;
         };
-        let (_, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
-        if plan.user_new.is_some() && !plan.init_from_object {
-            return None;
-        }
+        ty.instance_plan.peek().and_then(Option::as_ref)?;
         let n = match &*base.add(start + 2) {
             Object::Tuple(t) => t.len(),
             Object::List(l) => l.try_borrow().ok()?.len(),
@@ -11524,7 +11618,25 @@ unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32
     // SAFETY: the caller's contract.
     unsafe {
         let interp = &mut *st.interp.cast_mut();
-        match interp.core_ex_on_frame(&mut *st.frame, pc)? {
+        let r = interp.core_ex_on_frame(&mut *st.frame, pc)?;
+        // A spread that grew the stack past its room: the core loop goes on
+        // past the call (or raises there), the compiled code's view of its
+        // stack being stale.
+        if stack_moved(st) {
+            let frame = &mut *st.frame;
+            frame.pc = pc as u32 + 1;
+            if r.is_err() {
+                frame.stack.set_len(start);
+            }
+            settle(st);
+            let sw = &mut *st.sw;
+            *sw.last = pc;
+            if let Err(e) = r {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            }
+            return Some(RELOAD);
+        }
+        match r {
             Ok(()) => {
                 st.len = start + 1;
                 Some(0)
@@ -11536,6 +11648,29 @@ unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32
                 Some(RAISED)
             }
         }
+    }
+}
+
+/// Whether the running frame's operand stack moved (a lane that spread a
+/// call's arguments over it grew it past its room), the state's view of it
+/// refreshed: the compiled code, which loaded the stack's address on entry,
+/// must not go on from here.
+///
+/// # Safety
+///
+/// `st` is a live state, its frame the running one.
+#[inline(always)]
+unsafe fn stack_moved(st: &mut State) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let stack = &mut (*st.frame).stack;
+        let at = stack.as_mut_ptr();
+        if std::ptr::eq(at, st.stack) {
+            return false;
+        }
+        st.stack = at;
+        st.cap = stack.capacity();
+        true
     }
 }
 
@@ -11577,11 +11712,18 @@ unsafe extern "C" fn h_call_ex(
             if sw.pending.is_none() && !interp.core_call_lane(sw) {
                 sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Step));
             }
+            if stack_moved(st) {
+                return RELOAD;
+            }
             return if finished_in_place(st, start) {
                 0
             } else {
                 RELOAD
             };
+        }
+        // (A spread that grew the stack leaves the rest to the core loop.)
+        if stack_moved(st) {
+            return RELOAD;
         }
         if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
             if let Some(r) = run_pushed_directly(st, pc, start, saved_last) {
@@ -11668,11 +11810,14 @@ unsafe extern "C" fn h_call_forward(
         let saved_last = sw.last;
         let interp = &mut *st.interp.cast_mut();
         if !interp.core_call_forward(sw, pc) {
-            return if sw.pending.is_some() {
+            return if sw.pending.is_some() || stack_moved(st) {
                 RELOAD
             } else {
                 CALL_DECLINED
             };
+        }
+        if stack_moved(st) {
+            return RELOAD;
         }
         if sw.pending.is_none() && !std::ptr::eq(sw.cur, st.frame) {
             // (The call's own pc, three on, is the caller's last.)
@@ -12144,6 +12289,54 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
         st.len = len - n;
         st.pc = pc as usize + 1;
         RAISED
+    }
+}
+
+/// `WITH_EXCEPT_START` (the instruction at `pc`, `[exit, self, lasti,
+/// prev, exc]` atop a `len`-deep stack, written out) when the context
+/// manager's `__exit__` is a plain Python function with native code:
+/// `exit(type(exc), exc, exc.__traceback__)` called directly (its self, if
+/// bound, first) above the five, as a `CALL` of it runs. `0` the result
+/// atop, `CALL_DECLINED` untouched, `RAISED` or `RELOAD` as [`h_call`]'s.
+unsafe extern "C" fn h_with_except_start(
+    st: *mut State,
+    pc: u64,
+    len: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, one of its `WITH_EXCEPT_START`s,
+    // its stack depth (the stack written out) and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        let len = len as usize;
+        if st.sw.is_null() || len < 5 || len + 5 > st.cap {
+            return CALL_DECLINED;
+        }
+        let base = st.stack;
+        let (exit, exit_self, exc) = (
+            &*base.add(len - 5),
+            &*base.add(len - 4),
+            &*base.add(len - 1),
+        );
+        let Object::Instance(inst) = exc else {
+            return CALL_DECLINED;
+        };
+        if !matches!(exit, Object::Function(_)) {
+            return CALL_DECLINED;
+        }
+        let tb = inst.slot_get("__traceback__").unwrap_or(Object::None);
+        base.add(len).write(exit.clone());
+        base.add(len + 1).write(exit_self.clone());
+        base.add(len + 2).write(Object::Type(inst.cls()));
+        base.add(len + 3).write(exc.clone());
+        base.add(len + 4).write(tb);
+        match direct_call_out(st, pc as usize, len, len + 5, &mut *site, None) {
+            Some(r) => r,
+            None => {
+                crate::release_run(base.add(len), 5);
+                CALL_DECLINED
+            }
+        }
     }
 }
 
@@ -13632,7 +13825,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
         }
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
-        OpCode::Reraise => true,
+        OpCode::Reraise | OpCode::WithExceptStart => true,
         // A prologue `MAKE_CELL`: the activation's cells are built with it.
         OpCode::MakeCell => prologue_cell(code, pc),
         // (A slot shared with a cell saves the cell itself.)
@@ -14913,6 +15106,43 @@ impl<'a> Lower<'a> {
                 self.leave(r);
                 return false;
             }
+            OpCode::WithExceptStart if !self.inlining() && self.depth >= 5 => {
+                self.flush();
+                self.store_last();
+                let site: Box<DirectSite> = Box::default();
+                let at = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+                self.direct_sites.push(site);
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let r = self
+                    .call(
+                        h_with_except_start as *const () as usize,
+                        &[self.st, pcv, len, at],
+                        true,
+                    )
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let done = self.b.create_block();
+                let not_done = self.b.create_block();
+                self.b.ins().brif(r, not_done, &[], done, &[]);
+                self.b.switch_to_block(not_done);
+                let declined = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+                let left_b = self.b.create_block();
+                self.b.ins().brif(declined, out, &[], left_b, &[]);
+                self.b.switch_to_block(left_b);
+                self.leave(r);
+                self.b.switch_to_block(done);
+                let slot = self.depth;
+                self.push(Item::Mem(slot));
+                self.set_last(pc);
+                return true;
+            }
             OpCode::Reraise if !self.inlining() && self.depth > ins.arg as usize => {
                 self.flush();
                 self.store_last();
@@ -15894,6 +16124,12 @@ impl<'a> Lower<'a> {
             return self.binary_helper(pc, kind, ai, bi);
         }
         if native {
+            return self.binary_helper(pc, kind, ai, bi);
+        }
+        if crate::heap_site(self.ext, pc)
+            && matches!(ai, Item::Local(_) | Item::Const(_))
+            && matches!(bi, Item::Local(_) | Item::Const(_))
+        {
             return self.binary_helper(pc, kind, ai, bi);
         }
         // A value on the stack (a call's result, an element, a field) is as
@@ -17376,6 +17612,7 @@ impl<'a> Lower<'a> {
             last: self.last_pc.map_or(NO_LAST, |l| l as u32),
             builtin_recv,
             builtin,
+            own: (0, 0, 0),
         });
         let c = self
             .b

@@ -13329,6 +13329,9 @@ impl Interpreter {
                                 let Some(r) = Self::core_str_binop(a, b, kind) else {
                                     break None;
                                 };
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: the operands are strings and scalars
                                 // (or a tuple of them): releasing them runs no
                                 // code and frees nothing the collector tracks.
@@ -80295,6 +80298,7 @@ struct CodeConstObjects {
     /// operands and result on the stack (see `frame_jit::h_binop_dunder`);
     /// allocated on the first recorded one.
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
+    heap_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// The `BINARY_OP` sites' Python operator methods (see
     /// [`DunderSeen`]), allocated on the first recorded one.
     dunders: std::sync::OnceLock<Box<DunderTable>>,
@@ -81626,6 +81630,23 @@ fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
     if let Some(site) = sites.get(pc) {
         site.store(true, Ordering::Relaxed);
     }
+}
+
+pub(crate) fn heap_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sites = ext
+        .heap_sites
+        .get_or_init(|| (0..ninstrs).map(|_| AtomicBool::new(false)).collect());
+    if let Some(site) = sites.get(pc) {
+        site.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn heap_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.heap_sites
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether the `LOAD_ATTR` at `pc` has run a `property`'s getter (its
@@ -84115,6 +84136,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             field_slots: SiteSlots::new(),
             native_sites: std::sync::OnceLock::new(),
             instance_sites: std::sync::OnceLock::new(),
+            heap_sites: std::sync::OnceLock::new(),
             leaf_sites: SiteSlots::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
