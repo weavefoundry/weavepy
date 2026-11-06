@@ -3757,6 +3757,15 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: &Object) {
+    // A fresh empty list (`[]`, the commonest container born) holds nothing
+    // that could close a cycle: deferred without the element scan.
+    if let Object::List(l) = obj {
+        // SAFETY: a guard-free view that ends before anything runs.
+        if unsafe { l.peek() }.is_some_and(Vec::is_empty) {
+            track_inert(obj);
+            return;
+        }
+    }
     if let Object::Instance(inst) = obj {
         // The instance may have been born with deferred tracking; its
         // `__dict__` no longer needs to guard it.

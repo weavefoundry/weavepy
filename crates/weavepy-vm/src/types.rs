@@ -1782,16 +1782,17 @@ impl TypeObject {
     }
 
     /// Whether the class is one whose native method bodies read its slots
-    /// by the position its `__init__` sets them in (`collections.deque`,
-    /// `contextvars.Context`, asyncio's handles and futures): those keep
-    /// the per-key form their fast paths expect.
+    /// by the position its `__init__` sets them in (`contextvars.Context`,
+    /// asyncio's handles and futures): those keep the per-key form their
+    /// fast paths expect. (`collections.deque` declares its slots in the
+    /// order its `__init__` sets them, so its layout serves both.)
     fn slots_served_natively(&self) -> bool {
         let dict = self.dict.borrow();
         let Some(Object::Str(m)) = dict.get(&DictKey(Object::from_static("__module__"))) else {
             return false;
         };
         let m: &str = m;
-        m == "collections" || m == "contextvars" || m == "asyncio" || m.starts_with("asyncio.")
+        m == "contextvars" || m == "asyncio" || m.starts_with("asyncio.")
     }
 
     /// [`Self::fresh_slots`]'s layout: the member slots the MRO declares,

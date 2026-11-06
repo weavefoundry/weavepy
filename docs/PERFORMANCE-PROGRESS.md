@@ -382,6 +382,26 @@ branch and pull request.
     `findCaller` walking its callers) settles in place with the running
     activation's own instruction, instead of through the full attribute
     lookup: `logging_mix` takes 0.2% fewer instructions.
+  - A store-only `__init__` may store fresh empty containers too
+    (`self.items = []`, `self.index = {}`), so it builds the instance in
+    one pass instead of through the leaf evaluator, and a fresh empty list
+    is deferred by the cycle collector without its element scan.
+    `collections.deque` declares its slots in the order its `__init__`
+    sets them, so it lays them out like any slotted class instead of
+    keeping a name with each value. `C()` whose `__init__` stores one list
+    costs 1,996 instructions instead of 2,602, three stores with a list 2,218 instead of 3,042, `deque()` 3,316
+    instead of 4,481 and `contextlib.ExitStack()` 5,630 instead of 6,794.
+  - Measured and left: the hot code footprint is about three times
+    CPython's (204 KB of lines run at least once per iteration on
+    `context_managers`, against 66 KB), but neither of the obvious
+    layout levers moves it. The frame JIT's code for a loop is about 73%
+    dense in its hot lines, so moving its cold blocks out would save a
+    quarter of the JIT's share at most. About 38% of the hot
+    instructions are source lines compiled in more than one function,
+    but nearly all of those are reference counts, drops and JIT code,
+    which belong in line. Turning the leaf evaluator off changed neither
+    instructions nor simulated misses on `class_creation`, `deepcopy`
+    or `logging_mix`.
   - Measured and left: compiling code in the frame JIT whose loops tier 2
     has left alone for three hot spells (`pathlib`'s `_parse_path`, whose
     probes keep missing) cut the `pathlib` loop by 4% and enum creation by

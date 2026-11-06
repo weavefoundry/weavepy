@@ -20173,6 +20173,19 @@ impl Interpreter {
                 _ => return false,
             },
         };
+        // A fresh container is made as `BUILD_LIST`/`BUILD_MAP` would make
+        // it, which a collection due (or an allocation observer) leaves to
+        // the ordinary paths.
+        if shape
+            .stores
+            .iter()
+            .any(|&(_, src)| matches!(src, StoreSrc::NewList | StoreSrc::NewDict))
+            && (crate::stdlib::tracemalloc_real::is_tracking()
+                || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                || gc_trace::auto_collect_due())
+        {
+            return false;
+        }
         // Committed.
         let (inst, _) = self.alloc_plain_instance_obj(ty);
         let Object::Instance(i) = &inst else {
@@ -20212,6 +20225,18 @@ impl Interpreter {
                 }
                 StoreSrc::Const(c) => consts[c as usize].clone(),
                 StoreSrc::Int(n) => Object::Int(n),
+                StoreSrc::NewList => {
+                    let list = Object::new_list(Vec::new());
+                    gc_trace::track(&list);
+                    list
+                }
+                StoreSrc::NewDict => {
+                    let dict = Object::Dict(Rc::new(RefCell::new(
+                        DictData::with_capacity_and_hasher(0, crate::fasthash::FxBuildHasher),
+                    )));
+                    gc_trace::track(&dict);
+                    dict
+                }
             };
             split_vals[k].write(value);
         }
@@ -83825,6 +83850,10 @@ enum StoreSrc {
     Const(u32),
     /// A small int literal.
     Int(i64),
+    /// A fresh empty list (`BUILD_LIST 0`).
+    NewList,
+    /// A fresh empty dict (`BUILD_MAP 0`).
+    NewDict,
 }
 
 /// A *store-only* `__init__` (see [`code_store_init`]): its attribute
@@ -83896,6 +83925,8 @@ fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
                     }
                     OpCode::LoadConst => StoreSrc::Const(i.arg),
                     OpCode::LoadSmallInt => StoreSrc::Int(i64::from(i.arg)),
+                    OpCode::BuildList if i.arg == 0 => StoreSrc::NewList,
+                    OpCode::BuildMap if i.arg == 0 => StoreSrc::NewDict,
                     _ => return None,
                 };
                 let recv = ins.get(pc + 1)?;
