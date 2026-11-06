@@ -410,6 +410,16 @@ pub(crate) fn object_cell_offsets() -> (usize, usize) {
     )
 }
 
+/// A list's `GilCell` (around its vector): its borrow counter's and
+/// vector's byte offsets, for compiled code.
+pub(crate) fn list_cell_offsets() -> (usize, usize) {
+    type Cell = GilCell<Vec<crate::object::Object>>;
+    (
+        std::mem::offset_of!(Cell, borrow),
+        std::mem::offset_of!(Cell, data),
+    )
+}
+
 /// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
 /// nonzero once cells are shared between threads).
 pub(crate) fn cells_unguarded_flag() -> *const bool {

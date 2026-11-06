@@ -560,6 +560,18 @@ branch and pull request.
   - Measured and left: a `pathlib` path's `base / name` still costs about
     twice CPython's (15,309 instructions against 7,673), spread over the
     calls `__truediv__`, `with_segments`, `__new__` and `__init__` make.
+  - Compiled code indexes a list or tuple by an `int` in line, and stores
+    into a list over a scalar the same way, where it used to call the
+    frameless helpers: the container's tag, an unborrowed list, the index
+    in range from either end, the item copied with its count bumped, and
+    an owned container's reference given up by a plain decrement (a call's
+    result, `self.items[i]`). The core loop serves these subscripts
+    without the cache machinery, so a site's cache now settles on the
+    shape there while it's still empty, for the compile to read.
+    `nqueens` takes 4% fewer instructions, `chaos` 2.7%, `unpack_sequence`
+    1.4% and `go` 1.2%. Fixed before it landed: the layout probe read the
+    sample vector's capacity as its length when the two were equal, so a
+    list with room to spare read past its end from the end.
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless

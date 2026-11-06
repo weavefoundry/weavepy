@@ -1392,6 +1392,8 @@ struct Tags {
     list: u8,
     /// Where a frame's cells are (see [`CellLayout`]).
     cell_layout: Option<CellLayout>,
+    /// Where a list's and a tuple's items are (see [`SeqLayout`]).
+    seq_layout: Option<SeqLayout>,
     /// The `dict`, `set` and `str` tags (the method kernels' receivers).
     dict: u8,
     set: u8,
@@ -1495,6 +1497,7 @@ fn tags() -> Option<Tags> {
         ))),
         list: tag(&Object::new_list(Vec::new())),
         cell_layout: cell_layout(),
+        seq_layout: seq_layout(),
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -1609,6 +1612,107 @@ fn cell_layout() -> Option<CellLayout> {
         vec_len: off(data + 8 * len)?,
         borrow: off(cell_data + borrow)?,
         value: off(cell_data + value)?,
+    })
+}
+
+/// Where a list's and a tuple's items are, from the payload word: a list's
+/// borrow counter (an `i32`, negative while mutably borrowed) and its
+/// vector's pointer and length, and a tuple's length and first item.
+#[derive(Clone, Copy)]
+struct SeqLayout {
+    tuple_tag: u8,
+    list_borrow: i32,
+    list_ptr: i32,
+    list_len: i32,
+    tuple_len: i32,
+    tuple_items: i32,
+    /// Whether a tuple's count is its payload word's first (an owned
+    /// tuple's release then a plain decrement there).
+    tuple_counted: bool,
+}
+
+/// [`SeqLayout`], read off a sample list and tuple (`None` if they aren't
+/// the shapes the code assumes).
+fn seq_layout() -> Option<SeqLayout> {
+    const MARK: i64 = 0x5eed_5e9_0000_0001;
+    // (Room for 7: the vector's capacity and length differ, so each word
+    // is told apart by its value.)
+    let items = || {
+        let mut v = Vec::with_capacity(7);
+        v.extend([Object::Int(MARK), Object::Int(MARK + 1), Object::Int(MARK + 2)]);
+        v
+    };
+    let payload = |o: &Object| -> usize {
+        // SAFETY: an object is two words, its payload the second.
+        unsafe { *std::ptr::from_ref(o).cast::<usize>().add(1) }
+    };
+    let tag_of = |o: &Object| -> u8 {
+        // SAFETY: the tag is the object's first byte.
+        unsafe { *std::ptr::from_ref(o).cast::<u8>() }
+    };
+    let int_tag = tag_of(&Object::Int(0));
+    let off = |d: usize| i32::try_from(d).ok();
+    // The list: its allocation, then the cell's counter and vector.
+    let list = Object::new_list(items());
+    let Object::List(rc) = &list else {
+        return None;
+    };
+    // SAFETY: an `Rc` is one word, its allocation's address.
+    let alloc = unsafe { std::mem::transmute_copy::<_, usize>(rc) };
+    let data = (Rc::as_ptr(rc) as usize).checked_sub(alloc)?;
+    let (borrow, vec) = crate::sync::list_cell_offsets();
+    // SAFETY: the vector, inside the live sample.
+    let v: &Vec<Object> = unsafe { &*((alloc + data + vec) as *const Vec<Object>) };
+    let (vp, vl) = (v.as_ptr() as u64, v.len() as u64);
+    if v.capacity() == v.len() {
+        return None;
+    }
+    // SAFETY: the vector's three words, inside the live sample.
+    let words: [u64; 3] = unsafe { std::ptr::read((alloc + data + vec) as *const [u64; 3]) };
+    let ptr = words.iter().position(|&w| w == vp)?;
+    let len = words.iter().position(|&w| w == vl)?;
+    // SAFETY: the second item's two words, inside the vector.
+    let second: [u64; 2] = unsafe { std::ptr::read((vp as usize + 16) as *const [u64; 2]) };
+    let counter =
+        unsafe { &*((alloc + data + borrow) as *const std::sync::atomic::AtomicI32) };
+    let idle = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let held = {
+        let _g = rc.borrow_mut();
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    // The tuple: its length and items from the payload word.
+    let tuple = Object::Tuple(crate::tuple_storage::TupleStorage::from_vec(items()));
+    let tw = payload(&tuple);
+    let Object::Tuple(t) = &tuple else {
+        return None;
+    };
+    let first = std::ptr::from_ref(&t[0]) as usize;
+    let tuple_items = first.checked_sub(tw)?;
+    let tuple_len = (0..tuple_items / 8).find(|&k| {
+        // SAFETY: a word of the tuple's header, inside the live sample.
+        unsafe { *((tw + 8 * k) as *const u64) == 3 }
+    })?;
+    // SAFETY: the third item's word, inside the tuple.
+    let third = unsafe { *((first + 32 + 8) as *const i64) };
+    (payload(&list) == alloc
+        && ptr != len
+        && second[1] == (MARK + 1) as u64
+        && (second[0] & 0xff) as u8 == int_tag
+        && idle == 0
+        && held < 0
+        && t.len() == 3
+        && third == MARK + 2
+        && tag_of(&t[2]) == int_tag
+        && tag_of(&tuple) < 64)
+        .then_some(())?;
+    Some(SeqLayout {
+        tuple_tag: tag_of(&tuple),
+        list_borrow: off(data + borrow)?,
+        list_ptr: off(data + vec + 8 * ptr)?,
+        list_len: off(data + vec + 8 * len)?,
+        tuple_len: off(8 * tuple_len)?,
+        tuple_items: off(tuple_items)?,
+        tuple_counted: counted_at_payload(&tuple, tw as u64),
     })
 }
 
@@ -16917,6 +17021,112 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(done);
     }
 
+    /// Whether the `BINARY_SUBSCR` at `pc` of `cont` indexes in line (see
+    /// [`Self::seq_index_in_line`]): `Some(true)` a tuple's, `Some(false)`
+    /// a list's, as the site's cache settled. An owned container whose
+    /// release isn't a plain decrement at its payload word stays out.
+    fn seq_index_site(&self, pc: usize, cont: Item) -> Option<bool> {
+        use weavepy_compiler::InlineCache as IC;
+        let l = self.tags.seq_layout?;
+        if cfg!(debug_assertions) {
+            return None;
+        }
+        let borrowed = matches!(cont, Item::Local(_) | Item::Const(_));
+        match self.code.caches.get(pc as u32) {
+            IC::SubscrListInt
+                if borrowed || self.tags.rc_counted & (1 << self.tags.list) != 0 =>
+            {
+                Some(false)
+            }
+            IC::SubscrTupleInt if borrowed || l.tuple_counted => Some(true),
+            _ => None,
+        }
+    }
+
+    /// `cont[key]` of a list (`tuple` false) or tuple by an `int` in range,
+    /// in line: the list not mutably borrowed (nor cells shared), the item
+    /// copied to `slot` and an owned container's reference given up by a plain
+    /// decrement (another owner holding it, no release observed). Returns
+    /// the block to go on in; the current block is the cold one where the
+    /// caller emits its helper path, then jumps there.
+    fn seq_index_in_line(
+        &mut self,
+        tuple: bool,
+        slot: usize,
+        pcont: Value,
+        own_c: bool,
+        pkey: Value,
+        key_int: Option<Value>,
+    ) -> Block {
+        let l = self.tags.seq_layout.expect("checked by seq_index_site");
+        let helper_block = self.b.create_block();
+        let done = self.b.create_block();
+        let want = if tuple { l.tuple_tag } else { self.tags.list };
+        let tag = self.tag_at(pcont);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+        self.branch_out(other, helper_block);
+        let i = match key_int {
+            Some(v) => v,
+            None => {
+                let kt = self.tag_at(pkey);
+                let not_int = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, kt, i64::from(self.tags.int));
+                self.branch_out(not_int, helper_block);
+                self.b.ins().load(types::I64, FLAGS, pkey, 8)
+            }
+        };
+        let obj = self.b.ins().load(self.ptr, FLAGS, pcont, 8);
+        let (items, len) = if tuple {
+            let len = self.b.ins().load(types::I64, FLAGS, obj, l.tuple_len);
+            (self.b.ins().iadd_imm(obj, i64::from(l.tuple_items)), len)
+        } else {
+            let flag = self
+                .b
+                .ins()
+                .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
+            let unguarded = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+            self.branch_out(unguarded, helper_block);
+            let borrow = self.b.ins().load(types::I32, FLAGS, obj, l.list_borrow);
+            let held = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+            self.branch_out(held, helper_block);
+            let len = self.b.ins().load(types::I64, FLAGS, obj, l.list_len);
+            (self.b.ins().load(self.ptr, FLAGS, obj, l.list_ptr), len)
+        };
+        // A negative index counts from the end.
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
+        let from_end = self.b.ins().iadd(i, len);
+        let at = self.b.ins().select(neg, from_end, i);
+        let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
+        self.branch_out(outside, helper_block);
+        let byte = self.b.ins().ishl_imm(at, 4);
+        let src = self.b.ins().iadd(items, byte);
+        let dst = self.slot_addr(slot);
+        if own_c {
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            let gates = self
+                .b
+                .ins()
+                .iconst(self.ptr, crate::sync::release_gates_ptr() as i64);
+            let gates = self.b.ins().uload32(FLAGS, gates, 0);
+            let held = self.b.ins().bor(last, gates);
+            self.branch_out(held, helper_block);
+            self.copy_value(dst, src);
+            // (The item's clone ran no code: the count is as read.)
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let n = self.b.ins().iadd_imm(n, -1);
+            self.b.ins().store(FLAGS, n, obj, 0);
+        } else {
+            self.copy_value(dst, src);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.set_cold_block(helper_block);
+        self.b.switch_to_block(helper_block);
+        done
+    }
+
     /// `BINARY_SUBSCR` through [`h_subscr_ref`], which reads a local's or
     /// constant's operand in place (no reference taken or released): the
     /// item in the container's slot. `false`, emitting nothing, where the
@@ -16928,10 +17138,20 @@ impl<'a> Lower<'a> {
         let key = self.pop();
         let cont = self.pop();
         let slot = self.depth;
+        let tuple = self.seq_index_site(pc, cont);
+        let key_int = match key {
+            Item::Int(v) => Some(v),
+            _ => None,
+        };
         let (pcont, own_c) = self.ref_or_own(cont, slot);
         let (pkey, own_k) = self.ref_or_own(key, slot + 1);
         let owned = u8::from(own_c) | (u8::from(own_k) << 1);
+        let done = tuple.map(|tuple| self.seq_index_in_line(tuple, slot, pcont, own_c, pkey, key_int));
         self.subscr_call(pc, slot, pcont, pkey, owned);
+        if let Some(done) = done {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         self.push(Item::Mem(slot));
         self.set_last(pc);
         // (The helper released the owned operands; a finalizer that queued
@@ -16978,10 +17198,16 @@ impl<'a> Lower<'a> {
         let cont = self.pop();
         let val = self.pop();
         let slot = self.depth;
+        let in_line = self.list_store_site(pc, cont);
+        let key_int = match key {
+            Item::Int(v) => Some(v),
+            _ => None,
+        };
         let (pv, own_v) = self.ref_or_own(val, slot);
         let (pcont, own_c) = self.ref_or_own(cont, slot + 1);
         let (pkey, own_k) = self.ref_or_own(key, slot + 2);
         let owned = u8::from(own_v) | (u8::from(own_c) << 1) | (u8::from(own_k) << 2);
+        let stored = in_line.then(|| self.list_store_in_line(pv, own_v, pcont, own_c, pkey, key_int));
         let r = self
             .call(by_owned!(h_setitem_hot, owned, 3), &[pv, pcont, pkey], true)
             .expect("returns");
@@ -16999,9 +17225,113 @@ impl<'a> Lower<'a> {
         );
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
+        if let Some(stored) = stored {
+            self.b.ins().jump(stored, &[]);
+            self.b.switch_to_block(stored);
+        }
         self.set_last(pc);
         self.check_released(pc + 1);
         true
+    }
+
+    /// Whether the `STORE_SUBSCR` at `pc` into `cont` stores in line (see
+    /// [`Self::list_store_in_line`]): the site's cache settled on a list
+    /// and an `int`, and an owned list's release is a plain decrement.
+    fn list_store_site(&self, pc: usize, cont: Item) -> bool {
+        use weavepy_compiler::InlineCache as IC;
+        self.tags.seq_layout.is_some()
+            && !cfg!(debug_assertions)
+            && matches!(self.code.caches.get(pc as u32), IC::StoreSubscrListInt)
+            && (matches!(cont, Item::Local(_) | Item::Const(_))
+                || self.tags.rc_counted & (1 << self.tags.list) != 0)
+    }
+
+    /// `cont[key] = value` of a list by an `int` in range over a scalar,
+    /// in line: the list unborrowed (nor cells shared), the value moved in
+    /// (copied when borrowed) and an owned list's reference given up by a
+    /// plain decrement. Returns the block to go on in; the current block
+    /// is the cold one where the caller emits its helper path, then jumps
+    /// there.
+    fn list_store_in_line(
+        &mut self,
+        pv: Value,
+        own_v: bool,
+        pcont: Value,
+        own_c: bool,
+        pkey: Value,
+        key_int: Option<Value>,
+    ) -> Block {
+        let l = self.tags.seq_layout.expect("checked by list_store_site");
+        let helper_block = self.b.create_block();
+        let done = self.b.create_block();
+        let tag = self.tag_at(pcont);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.list));
+        self.branch_out(other, helper_block);
+        let i = match key_int {
+            Some(v) => v,
+            None => {
+                let kt = self.tag_at(pkey);
+                let not_int = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, kt, i64::from(self.tags.int));
+                self.branch_out(not_int, helper_block);
+                self.b.ins().load(types::I64, FLAGS, pkey, 8)
+            }
+        };
+        let obj = self.b.ins().load(self.ptr, FLAGS, pcont, 8);
+        let flag = self
+            .b
+            .ins()
+            .iconst(self.ptr, crate::sync::cells_unguarded_flag() as i64);
+        let unguarded = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+        self.branch_out(unguarded, helper_block);
+        // (Any borrow at all: the store needs the vector to itself.)
+        let borrow = self.b.ins().load(types::I32, FLAGS, obj, l.list_borrow);
+        self.branch_out(borrow, helper_block);
+        let len = self.b.ins().load(types::I64, FLAGS, obj, l.list_len);
+        let items = self.b.ins().load(self.ptr, FLAGS, obj, l.list_ptr);
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
+        let from_end = self.b.ins().iadd(i, len);
+        let at = self.b.ins().select(neg, from_end, i);
+        let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
+        self.branch_out(outside, helper_block);
+        let byte = self.b.ins().ishl_imm(at, 4);
+        let dst = self.b.ins().iadd(items, byte);
+        // The displaced value a scalar: nothing to release.
+        let old = self.tag_at(dst);
+        let scalar = self.is_scalar(old);
+        let heap = self.b.ins().icmp_imm(IntCC::Equal, scalar, 0);
+        self.branch_out(heap, helper_block);
+        if own_c {
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            let gates = self
+                .b
+                .ins()
+                .iconst(self.ptr, crate::sync::release_gates_ptr() as i64);
+            let gates = self.b.ins().uload32(FLAGS, gates, 0);
+            let held = self.b.ins().bor(last, gates);
+            self.branch_out(held, helper_block);
+        }
+        if own_v {
+            self.copy16(dst, pv);
+        } else {
+            self.copy_value(dst, pv);
+        }
+        if own_c {
+            // (The value's clone ran no code: the count is as read.)
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let n = self.b.ins().iadd_imm(n, -1);
+            self.b.ins().store(FLAGS, n, obj, 0);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.set_cold_block(helper_block);
+        self.b.switch_to_block(helper_block);
+        done
     }
 
     /// `LIST_APPEND` through [`h_list_append`] (the value leaves the stack

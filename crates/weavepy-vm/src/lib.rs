@@ -13476,6 +13476,12 @@ impl Interpreter {
                         // SAFETY: the `len` slots at `base` are initialized,
                         // and the helpers touch nothing else.
                         let subscr = matches!(ins.op, OpCode::BinarySubscr | OpCode::StoreSubscr);
+                        if subscr && len >= 2 {
+                            // SAFETY: `len >= 2`.
+                            unsafe {
+                                Self::note_subscr_shape(code, pc, ins.op == OpCode::StoreSubscr, base, len)
+                            };
+                        }
                         let n = if subscr {
                             unsafe {
                                 Self::core_subscr_hot(ins.op == OpCode::StoreSubscr, base, len)
@@ -21078,6 +21084,53 @@ impl Interpreter {
             }
             usize::MAX
         }
+    }
+
+    /// Settle the empty cache of the `BINARY_SUBSCR` (or, `store`, the
+    /// `STORE_SUBSCR`) at `pc` on the operands' shape (the container and
+    /// key, the top two of the `len` at `base`) when they're a list (or a
+    /// tuple, read) and an `int`: the core loop serves those without the
+    /// cache machinery, and compiled code indexes them in line by it.
+    ///
+    /// # Safety
+    ///
+    /// `len >= 2` initialized slots at `base`.
+    #[inline(always)]
+    unsafe fn note_subscr_shape(
+        code: &CodeObject,
+        pc: usize,
+        store: bool,
+        base: *const Object,
+        len: usize,
+    ) {
+        if matches!(code.caches.get(pc as u32), weavepy_compiler::InlineCache::Empty) {
+            // SAFETY: per the caller.
+            unsafe { Self::note_subscr_shape_slow(code, pc, store, base, len) }
+        }
+    }
+
+    /// [`Self::note_subscr_shape`]'s setting.
+    #[cold]
+    #[inline(never)]
+    unsafe fn note_subscr_shape_slow(
+        code: &CodeObject,
+        pc: usize,
+        store: bool,
+        base: *const Object,
+        len: usize,
+    ) {
+        // SAFETY: per the caller.
+        let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+        let cache = match (c, k) {
+            (Object::List(_), Object::Int(_)) if store => {
+                specialize::attempt_specialize_store_subscr(c, k)
+            }
+            (Object::List(_) | Object::Tuple(_), Object::Int(_)) if !store => {
+                specialize::attempt_specialize_binary_subscr(c, k)
+            }
+            _ => return,
+        };
+        code.caches.set(pc as u32, cache);
     }
 
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
