@@ -275,6 +275,16 @@ branch and pull request.
     general handler (`statistics`' exact ratios: 4.6% fewer).
   - A class whose `__init__` has no store-only shape skips that proof at
     every construction once refuted.
+  - Compiled arithmetic takes a `bool` operand as its int value in place
+    (`&`, `|` and `^` of two bools stay the core loop's, which keeps them
+    a `bool`). It used to leave for the core loop: `getattr(s, "r", 0) +
+    hasattr(s, "_w")` went from 1,860 to 1,536.
+  - `zlib.compress` keeps its compressor between calls with the same
+    level and window, and resets it (`deflateReset`, the same stream a
+    fresh one writes) instead of allocating and zeroing a new one's
+    tables, which for a short input took more than the compression:
+    `bytes_codecs` 4% faster (warm time on macOS; valgrind, which counts
+    the zeroing a byte at a time, put it at 15%).
   - Measured and left: a native caller's callback (`map(f, xs)` with a
     Python `f` that isn't a leaf) costs 3.4 times CPython's. Running its
     compiled body straight from the callback stops at its first call,

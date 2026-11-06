@@ -5089,18 +5089,34 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
     // compiler emitted (`BinOpKind` is `repr(u8)`).
     unsafe {
         let (a, b) = (&*at, &*at.add(1));
-        // Two numbers (the core loop's in-line arm).
+        // Two numbers (the core loop's in-line arm), a `bool` as its int
+        // value (but `bool & bool` and its kin stay a `bool`: the core
+        // loop's).
         let num = |o: &Object| match *o {
             Object::Int(i) => Some(crate::leaf_plan::V::I(i)),
+            Object::Bool(t) => Some(crate::leaf_plan::V::I(i64::from(t))),
             Object::Float(x) => Some(crate::leaf_plan::V::F(x)),
             _ => None,
         };
-        if let (Some(x), Some(y)) = (num(a), num(b)) {
+        let bitwise = matches!(kind as u8, k if k == BinOpKind::BitAnd as u8
+            || k == BinOpKind::BitOr as u8
+            || k == BinOpKind::BitXor as u8);
+        let two_bools = matches!((a, b), (Object::Bool(_), Object::Bool(_)));
+        if let (Some(x), Some(y), false) = (num(a), num(b), two_bools && bitwise) {
             let r = match crate::leaf_plan::binary(x, y, kind as u8) {
                 Some(crate::leaf_plan::V::I(i)) => Object::Int(i),
                 Some(crate::leaf_plan::V::F(f)) => Object::Float(f),
                 // (Two ints past the machine word take the bignum arm.)
-                _ if matches!((a, b), (Object::Int(_), Object::Int(_))) => Object::Unbound,
+                _ if matches!(
+                    (a, b),
+                    (
+                        Object::Int(_) | Object::Bool(_),
+                        Object::Int(_) | Object::Bool(_)
+                    )
+                ) =>
+                {
+                    Object::Unbound
+                }
                 _ => return 1,
             };
             if !matches!(r, Object::Unbound) {
