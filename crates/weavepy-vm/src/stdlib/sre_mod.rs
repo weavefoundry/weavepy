@@ -2892,6 +2892,43 @@ fn sre_getlower(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(i64::from(lowered)))
 }
 
+/// The version of the regular-expression compiler whose programs
+/// `_sre._cache_get` keeps: its Python sources' hashes and this engine's
+/// program format.
+fn compiler_tag() -> u64 {
+    static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TAG.get_or_init(|| {
+        let mut h = (MAGIC as u64) ^ ((CODESIZE as u64) << 32);
+        for name in ["re._parser", "re._compiler", "re._constants", "re._casefix"] {
+            let src =
+                super::frozen_lookup(name).map_or(0, |m| super::frozen_source_hash(name, m.source));
+            h = (h ^ src).wrapping_mul(0x0100_0000_01b3).rotate_left(17);
+        }
+        h
+    })
+}
+
+/// `_sre._cache_get(key)`: the bytes `_cache_put` stored for the bytes
+/// `key` (a pattern's compile, as `re._compiler` keys it), or `None`.
+fn sre_cache_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Bytes(key)) = args.first() else {
+        return Ok(Object::None);
+    };
+    Ok(
+        crate::frozen_code_cache::result_get("re", compiler_tag(), key)
+            .map_or(Object::None, Object::new_bytes),
+    )
+}
+
+/// `_sre._cache_put(key, value)`: keep the bytes `value` for `key`, for
+/// later processes' `_cache_get`.
+fn sre_cache_put(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [Object::Bytes(key), Object::Bytes(value)] = args {
+        crate::frozen_code_cache::result_put("re", compiler_tag(), key, value);
+    }
+    Ok(Object::None)
+}
+
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
@@ -2939,6 +2976,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("make_pattern", super::sre_objects::make_pattern),
             ("exec_match", super::sre_objects::exec_match),
             ("clear_templates", super::sre_objects::clear_templates),
+            ("_cache_get", sre_cache_get),
+            ("_cache_put", sre_cache_put),
         ] {
             d.insert(DictKey(Object::from_static(name)), b(name, f));
         }

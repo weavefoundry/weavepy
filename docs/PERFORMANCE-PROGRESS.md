@@ -303,6 +303,28 @@ branch and pull request.
     already did, instead of leaving the native code for the interpreter.
     A property store costs 1,251 instructions instead of 2,078 (CPython
     3.13: 1,379).
+  - A class whose `__init__` takes `*args`, `**kwargs` or keyword-only
+    parameters is constructed from compiled code by binding the call
+    straight into the `__init__`'s native body, as a plain `__init__`
+    already was, instead of through the interpreter's constructor lane.
+    `InitVa(i, 2)` with `__init__(self, *args)` costs 2,730 instructions
+    instead of 3,582 (CPython 3.13: 1,729); `collections_mix` takes 11%
+    fewer instructions (its named tuples' `__new__` lanes) and
+    `context_managers` 3% fewer (`suppress(KeyError)`).
+  - A regular expression's compiled program is kept on disk beside the
+    frozen code (`_sre._cache_get`, keyed by the pattern, its type and its
+    flags, invalidated by the regular-expression compiler's sources), so a
+    later process skips the pure-Python parser and compiler. A pattern
+    that might warn as it parses compiles every time, so its warning still
+    shows; a process stores at most 256 and a cache at most 4,096. Imports
+    that compile patterns get much cheaper: `decimal` 86 to 69 million
+    instructions, `statistics` 112 to 75 million (Linux, CPython 3.13: 46
+    and 73 million), and `datetime`, `pathlib`, `statistics` and
+    `urllib.parse` together 141 to 102 million. The suite's per-call
+    instruction counts leave imports out, so they don't show it.
+  - Measured and left: a user `__new__` (`pathlib`'s paths) still runs as
+    two interpreter activations, at 2.1 times CPython's cost, and
+    `super().__new__(cls)` at 3.4 times.
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless

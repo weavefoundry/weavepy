@@ -723,11 +723,13 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
         // the pointer is compared.
         if !std::ptr::eq(Rc::as_ptr(&*init.code.as_ptr()), Rc::as_ptr(code))
             || !Interpreter::lean_code_ok(code)
-            || Interpreter::has_extended_params(code)
         {
             return None;
         }
-        let missing = Interpreter::missing_defaults(init, code, argc + 1)?;
+        // (An `__init__(self, *args)` binds its surplus as the direct
+        // calls' extended binding does.)
+        let extended = Interpreter::has_extended_params(code);
+        let missing = Interpreter::lean_init_missing(init, code, argc + 1)?;
         let cells = !code.cellvars.is_empty() || !code.freevars.is_empty();
         if cells && code.cellvars.is_empty() && init.lean_cells_ref(code).is_none() {
             return None;
@@ -776,10 +778,7 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
             Rc::as_ptr(f),
             code_rc,
             true,
-            BindArgs::Positional {
-                missing,
-                extended: false,
-            },
+            BindArgs::Positional { missing, extended },
             cells,
             native.need(),
             interp.recs.top(),
