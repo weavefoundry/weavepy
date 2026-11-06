@@ -44514,6 +44514,13 @@ impl Interpreter {
                 let it = self.make_iter(v, globals)?;
                 let mut out = Vec::new();
                 if let Object::Generator(g) = &it {
+                    // A fresh generator whose body takes fast steps drains
+                    // in one go; where the steps stop short, the resumes
+                    // below go on from there.
+                    if let Some(v) = self.gen_fast_collect(g, &mut out) {
+                        drop(v);
+                        return Ok(out);
+                    }
                     // A lean resume moves each yield straight into `out`
                     // (see `Interpreter::sum_fold`).
                     loop {
@@ -49683,6 +49690,43 @@ impl Interpreter {
             GEN_RAW_RETURN.with(|r| r.set(true));
         }
         self.generator_send_fold(gen, Object::None, None)
+    }
+
+    /// Drain the fresh generator `gen` into `out` by fast steps (see
+    /// [`Self::gen_fast_drain`]), on the lean resume's terms: `Some` its
+    /// return value once it finished; `None` where the steps declined or
+    /// stopped short (what they took already in `out`), for the general
+    /// resume to go on from where they left it.
+    fn gen_fast_collect(&mut self, gen: &Rc<PyGenerator>, out: &mut Vec<Object>) -> Option<Object> {
+        // SAFETY: a read of the state's tag between instructions.
+        let fresh = matches!(
+            unsafe { gen.state_raw().peek() },
+            Some(crate::object::GeneratorState::Created(_))
+        );
+        if !fresh || !gen_fast::may_step(gen) {
+            return None;
+        }
+        let snap_gen = self.lean_snapshot()?;
+        if self.dbg_sample
+            || crate::trace::any_observers_active()
+            || crate::trace::eval_frame_record_active()
+            || crate::stdlib::greenlet_native::on_greenlet_stack()
+        {
+            return None;
+        }
+        match self.gen_fast_drain(
+            gen,
+            FoldSink::Collect(std::ptr::from_mut(out)),
+            snap_gen,
+            crate::gc_trace::maybe_dead_flag(),
+        ) {
+            gen_fast::GenNext::Exhausted(v) => Some(v),
+            gen_fast::GenNext::Yielded(v) => {
+                out.push(v);
+                None
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
     }
 
     /// [`Self::generator_next_raw`]'s fast step, on the lean resume's

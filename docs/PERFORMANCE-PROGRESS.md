@@ -322,6 +322,17 @@ branch and pull request.
     and 73 million), and `datetime`, `pathlib`, `statistics` and
     `urllib.parse` together 141 to 102 million. The suite's per-call
     instruction counts leave imports out, so they don't show it.
+  - `list(gen)`, `tuple(gen)`, `set(gen)` and `frozenset(gen)` of a fresh
+    generator with a simple body, called from compiled code, drain the
+    generator's fast steps straight into the new container, skipping the
+    constructor lanes between the call and the generator; a set's items
+    insert directly while they hash and compare natively. Where the drain
+    stops short, what it took goes back in the generator's place (a list,
+    or a `chain` of it and the generator) for the ordinary path. Any other
+    builtin's collection of a fresh generator (`"".join`, `min`) takes the
+    same fast drain first. `set(x for x in ())` costs 3,269 instructions
+    instead of 4,141, and `list(genexp)` of eight items 4,606 instead of
+    5,497 (CPython 3.13: 2,362 and 4,686).
   - Measured and left: a user `__new__` (`pathlib`'s paths) still runs as
     two interpreter activations, at 2.1 times CPython's cost, and
     `super().__new__(cls)` at 3.4 times.

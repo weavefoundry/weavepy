@@ -9785,6 +9785,147 @@ unsafe fn direct_done<const PUSHED: bool>(
     }
 }
 
+/// [`h_call`]'s `T(gen)` for `T` the builtin `list`, `tuple`, `set` or
+/// `frozenset` (the class at `start` on a `len`-deep stack, `gen` above its
+/// empty self slot) when `gen` is a fresh generator whose body takes fast
+/// steps: the steps drain it into the container, as the constructor's
+/// own drain would (a set's items hash only after the drain there too).
+/// `Some(0)` the container in the class's slot. Where the drain stops
+/// short, or a set's items need Python to hash or compare, what it took
+/// goes back in the generator's place (a list, or a `chain` of it and the
+/// generator) and the call declines to the ordinary path, which goes on
+/// from there. `None` for anything else, untouched.
+///
+/// # Safety
+///
+/// As `h_call`'s, with a non-null switch.
+#[inline(never)]
+unsafe fn ctor_drain(
+    st: &mut State,
+    ty: &Rc<crate::types::TypeObject>,
+    start: usize,
+    len: usize,
+) -> Option<u32> {
+    use crate::gen_fast::GenNext;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let bt = crate::builtin_types::builtin_types();
+        let kind = if Rc::ptr_eq(ty, &bt.list_) {
+            0
+        } else if Rc::ptr_eq(ty, &bt.tuple_) {
+            1
+        } else if Rc::ptr_eq(ty, &bt.set_) {
+            2
+        } else if Rc::ptr_eq(ty, &bt.frozenset_) {
+            3
+        } else {
+            return None;
+        };
+        let slot = st.stack.add(start + 2);
+        let Object::Generator(g) = &*slot else {
+            return None;
+        };
+        if !matches!(
+            g.state_raw().peek(),
+            Some(crate::object::GeneratorState::Created(_))
+        ) || !crate::gen_fast::may_step(g)
+            || !Interpreter::core_drops_plain()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::gc_trace::auto_collect_due()
+        {
+            return None;
+        }
+        let g = g.clone();
+        let interp = &mut *st.interp.cast_mut();
+        let mut items: Vec<Object> = Vec::new();
+        let r = interp.gen_fast_drain(
+            &g,
+            crate::FoldSink::Collect(&raw mut items),
+            st.snap_gen,
+            st.maybe_dead,
+        );
+        let finished = match r {
+            GenNext::Exhausted(v) => {
+                drop(v);
+                true
+            }
+            // (A collecting sink takes every yield.)
+            GenNext::Yielded(v) => {
+                items.push(v);
+                false
+            }
+            GenNext::Partial | GenNext::Declined => false,
+        };
+        let native = kind < 2
+            || items
+                .iter()
+                .all(|v| crate::object::LeafProbe::new(v).is_some());
+        if finished && native {
+            drop(g);
+            let obj = match kind {
+                0 => {
+                    let obj = Object::new_list(items);
+                    crate::gc_trace::track(&obj);
+                    obj
+                }
+                1 => Object::new_tuple(items),
+                _ => {
+                    let mut set = crate::object::SetData::with_capacity_and_hasher(
+                        items.len(),
+                        crate::fasthash::FxBuildHasher,
+                    );
+                    for v in items {
+                        set.insert(crate::object::DictKey(v));
+                    }
+                    if kind == 2 {
+                        let obj = Object::Set(Rc::new(crate::sync::RefCell::new(set)));
+                        crate::gc_trace::track(&obj);
+                        obj
+                    } else {
+                        Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(set)))
+                    }
+                }
+            };
+            crate::release_run(st.stack.add(start), len - start);
+            st.stack.add(start).write(obj);
+            st.len = start + 1;
+            return Some(0);
+        }
+        if items.is_empty() {
+            // Nothing taken: the ordinary path drives the generator from
+            // where its steps left it.
+            return Some(CALL_DECLINED);
+        }
+        // What the drain took, then (unless it finished) the rest.
+        let taken = Object::new_list(items);
+        crate::gc_trace::track(&taken);
+        let arg = if finished {
+            taken
+        } else {
+            let globals = (*st.frame).globals.clone();
+            let (Ok(active), Ok(source)) = (
+                interp.make_iter(&taken, &globals),
+                interp.make_iter(
+                    &Object::new_tuple(vec![Object::Generator(g.clone())]),
+                    &globals,
+                ),
+            ) else {
+                unreachable!("a list's and a tuple's iterators");
+            };
+            Object::LazyIter(Rc::new(crate::object::PyLazyIter::new(
+                crate::object::LazyIterKind::Chain {
+                    source: Some(source),
+                    active: Some(active),
+                },
+            )))
+        };
+        drop(g);
+        drop(std::mem::replace(&mut *slot, arg));
+        Some(CALL_DECLINED)
+    }
+}
+
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
 /// a `functools.lru_cache` wrapper that missed its cache
 /// (`Interpreter::core_lru_probe`): its function in the wrapper's place,
@@ -10186,6 +10327,20 @@ unsafe extern "C" fn h_call(
                 return 0;
             }
             return RELOAD;
+        }
+        // `list(gen)`, `tuple(gen)`, `set(gen)` or `frozenset(gen)` of a
+        // fresh generator with a simple body: its fast steps drain it
+        // straight into the new container.
+        if argc == 1 && !st.sw.is_null() {
+            if let (Object::Type(ty), Object::Unbound, Object::Generator(_)) = (
+                &*base.add(start),
+                &*base.add(start + 1),
+                &*base.add(start + 2),
+            ) {
+                if let Some(r) = ctor_drain(st, ty, start, len) {
+                    return r;
+                }
+            }
         }
         let done = |st: &mut State, r: Object| {
             crate::release_run(base.add(start), len - start);
