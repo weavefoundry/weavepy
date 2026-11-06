@@ -1634,12 +1634,16 @@ struct SeqLayout {
 /// [`SeqLayout`], read off a sample list and tuple (`None` if they aren't
 /// the shapes the code assumes).
 fn seq_layout() -> Option<SeqLayout> {
-    const MARK: i64 = 0x5eed_5e9_0000_0001;
+    const MARK: i64 = 0x5eed_05e9_0000_0001;
     // (Room for 7: the vector's capacity and length differ, so each word
     // is told apart by its value.)
     let items = || {
         let mut v = Vec::with_capacity(7);
-        v.extend([Object::Int(MARK), Object::Int(MARK + 1), Object::Int(MARK + 2)]);
+        v.extend([
+            Object::Int(MARK),
+            Object::Int(MARK + 1),
+            Object::Int(MARK + 2),
+        ]);
         v
     };
     let payload = |o: &Object| -> usize {
@@ -1673,8 +1677,7 @@ fn seq_layout() -> Option<SeqLayout> {
     let len = words.iter().position(|&w| w == vl)?;
     // SAFETY: the second item's two words, inside the vector.
     let second: [u64; 2] = unsafe { std::ptr::read((vp as usize + 16) as *const [u64; 2]) };
-    let counter =
-        unsafe { &*((alloc + data + borrow) as *const std::sync::atomic::AtomicI32) };
+    let counter = unsafe { &*((alloc + data + borrow) as *const std::sync::atomic::AtomicI32) };
     let idle = counter.load(std::sync::atomic::Ordering::Relaxed);
     let held = {
         let _g = rc.borrow_mut();
@@ -7150,7 +7153,7 @@ unsafe fn attr_miss_quick(
                 {
                     return Some(v);
                 }
-                field_hit_slow(site, inst).map(|v| crate::clone_hot(v))
+                field_hit_slow(site, inst).map(crate::clone_hot)
             }
             Object::Frame(_) | Object::Code(_) if local || droppable(recv) => {
                 let code = &*site.code;
@@ -11577,7 +11580,11 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
                 if !interp.core_builtin_kw_lane(sw, pc) {
                     return CALL_DECLINED;
                 }
-                return if finished_in_place(st, start) { 0 } else { RELOAD };
+                return if finished_in_place(st, start) {
+                    0
+                } else {
+                    RELOAD
+                };
             }
             // A plain Python callee switches in place, as `CALL`'s does.
             if !matches!(&ops[0], Object::Function(_)) || st.sw.is_null() {
@@ -14991,7 +14998,10 @@ impl<'a> Lower<'a> {
             let b = self.b.create_block();
             self.b.ins().brif(outside, b, &[], inside, &[]);
             self.b.switch_to_block(b);
-            let past = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, pc, n as i64);
+            let past = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, pc, n as i64);
             let chain = self.b.create_block();
             self.b.ins().brif(past, out, &[], chain, &[]);
             self.b.switch_to_block(chain);
@@ -17033,9 +17043,7 @@ impl<'a> Lower<'a> {
         }
         let borrowed = matches!(cont, Item::Local(_) | Item::Const(_));
         match self.code.caches.get(pc as u32) {
-            IC::SubscrListInt
-                if borrowed || self.tags.rc_counted & (1 << self.tags.list) != 0 =>
-            {
+            IC::SubscrListInt if borrowed || self.tags.rc_counted & (1 << self.tags.list) != 0 => {
                 Some(false)
             }
             IC::SubscrTupleInt if borrowed || l.tuple_counted => Some(true),
@@ -17098,7 +17106,10 @@ impl<'a> Lower<'a> {
         let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
         let from_end = self.b.ins().iadd(i, len);
         let at = self.b.ins().select(neg, from_end, i);
-        let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
+        let outside = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
         self.branch_out(outside, helper_block);
         let byte = self.b.ins().ishl_imm(at, 4);
         let src = self.b.ins().iadd(items, byte);
@@ -17146,7 +17157,8 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot);
         let (pkey, own_k) = self.ref_or_own(key, slot + 1);
         let owned = u8::from(own_c) | (u8::from(own_k) << 1);
-        let done = tuple.map(|tuple| self.seq_index_in_line(tuple, slot, pcont, own_c, pkey, key_int));
+        let done =
+            tuple.map(|tuple| self.seq_index_in_line(tuple, slot, pcont, own_c, pkey, key_int));
         self.subscr_call(pc, slot, pcont, pkey, owned);
         if let Some(done) = done {
             self.b.ins().jump(done, &[]);
@@ -17207,7 +17219,8 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot + 1);
         let (pkey, own_k) = self.ref_or_own(key, slot + 2);
         let owned = u8::from(own_v) | (u8::from(own_c) << 1) | (u8::from(own_k) << 2);
-        let stored = in_line.then(|| self.list_store_in_line(pv, own_v, pcont, own_c, pkey, key_int));
+        let stored =
+            in_line.then(|| self.list_store_in_line(pv, own_v, pcont, own_c, pkey, key_int));
         let r = self
             .call(by_owned!(h_setitem_hot, owned, 3), &[pv, pcont, pkey], true)
             .expect("returns");
@@ -17297,7 +17310,10 @@ impl<'a> Lower<'a> {
         let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
         let from_end = self.b.ins().iadd(i, len);
         let at = self.b.ins().select(neg, from_end, i);
-        let outside = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
+        let outside = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
         self.branch_out(outside, helper_block);
         let byte = self.b.ins().ishl_imm(at, 4);
         let dst = self.b.ins().iadd(items, byte);
@@ -17936,7 +17952,8 @@ impl<'a> Lower<'a> {
                 let helper_block = self.b.create_block();
                 let done = self.b.create_block();
                 let at = self.local_addr(i);
-                let memo = self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
+                let memo =
+                    self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
                 let v = self.field_place(memo, idx, helper_block);
                 let dst = self.slot_addr(slot);
                 self.copy_value(dst, v);
@@ -17960,7 +17977,8 @@ impl<'a> Lower<'a> {
                 let helper_block = self.b.create_block();
                 let done = self.b.create_block();
                 let at = self.slot_addr(slot);
-                let memo = self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
+                let memo =
+                    self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
                 let v = self.field_place(memo, idx, helper_block);
                 let inst = self.b.ins().load(self.ptr, FLAGS, at, 8);
                 let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
@@ -18381,10 +18399,10 @@ impl<'a> Lower<'a> {
                 let cap = self.b.ins().uload32(FLAGS, block, l.split_cap);
                 let body = self.b.ins().load(types::I64, FLAGS, inst, l.inst_c_body);
                 let next = self.b.ins().icmp_imm(IntCC::NotEqual, len, i64::from(idx));
-                let full = self
-                    .b
-                    .ins()
-                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, cap, i64::from(idx));
+                let full =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedLessThanOrEqual, cap, i64::from(idx));
                 let native = self.b.ins().icmp_imm(IntCC::NotEqual, body, 0);
                 let bad = self.b.ins().bor(next, full);
                 let bad = self.b.ins().bor(bad, native);

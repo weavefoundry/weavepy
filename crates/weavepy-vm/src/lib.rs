@@ -13479,7 +13479,13 @@ impl Interpreter {
                         if subscr && len >= 2 {
                             // SAFETY: `len >= 2`.
                             unsafe {
-                                Self::note_subscr_shape(code, pc, ins.op == OpCode::StoreSubscr, base, len)
+                                Self::note_subscr_shape(
+                                    code,
+                                    pc,
+                                    ins.op == OpCode::StoreSubscr,
+                                    base,
+                                    len,
+                                )
                             };
                         }
                         let n = if subscr {
@@ -21103,7 +21109,10 @@ impl Interpreter {
         base: *const Object,
         len: usize,
     ) {
-        if matches!(code.caches.get(pc as u32), weavepy_compiler::InlineCache::Empty) {
+        if matches!(
+            code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Empty
+        ) {
             // SAFETY: per the caller.
             unsafe { Self::note_subscr_shape_slow(code, pc, store, base, len) }
         }

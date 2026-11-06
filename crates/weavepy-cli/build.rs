@@ -55,7 +55,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WEAVEPY_ORDER_FILE");
     let order = match env::var_os("WEAVEPY_ORDER_FILE") {
         Some(path) => PathBuf::from(path),
-        None => Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order"),
+        None => {
+            Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("weavepy.order")
+        }
     };
     println!("cargo:rerun-if-changed={}", order.display());
     if order.exists() && env::var_os("WEAVEPY_NO_ORDER_FILE").is_none() {

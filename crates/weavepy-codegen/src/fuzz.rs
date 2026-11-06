@@ -642,7 +642,7 @@ unsafe fn call_checked(f: *const u8, a: i64, b: i64, mem: *mut u8) -> (i64, bool
             "push rbx", "push r12", "push r13", "push r14", "push r15", "push rbp",
             "mov rbx, 0x1111", "mov r12, 0x2222", "mov r13, 0x3333",
             "mov r14, 0x4444", "mov r15, 0x5555",
-            "call {f}",
+            "call r11",
             "xor ecx, ecx", "xor edx, edx",
             "cmp rbx, 0x1111", "setne cl", "or rdx, rcx",
             "cmp r12, 0x2222", "setne cl", "or rdx, rcx",
@@ -650,7 +650,9 @@ unsafe fn call_checked(f: *const u8, a: i64, b: i64, mem: *mut u8) -> (i64, bool
             "cmp r14, 0x4444", "setne cl", "or rdx, rcx",
             "cmp r15, 0x5555", "setne cl", "or rdx, rcx",
             "pop rbp", "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx",
-            f = in(reg) f,
+            // (In a register the sequence leaves alone: one it seeds would
+            // overwrite the callee's address before the call.)
+            in("r11") f,
             in("rdi") a, in("rsi") b, in("rdx") mem,
             lateout("rax") ret, lateout("rdx") bad,
             clobber_abi("C"),
@@ -664,7 +666,7 @@ unsafe fn call_checked(f: *const u8, a: i64, b: i64, mem: *mut u8) -> (i64, bool
             "stp x27, x28, [sp, #-16]!",
             "mov x19, #19", "mov x20, #20", "mov x21, #21", "mov x22, #22", "mov x23, #23",
             "mov x24, #24", "mov x25, #25", "mov x26, #26", "mov x27, #27", "mov x28, #28",
-            "blr {f}",
+            "blr x16",
             "mov x9, #0",
             "cmp x19, #19", "cset x10, ne", "orr x9, x9, x10",
             "cmp x20, #20", "cset x10, ne", "orr x9, x9, x10",
@@ -679,7 +681,8 @@ unsafe fn call_checked(f: *const u8, a: i64, b: i64, mem: *mut u8) -> (i64, bool
             "ldp x27, x28, [sp], #16", "ldp x25, x26, [sp], #16",
             "ldp x23, x24, [sp], #16", "ldp x21, x22, [sp], #16",
             "ldp x19, x20, [sp], #16",
-            f = in(reg) f,
+            // (As on x86-64: not in a register the sequence seeds.)
+            in("x16") f,
             in("x0") a, in("x1") b, in("x2") mem,
             lateout("x0") ret, out("x9") bad,
             clobber_abi("C"),

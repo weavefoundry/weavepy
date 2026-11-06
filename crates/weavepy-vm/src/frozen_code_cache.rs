@@ -435,38 +435,6 @@ pub fn clear() {
     CACHE.with(|c| c.borrow_mut().clear());
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_returns_fresh_copies() {
-        clear();
-        let mut code = CodeObject::default();
-        code.name = "foo".into();
-        insert("foo", &code);
-        let got = get("foo").expect("hit");
-        assert_eq!(got.name, "foo");
-        assert!(get("missing").is_none());
-    }
-
-    #[test]
-    fn cache_clears_inline_caches_on_clone() {
-        use weavepy_compiler::{CacheTable, InlineCache};
-        clear();
-        let mut code = CodeObject::default();
-        code.name = "warmed".into();
-        code.caches = CacheTable::with_len(2);
-        code.caches.set(0, InlineCache::BinOpAddInt);
-        insert("warmed", &code);
-        let got = get("warmed").expect("hit");
-        // The cloned code's cache must start empty so this
-        // interpreter's specializer gets to record fresh
-        // fingerprints.
-        assert_eq!(got.caches.get(0), InlineCache::Empty);
-    }
-}
-
 // ---------------------------------------------------------------------
 // Keyed results beside the frozen code (a regular expression's compiled
 // program, see `_sre._cache_get`): what a pure-Python compiler made from
@@ -556,5 +524,37 @@ pub fn result_put(kind: &str, tag: u64, key: &[u8], value: &[u8]) {
         let _ = std::fs::rename(&tmp, &path);
     } else {
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_returns_fresh_copies() {
+        clear();
+        let mut code = CodeObject::default();
+        code.name = "foo".into();
+        insert("foo", &code);
+        let got = get("foo").expect("hit");
+        assert_eq!(got.name, "foo");
+        assert!(get("missing").is_none());
+    }
+
+    #[test]
+    fn cache_clears_inline_caches_on_clone() {
+        use weavepy_compiler::{CacheTable, InlineCache};
+        clear();
+        let mut code = CodeObject::default();
+        code.name = "warmed".into();
+        code.caches = CacheTable::with_len(2);
+        code.caches.set(0, InlineCache::BinOpAddInt);
+        insert("warmed", &code);
+        let got = get("warmed").expect("hit");
+        // The cloned code's cache must start empty so this
+        // interpreter's specializer gets to record fresh
+        // fingerprints.
+        assert_eq!(got.caches.get(0), InlineCache::Empty);
     }
 }
