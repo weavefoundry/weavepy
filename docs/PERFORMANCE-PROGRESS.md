@@ -416,6 +416,23 @@ branch and pull request.
     first, when the values have room and the value needs no write
     barrier: `oo_patterns` takes 2.1% fewer instructions, `logging_mix`
     1.7% and `context_managers` 1%.
+  - `object.__new__(cls)` in a user `__new__` (`pathlib`'s paths) runs
+    from compiled code as the core loop's leaf call makes it, instead of
+    registering the activation for the core loop's lane, so the class's
+    `__init__` runs natively after it; and a certain attribute miss (an
+    unset `__slots__` member that a `try` catches, `pathlib`'s cached
+    parse) raises in place even at a site that also calls getters. A
+    `pathlib` join and four properties cost 83,347 instructions instead
+    of 116,859, and `stdlib_utils` takes 5.7% fewer.
+  - Next for `exceptions` and `try`-heavy code: a compiled function that
+    catches an exception registers its activation for the core loop's
+    catch, which needs the activation's frame shell for the traceback
+    entry, so the function's return and its caller's then run switched
+    (`exceptions` registers `lookup` and `guarded` once per raise).
+  - Measured and left: tracking an untracked instance through a small
+    helper when an in-line store puts a heap value in it (the write
+    barrier), instead of leaving the store to the full helper, changed
+    nothing measurable.
   - Measured and left: loading a method in line from its site's first
     cache (the class version, then the instance's values checked for the
     name) took `h_method` from 3.3% of `go` to 0.3%, but the compiled

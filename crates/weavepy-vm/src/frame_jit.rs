@@ -7105,8 +7105,13 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         if r == 0 {
             return 0;
         }
+        // A certain miss (an unset `__slots__` member among them) raises in
+        // place, as the full handler would, whatever else the site can do.
+        if let Some(r) = attr_miss_raise(st, site, at, local) {
+            return r;
+        }
         if site.direct.is_null() {
-            return attr_miss_raise(st, site, at, local).unwrap_or(CALL_DECLINED);
+            return CALL_DECLINED;
         }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
     }
@@ -10765,7 +10770,9 @@ unsafe extern "C" fn h_call(
             st.len = top - 1;
             return 0;
         }
-        if !kind.runs_in_core() {
+        // (`object.__new__(cls)`, a user `__new__`'s allocation, runs no
+        // code: as the core loop's leaf call makes it.)
+        if !kind.runs_in_core() && !matches!(kind, LeafKind::ObjectNew) {
             return leaf_call_lane(st, pc, start, len);
         }
         let first = if matches!(&ops[1], Object::Unbound) {
