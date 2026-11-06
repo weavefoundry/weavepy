@@ -469,6 +469,11 @@ branch and pull request.
     the interpreter: `async_tree` takes 1.9% fewer instructions. The
     setter's full half now takes a value's truth as CPython does,
     running its `__bool__` (it read any instance as true).
+  - A builtin called with keywords whose call may run Python code
+    (`sorted(xs, key=lambda v: -v)`, `ElementTree.SubElement(parent, tag,
+    id=...)`) goes through the core loop's lane for it with the activation
+    published, the result in place, instead of leaving compiled code:
+    `closures_decorators` and `xml_etree` take 1% fewer instructions.
   - Next for constructors: a class called with keywords (`C(i, b=2)`,
     `gather`'s `_GatheringFuture(children, loop=loop)`) leaves compiled
     code at the `CALL_KW` and runs its `__init__` in the core loop, 4,778

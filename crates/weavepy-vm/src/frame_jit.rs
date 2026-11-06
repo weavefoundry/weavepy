@@ -11448,6 +11448,24 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };
         let Some(r) = r else {
+            // A builtin whose keyword call may run Python code (`sorted`
+            // with a `key=` lambda): the core loop's lane for it, the
+            // activation published, the result in place.
+            if matches!((&ops[0], &ops[1]), (Object::Builtin(_), Object::Unbound))
+                && !st.sw.is_null()
+            {
+                let frame = &mut *st.frame;
+                frame.stack.set_len(len);
+                frame.pc = pc as u32;
+                settle(st);
+                let sw = &mut *st.sw;
+                *sw.last = st.last;
+                let interp = &mut *st.interp.cast_mut();
+                if !interp.core_builtin_kw_lane(sw, pc) {
+                    return CALL_DECLINED;
+                }
+                return if finished_in_place(st, start) { 0 } else { RELOAD };
+            }
             // A plain Python callee switches in place, as `CALL`'s does.
             if !matches!(&ops[0], Object::Function(_)) || st.sw.is_null() {
                 return CALL_DECLINED;
