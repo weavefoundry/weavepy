@@ -449,6 +449,31 @@ branch and pull request.
     the comparison no longer sends it to the core loop. `d[k] += a * a`
     over such values costs 2,109 instructions instead of 2,948, and
     `statistics.mean`, `median` and `pstdev` of 200 floats 3.4% fewer.
+  - A site that concatenates sequences or bytes (`buf += packed` of a
+    `bytearray`, `a + b` of lists) is noted as a heap value's too, so it
+    compiles through the general helper instead of the numeric path that
+    leaves compiled code for every non-number: `bytes_codecs`'s packing
+    loop costs 4,686 instructions per iteration instead of 5,131.
+  - A body too large for one compile runs in chunks, and a raise caught
+    by a handler in another chunk (a `with` block's in a loop, whose
+    handler is laid out past the loop) now goes on in that chunk, as a
+    jump between chunks does, instead of leaving for the core loop:
+    `context_managers`'s `bench` left its loop's chunk at every raise,
+    twice an iteration, and `context_managers` takes 4% fewer
+    instructions. (Weighing the exception edges in where the chunks are
+    cut got the same there, but moved `tomllib_loads`'s cuts into a hot
+    loop: 1.4% more.)
+  - A store through a native property's setter whose fast half runs no
+    Python code (asyncio's `Task._log_destroy_pending`, which `gather`
+    sets on every child) runs from compiled code, instead of leaving for
+    the interpreter: `async_tree` takes 1.9% fewer instructions. The
+    setter's full half now takes a value's truth as CPython does,
+    running its `__bool__` (it read any instance as true).
+  - Next for constructors: a class called with keywords (`C(i, b=2)`,
+    `gather`'s `_GatheringFuture(children, loop=loop)`) leaves compiled
+    code at the `CALL_KW` and runs its `__init__` in the core loop, 4,778
+    instructions against CPython's 3,210; binding `__init__`'s keywords
+    natively needs the permutation the function call sites cache.
   - Next for `exceptions` and `try`-heavy code: a compiled function that
     catches an exception registers its activation for the core loop's
     catch, which needs the activation's frame shell for the traceback

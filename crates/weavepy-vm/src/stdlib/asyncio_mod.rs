@@ -1802,7 +1802,13 @@ fn taskprop_log_destroy_pending(args: &[Object]) -> Result<Object, RuntimeError>
 fn taskprop_set_log_destroy_pending(args: &[Object]) -> Result<Object, RuntimeError> {
     let (_inst, st) = state_of(args)?;
     let v = args.get(1).cloned().unwrap_or(Object::None);
-    st.borrow_mut().log_destroy_pending = truthy(&v);
+    // (The value's truth, as CPython's `PyObject_IsTrue` takes it: a
+    // `__bool__` or `__len__` of its own runs.)
+    let on = match &v {
+        Object::None | Object::Bool(_) | Object::Int(_) => truthy(&v),
+        _ => interp()?.op_truth(&v)?,
+    };
+    st.borrow_mut().log_destroy_pending = on;
     Ok(Object::None)
 }
 

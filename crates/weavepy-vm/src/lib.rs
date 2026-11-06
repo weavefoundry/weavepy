@@ -10689,11 +10689,22 @@ impl Interpreter {
         };
         // SAFETY: GIL-serialized raw read of the setter cell; the clone is
         // taken before anything else runs.
-        let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
-            return false;
-        };
-        let f = f.clone();
-        self.leaf_setter_eval(&f, receiver, value)
+        match unsafe { &*prop.fset.as_ptr() } {
+            Object::Function(f) => {
+                let f = f.clone();
+                self.leaf_setter_eval(&f, receiver, value)
+            }
+            // A native setter's fast half (asyncio's `Task._log_destroy_pending`),
+            // which runs no Python code, as the core loop's store runs it.
+            Object::Builtin(b) => match self.leaf_call_kind(b) {
+                Some(LeafKind::Fast(fast)) => {
+                    let args = [receiver.clone(), value.clone()];
+                    matches!(fast(&args), Some(Ok(_)))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
@@ -13382,6 +13393,11 @@ impl Interpreter {
                                 let Some(r) = Self::core_seq_concat(a, b) else {
                                     break None;
                                 };
+                                // (A heap result: compiled code takes the
+                                // helper that keeps one, not the numbers'.)
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: both operand slots are initialized and
                                 // leave the stack; the result takes the first.
                                 unsafe {
@@ -13401,6 +13417,9 @@ impl Interpreter {
                             (Object::Bytes(_) | Object::ByteArray(_), Object::Bytes(_))
                                 if kind == BinOpKind::Add =>
                             {
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 let r = match (a, b) {
                                     (Object::Bytes(x), Object::Bytes(y)) => {
                                         let mut v = Vec::with_capacity(x.len() + y.len());

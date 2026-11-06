@@ -14854,7 +14854,25 @@ impl<'a> Lower<'a> {
             self.range.len() as i64,
         );
         let inside = self.b.create_block();
-        self.b.ins().brif(outside, out, &[], inside, &[]);
+        // A pc of another chunk (a handler laid out past the loop that
+        // raised) goes on there, the state already synced.
+        let elsewhere = if self.range.start > 0 || self.range.end < n {
+            let b = self.b.create_block();
+            self.b.ins().brif(outside, b, &[], inside, &[]);
+            self.b.switch_to_block(b);
+            let past = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, pc, n as i64);
+            let chain = self.b.create_block();
+            self.b.ins().brif(past, out, &[], chain, &[]);
+            self.b.switch_to_block(chain);
+            let s = self.b.ins().iconst(types::I32, i64::from(CHAIN));
+            self.b.ins().return_(&[s]);
+            true
+        } else {
+            false
+        };
+        if !elsewhere {
+            self.b.ins().brif(outside, out, &[], inside, &[]);
+        }
         self.b.switch_to_block(inside);
         let table = self.b.ins().iconst(self.ptr, self.route as i64);
         let off = self.b.ins().ishl_imm(pc, 2);
