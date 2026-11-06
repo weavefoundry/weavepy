@@ -7,6 +7,22 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 6, 2026, at `d07a0969` (PR #107), a PGO build against
+CPython 3.14 on the same host, interleaved in one session: warm time 0.948
+(geomean of 33 workloads), cold time 1.059, peak memory 1.262, and 0.961 of
+CPython's instructions. Since November 4's `11c639e5` (0.994 warm, 1.125
+cold) the worst have moved most: `exceptions` 1.30 to 1.10, `stdlib_utils`
+1.31 to 1.15, `logging_mix` 1.36 to 1.23, `deepcopy` 1.35 to 1.21 and
+`class_creation` 1.43 to 1.34. The worst warm times are now `async_tree`
+1.61, `context_managers` 1.40, `class_creation` 1.34, `logging_mix` 1.23,
+`deepcopy` 1.21, `tomllib_loads` 1.17, `stdlib_utils` 1.15 and `nqueens`
+1.15; the best are `pickle_roundtrip` 0.57, `scimark` 0.61,
+`unpack_sequence` 0.62, `json_roundtrip` 0.67 and `raytrace` 0.68. Peak
+memory is highest where many instances live (`async_tree` 1.60,
+`generators_tree` 1.50, `class_creation` 1.44): an instance with three
+attributes takes about 200 bytes against CPython's 130, its values a block
+of their own beside a 112-byte `PyInstance`.
+
 Measured later on November 4, 2026, at `11c639e5` (PR #107) with the
 iterator drain on top, a PGO build against CPython 3.14 on the same host,
 interleaved in one session: warm time 0.994 (geomean of 33 workloads), cold
@@ -424,11 +440,26 @@ branch and pull request.
     parse) raises in place even at a site that also calls getters. A
     `pathlib` join and four properties cost 83,347 instructions instead
     of 116,859, and `stdlib_utils` takes 5.7% fewer.
+  - An arithmetic site the core loop has seen produce or take a big int
+    (`statistics`' exact sums square numerators past a machine word) is
+    compiled through the helper that takes every shape, instead of the
+    numeric path, which leaves compiled code whenever its result isn't an
+    `int` or `float`. Big ints also compare natively (with each other, or
+    with a machine int by their sign), and a temporary one that dies in
+    the comparison no longer sends it to the core loop. `d[k] += a * a`
+    over such values costs 2,109 instructions instead of 2,948, and
+    `statistics.mean`, `median` and `pstdev` of 200 floats 3.4% fewer.
   - Next for `exceptions` and `try`-heavy code: a compiled function that
     catches an exception registers its activation for the core loop's
     catch, which needs the activation's frame shell for the traceback
     entry, so the function's return and its caller's then run switched
     (`exceptions` registers `lookup` and `guarded` once per raise).
+  - Measured and left: compiling, when its calls make it hot, code whose
+    loops have never repeated (`urllib.parse._checknetloc` returns before
+    its loop, and stays in the core loop since tier 2 never sees the loop
+    run) cut `stdlib_utils` by 1.2%, but `raytrace`'s `Scene.trace` meets
+    the test too (its first rays miss the scene and return before the
+    light loop), and taking it from tier 2 cost `raytrace` 8.4%.
   - Measured and left: tracking an untracked instance through a small
     helper when an in-line store puts a heap value in it (the write
     barrier), instead of leaving the store to the full helper, changed

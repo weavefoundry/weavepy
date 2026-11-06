@@ -13181,41 +13181,59 @@ impl Interpreter {
                                     BinOpKind::Add => match a.checked_add(b) {
                                         Some(r) => int_hot(r),
                                         // Past the machine word: the bignum
-                                        // arithmetic (exact ints run no Python).
-                                        None => match core_bignum_op(
-                                            &Object::Int(a),
-                                            &Object::Int(b),
-                                            kind,
-                                        ) {
-                                            Ok(v) => v,
-                                            Err(_) => break None,
-                                        },
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::Sub => match a.checked_sub(b) {
                                         Some(r) => int_hot(r),
                                         // Past the machine word: the bignum
-                                        // arithmetic (exact ints run no Python).
-                                        None => match core_bignum_op(
-                                            &Object::Int(a),
-                                            &Object::Int(b),
-                                            kind,
-                                        ) {
-                                            Ok(v) => v,
-                                            Err(_) => break None,
-                                        },
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::Mult => match a.checked_mul(b) {
                                         Some(r) => int_hot(r),
                                         // Past the machine word: the bignum
-                                        // arithmetic (exact ints run no Python).
-                                        None => match core_bignum_op(
-                                            &Object::Int(a),
-                                            &Object::Int(b),
-                                            kind,
-                                        ) {
-                                            Ok(v) => v,
-                                            Err(_) => break None,
-                                        },
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::BitAnd => int_hot(a & b),
                                     BinOpKind::BitOr => int_hot(a | b),
@@ -13301,6 +13319,9 @@ impl Interpreter {
                             // line.
                             (Object::Long(_), Object::Int(_) | Object::Long(_))
                             | (Object::Int(_), Object::Long(_)) => {
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 let r = core_bignum_op(a, b, kind);
                                 // SAFETY: ints leave by plain decrements.
                                 unsafe {
@@ -86938,13 +86959,13 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
     // SAFETY: the caller's contract.
     let (a, b) = unsafe { (&*at, &*at.add(1)) };
     // A value that dies here may hold or be anything with a finalizer,
-    // except what owns no objects.
+    // except what owns no objects (a string, bytes, a big int's digits).
     fn quiet(o: &Object) -> bool {
         match o.strong_word() {
             None => true,
             // SAFETY: a counted variant's word, live while `o` is.
             Some(w) => {
-                matches!(o, Object::Str(_) | Object::Bytes(_))
+                matches!(o, Object::Str(_) | Object::Bytes(_) | Object::Long(_))
                     || unsafe { &*w }.load(std::sync::atomic::Ordering::Relaxed) > 1
             }
         }
@@ -87074,6 +87095,13 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_)) => {
             return native_seq_compare(a, b, op, 0);
         }
+        // Big ints, against each other or a machine int (one past the
+        // machine range is above or below every machine int by its sign).
+        (Object::Long(x), Object::Long(y)) => return Some(by_ord(Some((**x).cmp(&**y)))),
+        (Object::Long(x), Object::Int(y)) => return Some(by_ord(Some(long_cmp_int(x, *y)))),
+        (Object::Int(x), Object::Long(y)) => {
+            return Some(by_ord(Some(long_cmp_int(y, *x).reverse())));
+        }
         _ => {}
     }
     if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
@@ -87098,6 +87126,16 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         _ => return None,
     };
     Some(same == matches!(op, CompareKind::Eq))
+}
+
+/// How the big int `x` orders against the machine int `y`, allocating
+/// nothing.
+fn long_cmp_int(x: &num_bigint::BigInt, y: i64) -> std::cmp::Ordering {
+    match i64::try_from(x) {
+        Ok(v) => v.cmp(&y),
+        Err(_) if x.sign() == num_bigint::Sign::Minus => std::cmp::Ordering::Less,
+        Err(_) => std::cmp::Ordering::Greater,
+    }
 }
 
 /// `a <op> b` for two exact tuples (or two exact lists) whose compared
