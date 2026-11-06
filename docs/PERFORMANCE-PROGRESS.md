@@ -333,6 +333,18 @@ branch and pull request.
     same fast drain first. `set(x for x in ())` costs 3,269 instructions
     instead of 4,141, and `list(genexp)` of eight items 4,606 instead of
     5,497 (CPython 3.13: 2,362 and 4,686).
+  - Compiled code runs `RERAISE` itself, as the general loop's arm does
+    (the traceback kept, no chaining, a cleanup handler's original raise
+    offset back as the frame's line), so an `except` clause that raises
+    anew leaves its frame natively instead of through the interpreter. A
+    missing attribute that the default lookup certainly misses raises its
+    `AttributeError` from the compiled read, without the interpreter's
+    resolution passes. A bound method called with a spread tuple or list
+    (`f(*args)`, `f = obj.method`) binds its function straight from the
+    spread. A caught `AttributeError` costs 3,849 instructions instead of
+    6,667 (CPython 3.13: 4,360), the benchmark's `guarded` miss 16,411
+    instead of 17,418, and the method spread 1,286 instead of 2,144
+    (CPython: 996).
   - Measured and left: a user `__new__` (`pathlib`'s paths) still runs as
     two interpreter activations, at 2.1 times CPython's cost, and
     `super().__new__(cls)` at 3.4 times.

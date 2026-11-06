@@ -6938,9 +6938,68 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             return 0;
         }
         if site.direct.is_null() {
-            return CALL_DECLINED;
+            return attr_miss_raise(st, site, at, local).unwrap_or(CALL_DECLINED);
         }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
+    }
+}
+
+/// [`attr_miss`] of an attribute the default lookup certainly misses
+/// without running code (see `attr_certainly_missing`): its
+/// `AttributeError` raised here, as the full handler would raise it, a
+/// stack receiver gone (`RAISED`, the error in `st` for the catch block).
+/// `None`, untouched, for anything else.
+///
+/// # Safety
+///
+/// As [`attr_miss`]'s.
+#[inline(never)]
+unsafe fn attr_miss_raise(
+    st: *mut State,
+    site: &AttrSite,
+    at: *mut Object,
+    local: bool,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        // (An inlined body's site numbers its pc and slots its own way: its
+        // raise leaves through the inlined body's exit.)
+        if st.sw.is_null() || !std::ptr::eq(Rc::as_ptr(&(*st.frame).code), site.code) {
+            return None;
+        }
+        let code = &*site.code;
+        let ins = code.instructions.get(site.pc as usize)?;
+        if ins.op != OpCode::LoadAttr {
+            return None;
+        }
+        let name = code.names.get(ins.arg as usize)?;
+        let recv = &*at;
+        if !matches!(recv, Object::Instance(_))
+            || (!local && !droppable(recv))
+            || !crate::attr_certainly_missing(recv, name)
+        {
+            return None;
+        }
+        let err = match crate::certain_miss_error(recv, name) {
+            crate::RuntimeError::PyException(mut exc) => {
+                (*st.interp.cast_mut()).attach_implicit_context(&mut exc);
+                Interpreter::sync_exc_attrs(&exc);
+                crate::RuntimeError::PyException(exc)
+            }
+            e => e,
+        };
+        // The instruction's receiver leaves with the raise.
+        if !local {
+            drop(at.read());
+        }
+        st.err = Some(err);
+        st.len = site.slot as usize;
+        st.pc = site.pc as usize + 1;
+        if site.last != NO_LAST {
+            st.last = site.last as usize;
+        }
+        Some(RAISED)
     }
 }
 
@@ -11275,11 +11334,54 @@ unsafe fn spread_direct(
     // SAFETY: the caller's contract: four initialized operand slots.
     unsafe {
         let base = st.stack;
+        if !matches!(&*base.add(start + 3), Object::Unbound) {
+            return None;
+        }
+        // A bound method of a plain function (`f = obj.method`) spreads
+        // as its function with the receiver in the self slot, as a `CALL`
+        // expands it; a decline puts the method back.
+        let mut method = None;
+        if let (Object::BoundMethod(bm), Object::Unbound) =
+            (&*base.add(start), &*base.add(start + 1))
+        {
+            if bm.redispatch_descriptor
+                || !matches!(&bm.function, Object::Function(f) if !crate::fn_is_leaf(f))
+            {
+                return None;
+            }
+            let (f, recv) = (bm.function.clone(), bm.receiver.clone());
+            method = Some(base.add(start).read());
+            base.add(start).write(f);
+            base.add(start + 1).write(recv);
+        }
+        let r = spread_function(st, pc, start, site);
+        if let (None, Some(m)) = (&r, method) {
+            drop(base.add(start).replace(m));
+            drop(base.add(start + 1).replace(Object::Unbound));
+        }
+        r
+    }
+}
+
+/// [`spread_direct`] once the callee is a plain function (its receiver, if
+/// any, in the self slot).
+///
+/// # Safety
+///
+/// As [`spread_direct`]'s.
+#[inline(always)]
+unsafe fn spread_function(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    site: &mut DirectSite,
+) -> Option<u32> {
+    // SAFETY: the caller's contract: four initialized operand slots.
+    unsafe {
+        let base = st.stack;
         // (A frameless leaf's call stays the core loop's, evaluated in
         // place.)
-        if !matches!(&*base.add(start), Object::Function(f) if !crate::fn_is_leaf(f))
-            || !matches!(&*base.add(start + 3), Object::Unbound)
-        {
+        if !matches!(&*base.add(start), Object::Function(f) if !crate::fn_is_leaf(f)) {
             return None;
         }
         // A site whose callee had no native body rechecks after `retry`
@@ -11979,6 +12081,74 @@ unsafe extern "C" fn h_raise(st: *mut State, pc: u64, len: u64, n: u64) -> u32 {
             Ok(e) | Err(e) => e,
         });
         st.len = len - n;
+        st.pc = pc as usize + 1;
+        RAISED
+    }
+}
+
+/// `RERAISE k` (the instruction at `pc`, the exception atop a `len`-deep
+/// stack, written out) as the general loop's arm runs it: the exception
+/// goes on with the traceback it has (a re-raise records no entry and
+/// settles no chaining), and with `k > 0` the original raise offset `k`
+/// slots below it becomes the frame's line again (PEP 626). `RAISED` the
+/// error in `st` for the catch block (this frame's handler, or out of it);
+/// `CALL_DECLINED` untouched for anything else (an observer that must see
+/// the unwind, a frame object the full path keeps current).
+unsafe extern "C" fn h_reraise(st: *mut State, pc: u64, len: u64, k: u64) -> u32 {
+    // SAFETY: the code passes its live state, one of its re-raises, and its
+    // stack depth (the stack written out).
+    unsafe {
+        let st = &mut *st;
+        let (len, k) = (len as usize, k as usize);
+        if st.sw.is_null() || len <= k || crate::trace::any_observers_active() {
+            return CALL_DECLINED;
+        }
+        let frame = &mut *st.frame;
+        if frame.py_frame.is_some() || !matches!(&*st.stack.add(len - 1), Object::Instance(_)) {
+            return CALL_DECLINED;
+        }
+        let orig = if k == 0 {
+            None
+        } else {
+            match &*st.stack.add(len - 1 - k) {
+                Object::Int(l) => Some(u32::try_from(*l).unwrap_or(0)),
+                _ => return CALL_DECLINED,
+            }
+        };
+        let mut pe = match Interpreter::normalize_exception(st.stack.add(len - 1).read(), None) {
+            Ok(pe) => pe,
+            Err(e) => {
+                st.err = Some(e);
+                st.len = len - 1;
+                st.pc = pc as usize + 1;
+                return RAISED;
+            }
+        };
+        pe.suppress_tb_once = true;
+        pe.context_settled = true;
+        Interpreter::sync_exc_attrs(&pe);
+        // The general arm's `cleanup_lasti`, carried into the next handler
+        // lookup and shown as the frame's line.
+        let carried = frame.exc.as_mut().and_then(|e| e.cleanup_lasti.take());
+        if let Some(orig) = orig.or(carried) {
+            frame.exc_mut().pending_lasti = Some(orig);
+            frame.stack.set_len(len - 1);
+            frame.pc = pc as u32 + 1;
+            settle(st);
+            let sw = &mut *st.sw;
+            *sw.last = st.last;
+            if std::ptr::eq(sw.cur, st.frame) {
+                let interp = &mut *st.interp.cast_mut();
+                let mut tmp = None;
+                let (_, _, shell) = sw.activation((*sw.inl).len(), &mut tmp);
+                interp
+                    .flush_lean(frame, &mut *shell.cast::<crate::QuietShell<'_>>())
+                    .lasti
+                    .store(orig, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        st.err = Some(crate::RuntimeError::PyException(pe));
+        st.len = len - 1;
         st.pc = pc as usize + 1;
         RAISED
     }
@@ -13401,6 +13571,7 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
         }
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
+        OpCode::Reraise => true,
         // A prologue `MAKE_CELL`: the activation's cells are built with it.
         OpCode::MakeCell => prologue_cell(code, pc),
         // (A slot shared with a cell saves the cell itself.)
@@ -14669,6 +14840,30 @@ impl<'a> Lower<'a> {
                 let n = self.b.ins().iconst(types::I64, i64::from(ins.arg));
                 let r = self
                     .call(h_raise as *const () as usize, &[self.st, pcv, len, n], true)
+                    .expect("returns");
+                let out = self.exit_with(pc, &[], INTERP);
+                let raised = self.b.create_block();
+                let declined = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, r, i64::from(CALL_DECLINED));
+                self.b.ins().brif(declined, out, &[], raised, &[]);
+                self.b.switch_to_block(raised);
+                self.leave(r);
+                return false;
+            }
+            OpCode::Reraise if !self.inlining() && self.depth > ins.arg as usize => {
+                self.flush();
+                self.store_last();
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                let len = self.b.ins().iconst(types::I64, self.depth as i64);
+                let k = self.b.ins().iconst(types::I64, i64::from(ins.arg));
+                let r = self
+                    .call(
+                        h_reraise as *const () as usize,
+                        &[self.st, pcv, len, k],
+                        true,
+                    )
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
                 let raised = self.b.create_block();
