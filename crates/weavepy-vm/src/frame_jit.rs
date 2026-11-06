@@ -17958,18 +17958,17 @@ impl<'a> Lower<'a> {
         if cfg!(debug_assertions) || crate::property_site(self.ext, pc) {
             return None;
         }
-        // (A site that adds its attribute, a constructor's, leaves it to the
-        // helper: the guards would fail there every time.)
-        if !matches!(
-            self.code.caches.get(pc as u32),
-            weavepy_compiler::InlineCache::StoreAttrInstance { .. }
-                | weavepy_compiler::InlineCache::StoreAttrSlot { .. }
-        ) {
-            return None;
-        }
+        use weavepy_compiler::InlineCache as IC;
+        // A site that adds its attribute (a constructor's) appends it as
+        // the instance's next value; one that replaces it, over it.
+        let append = match self.code.caches.get(pc as u32) {
+            IC::StoreAttrInstance { .. } | IC::StoreAttrSlot { .. } => false,
+            IC::StoreAttrNewKey { .. } => true,
+            _ => return None,
+        };
         let (ver, idx) = self.field_slots.get(pc)?.get();
         let slots = idx & crate::SLOT_FIELD != 0;
-        if ver == 0 || (slots && !l.slots_ok) {
+        if ver == 0 || (slots && !l.slots_ok) || (append && slots) {
             return None;
         }
         let deferred_at = inst_deferred_offset(&l)?;
@@ -17993,11 +17992,37 @@ impl<'a> Lower<'a> {
         let gates = self.b.ins().uload32(FLAGS, gates, 0);
         let busy = self.b.ins().bor(borrow, gates);
         self.branch_out(busy, helper);
-        let place = self.field_place(memo, idx, helper);
-        let old = self.tag_at(place);
-        let plain_old = self.is_scalar(old);
-        let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
-        self.branch_out(held, helper);
+        let (place, grown) = match memo {
+            // The next value of values laid out over the class's names,
+            // with room for it, of an instance with no native body.
+            inline::FieldMemo::Split { block, len } if append => {
+                let cap = self.b.ins().uload32(FLAGS, block, l.split_cap);
+                let body = self.b.ins().load(types::I64, FLAGS, inst, l.inst_c_body);
+                let next = self.b.ins().icmp_imm(IntCC::NotEqual, len, i64::from(idx));
+                let full = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, cap, i64::from(idx));
+                let native = self.b.ins().icmp_imm(IntCC::NotEqual, body, 0);
+                let bad = self.b.ins().bor(next, full);
+                let bad = self.b.ins().bor(bad, native);
+                self.branch_out(bad, helper);
+                let off = i64::from(idx) * 16 + i64::from(l.split_values);
+                (self.b.ins().iadd_imm(block, off), Some(block))
+            }
+            // A laid-out member, set or not.
+            inline::FieldMemo::Slots { values } => {
+                let off = i64::from(idx & !crate::SLOT_FIELD) * 16;
+                (self.b.ins().iadd_imm(values, off), None)
+            }
+            memo => (self.field_place(memo, idx, helper), None),
+        };
+        if grown.is_none() {
+            let old = self.tag_at(place);
+            let plain_old = self.is_scalar(old);
+            let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+            self.branch_out(held, helper);
+        }
         let new = self.tag_at(value);
         let plain_new = self.is_scalar(new);
         let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
@@ -18016,6 +18041,10 @@ impl<'a> Lower<'a> {
             self.b.ins().store(FLAGS, n, inst, 0);
         } else {
             self.copy16(place, value);
+        }
+        if let Some(block) = grown {
+            let len = self.b.ins().iconst(types::I32, i64::from(idx) + 1);
+            self.b.ins().store(FLAGS, len, block, l.split_len);
         }
         self.b.ins().jump(done, &[]);
         self.b.set_cold_block(helper);

@@ -411,6 +411,11 @@ branch and pull request.
     receiver's slot and the receiver's reference going by a plain
     decrement while another owner holds it: `go` takes 1% fewer
     instructions.
+  - A constructor's store of a field its class's instances add next
+    (the site's `StoreAttrNewKey` shape) appends it in line, after the
+    first, when the values have room and the value needs no write
+    barrier: `oo_patterns` takes 2.1% fewer instructions, `logging_mix`
+    1.7% and `context_managers` 1%.
   - Measured and left: loading a method in line from its site's first
     cache (the class version, then the instance's values checked for the
     name) took `h_method` from 3.3% of `go` to 0.3%, but the compiled

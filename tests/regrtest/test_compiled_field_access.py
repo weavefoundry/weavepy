@@ -80,6 +80,20 @@ class Fin:
         self.log.append(self.v)
 
 
+class Built:
+    # Not store-only: each store's value is computed, so compiled code
+    # appends the fields one by one.
+    def __init__(self, n, flip):
+        self.n = n + 0
+        if flip:
+            self.second = [n]
+            self.first = n * 2
+        else:
+            self.first = n * 2
+            self.second = [n]
+        self.third = str(n)
+
+
 def fresh_read(log, i):
     # The receiver's last reference goes with the read.
     return Fin(log, i).v
@@ -112,6 +126,10 @@ def run(i):
     assert make().y == 2
     log = []
     assert fresh_read(log, i) == i and log == [i]
+    b = Built(i, i % 50 == 49)
+    assert (b.n, b.first, b.second, b.third) == (i, i * 2, [i], str(i))
+    assert list(vars(b)) == (["n", "second", "first", "third"] if i % 50 == 49
+                             else ["n", "first", "second", "third"])
     return p
 
 
