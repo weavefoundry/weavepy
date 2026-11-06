@@ -921,7 +921,7 @@ enum Place {
 /// What a field read proved about its receiver, for the next read of the
 /// same receiver up to the next operation that isn't [`pure_op`].
 #[derive(Clone, Copy)]
-enum FieldMemo {
+pub(super) enum FieldMemo {
     /// Its split values block and their count.
     Split { block: Value, len: Value },
     /// Its laid-out `__slots__` values.
@@ -1094,68 +1094,11 @@ impl<'a> Lower<'a> {
         }
         let item = self.pop();
         let out = self.exit_with(pc, &[item], INTERP);
-        let ptr = self.ptr;
         let memo = match self.field_memo(i) {
             Some(m) => m,
             None => {
                 let at = self.local_addr(i);
-                let otag = self.tag_at(at);
-                let not_inst =
-                    self.b
-                        .ins()
-                        .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
-                self.branch_out(not_inst, out);
-                let inst = self.b.ins().load(ptr, FLAGS, at, 8);
-                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
-                let cver = self
-                    .b
-                    .ins()
-                    .load(types::I64, FLAGS, cls, l.type_attr_version);
-                let want = self.b.ins().iconst(types::I64, ver as i64);
-                let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
-                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
-                let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
-                let m = if slots {
-                    let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(&l));
-                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
-                    let form = self
-                        .b
-                        .ins()
-                        .uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
-                    let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
-                    let values = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
-                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-                    let other =
-                        self.b
-                            .ins()
-                            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
-                    let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
-                    let unsafe_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
-                    let bad = self.b.ins().bor(stale, busy);
-                    let bad = self.b.ins().bor(bad, other);
-                    let bad = self.b.ins().bor(bad, foreign);
-                    let bad = self.b.ins().bor(bad, unsafe_now);
-                    self.branch_out(bad, out);
-                    FieldMemo::Slots { values }
-                } else {
-                    let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
-                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
-                    let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
-                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-                    let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-                    let other = self.b.ins().bor(lazy, shared);
-                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
-                    let bad = self.b.ins().bor(stale, busy);
-                    let bad = self.b.ins().bor(bad, empty);
-                    let bad = self.b.ins().bor(bad, other);
-                    self.branch_out(bad, out);
-                    let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
-                    let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
-                    let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-                    self.branch_out(foreign, out);
-                    let len = self.b.ins().uload32(FLAGS, block, l.split_len);
-                    FieldMemo::Split { block, len }
-                };
+                let m = self.field_guards(&l, at, ver, slots, out);
                 self.inl
                     .last_mut()
                     .expect("in an inlined body")
@@ -1164,7 +1107,93 @@ impl<'a> Lower<'a> {
                 m
             }
         };
-        let v = match memo {
+        let v = self.field_place(memo, idx, out);
+        let f = self.inl.last_mut().expect("in an inlined body");
+        let temp = f.places.len() as u32;
+        f.places.push(Place::Temp(v));
+        self.push(Item::Local(temp));
+        self.set_last(pc);
+        Some(true)
+    }
+
+    /// The guards of a read of one field of the instance at `at` (a local's
+    /// slot), as a site settled it: an instance of the class version `ver`
+    /// whose values (`slots`: its laid-out `__slots__` members) are laid out
+    /// over its class's, unborrowed, with no published `__dict__`, while
+    /// counts aren't shared between threads. Any failure goes to `out`.
+    pub(super) fn field_guards(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        at: Value,
+        ver: u64,
+        slots: bool,
+        out: Block,
+    ) -> FieldMemo {
+        let ptr = self.ptr;
+        let otag = self.tag_at(at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, out);
+        let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let cver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let want = self.b.ins().iconst(types::I64, ver as i64);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+        if slots {
+            let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(l));
+            let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
+            let form = self
+                .b
+                .ins()
+                .uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
+            let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
+            let values = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
+            let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+            let other = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+            let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
+            let unsafe_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(stale, busy);
+            let bad = self.b.ins().bor(bad, other);
+            let bad = self.b.ins().bor(bad, foreign);
+            let bad = self.b.ins().bor(bad, unsafe_now);
+            self.branch_out(bad, out);
+            FieldMemo::Slots { values }
+        } else {
+            let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+            let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+            let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+            let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+            let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+            let other = self.b.ins().bor(lazy, shared);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+            let bad = self.b.ins().bor(stale, busy);
+            let bad = self.b.ins().bor(bad, empty);
+            let bad = self.b.ins().bor(bad, other);
+            self.branch_out(bad, out);
+            let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
+            let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
+            let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+            self.branch_out(foreign, out);
+            let len = self.b.ins().uload32(FLAGS, block, l.split_len);
+            FieldMemo::Split { block, len }
+        }
+    }
+
+    /// The address of the field at position `idx` (a site's, with its
+    /// `SLOT_FIELD` bit) of the values `memo` proved, `out` when it's unset.
+    pub(super) fn field_place(&mut self, memo: FieldMemo, idx: u32, out: Block) -> Value {
+        let l = *self.layout.expect("a field's guards ran");
+        match memo {
             FieldMemo::Slots { values } => {
                 let off = i64::from(idx & !crate::SLOT_FIELD) * 16;
                 let v = self.b.ins().iadd_imm(values, off);
@@ -1185,13 +1214,7 @@ impl<'a> Lower<'a> {
                 let off = i64::from(idx) * 16 + i64::from(l.split_values);
                 self.b.ins().iadd_imm(block, off)
             }
-        };
-        let f = self.inl.last_mut().expect("in an inlined body");
-        let temp = f.places.len() as u32;
-        f.places.push(Place::Temp(v));
-        self.push(Item::Local(temp));
-        self.set_last(pc);
-        Some(true)
+        }
     }
 
     /// An inlined body's parameter `i`, where its value is known unboxed.

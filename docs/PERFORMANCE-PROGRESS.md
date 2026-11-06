@@ -391,6 +391,21 @@ branch and pull request.
     keeping a name with each value. `C()` whose `__init__` stores one list
     costs 1,996 instructions instead of 2,602, three stores with a list 2,218 instead of 3,042, `deque()` 3,316
     instead of 4,481 and `contextlib.ExitStack()` 5,630 instead of 6,794.
+  - Compiled code reads a field of an instance local in line when its
+    site settled on one class (an instance's values laid out over its
+    class's, or a laid-out `__slots__` member), and stores over a field's
+    scalar in line when the value going in is a scalar or the instance
+    is already tracked by the cycle collector, the helpers taking only
+    what a guard turns away. Inlined bodies already read fields this way;
+    their stores do too now. A store of a function's attribute from a
+    local (`wrapper.__wrapped__ = f`, as `functools.wraps` and
+    `ExitStack.callback` make it) or a class's no longer leaves for the
+    interpreter. `self.x += 1` in a method costs 537 instructions instead
+    of 705, `go` takes 5% to 8% fewer, `generators_tree` 3.7% fewer,
+    `context_managers` 3% fewer and `mini_interpreter` 1.3% fewer, and
+    the closure factory `ExitStack.callback` uses 4,575 instead of 5,968.
+    (A store-only `__init__` also records once whether it makes a fresh
+    container, instead of asking each call.)
   - Measured and left: the hot code footprint is about three times
     CPython's (204 KB of lines run at least once per iteration on
     `context_managers`, against 66 KB), but neither of the obvious

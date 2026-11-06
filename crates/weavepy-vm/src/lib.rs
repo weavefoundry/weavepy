@@ -20176,10 +20176,7 @@ impl Interpreter {
         // A fresh container is made as `BUILD_LIST`/`BUILD_MAP` would make
         // it, which a collection due (or an allocation observer) leaves to
         // the ordinary paths.
-        if shape
-            .stores
-            .iter()
-            .any(|&(_, src)| matches!(src, StoreSrc::NewList | StoreSrc::NewDict))
+        if shape.fresh
             && (crate::stdlib::tracemalloc_real::is_tracking()
                 || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
                 || gc_trace::auto_collect_due())
@@ -22362,7 +22359,9 @@ impl Interpreter {
         else {
             return false;
         };
-        if n.starts_with("__") {
+        // (A dunder name may be one of a function's own attributes; the
+        // decorators' `__wrapped__` is a plain entry of its dictionary.)
+        if n.starts_with("__") && &**n != "__wrapped__" {
             return false;
         }
         // The existing dictionary in place (no code runs while it is
@@ -83864,6 +83863,8 @@ struct StoreInit {
     /// How many stores take each parameter (a parameter's last use moves
     /// it, any earlier one copies it).
     uses: Box<[u8]>,
+    /// Whether a store makes a fresh container.
+    fresh: bool,
 }
 
 /// The store-only shape of `code`: a body that is nothing but
@@ -83910,9 +83911,13 @@ fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
                 {
                     return None;
                 }
+                let fresh = stores
+                    .iter()
+                    .any(|&(_, src)| matches!(src, StoreSrc::NewList | StoreSrc::NewDict));
                 return Some(StoreInit {
                     stores: stores.into_boxed_slice(),
                     uses: uses.into_boxed_slice(),
+                    fresh,
                 });
             }
             _ => {

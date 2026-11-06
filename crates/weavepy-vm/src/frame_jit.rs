@@ -1406,6 +1406,39 @@ struct Tags {
     by_pointer: i64,
 }
 
+/// Where an instance's `deferred` flag sits, from its allocation (an
+/// instance's payload word), measured on a sample against `l`'s class
+/// offset; `None` when the flag isn't the one byte it's assumed to be.
+fn inst_deferred_offset(l: &weavepy_jit::ObjLayout) -> Option<i32> {
+    static AT: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        use crate::types::PyInstance;
+        let data = usize::try_from(l.inst_class)
+            .ok()?
+            .checked_sub(std::mem::offset_of!(PyInstance, class))?
+            .checked_sub(crate::sync::GilCell::<Rc<crate::types::TypeObject>>::DATA_OFFSET)?;
+        let at = data + std::mem::offset_of!(PyInstance, deferred);
+        if std::mem::size_of::<crate::sync::Cell<bool>>() != 1 {
+            return None;
+        }
+        let inst = Rc::new(PyInstance::new(
+            crate::builtin_types::builtin_types().object_.clone(),
+        ));
+        let obj = Object::Instance(inst.clone());
+        // SAFETY: the payload word of a live instance, and a byte inside
+        // its allocation.
+        let byte = |o: &Object| unsafe {
+            let alloc = std::ptr::from_ref(o).cast::<usize>().add(1).read() as *const u8;
+            alloc.add(at).read()
+        };
+        inst.deferred.set(true);
+        let on = byte(&obj);
+        inst.deferred.set(false);
+        let off = byte(&obj);
+        (on == 1 && off == 0).then_some(i32::try_from(at).ok()?)
+    })
+}
+
 /// The tags, read off sample values, if the layout is the one the code
 /// assumes.
 fn tags() -> Option<Tags> {
@@ -5673,6 +5706,31 @@ unsafe extern "C" fn h_store_attr(
                 name,
                 &*slot,
             )),
+            // A function's or a plain class's attribute (`wrapper.__wrapped__
+            // = f`, `Cls.count = n`): the stack form's store, over the value
+            // and a reference of the local's own.
+            Object::Function(_) | Object::Type(_) => {
+                let mut pair = [slot.read(), crate::clone_hot(local)];
+                let recv = pair.as_mut_ptr().add(1);
+                let stored = if matches!(local, Object::Function(_)) {
+                    Interpreter::core_function_store(code, name, recv)
+                } else {
+                    Interpreter::core_class_store(code, name, recv)
+                };
+                let [value, recv] = pair;
+                if stored {
+                    // Both moved out: the value into the dictionary, the
+                    // receiver's reference released.
+                    std::mem::forget(value);
+                    std::mem::forget(recv);
+                    0
+                } else {
+                    // (The value stays in its slot.)
+                    std::mem::forget(value);
+                    drop(recv);
+                    1
+                }
+            }
             _ => 1,
         }
     }
@@ -15959,6 +16017,7 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let local = self.local_addr(self.code.instructions[pc].arg);
+        let in_line = self.field_store_in_line(pc + 1, local, slot, false);
         let r = self
             .call(
                 h_store_attr as *const () as usize,
@@ -15969,6 +16028,10 @@ impl<'a> Lower<'a> {
         let out = self.exit_with(pc, &[], INTERP);
         let store_pc = self.b.ins().iconst(types::I64, pc as i64 + 1);
         self.setter_store(r, store_pc, local, slot, false, out);
+        if let Some(done) = in_line {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         self.depth -= 1;
         self.set_last(pc + 1);
         self.check_released(pc + 2);
@@ -17477,6 +17540,31 @@ impl<'a> Lower<'a> {
             .ins()
             .iconst(self.ptr, std::ptr::from_ref::<AttrSite>(&site) as i64);
         self.attr_sites.push(site);
+        // A field of an instance local the site settled on: read in line,
+        // its guards falling back on the helper.
+        let in_line_field = match (item, field.map(FieldSlot::get), self.layout) {
+            (Item::Local(i), Some((ver, idx)), Some(l))
+                if !in_line
+                    && ver != 0
+                    && (idx & crate::SLOT_FIELD == 0 || l.slots_ok)
+                    && !crate::property_site(self.ext, pc)
+                    && self.ext.attr_poly_slot(pc).is_none() =>
+            {
+                let l = *l;
+                let helper_block = self.b.create_block();
+                let done = self.b.create_block();
+                let at = self.local_addr(i);
+                let memo = self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
+                let v = self.field_place(memo, idx, helper_block);
+                let dst = self.slot_addr(slot);
+                self.copy_value(dst, v);
+                self.b.ins().jump(done, &[]);
+                self.b.set_cold_block(helper_block);
+                self.b.switch_to_block(helper_block);
+                Some(done)
+            }
+            _ => None,
+        };
         let r = match item {
             Item::Local(i) if in_line => {
                 let at = self.local_addr(i);
@@ -17490,6 +17578,10 @@ impl<'a> Lower<'a> {
         }
         .expect("returns");
         self.after_helper(r);
+        if let Some(done) = in_line_field {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         self.push(Item::Mem(slot));
         self.set_last(pc);
         true
@@ -17785,6 +17877,8 @@ impl<'a> Lower<'a> {
         } else {
             h_stack_store_attr as *const () as usize
         };
+        let recv = self.slot_addr(self.depth - 1);
+        let in_line = self.field_store_in_line(pc, recv, at, true);
         let r = self.call(helper, &[code, pcv, at], true).expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         if self.inlining() {
@@ -17797,10 +17891,99 @@ impl<'a> Lower<'a> {
                 .iadd_imm(at, std::mem::size_of::<Object>() as i64);
             self.setter_store(r, pcv, recv, at, true, out);
         }
+        if let Some(done) = in_line {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         self.depth -= 2;
         self.set_last(pc);
         self.check_released(pc + 1);
         true
+    }
+
+    /// `STORE_ATTR` at `pc` of the value at `value` into the instance at
+    /// `recv` (a local's slot, or with `release_recv` the stack's, whose
+    /// reference then goes), in line when the site settled on one field of
+    /// one class: the guards of a read of it (see [`Self::field_guards`]),
+    /// the values unborrowed, a scalar there now (nothing to release), and
+    /// a scalar going in or an instance already tracked (no write barrier
+    /// to run). The value moves in. `Some(done)`, the current block the
+    /// cold one where the caller emits its helper path and then goes on to
+    /// `done`; `None` emits nothing.
+    fn field_store_in_line(
+        &mut self,
+        pc: usize,
+        recv: Value,
+        value: Value,
+        release_recv: bool,
+    ) -> Option<Block> {
+        let l = *self.layout?;
+        if cfg!(debug_assertions) || crate::property_site(self.ext, pc) {
+            return None;
+        }
+        // (A site that adds its attribute, a constructor's, leaves it to the
+        // helper: the guards would fail there every time.)
+        if !matches!(
+            self.code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::StoreAttrInstance { .. }
+                | weavepy_compiler::InlineCache::StoreAttrSlot { .. }
+        ) {
+            return None;
+        }
+        let (ver, idx) = self.field_slots.get(pc)?.get();
+        let slots = idx & crate::SLOT_FIELD != 0;
+        if ver == 0 || (slots && !l.slots_ok) {
+            return None;
+        }
+        let deferred_at = inst_deferred_offset(&l)?;
+        let ptr = self.ptr;
+        let helper = self.b.create_block();
+        let done = self.b.create_block();
+        let memo = self.field_guards(&l, recv, ver, slots, helper);
+        let inst = self.b.ins().load(ptr, FLAGS, recv, 8);
+        let borrow_at = if slots {
+            l.inst_slots_borrow
+        } else {
+            l.inst_split_borrow
+        };
+        let borrow = self.b.ins().sload32(FLAGS, inst, borrow_at);
+        // (The release observers, dict watchers among them, and a count
+        // shared between threads.)
+        let gates = self
+            .b
+            .ins()
+            .iconst(ptr, crate::sync::release_gates_ptr() as i64);
+        let gates = self.b.ins().uload32(FLAGS, gates, 0);
+        let busy = self.b.ins().bor(borrow, gates);
+        self.branch_out(busy, helper);
+        let place = self.field_place(memo, idx, helper);
+        let old = self.tag_at(place);
+        let plain_old = self.is_scalar(old);
+        let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+        self.branch_out(held, helper);
+        let new = self.tag_at(value);
+        let plain_new = self.is_scalar(new);
+        let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
+        let tracked = self.b.ins().icmp_imm(IntCC::Equal, deferred, 0);
+        let ok = self.b.ins().bor(plain_new, tracked);
+        let barrier = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+        self.branch_out(barrier, helper);
+        if release_recv {
+            // The receiver's reference goes by a plain decrement: another
+            // owner holds the instance.
+            let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            self.branch_out(last, helper);
+            self.copy16(place, value);
+            let n = self.b.ins().iadd_imm(n, -1);
+            self.b.ins().store(FLAGS, n, inst, 0);
+        } else {
+            self.copy16(place, value);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.set_cold_block(helper);
+        self.b.switch_to_block(helper);
+        Some(done)
     }
 
     /// Where a `STORE_ATTR`'s plain store declined (`declined` non-zero):

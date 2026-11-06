@@ -446,6 +446,11 @@ pub(crate) fn release_gates() -> u32 {
     unsafe { std::ptr::from_ref(&RELEASE_GATES).cast::<u32>().read() }
 }
 
+/// The word [`release_gates`] reads, for native code that reads it in line.
+pub(crate) fn release_gates_ptr() -> *const u32 {
+    std::ptr::from_ref(&RELEASE_GATES).cast::<u32>()
+}
+
 /// The [`release_gates`] bits of the release observers alone (every flag
 /// but the reference-count bias's `rc_shared`).
 pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff, 0xff]);
