@@ -406,6 +406,15 @@ branch and pull request.
     the closure factory `ExitStack.callback` uses 4,575 instead of 5,968.
     (A store-only `__init__` also records once whether it makes a fresh
     container, instead of asking each call.)
+  - A field read of an instance on the stack (`self.board.size`,
+    `node.left.value`) is made in line too, the value taking the
+    receiver's slot and the receiver's reference going by a plain
+    decrement while another owner holds it: `go` takes 1% fewer
+    instructions.
+  - Measured and left: loading a method in line from its site's first
+    cache (the class version, then the instance's values checked for the
+    name) took `h_method` from 3.3% of `go` to 0.3%, but the compiled
+    guards cost as much as the helper's hit had, and `go` took 0.8% more.
   - Measured and left: the hot code footprint is about three times
     CPython's (204 KB of lines run at least once per iteration on
     `context_managers`, against 66 KB), but neither of the obvious

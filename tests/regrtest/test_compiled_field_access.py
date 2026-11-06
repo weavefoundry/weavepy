@@ -63,6 +63,28 @@ def make():
     return P(1, 2)
 
 
+class Outer:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def total(self):
+        return self.inner.x + self.inner.y
+
+
+class Fin:
+    def __init__(self, log, v):
+        self.log = log
+        self.v = v
+
+    def __del__(self):
+        self.log.append(self.v)
+
+
+def fresh_read(log, i):
+    # The receiver's last reference goes with the read.
+    return Fin(log, i).v
+
+
 def run(i):
     p = P(i, 0)
     assert p.bump() == (i + 1) * 3
@@ -85,6 +107,11 @@ def run(i):
     lst = [h]
     assert h.put(lst) is lst
     make().x = 5
+    o = Outer(P(i, 1))
+    assert o.total() == i + 1
+    assert make().y == 2
+    log = []
+    assert fresh_read(log, i) == i and log == [i]
     return p
 
 

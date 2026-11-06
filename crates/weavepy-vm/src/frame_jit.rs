@@ -17563,6 +17563,43 @@ impl<'a> Lower<'a> {
                 self.b.switch_to_block(helper_block);
                 Some(done)
             }
+            // The receiver on the stack: the value takes its slot, the
+            // receiver's reference going by a plain decrement (another
+            // owner holds the instance).
+            (Item::Mem(s), Some((ver, idx)), Some(l))
+                if s == slot
+                    && !cfg!(debug_assertions)
+                    && ver != 0
+                    && (idx & crate::SLOT_FIELD == 0 || l.slots_ok)
+                    && !crate::property_site(self.ext, pc)
+                    && self.ext.attr_poly_slot(pc).is_none() =>
+            {
+                let l = *l;
+                let helper_block = self.b.create_block();
+                let done = self.b.create_block();
+                let at = self.slot_addr(slot);
+                let memo = self.field_guards(&l, at, ver, idx & crate::SLOT_FIELD != 0, helper_block);
+                let v = self.field_place(memo, idx, helper_block);
+                let inst = self.b.ins().load(self.ptr, FLAGS, at, 8);
+                let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
+                let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+                let gates = self
+                    .b
+                    .ins()
+                    .iconst(self.ptr, crate::sync::release_gates_ptr() as i64);
+                let gates = self.b.ins().uload32(FLAGS, gates, 0);
+                let held = self.b.ins().bor(last, gates);
+                self.branch_out(held, helper_block);
+                self.copy_value(at, v);
+                // (The value's clone ran no code: the count is as read.)
+                let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
+                let n = self.b.ins().iadd_imm(n, -1);
+                self.b.ins().store(FLAGS, n, inst, 0);
+                self.b.ins().jump(done, &[]);
+                self.b.set_cold_block(helper_block);
+                self.b.switch_to_block(helper_block);
+                Some(done)
+            }
             _ => None,
         };
         let r = match item {
