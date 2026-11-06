@@ -10589,10 +10589,16 @@ impl Interpreter {
             return None;
         };
         // SAFETY: GIL-serialized raw read of the setter cell.
-        let Object::Builtin(b) = (unsafe { &*prop.fset.as_ptr() }) else {
-            return None;
+        let b = match unsafe { &*prop.fset.as_ptr() } {
+            Object::Builtin(b) => b.clone(),
+            // A Python setter of the setter shape (`self._x = value`):
+            // its one store, frameless (a decline stored nothing).
+            Object::Function(f) => {
+                let f = f.clone();
+                return self.leaf_py_setter(frame, &f, pc);
+            }
+            _ => return None,
         };
-        let b = b.clone();
         let args = [frame.stack[n - 1].clone(), frame.stack[n - 2].clone()];
         let r = match self.leaf_call_kind(&b)? {
             LeafKind::Fast(f) => f(&args)?,
@@ -10606,6 +10612,43 @@ impl Interpreter {
         self.release(receiver);
         self.release(value);
         Some(r.map(|v| self.release(v)))
+    }
+
+    /// [`Self::try_leaf_setter`] for a Python setter `f`: its body is the
+    /// setter shape (see `effect_setter_shape`), whose one store either
+    /// happens or doesn't, run frameless with the receiver and value atop
+    /// `frame`'s stack (the `STORE_ATTR` at `pc`). `None` touches nothing.
+    fn leaf_py_setter(
+        &mut self,
+        frame: &mut Frame,
+        f: &Rc<crate::object::PyFunction>,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        let code = f.code();
+        if code.arg_count != 2
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || !code_is_effect_leaf(&code)
+            || code_vm_ext(&code)?
+                .pure_leaf
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 16
+            || !pure_leaf_warm(&code)
+        {
+            return None;
+        }
+        let n = frame.stack.len();
+        let args: [*const Object; 2] =
+            [&raw const frame.stack[n - 1], &raw const frame.stack[n - 2]];
+        let done = self.leaf_init_eval(&code, f, &args)?;
+        drop(done);
+        let receiver = frame.stack.pop().expect("checked by the caller");
+        let value = frame.stack.pop().expect("checked by the caller");
+        frame.pc = pc as u32 + 1;
+        self.release(receiver);
+        self.release(value);
+        Some(Ok(()))
     }
 
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
@@ -13079,15 +13122,42 @@ impl Interpreter {
                                 match kind {
                                     BinOpKind::Add => match a.checked_add(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python).
+                                        None => match core_bignum_op(
+                                            &Object::Int(a),
+                                            &Object::Int(b),
+                                            kind,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(_) => break None,
+                                        },
                                     },
                                     BinOpKind::Sub => match a.checked_sub(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python).
+                                        None => match core_bignum_op(
+                                            &Object::Int(a),
+                                            &Object::Int(b),
+                                            kind,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(_) => break None,
+                                        },
                                     },
                                     BinOpKind::Mult => match a.checked_mul(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python).
+                                        None => match core_bignum_op(
+                                            &Object::Int(a),
+                                            &Object::Int(b),
+                                            kind,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(_) => break None,
+                                        },
                                     },
                                     BinOpKind::BitAnd => int_hot(a & b),
                                     BinOpKind::BitOr => int_hot(a | b),
@@ -15978,93 +16048,27 @@ impl Interpreter {
                     // string is itself), `!r` of a scalar or a string, no
                     // spec, and the join.
                     OpCode::ConvertValue => {
-                        if len == 0 {
+                        // SAFETY: `len > 0` is checked first; nothing else
+                        // reads the slot.
+                        if len == 0 || !unsafe { convert_in_place(base.add(len - 1), ins.arg) } {
                             break None;
-                        }
-                        // SAFETY: `len > 0`.
-                        let top = unsafe { base.add(len - 1) };
-                        let v = match (ins.arg & 0x03, unsafe { &*top }) {
-                            (1, Object::Str(_)) => None,
-                            (1 | 2, Object::Int(i)) => {
-                                let mut buf = itoa::Buffer::new();
-                                Some(Object::Str(SharedStr::from(buf.format(*i))))
-                            }
-                            (1 | 2, Object::Bool(b)) => {
-                                Some(Object::from_static(if *b { "True" } else { "False" }))
-                            }
-                            (1 | 2, Object::None) => Some(Object::from_static("None")),
-                            (1 | 2, Object::Float(f)) => Some(Object::Str(SharedStr::from(
-                                crate::object::float_repr(*f).as_str(),
-                            ))),
-                            (2, Object::Str(_)) => {
-                                // SAFETY: as above.
-                                let r = unsafe { &*top }.repr();
-                                Some(Object::Str(SharedStr::from(r.as_str())))
-                            }
-                            _ => break None,
-                        };
-                        if let Some(v) = v {
-                            // SAFETY: the replaced value is a scalar, which owes
-                            // no drop, or a string, released here (its repr
-                            // ran no Python, and nothing else reads the slot).
-                            unsafe { top.replace(v) };
                         }
                         last = pc;
                         pc += 1;
                     }
                     OpCode::FormatValue if ins.arg == 0 => {
-                        if len == 0 {
+                        // SAFETY: as above.
+                        if len == 0 || !unsafe { format_simple_in_place(base.add(len - 1)) } {
                             break None;
-                        }
-                        // SAFETY: `len > 0`.
-                        let top = unsafe { base.add(len - 1) };
-                        match unsafe { &*top } {
-                            Object::Str(_) => {}
-                            Object::Int(i) => {
-                                let mut buf = itoa::Buffer::new();
-                                // SAFETY: the replaced int owes no drop.
-                                unsafe { top.write(Object::Str(SharedStr::from(buf.format(*i)))) };
-                            }
-                            Object::Float(f) => {
-                                let r = SharedStr::from(crate::object::float_repr(*f).as_str());
-                                // SAFETY: the replaced float owes no drop.
-                                unsafe { top.write(Object::Str(r)) };
-                            }
-                            _ => break None,
                         }
                         last = pc;
                         pc += 1;
                     }
                     OpCode::BuildString => {
                         let n = ins.arg as usize;
-                        if n == 0 || n > len || crate::stdlib::tracemalloc_real::is_tracking() {
-                            break None;
-                        }
                         // SAFETY: the top `n` slots are initialized.
-                        let parts = unsafe { std::slice::from_raw_parts(base.add(len - n), n) };
-                        let mut strs: [&str; 8] = [""; 8];
-                        if n > strs.len() {
+                        if n == 0 || n > len || !unsafe { build_string_at(base.add(len - n), n) } {
                             break None;
-                        }
-                        let mut all = true;
-                        for (k, p) in parts.iter().enumerate() {
-                            match p {
-                                Object::Str(s) => strs[k] = s,
-                                _ => {
-                                    all = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if !all {
-                            break None;
-                        }
-                        let joined = Object::Str(SharedStr::concat(&strs[..n]));
-                        // SAFETY: the parts leave the stack (a string's release
-                        // runs nothing); the join takes the first slot.
-                        unsafe {
-                            release_run(base.add(len - n), n);
-                            base.add(len - n).write(joined);
                         }
                         len = len - n + 1;
                         last = pc;
@@ -19501,9 +19505,10 @@ impl Interpreter {
             return false;
         };
         // A store-only `__init__`: the stores themselves, as its sites
-        // last proved them.
+        // last proved them (not once refuted).
         if matches!(plan.native, crate::types::NativeKind::Plain)
             && !plan.seeds_exception_args
+            && plan.store_init.load(std::sync::atomic::Ordering::Relaxed) != 2
             && self.core_store_init(
                 frame,
                 &ty,
@@ -20014,6 +20019,11 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> bool {
         let Some(shape) = code_store_init(code) else {
+            // (No store-only shape, for this class version's `__init__`.)
+            if prove {
+                plan.store_init
+                    .store(2, std::sync::atomic::Ordering::Relaxed);
+            }
             return false;
         };
         let Some(slots) = code_vm_ext(code)
@@ -83415,6 +83425,96 @@ fn effect_setter_shape(code: &CodeObject) -> bool {
             && none.op == OpCode::LoadConst
             && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
             && ret.op == OpCode::ReturnValue)
+}
+
+/// `CONVERT_VALUE` (`arg`'s low bits: `1` for `!s`, `2` for `!r`) of the
+/// value at `top`, in place, for the exact scalars and strings whose
+/// conversion runs no Python (an f-string's pieces): `false` touches
+/// nothing.
+///
+/// # Safety
+///
+/// `top` is an initialized slot nothing else reads while this runs.
+#[inline]
+pub(crate) unsafe fn convert_in_place(top: *mut Object, arg: u32) -> bool {
+    // SAFETY: the caller's contract.
+    let v = match (arg & 0x03, unsafe { &*top }) {
+        (1, Object::Str(_)) => return true,
+        (1 | 2, Object::Int(i)) => {
+            let mut buf = itoa::Buffer::new();
+            Object::Str(SharedStr::from(buf.format(*i)))
+        }
+        (1 | 2, Object::Bool(b)) => Object::from_static(if *b { "True" } else { "False" }),
+        (1 | 2, Object::None) => Object::from_static("None"),
+        (1 | 2, Object::Float(f)) => {
+            Object::Str(SharedStr::from(crate::object::float_repr(*f).as_str()))
+        }
+        // SAFETY: as above.
+        (2, Object::Str(_)) => Object::Str(SharedStr::from(unsafe { &*top }.repr().as_str())),
+        _ => return false,
+    };
+    // SAFETY: the replaced value is a scalar, which owes no drop, or a
+    // string, released here (its repr ran no Python).
+    unsafe { top.replace(v) };
+    true
+}
+
+/// `FORMAT_VALUE 0` (no spec) of the value at `top`, in place, for a
+/// string, an int or a float: `false` touches nothing.
+///
+/// # Safety
+///
+/// As [`convert_in_place`]'s.
+#[inline]
+pub(crate) unsafe fn format_simple_in_place(top: *mut Object) -> bool {
+    // SAFETY: the caller's contract; a replaced int or float owes no drop.
+    unsafe {
+        match &*top {
+            Object::Str(_) => {}
+            Object::Int(i) => {
+                let mut buf = itoa::Buffer::new();
+                top.write(Object::Str(SharedStr::from(buf.format(*i))));
+            }
+            Object::Float(f) => {
+                let r = SharedStr::from(crate::object::float_repr(*f).as_str());
+                top.write(Object::Str(r));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `BUILD_STRING n` of the `n` strings from `at` up (an f-string's join):
+/// the joined string in `at`'s slot, the parts released; `false` touches
+/// nothing (a part that isn't a string, more than eight parts, or
+/// `tracemalloc` tracing, which the full handler's allocation records).
+///
+/// # Safety
+///
+/// The `n` slots from `at` are initialized, and nothing else reads them.
+#[inline]
+pub(crate) unsafe fn build_string_at(at: *mut Object, n: usize) -> bool {
+    if n == 0 || n > 8 || crate::stdlib::tracemalloc_real::is_tracking() {
+        return false;
+    }
+    // SAFETY: the caller's contract.
+    let parts = unsafe { std::slice::from_raw_parts(at, n) };
+    let mut strs: [&str; 8] = [""; 8];
+    for (k, p) in parts.iter().enumerate() {
+        match p {
+            Object::Str(s) => strs[k] = s,
+            _ => return false,
+        }
+    }
+    let joined = Object::Str(SharedStr::concat(&strs[..n]));
+    // SAFETY: the parts leave (a string's release runs nothing); the join
+    // takes the first slot.
+    unsafe {
+        release_run(at, n);
+        at.write(joined);
+    }
+    true
 }
 
 /// Whether every `RETURN_VALUE` in `code` returns the constant `None`

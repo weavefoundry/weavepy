@@ -1019,6 +1019,9 @@ fn worth_compiling(code: &CodeObject, ext: &CodeConstObjects, at: Heat) -> bool 
             | OpCode::BuildTuple
             | OpCode::BuildList
             | OpCode::BuildMap
+            | OpCode::ConvertValue
+            | OpCode::FormatValue
+            | OpCode::BuildString
             | OpCode::LoadDeref
             | OpCode::GetIter
             | OpCode::BinarySubscr
@@ -5096,14 +5099,24 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             let r = match crate::leaf_plan::binary(x, y, kind as u8) {
                 Some(crate::leaf_plan::V::I(i)) => Object::Int(i),
                 Some(crate::leaf_plan::V::F(f)) => Object::Float(f),
+                // (Two ints past the machine word take the bignum arm.)
+                _ if matches!((a, b), (Object::Int(_), Object::Int(_))) => Object::Unbound,
                 _ => return 1,
             };
-            at.write(r);
-            return 0;
+            if !matches!(r, Object::Unbound) {
+                at.write(r);
+                return 0;
+            }
         }
         let inplace = kind & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let kind: BinOpKind = std::mem::transmute(kind as u8);
         let r = match (a, b) {
+            // Ints past the machine word, and big ints: the full handler's
+            // bignum arithmetic (exact ints run no Python; an error, a
+            // division by zero say, is the core loop's to raise).
+            (Object::Int(_) | Object::Long(_), Object::Int(_) | Object::Long(_)) => {
+                crate::core_bignum_op(a, b, kind).ok()
+            }
             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
                 Interpreter::core_str_binop(a, b, kind)
             }
@@ -7348,6 +7361,39 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
 /// The longest `BUILD_TUPLE` native code builds (through [`h_build`]): a
 /// longer one leaves for the core loop.
 const MAX_NATIVE_TUPLE: usize = 16;
+
+/// [`h_fstring`]'s operations (the low byte; the rest is the operand).
+const FSTRING_CONVERT: u64 = 0;
+const FSTRING_FORMAT: u64 = 1;
+const FSTRING_JOIN: u64 = 2;
+
+/// Whether the native code runs the f-string instruction `op` (`arg`):
+/// a conversion, a spec-less format, or a join of up to eight parts.
+fn fstring_native(op: OpCode, arg: u32) -> bool {
+    match op {
+        OpCode::ConvertValue => matches!(arg & 0x03, 1 | 2),
+        OpCode::FormatValue => arg == 0,
+        OpCode::BuildString => (1..=8).contains(&arg),
+        _ => false,
+    }
+}
+
+/// An f-string's piece at stack slot `at`, as the core loop's arm runs it
+/// (see `crate::convert_in_place`, `crate::format_simple_in_place` and
+/// `crate::build_string_at`): `kind`'s low byte names the operation and
+/// the rest its operand (the conversion, or the join's part count). `0`
+/// done in place, anything else declined untouched.
+unsafe extern "C" fn h_fstring(at: *mut Object, kind: u64) -> u32 {
+    // SAFETY: the code passes the operation's initialized stack slots.
+    let done = unsafe {
+        match kind & 0xff {
+            FSTRING_CONVERT => crate::convert_in_place(at, (kind >> 8) as u32),
+            FSTRING_FORMAT => crate::format_simple_in_place(at),
+            _ => crate::build_string_at(at, (kind >> 8) as usize),
+        }
+    };
+    u32::from(!done)
+}
 
 unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32) -> u32 {
     // SAFETY: the code passes its live state and `n` initialized stack
@@ -13147,6 +13193,9 @@ fn native_at(code: &CodeObject, pc: usize) -> bool {
     match ins.op {
         OpCode::BuildTuple => (1..=MAX_NATIVE_TUPLE as u32).contains(&ins.arg),
         OpCode::BuildMap => (0..=8).contains(&ins.arg),
+        OpCode::ConvertValue | OpCode::FormatValue | OpCode::BuildString => {
+            fstring_native(ins.op, ins.arg)
+        }
         OpCode::UnaryOp => ins.arg <= 3,
         OpCode::RaiseVarargs => matches!(ins.arg, 1 | 2),
         // A prologue `MAKE_CELL`: the activation's cells are built with it.
@@ -14471,6 +14520,10 @@ impl<'a> Lower<'a> {
                 return self.build(pc, ins.arg as usize, false)
             }
             OpCode::BuildList => return self.build(pc, ins.arg as usize, true),
+            // An f-string's pieces, as the core loop's arms run them.
+            OpCode::ConvertValue | OpCode::FormatValue | OpCode::BuildString => {
+                return self.fstring_op(pc, ins.op, ins.arg)
+            }
             OpCode::BuildMap
                 if ins.arg == 0 && !self.is_gen() && crate::forward_call_shape(self.code, pc) =>
             {
@@ -17495,6 +17548,37 @@ impl<'a> Lower<'a> {
         let lv = self.b.ins().iconst(types::I32, i64::from(list));
         let r = self
             .call(h_build as *const () as usize, &[self.st, at, nv, lv], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth = self.depth - n + 1;
+        self.set_last(pc);
+        true
+    }
+
+    /// `CONVERT_VALUE`, `FORMAT_VALUE 0` or `BUILD_STRING n` (an
+    /// f-string's pieces) through [`h_fstring`], which runs the core
+    /// loop's arm; the core loop takes any other shape.
+    fn fstring_op(&mut self, pc: usize, op: OpCode, arg: u32) -> bool {
+        let n = if op == OpCode::BuildString {
+            arg as usize
+        } else {
+            1
+        };
+        if n == 0 || n > self.depth || !fstring_native(op, arg) {
+            self.exit(INTERP, pc);
+            return false;
+        }
+        self.flush();
+        let at = self.slot_addr(self.depth - n);
+        let kind = match op {
+            OpCode::ConvertValue => FSTRING_CONVERT | u64::from(arg) << 8,
+            OpCode::FormatValue => FSTRING_FORMAT,
+            _ => FSTRING_JOIN | (n as u64) << 8,
+        };
+        let kv = self.b.ins().iconst(types::I64, kind as i64);
+        let r = self
+            .call(h_fstring as *const () as usize, &[at, kv], true)
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);

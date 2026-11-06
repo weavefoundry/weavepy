@@ -256,6 +256,30 @@ branch and pull request.
 
 ## Done
 
+- **f-strings compiled, frameless property setters, and big ints in
+  compiled arithmetic** (PR #107). Instructions on Linux.
+  - The frame JIT runs `CONVERT_VALUE`, spec-less `FORMAT_VALUE` and
+    `BUILD_STRING` itself, through the core loop's own arms. The compiler
+    turns `"%s:%s" % (a, b)` into those instructions, as CPython's does,
+    and a body holding one had too many exits to compile, so it ran in
+    the core loop at every call. `Shape.describe` went from 3,468 to 1,419
+    (CPython 3.13: 1,369) and `oo_patterns` 4% fewer. The suite's
+    loop-free bodies now have no instruction the native code hands back.
+  - A property whose Python setter is the setter shape (`self._x =
+    value`) runs it frameless: its one store either happens or doesn't, so
+    a decline leaves nothing to undo. `s.width = s.width + 1` went from
+    3,173 to 2,081 (CPython 1,379).
+  - A product, sum or difference of machine ints that leaves the word,
+    and arithmetic on big ints, run the bignum arithmetic in place, in the
+    core loop and in compiled code, where they used to leave for the
+    general handler (`statistics`' exact ratios: 4.6% fewer).
+  - A class whose `__init__` has no store-only shape skips that proof at
+    every construction once refuted.
+  - Measured and left: a native caller's callback (`map(f, xs)` with a
+    Python `f` that isn't a leaf) costs 3.4 times CPython's. Running its
+    compiled body straight from the callback stops at its first call,
+    which needs an activation switch to raise through.
+
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless
   noted.
