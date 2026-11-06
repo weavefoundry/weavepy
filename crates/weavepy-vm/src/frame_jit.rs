@@ -6967,7 +6967,12 @@ unsafe fn field_hit_slow<'a>(
 ///
 /// As [`attr_hit`].
 #[inline(always)]
-unsafe fn attr_miss_quick(site: &AttrSite, recv: &Object, local: bool) -> Option<Object> {
+unsafe fn attr_miss_quick(
+    site: &AttrSite,
+    recv: &Object,
+    local: bool,
+    running: Option<(*const (), u32)>,
+) -> Option<Object> {
     // SAFETY: the caller's contract.
     unsafe {
         match recv {
@@ -6989,7 +6994,7 @@ unsafe fn attr_miss_quick(site: &AttrSite, recv: &Object, local: bool) -> Option
                 let code = &*site.code;
                 code.names
                     .get(code.instructions[site.pc as usize].arg as usize)
-                    .and_then(|name| Interpreter::frame_plain_attr(recv, name, None))
+                    .and_then(|name| Interpreter::frame_plain_attr(recv, name, running))
             }
             _ => None,
         }
@@ -7009,7 +7014,15 @@ unsafe fn attr_miss_quick(site: &AttrSite, recv: &Object, local: bool) -> Option
 unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: bool) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
-        if let Some(v) = attr_miss_quick(site, &*at, local) {
+        // (A live frame's line with the running activation's own
+        // instruction, as `h_property`'s frame read has it.)
+        let running = match &*at {
+            Object::Frame(_) if std::ptr::eq(Rc::as_ptr(&(*(*st).frame).code), site.code) => {
+                Some(((*(*st).frame).locals.identity(), site.pc))
+            }
+            _ => None,
+        };
+        if let Some(v) = attr_miss_quick(site, &*at, local, running) {
             if local {
                 (*st).stack.add(site.slot as usize).write(v);
             } else {

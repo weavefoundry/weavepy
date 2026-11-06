@@ -378,6 +378,10 @@ branch and pull request.
     bytes extends it in place from compiled code, as the core loop does.
     `with suppress(KeyError): {}[i]` costs 7,286 instructions instead of
     8,416 (CPython 3.13: 5,117), and `bytes_codecs` takes 1.3% fewer.
+  - A live frame's `f_lineno` read from compiled code (`logging`'s
+    `findCaller` walking its callers) settles in place with the running
+    activation's own instruction, instead of through the full attribute
+    lookup: `logging_mix` takes 0.2% fewer instructions.
   - Measured and left: compiling code in the frame JIT whose loops tier 2
     has left alone for three hot spells (`pathlib`'s `_parse_path`, whose
     probes keep missing) cut the `pathlib` loop by 4% and enum creation by
