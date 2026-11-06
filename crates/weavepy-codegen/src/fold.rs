@@ -268,6 +268,25 @@ pub(crate) fn fold(f: &mut Function, alias: &mut Vec<Value>) {
 }
 
 fn fold_one(e: &mut Emit<'_>, b: Block, inst: Inst, quotients: &mut HashMap<(Value, i64), Value>) {
+    // (Only these fold: anything else stays as it is.)
+    if !matches!(
+        e.f.dfg.insts[inst.index()].op,
+        Op::Alu(_)
+            | Op::AluImm(..)
+            | Op::Icmp(_)
+            | Op::IcmpImm(..)
+            | Op::Uextend
+            | Op::Sextend
+            | Op::Ireduce
+            | Op::Bnot
+            | Op::Ineg
+            | Op::Select
+            | Op::Brif(..)
+            | Op::Div(_)
+    ) {
+        e.out.push(inst);
+        return;
+    }
     let d = e.f.dfg.insts[inst.index()].clone();
     let args: Vec<Value> =
         e.f.dfg

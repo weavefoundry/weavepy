@@ -20,6 +20,10 @@ pub struct FunctionBuilder<'a> {
     var_types: Vec<Type>,
     defs: HashMap<(u32, u32), Value>,
     reads: Vec<(Value, Block, Variable)>,
+    /// The integer constants made so far, by type and value: one
+    /// definition serves every use (code generation rematerializes a
+    /// constant where it's used, whatever block defines it).
+    consts: HashMap<(Type, i64), Value>,
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -30,6 +34,7 @@ impl<'a> FunctionBuilder<'a> {
             var_types: Vec::new(),
             defs: HashMap::default(),
             reads: Vec::new(),
+            consts: HashMap::default(),
         }
     }
 
@@ -242,7 +247,12 @@ macro_rules! store_narrow {
 impl FuncInstBuilder<'_, '_> {
     pub fn iconst(self, ty: Type, imm: i64) -> Value {
         let imm = canon_imm(ty, imm);
-        self.b.push1(Op::Iconst(imm), &[], ty)
+        if let Some(&v) = self.b.consts.get(&(ty, imm)) {
+            return v;
+        }
+        let v = self.b.push1(Op::Iconst(imm), &[], ty);
+        self.b.consts.insert((ty, imm), v);
+        v
     }
 
     pub fn f64const(self, x: f64) -> Value {

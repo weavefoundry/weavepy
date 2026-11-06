@@ -42,6 +42,7 @@ impl Analysis {
 }
 
 /// The blocks a terminator branches to.
+#[inline(always)]
 pub(crate) fn successors(func: &Function, inst: Inst, mut f: impl FnMut(Block)) {
     match &func.dfg.insts[inst.index()].op {
         Op::Jump(e) => f(e.block),
@@ -61,6 +62,7 @@ pub(crate) fn successors(func: &Function, inst: Inst, mut f: impl FnMut(Block)) 
 }
 
 /// Every value a branch passes to its targets.
+#[inline(always)]
 fn branch_args(func: &Function, inst: Inst, mut f: impl FnMut(Value)) {
     match &func.dfg.insts[inst.index()].op {
         Op::Jump(e) => func.dfg.slice(e.args).iter().copied().for_each(&mut f),
@@ -80,9 +82,15 @@ fn branch_args(func: &Function, inst: Inst, mut f: impl FnMut(Value)) {
 }
 
 /// Every value `inst` reads: its operands, then its branch arguments.
+#[inline(always)]
 pub(crate) fn each_use(func: &Function, inst: Inst, mut f: impl FnMut(Value)) {
-    func.dfg.args(inst).iter().copied().for_each(&mut f);
-    branch_args(func, inst, f);
+    let d = &func.dfg.insts[inst.index()];
+    for &v in func.dfg.slice(d.args) {
+        f(v);
+    }
+    if matches!(d.op, Op::Jump(_) | Op::Brif(..) | Op::BrTable(_)) {
+        branch_args(func, inst, f);
+    }
 }
 
 /// Whether `v` is a value worth recomputing at each use rather than
@@ -207,48 +215,111 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
         ValueDef::Param(b, _) => b.0,
         ValueDef::Var => NO_BLOCK,
     };
+    // The values used outside the block that defines them, numbered in
+    // order of first such use, and each block's upward-exposed uses of
+    // them (flat, by block: `ue[ue_at[b]..ue_at[b + 1]]` for the block at
+    // position `b` of `order`).
     let mut gidx = vec![u32::MAX; dfg.values.len()];
     let mut globals = Vec::new();
+    let mut ue: Vec<u32> = Vec::new();
+    let mut ue_at: Vec<u32> = Vec::with_capacity(order.len() + 1);
     for &b in &order {
+        let start = ue.len();
+        ue_at.push(start as u32);
         for &inst in &dfg.blocks[b.index()].insts {
             each_use(func, inst, |v| {
-                if !remat[v.index()] && def_block(v) != b.0 && gidx[v.index()] == u32::MAX {
-                    gidx[v.index()] = globals.len() as u32;
-                    globals.push(v);
+                if !remat[v.index()] && def_block(v) != b.0 {
+                    let mut g = gidx[v.index()];
+                    if g == u32::MAX {
+                        g = globals.len() as u32;
+                        gidx[v.index()] = g;
+                        globals.push(v);
+                    }
+                    ue.push(g);
                 }
             });
         }
+        let list = &mut ue[start..];
+        list.sort_unstable();
+        let mut n = 0;
+        for i in 0..list.len() {
+            if i == 0 || list[i] != list[n - 1] {
+                list[n] = list[i];
+                n += 1;
+            }
+        }
+        ue.truncate(start + n);
     }
+    ue_at.push(ue.len() as u32);
     let words = globals.len().div_ceil(64).max(1);
     let mut live_in = vec![0u64; nblocks * words];
-    // Each block's upward-exposed uses and its definitions, of the globals.
-    let mut ue: Vec<Vec<u32>> = vec![Vec::new(); nblocks];
-    let mut defs: Vec<Vec<u32>> = vec![Vec::new(); nblocks];
+    // Each block's definitions of the globals, flat by block as above.
+    let mut def_count = vec![0u32; order.len() + 1];
     for &v in &globals {
-        let g = gidx[v.index()];
         let db = def_block(v);
-        if db != NO_BLOCK {
-            defs[db as usize].push(g);
+        if db != NO_BLOCK && pos[db as usize] != NO_BLOCK {
+            def_count[pos[db as usize] as usize] += 1;
         }
     }
+    let mut def_at = Vec::with_capacity(order.len() + 1);
+    let mut acc = 0u32;
+    for c in &def_count {
+        def_at.push(acc);
+        acc += c;
+    }
+    let mut defs = vec![0u32; acc as usize];
+    let mut fill = def_at.clone();
+    for &v in &globals {
+        let db = def_block(v);
+        if db != NO_BLOCK && pos[db as usize] != NO_BLOCK {
+            let p = pos[db as usize] as usize;
+            defs[fill[p] as usize] = gidx[v.index()];
+            fill[p] += 1;
+        }
+    }
+    // Each block's predecessors among the blocks of `order`, by position
+    // (flat, as above): a block is looked at again only when the live-in of
+    // a block it branches to changed.
+    let mut pred_count = vec![0u32; order.len() + 1];
     for &b in &order {
-        let list = &mut ue[b.index()];
-        for &inst in &dfg.blocks[b.index()].insts {
-            each_use(func, inst, |v| {
-                let g = gidx[v.index()];
-                if g != u32::MAX && def_block(v) != b.0 {
-                    list.push(g);
+        if let Some(&last) = dfg.blocks[b.index()].insts.last() {
+            successors(func, last, |s| {
+                let q = pos[s.index()];
+                if q != NO_BLOCK {
+                    pred_count[q as usize] += 1;
                 }
             });
         }
-        list.sort_unstable();
-        list.dedup();
     }
+    let mut pred_at = Vec::with_capacity(order.len() + 1);
+    let mut acc = 0u32;
+    for c in &pred_count {
+        pred_at.push(acc);
+        acc += c;
+    }
+    let mut preds = vec![0u32; acc as usize];
+    let mut fill = pred_at.clone();
+    for (p, &b) in order.iter().enumerate() {
+        if let Some(&last) = dfg.blocks[b.index()].insts.last() {
+            successors(func, last, |s| {
+                let q = pos[s.index()];
+                if q != NO_BLOCK {
+                    preds[fill[q as usize] as usize] = p as u32;
+                    fill[q as usize] += 1;
+                }
+            });
+        }
+    }
+    let mut dirty = vec![true; order.len()];
     let mut out = vec![0u64; words];
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in order.iter().rev() {
+        for (p, &b) in order.iter().enumerate().rev() {
+            if !dirty[p] {
+                continue;
+            }
+            dirty[p] = false;
             out.iter_mut().for_each(|w| *w = 0);
             if let Some(&last) = dfg.blocks[b.index()].insts.last() {
                 successors(func, last, |s| {
@@ -258,16 +329,19 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
                     }
                 });
             }
-            for &g in &defs[b.index()] {
+            for &g in &defs[def_at[p] as usize..def_at[p + 1] as usize] {
                 out[g as usize / 64] &= !(1 << (g % 64));
             }
-            for &g in &ue[b.index()] {
+            for &g in &ue[ue_at[p] as usize..ue_at[p + 1] as usize] {
                 out[g as usize / 64] |= 1 << (g % 64);
             }
             let at = b.index() * words;
             if live_in[at..at + words] != out[..] {
                 live_in[at..at + words].copy_from_slice(&out);
                 changed = true;
+                for &q in &preds[pred_at[p] as usize..pred_at[p + 1] as usize] {
+                    dirty[q as usize] = true;
+                }
             }
         }
     }

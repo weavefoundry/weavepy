@@ -111,6 +111,8 @@ struct Gen<'f, A: Asm> {
     pending: Option<Pending>,
     /// Scratch buffers, kept to save allocations.
     tmp: Vec<Value>,
+    /// Emptied snapshots' vectors, for the next ones.
+    snap_pool: Vec<Vec<(Value, Reg, bool)>>,
     tmp2: Vec<Value>,
     srcs: Vec<Src>,
     /// Each signature's argument locations and stack slots, once computed.
@@ -177,6 +179,7 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         calls_after: Vec::new(),
         pending: None,
         tmp: Vec::new(),
+        snap_pool: Vec::new(),
         tmp2: Vec::new(),
         srcs: Vec::new(),
         sig_locs: vec![None; f.dfg.sigs.len()],
@@ -418,14 +421,14 @@ impl<A: Asm> Gen<'_, A> {
         self.holds = [NONE; 64];
     }
 
-    fn snapshot(&self) -> Snap {
-        Snap {
-            vals: self
-                .live
+    fn snapshot(&mut self) -> Snap {
+        let mut vals = self.snap_pool.pop().unwrap_or_default();
+        vals.extend(
+            self.live
                 .iter()
-                .map(|&v| (v, self.reg_of[v.index()], self.home_ok[v.index()]))
-                .collect(),
-        }
+                .map(|&v| (v, self.reg_of[v.index()], self.home_ok[v.index()])),
+        );
+        Snap { vals }
     }
 
     fn slot(&mut self, v: Value) -> i32 {
@@ -822,12 +825,15 @@ impl<A: Asm> Gen<'_, A> {
         // The state at the start.
         if let Some(snap) = self.snaps[b.index()].take() {
             self.reset();
-            for (v, r, home) in snap.vals {
+            let mut vals = snap.vals;
+            for &(v, r, home) in &vals {
                 let n = self.first_use(v);
                 if n != NONE || self.pin[v.index()] != NOREG {
                     self.track(v, r, home, n);
                 }
             }
+            vals.clear();
+            self.snap_pool.push(vals);
         } else {
             debug_assert!(!self.an.inherits(b), "an inheriting block without a state");
             self.reset();

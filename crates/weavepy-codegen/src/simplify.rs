@@ -51,8 +51,10 @@ pub(crate) fn simplify(f: &mut Function) {
     crate::fold::fold(f, &mut alias);
     let nv = f.dfg.values.len();
     // Identities, and constants to the right.
-    for b in f.layout.clone() {
-        for &inst in &f.dfg.blocks[b.index()].insts {
+    for bi in 0..f.layout.len() {
+        let b = f.layout[bi];
+        for ii in 0..f.dfg.blocks[b.index()].insts.len() {
+            let inst = f.dfg.blocks[b.index()].insts[ii];
             let d = &f.dfg.insts[inst.index()];
             let (a0, a1) = (d.args.0 as usize, d.args.1 as usize);
             match d.op {
@@ -79,12 +81,7 @@ pub(crate) fn simplify(f: &mut Function) {
         }
     }
     // Every operand and branch argument through the aliases.
-    let insts: Vec<_> = f
-        .layout
-        .iter()
-        .flat_map(|b| f.dfg.blocks[b.index()].insts.clone())
-        .collect();
-    for &inst in &insts {
+    for_each_inst(f, |f, inst| {
         let d = &f.dfg.insts[inst.index()];
         let none = (0, 0);
         let ranges = match &d.op {
@@ -110,7 +107,7 @@ pub(crate) fn simplify(f: &mut Function) {
                 f.dfg.pool[i] = resolve(&alias, f.dfg.pool[i]);
             }
         }
-    }
+    });
     // Jumps through empty blocks.
     let nb = f.dfg.blocks.len();
     let entry = f.layout[0];
@@ -137,38 +134,36 @@ pub(crate) fn simplify(f: &mut Function) {
         }
         b
     };
-    for &inst in &insts {
-        match &mut f.dfg.insts[inst.index()].op {
-            Op::Jump(e) => e.block = target(&fwd, e.block),
-            Op::Brif(t, e) => {
-                t.block = target(&fwd, t.block);
-                e.block = target(&fwd, e.block);
-            }
-            Op::BrTable(jt) => {
-                let jt = *jt;
-                let t = &mut f.dfg.tables[jt.index()];
-                t.default.block = target(&fwd, t.default.block);
-                for c in &mut t.table {
-                    c.block = target(&fwd, c.block);
-                }
-            }
-            _ => {}
+    for_each_inst(f, |f, inst| match &mut f.dfg.insts[inst.index()].op {
+        Op::Jump(e) => e.block = target(&fwd, e.block),
+        Op::Brif(t, e) => {
+            t.block = target(&fwd, t.block);
+            e.block = target(&fwd, e.block);
         }
-    }
+        Op::BrTable(jt) => {
+            let jt = *jt;
+            let t = &mut f.dfg.tables[jt.index()];
+            t.default.block = target(&fwd, t.default.block);
+            for c in &mut t.table {
+                c.block = target(&fwd, c.block);
+            }
+        }
+        _ => {}
+    });
     // Instructions nothing uses.
     let mut uses = vec![0u32; nv];
-    for &inst in &insts {
+    for_each_inst(f, |f, inst| {
         crate::liveness::each_use(f, inst, |v| uses[v.index()] += 1);
-    }
+    });
     let mut dead = vec![false; f.dfg.insts.len()];
-    let mut work: Vec<crate::ir::Inst> = insts
-        .iter()
-        .copied()
-        .filter(|&i| {
-            let d = &f.dfg.insts[i.index()];
-            pure(&d.op) && f.dfg.slice(d.results).iter().all(|r| uses[r.index()] == 0)
-        })
-        .collect();
+    let mut work: Vec<crate::ir::Inst> = Vec::new();
+    for_each_inst(f, |f, i| {
+        let d = &f.dfg.insts[i.index()];
+        if pure(&d.op) && f.dfg.slice(d.results).iter().all(|r| uses[r.index()] == 0) {
+            work.push(i);
+        }
+    });
+    let work_found = !work.is_empty();
     while let Some(inst) = work.pop() {
         if dead[inst.index()] {
             continue;
@@ -191,7 +186,23 @@ pub(crate) fn simplify(f: &mut Function) {
             }
         }
     }
-    for b in f.layout.clone() {
-        f.dfg.blocks[b.index()].insts.retain(|i| !dead[i.index()]);
+    if work_found {
+        for bi in 0..f.layout.len() {
+            let b = f.layout[bi];
+            f.dfg.blocks[b.index()].insts.retain(|i| !dead[i.index()]);
+        }
+    }
+}
+
+/// Run `g` over every instruction of `f`'s layout, in order, with `f`
+/// itself (the instruction lists stay as they are).
+fn for_each_inst(f: &mut Function, mut g: impl FnMut(&mut Function, crate::ir::Inst)) {
+    for bi in 0..f.layout.len() {
+        let b = f.layout[bi];
+        let mut ii = 0;
+        while let Some(&inst) = f.dfg.blocks[b.index()].insts.get(ii) {
+            g(f, inst);
+            ii += 1;
+        }
     }
 }

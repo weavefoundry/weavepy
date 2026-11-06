@@ -572,6 +572,34 @@ branch and pull request.
     1.4% and `go` 1.2%. Fixed before it landed: the layout probe read the
     sample vector's capacity as its length when the two were equal, so a
     list with room to spare read past its end from the end.
+  - Compiles cost 18% fewer instructions (on `stdlib_utils`'s first call,
+    102 million to 84 million): the constant folder skips the
+    instructions it can't fold instead of copying each one's operands, the
+    simplifier walks the blocks in place instead of copying their
+    instruction lists, liveness finds the values that cross blocks and each
+    block's upward-exposed uses in one pass with flat per-block lists and
+    looks at a block again only when a block it branches to changed, the
+    walks over an instruction's uses are in line, a function's integer
+    constants are made once (each use rematerializes it), and the register
+    state a branch hands its successor reuses a vector. The first call of
+    `stdlib_utils` compiles about 35,000 IR instructions, and code
+    generation was 15% of it, about 2,500 instructions per IR instruction.
+    `class_creation`, which compiles the functions `dataclass` and
+    `namedtuple` generate through its warm runs, takes 4.2% fewer
+    instructions.
+  - Fixed: the code generator's differential fuzzer let the compiler put
+    the generated function's address in a callee-saved register the test
+    sequence seeds before the call, so in release builds the test jumped to
+    the seed and crashed (debug builds, as CI runs them, passed).
+  - Where the first call's time goes, on `stdlib_utils`: of its roughly
+    160 million instructions over a warm call, about 107 million are
+    compiling (75 million code generation, 11 million frame-JIT lowering, 9
+    million tier-2 analysis). With the frame JIT off the first call takes
+    as long, the interpreted code costing what the compiles save, so
+    cheaper compiles are what shorten it. A background compile thread would
+    hide them on a machine with a core to spare, but it cost 2 to 3 MB of
+    peak memory when the frame JIT had one, and memory is the metric
+    WeavePy trails most in.
 
 - **Polymorphic attribute sites, yields folded in place, and call-dense
   loops back to the frame JIT** (PR #107). Instructions on Linux unless
