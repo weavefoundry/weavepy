@@ -449,6 +449,11 @@ branch and pull request.
     the comparison no longer sends it to the core loop. `d[k] += a * a`
     over such values costs 2,109 instructions instead of 2,948, and
     `statistics.mean`, `median` and `pstdev` of 200 floats 3.4% fewer.
+  - A scalar builtin of big ints (`math.gcd` of `fractions`' terms) runs
+    as a leaf from compiled code, as for machine ints, instead of
+    publishing its caller for the core loop's lane: `statistics.mean`,
+    `median` and `pstdev` of 200 floats take another 1.4% fewer
+    instructions.
   - A site that concatenates sequences or bytes (`buf += packed` of a
     `bytearray`, `a + b` of lists) is noted as a heap value's too, so it
     compiles through the general helper instead of the numeric path that
@@ -474,11 +479,13 @@ branch and pull request.
     id=...)`) goes through the core loop's lane for it with the activation
     published, the result in place, instead of leaving compiled code:
     `closures_decorators` and `xml_etree` take 1% fewer instructions.
-  - Next for constructors: a class called with keywords (`C(i, b=2)`,
-    `gather`'s `_GatheringFuture(children, loop=loop)`) leaves compiled
-    code at the `CALL_KW` and runs its `__init__` in the core loop, 4,778
-    instructions against CPython's 3,210; binding `__init__`'s keywords
-    natively needs the permutation the function call sites cache.
+  - A plain class called with keywords (`C(i, b=2)`, `gather`'s
+    `_GatheringFuture(children, loop=loop)`) makes its instance and enters
+    its `__init__`'s native code directly from compiled code, the keywords
+    bound by the permutation the function call sites use (found for the
+    `__init__`, the instance its first positional), instead of leaving at
+    the `CALL_KW` and running the `__init__` in the core loop: `C(i, b=2)`
+    costs 2,679 instructions instead of 4,531.
   - Next for `exceptions` and `try`-heavy code: a compiled function that
     catches an exception registers its activation for the core loop's
     catch, which needs the activation's frame shell for the traceback

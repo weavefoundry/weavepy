@@ -32100,9 +32100,11 @@ impl Interpreter {
                 return Some(Ok(inst));
             }
             K::Opaque => true,
+            // (A big int is an exact int too: its arithmetic runs no Python
+            // code, `math.gcd` of `fractions`' terms among it.)
             K::Scalar => args
                 .iter()
-                .all(|a| matches!(a, O::Int(_) | O::Float(_) | O::Bool(_))),
+                .all(|a| matches!(a, O::Int(_) | O::Float(_) | O::Bool(_) | O::Long(_))),
             // The fast half decides (and declines untouched).
             K::Fast(f) => return f(args),
         };

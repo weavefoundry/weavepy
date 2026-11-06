@@ -797,6 +797,148 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
     }
 }
 
+/// [`ctor_direct`] for a `CALL_KW` of a plain class (`C(i, b=2)`), its
+/// operands from `start` up a `len`-deep stack (the class, its empty self
+/// slot, `argc` positionals, `kwc` keyword values and the names tuple):
+/// the instance made, and the `__init__` that has native code entered
+/// directly, the keywords bound by the permutation [`kw_perm`] finds for
+/// it (the instance its first positional). `None` touched nothing.
+///
+/// [`kw_perm`]: crate::specialize::kw_perm
+///
+/// # Safety
+///
+/// As [`ctor_direct`]'s.
+pub(super) unsafe fn ctor_direct_kw(
+    st: &mut State,
+    pc: usize,
+    start: usize,
+    len: usize,
+    argc: usize,
+    kwc: usize,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let slot = st.stack.add(start);
+        let (Object::Type(ty), Object::Unbound) = (&*slot, &*slot.add(1)) else {
+            return None;
+        };
+        let interp = &mut *st.interp.cast_mut();
+        let nested = interp.recs.top();
+        if st.no_direct
+            || interp.recs.full_at(nested)
+            || ty.flags.is_builtin
+            || ty.native_kind.get() != 0
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || (*st.maybe_dead).get()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || !Interpreter::metaclass_calls_like_type(ty)
+        {
+            return None;
+        }
+        // SAFETY: a guard-free read of the memoized plan.
+        let (ver, plan) = ty.instance_plan.peek().and_then(Option::as_ref)?;
+        if *ver != ty.attr_version.get() || plan.user_new.is_some() || plan.seeds_exception_args {
+            return None;
+        }
+        let (init, code) = plan.lean_init.as_ref()?;
+        // SAFETY: GIL-serialized raw read of the function's code cell; only
+        // the pointer is compared.
+        if !std::ptr::eq(Rc::as_ptr(&*init.code.as_ptr()), Rc::as_ptr(code))
+            || !Interpreter::lean_code_ok(code)
+            || !code.cellvars.is_empty()
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+        {
+            return None;
+        }
+        // (The cheap checks first: an `__init__` with no native code yet
+        // takes the full path, the permutation unfound.)
+        let ext = crate::code_vm_ext(code)?;
+        let native: &super::Native = ext.frame_jit.get(code.varnames.len())?;
+        if !native.enters_at(0) {
+            return None;
+        }
+        let cells = !code.freevars.is_empty() || !init.closure.is_empty();
+        if cells && init.lean_cells_ref(code).is_none() {
+            return None;
+        }
+        let Object::Tuple(names) = &*st.stack.add(len - 1) else {
+            return None;
+        };
+        if names.len() != kwc || !names.iter().all(|n| matches!(n, Object::Str(_))) {
+            return None;
+        }
+        let (perm, covered) = crate::specialize::kw_perm(
+            init,
+            code,
+            argc + 1,
+            names.iter().map(|n| match n {
+                Object::Str(s) => &**s,
+                _ => "",
+            }),
+        )?;
+        let dc = &*st.depth_cell;
+        if dc.get() + 1 > crate::recursion::recursion_limit() {
+            return None;
+        }
+        // Committed: the frame as the core loop's arm has it at the call,
+        // the instance made (a collection it sets off may run finalizers).
+        let native: *const super::Native = native;
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        let (ty, plan) = (ty.clone(), plan.clone());
+        let (init, _) = plan.lean_init.as_ref().expect("checked above");
+        let (inst, tracked) = interp.alloc_lean_instance_obj(&ty, &plan.native);
+        if tracked && crate::gc_trace::maybe_auto_collect() {
+            interp.run_pending_finalizers();
+        }
+        // The function takes the class's slot, and the instance the empty
+        // self slot.
+        let init = Rc::clone(init);
+        slot.add(1).write(inst.clone());
+        let cls = slot.replace(Object::Function(init));
+        drop(plan);
+        drop(ty);
+        drop(cls);
+        let Object::Function(f) = &*slot else {
+            std::hint::unreachable_unchecked()
+        };
+        let code_rc: &Rc<CodeObject> = &*f.code.as_ptr();
+        let native = &*native;
+        let bound = enter(
+            st,
+            pc,
+            start,
+            len,
+            Rc::as_ptr(f),
+            code_rc,
+            true,
+            BindArgs::Keywords {
+                perm,
+                covered,
+                kwc,
+                argc,
+            },
+            cells,
+            native.need(),
+            interp.recs.top(),
+            None,
+        );
+        assert!(bound, "the depth was checked above");
+        let rec_at = interp.recs.top();
+        let rec = &mut *rec_at;
+        std::ptr::write(&raw mut (*rec.st.lazy).init_inst, Some(inst));
+        rec.extra = true;
+        rec.st.clean = false;
+        Some(run(st, rec_at, native, None))
+    }
+}
+
 /// [`ctor_direct`] of a class with a plain Python `__new__` and `object`'s
 /// `__init__` (`fractions`' values) that has native code: `__new__` entered as a
 /// direct call of the class and the arguments, its activation carrying the

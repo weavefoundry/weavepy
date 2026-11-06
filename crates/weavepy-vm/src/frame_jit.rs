@@ -11429,6 +11429,15 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             }
         }
         Interpreter::core_instance_callee(base.add(start));
+        // A plain class whose `__init__` has native code: the instance made
+        // and the `__init__` entered directly, its keywords bound.
+        if matches!(&*base.add(start), Object::Type(ty) if ty.native_kind.get() == 0)
+            && !st.sw.is_null()
+        {
+            if let Some(r) = records::ctor_direct_kw(st, pc, start, len, argc, kwc) {
+                return r;
+            }
+        }
         let ops = std::slice::from_raw_parts(base.add(start), len - start);
         let interp = &*st.interp;
         let r = match &ops[0] {
