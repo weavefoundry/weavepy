@@ -65728,6 +65728,7 @@ impl Interpreter {
         if let Ok(m) = &parsed {
             collect_compiler_syntax_warnings(m, &mut warnings);
         }
+        LAST_PARSE_WARNED.set(!warnings.is_empty());
         // Emit warnings first: under `simplefilter('always')` they are
         // recorded and a later parse error still propagates; under
         // `simplefilter('error')` the first escape escalates to a
@@ -65925,6 +65926,7 @@ impl Interpreter {
         if let Ok(m) = &parsed {
             collect_compiler_syntax_warnings(m, &mut warnings);
         }
+        LAST_PARSE_WARNED.set(!warnings.is_empty());
         self.emit_escape_warnings(source, filename, &warnings)?;
         parsed.map_err(|e| parse_error_to_syntax_error(&e, source, filename))
     }
@@ -67499,15 +67501,23 @@ impl Interpreter {
                 // location), exactly like `compile()` — CPython's `exec`
                 // never raises `ValueError` for bad syntax. Invalid-escape
                 // `SyntaxWarning`s replay here too.
-                let module = self.parse_source_emitting_warnings(&src, "<string>")?;
-                let compiled = weavepy_compiler::compile_owned_module_with_options(
-                    module,
-                    &src,
-                    "<string>",
-                    self.exec_eval_compile_options(),
-                )
-                .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
-                Rc::new(compiled)
+                let opts = self.exec_eval_compile_options();
+                match source_code_get(SOURCE_EXEC, opts, &src) {
+                    Some(code) => code,
+                    None => {
+                        let module = self.parse_source_emitting_warnings(&src, "<string>")?;
+                        let warned = LAST_PARSE_WARNED.get();
+                        let compiled = weavepy_compiler::compile_owned_module_with_options(
+                            module, &src, "<string>", opts,
+                        )
+                        .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
+                        let code = Rc::new(compiled);
+                        if !warned {
+                            source_code_put(SOURCE_EXEC, opts, &src, &code);
+                        }
+                        code
+                    }
+                }
             }
             _ => unreachable!(),
         };
@@ -67715,15 +67725,24 @@ impl Interpreter {
         // `ValueError`; this is what `test_fstring`'s negative cases (which
         // call `eval("f'...'")` and assert `SyntaxError`) rely on.
         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
-        let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
-        let code = weavepy_compiler::compile_owned_eval_with_options(
-            module,
-            trimmed,
-            "<string>",
-            self.exec_eval_compile_options(),
-        )
-        .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
-        let mut frame = self.make_frame(Rc::new(code), Vec::new(), Vec::new(), globals_dict, None);
+        let opts = self.exec_eval_compile_options();
+        let code = match source_code_get(SOURCE_EVAL, opts, trimmed) {
+            Some(code) => code,
+            None => {
+                let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
+                let warned = LAST_PARSE_WARNED.get();
+                let compiled = weavepy_compiler::compile_owned_eval_with_options(
+                    module, trimmed, "<string>", opts,
+                )
+                .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
+                let code = Rc::new(compiled);
+                if !warned {
+                    source_code_put(SOURCE_EVAL, opts, trimmed, &code);
+                }
+                code
+            }
+        };
+        let mut frame = self.make_frame(code, Vec::new(), Vec::new(), globals_dict, None);
         match eval_locals {
             Some(Object::Dict(d)) => frame.rare_mut().class_namespace = Some(d),
             Some(mapping) => frame.rare_mut().class_namespace_obj = Some(mapping),
@@ -70483,6 +70502,75 @@ pub fn decode_source_bytes(bytes: &[u8], filename: &str) -> Result<String, Runti
 /// line/offset/text) instead of the file tokenizer's `Non-UTF-8 code…`.
 pub fn decode_compile_source_bytes(bytes: &[u8], filename: &str) -> Result<String, RuntimeError> {
     decode_source_bytes_inner(bytes, filename, false)
+}
+
+thread_local! {
+    /// Whether the last parse of `exec`'s or `eval`'s source reported a
+    /// warning (see [`source_code_get`]).
+    static LAST_PARSE_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The code `exec` and `eval` compiled from source strings, by source,
+    /// mode and compile options, in its encoded form (see
+    /// `weavepy_compiler::native_code`): `dataclasses` and `namedtuple`
+    /// build the same source for every class with the same fields, and its
+    /// compile cost more than the rest of making the class. Each hit
+    /// decodes a code object of its own (bodies decode on first use), so
+    /// nothing a run leaves in its code (caches, compiled code, what they
+    /// hold) outlives its functions. Only source whose parse warned about
+    /// nothing is kept (a warning is emitted at each compile).
+    #[allow(clippy::type_complexity)]
+    static SOURCE_CODE: std::cell::RefCell<
+        std::collections::HashMap<Box<str>, Vec<((u8, u32, u8), Box<[u8]>)>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const SOURCE_EXEC: u8 = 0;
+const SOURCE_EVAL: u8 = 1;
+/// The longest source [`SOURCE_CODE`] keeps, and how many it keeps (it
+/// starts over when full).
+const SOURCE_CODE_MAX_LEN: usize = 16 * 1024;
+const SOURCE_CODE_MAX: usize = 256;
+
+/// A fresh copy of the code `exec` or `eval` (`mode`) compiled from `src`
+/// under `opts`, when it's kept (see `SOURCE_CODE`).
+fn source_code_get(
+    mode: u8,
+    opts: weavepy_compiler::CompileOptions,
+    src: &str,
+) -> Option<Rc<CodeObject>> {
+    if src.len() > SOURCE_CODE_MAX_LEN {
+        return None;
+    }
+    let key = (mode, opts.flags, opts.optimize);
+    let code = SOURCE_CODE.with(|m| {
+        let m = m.borrow();
+        let (_, bytes) = m.get(src)?.iter().find(|(k, _)| *k == key)?;
+        weavepy_compiler::native_code::decode(bytes, "<string>")
+    })?;
+    Some(Rc::new(code))
+}
+
+/// Keep `code`, compiled from `src` (see [`source_code_get`]).
+fn source_code_put(
+    mode: u8,
+    opts: weavepy_compiler::CompileOptions,
+    src: &str,
+    code: &Rc<CodeObject>,
+) {
+    if src.len() > SOURCE_CODE_MAX_LEN {
+        return;
+    }
+    let Some(bytes) = weavepy_compiler::native_code::encode(code) else {
+        return;
+    };
+    SOURCE_CODE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= SOURCE_CODE_MAX {
+            m.clear();
+        }
+        m.entry(Box::from(src))
+            .or_default()
+            .push(((mode, opts.flags, opts.optimize), bytes.into_boxed_slice()));
+    });
 }
 
 /// CPython refuses to tokenize a string source containing NUL — the C

@@ -587,6 +587,24 @@ branch and pull request.
     `class_creation`, which compiles the functions `dataclass` and
     `namedtuple` generate through its warm runs, takes 4.2% fewer
     instructions.
+    A second round takes it to 80 million (22% below where it started): the
+    simplifier resolves aliases, forwards jumps and counts uses in one pass,
+    the folder keeps its operands in a small array and rebuilds each block's
+    list in the vector the last one gave up, a call drops what the callee
+    clobbers by walking the clobbered registers' bits instead of all 64, a
+    parallel move reuses its scratch vectors, and a merge edge lists the
+    values live into its block only when it's the first edge in.
+  - `exec` and `eval` of a source string reuse the code they compiled from
+    the same source under the same compile options (the caller's
+    `__future__` flags, the optimization level), up to 256 sources of 16 KB
+    or less, unless its parse warned (a warning is emitted at each
+    compile). `dataclasses` builds the same `__init__`, `__repr__` and
+    `__eq__` source for every class with the same fields, and `namedtuple`
+    the same `__new__`, and compiling it cost more than the rest of making
+    the class. The cache keeps the encoded form (as the frozen modules'
+    cache does), and each run decodes code of its own, bodies on first use:
+    reusing the code objects themselves kept what a run's caches and
+    compiled code hold (the functions it called) alive with them.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
