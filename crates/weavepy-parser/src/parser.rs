@@ -3997,7 +3997,7 @@ impl<'src> Parser<'src> {
         }
         Ok(Expr {
             kind: ExprKind::Lambda {
-                args,
+                args: Box::new(args),
                 body: Box::new(body),
             },
             span,

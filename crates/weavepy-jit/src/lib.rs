@@ -1,9 +1,9 @@
-//! RFC 0032 — tier-2 Cranelift JIT for WeavePy's unboxed numeric frames.
+//! RFC 0032 — tier-2 JIT for WeavePy's unboxed numeric frames.
 //!
 //! This crate compiles the *unboxed numeric/control-flow core* of a
 //! [`weavepy_compiler::CodeObject`] — `int`/`float`/`bool` arithmetic,
 //! comparisons, the conditional and unconditional jumps, `range`
-//! iteration, and `return` — to native machine code via Cranelift.
+//! iteration, and `return` — to native machine code via `weavepy-codegen`.
 //! Everything outside that subset (containers, attribute access, calls
 //! out, exceptions, generators) stays in the interpreter; a frame whose
 //! hot region touches an unsupported opcode is reported
@@ -35,8 +35,8 @@ pub use analyze::{
     PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
 pub use engine::{
-    admit_generic_loops, CompiledFrame, DirectLeaf, FieldAt, InlineMethod, JitEngine, OpMix,
-    NO_HOST_ENGINE,
+    admit_generic_loops, generic_loops_admitted, CompiledFrame, DirectLeaf, FieldAt, InlineMethod,
+    JitEngine, OpMix, NO_HOST_ENGINE,
 };
 pub use ir::{
     ArithKind, AttrSiteMeta, BlockId, CalleeSpanMeta, CmpKind, CompSavedMeta, CtorFieldSrc,

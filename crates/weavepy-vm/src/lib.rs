@@ -83,7 +83,7 @@ pub mod stdlib;
 pub mod stdlib_tree;
 pub mod sync;
 pub mod thread_registry;
-/// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
+/// RFC 0032 — tier-2 JIT integration. Present only under the
 /// `jit` feature; the dispatch loop calls into it behind `#[cfg]` gates.
 #[cfg(feature = "jit")]
 mod tier2;
@@ -1942,14 +1942,6 @@ impl Interpreter {
         }
     }
 
-    /// Start the JIT's code generator warming up with start-up (the next
-    /// [`Interpreter::run_site`]), for a program likely to compile: a
-    /// script or module rather than `-c` code or the REPL.
-    pub fn warm_jit_at_startup() {
-        #[cfg(feature = "jit")]
-        crate::tier2::warm_codegen_at_startup();
-    }
-
     /// Report that interpreter start-up is over: user code runs next
     /// (the JIT then uses its normal counter thresholds).
     pub fn note_startup_finished(&self) {
@@ -1964,8 +1956,6 @@ impl Interpreter {
     /// `-S` is active; another explicit call would repeat `.pth` processing.
     /// Startup import errors retain their best-effort handling.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
-        #[cfg(feature = "jit")]
-        crate::tier2::prewarm_at_startup();
         #[cfg(feature = "jit")]
         let _compile_guard = crate::tier2::startup_compilation_scope();
         // Startup runs bytecode too (site/.pth imports can allocate enough
@@ -2680,6 +2670,24 @@ impl Interpreter {
     /// references exist) make the park equivalent to a free. Elements
     /// are cleared in place so their refcounts fall now, exactly as a
     /// plain drop would.
+    /// Park `t`, a tuple this handle alone owns whose items were all moved
+    /// out (each slot `Unbound`), as [`Self::maybe_donate_tuple`] parks a
+    /// dead one; or free it when its bucket is full.
+    #[inline]
+    pub(crate) fn park_tuple(&self, t: ThinArc<crate::tuple_storage::TupleStorage>) {
+        const PER_LEN_CAP: usize = 8;
+        let n = t.len();
+        if n == 0 || n > 16 {
+            return;
+        }
+        if let Ok(mut pool) = self.tuple_pool.try_borrow_mut() {
+            let bucket = &mut pool[n - 1];
+            if bucket.len() < PER_LEN_CAP {
+                bucket.push(t);
+            }
+        }
+    }
+
     fn maybe_donate_tuple(&self, dropped: Object) {
         const PER_LEN_CAP: usize = 8;
         let Object::Tuple(t) = dropped else { return };
@@ -8024,6 +8032,8 @@ impl Interpreter {
                 clean: false,
                 wait_pc: usize::MAX,
                 wait_pending: None,
+                outer_lazy: 0,
+                fold: std::ptr::null(),
             };
             let status = native.run_direct(&mut st, pc);
             // (`frame` again: the helpers reach the frame through `st`.)
@@ -10597,10 +10607,16 @@ impl Interpreter {
             return None;
         };
         // SAFETY: GIL-serialized raw read of the setter cell.
-        let Object::Builtin(b) = (unsafe { &*prop.fset.as_ptr() }) else {
-            return None;
+        let b = match unsafe { &*prop.fset.as_ptr() } {
+            Object::Builtin(b) => b.clone(),
+            // A Python setter of the setter shape (`self._x = value`):
+            // its one store, frameless (a decline stored nothing).
+            Object::Function(f) => {
+                let f = f.clone();
+                return self.leaf_py_setter(frame, &f, pc);
+            }
+            _ => return None,
         };
-        let b = b.clone();
         let args = [frame.stack[n - 1].clone(), frame.stack[n - 2].clone()];
         let r = match self.leaf_call_kind(&b)? {
             LeafKind::Fast(f) => f(&args)?,
@@ -10614,6 +10630,99 @@ impl Interpreter {
         self.release(receiver);
         self.release(value);
         Some(r.map(|v| self.release(v)))
+    }
+
+    /// [`Self::try_leaf_setter`] for a Python setter `f`: its body is the
+    /// setter shape (see `effect_setter_shape`), whose one store either
+    /// happens or doesn't, run frameless with the receiver and value atop
+    /// `frame`'s stack (the `STORE_ATTR` at `pc`). `None` touches nothing.
+    fn leaf_py_setter(
+        &mut self,
+        frame: &mut Frame,
+        f: &Rc<crate::object::PyFunction>,
+        pc: usize,
+    ) -> Option<Result<(), RuntimeError>> {
+        let n = frame.stack.len();
+        if !self.leaf_setter_eval(f, &frame.stack[n - 1], &frame.stack[n - 2]) {
+            return None;
+        }
+        let receiver = frame.stack.pop().expect("checked by the caller");
+        let value = frame.stack.pop().expect("checked by the caller");
+        frame.pc = pc as u32 + 1;
+        self.release(receiver);
+        self.release(value);
+        Some(Ok(()))
+    }
+
+    /// A Python property setter `f` of the setter shape (see
+    /// `effect_setter_shape`) run frameless on `receiver` and `value`
+    /// (borrowed: the store takes its own reference): whether it ran (a
+    /// decline stored nothing).
+    fn leaf_setter_eval(
+        &mut self,
+        f: &Rc<crate::object::PyFunction>,
+        receiver: &Object,
+        value: &Object,
+    ) -> bool {
+        let code = f.code();
+        if code.arg_count != 2
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || !code_is_effect_leaf(&code)
+            || code_vm_ext(&code)
+                .is_none_or(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) != 16)
+            || !pure_leaf_warm(&code)
+        {
+            return false;
+        }
+        let args: [*const Object; 2] = [receiver, value];
+        self.leaf_init_eval(&code, f, &args).is_some()
+    }
+
+    /// `receiver.name = value` (the `STORE_ATTR` at `pc` of `code`) for a
+    /// property whose Python setter is the setter shape, as the core
+    /// loop's `try_leaf_setter` runs it (for compiled code, see
+    /// `frame_jit::h_setter_store`): whether it ran. The operands stay
+    /// where they are, for the caller to release.
+    pub(crate) fn leaf_setter_at(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        receiver: &Object,
+        value: &Object,
+    ) -> bool {
+        let Object::Instance(inst) = receiver else {
+            return false;
+        };
+        let Some(ins) = code.instructions.get(pc) else {
+            return false;
+        };
+        if ins.op != OpCode::StoreAttr || !Self::default_setattr(inst.cls_raw()) {
+            return false;
+        }
+        let Some(LeafAttr::Property(prop)) = Self::leaf_resolve_instance_attr(code, inst, ins.arg)
+        else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the setter cell; the clone is
+        // taken before anything else runs.
+        match unsafe { &*prop.fset.as_ptr() } {
+            Object::Function(f) => {
+                let f = f.clone();
+                self.leaf_setter_eval(&f, receiver, value)
+            }
+            // A native setter's fast half (asyncio's `Task._log_destroy_pending`),
+            // which runs no Python code, as the core loop's store runs it.
+            Object::Builtin(b) => match self.leaf_call_kind(b) {
+                Some(LeafKind::Fast(fast)) => {
+                    let args = [receiver.clone(), value.clone()];
+                    matches!(fast(&args), Some(Ok(_)))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
@@ -11112,6 +11221,13 @@ impl Interpreter {
             // Still pending means nothing flushed; a flush drains the list.
             if self.lean_pending.last() == Some(&addr) {
                 self.lean_pending.pop();
+            } else {
+                // (Newer entries above it would leave this one behind, its
+                // activation gone: see `State::outer_lazy`.)
+                debug_assert!(
+                    !self.lean_pending.contains(&addr),
+                    "pending entry left behind"
+                );
             }
         }
     }
@@ -11446,7 +11562,20 @@ impl Interpreter {
             shell: None,
         };
         let mut prev_pc: Option<usize> = None;
-        let exit = self.quiet_run(frame, QuietShell::Lazy(&mut act), snap_gen, &mut prev_pc);
+        // A compiled body runs straight from here, its return handed back
+        // (a native caller's callback: `map(f, xs)`, a sort key), as a
+        // generator step's does (see `quiet_native_step`).
+        #[cfg(feature = "jit")]
+        let native = self.lean_entry_native(frame);
+        #[cfg(not(feature = "jit"))]
+        let native = None;
+        let exit = self.quiet_run_from(
+            frame,
+            QuietShell::Lazy(&mut act),
+            snap_gen,
+            &mut prev_pc,
+            native,
+        );
         Self::sync_lazy_tb_lasti(act.shell.as_deref(), &frame.code, &exit);
         let outcome = match (exit, act.shell) {
             // The whole activation ran without ever needing its shell.
@@ -12389,6 +12518,8 @@ impl Interpreter {
                             clean: false,
                             wait_pc: usize::MAX,
                             wait_pending: None,
+                            outer_lazy: 0,
+                            fold: std::ptr::null(),
                         });
                         nst.len = len;
                         nst.pc = pc;
@@ -13078,15 +13209,60 @@ impl Interpreter {
                                 match kind {
                                     BinOpKind::Add => match a.checked_add(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::Sub => match a.checked_sub(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::Mult => match a.checked_mul(b) {
                                         Some(r) => int_hot(r),
-                                        None => break None,
+                                        // Past the machine word: the bignum
+                                        // arithmetic (exact ints run no Python),
+                                        // the site noted as a big int's.
+                                        None => {
+                                            if let Some(e) = ext {
+                                                heap_site_note(e, ninstrs, pc);
+                                            }
+                                            match core_bignum_op(
+                                                &Object::Int(a),
+                                                &Object::Int(b),
+                                                kind,
+                                            ) {
+                                                Ok(v) => v,
+                                                Err(_) => break None,
+                                            }
+                                        }
                                     },
                                     BinOpKind::BitAnd => int_hot(a & b),
                                     BinOpKind::BitOr => int_hot(a | b),
@@ -13172,6 +13348,9 @@ impl Interpreter {
                             // line.
                             (Object::Long(_), Object::Int(_) | Object::Long(_))
                             | (Object::Int(_), Object::Long(_)) => {
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 let r = core_bignum_op(a, b, kind);
                                 // SAFETY: ints leave by plain decrements.
                                 unsafe {
@@ -13200,6 +13379,9 @@ impl Interpreter {
                                 let Some(r) = Self::core_str_binop(a, b, kind) else {
                                     break None;
                                 };
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: the operands are strings and scalars
                                 // (or a tuple of them): releasing them runs no
                                 // code and frees nothing the collector tracks.
@@ -13229,6 +13411,11 @@ impl Interpreter {
                                 let Some(r) = Self::core_seq_concat(a, b) else {
                                     break None;
                                 };
+                                // (A heap result: compiled code takes the
+                                // helper that keeps one, not the numbers'.)
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 // SAFETY: both operand slots are initialized and
                                 // leave the stack; the result takes the first.
                                 unsafe {
@@ -13248,6 +13435,9 @@ impl Interpreter {
                             (Object::Bytes(_) | Object::ByteArray(_), Object::Bytes(_))
                                 if kind == BinOpKind::Add =>
                             {
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
                                 let r = match (a, b) {
                                     (Object::Bytes(x), Object::Bytes(y)) => {
                                         let mut v = Vec::with_capacity(x.len() + y.len());
@@ -13304,6 +13494,18 @@ impl Interpreter {
                         // SAFETY: the `len` slots at `base` are initialized,
                         // and the helpers touch nothing else.
                         let subscr = matches!(ins.op, OpCode::BinarySubscr | OpCode::StoreSubscr);
+                        if subscr && len >= 2 {
+                            // SAFETY: `len >= 2`.
+                            unsafe {
+                                Self::note_subscr_shape(
+                                    code,
+                                    pc,
+                                    ins.op == OpCode::StoreSubscr,
+                                    base,
+                                    len,
+                                )
+                            };
+                        }
                         let n = if subscr {
                             unsafe {
                                 Self::core_subscr_hot(ins.op == OpCode::StoreSubscr, base, len)
@@ -15974,81 +16176,30 @@ impl Interpreter {
                     }
                     // An f-string's pieces over the exact scalars and strings
                     // whose conversion and formatting run no Python: `!s` (a
-                    // string is itself), `!r` of an int, no spec, and the
-                    // join.
+                    // string is itself), `!r` of a scalar or a string, no
+                    // spec, and the join.
                     OpCode::ConvertValue => {
-                        if len == 0 {
+                        // SAFETY: `len > 0` is checked first; nothing else
+                        // reads the slot.
+                        if len == 0 || !unsafe { convert_in_place(base.add(len - 1), ins.arg) } {
                             break None;
-                        }
-                        // SAFETY: `len > 0`.
-                        let top = unsafe { base.add(len - 1) };
-                        let v = match (ins.arg & 0x03, unsafe { &*top }) {
-                            (1, Object::Str(_)) => None,
-                            (1 | 2, Object::Int(i)) => {
-                                let mut buf = itoa::Buffer::new();
-                                Some(Object::Str(SharedStr::from(buf.format(*i))))
-                            }
-                            (1 | 2, Object::Bool(b)) => {
-                                Some(Object::from_static(if *b { "True" } else { "False" }))
-                            }
-                            (1 | 2, Object::None) => Some(Object::from_static("None")),
-                            _ => break None,
-                        };
-                        if let Some(v) = v {
-                            // SAFETY: the replaced scalar owes no drop.
-                            unsafe { top.write(v) };
                         }
                         last = pc;
                         pc += 1;
                     }
                     OpCode::FormatValue if ins.arg == 0 => {
-                        if len == 0 {
+                        // SAFETY: as above.
+                        if len == 0 || !unsafe { format_simple_in_place(base.add(len - 1)) } {
                             break None;
-                        }
-                        // SAFETY: `len > 0`.
-                        let top = unsafe { base.add(len - 1) };
-                        match unsafe { &*top } {
-                            Object::Str(_) => {}
-                            Object::Int(i) => {
-                                let mut buf = itoa::Buffer::new();
-                                // SAFETY: the replaced int owes no drop.
-                                unsafe { top.write(Object::Str(SharedStr::from(buf.format(*i)))) };
-                            }
-                            _ => break None,
                         }
                         last = pc;
                         pc += 1;
                     }
                     OpCode::BuildString => {
                         let n = ins.arg as usize;
-                        if n == 0 || n > len || crate::stdlib::tracemalloc_real::is_tracking() {
-                            break None;
-                        }
                         // SAFETY: the top `n` slots are initialized.
-                        let parts = unsafe { std::slice::from_raw_parts(base.add(len - n), n) };
-                        let mut strs: [&str; 8] = [""; 8];
-                        if n > strs.len() {
+                        if n == 0 || n > len || !unsafe { build_string_at(base.add(len - n), n) } {
                             break None;
-                        }
-                        let mut all = true;
-                        for (k, p) in parts.iter().enumerate() {
-                            match p {
-                                Object::Str(s) => strs[k] = s,
-                                _ => {
-                                    all = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if !all {
-                            break None;
-                        }
-                        let joined = Object::Str(SharedStr::concat(&strs[..n]));
-                        // SAFETY: the parts leave the stack (a string's release
-                        // runs nothing); the join takes the first slot.
-                        unsafe {
-                            release_run(base.add(len - n), n);
-                            base.add(len - n).write(joined);
                         }
                         len = len - n + 1;
                         last = pc;
@@ -16246,6 +16397,10 @@ impl Interpreter {
         frame: &mut Frame,
         pc: usize,
     ) -> Option<usize> {
+        // (Registered first, as `core_pending_enter` does: a lazy callee
+        // registering later would push its entries above this one, which
+        // then stays behind when its call returns.)
+        self.settle_lazy();
         // SAFETY: as `core_pending_enter`.
         unsafe {
             let inl: &mut Vec<Box<InlineAct>> = &mut *sw.inl;
@@ -16415,6 +16570,33 @@ impl Interpreter {
     /// leaf, its result in place, or as an inline activation switched to
     /// here. `false` touches nothing (the native `__call__` takes the call,
     /// its errors included).
+    /// [`Self::core_partial_call`] of a partial over a builtin with a leaf
+    /// half and no stored keywords: the result, for `ops` the partial
+    /// instance and the call's positionals, of the builtin's leaf half
+    /// over the stored positionals and those (four at most). `None` for
+    /// anything else, a decline or an error.
+    fn core_partial_builtin(&self, ops: &[Object]) -> Option<Object> {
+        let [Object::Instance(inst), args @ ..] = ops else {
+            return None;
+        };
+        let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
+        let (b, n) = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
+            let Object::Builtin(b) = func else {
+                return None;
+            };
+            let n = stored.len() + args.len();
+            if !kw.is_empty() || b.binds_instance || n > buf.len() {
+                return None;
+            }
+            for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
+                *slot = v.clone();
+            }
+            Some((b.clone(), n))
+        })?;
+        let kind = self.leaf_call_kind(&b)?;
+        self.leaf_builtin_call(kind, &b, &buf[..n])?.ok()
+    }
+
     #[inline(never)]
     fn core_partial_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
@@ -16457,6 +16639,22 @@ impl Interpreter {
         });
         if let Some(r) = r {
             // The operands leave the stack, the result in their place.
+            self.release_call_operands(&mut frame.stack, callee_slot);
+            frame.stack.push(r);
+            frame.pc = pc as u32 + 1;
+            // SAFETY: the running activation's last-pc slot.
+            unsafe { *sw.last = pc };
+            // SAFETY: the running thread's own flag (see `quiet_run`).
+            if unsafe { (*sw.maybe_dead).get() } {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            }
+            return true;
+        }
+        // A builtin with a leaf half over the merged arguments
+        // (`partial(operator.add, 1)`): its result in place. A decline or
+        // an error leaves the call to the native `__call__`, which repeats
+        // it (a leaf runs no code, so nothing is observed twice).
+        if let Some(r) = self.core_partial_builtin(&frame.stack[callee_slot + 1..]) {
             self.release_call_operands(&mut frame.stack, callee_slot);
             frame.stack.push(r);
             frame.pc = pc as u32 + 1;
@@ -19389,13 +19587,7 @@ impl Interpreter {
             // and that `__init__`'s `args` (and a `StopIteration`'s
             // `value`).
             if plan.exc_native_init {
-                let (inst, tracked) = self.alloc_plain_instance_obj(&ty);
-                let mut init_args = Vec::with_capacity(argc + 1);
-                init_args.push(inst.clone());
-                init_args.extend(frame.stack.drain(self_slot + 1..));
-                // (An instance's `__init__` stores can't fail.)
-                let _ = builtin_types::exc_init(&init_args);
-                drop(init_args);
+                let (inst, tracked) = self.alloc_exc_native(&ty, frame, self_slot + 1);
                 frame.stack.truncate(callee_slot);
                 frame.stack.push(inst);
                 frame.pc = pc as u32 + 1;
@@ -19418,6 +19610,17 @@ impl Interpreter {
                 // in the same activation.
                 return true;
             }
+            if argc == 0 {
+                if let Some((inst, _)) = self.alloc_empty_container(&ty, &plan) {
+                    // SAFETY: as above (the finalizers that ran left this
+                    // activation's frame where it was).
+                    let frame = unsafe { &mut *sw.cur };
+                    frame.stack.truncate(callee_slot);
+                    frame.stack.push(inst);
+                    frame.pc = pc as u32 + 1;
+                    return true;
+                }
+            }
             return false;
         };
         // SAFETY: GIL-serialized raw read of the function's code cell;
@@ -19433,9 +19636,10 @@ impl Interpreter {
             return false;
         };
         // A store-only `__init__`: the stores themselves, as its sites
-        // last proved them.
+        // last proved them (not once refuted).
         if matches!(plan.native, crate::types::NativeKind::Plain)
             && !plan.seeds_exception_args
+            && plan.store_init.load(std::sync::atomic::Ordering::Relaxed) != 2
             && self.core_store_init(
                 frame,
                 &ty,
@@ -19552,6 +19756,15 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> bool {
         let Some((init, code)) = plan.lean_init.as_ref() else {
+            if plan.exc_native_init {
+                let (inst, tracked) = self.alloc_exc_native(ty, frame, start + 2);
+                frame.stack.truncate(start);
+                frame.stack.push(inst);
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
             if argc == 0 && plan.bare_alloc && ty.native_kind.get() == 0 {
                 let (inst, tracked) = self.alloc_plain_instance_obj(ty);
                 frame.stack.truncate(start);
@@ -19561,9 +19774,18 @@ impl Interpreter {
                 }
                 return true;
             }
+            if argc == 0 {
+                if let Some((inst, _)) = self.alloc_empty_container(ty, plan) {
+                    frame.stack.truncate(start);
+                    frame.stack.push(inst);
+                    return true;
+                }
+            }
             return false;
         };
-        if !matches!(plan.native, crate::types::NativeKind::Plain)
+        // (Neither path below seeds an exception's `args`.)
+        if plan.seeds_exception_args
+            || !matches!(plan.native, crate::types::NativeKind::Plain)
             // SAFETY: GIL-serialized raw read of the function's code cell;
             // only the pointer is compared.
             || !std::ptr::eq(
@@ -19928,6 +20150,11 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> bool {
         let Some(shape) = code_store_init(code) else {
+            // (No store-only shape, for this class version's `__init__`.)
+            if prove {
+                plan.store_init
+                    .store(2, std::sync::atomic::Ordering::Relaxed);
+            }
             return false;
         };
         let Some(slots) = code_vm_ext(code)
@@ -20016,6 +20243,16 @@ impl Interpreter {
                 _ => return false,
             },
         };
+        // A fresh container is made as `BUILD_LIST`/`BUILD_MAP` would make
+        // it, which a collection due (or an allocation observer) leaves to
+        // the ordinary paths.
+        if shape.fresh
+            && (crate::stdlib::tracemalloc_real::is_tracking()
+                || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+                || gc_trace::auto_collect_due())
+        {
+            return false;
+        }
         // Committed.
         let (inst, _) = self.alloc_plain_instance_obj(ty);
         let Object::Instance(i) = &inst else {
@@ -20055,6 +20292,18 @@ impl Interpreter {
                 }
                 StoreSrc::Const(c) => consts[c as usize].clone(),
                 StoreSrc::Int(n) => Object::Int(n),
+                StoreSrc::NewList => {
+                    let list = Object::new_list(Vec::new());
+                    gc_trace::track(&list);
+                    list
+                }
+                StoreSrc::NewDict => {
+                    let dict = Object::Dict(Rc::new(RefCell::new(
+                        DictData::with_capacity_and_hasher(0, crate::fasthash::FxBuildHasher),
+                    )));
+                    gc_trace::track(&dict);
+                    dict
+                }
             };
             split_vals[k].write(value);
         }
@@ -20627,6 +20876,31 @@ impl Interpreter {
         if !is_super_callable(g) || !Self::core_droppable(g) || !Self::core_droppable(cls_obj) {
             return None;
         }
+        // `super(C, cls).name` with a subclass of `C` for the receiver (a
+        // class method's, `__new__`'s): the attribute unbound, the self slot
+        // empty in the method form.
+        if let (Object::Type(c), Object::Type(k)) = (cls_obj, self_obj) {
+            if k.is_subclass_of(c) {
+                let f = Self::leaf_super_type_attr(code, c, k, pc as u32, ins.arg >> 2)?;
+                // SAFETY: all three operands leave the stack, the receiver
+                // too (a class, held by its module or its caller's frame
+                // besides): each was checked droppable or is plain.
+                unsafe {
+                    if !Self::core_droppable(&*base.add(len - 1)) {
+                        return None;
+                    }
+                    drop_hot_at(base.add(len - 1));
+                    drop_hot_at(base.add(len - 2));
+                    drop_hot_at(base.add(len - 3));
+                    base.add(len - 3).write(f);
+                    if ins.arg & 1 != 0 {
+                        base.add(len - 2).write(Object::Unbound);
+                        return Some(len - 1);
+                    }
+                    return Some(len - 2);
+                }
+            }
+        }
         let f = Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)?;
         // SAFETY: all three operands leave the stack; the two released ones
         // were checked droppable, and `self` moves into the shape the
@@ -20836,6 +21110,56 @@ impl Interpreter {
         }
     }
 
+    /// Settle the empty cache of the `BINARY_SUBSCR` (or, `store`, the
+    /// `STORE_SUBSCR`) at `pc` on the operands' shape (the container and
+    /// key, the top two of the `len` at `base`) when they're a list (or a
+    /// tuple or a string, read) and an `int`: the core loop serves those without the
+    /// cache machinery, and compiled code indexes them in line by it.
+    ///
+    /// # Safety
+    ///
+    /// `len >= 2` initialized slots at `base`.
+    #[inline(always)]
+    unsafe fn note_subscr_shape(
+        code: &CodeObject,
+        pc: usize,
+        store: bool,
+        base: *const Object,
+        len: usize,
+    ) {
+        if matches!(
+            code.caches.get(pc as u32),
+            weavepy_compiler::InlineCache::Empty
+        ) {
+            // SAFETY: per the caller.
+            unsafe { Self::note_subscr_shape_slow(code, pc, store, base, len) }
+        }
+    }
+
+    /// [`Self::note_subscr_shape`]'s setting.
+    #[cold]
+    #[inline(never)]
+    unsafe fn note_subscr_shape_slow(
+        code: &CodeObject,
+        pc: usize,
+        store: bool,
+        base: *const Object,
+        len: usize,
+    ) {
+        // SAFETY: per the caller.
+        let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+        let cache = match (c, k) {
+            (Object::List(_), Object::Int(_)) if store => {
+                specialize::attempt_specialize_store_subscr(c, k)
+            }
+            (Object::List(_) | Object::Tuple(_) | Object::Str(_), Object::Int(_)) if !store => {
+                specialize::attempt_specialize_binary_subscr(c, k)
+            }
+            _ => return,
+        };
+        code.caches.set(pc as u32, cache);
+    }
+
     /// The core loop's container instructions: `seq[i]` and `d[key]` over
     /// exact containers (an in-range index or a present `str`/`int` key),
     /// `seq[i] = v` in range and `d[key] = v`, and a comprehension's
@@ -20860,6 +21184,29 @@ impl Interpreter {
             )
         }
         match ins.op {
+            // `x[a:b:c]`'s slice (`range(n)[::-1]`): the bounds move in.
+            OpCode::BuildSlice if matches!(ins.arg, 2 | 3) && len >= ins.arg as usize => {
+                let n = ins.arg as usize;
+                let at = len - n;
+                // SAFETY: `len >= n`: the bounds leave their slots.
+                let (start, stop, step) = unsafe {
+                    (
+                        base.add(at).read(),
+                        base.add(at + 1).read(),
+                        if n == 3 {
+                            base.add(at + 2).read()
+                        } else {
+                            Object::None
+                        },
+                    )
+                };
+                // SAFETY: the first bound's slot takes the slice.
+                unsafe {
+                    base.add(at)
+                        .write(Object::Slice(Rc::new(PySlice { start, stop, step })));
+                }
+                Some(at + 1)
+            }
             OpCode::BinarySubscr => {
                 if len < 2 {
                     return None;
@@ -20928,10 +21275,16 @@ impl Interpreter {
                         Object::from_char(c)
                     }
                     (Object::Dict(d), Object::Instance(_)) if Self::core_droppable(k) => {
-                        let probe = crate::object::LeafProbe::new(k)?;
-                        // SAFETY: as above.
-                        let d = unsafe { d.peek() }?;
-                        clone_hot(d.get(&probe)?)
+                        match crate::object::LeafProbe::new(k) {
+                            Some(probe) => {
+                                // SAFETY: as above.
+                                let d = unsafe { d.peek() }?;
+                                clone_hot(d.get(&probe)?)
+                            }
+                            // A Python `__hash__` that evaluates as a pure
+                            // leaf: the key found as itself.
+                            None => crate::object::leaf_hashed_instance_get(d, k)??,
+                        }
                     }
                     // `seq[a:b:c]` with plain int (or omitted) bounds: the
                     // full handler's own slicing, out of line (a bad step
@@ -21314,7 +21667,23 @@ impl Interpreter {
                         // SAFETY: a store between two instructions (the probe
                         // and the insert run no code).
                         let st = unsafe { st.peek_mut() }?;
-                        if st.get_index_of(&probe).is_some() {
+                        // One probe settles both outcomes when its miss is final
+                        // (as the probe found it): the key moves in, or the
+                        // duplicate leaves.
+                        if Self::core_droppable(key) {
+                            // SAFETY: the key leaves the stack exactly once,
+                            // into the set or dropped; the probe's last use
+                            // is before either.
+                            match st.insert_probe_if(
+                                &probe,
+                                |p| p.miss_is_exact(),
+                                || DictKey(unsafe { base.add(len - 1).read() }),
+                            ) {
+                                Some(true) => {}
+                                Some(false) => unsafe { drop_hot(base.add(len - 1).read()) },
+                                None => return None,
+                            }
+                        } else if st.get_index_of(&probe).is_some() {
                             if !Self::core_droppable(key) {
                                 return None;
                             }
@@ -21358,6 +21727,47 @@ impl Interpreter {
                     _ => return None,
                 }
                 Some(len - operands)
+            }
+            // `{**a}` and `f(**kw)`'s merge, as the core loop's arm runs
+            // it: a plain dictionary into a plain dictionary, every key a
+            // `str` (native hashing and equality, so no Python runs). A
+            // call's merge that would repeat a keyword raises in the full
+            // handler.
+            OpCode::DictUpdate => {
+                let depth = (ins.arg >> 1) as usize + 1;
+                if len < depth + 1 {
+                    return None;
+                }
+                // SAFETY: `len > depth`, so both slots are initialized.
+                let (Object::Dict(target), Object::Dict(src)) =
+                    (unsafe { &*base.add(len - 1 - depth) }, unsafe {
+                        &*base.add(len - 1)
+                    })
+                else {
+                    return None;
+                };
+                if crate::capi_watchers::dicts_active() || Rc::ptr_eq(target, src) {
+                    return None;
+                }
+                // (Through the borrows, as the core loop's arm: the target's
+                // write barrier sees the merge.)
+                let (Ok(mut t), Ok(s)) = (target.try_borrow_mut(), src.try_borrow()) else {
+                    return None;
+                };
+                let str_keys = |d: &DictData| d.keys().all(|k| matches!(k.0, Object::Str(_)));
+                if !str_keys(&s)
+                    || !str_keys(&t)
+                    || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
+                {
+                    return None;
+                }
+                for (k, v) in s.iter() {
+                    t.insert(k.clone(), v.clone());
+                }
+                drop((t, s));
+                // SAFETY: the source leaves the stack.
+                unsafe { drop_hot(base.add(len - 1).read()) };
+                Some(len - 1)
             }
             OpCode::ListAppend => {
                 let depth = ins.arg as usize;
@@ -21405,6 +21815,45 @@ impl Interpreter {
                     }
                     _ => return None,
                 }
+                // SAFETY: the source leaves the stack (droppable).
+                drop(unsafe { base.add(len - 1).read() });
+                Some(len - 1)
+            }
+            // A set literal's update from its folded constant: an exact
+            // frozenset's or set's keys into the literal's empty set (no
+            // comparison runs), the source released by a plain decrement.
+            OpCode::SetUpdate => {
+                let depth = ins.arg as usize;
+                if len < 2 || depth == 0 || depth >= len {
+                    return None;
+                }
+                // SAFETY: `depth < len`, so both slots are initialized.
+                let (Object::Set(target), src) =
+                    (unsafe { (&*base.add(len - 1 - depth), &*base.add(len - 1)) })
+                else {
+                    return None;
+                };
+                if !Self::core_droppable(src) {
+                    return None;
+                }
+                let items = match src {
+                    Object::FrozenSet(s) => (**s).clone(),
+                    // SAFETY: a read between two instructions.
+                    Object::Set(s) if !Rc::ptr_eq(s, target) => unsafe { s.peek() }?.clone(),
+                    _ => return None,
+                };
+                if items
+                    .iter()
+                    .any(|k| crate::object::dict_key_is_reentrant(&k.0))
+                {
+                    return None;
+                }
+                // SAFETY: a store between two instructions.
+                let t = unsafe { target.peek_mut() }?;
+                if !t.is_empty() {
+                    return None;
+                }
+                *t = items;
                 // SAFETY: the source leaves the stack (droppable).
                 drop(unsafe { base.add(len - 1).read() });
                 Some(len - 1)
@@ -22030,7 +22479,9 @@ impl Interpreter {
         else {
             return false;
         };
-        if n.starts_with("__") {
+        // (A dunder name may be one of a function's own attributes; the
+        // decorators' `__wrapped__` is a plain entry of its dictionary.)
+        if n.starts_with("__") && &**n != "__wrapped__" {
             return false;
         }
         // The existing dictionary in place (no code runs while it is
@@ -22190,7 +22641,7 @@ impl Interpreter {
             if std::ptr::eq(ic, Rc::as_ptr(cls)) {
                 return Some(Ok(Object::Bool(true)));
             }
-            if !cls.metaclass_is_type() {
+            if !checks_like_type(cls, "__instancecheck__") {
                 return crate::stdlib::abc_mod::abc_instance_cached(cls, &inst.cls())
                     .map(|b| Ok(Object::Bool(b)));
             }
@@ -22231,7 +22682,7 @@ impl Interpreter {
             let Object::Type(cls) = cls else {
                 return None;
             };
-            if !cls.metaclass_is_type() {
+            if !checks_like_type(cls, "__instancecheck__") {
                 // An ABC answers here only when its verdict is known.
                 let known = match (obj, builtin_cls) {
                     (Object::Instance(inst), _)
@@ -23487,8 +23938,21 @@ impl Interpreter {
         let ext = code_vm_ext(code)?;
         let tries = ext.leaf_tries.load(std::sync::atomic::Ordering::Relaxed);
         let (bails, done) = (tries >> 32, tries & 0xFFFF_FFFF);
-        if bails >= LEAF_BAIL_LIMIT && bails > done {
-            return None;
+        let retry = bails >= LEAF_BAIL_LIMIT && bails > done;
+        if retry {
+            // Given up: the skipped calls count as bails, and one in
+            // `LEAF_RETRY_EVERY` tries again. The first attempts can come
+            // before the body's sites resolve (its global stamps fill as the
+            // core loop warms its site tables), and a retry that finishes
+            // starts the counts over.
+            let skips = bails + 1;
+            if skips >= u64::from(u32::MAX) || skips % LEAF_RETRY_EVERY != 0 {
+                if skips < u64::from(u32::MAX) {
+                    ext.leaf_tries
+                        .store(tries + (1 << 32), std::sync::atomic::Ordering::Relaxed);
+                }
+                return None;
+            }
         }
         let shape = ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed);
         let r = 'eval: {
@@ -23529,6 +23993,11 @@ impl Interpreter {
                 self.pure_leaf_eval::<false, false>(code, f, args)
             }
         };
+        if retry && r.is_some() {
+            ext.leaf_tries
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            return r;
+        }
         // (Each half stops counting when full: the counts only steer the
         // decision above.)
         let bump = if r.is_some() { 1 } else { 1 << 32 };
@@ -25258,6 +25727,82 @@ impl Interpreter {
     /// a raise) is left in `sw.pending`. `false` touches nothing (the
     /// quiet loop's own return path takes it).
     #[inline(never)]
+    /// The running inline activation's `err`, raised past its own handlers
+    /// (none covers the raise) while nothing observes frames: its
+    /// exceptional exit (`inline_finish`'s unwind, the shell pushed first
+    /// as its general arm pushes one) delivered to its caller, which runs
+    /// next with the error pending, as [`Self::core_return`] delivers a
+    /// return. `Err(err)` declines, having changed nothing.
+    pub(crate) fn core_raise_return(
+        &mut self,
+        sw: &mut CoreSwitch,
+        err: RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        // SAFETY: see `CoreSwitch`.
+        let inl = unsafe { &mut *sw.inl };
+        let depth = inl.len();
+        let plain = inl.last_mut().is_some_and(|top| {
+            top.gen.is_none()
+                && !top.direct
+                && !top.lazy_coro
+                && std::ptr::eq(&raw mut *top.frame, sw.cur)
+        });
+        if !plain
+            || !matches!(err, RuntimeError::PyException(_))
+            || crate::trace::any_observers_active()
+        {
+            return Err(err);
+        }
+        // SAFETY: the running activation is the top one.
+        let frame = unsafe { &mut *sw.cur };
+        let raise_pc = frame.pc.wrapping_sub(1);
+        if find_handler(&frame.code.exception_table, raise_pc).is_some() {
+            return Err(err);
+        }
+        let mut done = inl.pop().expect("checked above");
+        if depth == sw.entry_depth {
+            sw.entry_dead = true;
+        }
+        if done.act.shell.is_none() {
+            self.flush_pending_callers();
+            let shell = self.push_lean_shell(&done.frame, done.frame.pc);
+            done.act.shell = Some(shell);
+        }
+        let result = self.inline_finish(
+            &mut done,
+            QuietExit::Outcome {
+                stepped: Err(err),
+                cur_pc: raise_pc as usize,
+            },
+        );
+        done.clean = false;
+        let mut tmp = None;
+        // SAFETY: the caller is the innermost remaining activation.
+        let (cframe, clast, _) = unsafe { sw.activation(depth - 1, &mut tmp) };
+        // SAFETY: as above.
+        let entry = unsafe { self.inline_deliver(&mut *cframe, done, result) };
+        sw.cur = cframe;
+        sw.last = if clast == &raw mut sw.scratch {
+            sw.scratch = usize::MAX;
+            &raw mut sw.scratch
+        } else {
+            clast
+        };
+        match entry {
+            QuietEntry::Raised { err, .. } => {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Raised(err)));
+            }
+            // (An error delivered is raised; kept total.)
+            QuietEntry::Returned { cur_pc } => {
+                // SAFETY: as above.
+                unsafe { *sw.last = cur_pc };
+            }
+            QuietEntry::Stop(stop) => sw.pending = Some(CoreExit::Stop(stop)),
+            QuietEntry::Fresh => {}
+        }
+        Ok(())
+    }
+
     fn core_return(&mut self, sw: &mut CoreSwitch, snap_gen: u64) -> bool {
         // SAFETY: see `CoreSwitch`.
         let inl = unsafe { &mut *sw.inl };
@@ -29317,6 +29862,26 @@ impl Interpreter {
                 Object::Str(needle) => Some(crate::builtins::substr_find(hay, needle).is_some()),
                 _ => None,
             },
+            // A key whose Python `__hash__` evaluates as a pure leaf, found
+            // only as itself (any other key with its hash declines).
+            Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
+                if matches!(item, Object::Instance(_)) && !Self::leaf_hash_native(item) =>
+            {
+                // SAFETY: the running thread's interpreter, under the GIL;
+                // the evaluation runs no Python and takes no frame.
+                let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+                let probe =
+                    crate::object::LeafProbe::with_hash(item, interp.leaf_instance_hash(item)?);
+                let found = match container {
+                    // SAFETY: as below (the probe runs no code).
+                    Object::Dict(d) => unsafe { d.peek() }?.get_index_of(&probe).is_some(),
+                    // SAFETY: as below.
+                    Object::Set(st) => unsafe { st.peek() }?.get_index_of(&probe).is_some(),
+                    Object::FrozenSet(fs) => fs.get_index_of(&probe).is_some(),
+                    _ => return None,
+                };
+                (found || probe.miss_is_exact()).then_some(found)
+            }
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
                 if Self::leaf_hash_native(item) =>
             {
@@ -29422,8 +29987,9 @@ impl Interpreter {
                 .all(|x| matches!(x, Object::Int(_) | Object::Str(_))),
             Object::Type(t) => crate::object::type_hash_is_identity(t),
             Object::Instance(inst) => {
-                inst.native.get().is_none()
-                    && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
+                (inst.native.get().is_none()
+                    && inst.class_dunder(crate::types::Dunder::Hash).object_owner())
+                    || crate::object::int_like_value(inst).is_some()
             }
             _ => false,
         }
@@ -29927,7 +30493,10 @@ impl Interpreter {
         let mixed = !matches!(b, Object::Instance(_));
         let cls = ai.cls_raw();
         let k = op as usize;
-        let (dunder, rdunder) = binop_dunders(op);
+        let (dunder, _) = binop_dunders(op);
+        // (Two instances of one class never try its reflected method: the
+        // forward one's result stands, `NotImplemented` its `TypeError`, as
+        // CPython's `SLOT1BINFULL` has it.)
         if !same
             || ai.native.get().is_some()
             || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
@@ -29936,12 +30505,6 @@ impl Interpreter {
                     cls,
                     crate::types::AttrKey::vm(crate::types::vm_key::IBINOP + k as u32),
                     op.inplace_dunder(),
-                ))
-            || (!mixed
-                && !Self::class_lacks(
-                    cls,
-                    crate::types::AttrKey::vm(crate::types::vm_key::RBINOP + k as u32),
-                    rdunder,
                 ))
         {
             return None;
@@ -30035,6 +30598,49 @@ impl Interpreter {
         self.call(&Object::Function(f), args, &[], &g)
     }
 
+    /// `hash(v)` of an instance whose class's `__hash__` is a Python
+    /// function that evaluates as a pure leaf (`return self.v`), as
+    /// CPython's `slot_tp_hash` takes its result: the int itself, `-1`
+    /// made `-2`. `None` for anything else (another answer, a big int,
+    /// a native payload), which the full path hashes.
+    pub(crate) fn leaf_instance_hash(&self, v: &Object) -> Option<i64> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        if inst.native.get().is_some() || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let Some(Object::Function(f)) = inst.cls_raw().lookup("__hash__") else {
+            return None;
+        };
+        let code = f.code();
+        if !code_is_pure_leaf(&code)
+            || !pure_leaf_warm(&code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        // (A `__hash__` that hashes another such instance nests here; one
+        // that hashes itself would never end, which the full path reports
+        // as a RecursionError.)
+        thread_local! {
+            static NEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        }
+        let nest = NEST.with(std::cell::Cell::get);
+        if nest >= 8 {
+            return None;
+        }
+        NEST.with(|n| n.set(nest + 1));
+        let r = self.pure_leaf_eval::<false, false>(&code, &f, &[std::ptr::from_ref(v)]);
+        NEST.with(|n| n.set(nest));
+        match r? {
+            Object::Int(-1) => Some(-2),
+            Object::Int(r) => Some(r),
+            Object::Bool(b) => Some(i64::from(b)),
+            _ => None,
+        }
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -30058,6 +30664,8 @@ impl Interpreter {
                     NativeTruth::AlwaysTrue => Err(true),
                     NativeTruth::Bool(b, op) => Ok((Rc::as_ptr(b), false, *op)),
                     NativeTruth::Len(b) => Ok((Rc::as_ptr(b), true, 0)),
+                    NativeTruth::PyLen => Ok((std::ptr::null(), true, PY_LEN_TRUTH)),
+                    NativeTruth::PyBool(_) => Ok((std::ptr::null(), false, PY_BOOL_TRUTH)),
                     NativeTruth::Decline => Err(false),
                 }
             };
@@ -30079,6 +30687,32 @@ impl Interpreter {
             Err(true) => return Some(true),
             Err(false) => return None,
         };
+        // A Python `__len__` evaluated in place, or the full path's.
+        if op == PY_LEN_TRUTH {
+            return match self.leaf_instance_len(v)? {
+                Object::Int(n) => Some(n != 0),
+                _ => None,
+            };
+        }
+        // Likewise a Python `__bool__` (any answer but a `bool` is the full
+        // path's, which raises).
+        if op == PY_BOOL_TRUTH {
+            let f = match &*self.core_truth.borrow() {
+                Some((_, NativeTruth::PyBool(f))) => f.clone(),
+                _ => return None,
+            };
+            let code = f.code();
+            if !code_is_pure_leaf(&code)
+                || !pure_leaf_warm(&code)
+                || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+            {
+                return None;
+            }
+            return match self.pure_leaf_eval::<false, false>(&code, &f, &[std::ptr::from_ref(v)])? {
+                Object::Bool(b) => Some(b),
+                _ => None,
+            };
+        }
         // A deque's `__bool__`: its direct operation, without the call.
         if op == crate::stdlib::collections_native::OP_BOOL {
             if let Some(Object::Bool(b)) = crate::stdlib::collections_native::fast_op(op, v, None) {
@@ -30136,6 +30770,8 @@ impl Interpreter {
                         NativeTruth::Bool(b, op)
                     };
                 }
+                Some(Object::Function(_)) if is_len => return NativeTruth::PyLen,
+                Some(Object::Function(f)) => return NativeTruth::PyBool(f),
                 Some(_) => return NativeTruth::Decline,
             }
         }
@@ -30576,6 +31212,20 @@ impl Interpreter {
                     );
                 }
             }
+            // And `dict.fromkeys` over a list or tuple of plain keys.
+            if let Some(Object::ClassMethod(cm)) = builtin_types()
+                .dict_
+                .dict
+                .borrow()
+                .get(&crate::object::StrKey("fromkeys"))
+            {
+                if let Object::Builtin(f) = cm.func() {
+                    calls.insert(
+                        Rc::as_ptr(&f) as usize,
+                        LeafKind::Fast(crate::builtins::dict_fromkeys_leaf),
+                    );
+                }
+            }
             // `dict`'s subscript dunders, as a dict subclass that doesn't
             // override them inherits them (`defaultdict`, `Counter`,
             // `OrderedDict` reads): a present key reads, and a plain key
@@ -30694,6 +31344,8 @@ impl Interpreter {
                 }
                 [Object::List(l)] => l.try_borrow().ok()?.clone(),
                 [Object::Tuple(t)] => t.to_vec(),
+                // An exact dict's keys, in order (`list(dict.fromkeys(xs))`).
+                [Object::Dict(d)] => d.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect(),
                 _ => return None,
             };
             let obj = Object::new_list(items);
@@ -31147,7 +31799,7 @@ impl Interpreter {
             None => default
                 .filter(|_| {
                     type_attr_certainly_missing(cls, name)
-                        || (cls.flags.is_builtin
+                        || (type_miss_memo_ok(cls, name)
                             && cls.verdict_cached(crate::types::Verdict::TypeAttrMissing, name)
                                 == Some(true))
                 })
@@ -31528,9 +32180,11 @@ impl Interpreter {
                 return Some(Ok(inst));
             }
             K::Opaque => true,
+            // (A big int is an exact int too: its arithmetic runs no Python
+            // code, `math.gcd` of `fractions`' terms among it.)
             K::Scalar => args
                 .iter()
-                .all(|a| matches!(a, O::Int(_) | O::Float(_) | O::Bool(_))),
+                .all(|a| matches!(a, O::Int(_) | O::Float(_) | O::Bool(_) | O::Long(_))),
             // The fast half decides (and declines untouched).
             K::Fast(f) => return f(args),
         };
@@ -31881,10 +32535,17 @@ impl Interpreter {
                 }
                 Some(v)
             }
-            (LeafAttr::Method(f), _) => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
-                receiver.clone(),
-                Object::Function(f),
-            )))),
+            // A plain function off the class, bound, and remembered for the
+            // site at the class's version (see `inst_class_attr_quick`).
+            (LeafAttr::Method(f), _) => {
+                if let Some(slot) = code_method_slot(code, cache_pc) {
+                    slot.set(ver, &f);
+                }
+                Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    receiver.clone(),
+                    Object::Function(f),
+                ))))
+            }
             // A native method on the class (`re.Pattern.match`), bound as
             // its descriptor binds it, and remembered for the site.
             (LeafAttr::BuiltinMethod(b), _) => {
@@ -32409,7 +33070,7 @@ impl Interpreter {
         let name = code.names.get(name_idx as usize)?.as_str();
         if !matches!(
             name,
-            "__name__" | "__qualname__" | "__mro__" | "__bases__" | "__module__"
+            "__name__" | "__qualname__" | "__mro__" | "__bases__" | "__module__" | "__class__"
         ) || crate::capi_watchers::types_active()
         {
             return None;
@@ -32417,16 +33078,22 @@ impl Interpreter {
         if !Self::plain_metaclass(cls) {
             // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
             let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            // (`__class__` is `object`'s getset.)
+            let bt = builtin_types();
             if meta.c_ext_ptr.get() != 0
                 || !Self::default_getattribute(meta)
-                || meta
-                    .lookup_with_owner(name)
-                    .is_some_and(|(_, owner)| !Rc::ptr_eq(&owner, &builtin_types().type_))
+                || meta.lookup_with_owner(name).is_some_and(|(_, owner)| {
+                    !Rc::ptr_eq(&owner, &bt.type_)
+                        && !(name == "__class__" && Rc::ptr_eq(&owner, &bt.object_))
+                })
             {
                 return None;
             }
         }
         match name {
+            // The metaclass (`object.__class__`, a data descriptor on the
+            // metatype, ahead of the class's own entries).
+            "__class__" => return Some(Object::Type(cls.metaclass_or_type())),
             // (`type_mro_get`: a class still being made has none, which the
             // full path answers.)
             "__mro__" => {
@@ -32536,7 +33203,8 @@ impl Interpreter {
         // data descriptor, which yields to the class's own (CPython's
         // `type_getattro`) when the class's MRO has the name (its own leaf
         // attribute cache remembers the walk per version).
-        match Self::leaf_class_attr(code, meta, name_idx)? {
+        let meta_attr = Self::leaf_class_attr(code, meta, name_idx)?;
+        match &meta_attr {
             LeafAttr::InstanceOnly
             | LeafAttr::Method(_)
             | LeafAttr::ClassMethod(_)
@@ -32552,6 +33220,17 @@ impl Interpreter {
             _ => return None,
         }
         match Self::leaf_class_attr(code, cls, name_idx)? {
+            // Only the metaclass has it: a plain function there binds to
+            // the class, as an instance's method binds to the instance
+            // (`enum_class._add_member_(...)`).
+            LeafAttr::InstanceOnly => match meta_attr {
+                LeafAttr::Method(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                    Object::Type(cls.clone()),
+                    Object::Function(f),
+                )))),
+                // (Any other metaclass entry is the full path's to build.)
+                _ => None,
+            },
             LeafAttr::Method(f) => Some(Object::Function(f)),
             LeafAttr::Value(v) => Some(v),
             LeafAttr::ClassMethod(f) => Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
@@ -32560,9 +33239,7 @@ impl Interpreter {
             )))),
             LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
             LeafAttr::Property(p) => Some(Object::Property(p)),
-            // (A metaclass entry then binds to the class: the full path's
-            // to build.)
-            LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
+            LeafAttr::TupleField(_) => None,
         }
     }
 
@@ -32727,6 +33404,91 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+
+    /// `super(cls, k).name` for `k` a subclass of `cls`, as the proxy's
+    /// lookup answers it: the first entry past `cls` on `k`'s MRO, through
+    /// its descriptor with no instance (a plain function as it is, a static
+    /// method's function, a builtin that binds nothing), remembered per
+    /// site for `k`'s version. `None` for anything else (a class method, a
+    /// property, an entry only the full lookup synthesizes).
+    fn leaf_super_type_attr(
+        code: &CodeObject,
+        cls: &Rc<TypeObject>,
+        k: &TypeObject,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let ver = k.attr_version.get();
+        let cls_id = Rc::as_ptr(cls) as usize as u64;
+        let slot = code_method_slot(code, cache_pc);
+        let stamp = code_stamp_slot(code, cache_pc);
+        // (The kinds past the instance receivers' 1 and 2.)
+        match stamp.map(|s| s.get()) {
+            Some([c, v, 3]) if c == cls_id && v == ver => {
+                if let Some(f) = slot.and_then(|s| s.get(ver)) {
+                    return Some(Object::Function(f));
+                }
+            }
+            Some([c, v, 4]) if c == cls_id && v == ver => {
+                if let Some(b) = slot.and_then(|s| s.get_inst_builtin(ver)) {
+                    return Some(Object::Builtin(b));
+                }
+            }
+            _ => {}
+        }
+        // (The lookup walks `k`'s MRO alone: its metaclass takes no part.)
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let name = code.names.get(name_idx as usize)?;
+        if name == "__class__" {
+            return None;
+        }
+        let dunder = name.starts_with("__") && name != "__new__";
+        let mro = k.mro.try_borrow().ok()?;
+        let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+        let key = crate::object::StrKey(name.as_str());
+        let mut found = None;
+        for owner in &mro[start..] {
+            if owner.c_ext_ptr.get() != 0 {
+                return None;
+            }
+            let d = owner.dict.try_borrow().ok()?;
+            if let Some(v) = d.get(&key) {
+                if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                    return None;
+                }
+                found = Some(v.clone());
+                break;
+            }
+            if dunder && owner.flags.is_builtin {
+                return None;
+            }
+        }
+        let f = match found? {
+            Object::StaticMethod(sm) => match sm.func() {
+                f @ Object::Function(_) => f,
+                _ => return None,
+            },
+            f @ Object::Function(_) => f,
+            Object::Builtin(b) if !b.binds_instance => Object::Builtin(b),
+            _ => return None,
+        };
+        if let (Some(s), Some(st)) = (slot, stamp) {
+            match &f {
+                Object::Function(func) => {
+                    s.set(ver, func);
+                    st.set([cls_id, ver, 3]);
+                }
+                Object::Builtin(b) => {
+                    s.set_inst_builtin(ver, b);
+                    st.set([cls_id, ver, 4]);
+                }
+                _ => {}
+            }
+        }
+        Some(f)
     }
 
     /// The leaf half of `load_method_ic_hit`: the plain function (or the
@@ -34114,6 +34876,16 @@ impl Interpreter {
                 let stop = frame.pop()?;
                 let start = frame.pop()?;
                 let container = frame.pop()?;
+                // (Compiled code calls an instance's Python `__getitem__`
+                // itself once its site has sliced one: see `h_slice_dunder`.)
+                if matches!(container, Object::Instance(_)) {
+                    if let Some(ext) = code_vm_ext(&frame.code) {
+                        let pc = frame.pc as usize - 1;
+                        if !instance_site(ext, pc) {
+                            instance_site_note(ext, frame.code.instructions.len(), pc);
+                        }
+                    }
+                }
                 let key = Object::Slice(Rc::new(PySlice {
                     start,
                     stop,
@@ -37449,8 +38221,9 @@ impl Interpreter {
         holder: &Rc<crate::types::PyInstance>,
         target: &Rc<crate::types::PyInstance>,
     ) {
+        use crate::types::ExcTail;
         fn ctx_of(inst: &Rc<crate::types::PyInstance>) -> Option<Rc<crate::types::PyInstance>> {
-            match inst.slot_get("__context__") {
+            match inst.exc_tail_get(ExcTail::Context) {
                 Some(Object::Instance(i)) => Some(i),
                 _ => None,
             }
@@ -37461,13 +38234,13 @@ impl Interpreter {
             // Advance `fast` two steps, severing a link to `target`.
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.slot_set("__context__", Object::None);
+                drop(fast.exc_tail_set(ExcTail::Context, Object::None));
                 return;
             }
             fast = next;
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.slot_set("__context__", Object::None);
+                drop(fast.exc_tail_set(ExcTail::Context, Object::None));
                 return;
             }
             fast = next;
@@ -41303,6 +42076,15 @@ impl Interpreter {
                 // User-defined descriptor: invoke its `__get__` if
                 // present, otherwise pass the descriptor through.
                 if let Some(get_method) = user_get.or_else(|| inner_inst.cls().lookup("__get__")) {
+                    // A plain function: called as the bound method would
+                    // call it, and evaluated frameless when it's a warm
+                    // leaf (`enum.property.__get__`).
+                    if let Object::Function(f) = &get_method {
+                        return self.call_dunder_function(
+                            f.clone(),
+                            &[attr.clone(), instance.clone(), owner.clone()],
+                        );
+                    }
                     let bound =
                         Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), get_method)));
                     return self.call(
@@ -43927,6 +44709,21 @@ impl Interpreter {
             Object::Tuple(items) => Ok(items.to_vec()),
             Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
             Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
+            // Draining a view runs no code (the entries' clones and the
+            // pairs' tuples), so the dict can't change under it: its entries
+            // in order, as its iterator would give them.
+            Object::DictView(view) => {
+                use crate::object::DictViewKind as K;
+                let d = view.dict.borrow();
+                Ok(match view.kind {
+                    K::Keys => d.keys().map(|k| k.0.clone()).collect(),
+                    K::Values => d.values().cloned().collect(),
+                    K::Items => d
+                        .iter()
+                        .map(|(k, v)| Object::new_tuple_array([k.0.clone(), v.clone()]))
+                        .collect(),
+                })
+            }
             Object::Generator(_) | Object::Instance(_) => {
                 // CPython presizes via `PyObject_LengthHint` when building a
                 // container from an arbitrary iterable: `len(obj)` first,
@@ -43980,6 +44777,13 @@ impl Interpreter {
                 let it = self.make_iter(v, globals)?;
                 let mut out = Vec::new();
                 if let Object::Generator(g) = &it {
+                    // A fresh generator whose body takes fast steps drains
+                    // in one go; where the steps stop short, the resumes
+                    // below go on from there.
+                    if let Some(v) = self.gen_fast_collect(g, &mut out) {
+                        drop(v);
+                        return Ok(out);
+                    }
                     // A lean resume moves each yield straight into `out`
                     // (see `Interpreter::sum_fold`).
                     loop {
@@ -44019,6 +44823,15 @@ impl Interpreter {
                 // re-implement range/dict/str iteration here.
                 let it = self.make_iter(other, globals)?;
                 let mut out = Vec::new();
+                // A native iterator's step runs no code: one borrow for the
+                // whole drain, as `iter_next` takes one a step.
+                if let Object::Iter(cell) = &it {
+                    let mut it = cell.borrow_mut();
+                    while let Some(x) = it.next_value_checked()? {
+                        out.push(x);
+                    }
+                    return Ok(out);
+                }
                 while let Some(x) = self.iter_next(&it, globals)? {
                     out.push(x);
                 }
@@ -44987,6 +45800,17 @@ impl Interpreter {
         {
             return Ok(args[2].clone());
         }
+        // A class's miss, remembered per class version, as `hasattr`
+        // remembers it.
+        let builtin_type = match &args[0] {
+            Object::Type(t) if type_miss_memo_ok(t, &name) => Some(t),
+            _ => None,
+        };
+        if let Some(t) = builtin_type {
+            if t.verdict_cached(crate::types::Verdict::TypeAttrMissing, &name) == Some(true) {
+                return Ok(args[2].clone());
+            }
+        }
         let value_class = builtin_value_class(&args[0]);
         if let Some(c) = &value_class {
             if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
@@ -44996,6 +45820,9 @@ impl Interpreter {
         match self.load_attr(&args[0], &name) {
             Ok(v) => Ok(v),
             Err(e) if self.is_attribute_error(&e) => {
+                if let Some(t) = builtin_type {
+                    t.verdict_record(crate::types::Verdict::TypeAttrMissing, &name, true);
+                }
                 if let Some(c) = value_class {
                     c.verdict_record(crate::types::Verdict::ValueAttrMissing, &name, true);
                 }
@@ -45033,11 +45860,11 @@ impl Interpreter {
         {
             return Ok(Object::Bool(false));
         }
-        // A builtin class's miss, remembered per class version (a
-        // struct-sequence class, whose attributes can be set, moves its
-        // version when they are).
+        // A class's miss, remembered per class version (a struct-sequence
+        // class, whose attributes can be set, moves its version when they
+        // are).
         let builtin_type = match &args[0] {
-            Object::Type(t) if t.flags.is_builtin => Some(t),
+            Object::Type(t) if type_miss_memo_ok(t, &name) => Some(t),
             _ => None,
         };
         if let Some(t) = builtin_type {
@@ -49128,6 +49955,43 @@ impl Interpreter {
         self.generator_send_fold(gen, Object::None, None)
     }
 
+    /// Drain the fresh generator `gen` into `out` by fast steps (see
+    /// [`Self::gen_fast_drain`]), on the lean resume's terms: `Some` its
+    /// return value once it finished; `None` where the steps declined or
+    /// stopped short (what they took already in `out`), for the general
+    /// resume to go on from where they left it.
+    fn gen_fast_collect(&mut self, gen: &Rc<PyGenerator>, out: &mut Vec<Object>) -> Option<Object> {
+        // SAFETY: a read of the state's tag between instructions.
+        let fresh = matches!(
+            unsafe { gen.state_raw().peek() },
+            Some(crate::object::GeneratorState::Created(_))
+        );
+        if !fresh || !gen_fast::may_step(gen) {
+            return None;
+        }
+        let snap_gen = self.lean_snapshot()?;
+        if self.dbg_sample
+            || crate::trace::any_observers_active()
+            || crate::trace::eval_frame_record_active()
+            || crate::stdlib::greenlet_native::on_greenlet_stack()
+        {
+            return None;
+        }
+        match self.gen_fast_drain(
+            gen,
+            FoldSink::Collect(std::ptr::from_mut(out)),
+            snap_gen,
+            crate::gc_trace::maybe_dead_flag(),
+        ) {
+            gen_fast::GenNext::Exhausted(v) => Some(v),
+            gen_fast::GenNext::Yielded(v) => {
+                out.push(v);
+                None
+            }
+            gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,
+        }
+    }
+
     /// [`Self::generator_next_raw`]'s fast step, on the lean resume's
     /// terms: `None` when the generator or its body declines, with nothing
     /// run (or the body stopped partway, parked for the general resume to
@@ -49374,6 +50238,22 @@ impl Interpreter {
         // SAFETY: the frame, which the step holds while the body runs, holds
         // the code and with it its native code.
         .then(|| unsafe { &*std::ptr::from_ref(native) })
+    }
+
+    /// [`Self::gen_step_native`] for a fresh ordinary frame a lean run
+    /// starts: its code's compiled body, when that enters at its first
+    /// instruction.
+    #[cfg(feature = "jit")]
+    fn lean_entry_native(&self, frame: &Frame) -> Option<&'static frame_jit::Native> {
+        if frame.pc != 0 || !frame.stack.is_empty() || self.recs.full() {
+            return None;
+        }
+        let ext = code_vm_ext(&frame.code)?;
+        let native = ext.frame_jit.get(frame.locals.len())?;
+        (ext.dispatch_len > 0 && native.enters_at(0))
+            // SAFETY: as `gen_step_native`'s: the frame holds the code and
+            // with it its native code.
+            .then(|| unsafe { &*std::ptr::from_ref(native) })
     }
 
     /// A generator that just finished holds no frame, so it can neither
@@ -58535,6 +59415,17 @@ impl Interpreter {
         kwds: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        // `type.__prepare__` itself (built in, so unchangeable) returns a
+        // fresh empty dict whatever it is passed: nothing to observe.
+        let ty = &builtin_types().type_;
+        if Rc::ptr_eq(metaclass, ty)
+            || (metaclass.metaclass_is_type()
+                && metaclass
+                    .lookup_with_owner("__prepare__")
+                    .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, ty)))
+        {
+            return Ok(None);
+        }
         let bases_tuple =
             Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
         self.call_metaclass_prepare_tuple(metaclass, name, &bases_tuple, kwds, globals)
@@ -59872,7 +60763,7 @@ impl Interpreter {
                     .retain(|w| w.upgrade().is_none_or(|t| !Rc::ptr_eq(&t, ty)));
             }
             for b in &new_bases {
-                b.subclasses.borrow_mut().push(Rc::downgrade(ty));
+                b.add_subclass(ty);
             }
         }
         ty.invalidate_getattribute_cache();
@@ -60223,12 +61114,15 @@ impl Interpreter {
     /// Invoke `__set_name__(cls, name)` for every descriptor in the
     /// freshly-built class namespace that defines it. PEP 487.
     fn invoke_set_name_hooks(&mut self, ty: &Rc<TypeObject>) -> Result<(), RuntimeError> {
-        let entries: Vec<(String, Object)> = ty
+        // (Only a property or an instance can have the hook.)
+        let entries: Vec<(SharedStr, Object)> = ty
             .dict
             .borrow()
             .iter()
-            .filter_map(|(k, v)| match &k.0 {
-                Object::Str(s) => Some((s.to_string(), v.clone())),
+            .filter_map(|(k, v)| match (&k.0, v) {
+                (Object::Str(s), Object::Property(_) | Object::Instance(_)) => {
+                    Some((s.clone(), v.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -60238,13 +61132,13 @@ impl Interpreter {
             // exact type short-circuits here; subclass instances run the
             // full hook below.
             if let Object::Property(p) = &value {
-                *p.name.borrow_mut() = Some(Object::from_str(&attr_name));
+                *p.name.borrow_mut() = Some(Object::Str(attr_name));
                 continue;
             }
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
                     let owner = Object::Type(ty.clone());
-                    let name = Object::from_str(&attr_name);
+                    let name = Object::Str(attr_name.clone());
                     let builtins = self.builtins.clone();
                     // A plain function takes the descriptor as its first
                     // argument, with no bound method to build.
@@ -60384,6 +61278,18 @@ impl Interpreter {
         let Some(hook) = hook else {
             return Ok(());
         };
+        // `object.__init_subclass__()` does nothing (with keywords it
+        // raises, so those still make the call).
+        if subclass_kwargs.is_empty()
+            && builtin_types()
+                .object_
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("__init_subclass__")))
+                .is_some_and(|object_hook| object_hook.is_same(&hook))
+        {
+            return Ok(());
+        }
         // CPython treats __init_subclass__ as an implicit classmethod
         // regardless of how it was defined.
         let callable = match hook {
@@ -60521,6 +61427,32 @@ impl Interpreter {
         }
     }
 
+    /// `C()` for a class whose plan is [`InstancePlan::empty_container`]:
+    /// a fresh instance carrying its empty payload, tracked at once, as
+    /// the full constructor makes it. The flag reports whether pending
+    /// finalizers ran. `None` for any other plan, or under the
+    /// `_testcapi.set_nomemory` injection window.
+    ///
+    /// [`InstancePlan::empty_container`]: crate::types::InstancePlan::empty_container
+    fn alloc_empty_container(
+        &mut self,
+        cls: &Rc<TypeObject>,
+        plan: &crate::types::InstancePlan,
+    ) -> Option<(Object, bool)> {
+        if !plan.empty_container || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails() {
+            return None;
+        }
+        let payload = Self::lean_payload(&plan.native)?;
+        let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), payload)));
+        gc_trace::track(&inst);
+        let mut ran = false;
+        if gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+            ran = true;
+        }
+        Some((inst, ran))
+    }
+
     /// The empty native payload a fresh instance of a `dict`, `list` or
     /// `set` subclass with its own `__init__` starts with (that `__init__`
     /// owns the filling, as in [`Self::native_value_payload`]); `None` for
@@ -60551,7 +61483,30 @@ impl Interpreter {
     /// `BaseException_new`'s seeding of a fresh exception instance's
     /// `args` from the constructor's positionals, which holds even when the
     /// class's `__init__` never calls `super().__init__`.
-    fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
+    /// `E(*args)` for a class whose plan is
+    /// [`InstancePlan::exc_native_init`], its arguments `frame`'s stack from
+    /// `from` up (drained): the allocation, and `BaseException.__init__`'s
+    /// `args` (and a `StopIteration`'s `value`). The flag reports whether
+    /// the instance is tracked.
+    ///
+    /// [`InstancePlan::exc_native_init`]: crate::types::InstancePlan::exc_native_init
+    fn alloc_exc_native(
+        &self,
+        ty: &Rc<TypeObject>,
+        frame: &mut Frame,
+        from: usize,
+    ) -> (Object, bool) {
+        let (inst, tracked) = self.alloc_plain_instance_obj(ty);
+        let value = (exc_family_flags(ty) & EXC_FAM_STOP_ITERATION != 0)
+            .then(|| frame.stack.get(from).cloned().unwrap_or(Object::None));
+        Self::seed_exception_args(&inst, frame.stack.drain(from..));
+        if let (Some(value), Object::Instance(i)) = (value, &inst) {
+            i.slot_set("value", value);
+        }
+        (inst, tracked)
+    }
+
+    pub(crate) fn seed_exception_args(inst: &Object, args: impl ExactSizeIterator<Item = Object>) {
         if let Object::Instance(i) = inst {
             let args = Object::tuple_from_exact(args);
             if i.slots.borrow().is_empty_default() {
@@ -60862,6 +61817,27 @@ impl Interpreter {
             && matches!(native, NativeKind::Plain)
             && !cls.is_subclass_of(&bt.module_)
             && !cls.is_subclass_of(&bt.generic_alias_);
+        let empty_container = user_new.is_none()
+            && abstract_error.is_none()
+            && !seeds_exception_args
+            && !cls.is_type_subclass()
+            && match &native {
+                NativeKind::Value {
+                    base,
+                    mutable: true,
+                } if Rc::ptr_eq(base, &bt.dict_)
+                    || Rc::ptr_eq(base, &bt.list_)
+                    || Rc::ptr_eq(base, &bt.set_) =>
+                {
+                    let own = base
+                        .dict
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__init__")))
+                        .cloned();
+                    matches!((&init_fn, own), (Some(a), Some(b)) if a.is_same(&b))
+                }
+                _ => false,
+            };
         let object_new_plain = !seeds_exception_args
             && abstract_error.is_none()
             && matches!(native, NativeKind::Plain)
@@ -60883,6 +61859,7 @@ impl Interpreter {
             lean_init,
             tuple_new,
             bare_alloc,
+            empty_container,
             object_new_plain,
             store_init: std::sync::atomic::AtomicU8::new(0),
             slot_members: std::sync::OnceLock::new(),
@@ -61367,6 +62344,11 @@ impl Interpreter {
         // resolution, native payload classification — comes from the
         // memoised per-class plan (invalidated by `attr_version`).
         let plan = self.instance_plan(&cls);
+        if args.is_empty() && kwargs.is_empty() {
+            if let Some((inst, _)) = self.alloc_empty_container(&cls, &plan) {
+                return Ok(inst);
+            }
+        }
 
         // PEP 3119: refuse to instantiate a class that still carries
         // unimplemented abstract methods. CPython enforces this inside
@@ -63422,7 +64404,7 @@ impl Interpreter {
     ) -> Box<InlineAct> {
         let mut boxed = match self.lazy_boxes.pop() {
             Some(boxed) => boxed,
-            None => self.lazy_box_new(),
+            None => self.lazy_box_new(gen_stack_room(code, code.varnames.len())),
         };
         let fr: &mut Frame = &mut boxed;
         if !Rc::ptr_eq(&fr.code, code) {
@@ -63487,7 +64469,7 @@ impl Interpreter {
     /// whose coroutine was made took its box along).
     #[cold]
     #[inline(never)]
-    fn lazy_box_new(&self) -> Box<LeanFrame> {
+    fn lazy_box_new(&self, stack_room: usize) -> Box<LeanFrame> {
         let spare = self.gen_spares.borrow_mut().pop();
         let placeholder = inline_placeholder();
         let Some(GenParts {
@@ -63496,7 +64478,9 @@ impl Interpreter {
             boxed,
         }) = spare
         else {
-            let mut boxed = Box::new(parked_lean_frame());
+            // (A stack with room for what the code needs and no more: a
+            // suspended coroutine keeps it, and a task tree holds thousands.)
+            let mut boxed = Box::new(parked_lean_frame_with(stack_room));
             // SAFETY: the stale copy is overwritten without a drop.
             unsafe { std::ptr::write(&raw mut boxed.code, placeholder.code.clone()) };
             return boxed;
@@ -64771,6 +65755,7 @@ impl Interpreter {
         if let Ok(m) = &parsed {
             collect_compiler_syntax_warnings(m, &mut warnings);
         }
+        LAST_PARSE_WARNED.set(!warnings.is_empty());
         // Emit warnings first: under `simplefilter('always')` they are
         // recorded and a later parse error still propagates; under
         // `simplefilter('error')` the first escape escalates to a
@@ -64968,6 +65953,7 @@ impl Interpreter {
         if let Ok(m) = &parsed {
             collect_compiler_syntax_warnings(m, &mut warnings);
         }
+        LAST_PARSE_WARNED.set(!warnings.is_empty());
         self.emit_escape_warnings(source, filename, &warnings)?;
         parsed.map_err(|e| parse_error_to_syntax_error(&e, source, filename))
     }
@@ -66254,14 +67240,36 @@ impl Interpreter {
         // the tokenizer sees the escape before any later hard error.
         let (_, warnings) = weavepy_lexer::tokenize_with_escapes(source);
         self.emit_escape_warnings(source, filename, &warnings)?;
-        let spec = crate::stdlib::ast_mod::parse(&[
+        let args = [
             Object::from_str(source.to_owned()),
             Object::from_str(filename.to_owned()),
             Object::from_str(mode.to_owned()),
             Object::Bool(type_comments),
             Object::Bool(flufl),
-        ])?;
-        let ast_module = self.do_import("ast", &Object::None, 0, outer_globals)?;
+        ];
+        // With `ast` loaded and unchanged, build its nodes while parsing:
+        // the tree `_from_spec` would build from the spec.
+        let loaded = self.cache.get("ast");
+        let direct = loaded
+            .as_ref()
+            .and_then(|module| crate::stdlib::ast_build::direct(self, module));
+        let mut imported = None;
+        if let (Some(loaded), Some(direct)) = (loaded, direct) {
+            let (tree, direct) = crate::stdlib::ast_mod::parse_with(&args, direct);
+            let tree = tree?;
+            if !direct.failed() {
+                let module = self.do_import("ast", &Object::None, 0, outer_globals)?;
+                if module.is_same(&loaded) {
+                    return Ok(tree);
+                }
+                imported = Some(module);
+            }
+        }
+        let spec = crate::stdlib::ast_mod::parse(&args)?;
+        let ast_module = match imported {
+            Some(module) => module,
+            None => self.do_import("ast", &Object::None, 0, outer_globals)?,
+        };
         let builder = self.load_attr(&ast_module, "_from_spec")?;
         self.call(&builder, &[spec], &[], outer_globals)
     }
@@ -66520,15 +67528,23 @@ impl Interpreter {
                 // location), exactly like `compile()` — CPython's `exec`
                 // never raises `ValueError` for bad syntax. Invalid-escape
                 // `SyntaxWarning`s replay here too.
-                let module = self.parse_source_emitting_warnings(&src, "<string>")?;
-                let compiled = weavepy_compiler::compile_owned_module_with_options(
-                    module,
-                    &src,
-                    "<string>",
-                    self.exec_eval_compile_options(),
-                )
-                .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
-                Rc::new(compiled)
+                let opts = self.exec_eval_compile_options();
+                match source_code_get(SOURCE_EXEC, opts, &src) {
+                    Some(code) => code,
+                    None => {
+                        let module = self.parse_source_emitting_warnings(&src, "<string>")?;
+                        let warned = LAST_PARSE_WARNED.get();
+                        let compiled = weavepy_compiler::compile_owned_module_with_options(
+                            module, &src, "<string>", opts,
+                        )
+                        .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
+                        let code = Rc::new(compiled);
+                        if !warned {
+                            source_code_put(SOURCE_EXEC, opts, &src, &code);
+                        }
+                        code
+                    }
+                }
             }
             _ => unreachable!(),
         };
@@ -66736,15 +67752,24 @@ impl Interpreter {
         // `ValueError`; this is what `test_fstring`'s negative cases (which
         // call `eval("f'...'")` and assert `SyntaxError`) rely on.
         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
-        let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
-        let code = weavepy_compiler::compile_owned_eval_with_options(
-            module,
-            trimmed,
-            "<string>",
-            self.exec_eval_compile_options(),
-        )
-        .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
-        let mut frame = self.make_frame(Rc::new(code), Vec::new(), Vec::new(), globals_dict, None);
+        let opts = self.exec_eval_compile_options();
+        let code = match source_code_get(SOURCE_EVAL, opts, trimmed) {
+            Some(code) => code,
+            None => {
+                let module = self.parse_eval_source_emitting_warnings(trimmed, "<string>")?;
+                let warned = LAST_PARSE_WARNED.get();
+                let compiled = weavepy_compiler::compile_owned_eval_with_options(
+                    module, trimmed, "<string>", opts,
+                )
+                .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
+                let code = Rc::new(compiled);
+                if !warned {
+                    source_code_put(SOURCE_EVAL, opts, trimmed, &code);
+                }
+                code
+            }
+        };
+        let mut frame = self.make_frame(code, Vec::new(), Vec::new(), globals_dict, None);
         match eval_locals {
             Some(Object::Dict(d)) => frame.rare_mut().class_namespace = Some(d),
             Some(mapping) => frame.rare_mut().class_namespace_obj = Some(mapping),
@@ -69506,6 +70531,75 @@ pub fn decode_compile_source_bytes(bytes: &[u8], filename: &str) -> Result<Strin
     decode_source_bytes_inner(bytes, filename, false)
 }
 
+thread_local! {
+    /// Whether the last parse of `exec`'s or `eval`'s source reported a
+    /// warning (see [`source_code_get`]).
+    static LAST_PARSE_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The code `exec` and `eval` compiled from source strings, by source,
+    /// mode and compile options, in its encoded form (see
+    /// `weavepy_compiler::native_code`): `dataclasses` and `namedtuple`
+    /// build the same source for every class with the same fields, and its
+    /// compile cost more than the rest of making the class. Each hit
+    /// decodes a code object of its own (bodies decode on first use), so
+    /// nothing a run leaves in its code (caches, compiled code, what they
+    /// hold) outlives its functions. Only source whose parse warned about
+    /// nothing is kept (a warning is emitted at each compile).
+    #[allow(clippy::type_complexity)]
+    static SOURCE_CODE: std::cell::RefCell<
+        std::collections::HashMap<Box<str>, Vec<((u8, u32, u8), Box<[u8]>)>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const SOURCE_EXEC: u8 = 0;
+const SOURCE_EVAL: u8 = 1;
+/// The longest source [`SOURCE_CODE`] keeps, and how many it keeps (it
+/// starts over when full).
+const SOURCE_CODE_MAX_LEN: usize = 16 * 1024;
+const SOURCE_CODE_MAX: usize = 256;
+
+/// A fresh copy of the code `exec` or `eval` (`mode`) compiled from `src`
+/// under `opts`, when it's kept (see `SOURCE_CODE`).
+fn source_code_get(
+    mode: u8,
+    opts: weavepy_compiler::CompileOptions,
+    src: &str,
+) -> Option<Rc<CodeObject>> {
+    if src.len() > SOURCE_CODE_MAX_LEN {
+        return None;
+    }
+    let key = (mode, opts.flags, opts.optimize);
+    let code = SOURCE_CODE.with(|m| {
+        let m = m.borrow();
+        let (_, bytes) = m.get(src)?.iter().find(|(k, _)| *k == key)?;
+        weavepy_compiler::native_code::decode(bytes, "<string>")
+    })?;
+    Some(Rc::new(code))
+}
+
+/// Keep `code`, compiled from `src` (see [`source_code_get`]).
+fn source_code_put(
+    mode: u8,
+    opts: weavepy_compiler::CompileOptions,
+    src: &str,
+    code: &Rc<CodeObject>,
+) {
+    if src.len() > SOURCE_CODE_MAX_LEN {
+        return;
+    }
+    let Some(bytes) = weavepy_compiler::native_code::encode(code) else {
+        return;
+    };
+    SOURCE_CODE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= SOURCE_CODE_MAX {
+            m.clear();
+        }
+        m.entry(Box::from(src))
+            .or_default()
+            .push(((mode, opts.flags, opts.optimize), bytes.into_boxed_slice()));
+    });
+}
+
 /// CPython refuses to tokenize a string source containing NUL — the C
 /// tokenizer is NUL-terminated internally. `compile()`/`exec`/`eval`
 /// raise a bare `SyntaxError` (3.12+; it was `ValueError` before).
@@ -71762,6 +72856,20 @@ impl LeafKind {
 /// `issubclass(cls, classinfo)` for a class against classes (or a flat
 /// tuple of them) whose metaclass is `type`: the MRO alone answers, with
 /// no `__subclasscheck__` to run. `None` for anything else.
+/// Whether `type(cls).<hook>` (`__instancecheck__`, `__subclasscheck__`)
+/// is `type`'s own: an `EnumType` class checks as any class does, an ABC
+/// doesn't.
+fn checks_like_type(cls: &TypeObject, hook: &str) -> bool {
+    if cls.metaclass_is_type() {
+        return true;
+    }
+    let meta = cls.metaclass_or_type();
+    meta.c_ext_ptr.get() == 0
+        && meta
+            .lookup_with_owner(hook)
+            .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_))
+}
+
 fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Type(cls), spec] = args else {
         return None;
@@ -71775,7 +72883,7 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         let Object::Type(c) = c else {
             return None;
         };
-        if !c.metaclass_is_type() {
+        if !checks_like_type(c, "__subclasscheck__") {
             return None;
         }
         // (`os.PathLike` answers structurally, as the full call does.)
@@ -71790,8 +72898,9 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 17] = [
+    let pure: [leaf_builtins::Fast; 18] = [
         leaf_issubclass,
+        crate::seqiter::hash_fast,
         Interpreter::leaf_hasattr,
         crate::seqiter::min_fast,
         crate::seqiter::max_fast,
@@ -71809,7 +72918,9 @@ fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
         crate::builtins::bytes_decode_leaf,
         crate::builtins::dict_getitem_leaf,
     ];
-    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f)) || crate::stdlib::math::is_fast_half(f)
+    pure.iter().any(|&p| std::ptr::fn_addr_eq(p, f))
+        || crate::stdlib::math::is_fast_half(f)
+        || crate::stdlib::operator_accel::is_fast_half(f)
 }
 
 /// A receiver's builtin variant, for the method table.
@@ -72119,12 +73230,17 @@ impl InlineAct {
 /// (overwritten without a drop when it's bound), and empty locals and
 /// operand stack of its own.
 fn parked_lean_frame() -> LeanFrame {
+    parked_lean_frame_with(16)
+}
+
+/// [`parked_lean_frame`] with an operand stack of room for `stack_room`.
+fn parked_lean_frame_with(stack_room: usize) -> LeanFrame {
     let placeholder = inline_placeholder();
     LeanFrame(std::mem::ManuallyDrop::new(Frame {
         code: borrowed_rc(&placeholder.code),
         locals: frame_slots::FrameLocals::from_shared(Rc::new(RefCell::new(Vec::new()))),
         cells: borrowed_rc(&placeholder.cells),
-        stack: frame_slots::FrameStack::with_capacity(16),
+        stack: frame_slots::FrameStack::with_capacity(stack_room),
         globals: borrowed_rc(&placeholder.dict),
         builtins: borrowed_rc(&placeholder.dict),
         rare: None,
@@ -72788,14 +73904,17 @@ fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Opt
 }
 
 /// The `SEND` of an `await` of the `CALL` at `pc`'s result: the call is
-/// followed by `GET_AWAITABLE 0; LOAD_CONST None; SEND`.
+/// followed by `GET_AWAITABLE; LOAD_CONST None; SEND`. The awaitable's
+/// argument (`1` and `2` for `async with`'s `__aenter__` and `__aexit__`)
+/// only words the error for a result that isn't awaitable, which a
+/// coroutine function's call never is.
 #[inline]
 pub(crate) fn await_send_after(code: &CodeObject, pc: usize) -> Option<usize> {
     let [get, none, send] = code.instructions.get(pc + 1..pc + 4)? else {
         return None;
     };
     (get.op == OpCode::GetAwaitable
-        && get.arg == 0
+        && get.arg <= 2
         && none.op == OpCode::LoadConst
         && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
         && send.op == OpCode::Send
@@ -73239,7 +74358,7 @@ mod burst_stats {
         "frame-JIT direct call registered",
         "frame-JIT inlined body's exit",
     ];
-    static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    static CALLS: [AtomicU64; CALL_NAMES.len()] = [const { AtomicU64::new(0) }; CALL_NAMES.len()];
 
     /// Count one call taking path `i` (one of the `CALL_*` constants).
     /// (Every call path counts: off, it's one load in line.)
@@ -74372,6 +75491,22 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
 }
 
+/// Whether the full path may remember class `t`'s miss of `name` per class
+/// version (see [`crate::types::Verdict::TypeAttrMissing`]): a builtin
+/// class's, or a Python class's under plain `type` with no entry for the
+/// name anywhere on its MRO, which nothing but a change to one of those
+/// dictionaries (moving the version) can supply. That covers a class with
+/// a builtin base, which [`type_attr_certainly_missing`] can't vouch for
+/// (`hasattr(type(op), "_asyncio_future_blocking")` of `re`'s opcodes, an
+/// `int` subclass).
+fn type_miss_memo_ok(t: &TypeObject, name: &str) -> bool {
+    t.flags.is_builtin
+        || (Interpreter::plain_metaclass(t)
+            && t.c_ext_ptr.get() == 0
+            && t.native_kind.get() == 0
+            && t.lookup(name).is_none())
+}
+
 /// Whether `t.name`, looked up by `type.__getattribute__`, certainly ends
 /// in its `AttributeError` without running any code: a name that is no
 /// dunder (those have special and synthesized forms) and not `mro`, that
@@ -74383,7 +75518,33 @@ fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
 /// such names).
 fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
     use crate::types::Dunder;
-    if name.starts_with("__") || name == "mro" || crate::capi_watchers::types_active() {
+    if name == "mro" || crate::capi_watchers::types_active() {
+        return false;
+    }
+    // (The dunders `load_attr_type` answers outside any dictionary.)
+    let dunder = name.starts_with("__");
+    if dunder
+        && matches!(
+            name,
+            "__name__"
+                | "__qualname__"
+                | "__bases__"
+                | "__base__"
+                | "__mro__"
+                | "__class__"
+                | "__type_params__"
+                | "__dict__"
+                | "__flags__"
+                | "__itemsize__"
+                | "__basicsize__"
+                | "__subclasses__"
+                | "__module__"
+                | "__dir__"
+                | "__abstractmethods__"
+                | "__text_signature__"
+                | "__doc__"
+        )
+    {
         return false;
     }
     let object = &builtin_types().object_;
@@ -74403,7 +75564,14 @@ fn type_attr_certainly_missing(t: &Rc<TypeObject>, name: &str) -> bool {
     {
         return false;
     }
-    t.lookup(name).is_none() && meta.lookup(name).is_none()
+    if t.lookup(name).is_some() || meta.lookup(name).is_some() {
+        return false;
+    }
+    // A dunder may still be a builtin base's slot wrapper (`object.__repr__`)
+    // or a synthesized class method.
+    !dunder
+        || (crate::builtins::builtin_classmethod(&t.name, name).is_none()
+            && builtin_slot_wrapper(t, name).is_none())
 }
 
 /// `PyObject_GetAttr`'s augmentation of a propagating `AttributeError`
@@ -76658,7 +77826,7 @@ pub(crate) fn percent_format_with(
                 return Err(value_error("incomplete format"));
             }
             // Optional mapping key: %(name)s
-            let mut mapping_key: Option<String> = None;
+            let mut mapping_key: Option<&str> = None;
             if bytes[i] == b'(' {
                 let mut depth = 1;
                 let start = i + 1;
@@ -76675,8 +77843,7 @@ pub(crate) fn percent_format_with(
                 }
                 mapping_key = Some(
                     std::str::from_utf8(&bytes[start..j])
-                        .map_err(|_| value_error("invalid utf-8"))?
-                        .to_owned(),
+                        .map_err(|_| value_error("invalid utf-8"))?,
                 );
                 i = j + 1;
             }
@@ -76800,46 +77967,58 @@ pub(crate) fn percent_format_with(
                 continue;
             }
             let item = if let Some(k) = mapping_key {
-                // In bytes mode the mapping is keyed by *bytes* (the raw
-                // template slice, latin-1); in str mode by text.
-                let key_obj = match mode {
-                    PercentMode::Bytes => {
-                        Object::new_bytes(k.chars().map(|c| c as u8).collect::<Vec<u8>>())
+                // (A text key of a plain dict: probed without making the
+                // key's object.)
+                let plain = match (mode, value) {
+                    (PercentMode::Str, Object::Dict(d)) => {
+                        Some(d.borrow().get(&crate::object::StrKey(k)).cloned())
                     }
-                    PercentMode::Str => Object::from_str(&k),
+                    _ => None,
                 };
-                match value {
-                    Object::Dict(d) => d
-                        .borrow()
-                        .get(&DictKey(key_obj.clone()))
-                        .cloned()
-                        .ok_or_else(|| crate::error::key_error_object(key_obj.clone()))?,
-                    // A mapping *instance* — a dict subclass that overrides
-                    // `__getitem__` (Django's `DictWrapper` computes values
-                    // for `qn_`-prefixed keys), `UserDict`, … — goes through
-                    // the full subscript protocol, exactly like CPython's
-                    // `PyObject_GetItem`.
-                    Object::Instance(_) => {
-                        match crate::vm_singletons::current_interpreter_ptr() {
-                            // SAFETY: published by an enclosing VM frame
-                            // still live on this thread; the GIL keeps the
-                            // access exclusive.
-                            Some(p) => unsafe { &mut *p }.subscr_get_public(value, &key_obj)?,
-                            // Rust-side callers with no live interpreter:
-                            // the native dict payload is all we can read.
-                            None => match value.native_value() {
-                                Some(Object::Dict(d)) => d
-                                    .borrow()
-                                    .get(&DictKey(key_obj.clone()))
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        crate::error::key_error_object(key_obj.clone())
-                                    })?,
-                                _ => return Err(type_error("format requires a mapping")),
-                            },
+                if let Some(found) = plain {
+                    found.ok_or_else(|| crate::error::key_error_object(Object::from_str(k)))?
+                } else {
+                    // In bytes mode the mapping is keyed by *bytes* (the raw
+                    // template slice, latin-1); in str mode by text.
+                    let key_obj = match mode {
+                        PercentMode::Bytes => {
+                            Object::new_bytes(k.chars().map(|c| c as u8).collect::<Vec<u8>>())
                         }
+                        PercentMode::Str => Object::from_str(k),
+                    };
+                    match value {
+                        Object::Dict(d) => d
+                            .borrow()
+                            .get(&DictKey(key_obj.clone()))
+                            .cloned()
+                            .ok_or_else(|| crate::error::key_error_object(key_obj.clone()))?,
+                        // A mapping *instance* — a dict subclass that overrides
+                        // `__getitem__` (Django's `DictWrapper` computes values
+                        // for `qn_`-prefixed keys), `UserDict`, … — goes through
+                        // the full subscript protocol, exactly like CPython's
+                        // `PyObject_GetItem`.
+                        Object::Instance(_) => {
+                            match crate::vm_singletons::current_interpreter_ptr() {
+                                // SAFETY: published by an enclosing VM frame
+                                // still live on this thread; the GIL keeps the
+                                // access exclusive.
+                                Some(p) => unsafe { &mut *p }.subscr_get_public(value, &key_obj)?,
+                                // Rust-side callers with no live interpreter:
+                                // the native dict payload is all we can read.
+                                None => match value.native_value() {
+                                    Some(Object::Dict(d)) => d
+                                        .borrow()
+                                        .get(&DictKey(key_obj.clone()))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            crate::error::key_error_object(key_obj.clone())
+                                        })?,
+                                    _ => return Err(type_error("format requires a mapping")),
+                                },
+                            }
+                        }
+                        _ => return Err(type_error("format requires a mapping")),
                     }
-                    _ => return Err(type_error("format requires a mapping")),
                 }
             } else {
                 let v = positional
@@ -78893,7 +80072,33 @@ fn is_c_profiled_callable(obj: &Object) -> bool {
 /// comparisons. Shared with the CALL inline caches (RFC 0058 WS3),
 /// whose native fast paths must never bypass this chain.
 #[inline]
-pub(crate) fn builtin_needs_interp(name: &str) -> bool {
+pub(crate) fn builtin_needs_interp(name: &'static str) -> bool {
+    use std::cell::Cell;
+    /// Memoized answers by the name's address and length (builtin names
+    /// are `'static`, so an address names one string for good): the list
+    /// below is about 65 comparisons, and every builtin call through the
+    /// generic dispatch asks.
+    const WAYS: usize = 256;
+    thread_local! {
+        static MEMO: [Cell<(usize, u32)>; WAYS] =
+            const { [const { Cell::new((0, 0)) }; WAYS] };
+    }
+    let key = name.as_ptr() as usize;
+    let len = name.len() as u32;
+    let i = ((key >> 3) ^ (key >> 11) ^ len as usize) % WAYS;
+    MEMO.with(|m| {
+        // The length's top bit holds the answer, the next one validity.
+        let (k, l) = m[i].get();
+        if k == key && l & !(3 << 30) == len && l & (1 << 30) != 0 {
+            return l & (1 << 31) != 0;
+        }
+        let r = builtin_needs_interp_uncached(name);
+        m[i].set((key, len | (1 << 30) | (u32::from(r) << 31)));
+        r
+    })
+}
+
+fn builtin_needs_interp_uncached(name: &str) -> bool {
     name.starts_with("__vm:")
         || name.starts_with(".u.")
         || name == builtins::BUILD_CLASS_NAME
@@ -78986,7 +80191,7 @@ pub(crate) fn builtin_needs_interp(name: &str) -> bool {
 /// of the tail-position special cases (`__getitem__`'s `__missing__`
 /// dispatch, the `fspath` coercion family, zero-arg `super`).
 #[inline]
-pub(crate) fn native_call_ic_safe(name: &str) -> bool {
+pub(crate) fn native_call_ic_safe(name: &'static str) -> bool {
     !name.starts_with('.')
         && name != "__getitem__"
         && name != "super"
@@ -79355,6 +80560,7 @@ struct CodeConstObjects {
     /// operands and result on the stack (see `frame_jit::h_binop_dunder`);
     /// allocated on the first recorded one.
     instance_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
+    heap_sites: std::sync::OnceLock<Box<[std::sync::atomic::AtomicBool]>>,
     /// The `BINARY_OP` sites' Python operator methods (see
     /// [`DunderSeen`]), allocated on the first recorded one.
     dunders: std::sync::OnceLock<Box<DunderTable>>,
@@ -80187,6 +81393,53 @@ pub(crate) fn builtin_method_site(
     Some((tag, kind, b.clone()))
 }
 
+/// The native method a `LOAD_ATTR` (method) site at `attr_pc` cached for
+/// an instance receiver, with the class attribute version it was cached
+/// under and the fast half its `CALL` at `call_pc` settled on (`None` for a
+/// body that is a leaf whole), for the frame JIT's instance method calls
+/// (see [`Interpreter::core_native_method`], which they replace).
+#[cfg(feature = "jit")]
+pub(crate) fn inst_builtin_method_site(
+    ext: &CodeConstObjects,
+    attr_pc: usize,
+    call_pc: usize,
+) -> Option<(
+    u64,
+    Option<leaf_builtins::Fast>,
+    Rc<crate::object::BuiltinFn>,
+)> {
+    let slots = ext.method_sites();
+    // SAFETY: GIL-serialized; the borrow ends before any refill.
+    let (ver, f) = unsafe { &*slots.get(attr_pc)?.0.get() };
+    let MethodSlotFn::Builtin(b) = f else {
+        return None;
+    };
+    if *ver == 0 || ver & MethodSlot::BUILTIN_TAG != 0 {
+        return None;
+    }
+    let fast = match slots.get(call_pc)?.get_leaf_ptr(Rc::as_ptr(b))? {
+        LeafKind::Fast(f) => Some(f),
+        LeafKind::Opaque => None,
+        _ => return None,
+    };
+    Some((*ver, fast, b.clone()))
+}
+
+/// Whether a method `cls` (an instance's class at the version its site
+/// cached) resolved stays the one an attribute read finds: the class reads
+/// attributes the default way, and `inst` holds none of its own.
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn inst_method_unshadowed(
+    cls: &crate::types::TypeObject,
+    inst: &crate::types::PyInstance,
+) -> bool {
+    inst.dict.published().is_none()
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        && unsafe { inst.dict.split_cell().peek() }.is_some_and(|s| s.is_empty())
+        && Interpreter::default_getattribute(cls)
+}
+
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.
 #[cfg(feature = "jit")]
 pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKind> {
@@ -80686,6 +81939,23 @@ fn instance_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
     if let Some(site) = sites.get(pc) {
         site.store(true, Ordering::Relaxed);
     }
+}
+
+pub(crate) fn heap_site_note(ext: &CodeConstObjects, ninstrs: usize, pc: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sites = ext
+        .heap_sites
+        .get_or_init(|| (0..ninstrs).map(|_| AtomicBool::new(false)).collect());
+    if let Some(site) = sites.get(pc) {
+        site.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn heap_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.heap_sites
+        .get()
+        .and_then(|s| s.get(pc))
+        .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether the `LOAD_ATTR` at `pc` has run a `property`'s getter (its
@@ -81423,6 +82693,39 @@ fn tuple_field_hit(slot: &StampSlot, inst: &PyInstance) -> Option<Object> {
 /// [`class_attr_hit`] for a stamp filled with `via` (`0`, or
 /// [`CLASS_ATTR_VIA_INSTANCE`]).
 #[inline(always)]
+/// `inst.name` at the plain `LOAD_ATTR` at `pc` (receiver `recv`) from the
+/// site's own caches alone, as [`Interpreter::leaf_attr_resolve_site`]
+/// fills them: a scalar class attribute its stamp remembers, or a plain
+/// function its method slot resolved at the class's version, bound to
+/// `recv`; in either case one the instance doesn't shadow. `None` for
+/// anything else (compiled code's attribute miss then takes the full
+/// resolution).
+pub(crate) fn inst_class_attr_quick(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    inst: &PyInstance,
+    recv: &Object,
+    pc: usize,
+) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if let Some(v) = ext
+        .stamp_slot(pc)
+        .and_then(|s| class_attr_hit_via(s, cls, CLASS_ATTR_VIA_INSTANCE))
+    {
+        let name_idx = code.instructions.get(pc)?.arg;
+        return (!inst_may_shadow(inst, code, name_idx)).then_some(v);
+    }
+    let f = ext.method_slot(pc)?.get_held(cls.attr_version.get())?;
+    let name_idx = code.instructions.get(pc)?.arg;
+    if inst_may_shadow(inst, code, name_idx) {
+        return None;
+    }
+    Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+        recv.clone(),
+        Object::Function(f),
+    ))))
+}
+
 fn class_attr_hit_via(
     slot: &StampSlot,
     cls: &crate::types::TypeObject,
@@ -81464,13 +82767,18 @@ fn class_attr_fill_via(
         Object::Bool(b) => (CLASS_ATTR_BOOL, u64::from(*b)),
         Object::None => (CLASS_ATTR_NONE, 0),
         // A value no access can bind or call `__get__` on, however its
-        // class changes later, read through an instance.
+        // class changes later, read through an instance: an exact
+        // container's too (a table like `PREC = {...}`; the entry is read
+        // again at each hit, so its contents may change).
         Object::Str(_)
         | Object::Bytes(_)
         | Object::Long(_)
         | Object::Tuple(_)
         | Object::FrozenSet(_)
         | Object::Module(_)
+        | Object::Dict(_)
+        | Object::List(_)
+        | Object::Set(_)
             if via == CLASS_ATTR_VIA_INSTANCE =>
         {
             return class_entry_fill(code, cls, pc, v, via);
@@ -82429,6 +83737,59 @@ fn code_is_pure_leaf(code: &CodeObject) -> bool {
 
 /// The pcs a call runs through on its ordinary paths: from the entry
 /// along fall-throughs and jumps (not into the exception handlers).
+/// The pcs of `body` (see [`body_pcs`]) every path from which reaches a
+/// `RAISE_VARARGS` before any return: a path that will raise. (A loop
+/// counts only if every way out of it raises.)
+fn raise_bound_pcs(code: &CodeObject, body: &[usize]) -> Vec<bool> {
+    let ins = &code.instructions;
+    let n = ins.len();
+    let mut doomed = vec![false; n];
+    if !body.iter().any(|&pc| ins[pc].op == OpCode::RaiseVarargs) {
+        return doomed;
+    }
+    let mut in_body = vec![false; n];
+    for &pc in body {
+        in_body[pc] = true;
+    }
+    let succ = |pc: usize| -> ([usize; 2], usize) {
+        let i = ins[pc];
+        let next = pc + 1;
+        match i.op {
+            OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => ([0, 0], 0),
+            OpCode::JumpForward => ([next + i.arg as usize, 0], 1),
+            OpCode::JumpBackward => ([next.saturating_sub(i.arg as usize), 0], 1),
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => ([next + i.arg as usize, next], 2),
+            _ => ([next, 0], 1),
+        }
+    };
+    for &pc in body {
+        if ins[pc].op == OpCode::RaiseVarargs {
+            doomed[pc] = true;
+        }
+    }
+    // Grow the set to a fixed point: a pc whose successors all raise.
+    loop {
+        let mut grew = false;
+        for &pc in body {
+            if doomed[pc] {
+                continue;
+            }
+            let (s, k) = succ(pc);
+            if k > 0 && s[..k].iter().all(|&t| t < n && in_body[t] && doomed[t]) {
+                doomed[pc] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            return doomed;
+        }
+    }
+}
+
 pub(crate) fn body_pcs(code: &CodeObject) -> Vec<usize> {
     let ins = &code.instructions;
     let n = ins.len();
@@ -82480,9 +83841,13 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && code.instructions.len() <= 64;
     let pure_op = |ins: &weavepy_compiler::Instruction| {
         // A fresh empty list or dict is unobservable until stored, so
-        // a declined evaluation that made one still did nothing.
+        // a declined evaluation that made one still did nothing; so is a
+        // fresh tuple (`return (x, 1)`, a key function's pair).
         if matches!(ins.op, OpCode::BuildList | OpCode::BuildMap) {
             return ins.arg == 0;
+        }
+        if ins.op == OpCode::BuildTuple {
+            return (1..=3).contains(&ins.arg);
         }
         matches!(
             ins.op,
@@ -82527,14 +83892,23 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     // Only the ordinary paths count: an exception handler runs only after
     // something raised, and an evaluation that meets a raise declines (the
     // ordinary call then runs the handler).
-    let body: Vec<&weavepy_compiler::Instruction> = if structural {
+    // (A path bound for a `raise` declines at the first instruction the
+    // plan can't express, before anything it does is seen, and the
+    // ordinary call then raises: those paths needn't be pure, so a body
+    // guarded by `if bad: raise ...` still evaluates frameless.)
+    let pcs = if structural {
         body_pcs(code)
-            .into_iter()
-            .map(|pc| &code.instructions[pc])
-            .collect()
     } else {
         Vec::new()
     };
+    let doomed = raise_bound_pcs(code, &pcs);
+    let body: Vec<&weavepy_compiler::Instruction> = pcs
+        .iter()
+        .filter(|&&pc| !doomed[pc])
+        .map(|&pc| &code.instructions[pc])
+        .collect();
+    // (A body that always raises has nothing to evaluate.)
+    let structural = structural && !body.is_empty();
     let ok = structural && body.iter().all(|i| pure_op(i));
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see
@@ -82641,6 +84015,96 @@ fn effect_setter_shape(code: &CodeObject) -> bool {
             && ret.op == OpCode::ReturnValue)
 }
 
+/// `CONVERT_VALUE` (`arg`'s low bits: `1` for `!s`, `2` for `!r`) of the
+/// value at `top`, in place, for the exact scalars and strings whose
+/// conversion runs no Python (an f-string's pieces): `false` touches
+/// nothing.
+///
+/// # Safety
+///
+/// `top` is an initialized slot nothing else reads while this runs.
+#[inline]
+pub(crate) unsafe fn convert_in_place(top: *mut Object, arg: u32) -> bool {
+    // SAFETY: the caller's contract.
+    let v = match (arg & 0x03, unsafe { &*top }) {
+        (1, Object::Str(_)) => return true,
+        (1 | 2, Object::Int(i)) => {
+            let mut buf = itoa::Buffer::new();
+            Object::Str(SharedStr::from(buf.format(*i)))
+        }
+        (1 | 2, Object::Bool(b)) => Object::from_static(if *b { "True" } else { "False" }),
+        (1 | 2, Object::None) => Object::from_static("None"),
+        (1 | 2, Object::Float(f)) => {
+            Object::Str(SharedStr::from(crate::object::float_repr(*f).as_str()))
+        }
+        // SAFETY: as above.
+        (2, Object::Str(_)) => Object::Str(SharedStr::from(unsafe { &*top }.repr().as_str())),
+        _ => return false,
+    };
+    // SAFETY: the replaced value is a scalar, which owes no drop, or a
+    // string, released here (its repr ran no Python).
+    unsafe { top.replace(v) };
+    true
+}
+
+/// `FORMAT_VALUE 0` (no spec) of the value at `top`, in place, for a
+/// string, an int or a float: `false` touches nothing.
+///
+/// # Safety
+///
+/// As [`convert_in_place`]'s.
+#[inline]
+pub(crate) unsafe fn format_simple_in_place(top: *mut Object) -> bool {
+    // SAFETY: the caller's contract; a replaced int or float owes no drop.
+    unsafe {
+        match &*top {
+            Object::Str(_) => {}
+            Object::Int(i) => {
+                let mut buf = itoa::Buffer::new();
+                top.write(Object::Str(SharedStr::from(buf.format(*i))));
+            }
+            Object::Float(f) => {
+                let r = SharedStr::from(crate::object::float_repr(*f).as_str());
+                top.write(Object::Str(r));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `BUILD_STRING n` of the `n` strings from `at` up (an f-string's join):
+/// the joined string in `at`'s slot, the parts released; `false` touches
+/// nothing (a part that isn't a string, more than eight parts, or
+/// `tracemalloc` tracing, which the full handler's allocation records).
+///
+/// # Safety
+///
+/// The `n` slots from `at` are initialized, and nothing else reads them.
+#[inline]
+pub(crate) unsafe fn build_string_at(at: *mut Object, n: usize) -> bool {
+    if n == 0 || n > 8 || crate::stdlib::tracemalloc_real::is_tracking() {
+        return false;
+    }
+    // SAFETY: the caller's contract.
+    let parts = unsafe { std::slice::from_raw_parts(at, n) };
+    let mut strs: [&str; 8] = [""; 8];
+    for (k, p) in parts.iter().enumerate() {
+        match p {
+            Object::Str(s) => strs[k] = s,
+            _ => return false,
+        }
+    }
+    let joined = Object::Str(SharedStr::concat(&strs[..n]));
+    // SAFETY: the parts leave (a string's release runs nothing); the join
+    // takes the first slot.
+    unsafe {
+        release_run(at, n);
+        at.write(joined);
+    }
+    true
+}
+
 /// Whether every `RETURN_VALUE` in `code` returns the constant `None`
 /// (what a constructor's `__init__` must return), decided once.
 fn code_returns_only_none(code: &CodeObject) -> bool {
@@ -82703,6 +84167,10 @@ enum StoreSrc {
     Const(u32),
     /// A small int literal.
     Int(i64),
+    /// A fresh empty list (`BUILD_LIST 0`).
+    NewList,
+    /// A fresh empty dict (`BUILD_MAP 0`).
+    NewDict,
 }
 
 /// A *store-only* `__init__` (see [`code_store_init`]): its attribute
@@ -82713,6 +84181,8 @@ struct StoreInit {
     /// How many stores take each parameter (a parameter's last use moves
     /// it, any earlier one copies it).
     uses: Box<[u8]>,
+    /// Whether a store makes a fresh container.
+    fresh: bool,
 }
 
 /// The store-only shape of `code`: a body that is nothing but
@@ -82759,9 +84229,13 @@ fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
                 {
                     return None;
                 }
+                let fresh = stores
+                    .iter()
+                    .any(|&(_, src)| matches!(src, StoreSrc::NewList | StoreSrc::NewDict));
                 return Some(StoreInit {
                     stores: stores.into_boxed_slice(),
                     uses: uses.into_boxed_slice(),
+                    fresh,
                 });
             }
             _ => {
@@ -82774,6 +84248,8 @@ fn store_init_shape(code: &CodeObject) -> Option<StoreInit> {
                     }
                     OpCode::LoadConst => StoreSrc::Const(i.arg),
                     OpCode::LoadSmallInt => StoreSrc::Int(i64::from(i.arg)),
+                    OpCode::BuildList if i.arg == 0 => StoreSrc::NewList,
+                    OpCode::BuildMap if i.arg == 0 => StoreSrc::NewDict,
                     _ => return None,
                 };
                 let recv = ins.get(pc + 1)?;
@@ -82858,6 +84334,10 @@ fn pure_leaf_warm(code: &CodeObject) -> bool {
 /// the core loop stops trying them when they rarely finish (see
 /// `CodeConstObjects::leaf_tries`).
 const LEAF_BAIL_LIMIT: u64 = 64;
+
+/// How often a code object whose frameless evaluations gave up tries one
+/// again (see [`LEAF_BAIL_LIMIT`]): once in this many calls.
+const LEAF_RETRY_EVERY: u64 = 1024;
 
 /// Whether `f`'s code is a pure or an effect leaf (the core loop's
 /// frameless call candidates).
@@ -83010,6 +84490,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             field_slots: SiteSlots::new(),
             native_sites: std::sync::OnceLock::new(),
             instance_sites: std::sync::OnceLock::new(),
+            heap_sites: std::sync::OnceLock::new(),
             leaf_sites: SiteSlots::new(),
             leaf_plan: std::sync::OnceLock::new(),
             returns_none: std::sync::atomic::AtomicU8::new(0),
@@ -83363,9 +84844,19 @@ enum NativeTruth {
     Bool(Rc<crate::object::BuiltinFn>, u8),
     /// A registered native `__len__`.
     Len(Rc<crate::object::BuiltinFn>),
+    /// No `__bool__`, and a Python `__len__` (`re`'s `SubPattern`): its
+    /// result when it evaluates as a pure leaf (see `leaf_instance_len`).
+    PyLen,
+    /// A Python `__bool__`: its result when it evaluates as a pure leaf.
+    PyBool(Rc<crate::object::PyFunction>),
     /// Anything else: the full path decides.
     Decline,
 }
+
+/// [`NativeTruth::PyLen`]'s stand-in operation in `leaf_instance_truth`.
+const PY_LEN_TRUTH: u8 = u8::MAX;
+/// [`NativeTruth::PyBool`]'s.
+const PY_BOOL_TRUTH: u8 = u8::MAX - 1;
 
 /// [`inst_may_shadow`] first settled by a leaf site's bound (see
 /// [`LeafSiteData::limit`]): values laid over the class's names `keys`
@@ -83644,6 +85135,21 @@ pub fn sequence_concat_native(a: &Object, b: &Object) -> Result<Object, RuntimeE
     binary_op(a, b, BinOpKind::Add)
 }
 
+/// `out` (empty) made `times` copies of `unit`, back to back, by doubling
+/// what it holds (a copy per repeat made `b"\0" * 65536` 65,536 calls).
+fn repeat_into<T: Copy>(out: &mut Vec<T>, unit: &[T], times: usize) {
+    let total = unit.len() * times;
+    if total == 0 {
+        return;
+    }
+    out.reserve(total);
+    out.extend_from_slice(unit);
+    while out.len() < total {
+        let n = out.len().min(total - out.len());
+        out.extend_from_within(..n);
+    }
+}
+
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
@@ -83827,9 +85333,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             };
             let times = checked_repeat_count(cps.len(), *n, "string")?;
             let mut out = Vec::with_capacity(cps.len().saturating_mul(times));
-            for _ in 0..times {
-                out.extend_from_slice(&cps);
-            }
+            repeat_into(&mut out, &cps, times);
             Ok(Object::str_from_codepoints(out))
         }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
@@ -83851,10 +85355,12 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                     crate::error::PyException::from_builtin("MemoryError", ""),
                 ));
             }
-            for _ in 0..times {
-                out.push_str(x);
-            }
-            Ok(Object::from_str(out))
+            let mut bytes = out.into_bytes();
+            repeat_into(&mut bytes, x.as_bytes(), times);
+            // SAFETY: copies of a whole `str`, back to back, are UTF-8.
+            Ok(Object::from_str(unsafe {
+                String::from_utf8_unchecked(bytes)
+            }))
         }
         (O::Str(template), v, B::Mod) => {
             if percent_args_need_bridge(v) {
@@ -83951,18 +85457,14 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             let times = checked_repeat_count(x.len(), *n, "bytes")?;
             let mut out = try_alloc_vec(x.len() * times)?;
-            for _ in 0..times {
-                out.extend_from_slice(x);
-            }
+            repeat_into(&mut out, x, times);
             Ok(Object::new_bytes(out))
         }
         (O::ByteArray(x), O::Int(n), B::Mult) | (O::Int(n), O::ByteArray(x), B::Mult) => {
             let body = x.borrow().clone();
             let times = checked_repeat_count(body.len(), *n, "bytearray")?;
             let mut out = try_alloc_vec(body.len() * times)?;
-            for _ in 0..times {
-                out.extend_from_slice(&body);
-            }
+            repeat_into(&mut out, &body, times);
             Ok(Object::new_bytearray(out))
         }
         // Set operators accept any mix of `set`/`frozenset` operands; the
@@ -85754,13 +87256,13 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
     // SAFETY: the caller's contract.
     let (a, b) = unsafe { (&*at, &*at.add(1)) };
     // A value that dies here may hold or be anything with a finalizer,
-    // except what owns no objects.
+    // except what owns no objects (a string, bytes, a big int's digits).
     fn quiet(o: &Object) -> bool {
         match o.strong_word() {
             None => true,
             // SAFETY: a counted variant's word, live while `o` is.
             Some(w) => {
-                matches!(o, Object::Str(_) | Object::Bytes(_))
+                matches!(o, Object::Str(_) | Object::Bytes(_) | Object::Long(_))
                     || unsafe { &*w }.load(std::sync::atomic::Ordering::Relaxed) > 1
             }
         }
@@ -85890,6 +87392,13 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_)) => {
             return native_seq_compare(a, b, op, 0);
         }
+        // Big ints, against each other or a machine int (one past the
+        // machine range is above or below every machine int by its sign).
+        (Object::Long(x), Object::Long(y)) => return Some(by_ord(Some((**x).cmp(&**y)))),
+        (Object::Long(x), Object::Int(y)) => return Some(by_ord(Some(long_cmp_int(x, *y)))),
+        (Object::Int(x), Object::Long(y)) => {
+            return Some(by_ord(Some(long_cmp_int(y, *x).reverse())));
+        }
         _ => {}
     }
     if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
@@ -85914,6 +87423,16 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         _ => return None,
     };
     Some(same == matches!(op, CompareKind::Eq))
+}
+
+/// How the big int `x` orders against the machine int `y`, allocating
+/// nothing.
+fn long_cmp_int(x: &num_bigint::BigInt, y: i64) -> std::cmp::Ordering {
+    match i64::try_from(x) {
+        Ok(v) => v.cmp(&y),
+        Err(_) if x.sign() == num_bigint::Sign::Minus => std::cmp::Ordering::Less,
+        Err(_) => std::cmp::Ordering::Greater,
+    }
 }
 
 /// `a <op> b` for two exact tuples (or two exact lists) whose compared
@@ -87078,6 +88597,8 @@ assert loop(2000) == 1999000
             }
             return;
         }
+        // Its loops are call-dense, which tier 2 would otherwise retire.
+        weavepy_jit::admit_generic_loops();
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
@@ -88264,48 +89785,6 @@ assert loop(2000) == 1999000
             status.success(),
             "isolated recursion-limit test failed: {status}"
         );
-    }
-
-    /// Frame compiles generating their code in the background: the
-    /// interpreter keeps running the code until its native form comes
-    /// back, installs it at a warm-up check, and computes what it
-    /// computed without it. (In a child process: the switch is
-    /// process-wide.)
-    #[cfg(feature = "jit")]
-    #[test]
-    fn frame_compiles_install_from_the_background() {
-        const CHILD: &str = "WEAVEPY_BACKGROUND_COMPILE_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let status =
-                std::process::Command::new(std::env::current_exe().expect("test executable"))
-                    .args([
-                        "--exact",
-                        "tests::frame_compiles_install_from_the_background",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
-                    .env("WEAVEPY_TIER2", "0")
-                    .env("WEAVEPY_FRAME_JIT_HOT", "50")
-                    .status()
-                    .expect("spawn background-compile test");
-            assert!(status.success(), "background-compile test failed: {status}");
-            return;
-        }
-        let src = "def tri(n):\n    t = 0\n    for i in range(n):\n        if i % 3:\n            t += i\n        else:\n            t -= 1\n    return t\n\
-                   def poly(a, b):\n    return a * b + a - b\n\
-                   s = 0\nfor k in range(3000):\n    s += tri(40) + poly(k, 7)\n\
-                   print(s)\n";
-        let sync = run(src);
-        crate::frame_jit::FORCE_ASYNC.store(true, std::sync::atomic::Ordering::Relaxed);
-        let before = crate::frame_jit::INSTALLED.load(std::sync::atomic::Ordering::Relaxed);
-        let out = run(src);
-        let installed =
-            crate::frame_jit::INSTALLED.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert_eq!(out, sync);
-        assert!(installed >= 1, "no background compile was installed");
-        // A process can fork with the compiler idle and start it again.
-        crate::frame_jit::quiesce_compiler();
-        assert_eq!(run(src), sync);
     }
 
     fn check_cold_instance_dictionaries() {

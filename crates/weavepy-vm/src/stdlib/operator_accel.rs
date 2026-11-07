@@ -128,6 +128,16 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::new_list(names),
         );
 
+        // The arithmetic functions' leaf halves: two plain ints or floats
+        // have no dunders, so the native arithmetic is the whole call (a
+        // core-loop or compiled caller, and a `partial` over one, run it in
+        // place). Anything else declines to the full body.
+        for (name, fast) in BINARY_FAST {
+            if let Some(Object::Builtin(b)) = d.get(&crate::object::StrKey(name)) {
+                crate::leaf_builtins::register_fast(b, *fast);
+            }
+        }
+
         // CPython's `attrgetter` / `itemgetter` / `methodcaller` are C types:
         // calling one pushes no Python frame. pandas'
         // `find_stack_level()`-based warnings count stack frames between the
@@ -279,6 +289,37 @@ fn one_arg<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeErro
             args.len()
         ))),
     }
+}
+
+/// `operator`'s binary arithmetic over two plain ints or floats (see
+/// [`binary`]); `None` for any other operands.
+#[inline(always)]
+fn binary_fast(args: &[Object], op: BinOpKind) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [a @ (Object::Int(_) | Object::Float(_)), b @ (Object::Int(_) | Object::Float(_))] => {
+            Some(crate::binary_op(a, b, op))
+        }
+        _ => None,
+    }
+}
+
+/// The leaf halves of [`binary`]'s functions, by name.
+const BINARY_FAST: &[(&str, crate::leaf_builtins::Fast)] = &[
+    ("add", |a| binary_fast(a, BinOpKind::Add)),
+    ("sub", |a| binary_fast(a, BinOpKind::Sub)),
+    ("mul", |a| binary_fast(a, BinOpKind::Mult)),
+    ("truediv", |a| binary_fast(a, BinOpKind::Div)),
+    ("floordiv", |a| binary_fast(a, BinOpKind::FloorDiv)),
+    ("mod", |a| binary_fast(a, BinOpKind::Mod)),
+    ("pow", |a| binary_fast(a, BinOpKind::Pow)),
+    ("lshift", |a| binary_fast(a, BinOpKind::LShift)),
+    ("rshift", |a| binary_fast(a, BinOpKind::RShift)),
+];
+
+/// Whether `f` is one of [`BINARY_FAST`]'s halves, which run no code (a
+/// frameless leaf may call them).
+pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
+    BINARY_FAST.iter().any(|&(_, p)| std::ptr::fn_addr_eq(p, f))
 }
 
 fn binary(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {

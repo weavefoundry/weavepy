@@ -112,14 +112,10 @@ impl Builder<'_> {
             if b.name == "setattr" && crate::descr_registry::module_of_builtin(&b).is_none())
     }
 
-    fn walk(
-        &mut self,
-        vm: &mut Interpreter,
-        spec: &Object,
-        builder: &Object,
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        let function = match builder {
+    /// `builder` as a function whose calls can be replaced: the frozen
+    /// helper, run unobserved.
+    fn replaceable<'f>(&self, vm: &Interpreter, builder: &'f Object) -> Option<&'f PyFunction> {
+        match builder {
             Object::Function(function)
                 if !crate::gil::free_threading_enabled()
                     && !crate::trace::any_observers_active()
@@ -133,12 +129,27 @@ impl Builder<'_> {
                 Some(function)
             }
             _ => None,
-        };
+        }
+    }
+
+    /// Whether the helper's names still mean the operations it captured.
+    fn ordinary_names(&self, function: &PyFunction) -> bool {
+        self.checks
+            .iter()
+            .zip(&self.state[1..])
+            .all(|(name, expected)| name.matches(function, expected))
+    }
+
+    fn walk(
+        &mut self,
+        vm: &mut Interpreter,
+        spec: &Object,
+        builder: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let function = self.replaceable(vm, builder);
         let ordinary = function.is_some_and(|function| {
-            self.checks
-                .iter()
-                .zip(&self.state[1..])
-                .all(|(name, expected)| name.matches(function, expected))
+            self.ordinary_names(function)
                 && (!matches!(spec, Object::Dict(_)) || self.builtin_setter(function))
         });
         let simple = matches!(
@@ -309,42 +320,124 @@ pub(crate) fn build(
     if state.len() != 4 || !kwargs.is_empty() {
         return Err(type_error("invalid _ast._build arguments"));
     }
-    // The frozen module can itself be imported with replaced builtins. Only
-    // the ordinary operations captured at import justify native type tests.
-    let types = crate::builtin_types::builtin_types();
-    if !matches!(&state[1], Object::Type(cls) if Rc::ptr_eq(cls, &types.dict_))
-        || !matches!(&state[2], Object::Type(cls) if Rc::ptr_eq(cls, &types.list_))
-        || !matches!(&state[3], Object::Builtin(b) if b.name == "isinstance"
-            && crate::descr_registry::module_of_builtin(b).is_none())
-    {
-        return vm.call(builder, std::slice::from_ref(spec), &[], globals);
+    match Builder::new(&state[..]) {
+        Some(mut native) => native.walk(vm, spec, builder, globals),
+        None => vm.call(builder, std::slice::from_ref(spec), &[], globals),
     }
-    let Object::Code(code) = &state[0] else {
-        return vm.call(builder, std::slice::from_ref(spec), &[], globals);
+}
+
+impl<'a> Builder<'a> {
+    /// The native walk for the helper's captured `state`, unless the
+    /// state is not the ordinary operations.
+    fn new(state: &'a [Object]) -> Option<Self> {
+        // The frozen module can itself be imported with replaced builtins.
+        // Only the ordinary operations captured at import justify native
+        // type tests.
+        let types = crate::builtin_types::builtin_types();
+        if state.len() != 4
+            || !matches!(&state[1], Object::Type(cls) if Rc::ptr_eq(cls, &types.dict_))
+            || !matches!(&state[2], Object::Type(cls) if Rc::ptr_eq(cls, &types.list_))
+            || !matches!(&state[3], Object::Builtin(b) if b.name == "isinstance"
+                && crate::descr_registry::module_of_builtin(b).is_none())
+        {
+            return None;
+        }
+        let Object::Code(code) = &state[0] else {
+            return None;
+        };
+        // Reuse the Python helper's literal, including its identity when an
+        // unusual key observes the operand passed to __eq__.
+        let type_key = crate::code_const_objects(code)
+            .iter()
+            .find(|value| matches!(value, Object::Str(name) if &**name == "_type"))
+            .cloned()?;
+        Some(Builder {
+            state,
+            checks: [
+                Name::new("dict"),
+                Name::new("list"),
+                Name::new("isinstance"),
+            ],
+            registry: Name::new("_NODE_TYPES"),
+            setter: Name::new("setattr"),
+            recursive: Name::new("_build"),
+            type_key,
+            budget: 256,
+        })
+    }
+}
+
+/// A value in `dict` found without running code.
+fn peek(dict: &Rc<RefCell<DictData>>, text: &'static str) -> Option<Object> {
+    let probe = LeafNameProbe::new(text, crate::object::py_str_hash(text));
+    let dict = dict.borrow();
+    let value = dict.get(&probe);
+    if probe.saw_exotic() {
+        return None;
+    }
+    value.cloned()
+}
+
+/// Whether `ast.parse` may build the node instances itself while it
+/// parses (see [`super::ast_mod::Direct`]) instead of handing a spec to
+/// `module._from_spec`: the state to build with, when that call would
+/// reach the native walk with every node an ordinary one, so that
+/// nothing could tell the two apart.
+pub(crate) fn direct(vm: &Interpreter, module: &Object) -> Option<super::ast_mod::Direct> {
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let Object::Module(module) = module else {
+        return None;
     };
-    // Reuse the Python helper's literal, including its identity when an
-    // unusual key observes the operand passed to __eq__.
-    let Some(type_key) = crate::code_const_objects(code)
-        .iter()
-        .find(|value| matches!(value, Object::Str(name) if &**name == "_type"))
-        .cloned()
+    let Object::Tuple(direct) = peek(&module.dict, "_DIRECT_STATE")? else {
+        return None;
+    };
+    let [Object::Code(from_spec_code), new @ Object::StaticMethod(new_method), Object::Code(new_code)] =
+        &direct[..]
     else {
-        return vm.call(builder, std::slice::from_ref(spec), &[], globals);
+        return None;
     };
-    Builder {
-        state,
-        checks: [
-            Name::new("dict"),
-            Name::new("list"),
-            Name::new("isinstance"),
-        ],
-        registry: Name::new("_NODE_TYPES"),
-        setter: Name::new("setattr"),
-        recursive: Name::new("_build"),
-        type_key,
-        budget: 256,
+    // `_from_spec(spec)` is `_ast._build(spec, _build, _BUILD_STATE)`.
+    let Object::Function(from_spec) = peek(&module.dict, "_from_spec")? else {
+        return None;
+    };
+    if !Rc::ptr_eq(&from_spec.code.borrow(), from_spec_code)
+        || !Rc::ptr_eq(&from_spec.globals, &module.dict)
+    {
+        return None;
     }
-    .walk(vm, spec, builder, globals)
+    let Object::Module(native) = Name::new("_ast").peek(&from_spec)? else {
+        return None;
+    };
+    if native.name != "_ast"
+        || !matches!(peek(&native.dict, "_build")?, Object::Builtin(b) if b.name == "__vm:ast_build")
+    {
+        return None;
+    }
+    let builder = Name::new("_build").peek(&from_spec)?;
+    let Object::Tuple(state) = Name::new("_BUILD_STATE").peek(&from_spec)? else {
+        return None;
+    };
+    let native = Builder::new(&state[..])?;
+    let function = native.replaceable(vm, &builder)?;
+    if !native.ordinary_names(function) || !native.builtin_setter(function) {
+        return None;
+    }
+    let Object::Dict(registry) = native.registry.peek(function)? else {
+        return None;
+    };
+    // `cls.__new__(cls)` is `AST.__new__`: `object.__new__(cls)`.
+    let Object::Function(ast_new) = new_method.func() else {
+        return None;
+    };
+    let object = &crate::builtin_types::builtin_types().object_;
+    if !Rc::ptr_eq(&ast_new.code.borrow(), new_code)
+        || !matches!(Name::new("object").peek(&ast_new), Some(Object::Type(t)) if Rc::ptr_eq(&t, object))
+    {
+        return None;
+    }
+    Some(super::ast_mod::Direct::new(registry, new.clone()))
 }
 
 #[cfg(test)]

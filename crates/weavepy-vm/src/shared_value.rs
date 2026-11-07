@@ -899,6 +899,12 @@ impl SharedStr {
 /// [`small_table`]'s strings, built on first use.
 static SMALL_TABLE: std::sync::OnceLock<[SharedStr; 257]> = std::sync::OnceLock::new();
 
+/// The address of the single-character strings' table (each entry one
+/// word: the string's allocation), once it is built, for compiled code.
+pub(crate) fn small_table_addr() -> Option<usize> {
+    SMALL_TABLE.get().map(|t| t.as_ptr() as usize)
+}
+
 /// [`SharedStr::small`]'s strings: the 256 Latin-1 characters by code
 /// point, then the empty string.
 fn small_table() -> &'static [SharedStr; 257] {

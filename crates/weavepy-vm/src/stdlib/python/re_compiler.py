@@ -11,6 +11,7 @@
 """Internal support module for sre"""
 
 import _sre
+import marshal as _marshal
 from . import _parser
 from ._constants import *
 from ._casefix import _EXTRA_CASES
@@ -757,8 +758,47 @@ def dis(code):
     dis_(0, len(code))
 
 
+# WeavePy: a pattern's compiled program, kept across processes (see
+# `_sre._cache_get`, which invalidates it when this compiler changes).
+# A pattern that might warn as it parses (a possible nested set or set
+# operation) compiles every time, so that its warning still shows.
+_WARN_MARKS = ('[[', '--', '&&', '~~', '||')
+_WARN_MARKS_B = (b'[[', b'--', b'&&', b'~~', b'||')
+
+def _cache_key(p, flags):
+    t = type(p)
+    if t is str:
+        marks = _WARN_MARKS
+    elif t is bytes:
+        marks = _WARN_MARKS_B
+    else:
+        return None
+    for m in marks:
+        if m in p:
+            return None
+    try:
+        flags = int(flags)
+    except Exception:
+        return None
+    if flags & SRE_FLAG_DEBUG:
+        return None
+    return _marshal.dumps((t is str, p, flags))
+
 def compile(p, flags=0):
     # internal: convert pattern list to internal format
+
+    key = _cache_key(p, flags)
+    if key is not None:
+        hit = _sre._cache_get(key)
+        if hit is not None:
+            try:
+                state_flags, code, groups, groupindex, indexgroup = _marshal.loads(hit)
+            except Exception:
+                pass
+            else:
+                from . import _engine
+                return _engine.compile_pattern(
+                    p, flags | state_flags, code, groups, groupindex, indexgroup)
 
     if isstring(p):
         pattern = p
@@ -781,9 +821,17 @@ def compile(p, flags=0):
     # WeavePy: the matching engine core (_sre) is a pure-data backtracker;
     # the user-visible Pattern / Match objects live in the frozen
     # re._engine module (so callable re.sub, scanner, etc. stay in Python).
+    indexgroup = tuple(indexgroup)
+    if key is not None:
+        try:
+            _sre._cache_put(key, _marshal.dumps(
+                (p.state.flags, [int(c) for c in code], p.state.groups-1,
+                 groupindex, indexgroup)))
+        except Exception:
+            pass
     from . import _engine
     return _engine.compile_pattern(
         pattern, flags | p.state.flags, code,
         p.state.groups-1,
-        groupindex, tuple(indexgroup)
+        groupindex, indexgroup
         )

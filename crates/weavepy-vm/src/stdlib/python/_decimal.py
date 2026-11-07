@@ -93,20 +93,18 @@ try:
 except ImportError:
     DecimalTuple = lambda *args: args
 
-# Rounding. The C accelerator shares the interned rounding-mode string
-# objects with _pydecimal (test_decimal asserts `C.ROUND_UP is
-# P.ROUND_UP`), so alias the pure-Python module's constants instead of
-# spelling fresh literals.
-import _pydecimal as _pyd
-ROUND_DOWN = _pyd.ROUND_DOWN
-ROUND_HALF_UP = _pyd.ROUND_HALF_UP
-ROUND_HALF_EVEN = _pyd.ROUND_HALF_EVEN
-ROUND_CEILING = _pyd.ROUND_CEILING
-ROUND_FLOOR = _pyd.ROUND_FLOOR
-ROUND_UP = _pyd.ROUND_UP
-ROUND_HALF_DOWN = _pyd.ROUND_HALF_DOWN
-ROUND_05UP = _pyd.ROUND_05UP
-del _pyd
+# Rounding. The C accelerator shares the rounding-mode string objects
+# with _pydecimal (test_decimal asserts `C.ROUND_UP is P.ROUND_UP`): both
+# modules' literals are identifier-like constants, which the compiler
+# interns, so they are the same objects without importing _pydecimal.
+ROUND_DOWN = 'ROUND_DOWN'
+ROUND_HALF_UP = 'ROUND_HALF_UP'
+ROUND_HALF_EVEN = 'ROUND_HALF_EVEN'
+ROUND_CEILING = 'ROUND_CEILING'
+ROUND_FLOOR = 'ROUND_FLOOR'
+ROUND_UP = 'ROUND_UP'
+ROUND_HALF_DOWN = 'ROUND_HALF_DOWN'
+ROUND_05UP = 'ROUND_05UP'
 
 # Compatibility with the C version
 HAVE_THREADS = True

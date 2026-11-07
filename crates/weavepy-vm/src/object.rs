@@ -3741,6 +3741,10 @@ impl<'a> LeafProbe<'a> {
     #[inline(never)]
     fn other_hash(key: &Object) -> Option<i64> {
         Some(match key {
+            // An `int` subclass keeping `int`'s hash: its value's.
+            Object::Instance(i) if int_like_value(i).is_some() => {
+                py_hash_long_i64(int_like_value(i)?)
+            }
             Object::Instance(i)
                 if i.native.get().is_none()
                     && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
@@ -3756,6 +3760,9 @@ impl<'a> LeafProbe<'a> {
             {
                 py_hash_value(key)?
             }
+            // A tuple of those, `None`, `int`-like instances and such tuples
+            // (`re`'s `(LITERAL, 97)` and `(RANGE, (48, 57))`): the same.
+            Object::Tuple(t) if t.iter().all(|x| leaf_tuple_item(x, 0)) => py_hash_value(key)?,
             Object::Bytes(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
@@ -3775,6 +3782,98 @@ impl<'a> LeafProbe<'a> {
     #[inline]
     pub fn miss_is_exact(&self) -> bool {
         !self.foreign.get()
+    }
+}
+
+/// The value of an instance of an `int` subclass that keeps `int`'s
+/// `__hash__`, `__eq__` and `__ne__` (`re`'s `_NamedIntConstant` opcodes;
+/// not an `IntEnum` member, whose `Enum` defines `__hash__`): it hashes and
+/// compares as that value, running no Python code.
+#[inline]
+pub(crate) fn int_like_value(i: &crate::types::PyInstance) -> Option<i64> {
+    use crate::types::Dunder;
+    let Some(Object::Int(v)) = i.native.get() else {
+        return None;
+    };
+    let cls = i.cls_raw();
+    (cls.native_kind.get() == 0
+        && cls.c_ext_ptr.get() == 0
+        && cls.dunder(Dunder::Hash).builtin_owner()
+        && cls.dunder(Dunder::Eq).builtin_owner()
+        && cls.dunder(Dunder::Ne).builtin_owner())
+    .then_some(*v)
+}
+
+/// The value a machine `int`, or an instance of an `int` subclass that
+/// keeps `int`'s ordering (`__lt__`, `__le__`, `__gt__`, `__ge__`), orders
+/// by: `min(hi, MAXWIDTH)` of `re`'s opcodes runs no Python code.
+pub(crate) fn int_order_value(o: &Object) -> Option<i64> {
+    match o {
+        Object::Int(v) => Some(*v),
+        Object::Instance(i) => {
+            let Some(Object::Int(v)) = i.native.get() else {
+                return None;
+            };
+            let cls = i.cls_raw();
+            (cls.native_kind.get() == 0
+                && cls.c_ext_ptr.get() == 0
+                && cls.memo_verdict(crate::types::Verdict::IntOrder, "", || {
+                    let int = &crate::builtin_types::builtin_types().int_;
+                    ["__lt__", "__le__", "__gt__", "__ge__"].iter().all(|n| {
+                        cls.lookup_with_owner(n)
+                            .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, int))
+                    })
+                }))
+            .then_some(*v)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `o` may sit in a tuple key [`LeafProbe`] hashes and compares
+/// natively: a machine `int`, a `str`, `bytes`, `None`, an
+/// [`int_like_value`] instance, or a (shallowly nested) tuple of those.
+fn leaf_tuple_item(o: &Object, depth: u32) -> bool {
+    match o {
+        Object::Int(_) | Object::Str(_) | Object::Bytes(_) | Object::None => true,
+        Object::Instance(i) => int_like_value(i).is_some(),
+        Object::Tuple(t) => depth < 3 && t.iter().all(|x| leaf_tuple_item(x, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Item-by-item equality of two tuples as Python decides it, where every
+/// pairing settles natively (see [`leaf_tuple_item`]); `None` when one
+/// might need an `__eq__` (an equal `True` or `1.0`, say), or pairs an
+/// `int`-like instance with anything but itself.
+fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
+    let mut equal = true;
+    for (x, y) in a.iter().zip(b.iter()) {
+        equal &= match (x, y) {
+            (Object::Int(p), Object::Int(q)) => p == q,
+            (Object::Str(p), Object::Str(q)) => p.as_bytes() == q.as_bytes(),
+            (Object::Bytes(p), Object::Bytes(q)) => p[..] == q[..],
+            (Object::None, Object::None) => true,
+            (Object::Instance(p), Object::Instance(q)) if Rc::ptr_eq(p, q) => true,
+            (Object::Tuple(p), Object::Tuple(q)) if depth < 3 => {
+                p.len() == q.len() && leaf_tuples_eq(p, q, depth + 1)?
+            }
+            // (An `int`-like instance inside a tuple equals only itself
+            // here: the native `lru_cache` trusts a native match not to be
+            // a subclass's, whose stored owner it guards.)
+            _ => return None,
+        };
+    }
+    Some(equal)
+}
+
+/// A machine `int`'s value, or an [`int_like_value`] instance's.
+#[inline]
+fn int_like(o: &Object) -> Option<i64> {
+    match o {
+        Object::Int(v) => Some(*v),
+        Object::Instance(i) => int_like_value(i),
+        _ => None,
     }
 }
 
@@ -3836,6 +3935,13 @@ impl LeafProbe<'_> {
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
+            // `int`'s equality, which an `int` subclass that keeps it shares
+            // (`re`'s opcodes against each other and against plain ints).
+            (Object::Instance(_) | Object::Int(_), Object::Instance(_) | Object::Int(_))
+                if int_like(self.key).is_some() && int_like(&key.0).is_some() =>
+            {
+                int_like(self.key) == int_like(&key.0)
+            }
             (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
             (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
             (Object::Generator(a), Object::Generator(b))
@@ -3846,19 +3952,13 @@ impl LeafProbe<'_> {
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
-                let mut equal = true;
-                for (x, y) in a.iter().zip(b.iter()) {
-                    match (x, y) {
-                        (Object::Int(p), Object::Int(q)) => equal &= p == q,
-                        (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
-                        (Object::Bytes(p), Object::Bytes(q)) => equal &= p[..] == q[..],
-                        _ => {
-                            self.foreign.set(true);
-                            return false;
-                        }
+                match leaf_tuples_eq(a, b, 0) {
+                    Some(equal) => equal,
+                    None => {
+                        self.foreign.set(true);
+                        false
                     }
                 }
-                equal
             }
             _ => {
                 self.foreign.set(true);
@@ -4546,6 +4646,9 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    if let Some(found) = leaf_hashed_instance_get(d, key) {
+        return Ok(found);
+    }
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
@@ -4555,6 +4658,32 @@ pub(crate) fn dict_reentrant_get(
                 .map(|(_, v)| v.clone()))
         }
         None => Ok(None),
+    }
+}
+
+/// [`dict_reentrant_get`] of an instance whose class's Python `__hash__`
+/// evaluates as a pure leaf (see `Interpreter::leaf_instance_hash`), found
+/// only as itself, as CPython's probe tries identity before `__eq__`: the
+/// stored value, or (`Some(None)`) none when no stored key shared its hash.
+/// `None` when another key with that hash would need `__eq__`, or the hash
+/// isn't settled natively.
+pub(crate) fn leaf_hashed_instance_get(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Option<Option<Object>> {
+    if !matches!(key, Object::Instance(_)) {
+        return None;
+    }
+    // SAFETY: the running thread's interpreter, under the GIL; the
+    // evaluation runs no Python and takes no frame.
+    let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+    let hash = interp.leaf_instance_hash(key)?;
+    let probe = LeafProbe::with_hash(key, hash);
+    let m = d.try_borrow().ok()?;
+    match m.get_index_of(&probe) {
+        Some(i) => Some(m.get_index(i).map(|(_, v)| v.clone())),
+        None if probe.miss_is_exact() => Some(None),
+        None => None,
     }
 }
 
@@ -14488,11 +14617,11 @@ impl Object {
     /// stored string with stable identity — e.g. `cls.__name__`, which
     /// `inspect.classify_class_attrs` compares with `is`.
     pub fn interned_str(s: &str) -> Self {
-        use std::collections::HashSet;
+        use crate::fasthash::FxHashSet;
         use std::sync::{Mutex, OnceLock};
         // The canonical string is also the key; don't duplicate its text.
-        static TABLE: OnceLock<Mutex<HashSet<SharedStr>>> = OnceLock::new();
-        let table = TABLE.get_or_init(|| Mutex::new(HashSet::new()));
+        static TABLE: OnceLock<Mutex<FxHashSet<SharedStr>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(FxHashSet::default()));
         let mut t = table.lock().unwrap();
         if let Some(rc) = t.get(s) {
             return Object::Str(rc.clone());

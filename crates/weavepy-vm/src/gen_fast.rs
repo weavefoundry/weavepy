@@ -573,6 +573,8 @@ impl Interpreter {
                         clean: false,
                         wait_pc: usize::MAX,
                         wait_pending: None,
+                        outer_lazy: 0,
+                        fold: fold.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
                     });
                     nst.len = len;
                     nst.pc = pc;
@@ -924,6 +926,8 @@ impl Interpreter {
             clean: false,
             wait_pc: usize::MAX,
             wait_pending: None,
+            outer_lazy: 0,
+            fold: std::ptr::null(),
         };
         // SAFETY: the body's activation state, as `gen_fast_step` holds it.
         let status = unsafe { native.run(&mut st) };

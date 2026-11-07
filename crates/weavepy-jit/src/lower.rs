@@ -1,9 +1,9 @@
-//! Lower the typed IR ([`TFunc`]) to a Cranelift function.
+//! Lower the typed IR ([`TFunc`]) to a `weavepy-codegen` function.
 //!
-//! Locals become Cranelift *variables* (the SSA builder inserts phis at
+//! Locals become *variables* (the SSA builder inserts phis at
 //! merges); the operand stack is an explicit `Vec` of SSA values.
 //! Cross-block operand values (RFC 0069 WS2 — ternaries, short-circuit
-//! chains) are carried as Cranelift *block parameters*: each block
+//! chains) are carried as *block parameters*: each block
 //! declares one param per [`crate::ir::TBlock::entry_stack`] lane and
 //! every jump/branch passes the live stack as block arguments. Integer
 //! arithmetic is emitted with explicit overflow / divide-by-zero checks
@@ -11,13 +11,11 @@
 //! locals + spilled stack back into the [`JitFrame`] and returns
 //! [`JitStatus::Deopt`] so the interpreter resumes at the exact pc.
 
-use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    types, AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, SigRef, Signature,
-    StackSlot, StackSlotData, StackSlotKind, Type, Value,
+use weavepy_codegen::ir::condcodes::{FloatCC, IntCC};
+use weavepy_codegen::{
+    types, AbiParam, Block, BlockArg, FuncRef, Function, FunctionBuilder, MemFlags, SigRef,
+    Signature, StackSlot, StackSlotData, StackSlotKind, Type, Value, Variable,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use crate::engine::{FieldAt, InlineMethod};
 use crate::ir::{ArithKind, CmpKind, MathFunc, MethodRet, SliceOrigin, TFunc, TOp, TStmt, TTerm};
@@ -83,19 +81,18 @@ struct SiteCall {
     gaps: u32,
 }
 
-/// Build the Cranelift function body for `tfunc` into `func`; `false` when
+/// Build the function body for `tfunc` into `func`; `false` when
 /// the body assigned a local the write-back plan missed (the build must be
 /// discarded).
 pub(crate) fn build_function(
     func: &mut Function,
-    fbctx: &mut FunctionBuilderContext,
     tfunc: &TFunc,
     ptr_ty: Type,
     self_func: Option<FuncRef>,
     leaves: Vec<LeafTarget>,
     inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
 ) -> bool {
-    let mut builder = FunctionBuilder::new(func, fbctx);
+    let mut builder = FunctionBuilder::new(func);
     let mut lc = Lowerer::new(&mut builder, tfunc, ptr_ty);
     lc.self_func = self_func;
     lc.leaves = leaves;
@@ -111,7 +108,7 @@ struct Lowerer<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     tfunc: &'a TFunc,
     ptr_ty: Type,
-    /// One Cranelift block per (reachable) TBlock.
+    /// One block per (reachable) TBlock.
     cl_blocks: Vec<Block>,
     /// One variable per managed local slot (others unused).
     vars: Vec<Option<Variable>>,
@@ -384,7 +381,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .load(self.ptr_ty, trusted, self.frame_ptr, OFF_CALL_TAGS);
         }
 
-        // One Cranelift block per TBlock, with one block parameter per
+        // One block per TBlock, with one block parameter per
         // entry-stack lane (RFC 0069 WS2).
         self.cl_blocks = Vec::with_capacity(self.tfunc.blocks.len());
         for tb in &self.tfunc.blocks {
@@ -3688,7 +3685,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
         let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
         let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
-        let body = self.b.ins().load(ptr, t, inst, l.inst_c_body);
+        let body = self.b.ins().uload8(ptr, t, inst, l.inst_c_body);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, t, flag, 0);
         let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
@@ -5053,7 +5050,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     /// The member slots of the instance at `inst` (its payload pointer),
     /// as the embedder lays them out (see
-    /// [`runtime::ObjLayout::slots_laid_out`]): their values' pointer, and
+    /// [`runtime::ObjLayout::inst_slots`]): their values' pointer, and
     /// whether they're unusable here (borrowed for a write, or at all when
     /// not `read`, or not laid out over the layout whose address is
     /// `layout`). The caller checks that cells are unshared.
@@ -5066,18 +5063,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ) -> (Value, Value) {
         let t = MemFlags::trusted();
         let borrow = self.b.ins().sload32(t, inst, l.inst_slots_borrow);
-        let form = self.b.ins().uload8(types::I32, t, inst, l.inst_slots_tag);
-        let names = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_layout);
-        let vals = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_values);
+        let word = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots);
+        let form = self.b.ins().band_imm(word, 7);
+        let names = self.b.ins().load(self.ptr_ty, t, word, 0);
+        let vals = self.b.ins().iadd_imm(word, i64::from(l.slots_values));
         let busy = if read {
             self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
         } else {
             self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
         };
-        let other = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, form, 0);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
         let bad = self.b.ins().bor(busy, other);
         let bad = self.b.ins().bor(bad, foreign);

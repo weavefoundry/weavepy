@@ -435,6 +435,98 @@ pub fn clear() {
     CACHE.with(|c| c.borrow_mut().clear());
 }
 
+// ---------------------------------------------------------------------
+// Keyed results beside the frozen code (a regular expression's compiled
+// program, see `_sre._cache_get`): what a pure-Python compiler made from
+// its input, kept so a later process takes it instead of compiling again.
+//
+// Layout: `<cache_dir>/weavepy/<kind>-<CACHE_TAG>-<tag>/<key hash>`, where
+// `tag` names the compiler's own version (its sources' hashes), holding the
+// magic `WPYR`, the key's and the value's lengths, the key itself (a hash
+// collision is a miss) and the value.
+
+const RESULT_MAGIC: &[u8; 4] = b"WPYR";
+
+/// FNV-1a over `bytes` (a stable hash: artifacts outlive the process).
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+fn result_path(kind: &str, tag: u64, key: &[u8]) -> Option<PathBuf> {
+    let dir = disk_dir()?
+        .parent()?
+        .join(format!("{kind}-{}-{tag:016x}", crate::pycache::CACHE_TAG));
+    Some(dir.join(format!("{:016x}", stable_hash(key))))
+}
+
+/// The value stored for `key` among `kind`'s results of the compiler
+/// version `tag`, if any (a damaged or colliding artifact is a miss).
+pub fn result_get(kind: &str, tag: u64, key: &[u8]) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(result_path(kind, tag, key)?).ok()?;
+    let word = |at: usize| -> Option<usize> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize)
+    };
+    if bytes.get(0..4)? != RESULT_MAGIC {
+        return None;
+    }
+    let (klen, vlen) = (word(4)?, word(8)?);
+    if bytes.len() != 12 + klen + vlen || &bytes[12..12 + klen] != key {
+        return None;
+    }
+    Some(bytes[12 + klen..].to_vec())
+}
+
+/// The most results one process stores, and the most a kind's directory
+/// takes: a program that builds its patterns from its input (a pattern per
+/// word it escapes) would otherwise fill the disk with ones never seen
+/// again.
+const RESULT_PUTS_PER_PROCESS: u32 = 256;
+const RESULT_DIR_ENTRIES: usize = 4096;
+
+/// Store `value` for `key` among `kind`'s results of the compiler version
+/// `tag` (best effort: a failed write leaves nothing behind).
+pub fn result_put(kind: &str, tag: u64, key: &[u8], value: &[u8]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static PUTS: AtomicU32 = AtomicU32::new(0);
+    static FULL: OnceLock<bool> = OnceLock::new();
+    if PUTS.fetch_add(1, Ordering::Relaxed) >= RESULT_PUTS_PER_PROCESS {
+        return;
+    }
+    let Some(path) = result_path(kind, tag, key) else {
+        return;
+    };
+    // (Counted once a process: the cap is approximate across processes.)
+    let full = *FULL.get_or_init(|| {
+        path.parent()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .is_some_and(|d| d.count() >= RESULT_DIR_ENTRIES)
+    });
+    if full {
+        return;
+    }
+    let (Ok(klen), Ok(vlen)) = (u32::try_from(key.len()), u32::try_from(value.len())) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut bytes = Vec::with_capacity(12 + key.len() + value.len());
+    bytes.extend_from_slice(RESULT_MAGIC);
+    bytes.extend_from_slice(&klen.to_le_bytes());
+    bytes.extend_from_slice(&vlen.to_le_bytes());
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(value);
+    // As `write_disk`: a reader never sees a partial artifact.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -410,6 +410,16 @@ pub(crate) fn object_cell_offsets() -> (usize, usize) {
     )
 }
 
+/// A list's `GilCell` (around its vector): its borrow counter's and
+/// vector's byte offsets, for compiled code.
+pub(crate) fn list_cell_offsets() -> (usize, usize) {
+    type Cell = GilCell<Vec<crate::object::Object>>;
+    (
+        std::mem::offset_of!(Cell, borrow),
+        std::mem::offset_of!(Cell, data),
+    )
+}
+
 /// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
 /// nonzero once cells are shared between threads).
 pub(crate) fn cells_unguarded_flag() -> *const bool {
@@ -444,6 +454,11 @@ pub(crate) fn release_gates() -> u32 {
     // says why that's sound): the observers' flags are set between
     // operations, by the thread that then observes.
     unsafe { std::ptr::from_ref(&RELEASE_GATES).cast::<u32>().read() }
+}
+
+/// The word [`release_gates`] reads, for native code that reads it in line.
+pub(crate) fn release_gates_ptr() -> *const u32 {
+    std::ptr::from_ref(&RELEASE_GATES).cast::<u32>()
 }
 
 /// The [`release_gates`] bits of the release observers alone (every flag
@@ -519,18 +534,20 @@ fn biased_here() -> bool {
     if cells_shared() {
         return false;
     }
-    // Debug builds -- which is what the unit-test binary is -- keep the
-    // identity check as a *steer*: that binary runs many VM threads at
-    // once with no GIL between them (every test is its own interpreter),
-    // so the invariant above does not hold there, and only the first
-    // registered thread may take the lock-free path. A release build has
-    // one VM thread under the GIL and pays nothing.
-    #[cfg(debug_assertions)]
+    // Debug and test builds keep the identity check as a *steer*: the
+    // unit-test binary (optimized or not) runs many VM threads at once
+    // with no GIL between them (every test is its own interpreter), so the
+    // invariant above does not hold there, and only the first registered
+    // thread may take the lock-free path. (Without it, two threads' plain
+    // updates of `SOLE_GUARDS` can lose one, and the next thread to
+    // register spins in `revoke_bias` forever, holding the GIL.) A release
+    // build has one VM thread under the GIL and pays nothing.
+    #[cfg(any(debug_assertions, test))]
     {
         let first = FIRST.load(Ordering::Relaxed);
         first != 0 && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, test)))]
     {
         true
     }
