@@ -832,6 +832,11 @@ branch and pull request.
     used (a program that never shares cells never registers): `startup.py`
     takes 11.4 ms instead of 32.7 in the container (CPython 11.5), against
     12 ms of CPU either way. CI's bench gate read 13.6 ms against 10.4.
+  - `str % dict` whose one conversion is a bare `%r` or `%s` (the dict
+    itself is the value: `logger.error("error: %r", {"i": i})`, which
+    `LogRecord.getMessage` formats) renders the dict's repr natively when
+    its keys and values are plain, instead of leaving compiled code:
+    `logging_mix` runs 2.4% fewer instructions.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

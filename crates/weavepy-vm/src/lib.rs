@@ -77379,6 +77379,47 @@ fn percent_leaf_args(args: &Object) -> bool {
 /// `None` value, found by exact native lookup: the rendered text, or
 /// `None` (nothing run) for any other shape, which can run Python code
 /// (a value's `__str__`, a key's `__eq__`) or raise.
+/// [`percent_format_leaf_mapping`] of a template whose one conversion is a
+/// bare `%r` or `%s` (with no flags, width or precision), over the dict
+/// `value` whose keys and values are all `str`, `int`, `float`, `bool` or
+/// `None`: the template with the dict's repr in that place. `None` for
+/// anything else.
+fn percent_render_whole_dict(
+    template: &str,
+    map: &crate::object::DictData,
+    value: &Object,
+) -> Option<String> {
+    let bytes = template.as_bytes();
+    let mut at = None;
+    let mut i = 0;
+    while let Some(off) = memchr::memchr(b'%', &bytes[i..]) {
+        let k = i + off + 1;
+        match bytes.get(k)? {
+            b'%' => i = k + 1,
+            b'r' | b's' if at.is_none() => {
+                at = Some(k - 1);
+                i = k + 1;
+            }
+            _ => return None,
+        }
+    }
+    let at = at?;
+    let plain = |o: &Object| {
+        matches!(
+            o,
+            Object::Str(_) | Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+        )
+    };
+    if !map.iter().all(|(k, v)| plain(&k.0) && plain(v)) {
+        return None;
+    }
+    let unescape = |t: &str| t.replace("%%", "%");
+    let mut out = unescape(&template[..at]);
+    out.push_str(&value.repr());
+    out.push_str(&unescape(&template[at + 2..]));
+    Some(out)
+}
+
 fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String> {
     let Object::Dict(d) = value else {
         return None;
@@ -77388,6 +77429,12 @@ fn percent_format_leaf_mapping(template: &str, value: &Object) -> Option<String>
     // The plain shape (`logging`'s `%(asctime)s %(levelname)s ...`), in
     // one pass.
     if let Some(out) = percent_render_plain(template, PercentArgs::Mapping(&map)) {
+        return Some(out);
+    }
+    // One bare `%r` or `%s`, which consumes the dict itself (`logging`'s
+    // `logger.error("error: %r", {"i": i})`): its repr, when every key and
+    // value renders natively.
+    if let Some(out) = percent_render_whole_dict(template, &map, value) {
         return Some(out);
     }
     let mut i = 0;
