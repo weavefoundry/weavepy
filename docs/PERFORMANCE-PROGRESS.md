@@ -810,8 +810,20 @@ branch and pull request.
       reallocation (127 million instructions instead of 164; `main` 131).
     - A constructor's leaf `__init__` runs its plan's native code, as any
       effect leaf's does (its stores buffered, landing at the end), instead
-      of always the plan interpreter: `float_math` runs 718 million
-      instructions instead of 800 (`main` 706).
+      of always the plan interpreter, when the plan calls something:
+      `float_math` runs 718 million instructions instead of 800 (`main`
+      706). (A constructor that only computes and stores stays
+      interpreted, where its stores land at once: buffering them made
+      `mini_interpreter`'s `BinOp.__init__` 2% dearer.)
+  - A class's constant read off a class value (`BinaryConstraint.FORWARD`
+    in `deltablue`, the receiver on the stack) is answered from the site's
+    memo by `h_attr_stack` itself, and the memo fills before the core
+    loop's stamp is tried: `deltablue` runs 6% fewer instructions.
+  - The in-line release, dict probe and `len` go only where code is likely
+    hot: anywhere in a body of up to 160 instructions, else inside a loop.
+    Every site's extra code cost `class_creation`, which compiles large
+    cold functions (`namedtuple`, `inspect.signature`), 4% more
+    instructions; this takes back a third of that.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

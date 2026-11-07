@@ -1643,6 +1643,46 @@ struct SeqLayout {
     tuple_counted: bool,
 }
 
+/// Whether the in-line paths a cold straight-line body would only pay to
+/// compile go at `pc` of `code`: anywhere in a small body (a hot leaf, a
+/// recursive helper), else inside a loop (between a `JUMP_BACKWARD` and
+/// its target). Memoized for the last few codes compiled (an entry another
+/// code later reuses the address of only moves that choice).
+fn in_loop(code: &CodeObject, pc: usize) -> bool {
+    /// The largest body whose every instruction counts as hot.
+    const SMALL_BODY: usize = 160;
+    if code.instructions.len() <= SMALL_BODY {
+        return true;
+    }
+    type Entry = (usize, usize, Rc<[bool]>);
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (std::ptr::from_ref(code) as usize, code.instructions.len());
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some((_, _, map)) = m.iter().find(|(p, n, _)| (*p, *n) == key) {
+            return map.get(pc).copied().unwrap_or(false);
+        }
+        let mut map = vec![false; code.instructions.len()];
+        for (j, ins) in code.instructions.iter().enumerate() {
+            if ins.op == OpCode::JumpBackward {
+                let target = (j + 1).saturating_sub(ins.arg as usize);
+                for x in &mut map[target.min(j)..=j] {
+                    *x = true;
+                }
+            }
+        }
+        let map: Rc<[bool]> = map.into();
+        let hit = map.get(pc).copied().unwrap_or(false);
+        if m.len() >= 8 {
+            m.remove(0);
+        }
+        m.push((key.0, key.1, map));
+        hit
+    })
+}
+
 /// Where an iterator value's state is, from its payload word (its `Rc`'s
 /// allocation): the cell's borrow counter, the iterator's discriminant
 /// byte and the values it takes for a list's and a range's iterator, and
@@ -7594,10 +7634,15 @@ unsafe fn attr_miss_quick(
     // SAFETY: the caller's contract.
     unsafe {
         match recv {
-            Object::Type(cls) if local || Rc::strong_count(cls) > 1 => (*site.ext)
-                .stamp_slot(site.pc as usize)
-                .and_then(|s| crate::class_attr_hit(s, cls))
-                .or_else(|| type_attr_read(site, cls)),
+            // (The site's memo first: it fills on the first read, and
+            // `h_attr_stack` answers from it without coming here.)
+            Object::Type(cls) if local || Rc::strong_count(cls) > 1 => {
+                type_attr_read(site, cls).or_else(|| {
+                    (*site.ext)
+                        .stamp_slot(site.pc as usize)
+                        .and_then(|s| crate::class_attr_hit(s, cls))
+                })
+            }
             Object::Instance(inst) if local || droppable(recv) => {
                 if let Some(d) = inst_dict_read(site, inst) {
                     return Some(d);
@@ -7931,15 +7976,18 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
     unsafe {
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
-        if let Object::Instance(inst) = &*at {
-            if let Some(v) = field_hit(s, inst) {
-                let v = crate::clone_hot(v);
-                if plain_release(&*at) {
-                    at.write(v);
-                    return 0;
-                }
-                drop(v);
+        let v = match &*at {
+            Object::Instance(inst) => field_hit(s, inst).map(|v| crate::clone_hot(v)),
+            // A class's constant the site memoized (`Direction.FORWARD`).
+            Object::Type(cls) => type_attr_memo(s, cls),
+            _ => None,
+        };
+        if let Some(v) = v {
+            if plain_release(&*at) {
+                at.write(v);
+                return 0;
             }
+            drop(v);
         }
         attr_stack_slow(st, site)
     }
@@ -8012,6 +8060,20 @@ unsafe fn builtin_attr_read(
 /// and its version are the ones it was read under, else looked up (in
 /// the class's own dict for `__doc__`, as `type`'s descriptor reads it)
 /// and remembered. `None` for anything else (the full lookup's then).
+/// [`type_attr_read`]'s memo alone: the atom the site holds for `cls` at
+/// its current version.
+#[inline]
+fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
+    let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
+    let memo = site.type_attr.try_borrow().ok()?;
+    match memo.as_ref()? {
+        (mp, mver, v) if *mp == p && *mver == ver && ver != 0 && !matches!(v, Object::Unbound) => {
+            Some(crate::clone_hot(v))
+        }
+        _ => None,
+    }
+}
+
 fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
     if let Ok(memo) = site.type_attr.try_borrow() {
@@ -15963,11 +16025,14 @@ impl<'a> Lower<'a> {
                         let done = self.b.create_block();
                         self.b.ins().brif(scalar, done, &[], heap, &[]);
                         self.b.switch_to_block(heap);
-                        // (Another owner keeping it: a plain decrement.)
-                        let helper = self.b.create_block();
-                        self.plain_release_in_line(at, done, helper);
-                        self.b.set_cold_block(helper);
-                        self.b.switch_to_block(helper);
+                        // (Another owner keeping it, in a loop: a plain
+                        // decrement.)
+                        if in_loop(self.code, pc) {
+                            let helper = self.b.create_block();
+                            self.plain_release_in_line(at, done, helper);
+                            self.b.set_cold_block(helper);
+                            self.b.switch_to_block(helper);
+                        }
                         let site = SlotWord::new(0, s, pc, self.last_pc);
                         let w = self.b.ins().iconst(types::I64, site.0 as i64);
                         let r = self
@@ -17263,8 +17328,8 @@ impl<'a> Lower<'a> {
     /// `done`.
     fn store_from_slot(&mut self, pc: usize, i: u32, slot: usize, done: Block) {
         // The old value's reference given up in line when another owner
-        // keeps it (see `plain_release`).
-        if !self.inlining() {
+        // keeps it (see `plain_release`), in a loop.
+        if !self.inlining() && in_loop(self.code, pc) {
             let local = self.local_addr(i);
             let src = self.slot_addr(slot);
             let fast = self.b.create_block();
@@ -18012,6 +18077,7 @@ impl<'a> Lower<'a> {
         use weavepy_compiler::InlineCache as IC;
         let l = self.tags.dict_layout?;
         if cfg!(debug_assertions)
+            || !in_loop(self.code, pc)
             || !matches!(self.code.caches.get(pc as u32), IC::Empty | IC::SubscrDict)
         {
             return None;
@@ -20030,7 +20096,7 @@ impl<'a> Lower<'a> {
             return None;
         };
         let (f, kind, _) = crate::call_site_builtin(self.ext, pc)?;
-        if kind != Some(crate::LeafKind::Len) {
+        if kind != Some(crate::LeafKind::Len) || !in_loop(self.code, pc) {
             return None;
         }
         let sample = Object::Builtin(f.clone());

@@ -257,6 +257,8 @@ pub(crate) struct LeafPlan {
     /// reassigned), each to a different name: the buffered stores share
     /// one receiver and each is the latest to its attribute.
     unique_stores: bool,
+    /// The plan calls something (a `Call` operation).
+    calls: bool,
     /// Evaluations so far, toward compiling the plan (see [`jit`]).
     #[cfg(feature = "jit")]
     runs: std::sync::atomic::AtomicU32,
@@ -738,7 +740,9 @@ impl Builder<'_> {
                 _ => return None,
             }
         }
+        let calls = self.ops.iter().any(|op| matches!(op, Op::Call { .. }));
         Some(LeafPlan {
+            calls,
             ops: self.ops.into_boxed_slice(),
             consts: self.consts.into_boxed_slice(),
             nargs: u8::try_from(crate::leaf_arity(self.code)).ok()?,
@@ -1084,12 +1088,15 @@ impl Interpreter {
             return None;
         }
         // A warm plan runs as native code (a getter's evaluation stays
-        // here). A constructor's runs as any effect leaf's: its stores are
-        // buffered and land at the end, so a decline leaves the fresh
-        // instance untouched (the caller discards it anyway), and a read of
-        // a buffered field answers through the general read.
+        // here). A constructor's that calls something runs as any effect
+        // leaf's: its stores are buffered and land at the end, so a decline
+        // leaves the fresh instance untouched (the caller discards it
+        // anyway), and a read of a buffered field answers through the
+        // general read. One that only computes and stores runs here, where
+        // its stores land at once (buffering them costs more than the
+        // native code saves).
         #[cfg(feature = "jit")]
-        if !GETTER {
+        if !GETTER && (!FRESH || plan.calls) {
             if let Some(r) = jit::run::<EFFECT>(self, code, ext, plan, f, args, nest) {
                 return r;
             }
