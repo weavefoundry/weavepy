@@ -624,6 +624,11 @@ branch and pull request.
     doesn't shadow the name. A scalar's read costs 231 instructions a call
     instead of 511, and `logging`'s `warning(msg, *args, **kwargs)` shape
     3,637 instead of 4,290.
+  - `==` and `!=` whose operands are locals or constants, past the
+    numbers compared in line, compare two exact strings where they lie
+    through a helper that takes no reference: the generic compare site
+    copied both operands to the stack and released them after. `tomllib`'s `char == "["` tests take 4.1% of its
+    instructions off.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

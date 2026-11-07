@@ -5132,6 +5132,21 @@ unsafe extern "C" fn h_contains_ref(
     }
 }
 
+/// `a == b` of two `str`s read in place where they lie (a local's or a
+/// constant's): `0` or `1`; `2` for any other pair, which the generic
+/// compare decides.
+unsafe extern "C" fn h_str_eq_ref(a: *const Object, b: *const Object) -> u32 {
+    // SAFETY: the code passes two initialized values.
+    unsafe {
+        match (&*a, &*b) {
+            (Object::Str(x), Object::Str(y)) => u32::from(
+                crate::shared_value::SharedStr::ptr_eq(x, y) || x.as_bytes() == y.as_bytes(),
+            ),
+            _ => 2,
+        }
+    }
+}
+
 /// `BINARY_SUBSCR` (the `pc`th instruction `ins` of `code`) on a stack
 /// `len` deep whose top two slots are the container's and key's (each
 /// owned there, by the bits of `flags`, or a local's or constant's at
@@ -17661,6 +17676,31 @@ impl<'a> Lower<'a> {
     ) {
         self.b.switch_to_block(other);
         let dunder = crate::instance_site(self.ext, pc);
+        // An equality of two exact strings read where they lie (a local's
+        // or a constant's), before anything is copied for the site.
+        let kind = (arg & !COMPARE_OP_TO_BOOL_FLAG) as u8;
+        let eq = kind == CompareKind::Eq as u8;
+        let in_place = |i: &Item| matches!(i, Item::Local(_) | Item::Const(_));
+        if (eq || kind == CompareKind::NotEq as u8) && in_place(&ai) && in_place(&bi) && !dunder {
+            let addr = |s: &mut Self, i: Item| match i {
+                Item::Local(l) => s.local_addr(l),
+                Item::Const(k) => s.const_addr(k),
+                _ => unreachable!("in place"),
+            };
+            let (pa, pb) = (addr(self, ai), addr(self, bi));
+            let r = self
+                .call(h_str_eq_ref as *const () as usize, &[pa, pb], true)
+                .expect("returns");
+            let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
+            let ready = self.b.create_block();
+            let generic = self.b.create_block();
+            self.b.ins().brif(declined, generic, &[], ready, &[]);
+            self.b.switch_to_block(ready);
+            let cc = if eq { IntCC::NotEqual } else { IntCC::Equal };
+            let t = self.b.ins().icmp_imm(cc, r, 0);
+            self.b.ins().jump(done, &[t.into()]);
+            self.b.switch_to_block(generic);
+        }
         let c = self.operand_site(pc, arg, ai, bi, dunder);
         let r = self
             .call(h_compare_site as *const () as usize, &[self.st, c], true)
