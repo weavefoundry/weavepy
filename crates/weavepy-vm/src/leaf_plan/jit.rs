@@ -1176,14 +1176,12 @@ impl Lower<'_> {
     ) -> (Value, Value) {
         let f = MemFlags::trusted();
         let borrow = self.b.ins().sload32(f, inst, l.inst_slots_borrow);
-        let form = self.b.ins().uload8(types::I32, f, inst, l.inst_slots_tag);
-        let names = self.b.ins().load(self.ptr, f, inst, l.inst_slots_layout);
-        let vals = self.b.ins().load(self.ptr, f, inst, l.inst_slots_values);
+        let word = self.b.ins().load(self.ptr, f, inst, l.inst_slots);
+        let form = self.b.ins().band_imm(word, 7);
+        let names = self.b.ins().load(self.ptr, f, word, 0);
+        let vals = self.b.ins().iadd_imm(word, i64::from(l.slots_values));
         let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-        let other = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, form, 0);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
         let bad = self.b.ins().bor(busy, other);
         let bad = self.b.ins().bor(bad, foreign);

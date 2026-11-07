@@ -443,10 +443,25 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
         ..FutState::default()
     }));
     let handle = registry().borrow_mut().insert(st.clone());
-    inst.slots
-        .borrow_mut()
-        .insert(HANDLE_KEY, Object::Int(handle));
+    let mut slots = inst.slots.borrow_mut();
+    if slots.is_empty_default() {
+        // (The usual case: laid out alone, the handle needs no key of its
+        // own, and `handle_of` reads it without comparing names.)
+        *slots = crate::types::SlotStorage::from_layout(
+            handle_layout().clone(),
+            vec![Object::Int(handle)],
+        );
+    } else {
+        slots.insert(HANDLE_KEY, Object::Int(handle));
+    }
     st
+}
+
+/// The slot layout of a future that holds nothing but its handle.
+fn handle_layout() -> &'static crate::shared_value::SharedSlice<DictKey> {
+    static LAYOUT: std::sync::OnceLock<crate::shared_value::SharedSlice<DictKey>> =
+        std::sync::OnceLock::new();
+    LAYOUT.get_or_init(|| vec![DictKey(crate::stdlib::sys::intern_name(HANDLE_KEY))].into())
 }
 
 /// [`HANDLE_KEY`], interned: the slot key shares its storage, so the
@@ -462,9 +477,15 @@ fn handle_key() -> &'static str {
 /// The registry handle stored on `inst`, if a state is attached.
 #[inline]
 fn handle_of(inst: &PyInstance) -> Option<i64> {
-    let read = |slots: &crate::types::SlotStorage| match slots.get_hinted(0, handle_key()) {
-        Some(Object::Int(h)) => Some(*h),
-        _ => None,
+    let read = |slots: &crate::types::SlotStorage| {
+        let slot = match slots.values_for_layout(handle_layout()) {
+            Some(values) => values.first(),
+            None => slots.get_hinted(0, handle_key()),
+        };
+        match slot {
+            Some(Object::Int(h)) => Some(*h),
+            _ => None,
+        }
     };
     // SAFETY: a read of one slot that runs no code.
     if let Some(slots) = unsafe { inst.slots.peek() } {

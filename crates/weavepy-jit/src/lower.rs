@@ -3685,7 +3685,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
         let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
         let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
-        let body = self.b.ins().load(ptr, t, inst, l.inst_c_body);
+        let body = self.b.ins().uload8(ptr, t, inst, l.inst_c_body);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, t, flag, 0);
         let watchers = self.b.ins().iconst(ptr, l.dict_watchers as i64);
@@ -5050,7 +5050,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     /// The member slots of the instance at `inst` (its payload pointer),
     /// as the embedder lays them out (see
-    /// [`runtime::ObjLayout::slots_laid_out`]): their values' pointer, and
+    /// [`runtime::ObjLayout::inst_slots`]): their values' pointer, and
     /// whether they're unusable here (borrowed for a write, or at all when
     /// not `read`, or not laid out over the layout whose address is
     /// `layout`). The caller checks that cells are unshared.
@@ -5063,18 +5063,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ) -> (Value, Value) {
         let t = MemFlags::trusted();
         let borrow = self.b.ins().sload32(t, inst, l.inst_slots_borrow);
-        let form = self.b.ins().uload8(types::I32, t, inst, l.inst_slots_tag);
-        let names = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_layout);
-        let vals = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots_values);
+        let word = self.b.ins().load(self.ptr_ty, t, inst, l.inst_slots);
+        let form = self.b.ins().band_imm(word, 7);
+        let names = self.b.ins().load(self.ptr_ty, t, word, 0);
+        let vals = self.b.ins().iadd_imm(word, i64::from(l.slots_values));
         let busy = if read {
             self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0)
         } else {
             self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0)
         };
-        let other = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, form, 0);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
         let bad = self.b.ins().bor(busy, other);
         let bad = self.b.ins().bor(bad, foreign);

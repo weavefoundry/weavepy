@@ -663,6 +663,19 @@ branch and pull request.
     run faulted in pages for a few functions apiece. Peak RSS falls 2.3%
     (the geometric mean of the 33 workloads, every one lower, and
     `sqlite_queries` 7.6%).
+  - An instance is a 96-byte allocation instead of 128: its slot storage
+    is one tagged word instead of four (a laid-out `__slots__` block now
+    holds its layout's owner and values in one allocation, and the per-key
+    and packed forms are boxed), and a C extension instance's native body
+    pointer lives in a side table behind a one-byte flag. Compiled code
+    reads a slot through the word: one more dependent load. Asyncio's
+    futures lay their state handle out alone, so finding the state
+    compares no names. An instance with no attributes takes 117 bytes
+    instead of 149, and one with three takes 182 instead of 214;
+    `float_points` peaks 8.4% lower, `oo_patterns` 4.2% and
+    `collections_mix` 2.9%. Instructions are within 0.5% except
+    `decimal_telco` (1.7% more: a packed decimal's fields sit behind the
+    word) and `context_managers` (0.5% fewer).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

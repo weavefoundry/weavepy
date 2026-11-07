@@ -1051,7 +1051,7 @@ pub struct AttrSiteMeta {
     pub self_ctor: Option<u32>,
     /// The receiver the embedder probed keeps the attribute in a
     /// `__slots__` member its class lays out (see
-    /// [`crate::runtime::ObjLayout::slots_laid_out`]): compiled code reads
+    /// [`crate::runtime::ObjLayout::inst_slots`]): compiled code reads
     /// and writes it there in line instead of in split values. Set by the
     /// embedder before lowering; the helpers decide any other shape.
     pub slot_member: bool,

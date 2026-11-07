@@ -18599,7 +18599,7 @@ impl<'a> Lower<'a> {
             // with room for it, of an instance with no native body.
             inline::FieldMemo::Split { block, len } if append => {
                 let cap = self.b.ins().uload32(FLAGS, block, l.split_cap);
-                let body = self.b.ins().load(types::I64, FLAGS, inst, l.inst_c_body);
+                let body = self.b.ins().uload8(types::I64, FLAGS, inst, l.inst_c_body);
                 let next = self.b.ins().icmp_imm(IntCC::NotEqual, len, i64::from(idx));
                 let full =
                     self.b
