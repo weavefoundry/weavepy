@@ -574,11 +574,11 @@ fn specialize_call_kw_by<'a>(
 ) -> InlineCache {
     let code = f.code();
     // (A closure binds the same way: its cells are the function's, not the
-    // call's. Cell variables of the code's own are bound by name.)
+    // call's. The code's own cell variables are made from the bound locals
+    // by every binder that takes the permutation, or the binder declines.)
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
-        || !code.cellvars.is_empty()
         || code.freevars.len() != f.closure.len()
     {
         return InlineCache::Cooldown(COOLDOWN);

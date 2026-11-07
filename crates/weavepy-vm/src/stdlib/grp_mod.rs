@@ -35,8 +35,7 @@ unsafe fn group_to_object(g: *const libc::group) -> Object {
         } else {
             Object::from_str(
                 unsafe { std::ffi::CStr::from_ptr(p) }
-                    .to_string_lossy()
-                    .into_owned(),
+                    .to_string_lossy(),
             )
         }
     }

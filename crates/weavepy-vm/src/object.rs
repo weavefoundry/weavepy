@@ -9565,7 +9565,11 @@ pub enum LazyIterKind {
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
+///
+/// (`repr(u8)`: the discriminant is the first byte, which the frame JIT's
+/// in-line `FOR_ITER` steps test; see `frame_jit::iter_layout`.)
 #[derive(Debug, Clone)]
+#[repr(u8)]
 pub enum PyIterator {
     List {
         items: Rc<RefCell<Vec<Object>>>,
@@ -14554,8 +14558,8 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 // ---------- factory helpers ----------
 
 impl Object {
-    pub fn from_str(s: impl Into<String>) -> Self {
-        Object::Str(SharedStr::from(s.into().as_str()))
+    pub fn from_str(s: impl AsRef<str>) -> Self {
+        Object::Str(SharedStr::from(s.as_ref()))
     }
 
     /// A one-character `str`. Latin-1 characters come from a shared table
@@ -14895,7 +14899,7 @@ mod tests {
             (Object::Bool(true), 2),
             (Object::Int(7), 3),
             (Object::Float(1.5), 4),
-            (Object::from_str("a fresh string".to_owned()), 7),
+            (Object::from_str("a fresh string"), 7),
             (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
             (Object::new_bytes(vec![1, 2, 3]), 27),
             (Object::new_list(vec![Object::Int(1)]), 10),

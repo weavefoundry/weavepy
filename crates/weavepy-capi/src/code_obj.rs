@@ -298,7 +298,7 @@ pub(crate) fn facade_for_vm_code(obj: &weavepy_vm::object::Object) -> Option<*mu
     }
     let base = p as *mut u8;
     let mk_str =
-        |s: &str| -> *mut PyObject { crate::object::into_owned(Object::from_str(s.to_owned())) };
+        |s: &str| -> *mut PyObject { crate::object::into_owned(Object::from_str(s)) };
     unsafe {
         write_int(base, OFF_ARGCOUNT, c.arg_count as c_int);
         write_int(base, OFF_POSONLY, c.posonly_count as c_int);

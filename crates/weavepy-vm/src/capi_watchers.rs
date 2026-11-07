@@ -187,7 +187,7 @@ pub fn dict_event(
     call_dispatcher(
         &cb,
         vec![
-            Object::from_str(event.to_owned()),
+            Object::from_str(event),
             Object::Int(i64::from(mask)),
             Object::Int(addr as i64),
             key.cloned().unwrap_or(Object::None),
@@ -378,7 +378,7 @@ pub fn func_event(event: &str, func: &Object, new_value: &Object) {
     call_dispatcher(
         &cb,
         vec![
-            Object::from_str(event.to_owned()),
+            Object::from_str(event),
             func.clone(),
             new_value.clone(),
         ],

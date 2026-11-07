@@ -4715,8 +4715,13 @@ pub(crate) fn sync_native_locals(locals: &Rc<GilRefCell<Vec<Object>>>) {
     });
 }
 
-/// The size of [`CallCtx::pin_memo`].
-const PIN_MEMO: usize = 32;
+/// The size of [`CallCtx::pin_memo`]: sets of [`PIN_MEMO_WAYS`] slots.
+const PIN_MEMO: usize = 64;
+
+/// The slots an identity may sit in (the home slot's set). Two let three
+/// objects of a loop whose addresses share a set thrash it, each miss
+/// pinning anew (`richards`' eight tasks, as allocation addresses fell).
+const PIN_MEMO_WAYS: usize = 4;
 
 /// The identity [`pin_reusing`] keys an object by (`0` for objects whose
 /// pins aren't reused).
@@ -4729,13 +4734,13 @@ fn pin_identity(v: &Object) -> usize {
     }
 }
 
-/// The [`CallCtx::pin_memo`] pair of entries for an object identity (`s`
-/// and `s ^ 1`). The address is mixed multiplicatively: allocations a
+/// The [`CallCtx::pin_memo`] home entry for an object identity, whose set
+/// (`s ^ w` for each of [`PIN_MEMO_WAYS`]) it may sit in. The address is mixed multiplicatively: allocations a
 /// fixed stride apart (a loop's few instances) would otherwise share
 /// entries, and each would evict the other on every read.
 #[inline]
 fn pin_memo_slot(id: usize) -> usize {
-    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize >> (usize::BITS - 5)
+    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize >> (usize::BITS - PIN_MEMO.trailing_zeros())
 }
 
 /// The identity of the object `pins[ix]` holds (`0` for none).
@@ -4758,7 +4763,7 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
         return None;
     }
     let s = pin_memo_slot(id);
-    [s, s ^ 1].into_iter().find_map(|k| {
+    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
         let hint = memo[k] as usize;
         match pins.get(hint) {
             Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
@@ -4776,7 +4781,7 @@ fn list_pin_memo_hit(
     memo: &[u32; PIN_MEMO],
 ) -> Option<u64> {
     let s = pin_memo_slot(Rc::as_ptr(l) as usize);
-    [s, s ^ 1].into_iter().find_map(|k| {
+    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
         let hint = memo[k] as usize;
         match pins.get(hint) {
             Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
@@ -4797,8 +4802,12 @@ fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]
         return;
     }
     let s = pin_memo_slot(id);
-    let held = pin_memo_holds(pins, memo[s]);
-    let k = if held == 0 || held == id { s } else { s ^ 1 };
+    // A free entry of the set, or this identity's own; else one by the
+    // pin's index, so that a set's entries take turns.
+    let k = (0..PIN_MEMO_WAYS)
+        .map(|w| s ^ w)
+        .find(|&k| matches!(pin_memo_holds(pins, memo[k]), 0) || pin_memo_holds(pins, memo[k]) == id)
+        .unwrap_or(s ^ (ix % PIN_MEMO_WAYS));
     memo[k] = ix as u32;
 }
 

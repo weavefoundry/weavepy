@@ -44,8 +44,7 @@ unsafe fn passwd_to_object(p: *const libc::passwd) -> Object {
         } else {
             Object::from_str(
                 unsafe { std::ffi::CStr::from_ptr(p) }
-                    .to_string_lossy()
-                    .into_owned(),
+                    .to_string_lossy(),
             )
         }
     }

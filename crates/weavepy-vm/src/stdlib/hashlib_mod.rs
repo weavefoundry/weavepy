@@ -792,7 +792,7 @@ fn cache_insert(key: &str, value: Object) {
     if let Some(cache) = CTOR_CACHE.lock().unwrap().as_ref() {
         cache
             .borrow_mut()
-            .insert(DictKey(Object::from_str(key.to_owned())), value);
+            .insert(DictKey(Object::from_str(key)), value);
     }
 }
 

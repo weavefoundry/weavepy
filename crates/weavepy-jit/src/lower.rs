@@ -5681,34 +5681,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.vstack.push((r, JitType::Bool));
     }
 
-    // ---- overflow helpers (portable signed-overflow detection) -----
+    // ---- overflow helpers -----------------------------------------
+    //
+    // (The code generator's overflow operations set the result and a
+    // flag in one instruction where the target has one: `add`/`sub`/`imul`
+    // and `jo` on x86-64, `adds`/`subs` and `b.vs` on AArch64.)
 
     fn checked_add(&mut self, a: Value, b: Value) -> (Value, Value) {
-        let r = self.b.ins().iadd(a, b);
-        let axr = self.b.ins().bxor(a, r);
-        let bxr = self.b.ins().bxor(b, r);
-        let and = self.b.ins().band(axr, bxr);
-        let zero = self.b.ins().iconst(types::I64, 0);
-        let ovf = self.b.ins().icmp(IntCC::SignedLessThan, and, zero);
-        (r, ovf)
+        self.b.ins().sadd_overflow(a, b)
     }
 
     fn checked_sub(&mut self, a: Value, b: Value) -> (Value, Value) {
-        let r = self.b.ins().isub(a, b);
-        let axb = self.b.ins().bxor(a, b);
-        let axr = self.b.ins().bxor(a, r);
-        let and = self.b.ins().band(axb, axr);
-        let zero = self.b.ins().iconst(types::I64, 0);
-        let ovf = self.b.ins().icmp(IntCC::SignedLessThan, and, zero);
-        (r, ovf)
+        self.b.ins().ssub_overflow(a, b)
     }
 
     fn checked_mul(&mut self, a: Value, b: Value) -> (Value, Value) {
-        let lo = self.b.ins().imul(a, b);
-        let hi = self.b.ins().smulhi(a, b);
-        let sign = self.b.ins().sshr_imm(lo, 63);
-        let ovf = self.b.ins().icmp(IntCC::NotEqual, hi, sign);
-        (lo, ovf)
+        self.b.ins().smul_overflow(a, b)
     }
 
     // ---- deopt / side exits ---------------------------------------

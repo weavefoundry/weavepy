@@ -413,10 +413,15 @@ pub(crate) fn object_cell_offsets() -> (usize, usize) {
 /// A list's `GilCell` (around its vector): its borrow counter's and
 /// vector's byte offsets, for compiled code.
 pub(crate) fn list_cell_offsets() -> (usize, usize) {
-    type Cell = GilCell<Vec<crate::object::Object>>;
+    cell_offsets::<Vec<crate::object::Object>>()
+}
+
+/// Where a `GilCell<T>`'s borrow counter and its value sit in it.
+pub(crate) fn cell_offsets<T>() -> (usize, usize) {
+    type Cell<T> = GilCell<T>;
     (
-        std::mem::offset_of!(Cell, borrow),
-        std::mem::offset_of!(Cell, data),
+        std::mem::offset_of!(Cell<T>, borrow),
+        std::mem::offset_of!(Cell<T>, data),
     )
 }
 

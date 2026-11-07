@@ -199,6 +199,10 @@ pub(crate) enum Verdict {
     /// The class's `__lt__`, `__le__`, `__gt__` and `__ge__` are `int`'s
     /// (see `object::int_order_value`); `name` unused.
     IntOrder = 10,
+    /// `name` is a `__slots__` member without a default that the default
+    /// lookup finds first, under `object`'s own `__getattribute__` (see
+    /// `slot_member_unset`).
+    SlotMember = 11,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -2610,6 +2614,26 @@ impl TypeObject {
     /// CPython's `_PyType_GetFullyQualifiedName(type, '.')` (the `%T`
     /// format): [`Self::qualified_display_name`], but without a
     /// `__main__` prefix either.
+    /// `f` of [`Self::fully_qualified_name`], borrowed from the memo when
+    /// it stands (no copy).
+    pub fn with_fully_qualified_name<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let ver = self.attr_version.get();
+        let stamp = self.dict.try_borrow().map_or(0, |d| d.mutation_stamp());
+        let tp_name = self.c_tp_name.get().map_or(0, |n| n.as_ptr() as usize);
+        if let Ok(memo) = self.display_name_memo.try_borrow() {
+            if let Some((v, s, t, name, main)) = &*memo {
+                if *v == ver && *s == stamp && *t == tp_name && stamp != 0 {
+                    let name = match name.strip_prefix("__main__.") {
+                        Some(rest) if *main => rest,
+                        _ => name,
+                    };
+                    return f(name);
+                }
+            }
+        }
+        f(&self.fully_qualified_name())
+    }
+
     pub fn fully_qualified_name(&self) -> String {
         let (full, main) = self.display_names();
         match full.strip_prefix("__main__.") {

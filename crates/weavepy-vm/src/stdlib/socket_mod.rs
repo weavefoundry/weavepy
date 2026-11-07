@@ -530,7 +530,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("MSG_EOR", libc::MSG_EOR),
         ] {
             d.insert(
-                DictKey(Object::from_str(name.to_owned())),
+                DictKey(Object::from_str(name)),
                 Object::Int(i64::from(val)),
             );
         }
@@ -577,7 +577,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("AI_V4MAPPED", libc::AI_V4MAPPED),
         ] {
             d.insert(
-                DictKey(Object::from_str(name.to_owned())),
+                DictKey(Object::from_str(name)),
                 Object::Int(i64::from(val)),
             );
         }
@@ -625,7 +625,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("EAI_SYSTEM", libc::EAI_SYSTEM),
         ] {
             d.insert(
-                DictKey(Object::from_str(name.to_owned())),
+                DictKey(Object::from_str(name)),
                 Object::Int(i64::from(val)),
             );
         }
@@ -651,7 +651,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("EAI_MAX", 15),
         ] {
             d.insert(
-                DictKey(Object::from_str(name.to_owned())),
+                DictKey(Object::from_str(name)),
                 Object::Int(i64::from(val)),
             );
         }
@@ -3857,7 +3857,7 @@ fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
     }
     buf[buf.len() - 1] = 0;
     let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr().cast::<libc::c_char>()) };
-    Ok(Object::from_str(cstr.to_string_lossy().into_owned()))
+    Ok(Object::from_str(cstr.to_string_lossy()))
 }
 
 /// Non-POSIX fallback (the Windows libc crate has no `gethostname`):
@@ -4345,7 +4345,7 @@ fn mod_getaddrinfo(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::from_static("")
         } else {
             let c = unsafe { CStr::from_ptr(ai.ai_canonname) };
-            Object::from_str(c.to_string_lossy().into_owned())
+            Object::from_str(c.to_string_lossy())
         };
         out.push(Object::new_tuple_array([
             Object::Int(i64::from(ai.ai_family)),

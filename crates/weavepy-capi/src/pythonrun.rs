@@ -108,8 +108,8 @@ fn compile_source(
     interp.call_object(
         compile,
         &[
-            Object::from_str(source.to_owned()),
-            Object::from_str(filename.to_owned()),
+            Object::from_str(source),
+            Object::from_str(filename),
             Object::from_static(mode),
             Object::Int(i64::from(flags)),
             Object::Bool(false), // dont_inherit
@@ -244,7 +244,7 @@ fn run_in_embed_subinterp(id: i64, source: &str) -> Option<c_int> {
     let result = with_host(|interp| {
         interp.call_object(
             run_string,
-            &[Object::Int(id), Object::from_str(source.to_owned())],
+            &[Object::Int(id), Object::from_str(source)],
             &[],
         )
     })?;
@@ -695,7 +695,7 @@ fn command_complete(interp: &mut Interpreter, source: &str) -> Result<bool, Runt
     let Some(cc) = compile_command else {
         return Ok(true);
     };
-    let r = interp.call_object(cc, &[Object::from_str(source.to_owned())], &[])?;
+    let r = interp.call_object(cc, &[Object::from_str(source)], &[])?;
     Ok(!matches!(r, Object::None))
 }
 

@@ -62,7 +62,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 
 fn gettempdir(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(
-        std::env::temp_dir().to_string_lossy().into_owned(),
+        std::env::temp_dir().to_string_lossy(),
     ))
 }
 
@@ -136,8 +136,8 @@ fn mkstemp(args: &[Object]) -> Result<Object, RuntimeError> {
             // `os.fdopen`-style code we ship inside `tempfile.py`).
             drop(f);
             return Ok(Object::new_tuple_array([
-                Object::from_str(path.to_string_lossy().into_owned()),
-                Object::from_str(path.to_string_lossy().into_owned()),
+                Object::from_str(path.to_string_lossy()),
+                Object::from_str(path.to_string_lossy()),
             ]));
         }
     }
@@ -165,7 +165,7 @@ fn mkdtemp(args: &[Object]) -> Result<Object, RuntimeError> {
         let path = dir.join(&name);
         if !path.exists() {
             std::fs::create_dir(&path).map_err(|e| io_error_to_py(&e))?;
-            return Ok(Object::from_str(path.to_string_lossy().into_owned()));
+            return Ok(Object::from_str(path.to_string_lossy()));
         }
     }
     Err(crate::error::os_error("mkdtemp: no usable name"))

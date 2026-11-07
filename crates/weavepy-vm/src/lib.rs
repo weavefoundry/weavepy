@@ -677,7 +677,7 @@ pub fn os_args_bridged() -> Vec<String> {
                         "utf-8",
                         "surrogateescape",
                     )
-                    .unwrap_or_else(|_| Object::from_str(os.to_string_lossy().into_owned()));
+                    .unwrap_or_else(|_| Object::from_str(os.to_string_lossy()));
                     let transport = match obj {
                         Object::WStr(cps) => crate::builtins::bridge_encode_cps(&cps),
                         other => other.to_str(),
@@ -1874,7 +1874,7 @@ impl Interpreter {
             let mut xopts = crate::object::DictData::default();
             for raw in &flags.xoptions {
                 let (k, v) = match raw.split_once('=') {
-                    Some((k, v)) => (k.to_owned(), Object::from_str(v.to_owned())),
+                    Some((k, v)) => (k.to_owned(), Object::from_str(v)),
                     None => (raw.clone(), Object::Bool(true)),
                 };
                 xopts.insert(crate::object::DictKey(Object::from_str(k)), v);
@@ -3571,7 +3571,7 @@ impl Interpreter {
         };
         d.insert(DictKey(Object::from_static("exc_traceback")), tb);
         let err_msg_obj = match err_msg {
-            Some(m) => Object::from_str(m.to_owned()),
+            Some(m) => Object::from_str(m),
             None => Object::None,
         };
         d.insert(DictKey(Object::from_static("err_msg")), err_msg_obj);
@@ -3708,7 +3708,7 @@ impl Interpreter {
                 if let Ok(write) = self.load_attr(&stderr_obj, "write") {
                     let globals = self.builtins.clone();
                     if self
-                        .call(&write, &[Object::from_str(text.to_owned())], &[], &globals)
+                        .call(&write, &[Object::from_str(text)], &[], &globals)
                         .is_ok()
                     {
                         if let Ok(flush) = self.load_attr(&stderr_obj, "flush") {
@@ -9956,7 +9956,8 @@ impl Interpreter {
             || code.is_generator
             || code.is_coroutine
             || code.is_async_generator
-            || !code.cellvars.is_empty()
+            // (The code's own cells are made from the bound locals by
+            // each binder: see `specialize::attempt_specialize_call_kw_names`.)
             || code.freevars.len() != f.closure.len()
             // SAFETY: GIL-serialized raw read of the slot store's
             // emptiness (the burst is off in free-threaded mode).
@@ -38568,7 +38569,7 @@ impl Interpreter {
         });
         if let Some(getitem) = owner_getitem {
             let g = self.builtins.clone();
-            match self.call(&getitem, &[Object::from_str(name.to_owned())], &[], &g) {
+            match self.call(&getitem, &[Object::from_str(name)], &[], &g) {
                 Ok(v) => return Ok(v),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "KeyError" => {}
                 Err(e) => return Err(e),
@@ -38580,7 +38581,7 @@ impl Interpreter {
             if let Some(owner) = owner {
                 if let Some(miss) = instance_method(&owner, "__missing__") {
                     let g = self.builtins.clone();
-                    match self.call(&miss, &[Object::from_str(name.to_owned())], &[], &g) {
+                    match self.call(&miss, &[Object::from_str(name)], &[], &g) {
                         Ok(v) => return Ok(v),
                         Err(RuntimeError::PyException(exc)) if exc.type_name() == "KeyError" => {}
                         Err(e) => return Err(e),
@@ -38658,7 +38659,7 @@ impl Interpreter {
             }
         }
         let err = name_error(format!("name '{name}' is not defined"));
-        crate::error::set_exception_attr(&err, "name", Object::from_str(name.to_owned()));
+        crate::error::set_exception_attr(&err, "name", Object::from_str(name));
         Err(err)
     }
 
@@ -38913,7 +38914,7 @@ impl Interpreter {
                             None | Some(Object::None)
                         );
                         if need {
-                            inst.slot_set("name", Object::from_str(name.to_owned()));
+                            inst.slot_set("name", Object::from_str(name));
                             inst.slot_set("obj", obj.clone());
                         }
                     }
@@ -42371,7 +42372,7 @@ impl Interpreter {
             );
             if !is_default_sink {
                 let write = self.load_attr(&target, "write")?;
-                self.call(&write, &[Object::from_str(text.to_owned())], &[], globals)?;
+                self.call(&write, &[Object::from_str(text)], &[], globals)?;
                 return Ok(());
             }
         }
@@ -53158,7 +53159,8 @@ impl Interpreter {
             return None;
         }
         let recv = frame.stack.pop()?;
-        let err = certain_miss_error(&recv, name);
+        let name_obj = code_vm_ext(&frame.code).and_then(|e| e.name_objs.get(name_idx as usize));
+        let err = certain_miss_error_obj(&recv, name, name_obj);
         self.release(recv);
         Some(err)
     }
@@ -53424,7 +53426,9 @@ impl Interpreter {
                 // without its resolution passes.
                 if let (1, Some(name)) = (n & 1, frame.code.names.get(name_idx as usize)) {
                     if attr_certainly_missing(&receiver, name) {
-                        let err = certain_miss_error(&receiver, name);
+                        let name_obj = code_vm_ext(&frame.code)
+                            .and_then(|e| e.name_objs.get(name_idx as usize));
+                        let err = certain_miss_error_obj(&receiver, name, name_obj);
                         self.release(receiver);
                         return Err(err);
                     }
@@ -59298,7 +59302,7 @@ impl Interpreter {
         // protocol — `__getitem__` (and dict's `__missing__` hook) must
         // observe the probe (test_broken_class_namespace's
         // `WeirdMapping.__missing__` raises RuntimeError on purpose).
-        let key = Object::from_str(name.to_owned());
+        let key = Object::from_str(name);
         let result = match instance_method(mapping, "__getitem__") {
             Some(method) => self.call(
                 &method,
@@ -65999,7 +66003,7 @@ impl Interpreter {
             let args = [
                 Object::from_str(w.message.clone()),
                 syntax_warning.clone(),
-                Object::from_str(filename.to_owned()),
+                Object::from_str(filename),
                 Object::Int(i64::from(lineno)),
             ];
             if let Err(e) = self.call(&warn_explicit, &args, &[], &globals) {
@@ -67246,9 +67250,9 @@ impl Interpreter {
         let (_, warnings) = weavepy_lexer::tokenize_with_escapes(source);
         self.emit_escape_warnings(source, filename, &warnings)?;
         let args = [
-            Object::from_str(source.to_owned()),
-            Object::from_str(filename.to_owned()),
-            Object::from_str(mode.to_owned()),
+            Object::from_str(source),
+            Object::from_str(filename),
+            Object::from_str(mode),
             Object::Bool(type_comments),
             Object::Bool(flufl),
         ];
@@ -68449,7 +68453,7 @@ impl Interpreter {
         let portion_list = Object::new_list(
             portions
                 .iter()
-                .map(|d| Object::from_str(d.to_string_lossy().into_owned()))
+                .map(|d| Object::from_str(d.to_string_lossy()))
                 .collect(),
         );
         let path_obj = self
@@ -68564,7 +68568,7 @@ impl Interpreter {
                 // CPython raises this with `name=name`; the blocked-import
                 // handlers in `importlib/abc.py` (and test fixtures) branch
                 // on `exc.name`.
-                crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
+                crate::error::set_exception_attr(&err, "name", Object::from_str(full));
                 return Err(err);
             }
             // RFC 0040 WS1 — `os` is imported extremely early in startup
@@ -68637,7 +68641,7 @@ impl Interpreter {
             if matches!(done, Object::None) {
                 let err =
                     module_not_found_error(format!("import of {full} halted; None in sys.modules"));
-                crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
+                crate::error::set_exception_attr(&err, "name", Object::from_str(full));
                 return Err(err);
             }
             if full == "os" {
@@ -68927,7 +68931,7 @@ impl Interpreter {
             }
         }
         let err = module_not_found_error(msg);
-        crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
+        crate::error::set_exception_attr(&err, "name", Object::from_str(full));
         Err(err)
     }
 
@@ -68995,7 +68999,7 @@ impl Interpreter {
         // recognise native modules, not `types.ModuleType` instances.
         let payload = match self.call(
             &func,
-            &[Object::from_str(full.to_owned())],
+            &[Object::from_str(full)],
             &[],
             &helper_globals,
         )? {
@@ -69211,7 +69215,7 @@ impl Interpreter {
                         for part in full.split('.') {
                             dir.push(part);
                         }
-                        Some(Object::from_str(dir.to_string_lossy().into_owned()))
+                        Some(Object::from_str(dir.to_string_lossy()))
                     }
                     _ => None,
                 });
@@ -69247,7 +69251,7 @@ impl Interpreter {
             {
                 globals.borrow_mut().insert(
                     DictKey(Object::from_static("__cached__")),
-                    Object::from_str(cached.to_string_lossy().into_owned()),
+                    Object::from_str(cached.to_string_lossy()),
                 );
             }
         }
@@ -69380,7 +69384,7 @@ impl Interpreter {
         if let Some(cached) = crate::pycache::cache_path_for(path, self.optimize_level) {
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__cached__")),
-                Object::from_str(cached.to_string_lossy().into_owned()),
+                Object::from_str(cached.to_string_lossy()),
             );
         }
         let module_obj = Object::Module(Rc::new(PyModule {
@@ -69694,7 +69698,7 @@ impl Interpreter {
                 crate::error::set_exception_attr(
                     &err,
                     "name_from",
-                    Object::from_str(name.to_owned()),
+                    Object::from_str(name),
                 );
                 if let Some(Object::Str(path)) = m
                     .dict
@@ -71272,7 +71276,7 @@ fn file_input_eof_fixup(exc: &crate::error::PyException, source: &str) {
         return;
     };
     inst.slot_set("offset", Object::Int(0));
-    inst.slot_set("text", Object::from_str(line.to_owned()));
+    inst.slot_set("text", Object::from_str(line));
 }
 
 fn lex_eof_kind(err: &weavepy_parser::ParseError, source: &str) -> Option<LexEofKind> {
@@ -71593,7 +71597,7 @@ fn attach_syntax_error_metadata(err: &RuntimeError, last_stmt: (u32, u32), sourc
         Object::new_tuple_array([
             Object::Int(i64::from(last_stmt.0)),
             Object::Int(i64::from(last_stmt.1)),
-            Object::from_str(source.to_owned()),
+            Object::from_str(source),
         ]),
     );
 }
@@ -75682,14 +75686,21 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
 /// The `AttributeError` a certainly missing `obj.name` (see
 /// [`attr_certainly_missing`]) raises: an unset `__slots__` member's names
 /// the class by its fully qualified name, as CPython's `member_get` does.
-fn certain_miss_error(obj: &Object, name: &str) -> RuntimeError {
+/// Its `name` field is `name_obj` when given (the code's interned name,
+/// shared rather than copied).
+pub(crate) fn certain_miss_error_obj(
+    obj: &Object,
+    name: &str,
+    name_obj: Option<&Object>,
+) -> RuntimeError {
     match obj {
-        Object::Instance(inst)
-            if matches!(inst.cls().lookup(name), Some(Object::SlotDescriptor(_))) =>
-        {
-            crate::error::attribute_error_typed(obj, name, &inst.cls().fully_qualified_name())
+        Object::Instance(inst) if slot_member_class(inst.cls_raw(), name) => {
+            let cls = inst.cls();
+            cls.with_fully_qualified_name(|qual| {
+                crate::error::attribute_error_parts(obj, name, name_obj, qual)
+            })
         }
-        _ => crate::error::attribute_error_named(obj, name),
+        _ => crate::error::attribute_error_named_obj(obj, name, name_obj),
     }
 }
 
@@ -75699,12 +75710,19 @@ fn certain_miss_error(obj: &Object, name: &str) -> RuntimeError {
 /// `__get__` raises the lookup's `AttributeError` (CPython's `member_get`).
 #[inline(never)]
 fn slot_member_unset(cls: &Rc<TypeObject>, inst: &PyInstance, name: &str) -> bool {
+    slot_member_class(cls, name) && inst.slots.borrow().get(name).is_none()
+}
+
+/// The class half of [`slot_member_unset`]: `name` is a `__slots__` member
+/// without a default that `cls`'s default lookup finds first (memoized
+/// until the class or a base changes).
+fn slot_member_class(cls: &TypeObject, name: &str) -> bool {
     use crate::types::Dunder;
-    if !cls.dunder(Dunder::GetAttribute).object_owner() || cls.is_super_proxy_type() {
-        return false;
-    }
-    matches!(cls.lookup(name), Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none())
-        && inst.slot_get(name).is_none()
+    cls.memo_verdict(crate::types::Verdict::SlotMember, name, || {
+        cls.dunder(Dunder::GetAttribute).object_owner()
+            && !cls.is_super_proxy_type()
+            && matches!(cls.lookup(name), Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none())
+    })
 }
 
 /// Resolve a built-in slot-wrapper dunder reached via *type-level* attribute

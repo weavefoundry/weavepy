@@ -1083,10 +1083,13 @@ impl Interpreter {
         if args.len() != nargs {
             return None;
         }
-        // A warm plan runs as native code (a getter's or constructor's
-        // evaluation stays here).
+        // A warm plan runs as native code (a getter's evaluation stays
+        // here). A constructor's runs as any effect leaf's: its stores are
+        // buffered and land at the end, so a decline leaves the fresh
+        // instance untouched (the caller discards it anyway), and a read of
+        // a buffered field answers through the general read.
         #[cfg(feature = "jit")]
-        if !GETTER && !FRESH {
+        if !GETTER {
             if let Some(r) = jit::run::<EFFECT>(self, code, ext, plan, f, args, nest) {
                 return r;
             }

@@ -139,7 +139,7 @@ unsafe fn build_py_params(argc: c_int, argv: *mut *mut ffi::sqlite3_value) -> Ve
                 } else {
                     std::slice::from_raw_parts(p, n).to_vec()
                 };
-                Object::from_str(String::from_utf8_lossy(&bytes).into_owned())
+                Object::from_str(String::from_utf8_lossy(&bytes))
             }
         };
         out.push(obj);

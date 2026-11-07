@@ -636,7 +636,7 @@ pub unsafe extern "C" fn PyUnicode_FromOrdinal(ord: c_int) -> *mut PyObject {
         Some(c) => {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            crate::object::into_owned(Object::from_str(s.to_owned()))
+            crate::object::into_owned(Object::from_str(s))
         }
         None => {
             crate::errors::set_value_error("ordinal out of range for chr()");

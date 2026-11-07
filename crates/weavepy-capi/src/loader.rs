@@ -403,7 +403,7 @@ pub fn load_extension_module(
         // spelling to resolve C functions back to their module.
         d.insert(
             DictKey(Object::from_static("__name__")),
-            Object::from_str(module_name.to_owned()),
+            Object::from_str(module_name),
         );
         // `PyModule_Create2` seeds the `__spec__`/`__loader__` = None
         // placeholders CPython's `module_init_dict` puts in every fresh
@@ -748,7 +748,7 @@ fn vm_load_extension(
             weavepy_vm::error::set_exception_attr(
                 &e,
                 "name",
-                Object::from_str(full_name.to_owned()),
+                Object::from_str(full_name),
             );
             weavepy_vm::error::set_exception_attr(
                 &e,
@@ -839,7 +839,7 @@ pub fn load_inittab_module(
     if let Object::Module(module) = &module_obj {
         let mut d = module.dict.borrow_mut();
         d.entry(DictKey(Object::from_static("__name__")))
-            .or_insert_with(|| Object::from_str(module_name.to_owned()));
+            .or_insert_with(|| Object::from_str(module_name));
     }
     Ok(module_obj)
 }
@@ -857,7 +857,7 @@ pub(crate) unsafe fn _interp_smoke(
         let mut d = dict.borrow_mut();
         d.insert(
             DictKey(Object::from_static("__name__")),
-            Object::from_str(name.to_owned()),
+            Object::from_str(name),
         );
         for m in methods {
             if m.ml_name.is_null() {

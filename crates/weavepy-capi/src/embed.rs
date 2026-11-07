@@ -417,7 +417,7 @@ pub fn exec_in_main(
     if let Some(f) = filename {
         main_dict.borrow_mut().insert(
             DictKey(Object::from_static("__file__")),
-            Object::from_str(f.to_owned()),
+            Object::from_str(f),
         );
     }
     let compile = builtin_of(interp, "compile").ok_or_else(|| {
@@ -428,8 +428,8 @@ pub fn exec_in_main(
     let code = interp.call_object(
         compile,
         &[
-            Object::from_str(source.to_owned()),
-            Object::from_str(filename.unwrap_or("<string>").to_owned()),
+            Object::from_str(source),
+            Object::from_str(filename.unwrap_or("<string>")),
             Object::from_static("exec"),
         ],
         &[],
@@ -676,7 +676,7 @@ unsafe fn call_xxsubinterpreters(method: &str, args: &[Object]) -> Option<Object
     let func = m
         .dict
         .borrow()
-        .get(&DictKey(Object::from_str(method.to_owned())))
+        .get(&DictKey(Object::from_str(method)))
         .cloned()?;
     // Drive the registry from the *main* (owned) interpreter, never from
     // whatever `LAST_INTERPRETER` was left pointing at: a `PyRun_*` routed

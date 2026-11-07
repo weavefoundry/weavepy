@@ -767,6 +767,51 @@ branch and pull request.
     returns the dict from the site's memo of that class's answer instead of
     two MRO walks and a type-name test each time: 57.5 ns becomes 31
     (CPython 32), and `deepcopy` runs 0.9% fewer instructions.
+  - The `AttributeError` of an attribute certainly missing is built with
+    one allocation for its message and the code's interned name for its
+    `name` field, and an unset `__slots__` member's class is named from the
+    memoized qualified name; whether a name is such a member is memoized
+    on the class. `Object::from_str` of a `&str` no longer copies it twice.
+    The `pathlib` shape (a property that catches the `AttributeError` of
+    its cache slot once per object) runs 5% fewer instructions, and
+    `stdlib_utils` and `logging_mix` 0.5% fewer.
+  - A keyword call of a function with cell variables (`parse_qs` calling
+    `parse_qsl`, whose nested `_unquote` captures its arguments) binds
+    through the site's permutation and runs directly: the binders made the
+    cells from the bound locals all along, but the specializer refused such
+    callees. `stdlib_utils` runs 0.5% fewer instructions.
+  - `FOR_ITER` steps a list's or a range's iterator in compiled code
+    instead of calling `h_for_iter`, and a store over a local (or a
+    `POP_TOP` of a value) that another owner keeps gives up its reference
+    by a plain decrement in line instead of calling `h_store`: a loop of
+    `x = values[s]` over a list takes 247 instructions an iteration instead
+    of 293, `sudoku` 2.2% fewer and `comprehensions` 2.5%.
+  - `d[k]` of a dict by a `str` key whose hash is known probes the key's
+    home slot in compiled code, the value copied when the slot holds the
+    same string or an equal one (a key built apart from the dict's own,
+    as `sudoku`'s units are, compared by a small helper), anything else
+    through the helper as before: the loop above takes 230 instructions
+    an iteration.
+  - `len(x)` at a site settled on the builtin `len` reads a list's,
+    tuple's or string's length in compiled code (the callee checked by its
+    payload word, both references given up by plain decrements) instead of
+    calling `h_site_leaf`: `t += len(values[s])` in that loop takes 342
+    instructions an iteration instead of 467.
+  - Fixed three of the CI bench gate's regressions against `main` (its A/B
+    of this branch's tier 2 against Cranelift's):
+    - Tier 2's checked `int` arithmetic uses the code generator's overflow
+      operations (`add`, `sub` or `imul` and `jo`) instead of computing
+      the overflow test from the result: `jitloop` runs 96 million
+      instructions instead of 122 (`main` 115), `nested_loops` 73 instead
+      of 108 (100), `sumvm` 46 instead of 56 (70).
+    - The pin memo tier 2 reuses an object's pin by is 64 entries in sets
+      of four instead of 32 in pairs: three of `richards`' eight tasks
+      sharing a pair made every miss pin anew, and the table grew by
+      reallocation (127 million instructions instead of 164; `main` 131).
+    - A constructor's leaf `__init__` runs its plan's native code, as any
+      effect leaf's does (its stores buffered, landing at the end), instead
+      of always the plan interpreter: `float_math` runs 718 million
+      instructions instead of 800 (`main` 706).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

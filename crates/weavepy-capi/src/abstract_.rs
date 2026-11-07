@@ -3978,8 +3978,7 @@ pub unsafe extern "C" fn PyMapping_GetItemString(
     }
     let k = crate::object::into_owned(Object::from_str(
         unsafe { CStr::from_ptr(key) }
-            .to_string_lossy()
-            .into_owned(),
+            .to_string_lossy(),
     ));
     let result = unsafe { PyObject_GetItem(o, k) };
     unsafe { crate::object::Py_DecRef(k) };
@@ -4008,8 +4007,7 @@ pub unsafe extern "C" fn PyMapping_HasKeyString(o: *mut PyObject, key: *const c_
     }
     let k = crate::object::into_owned(Object::from_str(
         unsafe { CStr::from_ptr(key) }
-            .to_string_lossy()
-            .into_owned(),
+            .to_string_lossy(),
     ));
     let result = unsafe { PyMapping_HasKey(o, k) };
     unsafe { crate::object::Py_DecRef(k) };
@@ -4027,8 +4025,7 @@ pub unsafe extern "C" fn PyMapping_SetItemString(
     }
     let k = crate::object::into_owned(Object::from_str(
         unsafe { CStr::from_ptr(key) }
-            .to_string_lossy()
-            .into_owned(),
+            .to_string_lossy(),
     ));
     let result = unsafe { PyObject_SetItem(o, k, v) };
     unsafe { crate::object::Py_DecRef(k) };
