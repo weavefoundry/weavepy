@@ -578,9 +578,13 @@ fn publish_sole_guard() {
 
 /// Whether [`heavy_barrier`] can make *every* thread execute a full
 /// memory barrier: `membarrier(2)` on Linux, `FlushProcessWriteBuffers`
-/// on Windows. Set once, at process start-up, only after the platform
-/// facility is confirmed to work; a thread that reads it stale (`false`)
-/// simply fences itself, which is always sound.
+/// on Windows. Set once, by the first revocation (the only caller of the
+/// barrier), only after the platform facility is confirmed to work.
+///
+/// (Not at start-up: Linux registers a process that already has more
+/// than one thread, as the interpreter's large-stack thread makes it, by
+/// waiting out an RCU grace period, which took 10 to 20 ms of every
+/// start. A program that never shares cells never registers.)
 ///
 /// This is what keeps the biased borrow path free of barriers: the
 /// ordering the revocation handshake needs is paid by the revoker, at
@@ -686,7 +690,9 @@ fn revoke_bias() {
     // After this every thread has executed a full barrier: a borrow that
     // read the flag as clear did so before it, and its guard store --
     // program-ordered before that read and compiler-fenced -- is therefore
-    // visible to the drain below.
+    // visible to the drain below. (The facility is registered here, the
+    // first time a barrier is due.)
+    enable_asymmetric_barrier();
     heavy_barrier();
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
@@ -701,7 +707,7 @@ pub fn note_vm_thread(thread_id: u64) {
         return;
     }
     match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => enable_asymmetric_barrier(),
+        Ok(_) => {}
         Err(first) if first == thread_id => {}
         Err(first) => {
             if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {

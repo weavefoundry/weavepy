@@ -824,6 +824,14 @@ branch and pull request.
     Every site's extra code cost `class_creation`, which compiles large
     cold functions (`namedtuple`, `inspect.signature`), 4% more
     instructions; this takes back a third of that.
+  - Linux start-up no longer waits out an RCU grace period: the process
+    registered for expedited private `membarrier`s when its first VM thread
+    started, after the large-stack thread existed, and the kernel registers
+    a multi-threaded process by `synchronize_rcu()`. The registration now
+    happens at the first bias revocation, the only place the barrier is
+    used (a program that never shares cells never registers): `startup.py`
+    takes 11.4 ms instead of 32.7 in the container (CPython 11.5), against
+    12 ms of CPU either way. CI's bench gate read 13.6 ms against 10.4.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
