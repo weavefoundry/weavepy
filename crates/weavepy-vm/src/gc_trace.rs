@@ -391,8 +391,87 @@ impl<T: YoungKind> YoungSet<T> {
 /// generation without hashing. An instance records its slot itself
 /// ([`crate::types::PyInstance::gc_slot`]), so registering one, finding
 /// it from an edge, and its death's removal never touch the index.
+/// [`Registry`]'s entries, in chunks of [`SLAB_CHUNK`] that never move:
+/// growing appends a chunk instead of copying every entry into a buffer
+/// twice the size (whose copy, alongside the old one, set the peak of a
+/// program with many live objects).
+#[derive(Default)]
+struct Slab {
+    chunks: Vec<Box<[std::mem::MaybeUninit<Entry>; SLAB_CHUNK]>>,
+    len: usize,
+}
+
+/// Entries per [`Slab`] chunk.
+const SLAB_CHUNK: usize = 1024;
+
+impl Slab {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, e: Entry) {
+        let (c, i) = (self.len / SLAB_CHUNK, self.len % SLAB_CHUNK);
+        if c == self.chunks.len() {
+            // SAFETY: an array of `MaybeUninit`s needs no initialization.
+            let chunk = unsafe {
+                Box::<[std::mem::MaybeUninit<Entry>; SLAB_CHUNK]>::new_uninit().assume_init()
+            };
+            self.chunks.push(chunk);
+        }
+        self.chunks[c][i].write(e);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&Entry> {
+        // SAFETY: the first `len` entries are initialized.
+        (i < self.len).then(|| unsafe { self.get_unchecked(i) })
+    }
+
+    /// # Safety
+    ///
+    /// `i < self.len()`.
+    #[inline(always)]
+    unsafe fn get_unchecked(&self, i: usize) -> &Entry {
+        // SAFETY: per the caller, the entry is initialized.
+        unsafe {
+            self.chunks
+                .get_unchecked(i / SLAB_CHUNK)
+                .get_unchecked(i % SLAB_CHUNK)
+                .assume_init_ref()
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Slab {
+    type Output = Entry;
+    #[inline]
+    fn index(&self, i: usize) -> &Entry {
+        self.get(i).expect("collector slot in range")
+    }
+}
+
+impl std::ops::IndexMut<usize> for Slab {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Entry {
+        assert!(i < self.len, "collector slot in range");
+        // SAFETY: the first `len` entries are initialized.
+        unsafe { self.chunks[i / SLAB_CHUNK][i % SLAB_CHUNK].assume_init_mut() }
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        for i in 0..self.len {
+            // SAFETY: the first `len` entries are initialized, each dropped once.
+            unsafe { self.chunks[i / SLAB_CHUNK][i % SLAB_CHUNK].assume_init_drop() };
+        }
+    }
+}
+
 struct Registry {
-    slab: Vec<Entry>,
+    slab: Slab,
     /// Head of the free-slot list (threaded through `Entry::pos`).
     free: u32,
     gens: [Vec<u32>; N_GENERATIONS],
@@ -404,7 +483,7 @@ struct Registry {
 impl Registry {
     fn new() -> Self {
         Self {
-            slab: Vec::new(),
+            slab: Slab::default(),
             free: NO_SLOT,
             gens: Default::default(),
             frozen: Vec::new(),

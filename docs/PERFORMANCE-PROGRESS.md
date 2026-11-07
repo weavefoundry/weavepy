@@ -14,7 +14,9 @@ peak memory 1.268, instructions 0.940 (on a release build). Since `02c5de6e`
 reuses the code `dataclasses` and `namedtuple` compile, and compiles cost less
 throughout. The worst warm times are `async_tree` 1.52, `context_managers`
 1.22, `tomllib_loads` 1.21, `deepcopy` 1.19, `stdlib_utils` and `logging_mix`
-1.17; the worst cold times `async_tree` 2.02 and `stdlib_utils` 1.55.
+1.17; the worst cold times `async_tree` 2.02 and `stdlib_utils` 1.55. With
+in-line string compares and indexing (`289c1dd8`) the next PGO run read warm
+0.917, cold 1.022 and peak memory 1.278, `tomllib_loads` 1.09 warm.
 
 Measured later on November 6, 2026, at `02c5de6e` (PR #107), a PGO build
 against CPython 3.14 on the same host, interleaved in one session: warm time
@@ -642,6 +644,12 @@ branch and pull request.
     string's reference given up by a plain decrement. The core loop
     settles a string site's cache on the shape too. `tomllib`'s
     `char = src[pos]` takes another 1.4% of its instructions off.
+  - The collector's registry keeps its entries in chunks of 1,024 that
+    never move, instead of one vector that doubled, copying every entry
+    into a buffer twice the size while the old one was still there (the
+    copy set the peak of a program with many live objects). `async_tree`
+    peaks 2.5% to 5% lower and a pending task takes 3,339 bytes instead of
+    3,530; instructions are unchanged.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
