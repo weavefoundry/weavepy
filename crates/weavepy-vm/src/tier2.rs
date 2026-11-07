@@ -3575,7 +3575,7 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         tag_unbound: tag(&Object::Unbound),
         inst_slots_borrow: i32_of(slots_borrow)?,
         inst_slots: i32_of(slots_at)?,
-        slots_values: slots.map_or(0, |v| v),
+        slots_values: slots.unwrap_or(0),
         ctx_pins_ptr: i32_of(ctx_pins + vec_ptr)?,
         ctx_pins_len: i32_of(ctx_pins + vec_len)?,
         pin_size: i32_of(std::mem::size_of::<Pin>())?,
@@ -3661,7 +3661,7 @@ fn laid_out_slots_layout() -> Option<i32> {
     let layout_addr = crate::shared_value::SharedSlice::word(&layout);
     let reads_laid_out = |s: &SlotStorage| {
         let w = word(s);
-        w & 7 == 0 && first(w) == layout_addr
+        w.trailing_zeros() >= 3 && first(w) == layout_addr
     };
     let values_at = crate::types::SLOT_VALUES_AT;
     for fixed in [
@@ -13160,7 +13160,10 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
     // stores it (the store runs no code, so no guard can have broken).
     if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (&container, &index) {
         // SAFETY: three initialized values, borrowed (the value cloned in).
-        if unsafe { crate::h_inst_dict_set::<0>(&value, &container, &index) } == 0 {
+        if unsafe {
+            crate::h_inst_dict_set::<0>(&raw const value, &raw const container, &raw const index)
+        } == 0
+        {
             // (A displaced value's release may have queued a finalizer.)
             if finalizer_queued() {
                 ctx.parked = None;

@@ -32,6 +32,7 @@ macro_rules! weak_object {
             /// The handle as its variant's tag and its pointer (never `0`),
             /// for a table that packs them beside other fields.
             #[inline]
+            #[allow(clippy::cast_ptr_alignment)]
             pub(crate) fn into_parts(self) -> (u8, usize) {
                 let this = std::mem::ManuallyDrop::new(self);
                 let p = std::ptr::from_ref(&*this).cast::<u8>();
@@ -47,6 +48,7 @@ macro_rules! weak_object {
             /// `tag` and `ptr` came from `into_parts`, and the handle they
             /// own is rebuilt (and so released) once.
             #[inline]
+            #[allow(clippy::cast_ptr_alignment)]
             pub(crate) unsafe fn from_parts(tag: u8, ptr: usize) -> Self {
                 let mut out = std::mem::MaybeUninit::<Self>::uninit();
                 let p = out.as_mut_ptr().cast::<u8>();

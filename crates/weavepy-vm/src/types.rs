@@ -3001,6 +3001,7 @@ impl SlotStorage {
     ///
     /// `write` must initialize all `layout.len()` values at its pointer.
     #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
     unsafe fn fixed_with_raw(
         layout: SharedSlice<DictKey>,
         write: impl FnOnce(*mut Object),
@@ -5042,7 +5043,7 @@ mod slot_storage_tests {
             );
             assert!(matches!(second.get(&names[1]), Some(Object::Str(_))));
             assert_eq!(weak_value.strong_count(), 2 * len - 2);
-            assert!(first.form() == "fixed");
+            assert_eq!(first.form(), "fixed");
             assert!(first.get_index(len).is_none());
             assert!(first.get_index_mut(usize::MAX).is_none());
 
@@ -5058,7 +5059,7 @@ mod slot_storage_tests {
             assert!(second.remove(&names[0]).is_none());
             assert!(second.get(&names[0]).is_none());
             assert!(second.index_of(&names[0]).is_none());
-            assert!(second.form() == "fixed");
+            assert_eq!(second.form(), "fixed");
             assert_eq!(weak_layout.strong_count(), 1);
             assert_eq!(weak_value.strong_count(), 2 * len - 3);
             for (index, (key, _)) in first.iter().take(len).enumerate() {
@@ -5100,7 +5101,7 @@ mod slot_storage_tests {
         // A store fills its laid-out slot in place.
         assert!(slots.insert("b", Object::Int(2)).is_none());
         *slots.laid_out_mut(2, "c").unwrap() = Object::Int(3);
-        assert!(slots.form() == "fixed");
+        assert_eq!(slots.form(), "fixed");
         assert_eq!(slots.get("b").and_then(Object::as_i64), Some(2));
         assert_eq!(slots.index_of("c"), Some(2));
         let set: Vec<i64> = slots.iter().filter_map(|(_, v)| v.as_i64()).collect();
@@ -5108,7 +5109,7 @@ mod slot_storage_tests {
         assert!(slots.leading([&SharedStr::from("a")]).is_none());
         // A name off the layout moves the set slots to the per-key form.
         slots.insert("d", Object::Int(4));
-        assert!(slots.form() != "fixed");
+        assert_ne!(slots.form(), "fixed");
         assert!(slots.get("a").is_none());
         assert_eq!(slots.iter().count(), 3);
     }
@@ -5228,14 +5229,14 @@ mod slot_storage_tests {
                 .and_then(|v| v.as_i64()),
             Some(1)
         );
-        assert!(slots.form() == "single");
+        assert_eq!(slots.form(), "single");
         assert!(slots.remove("missing").is_none());
         assert_eq!(slots.remove("value").and_then(|v| v.as_i64()), Some(2));
         assert_eq!(slots.iter().count(), 0);
         assert!(slots.insert("α", Object::None).is_none());
         assert!(matches!(slots.get("α"), Some(Object::None)));
         assert_eq!(slots.iter().count(), 1);
-        assert!(slots.form() == "single");
+        assert_eq!(slots.form(), "single");
     }
 
     #[test]
@@ -5247,9 +5248,9 @@ mod slot_storage_tests {
             assert!(slots.insert(&name, Object::Int(i)).is_none());
             keys.push(slots.iter().last().unwrap().0 .0.clone());
             match i {
-                0 => assert!(slots.form() == "single"),
-                1..=15 => assert!(slots.form() == "small"),
-                _ => assert!(slots.form() == "many"),
+                0 => assert_eq!(slots.form(), "single"),
+                1..=15 => assert_eq!(slots.form(), "small"),
+                _ => assert_eq!(slots.form(), "many"),
             }
             for (index, (key, value)) in slots.iter().enumerate() {
                 assert!(key.0.is_same(&keys[index]));
@@ -5276,10 +5277,12 @@ mod slot_storage_tests {
         ] {
             slots.insert(name, Object::None);
         }
-        assert!(slots.form() == "small" && slots.iter().count() == 8);
+        assert_eq!(slots.form(), "small");
+        assert_eq!(slots.iter().count(), 8);
         assert!(slots.remove("two").is_some());
         slots.insert("α", Object::Int(9));
-        assert!(slots.form() == "small" && slots.iter().count() == 8);
+        assert_eq!(slots.form(), "small");
+        assert_eq!(slots.iter().count(), 8);
         assert!(
             matches!(&slots.iter().last().unwrap().0 .0, Object::Str(name) if name.as_ref() == "α")
         );
@@ -5326,7 +5329,7 @@ mod slot_storage_tests {
         slots.insert("first", Object::Int(1));
         let original_key = slots.iter().next().unwrap().0 .0.clone();
         slots.insert("second", Object::Int(2));
-        assert!(slots.form() == "small");
+        assert_eq!(slots.form(), "small");
         assert!(slots.iter().next().unwrap().0 .0.is_same(&original_key));
         let names = |slots: &SlotStorage| {
             slots

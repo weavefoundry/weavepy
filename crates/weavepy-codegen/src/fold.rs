@@ -367,7 +367,7 @@ fn fold_one(e: &mut Emit<'_>, b: Block, inst: Inst, quotients: &mut HashMap<(Val
         }
     }
     // Booleans widened only to be tested: test them as they are.
-    if let Some(src) = widened(e.f, &args, &d.op) {
+    if let Some(src) = widened(e.f, args, &d.op) {
         match &d.op {
             Op::Brif(..) => {
                 let a = e.f.dfg.intern(&[src]);
