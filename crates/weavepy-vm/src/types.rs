@@ -3898,6 +3898,23 @@ impl SlotStorage {
         &mut self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&mut Object; N]> {
+        // A `__slots__` layout led by the names themselves (a deque's).
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
+            if let (Some(keys), Some(values)) = (layout.get(..N), values.get_mut(..N)) {
+                let mut same = true;
+                for (key, name) in keys.iter().zip(names) {
+                    same &= matches!(&key.0, Object::Str(s)
+                        if crate::shared_value::SharedStr::ptr_eq(s, name));
+                }
+                if same && !values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    let base = values.as_mut_ptr();
+                    // SAFETY: `N` distinct in-range values, borrowed from
+                    // `self` for the result's lifetime.
+                    return Some(std::array::from_fn(|i| unsafe { &mut *base.add(i) }));
+                }
+            }
+            return self.leading_mut(names);
+        }
         if !self.leads_with_interned(&names) {
             return self.leading_mut(names);
         }

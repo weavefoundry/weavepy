@@ -174,6 +174,17 @@ fn install_handle(args: &[Object]) -> Result<Object, RuntimeError> {
         .map(|n| crate::types::slot_key(n))
         .collect::<Vec<_>>()
         .into();
+    // The class's own instances are laid out the same way, when nothing
+    // has decided their storage yet (asyncio's classes otherwise keep the
+    // per-key form): compiled code's slot reads of a handle
+    // (`handle._cancelled` in `_run_once`) then find the layout they
+    // guard on, natively built or not.
+    if cls.slot_layout.set(Some(layout.clone())).is_ok() {
+        cls.slot_layout_word.store(
+            SharedSlice::word(&layout),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let st = Rc::new(HandleState {
         cls: cls.clone(),
         layout,

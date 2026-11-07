@@ -728,6 +728,19 @@ branch and pull request.
     (`f_back`, `f_code`, `co_filename`: `logging`'s caller search) ahead of
     the instance caches it would otherwise try first: `logging_mix` runs
     0.4% fewer instructions.
+  - Asyncio's `Handle` class lays its slots out in the order its native
+    constructor writes them, when `install_handle` finds the class's
+    storage undecided (asyncio's classes otherwise keep the per-key form).
+    `call_soon`'s handles and `Handle(...)`'s then share one layout, so
+    compiled code's guarded slot reads find it: `_run_once`'s
+    `handle._cancelled` missed every time. With a deque's laid-out slots
+    matched by name identity (the ready queue's `append` and `popleft`)
+    and a built-in value's `__class__` read without the instance caches
+    (`asyncio.isfuture` of a coroutine), `async_tree` runs 2.3% fewer
+    instructions.
+  - An attribute site that has read a class's attribute through an
+    instance tries that first on its slow paths: `o.k` of a class constant
+    takes 38.6 ns instead of 48.3 (container build; CPython about 19).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

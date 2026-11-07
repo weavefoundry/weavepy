@@ -7259,6 +7259,9 @@ pub(crate) struct AttrSite {
     /// the receiver (the call can raise or switch); null otherwise.
     direct: *mut DirectSite,
     cache: SlotCache,
+    /// Whether the site has read a class's attribute through an instance
+    /// (see `inst_class_attr_quick`): the slow paths try that first.
+    class_attr: Cell<bool>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -7410,13 +7413,41 @@ unsafe fn attr_miss_quick(
                 }
                 // A class attribute it doesn't shadow (a scalar, or a
                 // method bound to it), as the site last resolved it.
-                crate::inst_class_attr_quick(&*site.code, &*site.ext, inst, recv, site.pc as usize)
+                let v = crate::inst_class_attr_quick(
+                    &*site.code,
+                    &*site.ext,
+                    inst,
+                    recv,
+                    site.pc as usize,
+                );
+                if v.is_some() {
+                    site.class_attr.set(true);
+                }
+                v
             }
             Object::Frame(_) | Object::Code(_) if local || droppable(recv) => {
                 let code = &*site.code;
                 code.names
                     .get(code.instructions[site.pc as usize].arg as usize)
                     .and_then(|name| Interpreter::frame_plain_attr(recv, name, running))
+            }
+            // A built-in value's `__class__` (`asyncio.isfuture`'s test of a
+            // coroutine): its type, which no instance attribute shadows.
+            Object::Coroutine(_)
+            | Object::Generator(_)
+            | Object::Function(_)
+            | Object::Tuple(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Str(_)
+            | Object::Int(_)
+                if local || droppable(recv) =>
+            {
+                let code = &*site.code;
+                let name = code
+                    .names
+                    .get(code.instructions[site.pc as usize].arg as usize)?;
+                (&**name == "__class__").then(|| Object::Type(crate::builtins::class_of(recv)))
             }
             _ => None,
         }
@@ -7613,11 +7644,24 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
         let site = &*site;
         let at = (*st).locals.add(site.local as usize);
         let slot = site.slot as usize;
-        if let Object::Frame(_) | Object::Code(_) = &*at {
-            if let Some(v) = frame_code_attr(st, site, &*at) {
-                (*st).stack.add(slot).write(v);
-                return 0;
+        match &*at {
+            Object::Frame(_) | Object::Code(_) => {
+                if let Some(v) = frame_code_attr(st, site, &*at) {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
             }
+            // (A class attribute the site has read before.)
+            Object::Instance(inst) if site.class_attr.get() => {
+                let (code, ext) = (&*site.code, &*site.ext);
+                if let Some(v) =
+                    crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
+            }
+            _ => {}
         }
         if let Some(v) = attr_hit(site, &*at) {
             (*st).stack.add(slot).write(crate::clone_hot(v));
@@ -7692,14 +7736,30 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
         let site = &*site;
         let at = (*st).stack.add(site.slot as usize);
         let slot = site.slot as usize;
-        if let Object::Frame(_) | Object::Code(_) = &*at {
-            if let Some(v) = frame_code_attr(st, site, &*at) {
-                if plain_release(&*at) {
-                    at.write(v);
-                    return 0;
+        match &*at {
+            Object::Frame(_) | Object::Code(_) => {
+                if let Some(v) = frame_code_attr(st, site, &*at) {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
                 }
-                drop(v);
             }
+            // (A class attribute the site has read before.)
+            Object::Instance(inst) if site.class_attr.get() => {
+                let (code, ext) = (&*site.code, &*site.ext);
+                if let Some(v) =
+                    crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
+                }
+            }
+            _ => {}
         }
         let r = if let Some(v) = attr_hit(site, &*at).or_else(|| match &*at {
             Object::Instance(inst) => field_hit(site, inst),
@@ -18483,6 +18543,7 @@ impl<'a> Lower<'a> {
             field2: Cell::new((0, 0)),
             direct,
             cache: SlotCache::default(),
+            class_attr: Cell::new(false),
         });
         let c = self
             .b
