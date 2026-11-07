@@ -655,6 +655,14 @@ branch and pull request.
     generator's does, instead of room for 16: a suspended coroutine keeps
     it, and a task tree holds thousands. A pending task takes 3,179 bytes
     instead of 3,385, and `async_tree` peaks 5% lower.
+  - The linker order file (`crates/weavepy-cli/weavepy.order`) is rebuilt
+    from callgrind profiles of start-up and of every pybench workload
+    (`scripts/extend-order-file.py`). A third of the functions `go` runs
+    had joined the binary since the file was last made, and they sat
+    scattered through the text among code no workload touches, so each
+    run faulted in pages for a few functions apiece. Peak RSS falls 2.3%
+    (the geometric mean of the 33 workloads, every one lower, and
+    `sqlite_queries` 7.6%).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
