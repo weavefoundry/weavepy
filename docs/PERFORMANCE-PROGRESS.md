@@ -629,6 +629,12 @@ branch and pull request.
     through a helper that takes no reference: the generic compare site
     copied both operands to the stack and released them after. `tomllib`'s `char == "["` tests take 4.1% of its
     instructions off.
+  - Compiled code indexes a pure-ASCII string by an `int` in line as it
+    does a list: the byte read where it lies and its single-character
+    string taken from the shared table of them, its count bumped, an owned
+    string's reference given up by a plain decrement. The core loop
+    settles a string site's cache on the shape too. `tomllib`'s
+    `char = src[pos]` takes another 1.4% of its instructions off.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

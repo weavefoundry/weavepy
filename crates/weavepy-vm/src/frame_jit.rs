@@ -1394,6 +1394,8 @@ struct Tags {
     cell_layout: Option<CellLayout>,
     /// Where a list's and a tuple's items are (see [`SeqLayout`]).
     seq_layout: Option<SeqLayout>,
+    /// Where a string's bytes are (see [`StrLayout`]).
+    str_layout: Option<StrLayout>,
     /// The `dict`, `set` and `str` tags (the method kernels' receivers).
     dict: u8,
     set: u8,
@@ -1498,6 +1500,7 @@ fn tags() -> Option<Tags> {
         list: tag(&Object::new_list(Vec::new())),
         cell_layout: cell_layout(),
         seq_layout: seq_layout(),
+        str_layout: str_layout(),
         rc_counted: if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
             0
@@ -1716,6 +1719,47 @@ fn seq_layout() -> Option<SeqLayout> {
         tuple_len: off(8 * tuple_len)?,
         tuple_items: off(tuple_items)?,
         tuple_counted: counted_at_payload(&tuple, tw as u64),
+    })
+}
+
+/// Where a string's bytes and its lengths are, from the payload word: the
+/// byte length, the code-point count (equal for pure ASCII) and the first
+/// byte; and whether its count is the payload word's first.
+#[derive(Clone, Copy)]
+struct StrLayout {
+    len: i32,
+    chars: i32,
+    bytes: i32,
+    counted: bool,
+}
+
+/// [`StrLayout`], read off a sample string (`None` if it isn't the shape
+/// the code assumes).
+fn str_layout() -> Option<StrLayout> {
+    use crate::shared_value::SharedStr;
+    // (Three bytes, two code points: the two words are told apart.)
+    let s = SharedStr::from("a\u{e9}");
+    let n = SharedStr::char_count(&s);
+    let obj = Object::Str(s.clone());
+    // SAFETY: an object is two words, its payload the second.
+    let w = unsafe { *std::ptr::from_ref(&obj).cast::<usize>().add(1) };
+    let find = |value: usize| {
+        (2..8).find(|&k| {
+            // SAFETY: a header word of the live sample.
+            unsafe { *((w + 8 * k) as *const usize) == value }
+        })
+    };
+    let len = find(s.len())?;
+    let chars = find(n)?;
+    let bytes = (s.as_ptr() as usize).checked_sub(w)?;
+    let off = |d: usize| i32::try_from(d).ok();
+    (n == 2 && s.len() == 3 && len != chars && bytes >= 8 * (chars.max(len) + 1)).then_some(())?;
+    drop(s);
+    Some(StrLayout {
+        len: off(8 * len)?,
+        chars: off(8 * chars)?,
+        bytes: off(bytes)?,
+        counted: counted_at_payload(&obj, w as u64),
     })
 }
 
@@ -17158,6 +17202,115 @@ impl<'a> Lower<'a> {
         done
     }
 
+    /// Whether the `BINARY_SUBSCR` at `pc` of `cont` indexes a string in
+    /// line (see [`Self::str_index_in_line`]): the site's cache settled on
+    /// an ASCII string and an `int`, the single characters' table built,
+    /// and an owned string's release a plain decrement.
+    fn str_index_site(&self, pc: usize, cont: Item) -> Option<(StrLayout, usize)> {
+        use weavepy_compiler::InlineCache as IC;
+        let l = self.tags.str_layout?;
+        if cfg!(debug_assertions)
+            || !matches!(self.code.caches.get(pc as u32), IC::SubscrStrInt)
+            || !(matches!(cont, Item::Local(_) | Item::Const(_)) || l.counted)
+        {
+            return None;
+        }
+        Some((l, crate::shared_value::small_table_addr()?))
+    }
+
+    /// `s[key]` of a pure-ASCII string by an `int` in range, in line: its
+    /// character the single characters' table's string (`table`), its
+    /// count bumped (counts unshared), and an owned string's reference
+    /// given up by a plain decrement. Returns the block to go on in; the
+    /// current block is the cold one where the caller emits its helper
+    /// path, then jumps there.
+    #[allow(clippy::too_many_arguments)]
+    fn str_index_in_line(
+        &mut self,
+        l: StrLayout,
+        table: usize,
+        slot: usize,
+        pcont: Value,
+        own_c: bool,
+        pkey: Value,
+        key_int: Option<Value>,
+    ) -> Block {
+        let helper_block = self.b.create_block();
+        let done = self.b.create_block();
+        let tag = self.tag_at(pcont);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(self.tags.str));
+        self.branch_out(other, helper_block);
+        let i = match key_int {
+            Some(v) => v,
+            None => {
+                let kt = self.tag_at(pkey);
+                let not_int = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, kt, i64::from(self.tags.int));
+                self.branch_out(not_int, helper_block);
+                self.b.ins().load(types::I64, FLAGS, pkey, 8)
+            }
+        };
+        let obj = self.b.ins().load(self.ptr, FLAGS, pcont, 8);
+        // Pure ASCII: as many code points (known) as bytes.
+        let len = self.b.ins().load(types::I64, FLAGS, obj, l.len);
+        let chars = self.b.ins().load(types::I64, FLAGS, obj, l.chars);
+        let mixed = self.b.ins().icmp(IntCC::NotEqual, len, chars);
+        self.branch_out(mixed, helper_block);
+        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
+        let from_end = self.b.ins().iadd(i, len);
+        let at = self.b.ins().select(neg, from_end, i);
+        let outside = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, at, len);
+        self.branch_out(outside, helper_block);
+        // Counts unshared (the character's is bumped by a plain add).
+        let flag = self.b.ins().iconst(
+            self.ptr,
+            std::ptr::from_ref(crate::sync::rc_shared_flag()) as i64,
+        );
+        let shared = self.b.ins().uload8(types::I32, FLAGS, flag, 0);
+        self.branch_out(shared, helper_block);
+        if own_c {
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            let gates = self
+                .b
+                .ins()
+                .iconst(self.ptr, crate::sync::release_gates_ptr() as i64);
+            let gates = self.b.ins().uload32(FLAGS, gates, 0);
+            let held = self.b.ins().bor(last, gates);
+            self.branch_out(held, helper_block);
+        }
+        let at_byte = self.b.ins().iadd(obj, at);
+        let byte = self.b.ins().uload8(types::I64, FLAGS, at_byte, l.bytes);
+        let off = self.b.ins().ishl_imm(byte, 3);
+        let base = self.b.ins().iconst(self.ptr, table as i64);
+        let entry = self.b.ins().iadd(base, off);
+        let ch = self.b.ins().load(self.ptr, FLAGS, entry, 0);
+        let n = self.b.ins().load(types::I64, FLAGS, ch, 0);
+        let n = self.b.ins().iadd_imm(n, 1);
+        self.b.ins().store(FLAGS, n, ch, 0);
+        let dst = self.slot_addr(slot);
+        self.write_tag(dst, self.tags.str);
+        self.b.ins().store(FLAGS, ch, dst, 8);
+        if own_c {
+            // (The character's clone ran no code: the count is as read.)
+            let n = self.b.ins().load(types::I64, FLAGS, obj, 0);
+            let n = self.b.ins().iadd_imm(n, -1);
+            self.b.ins().store(FLAGS, n, obj, 0);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.set_cold_block(helper_block);
+        self.b.switch_to_block(helper_block);
+        done
+    }
+
     /// `BINARY_SUBSCR` through [`h_subscr_ref`], which reads a local's or
     /// constant's operand in place (no reference taken or released): the
     /// item in the container's slot. `false`, emitting nothing, where the
@@ -17177,8 +17330,12 @@ impl<'a> Lower<'a> {
         let (pcont, own_c) = self.ref_or_own(cont, slot);
         let (pkey, own_k) = self.ref_or_own(key, slot + 1);
         let owned = u8::from(own_c) | (u8::from(own_k) << 1);
-        let done =
-            tuple.map(|tuple| self.seq_index_in_line(tuple, slot, pcont, own_c, pkey, key_int));
+        let done = match tuple {
+            Some(tuple) => Some(self.seq_index_in_line(tuple, slot, pcont, own_c, pkey, key_int)),
+            None => self.str_index_site(pc, cont).map(|(l, table)| {
+                self.str_index_in_line(l, table, slot, pcont, own_c, pkey, key_int)
+            }),
+        };
         self.subscr_call(pc, slot, pcont, pkey, owned);
         if let Some(done) = done {
             self.b.ins().jump(done, &[]);

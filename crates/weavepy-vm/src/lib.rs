@@ -21095,7 +21095,7 @@ impl Interpreter {
     /// Settle the empty cache of the `BINARY_SUBSCR` (or, `store`, the
     /// `STORE_SUBSCR`) at `pc` on the operands' shape (the container and
     /// key, the top two of the `len` at `base`) when they're a list (or a
-    /// tuple, read) and an `int`: the core loop serves those without the
+    /// tuple or a string, read) and an `int`: the core loop serves those without the
     /// cache machinery, and compiled code indexes them in line by it.
     ///
     /// # Safety
@@ -21134,7 +21134,7 @@ impl Interpreter {
             (Object::List(_), Object::Int(_)) if store => {
                 specialize::attempt_specialize_store_subscr(c, k)
             }
-            (Object::List(_) | Object::Tuple(_), Object::Int(_)) if !store => {
+            (Object::List(_) | Object::Tuple(_) | Object::Str(_), Object::Int(_)) if !store => {
                 specialize::attempt_specialize_binary_subscr(c, k)
             }
             _ => return,

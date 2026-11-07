@@ -155,6 +155,43 @@ def store_key(x):
 data.sort(key=store_key)
 assert data == [1, 2, 3] and seen == [None, None, None], (data, seen)
 
+# Strings: an ASCII string's characters (from either end, owned as a call's
+# result, or a local), then a non-ASCII one, a subclass and a miss.
+def chars(text, n):
+    out = []
+    for k in range(n):
+        out.append(text[k % len(text)] + text[-1 - k % len(text)])
+    return out
+
+
+def made(k):
+    return "xyz%d" % (k % 10)
+
+
+def owned_char(n):
+    return [made(k)[k % 4] for k in range(n)]
+
+
+assert chars("abc", 3000)[-3:] == ["ac", "bb", "ca"]
+assert owned_char(3000)[-4:] == ["x", "y", "z", "9"]
+assert chars("héllo", 5) == ["ho", "él", "ll", "lé", "oh"]
+
+
+class S(str):
+    def __getitem__(self, i):
+        return "S"
+
+
+assert chars(S("abc"), 2) == ["SS", "SS"]
+for i in (3, -4):
+    try:
+        pick("abc", i)
+    except IndexError as e:
+        assert "string index out of range" in str(e), e
+    else:
+        raise AssertionError(i)
+assert pick("abc", -1) == "c" and pick("abc", 0) is pick("zab", 1)
+
 # Other containers at a site that settled on lists.
 assert pick({0: "d"}, 0) == "d"
 assert pick("abc", -1) == "c"
