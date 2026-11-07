@@ -504,6 +504,13 @@ branch and pull request.
     `__init__`, the instance its first positional), instead of leaving at
     the `CALL_KW` and running the `__init__` in the core loop: `C(i, b=2)`
     costs 2,679 instructions instead of 4,531.
+  - Open: `test_set` fails about once in a hundred runs, a set missing
+    members after a `discard` (`test_discard_absent`, and
+    `test_set_membership` after `discard(set(range(3)))`). It predates this
+    round, doesn't repeat under the failing run's hash seed, and 480,000
+    random discards against a model and runs with collections every few
+    allocations found nothing; the dict-map removal (backward-shift
+    deletion, then the moved entry re-pointed) reads correct.
   - Next for `exceptions` and `try`-heavy code: a compiled function that
     catches an exception registers its activation for the core loop's
     catch, which needs the activation's frame shell for the traceback
