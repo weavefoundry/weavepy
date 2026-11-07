@@ -681,6 +681,11 @@ branch and pull request.
     their class's empty slots that the constructor then replaced, and a
     laid-out block takes its values in one copy. `async_tree` runs 1.9%
     fewer instructions.
+  - A collector registry entry is 24 bytes instead of 32: it keeps its weak
+    handle as the handle's pointer and tag, the tag beside the entry's
+    generation and flags, instead of as a `WeakObject`, whose tag took a
+    word of its own. Every tracked object costs 8 bytes less (a pending
+    asyncio task tracks seven); instructions are unchanged.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

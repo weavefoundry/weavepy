@@ -209,8 +209,10 @@ const F_REACHED: u8 = 8;
 /// reserved until then, so the address the index keys it by can't be
 /// reused by another object meanwhile.
 struct Entry {
-    /// The object, held weakly; `None` for a free slot.
-    obj: Option<WeakObject>,
+    /// The object's weak handle, packed with [`Self::kind`] (see
+    /// [`WeakObject::into_parts`]), or `0` for a free slot: as a
+    /// `WeakObject`, the handle's tag would take a word of its own.
+    weak: usize,
     /// Position in the owning list (`gens[gen]`, or `frozen`), or the next
     /// free slot for a free one.
     pos: u32,
@@ -220,13 +222,77 @@ struct Entry {
     /// While [`F_CAND`] is set: the candidate's node number in the
     /// collection's edge lists.
     node: std::cell::Cell<u32>,
+    /// The weak handle's tag.
+    kind: u8,
     /// Generation (0..N_GENERATIONS), [`GEN_FROZEN`] or [`GEN_FREE`].
     gen: u8,
     /// [`F_FINALIZED`], [`F_QUEUED`] and [`F_CAND`].
     flags: std::cell::Cell<u8>,
 }
 
+const _: () = assert!(std::mem::size_of::<Entry>() == 24);
+
+/// An [`Entry`]'s weak handle, borrowed (it releases nothing).
+struct WeakView<'a>(
+    std::mem::ManuallyDrop<WeakObject>,
+    std::marker::PhantomData<&'a Entry>,
+);
+
+impl std::ops::Deref for WeakView<'_> {
+    type Target = WeakObject;
+
+    #[inline(always)]
+    fn deref(&self) -> &WeakObject {
+        &self.0
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        drop(self.take_obj());
+    }
+}
+
 impl Entry {
+    /// A slot holding `obj`.
+    #[inline]
+    fn holding(obj: WeakObject, pos: u32, gen: u8, flags: u8) -> Self {
+        let (kind, weak) = obj.into_parts();
+        Self {
+            weak,
+            pos,
+            gc_refs: std::cell::Cell::new(0),
+            node: std::cell::Cell::new(0),
+            kind,
+            gen,
+            flags: std::cell::Cell::new(flags),
+        }
+    }
+
+    /// The object's handle; `None` for a free slot.
+    #[inline(always)]
+    fn obj(&self) -> Option<WeakView<'_>> {
+        // SAFETY: the parts are the handle this entry owns; the view
+        // never drops it.
+        (self.weak != 0).then(|| {
+            WeakView(
+                std::mem::ManuallyDrop::new(unsafe {
+                    WeakObject::from_parts(self.kind, self.weak)
+                }),
+                std::marker::PhantomData,
+            )
+        })
+    }
+
+    /// Take the handle out, leaving a free slot's.
+    #[inline]
+    fn take_obj(&mut self) -> Option<WeakObject> {
+        let weak = std::mem::replace(&mut self.weak, 0);
+        // SAFETY: the parts were this entry's handle, which it no longer
+        // holds.
+        (weak != 0).then(|| unsafe { WeakObject::from_parts(self.kind, weak) })
+    }
+
     #[inline]
     fn has(&self, flag: u8) -> bool {
         self.flags.get() & flag != 0
@@ -532,14 +598,7 @@ impl Registry {
     /// Add `obj` to list `gen` in a fresh slot.
     fn insert(&mut self, obj: WeakObject, gen: u8, flags: u8) -> u32 {
         let pos = self.list_mut(gen).len() as u32;
-        let entry = Entry {
-            obj: Some(obj),
-            pos,
-            gc_refs: std::cell::Cell::new(0),
-            node: std::cell::Cell::new(0),
-            gen,
-            flags: std::cell::Cell::new(flags),
-        };
+        let entry = Entry::holding(obj, pos, gen, flags);
         let slot = if self.free != NO_SLOT {
             let slot = self.free;
             let e = &mut self.slab[slot as usize];
@@ -576,7 +635,7 @@ impl Registry {
     fn release(&mut self, slot: u32) -> Option<WeakObject> {
         let free = self.free;
         let e = &mut self.slab[slot as usize];
-        let w = e.obj.take();
+        let w = e.take_obj();
         e.gen = GEN_FREE;
         e.flags.set(0);
         e.pos = free;
@@ -594,11 +653,11 @@ impl Registry {
 
     /// Drop the index entry (or a live instance's record) naming `slot`.
     fn forget_key(&mut self, slot: u32) {
-        let Some(w) = self.slab[slot as usize].obj.as_ref() else {
+        let Some(w) = self.slab[slot as usize].obj() else {
             return;
         };
-        if slot_is_intrusive(w) {
-            clear_intrusive_slot(w);
+        if slot_is_intrusive(&w) {
+            clear_intrusive_slot(&w);
         } else {
             let key = w.addr() as ObjectId;
             if self.index.get(&key) == Some(&slot) {
@@ -1436,7 +1495,7 @@ impl GcState {
         addr: usize,
     ) -> Option<WeakObject> {
         let e = reg.slab.get(slot as usize)?;
-        match &e.obj {
+        match e.obj().as_deref() {
             Some(WeakObject::Instance(w)) if w.as_ptr() as usize == addr => {}
             _ => return None,
         }
@@ -1497,7 +1556,7 @@ impl GcState {
     /// the young sets.
     fn untrack_slot(&self, slot: u32, id: ObjectId, young: bool) {
         let remove = |reg: &mut Registry| {
-            let dead = reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead);
+            let dead = reg.entry(slot).obj().is_none_or(|w| w.is_dead());
             (reg.remove(slot), dead)
         };
         // SAFETY (both views): nothing runs code while they live.
@@ -1582,12 +1641,7 @@ impl GcState {
         while examined < budget && i < reg.gens[gen].len() {
             examined += 1;
             let slot = reg.gens[gen][i];
-            if reg
-                .list_entry(slot)
-                .obj
-                .as_ref()
-                .is_none_or(WeakObject::is_dead)
-            {
+            if reg.list_entry(slot).obj().is_none_or(|w| w.is_dead()) {
                 // (The swap brings the list's last member to `i`.)
                 drop(reg.remove(slot));
                 removed += 1;
@@ -1683,7 +1737,7 @@ impl GcState {
             if e.has(F_FINALIZED) || e.has(F_QUEUED) {
                 continue;
             }
-            if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
+            if let Some(obj) = e.obj().and_then(|w| w.upgrade()) {
                 if has_finalizer(&obj) {
                     out.push(obj);
                 }
@@ -1913,7 +1967,7 @@ impl GcState {
         let reg = self.reg.borrow();
         let mut out = Vec::new();
         let mut push = |s: &u32| {
-            out.extend(reg.entry(*s).obj.as_ref().and_then(WeakObject::upgrade));
+            out.extend(reg.entry(*s).obj().and_then(|w| w.upgrade()));
         };
         match generation {
             Some(g) if g < N_GENERATIONS => reg.gens[g].iter().for_each(&mut push),
@@ -2203,7 +2257,7 @@ impl GcState {
             let e = reg.list_entry(slot);
             e.node.set(starts.len() as u32);
             starts.push(edges.len() as u32);
-            let Some(w) = e.obj.as_ref() else { continue };
+            let Some(w) = e.obj() else { continue };
             // Phase 3's outer refcount, read here while the entry is at hand:
             // the walk takes no reference to a candidate that outlives the
             // visit, so the count is the one it will be after the walk.
@@ -2275,7 +2329,7 @@ impl GcState {
                         "[root] slot={} gc_refs={} sc={}",
                         g,
                         e.gc_refs.get(),
-                        e.obj.as_ref().map_or(0, WeakObject::strong_count)
+                        e.obj().map_or(0, |w| w.strong_count())
                     );
                 } else {
                     let t = &temps[(g & !TEMP_BIT) as usize];
@@ -2309,7 +2363,7 @@ impl GcState {
         for &slot in lists.iter().flatten() {
             let e = reg.list_entry(slot);
             if !e.has(F_REACHED) {
-                if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
+                if let Some(obj) = e.obj().and_then(|w| w.upgrade()) {
                     unreachable.push((slot, obj));
                 }
             }
@@ -2488,7 +2542,7 @@ impl GcState {
             while i < reg.gens[g].len() {
                 let slot = reg.gens[g][i];
                 let e = reg.list_entry(slot);
-                if e.obj.as_ref().is_none_or(WeakObject::is_dead) {
+                if e.obj().is_none_or(|w| w.is_dead()) {
                     // (The swap brings the list's last member to `i`.)
                     dead.push(reg.remove(slot));
                     continue;
@@ -4388,7 +4442,7 @@ mod tests {
     fn registry_entries_stay_compact_and_slots_are_reused() {
         let _gil = crate::gil::hold_gil();
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Entry>(), 32);
+        assert_eq!(std::mem::size_of::<Entry>(), 24);
         let state = GcState::new();
         let roots: Vec<_> = (0..3)
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))
