@@ -73886,14 +73886,17 @@ fn yield_from_resend(instrs: &[weavepy_compiler::Instruction], pc: usize) -> Opt
 }
 
 /// The `SEND` of an `await` of the `CALL` at `pc`'s result: the call is
-/// followed by `GET_AWAITABLE 0; LOAD_CONST None; SEND`.
+/// followed by `GET_AWAITABLE; LOAD_CONST None; SEND`. The awaitable's
+/// argument (`1` and `2` for `async with`'s `__aenter__` and `__aexit__`)
+/// only words the error for a result that isn't awaitable, which a
+/// coroutine function's call never is.
 #[inline]
 pub(crate) fn await_send_after(code: &CodeObject, pc: usize) -> Option<usize> {
     let [get, none, send] = code.instructions.get(pc + 1..pc + 4)? else {
         return None;
     };
     (get.op == OpCode::GetAwaitable
-        && get.arg == 0
+        && get.arg <= 2
         && none.op == OpCode::LoadConst
         && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
         && send.op == OpCode::Send
@@ -77805,7 +77808,7 @@ pub(crate) fn percent_format_with(
                 return Err(value_error("incomplete format"));
             }
             // Optional mapping key: %(name)s
-            let mut mapping_key: Option<String> = None;
+            let mut mapping_key: Option<&str> = None;
             if bytes[i] == b'(' {
                 let mut depth = 1;
                 let start = i + 1;
@@ -77822,8 +77825,7 @@ pub(crate) fn percent_format_with(
                 }
                 mapping_key = Some(
                     std::str::from_utf8(&bytes[start..j])
-                        .map_err(|_| value_error("invalid utf-8"))?
-                        .to_owned(),
+                        .map_err(|_| value_error("invalid utf-8"))?,
                 );
                 i = j + 1;
             }
@@ -77947,46 +77949,58 @@ pub(crate) fn percent_format_with(
                 continue;
             }
             let item = if let Some(k) = mapping_key {
-                // In bytes mode the mapping is keyed by *bytes* (the raw
-                // template slice, latin-1); in str mode by text.
-                let key_obj = match mode {
-                    PercentMode::Bytes => {
-                        Object::new_bytes(k.chars().map(|c| c as u8).collect::<Vec<u8>>())
+                // (A text key of a plain dict: probed without making the
+                // key's object.)
+                let plain = match (mode, value) {
+                    (PercentMode::Str, Object::Dict(d)) => {
+                        Some(d.borrow().get(&crate::object::StrKey(k)).cloned())
                     }
-                    PercentMode::Str => Object::from_str(&k),
+                    _ => None,
                 };
-                match value {
-                    Object::Dict(d) => d
-                        .borrow()
-                        .get(&DictKey(key_obj.clone()))
-                        .cloned()
-                        .ok_or_else(|| crate::error::key_error_object(key_obj.clone()))?,
-                    // A mapping *instance* — a dict subclass that overrides
-                    // `__getitem__` (Django's `DictWrapper` computes values
-                    // for `qn_`-prefixed keys), `UserDict`, … — goes through
-                    // the full subscript protocol, exactly like CPython's
-                    // `PyObject_GetItem`.
-                    Object::Instance(_) => {
-                        match crate::vm_singletons::current_interpreter_ptr() {
-                            // SAFETY: published by an enclosing VM frame
-                            // still live on this thread; the GIL keeps the
-                            // access exclusive.
-                            Some(p) => unsafe { &mut *p }.subscr_get_public(value, &key_obj)?,
-                            // Rust-side callers with no live interpreter:
-                            // the native dict payload is all we can read.
-                            None => match value.native_value() {
-                                Some(Object::Dict(d)) => d
-                                    .borrow()
-                                    .get(&DictKey(key_obj.clone()))
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        crate::error::key_error_object(key_obj.clone())
-                                    })?,
-                                _ => return Err(type_error("format requires a mapping")),
-                            },
+                if let Some(found) = plain {
+                    found.ok_or_else(|| crate::error::key_error_object(Object::from_str(k)))?
+                } else {
+                    // In bytes mode the mapping is keyed by *bytes* (the raw
+                    // template slice, latin-1); in str mode by text.
+                    let key_obj = match mode {
+                        PercentMode::Bytes => {
+                            Object::new_bytes(k.chars().map(|c| c as u8).collect::<Vec<u8>>())
                         }
+                        PercentMode::Str => Object::from_str(k),
+                    };
+                    match value {
+                        Object::Dict(d) => d
+                            .borrow()
+                            .get(&DictKey(key_obj.clone()))
+                            .cloned()
+                            .ok_or_else(|| crate::error::key_error_object(key_obj.clone()))?,
+                        // A mapping *instance* — a dict subclass that overrides
+                        // `__getitem__` (Django's `DictWrapper` computes values
+                        // for `qn_`-prefixed keys), `UserDict`, … — goes through
+                        // the full subscript protocol, exactly like CPython's
+                        // `PyObject_GetItem`.
+                        Object::Instance(_) => {
+                            match crate::vm_singletons::current_interpreter_ptr() {
+                                // SAFETY: published by an enclosing VM frame
+                                // still live on this thread; the GIL keeps the
+                                // access exclusive.
+                                Some(p) => unsafe { &mut *p }.subscr_get_public(value, &key_obj)?,
+                                // Rust-side callers with no live interpreter:
+                                // the native dict payload is all we can read.
+                                None => match value.native_value() {
+                                    Some(Object::Dict(d)) => d
+                                        .borrow()
+                                        .get(&DictKey(key_obj.clone()))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            crate::error::key_error_object(key_obj.clone())
+                                        })?,
+                                    _ => return Err(type_error("format requires a mapping")),
+                                },
+                            }
+                        }
+                        _ => return Err(type_error("format requires a mapping")),
                     }
-                    _ => return Err(type_error("format requires a mapping")),
                 }
             } else {
                 let v = positional

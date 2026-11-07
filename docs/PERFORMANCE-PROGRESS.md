@@ -686,6 +686,18 @@ branch and pull request.
     generation and flags, instead of as a `WeakObject`, whose tag took a
     word of its own. Every tracked object costs 8 bytes less (a pending
     asyncio task tracks seven); instructions are unchanged.
+  - `async with` over a coroutine `__aenter__` or `__aexit__` runs the
+    method's body in line, as an `await` of a coroutine function's call
+    does: that path recognized only `GET_AWAITABLE 0`, and `async with`
+    marks its two awaits 1 and 2 (the argument only words the error for a
+    result that isn't awaitable, which a coroutine never is). An
+    uncontended `async with asyncio.Lock()` takes 396 ns instead of 693
+    (CPython 351), a trivial async manager 208 ns instead of 504 (CPython
+    227), and `async_tree` runs 0.8% fewer instructions.
+  - `%(key)s` conversions probe a plain dict with the key's text instead of
+    making a `String` and then a string object of it per key (`logging`'s
+    `%(asctime)s %(levelname)s ...` record format): `logging_mix` runs 0.2%
+    fewer instructions.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
