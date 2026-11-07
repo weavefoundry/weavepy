@@ -6762,6 +6762,12 @@ pub(crate) struct MethodSite {
     /// instance holds): its class's version, its values' shared names and
     /// the value's position among them (`0` versions: none yet).
     own: (u64, u64, u32),
+    /// A `staticmethod` or `classmethod` of the receiver's class the site
+    /// loaded last: the class's version, whether it binds the class, and
+    /// the function it wraps.
+    desc: Option<(u64, bool, Object)>,
+    /// The class version whose attribute the site found isn't one.
+    desc_miss: u64,
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -6837,6 +6843,28 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                         }
                     }
                 }
+                // A `staticmethod` or `classmethod` the site loaded last, while
+                // the class version holds and the instance can't shadow it:
+                // its function, and the class or an empty self slot.
+                if let Some((ver, binds_class, func)) = &s.desc {
+                    let cls = inst.cls_raw();
+                    let code = &*s.code;
+                    if *ver == cls.attr_version.get()
+                        && droppable(&*top)
+                        && Interpreter::default_getattribute(cls)
+                        && !crate::inst_may_shadow(inst, code, code.instructions[s.pc as usize].arg)
+                    {
+                        let self_slot = if *binds_class {
+                            Object::Type(inst.cls())
+                        } else {
+                            Object::Unbound
+                        };
+                        let f = crate::clone_hot(func);
+                        crate::drop_hot(std::mem::replace(&mut *top, f));
+                        (*st).stack.add(s.len as usize).write(self_slot);
+                        return 0;
+                    }
+                }
                 Some(inst.clone())
             }
             _ => None,
@@ -6852,6 +6880,16 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         );
         if r != 0 {
             return left(st, s.pc, s.last, s.len as usize);
+        }
+        // A `staticmethod`'s or `classmethod`'s function: the descriptor, for
+        // the next time.
+        if let Some(inst) = &recv {
+            note_method_desc(
+                s,
+                inst,
+                &*(*st).stack.add(s.len as usize - 1),
+                &*(*st).stack.add(s.len as usize),
+            );
         }
         // A value of the instance's own: where it sits, for the next time.
         // (Only under the default lookup: a class's own `__getattribute__`
@@ -6885,6 +6923,60 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             return left_marked(st, s.pc, s.len as usize + 1);
         }
         0
+    }
+}
+
+/// Record in `s` the `staticmethod` or `classmethod` of `inst`'s class that
+/// the site's load just found, as `callable` and `self_slot` hold its
+/// result: its function, and the class (or nothing) bound to it.
+///
+/// # Safety
+///
+/// `s`'s code is live.
+unsafe fn note_method_desc(
+    s: &mut MethodSite,
+    inst: &Rc<crate::types::PyInstance>,
+    callable: &Object,
+    self_slot: &Object,
+) {
+    // (Only a result shaped as a descriptor's is worth a lookup: a plain
+    // method's has the instance in the self slot.)
+    if !matches!(callable, Object::Function(_))
+        || !matches!(self_slot, Object::Unbound | Object::Type(_))
+    {
+        return;
+    }
+    let cls = inst.cls_raw();
+    let ver = cls.attr_version.get();
+    if ver == s.desc_miss || !Interpreter::default_getattribute(cls) {
+        return;
+    }
+    // SAFETY: the caller's contract.
+    let code = unsafe { &*s.code };
+    let Some(name) = code
+        .names
+        .get(code.instructions[s.pc as usize].arg as usize)
+    else {
+        return;
+    };
+    let (wrapper, binds_class) = match cls.lookup(name) {
+        Some(Object::StaticMethod(w)) => (w, false),
+        Some(Object::ClassMethod(w)) => (w, true),
+        _ => {
+            s.desc_miss = ver;
+            return;
+        }
+    };
+    let func = wrapper.func();
+    let bound_ok = if binds_class {
+        matches!(self_slot, Object::Type(t) if std::ptr::eq(Rc::as_ptr(t), cls))
+    } else {
+        matches!(self_slot, Object::Unbound)
+    };
+    if bound_ok && matches!(func, Object::Function(_)) && func.is_same(callable) {
+        s.desc = Some((ver, binds_class, func));
+    } else {
+        s.desc_miss = ver;
     }
 }
 
@@ -7521,6 +7613,12 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
         let site = &*site;
         let at = (*st).locals.add(site.local as usize);
         let slot = site.slot as usize;
+        if let Object::Frame(_) | Object::Code(_) = &*at {
+            if let Some(v) = frame_code_attr(st, site, &*at) {
+                (*st).stack.add(slot).write(v);
+                return 0;
+            }
+        }
         if let Some(v) = attr_hit(site, &*at) {
             (*st).stack.add(slot).write(crate::clone_hot(v));
             return 0;
@@ -7559,6 +7657,33 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
     }
 }
 
+/// A frame's or a code object's plain attribute (`f_back`, `f_code`,
+/// `co_filename`: what `logging` reads to find its caller), as
+/// [`attr_miss_quick`] reads it, ahead of the instance caches.
+///
+/// # Safety
+///
+/// As [`h_attr_local`]'s; `recv` is the site's receiver.
+#[inline(always)]
+unsafe fn frame_code_attr(st: *mut State, site: &AttrSite, recv: &Object) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let code = &*site.code;
+        // (A live frame's line with the running activation's own
+        // instruction, as `attr_miss` has it.)
+        let running = match recv {
+            Object::Frame(_) if std::ptr::eq(Rc::as_ptr(&(*(*st).frame).code), site.code) => {
+                Some(((*(*st).frame).locals.identity(), site.pc))
+            }
+            _ => None,
+        };
+        let name = code
+            .names
+            .get(code.instructions[site.pc as usize].arg as usize)?;
+        Interpreter::frame_plain_attr(recv, name, running)
+    }
+}
+
 /// [`h_attr_stack`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -7567,6 +7692,15 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
         let site = &*site;
         let at = (*st).stack.add(site.slot as usize);
         let slot = site.slot as usize;
+        if let Object::Frame(_) | Object::Code(_) = &*at {
+            if let Some(v) = frame_code_attr(st, site, &*at) {
+                if plain_release(&*at) {
+                    at.write(v);
+                    return 0;
+                }
+                drop(v);
+            }
+        }
         let r = if let Some(v) = attr_hit(site, &*at).or_else(|| match &*at {
             Object::Instance(inst) => field_hit(site, inst),
             _ => None,
@@ -18572,6 +18706,8 @@ impl<'a> Lower<'a> {
             builtin_recv,
             builtin,
             own: (0, 0, 0),
+            desc: None,
+            desc_miss: 0,
         });
         let c = self
             .b

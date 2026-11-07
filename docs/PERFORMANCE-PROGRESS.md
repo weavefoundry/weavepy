@@ -715,6 +715,19 @@ branch and pull request.
     frame compiler's code does, instead of through the general subscript:
     `d[k] += 1` on a `defaultdict` takes 65.5 ns instead of 189.4 (CPython
     68.9).
+  - A method load through an instance that found a `staticmethod` or a
+    `classmethod` keeps the wrapped function on its site, under the class
+    version, and loads it again from there while the instance can't shadow
+    the name, instead of running the full method load every time. A site
+    learns only from a result shaped as a descriptor's, and remembers a
+    version whose attribute isn't one, so polymorphic plain-method sites
+    pay nothing. A `classmethod` call through an instance takes 44.9 ns
+    instead of 58.5 (CPython 53.5), a `staticmethod` call 24.9 instead of
+    45.8 (CPython 46.7), with the frame compiler's code alone.
+  - Compiled code reads a frame's or a code object's plain attributes
+    (`f_back`, `f_code`, `co_filename`: `logging`'s caller search) ahead of
+    the instance caches it would otherwise try first: `logging_mix` runs
+    0.4% fewer instructions.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
