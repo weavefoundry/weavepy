@@ -377,10 +377,6 @@ pub fn func_event(event: &str, func: &Object, new_value: &Object) {
     let Some(cb) = cb else { return };
     call_dispatcher(
         &cb,
-        vec![
-            Object::from_str(event),
-            func.clone(),
-            new_value.clone(),
-        ],
+        vec![Object::from_str(event), func.clone(), new_value.clone()],
     );
 }

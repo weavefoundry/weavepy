@@ -7636,13 +7636,12 @@ unsafe fn attr_miss_quick(
         match recv {
             // (The site's memo first: it fills on the first read, and
             // `h_attr_stack` answers from it without coming here.)
-            Object::Type(cls) if local || Rc::strong_count(cls) > 1 => {
-                type_attr_read(site, cls).or_else(|| {
+            Object::Type(cls) if local || Rc::strong_count(cls) > 1 => type_attr_read(site, cls)
+                .or_else(|| {
                     (*site.ext)
                         .stamp_slot(site.pc as usize)
                         .and_then(|s| crate::class_attr_hit(s, cls))
-                })
-            }
+                }),
             Object::Instance(inst) if local || droppable(recv) => {
                 if let Some(d) = inst_dict_read(site, inst) {
                     return Some(d);
@@ -7977,7 +7976,7 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
         let v = match &*at {
-            Object::Instance(inst) => field_hit(s, inst).map(|v| crate::clone_hot(v)),
+            Object::Instance(inst) => field_hit(s, inst).map(crate::clone_hot),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
             _ => None,
@@ -18124,7 +18123,10 @@ impl<'a> Lower<'a> {
         let empty = self.b.ins().icmp_imm(IntCC::Equal, sv, 0);
         self.branch_out(empty, helper_block);
         let x = self.b.ins().bxor(sv, m);
-        let other = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, x, l.ix_mask);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, x, l.ix_mask);
         self.branch_out(other, helper_block);
         let ix = self.b.ins().band_imm(sv, l.ix_mask);
         let ix = self.b.ins().iadd_imm(ix, -1);
@@ -19214,11 +19216,20 @@ impl<'a> Lower<'a> {
     /// cells shared), as `h_for_iter` peeks them. Leaves the current block
     /// the helper's: a list's end, a range's, and any other iterator go
     /// there.
-    fn for_iter_in_line(&mut self, pc: usize, it: Value, out: Value, int_b: Block, pushed_b: Block) {
+    fn for_iter_in_line(
+        &mut self,
+        pc: usize,
+        it: Value,
+        out: Value,
+        int_b: Block,
+        pushed_b: Block,
+    ) {
         use weavepy_compiler::InlineCache as IC;
-        let (Some(l), Some(s), false) =
-            (self.tags.iter_layout, self.tags.seq_layout, cfg!(debug_assertions))
-        else {
+        let (Some(l), Some(s), false) = (
+            self.tags.iter_layout,
+            self.tags.seq_layout,
+            cfg!(debug_assertions),
+        ) else {
             return;
         };
         if !matches!(
@@ -19229,7 +19240,10 @@ impl<'a> Lower<'a> {
         }
         let helper_b = self.b.create_block();
         let tag = self.tag_at(it);
-        let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag));
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, tag, i64::from(l.tag));
         self.branch_out(other, helper_b);
         let flag = self
             .b
@@ -19255,7 +19269,10 @@ impl<'a> Lower<'a> {
         let step = self.b.ins().load(types::I64, FLAGS, obj, l.range_step);
         let down = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, step, 0);
         self.branch_out(down, helper_b);
-        let done = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, cur, stop);
+        let done = self
+            .b
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, cur, stop);
         self.branch_out(done, helper_b);
         let next = self.b.ins().iadd(cur, step);
         self.b.ins().store(FLAGS, next, obj, l.range_current);
@@ -20090,9 +20107,11 @@ impl<'a> Lower<'a> {
     /// lowering goes on, in the cold block, for anything else. `None`,
     /// emitting nothing, for another site.
     fn len_in_line(&mut self, pc: usize) -> Option<Block> {
-        let (Some(seq), Some(sl), false) =
-            (self.tags.seq_layout, self.tags.str_layout, cfg!(debug_assertions))
-        else {
+        let (Some(seq), Some(sl), false) = (
+            self.tags.seq_layout,
+            self.tags.str_layout,
+            cfg!(debug_assertions),
+        ) else {
             return None;
         };
         let (f, kind, _) = crate::call_site_builtin(self.ext, pc)?;
@@ -20137,7 +20156,10 @@ impl<'a> Lower<'a> {
         self.b.append_block_param(got, types::I64);
         // A list: not mutably borrowed.
         let not_list = self.b.create_block();
-        let is = self.b.ins().icmp_imm(IntCC::Equal, at, i64::from(self.tags.list));
+        let is = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, at, i64::from(self.tags.list));
         let list_b = self.b.create_block();
         self.b.ins().brif(is, list_b, &[], not_list, &[]);
         self.b.switch_to_block(list_b);
@@ -20155,7 +20177,10 @@ impl<'a> Lower<'a> {
         // A tuple.
         self.b.switch_to_block(not_list);
         let not_tuple = self.b.create_block();
-        let is = self.b.ins().icmp_imm(IntCC::Equal, at, i64::from(seq.tuple_tag));
+        let is = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, at, i64::from(seq.tuple_tag));
         let tuple_b = self.b.create_block();
         self.b.ins().brif(is, tuple_b, &[], not_tuple, &[]);
         self.b.switch_to_block(tuple_b);
@@ -20163,7 +20188,10 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(got, &[n.into()]);
         // A string whose code-point count is known.
         self.b.switch_to_block(not_tuple);
-        let not_str = self.b.ins().icmp_imm(IntCC::NotEqual, at, i64::from(self.tags.str));
+        let not_str = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, at, i64::from(self.tags.str));
         self.branch_out(not_str, helper);
         let n = self.b.ins().load(types::I64, FLAGS, obj, sl.chars);
         let unknown = self.b.ins().icmp_imm(IntCC::Equal, n, -1);

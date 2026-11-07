@@ -529,10 +529,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("MSG_DONTWAIT", libc::MSG_DONTWAIT),
             ("MSG_EOR", libc::MSG_EOR),
         ] {
-            d.insert(
-                DictKey(Object::from_str(name)),
-                Object::Int(i64::from(val)),
-            );
+            d.insert(DictKey(Object::from_str(name)), Object::Int(i64::from(val)));
         }
         #[cfg(not(unix))]
         {
@@ -576,10 +573,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("AI_ALL", libc::AI_ALL),
             ("AI_V4MAPPED", libc::AI_V4MAPPED),
         ] {
-            d.insert(
-                DictKey(Object::from_str(name)),
-                Object::Int(i64::from(val)),
-            );
+            d.insert(DictKey(Object::from_str(name)), Object::Int(i64::from(val)));
         }
         // On non-unix these are the ws2tcpip.h values — they are passed
         // straight into Winsock's `getaddrinfo` hints.
@@ -624,10 +618,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("EAI_SOCKTYPE", libc::EAI_SOCKTYPE),
             ("EAI_SYSTEM", libc::EAI_SYSTEM),
         ] {
-            d.insert(
-                DictKey(Object::from_str(name)),
-                Object::Int(i64::from(val)),
-            );
+            d.insert(DictKey(Object::from_str(name)), Object::Int(i64::from(val)));
         }
         #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
         d.insert(
@@ -650,10 +641,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("EAI_PROTOCOL", 13),
             ("EAI_MAX", 15),
         ] {
-            d.insert(
-                DictKey(Object::from_str(name)),
-                Object::Int(i64::from(val)),
-            );
+            d.insert(DictKey(Object::from_str(name)), Object::Int(i64::from(val)));
         }
         // Winsock spelling (ws2tcpip.h maps EAI_* onto WSA error codes).
         #[cfg(not(unix))]

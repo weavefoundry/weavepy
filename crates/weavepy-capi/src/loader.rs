@@ -745,11 +745,7 @@ fn vm_load_extension(
             ));
             // ImportError carries the module name and origin path
             // (CPython sets both on every dynload failure).
-            weavepy_vm::error::set_exception_attr(
-                &e,
-                "name",
-                Object::from_str(full_name),
-            );
+            weavepy_vm::error::set_exception_attr(&e, "name", Object::from_str(full_name));
             weavepy_vm::error::set_exception_attr(
                 &e,
                 "path",

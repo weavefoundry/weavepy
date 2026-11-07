@@ -61,9 +61,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 }
 
 fn gettempdir(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(
-        std::env::temp_dir().to_string_lossy(),
-    ))
+    Ok(Object::from_str(std::env::temp_dir().to_string_lossy()))
 }
 
 fn gettempprefix(_args: &[Object]) -> Result<Object, RuntimeError> {

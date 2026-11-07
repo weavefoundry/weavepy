@@ -1002,10 +1002,7 @@ pub unsafe extern "C" fn PyConfig_Names() -> *mut PyObject {
     names.extend_from_slice(STR_NAMES);
     names.extend_from_slice(LIST_NAMES);
     names.sort_unstable();
-    let items: Vec<Object> = names
-        .into_iter()
-        .map(|n| Object::from_str(n))
-        .collect();
+    let items: Vec<Object> = names.into_iter().map(|n| Object::from_str(n)).collect();
     let tuple = crate::object::into_owned(Object::new_tuple(items));
     let set = unsafe { crate::containers::PyFrozenSet_New(tuple) };
     unsafe { crate::object::Py_DecRef(tuple) };

@@ -4740,7 +4740,8 @@ fn pin_identity(v: &Object) -> usize {
 /// entries, and each would evict the other on every read.
 #[inline]
 fn pin_memo_slot(id: usize) -> usize {
-    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize >> (usize::BITS - PIN_MEMO.trailing_zeros())
+    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize
+        >> (usize::BITS - PIN_MEMO.trailing_zeros())
 }
 
 /// The identity of the object `pins[ix]` holds (`0` for none).
@@ -4806,7 +4807,9 @@ fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]
     // pin's index, so that a set's entries take turns.
     let k = (0..PIN_MEMO_WAYS)
         .map(|w| s ^ w)
-        .find(|&k| matches!(pin_memo_holds(pins, memo[k]), 0) || pin_memo_holds(pins, memo[k]) == id)
+        .find(|&k| {
+            matches!(pin_memo_holds(pins, memo[k]), 0) || pin_memo_holds(pins, memo[k]) == id
+        })
         .unwrap_or(s ^ (ix % PIN_MEMO_WAYS));
     memo[k] = ix as u32;
 }

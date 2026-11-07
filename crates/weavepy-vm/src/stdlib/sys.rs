@@ -719,10 +719,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             // the installation (3.14's `site.venv()` only checks this;
             // it no longer assigns it — test_venv, test_sysconfig
             // test_makefile_overwrites_config_vars).
-            let venv_prefix = venv_prefix_dir().map_or_else(
-                || prefix.clone(),
-                |p| Object::from_str(p.to_string_lossy()),
-            );
+            let venv_prefix = venv_prefix_dir()
+                .map_or_else(|| prefix.clone(), |p| Object::from_str(p.to_string_lossy()));
             for name in ["prefix", "exec_prefix"] {
                 d.insert(DictKey(Object::from_static(name)), venv_prefix.clone());
             }
@@ -749,9 +747,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `sys._stdlib_dir`). `None` when the tree is unavailable.
         d.insert(
             DictKey(Object::from_static("_stdlib_dir")),
-            crate::stdlib_tree::stdlib_dir().map_or(Object::None, |p| {
-                Object::from_str(p.to_string_lossy())
-            }),
+            crate::stdlib_tree::stdlib_dir()
+                .map_or(Object::None, |p| Object::from_str(p.to_string_lossy())),
         );
         d.insert(
             DictKey(Object::from_static("implementation")),

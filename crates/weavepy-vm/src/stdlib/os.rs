@@ -1255,9 +1255,7 @@ fn os_getenv(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("getenv() first arg must be str")),
     };
     let default = args.get(1).cloned().unwrap_or(Object::None);
-    Ok(std::env::var_os(&key).map_or(default, |v| {
-        Object::from_str(v.to_string_lossy())
-    }))
+    Ok(std::env::var_os(&key).map_or(default, |v| Object::from_str(v.to_string_lossy())))
 }
 
 /// Coerce an `os.putenv`/`os.unsetenv` argument (str or bytes-like) to a
@@ -3121,9 +3119,7 @@ fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> 
         Object::WStr(cps) => {
             let bytes =
                 crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
-            Ok(Object::from_str(
-                String::from_utf8_lossy(&bytes),
-            ))
+            Ok(Object::from_str(String::from_utf8_lossy(&bytes)))
         }
         Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
         Object::Instance(_) => {
@@ -5669,10 +5665,7 @@ fn os_cpu_count(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_get_exec_path(_args: &[Object]) -> Result<Object, RuntimeError> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let path = std::env::var("PATH").unwrap_or_default();
-    let parts: Vec<Object> = path
-        .split(sep)
-        .map(Object::from_str)
-        .collect();
+    let parts: Vec<Object> = path.split(sep).map(Object::from_str).collect();
     Ok(Object::new_list(parts))
 }
 

@@ -2901,10 +2901,7 @@ fn assemble_type_dict(
 ) -> DictData {
     let mut dict = DictData::default();
     if let Some(d) = doc {
-        dict.insert(
-            DictKey(Object::from_static("__doc__")),
-            Object::from_str(d),
-        );
+        dict.insert(DictKey(Object::from_static("__doc__")), Object::from_str(d));
     }
     dict.insert(
         DictKey(Object::from_static("__module__")),

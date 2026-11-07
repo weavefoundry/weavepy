@@ -262,7 +262,9 @@ pub(crate) fn table_layout() -> Option<TableLayout> {
     for i in 0..n as i64 {
         t.insert_hashed(i, DictKey(Object::Int(i)), Object::Int(i));
     }
-    if t.slots.is_empty() || t.entries.capacity() == t.entries.len() && t.entries.len() == t.slots.len() {
+    if t.slots.is_empty()
+        || t.entries.capacity() == t.entries.len() && t.entries.len() == t.slots.len()
+    {
         return None;
     }
     let base = std::ptr::from_ref(&t) as usize;

@@ -68997,12 +68997,7 @@ impl Interpreter {
         // build the module *natively* from the code object so it is a true
         // `Object::Module` — dotted-import binding and `IMPORT_FROM` only
         // recognise native modules, not `types.ModuleType` instances.
-        let payload = match self.call(
-            &func,
-            &[Object::from_str(full)],
-            &[],
-            &helper_globals,
-        )? {
+        let payload = match self.call(&func, &[Object::from_str(full)], &[], &helper_globals)? {
             Object::Tuple(t) => t,
             _ => return Ok(None),
         };
@@ -69695,11 +69690,7 @@ impl Interpreter {
                 // attribute) — `traceback.py`'s suggestion machinery keys
                 // off `name_from`.
                 crate::error::set_exception_attr(&err, "name", Object::from_str(m.name.clone()));
-                crate::error::set_exception_attr(
-                    &err,
-                    "name_from",
-                    Object::from_str(name),
-                );
+                crate::error::set_exception_attr(&err, "name_from", Object::from_str(name));
                 if let Some(Object::Str(path)) = m
                     .dict
                     .borrow()
