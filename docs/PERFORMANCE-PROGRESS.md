@@ -7,6 +7,15 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured in the evening of November 6, 2026, at `e6cd488b` (PR #107), a PGO
+build against CPython 3.14 on the same host: warm time 0.916, cold time 1.033,
+peak memory 1.268, instructions 0.940 (on a release build). Since `02c5de6e`
+`class_creation` moved from 1.31 to 1.05 warm and 1.60 to 1.30 cold, as `exec`
+reuses the code `dataclasses` and `namedtuple` compile, and compiles cost less
+throughout. The worst warm times are `async_tree` 1.52, `context_managers`
+1.22, `tomllib_loads` 1.21, `deepcopy` 1.19, `stdlib_utils` and `logging_mix`
+1.17; the worst cold times `async_tree` 2.02 and `stdlib_utils` 1.55.
+
 Measured later on November 6, 2026, at `02c5de6e` (PR #107), a PGO build
 against CPython 3.14 on the same host, interleaved in one session: warm time
 0.934, cold time 1.049, peak memory 1.278. Since `d07a0969` the moves are
@@ -605,6 +614,16 @@ branch and pull request.
     cache does), and each run decodes code of its own, bodies on first use:
     reusing the code objects themselves kept what a run's caches and
     compiled code hold (the functions it called) alive with them.
+  - Compiled code reads a class attribute through an instance (`self.flag`,
+    a class-level default) and a method as a value (`f = self.method`,
+    `self._log(msg, args, **kwargs)`, whose `CALL_FUNCTION_EX` takes no
+    method load) from the site's own caches, where it used to take the
+    core loop's whole resolution at every read: a scalar the site's stamp
+    remembers, or the function its method slot resolved at the class's
+    version, bound to the receiver, either one only while the instance
+    doesn't shadow the name. A scalar's read costs 231 instructions a call
+    instead of 511, and `logging`'s `warning(msg, *args, **kwargs)` shape
+    3,637 instead of 4,290.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

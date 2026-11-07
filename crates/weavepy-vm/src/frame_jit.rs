@@ -7153,7 +7153,12 @@ unsafe fn attr_miss_quick(
                 {
                     return Some(v);
                 }
-                field_hit_slow(site, inst).map(crate::clone_hot)
+                if let Some(v) = field_hit_slow(site, inst) {
+                    return Some(crate::clone_hot(v));
+                }
+                // A class attribute it doesn't shadow (a scalar, or a
+                // method bound to it), as the site last resolved it.
+                crate::inst_class_attr_quick(&*site.code, &*site.ext, inst, recv, site.pc as usize)
             }
             Object::Frame(_) | Object::Code(_) if local || droppable(recv) => {
                 let code = &*site.code;

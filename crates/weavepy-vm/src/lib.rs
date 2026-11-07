@@ -32517,10 +32517,17 @@ impl Interpreter {
                 }
                 Some(v)
             }
-            (LeafAttr::Method(f), _) => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
-                receiver.clone(),
-                Object::Function(f),
-            )))),
+            // A plain function off the class, bound, and remembered for the
+            // site at the class's version (see `inst_class_attr_quick`).
+            (LeafAttr::Method(f), _) => {
+                if let Some(slot) = code_method_slot(code, cache_pc) {
+                    slot.set(ver, &f);
+                }
+                Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                    receiver.clone(),
+                    Object::Function(f),
+                ))))
+            }
             // A native method on the class (`re.Pattern.match`), bound as
             // its descriptor binds it, and remembered for the site.
             (LeafAttr::BuiltinMethod(b), _) => {
@@ -82600,6 +82607,39 @@ fn tuple_field_hit(slot: &StampSlot, inst: &PyInstance) -> Option<Object> {
 /// [`class_attr_hit`] for a stamp filled with `via` (`0`, or
 /// [`CLASS_ATTR_VIA_INSTANCE`]).
 #[inline(always)]
+/// `inst.name` at the plain `LOAD_ATTR` at `pc` (receiver `recv`) from the
+/// site's own caches alone, as [`Interpreter::leaf_attr_resolve_site`]
+/// fills them: a scalar class attribute its stamp remembers, or a plain
+/// function its method slot resolved at the class's version, bound to
+/// `recv`; in either case one the instance doesn't shadow. `None` for
+/// anything else (compiled code's attribute miss then takes the full
+/// resolution).
+pub(crate) fn inst_class_attr_quick(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    inst: &PyInstance,
+    recv: &Object,
+    pc: usize,
+) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if let Some(v) = ext
+        .stamp_slot(pc)
+        .and_then(|s| class_attr_hit_via(s, cls, CLASS_ATTR_VIA_INSTANCE))
+    {
+        let name_idx = code.instructions.get(pc)?.arg;
+        return (!inst_may_shadow(inst, code, name_idx)).then_some(v);
+    }
+    let f = ext.method_slot(pc)?.get_held(cls.attr_version.get())?;
+    let name_idx = code.instructions.get(pc)?.arg;
+    if inst_may_shadow(inst, code, name_idx) {
+        return None;
+    }
+    Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+        recv.clone(),
+        Object::Function(f),
+    ))))
+}
+
 fn class_attr_hit_via(
     slot: &StampSlot,
     cls: &crate::types::TypeObject,
