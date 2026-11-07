@@ -138,19 +138,21 @@ fn handle_run(hs: &HandleState, args: &[Object]) -> Result<Object, RuntimeError>
 /// A `Handle(callback, args, loop, context)` built natively for a loop
 /// not in debug mode (so `_source_traceback` is `None`).
 fn new_handle(hs: &HandleState, cb: Object, args: Object, loop_: Object, ctx: Object) -> Object {
-    let mut inst = PyInstance::new(hs.cls.clone());
-    inst.slots = RefCell::new(SlotStorage::from_layout(
-        hs.layout.clone(),
-        vec![
-            ctx,
-            loop_,
-            cb,
-            args,
-            Object::Bool(false),
-            Object::None,
-            Object::None,
-        ],
-    ));
+    let inst = PyInstance::with_slots(
+        hs.cls.clone(),
+        SlotStorage::from_layout_array(
+            hs.layout.clone(),
+            [
+                ctx,
+                loop_,
+                cb,
+                args,
+                Object::Bool(false),
+                Object::None,
+                Object::None,
+            ],
+        ),
+    );
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     obj

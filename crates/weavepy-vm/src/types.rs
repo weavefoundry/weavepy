@@ -2985,18 +2985,36 @@ impl SlotStorage {
     #[inline]
     fn fixed_with(layout: SharedSlice<DictKey>, mut fill: impl FnMut(usize) -> Object) -> Self {
         let n = layout.len();
-        // SAFETY: a nonzero size (the header), written in full below
-        // before the word is published.
+        // SAFETY: every value is written.
+        unsafe {
+            Self::fixed_with_raw(layout, |values| {
+                for i in 0..n {
+                    values.add(i).write(fill(i));
+                }
+            })
+        }
+    }
+
+    /// A laid-out block over `layout` whose values `write` initializes.
+    ///
+    /// # Safety
+    ///
+    /// `write` must initialize all `layout.len()` values at its pointer.
+    #[inline]
+    unsafe fn fixed_with_raw(
+        layout: SharedSlice<DictKey>,
+        write: impl FnOnce(*mut Object),
+    ) -> Self {
+        let n = layout.len();
+        // SAFETY: a nonzero size (the header); the caller writes the
+        // values before the word is published.
         unsafe {
             let p = std::alloc::alloc(Self::fixed_alloc(n));
             if p.is_null() {
                 std::alloc::handle_alloc_error(Self::fixed_alloc(n));
             }
             p.cast::<FixedHead>().write(FixedHead { layout });
-            let values = p.add(SLOT_VALUES_AT).cast::<Object>();
-            for i in 0..n {
-                values.add(i).write(fill(i));
-            }
+            write(p.add(SLOT_VALUES_AT).cast::<Object>());
             Self { word: p as usize }
         }
     }
@@ -3321,7 +3339,36 @@ impl SlotStorage {
         if layout.len() != values.len() {
             return Self::from_entries(layout.iter().cloned().zip(values).collect());
         }
-        Self::fixed(layout, values)
+        let mut values = std::mem::ManuallyDrop::new(values);
+        // SAFETY: the values move into the block (one per name), and the
+        // vector, emptied, frees only its buffer.
+        unsafe {
+            let src = values.as_ptr();
+            let n = values.len();
+            values.set_len(0);
+            let out =
+                Self::fixed_with_raw(layout, |dst| std::ptr::copy_nonoverlapping(src, dst, n));
+            std::mem::ManuallyDrop::drop(&mut values);
+            out
+        }
+    }
+
+    /// [`Self::from_layout`] of exactly `N` values, written in place.
+    #[inline]
+    pub fn from_layout_array<const N: usize>(
+        layout: SharedSlice<DictKey>,
+        values: [Object; N],
+    ) -> Self {
+        if layout.len() != N {
+            return Self::from_layout(layout, values.into());
+        }
+        let values = std::mem::ManuallyDrop::new(values);
+        // SAFETY: the `N` values move into the block (one per name).
+        unsafe {
+            Self::fixed_with_raw(layout, |dst| {
+                std::ptr::copy_nonoverlapping(values.as_ptr(), dst, N);
+            })
+        }
     }
 
     /// Access native fields only when the shared layout is the same

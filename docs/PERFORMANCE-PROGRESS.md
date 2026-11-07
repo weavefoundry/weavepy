@@ -676,6 +676,11 @@ branch and pull request.
     `collections_mix` 2.9%. Instructions are within 0.5% except
     `decimal_telco` (1.7% more: a packed decimal's fields sit behind the
     word) and `context_managers` (0.5% fewer).
+  - Asyncio's handles and future iterators and `contextvars`' contexts and
+    tokens are built with their slots laid out in place, instead of with
+    their class's empty slots that the constructor then replaced, and a
+    laid-out block takes its values in one copy. `async_tree` runs 1.9%
+    fewer instructions.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

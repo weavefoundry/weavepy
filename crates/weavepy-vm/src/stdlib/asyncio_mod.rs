@@ -447,9 +447,9 @@ fn attach_state(inst: &Rc<PyInstance>) -> Rc<RefCell<FutState>> {
     if slots.is_empty_default() {
         // (The usual case: laid out alone, the handle needs no key of its
         // own, and `handle_of` reads it without comparing names.)
-        *slots = crate::types::SlotStorage::from_layout(
+        *slots = crate::types::SlotStorage::from_layout_array(
             handle_layout().clone(),
-            vec![Object::Int(handle)],
+            [Object::Int(handle)],
         );
     } else {
         slots.insert(HANDLE_KEY, Object::Int(handle));
@@ -1913,11 +1913,13 @@ fn future_iter_class_ref() -> &'static Rc<TypeObject> {
 }
 
 fn future_iter_new(fut: &Object) -> Object {
-    let mut inst = PyInstance::new(future_iter_class());
-    inst.slots = RefCell::new(crate::types::SlotStorage::from_layout(
-        fi_layout().clone(),
-        vec![fut.clone(), Object::Bool(false)],
-    ));
+    let inst = PyInstance::with_slots(
+        future_iter_class(),
+        crate::types::SlotStorage::from_layout_array(
+            fi_layout().clone(),
+            [fut.clone(), Object::Bool(false)],
+        ),
+    );
     let out = Object::Instance(Rc::new(inst));
     // Built outside the ordinary instantiation path, so enrol with the
     // collector by hand: a suspended `await` parks this iterator on the

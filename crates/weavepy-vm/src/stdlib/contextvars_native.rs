@@ -144,22 +144,26 @@ fn new_dict() -> Object {
 
 /// A natively built `Context` over `data` (shared, not copied).
 fn new_context(st: &State, data: Object) -> Object {
-    let mut inst = PyInstance::new(st.context_cls.clone());
-    inst.slots = RefCell::new(SlotStorage::from_layout(
-        st.context_layout.clone(),
-        vec![data, Object::Bool(false), Object::None],
-    ));
+    let inst = PyInstance::with_slots(
+        st.context_cls.clone(),
+        SlotStorage::from_layout_array(
+            st.context_layout.clone(),
+            [data, Object::Bool(false), Object::None],
+        ),
+    );
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     obj
 }
 
 fn new_token(st: &State, var: Object, old: Object, ctx: Object) -> Object {
-    let mut inst = PyInstance::new(st.token_cls.clone());
-    inst.slots = RefCell::new(SlotStorage::from_layout(
-        st.token_layout.clone(),
-        vec![var, old, Object::Bool(false), ctx],
-    ));
+    let inst = PyInstance::with_slots(
+        st.token_cls.clone(),
+        SlotStorage::from_layout_array(
+            st.token_layout.clone(),
+            [var, old, Object::Bool(false), ctx],
+        ),
+    );
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     obj
