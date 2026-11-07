@@ -837,6 +837,14 @@ branch and pull request.
     `LogRecord.getMessage` formats) renders the dict's repr natively when
     its keys and values are plain, instead of leaving compiled code:
     `logging_mix` runs 2.4% fewer instructions.
+  - A natively served `datetime`'s, `date`'s or `timedelta`'s public field
+    (`current.hour`) is read off its packed state at the start of the
+    attribute site's miss path, out of line, instead of after the instance
+    probes and the core loop's cached reads: the bench gate's
+    `datetime_ops` runs 6% fewer instructions with 14% fewer simulated
+    instruction-cache misses, and 8% faster in the container. (CI's Linux
+    gate read it 16% to 20% slower than `main`, though fewer instructions
+    ran; macOS release builds timed it level.)
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

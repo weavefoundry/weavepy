@@ -7643,6 +7643,13 @@ unsafe fn attr_miss_quick(
                         .and_then(|s| crate::class_attr_hit(s, cls))
                 }),
             Object::Instance(inst) if local || droppable(recv) => {
+                // A natively served value's public field (`dt.hour`), read
+                // off its packed state.
+                if inst.cls_raw().native_kind.get() != 0 {
+                    if let Some(v) = native_field_read(site, inst) {
+                        return Some(v);
+                    }
+                }
                 if let Some(d) = inst_dict_read(site, inst) {
                     return Some(d);
                 }
@@ -7737,6 +7744,23 @@ unsafe fn inst_dict_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
         *site.type_attr.try_borrow_mut().ok()? = Some((p, ver, Object::None));
     }
     Some(Object::Dict(inst.dict_shared()))
+}
+
+/// `inst.name` at `site` of a natively served value (see
+/// `datetime_native::leaf_field`), kept out of line.
+///
+/// # Safety
+///
+/// The site's code is live.
+#[inline(never)]
+unsafe fn native_field_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    let (code, ext) = unsafe { (&*site.code, &*site.ext) };
+    let name_idx = code.instructions.get(site.pc as usize)?.arg as usize;
+    let Some(Object::Str(name)) = ext.name_objs.get(name_idx) else {
+        return None;
+    };
+    crate::stdlib::datetime_native::leaf_field(inst, name)
 }
 
 /// [`attr_hit`] missed for the receiver at `at`: a property's cached
