@@ -80,35 +80,7 @@ pub(crate) fn simplify(f: &mut Function) {
             }
         }
     }
-    // Every operand and branch argument through the aliases.
-    for_each_inst(f, |f, inst| {
-        let d = &f.dfg.insts[inst.index()];
-        let none = (0, 0);
-        let ranges = match &d.op {
-            Op::Jump(e) => [d.args, e.args, none],
-            Op::Brif(t, e) => [d.args, t.args, e.args],
-            _ => [d.args, none, none],
-        };
-        if let Op::BrTable(jt) = d.op {
-            {
-                let t = &mut f.dfg.tables[jt.index()];
-                for v in t.default.args.iter_mut() {
-                    *v = resolve(&alias, *v);
-                }
-                for c in &mut t.table {
-                    for v in c.args.iter_mut() {
-                        *v = resolve(&alias, *v);
-                    }
-                }
-            }
-        }
-        for (s, e) in ranges {
-            for i in s as usize..e as usize {
-                f.dfg.pool[i] = resolve(&alias, f.dfg.pool[i]);
-            }
-        }
-    });
-    // Jumps through empty blocks.
+    // Jumps through empty blocks (by the blocks' shapes alone).
     let nb = f.dfg.blocks.len();
     let entry = f.layout[0];
     let mut fwd: Vec<Block> = (0..nb as u32).map(Block).collect();
@@ -134,34 +106,60 @@ pub(crate) fn simplify(f: &mut Function) {
         }
         b
     };
-    for_each_inst(f, |f, inst| match &mut f.dfg.insts[inst.index()].op {
-        Op::Jump(e) => e.block = target(&fwd, e.block),
-        Op::Brif(t, e) => {
-            t.block = target(&fwd, t.block);
-            e.block = target(&fwd, e.block);
-        }
-        Op::BrTable(jt) => {
-            let jt = *jt;
-            let t = &mut f.dfg.tables[jt.index()];
-            t.default.block = target(&fwd, t.default.block);
-            for c in &mut t.table {
-                c.block = target(&fwd, c.block);
+    // One pass: every operand and branch argument through the aliases,
+    // branches past empty blocks, the uses counted, and the instructions
+    // that might be unused noted.
+    let mut uses = vec![0u32; nv];
+    let mut work: Vec<crate::ir::Inst> = Vec::new();
+    for_each_inst(f, |f, inst| {
+        let d = &f.dfg.insts[inst.index()];
+        let none = (0, 0);
+        let ranges = match &d.op {
+            Op::Jump(e) => [d.args, e.args, none],
+            Op::Brif(t, e) => [d.args, t.args, e.args],
+            _ => [d.args, none, none],
+        };
+        let candidate = pure(&d.op) && d.results.1 > d.results.0;
+        for (s, e) in ranges {
+            for i in s as usize..e as usize {
+                let v = resolve(&alias, f.dfg.pool[i]);
+                f.dfg.pool[i] = v;
+                uses[v.index()] += 1;
             }
         }
-        _ => {}
+        match &mut f.dfg.insts[inst.index()].op {
+            Op::Jump(e) => e.block = target(&fwd, e.block),
+            Op::Brif(t, e) => {
+                t.block = target(&fwd, t.block);
+                e.block = target(&fwd, e.block);
+            }
+            Op::BrTable(jt) => {
+                let jt = *jt;
+                let t = &mut f.dfg.tables[jt.index()];
+                t.default.block = target(&fwd, t.default.block);
+                for v in t.default.args.iter_mut() {
+                    *v = resolve(&alias, *v);
+                    uses[v.index()] += 1;
+                }
+                for c in &mut t.table {
+                    c.block = target(&fwd, c.block);
+                    for v in c.args.iter_mut() {
+                        *v = resolve(&alias, *v);
+                        uses[v.index()] += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if candidate {
+            work.push(inst);
+        }
     });
     // Instructions nothing uses.
-    let mut uses = vec![0u32; nv];
-    for_each_inst(f, |f, inst| {
-        crate::liveness::each_use(f, inst, |v| uses[v.index()] += 1);
-    });
     let mut dead = vec![false; f.dfg.insts.len()];
-    let mut work: Vec<crate::ir::Inst> = Vec::new();
-    for_each_inst(f, |f, i| {
+    work.retain(|&i| {
         let d = &f.dfg.insts[i.index()];
-        if pure(&d.op) && f.dfg.slice(d.results).iter().all(|r| uses[r.index()] == 0) {
-            work.push(i);
-        }
+        f.dfg.slice(d.results).iter().all(|r| uses[r.index()] == 0)
     });
     let work_found = !work.is_empty();
     while let Some(inst) = work.pop() {

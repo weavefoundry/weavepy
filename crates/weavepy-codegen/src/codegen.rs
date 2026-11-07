@@ -113,6 +113,10 @@ struct Gen<'f, A: Asm> {
     tmp: Vec<Value>,
     /// Emptied snapshots' vectors, for the next ones.
     snap_pool: Vec<Vec<(Value, Reg, bool)>>,
+    /// [`Self::moves`]' scratch: the slots written, and the register moves
+    /// still to make.
+    mv_written: Vec<i32>,
+    mv_pending: Vec<(Reg, Reg)>,
     tmp2: Vec<Value>,
     srcs: Vec<Src>,
     /// Each signature's argument locations and stack slots, once computed.
@@ -180,6 +184,8 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         pending: None,
         tmp: Vec::new(),
         snap_pool: Vec::new(),
+        mv_written: Vec::new(),
+        mv_pending: Vec::new(),
         tmp2: Vec::new(),
         srcs: Vec::new(),
         sig_locs: vec![None; f.dfg.sigs.len()],
@@ -1430,9 +1436,12 @@ impl<A: Asm> Gen<'_, A> {
             }
         }
         self.tmp = dead;
-        for r in 0..64u8 {
-            if abi.clobbers & bit(r) != 0 && self.holds[r as usize] != NONE {
-                let v = Value(self.holds[r as usize]);
+        let mut clobbered = abi.clobbers;
+        while clobbered != 0 {
+            let r = clobbered.trailing_zeros() as usize;
+            clobbered &= clobbered - 1;
+            if self.holds[r] != NONE {
+                let v = Value(self.holds[r]);
                 if self.pin[v.index()] == NOREG {
                     self.untrack(v);
                 }
@@ -1502,9 +1511,9 @@ impl<A: Asm> Gen<'_, A> {
             return Ok(Vec::new());
         }
         let mut moves = Vec::new();
-        let live = self.live_into(t);
         if self.canon[t.index()].is_none() && !self.done[t.index()] {
             // The first edge in: the block starts in this edge's state.
+            let live = self.live_into(t);
             let mut avoid = 0;
             let mut canon = Vec::with_capacity(live.len());
             for v in live {
@@ -1710,13 +1719,12 @@ impl<A: Asm> Gen<'_, A> {
         // A slot this assignment writes and also reads (parameters in their
         // slots, swapped by a loop's back edge): read through a copy, made
         // before anything is written.
-        let written: Vec<i32> = moves
-            .iter()
-            .filter_map(|&(d, _)| match d {
-                Dst::Sp(off) => Some(off),
-                Dst::R(_) => None,
-            })
-            .collect();
+        let mut written = std::mem::take(&mut self.mv_written);
+        written.clear();
+        written.extend(moves.iter().filter_map(|&(d, _)| match d {
+            Dst::Sp(off) => Some(off),
+            Dst::R(_) => None,
+        }));
         if !written.is_empty() {
             for m in &mut moves {
                 if let Src::Slot(off, float) = m.1 {
@@ -1756,13 +1764,13 @@ impl<A: Asm> Gen<'_, A> {
         }
         // Register to register, in an order that reads each source before
         // it's overwritten, cycles broken by swaps.
-        let mut pending: Vec<(Reg, Reg)> = moves
-            .iter()
-            .filter_map(|&(d, s)| match (d, s) {
-                (Dst::R(d), Src::R(s)) => Some((d, s)),
-                _ => None,
-            })
-            .collect();
+        self.mv_written = written;
+        let mut pending = std::mem::take(&mut self.mv_pending);
+        pending.clear();
+        pending.extend(moves.iter().filter_map(|&(d, s)| match (d, s) {
+            (Dst::R(d), Src::R(s)) => Some((d, s)),
+            _ => None,
+        }));
         while !pending.is_empty() {
             let ready = (0..pending.len()).find(|&i| {
                 let d = pending[i].0;
@@ -1787,6 +1795,7 @@ impl<A: Asm> Gen<'_, A> {
                 }
             }
         }
+        self.mv_pending = pending;
         // Then what comes from memory or immediates.
         for &(d, s) in &moves {
             let Dst::R(r) = d else { continue };

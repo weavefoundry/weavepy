@@ -250,20 +250,28 @@ impl Emit<'_> {
 /// replaced values' new values go in `alias` (grown for the values this
 /// makes).
 pub(crate) fn fold(f: &mut Function, alias: &mut Vec<Value>) {
-    for b in f.layout.clone() {
-        let insts = std::mem::take(&mut f.dfg.blocks[b.index()].insts);
+    // (Each block's list is rebuilt in the vector the previous block's
+    // list gave up.)
+    let mut spare: Vec<Inst> = Vec::new();
+    for bi in 0..f.layout.len() {
+        let b = f.layout[bi];
+        let mut insts = std::mem::take(&mut f.dfg.blocks[b.index()].insts);
+        spare.clear();
+        spare.reserve(insts.len());
         let mut e = Emit {
             f,
             alias,
-            out: Vec::with_capacity(insts.len()),
+            out: spare,
         };
         // Quotients made in this block, by dividend and divisor.
         let mut quotients: HashMap<(Value, i64), Value> = HashMap::default();
-        for inst in insts {
+        for &inst in &insts {
             fold_one(&mut e, b, inst, &mut quotients);
         }
         let out = std::mem::take(&mut e.out);
         f.dfg.blocks[b.index()].insts = out;
+        insts.clear();
+        spare = insts;
     }
 }
 
@@ -288,12 +296,17 @@ fn fold_one(e: &mut Emit<'_>, b: Block, inst: Inst, quotients: &mut HashMap<(Val
         return;
     }
     let d = e.f.dfg.insts[inst.index()].clone();
-    let args: Vec<Value> =
-        e.f.dfg
-            .slice(d.args)
-            .iter()
-            .map(|&v| resolve(e.alias, v))
-            .collect();
+    // (These take at most three operands.)
+    let operands = e.f.dfg.slice(d.args);
+    if operands.len() > 4 {
+        e.out.push(inst);
+        return;
+    }
+    let mut buf = [Value(0); 4];
+    for (slot, &v) in buf.iter_mut().zip(operands) {
+        *slot = resolve(e.alias, v);
+    }
+    let args = &buf[..operands.len()];
     let c = |e: &Emit<'_>, k: usize| konst(e.f, e.alias, args[k]);
     let ty = d.ty;
     let folded: Option<i64> = match &d.op {
