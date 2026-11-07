@@ -741,6 +741,32 @@ branch and pull request.
   - An attribute site that has read a class's attribute through an
     instance tries that first on its slow paths: `o.k` of a class constant
     takes 38.6 ns instead of 48.3 (container build; CPython about 19).
+  - Compiled code reads an atom (a number, a string, `None`) a class holds
+    from the attribute site's memo of it while the class and its version
+    are the ones it was read under, where the class's metaclass reads
+    attributes as `type` does (`ABCMeta` included) and doesn't shadow the
+    name. Such reads (`type(self).__doc__` in `contextlib`'s generator
+    managers) left compiled code for the interpreter every time.
+  - A built-in container's or string's method read as a value
+    (`append = y.append`, `memo.get` in `copy.deepcopy`) is bound from the
+    site's memo of the method for that kind of receiver (the types never
+    change) instead of looked up each time. With the class atoms above,
+    `context_managers` runs 2.4% fewer instructions and `deepcopy` 1.4%.
+  - The class read remembers a declined name too (an `Enum` member, a
+    function), so that `w.kind is not Kind.C` doesn't repeat the
+    metaclass and class lookups each time it misses: `comprehensions` ran
+    3% more instructions without it.
+  - `cls.__new__` of a class that inherits a builtin constructor
+    (`object.__new__`, as `copy`'s reconstruction reads it) is read from the
+    same memo: 54 ns becomes 29 (container build; CPython 28).
+  - Method calls on ints, bools, floats, tuples and bytes take the memoized
+    method for their kind as lists and strings do (`x.bit_length()`,
+    `f.is_integer()`, `t.count(v)`, `b.decode()`): four such calls take
+    249 ns instead of 360.
+  - `o.__dict__` of an instance whose class keeps its default managed dict
+    returns the dict from the site's memo of that class's answer instead of
+    two MRO walks and a type-name test each time: 57.5 ns becomes 31
+    (CPython 32), and `deepcopy` runs 0.9% fewer instructions.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

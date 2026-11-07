@@ -26392,22 +26392,27 @@ impl Interpreter {
                 Some(self.maybe_bind(recv, m))
             }
             Object::Instance(inst) if name == "__dict__" => {
-                let cls = inst.cls_raw();
-                if inst.native.get().is_some()
-                    || !cls.has_managed_dict()
-                    || !Self::default_getattribute(cls)
-                    || cls.lookup("__getattr__").is_some()
-                {
-                    return None;
-                }
-                let member = cls.lookup("__dict__")?;
-                if crate::builtins::class_of(&member).name != "member_descriptor" {
+                if inst.native.get().is_some() || !Self::managed_dict_attr(inst.cls_raw()) {
                     return None;
                 }
                 Some(Object::Dict(inst.dict_shared()))
             }
             _ => None,
         }
+    }
+
+    /// Whether `inst.__dict__` of a `cls` instance (one with no native
+    /// value) is its own managed dict: the class keeps one, reads
+    /// attributes as `object` does with no `__getattr__`, and its
+    /// `__dict__` is the default member. Valid while the class's attribute
+    /// version holds.
+    pub(crate) fn managed_dict_attr(cls: &TypeObject) -> bool {
+        cls.has_managed_dict()
+            && Self::default_getattribute(cls)
+            && cls.lookup("__getattr__").is_none()
+            && cls
+                .lookup("__dict__")
+                .is_some_and(|m| crate::builtins::class_of(&m).name == "member_descriptor")
     }
 
     /// `f.name` or `f.name = v` (`ins`, a `LOAD_ATTR` without the method

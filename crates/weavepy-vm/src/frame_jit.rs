@@ -7262,6 +7262,13 @@ pub(crate) struct AttrSite {
     /// Whether the site has read a class's attribute through an instance
     /// (see `inst_class_attr_quick`): the slow paths try that first.
     class_attr: Cell<bool>,
+    /// A class receiver's attribute the site read last (see
+    /// [`type_attr_read`]): the class, its version and the value.
+    type_attr: std::cell::RefCell<Option<(usize, u64, Object)>>,
+    /// The method of an exact `list`, `dict`, `set` or `str` the site read
+    /// as a value last (see [`builtin_attr_read`]): the receiver's kind
+    /// and the method.
+    builtin_attr: std::cell::RefCell<Option<(u8, Rc<crate::object::BuiltinFn>)>>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -7398,8 +7405,12 @@ unsafe fn attr_miss_quick(
         match recv {
             Object::Type(cls) if local || Rc::strong_count(cls) > 1 => (*site.ext)
                 .stamp_slot(site.pc as usize)
-                .and_then(|s| crate::class_attr_hit(s, cls)),
+                .and_then(|s| crate::class_attr_hit(s, cls))
+                .or_else(|| type_attr_read(site, cls)),
             Object::Instance(inst) if local || droppable(recv) => {
+                if let Some(d) = inst_dict_read(site, inst) {
+                    return Some(d);
+                }
                 // A named tuple's field (a data descriptor: no instance
                 // shadows it), as the core loop's resolution reads it.
                 if let Some(v) = (*site.ext)
@@ -7454,6 +7465,45 @@ unsafe fn attr_miss_quick(
     }
 }
 
+/// `inst.__dict__` at `site`, where the instance's class keeps its default
+/// managed dict (see `Interpreter::managed_dict_attr`): the dict, the
+/// class's answer memoized in the site's class memo under its attribute
+/// version, with the pointer's low bit set so that a read of the class
+/// itself at the same site never matches it.
+///
+/// # Safety
+///
+/// The site's code is live.
+#[inline]
+unsafe fn inst_dict_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    let code = unsafe { &*site.code };
+    let name: &str = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name != "__dict__" || inst.native.get().is_some() {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    let (p, ver) = (std::ptr::from_ref(cls) as usize | 1, cls.attr_version.get());
+    let known = site
+        .type_attr
+        .try_borrow()
+        .ok()?
+        .as_ref()
+        .is_some_and(|(mp, mver, _)| *mp == p && *mver == ver && ver != 0);
+    if !known {
+        if ver == 0
+            || crate::object::exotic_str_keys_possible()
+            || !Interpreter::managed_dict_attr(cls)
+        {
+            return None;
+        }
+        *site.type_attr.try_borrow_mut().ok()? = Some((p, ver, Object::None));
+    }
+    Some(Object::Dict(inst.dict_shared()))
+}
+
 /// [`attr_hit`] missed for the receiver at `at`: a property's cached
 /// getter first at a site that has run one, then the core loop's cached
 /// reads, then a property's getter (the code's `0`, a status to return, or
@@ -7475,7 +7525,9 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
-        if let Some(v) = attr_miss_quick(site, &*at, local, running) {
+        if let Some(v) = attr_miss_quick(site, &*at, local, running)
+            .or_else(|| builtin_attr_read(st, site, &*at, local))
+        {
             if local {
                 (*st).stack.add(site.slot as usize).write(v);
             } else {
@@ -7699,6 +7751,181 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
         }
         attr_stack_slow(st, site)
     }
+}
+
+/// `x.name` of an exact `list`, `dict`, `set` or `str` naming one of its
+/// type's methods, read as a value (`append = y.append`): the method bound
+/// to `x`, from the site's memo of the method for that kind of receiver
+/// (the types are immutable), else resolved as the full read resolves it
+/// (`Interpreter::lookup_method`, so the method keeps its identity).
+///
+/// # Safety
+///
+/// As [`attr_miss`]'s; `recv` is the site's receiver.
+unsafe fn builtin_attr_read(
+    st: *mut State,
+    site: &AttrSite,
+    recv: &Object,
+    local: bool,
+) -> Option<Object> {
+    let tag = match recv {
+        Object::List(_) => 1u8,
+        Object::Dict(_) => 2,
+        Object::Set(_) => 3,
+        Object::Str(_) => 4,
+        _ => return None,
+    };
+    // (A stack receiver's release follows the read.)
+    if !local && !droppable(recv) {
+        return None;
+    }
+    let bind = |b: &Rc<crate::object::BuiltinFn>| {
+        if b.binds_instance {
+            Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                recv.clone(),
+                Object::Builtin(b.clone()),
+            )))
+        } else {
+            Object::Builtin(b.clone())
+        }
+    };
+    if let Ok(memo) = site.builtin_attr.try_borrow() {
+        if let Some((t, b)) = memo.as_ref() {
+            if *t == tag {
+                return Some(bind(b));
+            }
+        }
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let name: &str = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name.starts_with("__") {
+        return None;
+    }
+    // SAFETY: the interpreter outlives the code it runs.
+    let Object::Builtin(b) = (unsafe { &*(*st).interp }).lookup_method(recv, name)? else {
+        return None;
+    };
+    if let Ok(mut memo) = site.builtin_attr.try_borrow_mut() {
+        *memo = Some((tag, b.clone()));
+    }
+    Some(bind(&b))
+}
+
+/// `cls.name` of a class whose metaclass is `type`, where the attribute
+/// is an atom no descriptor protocol changes on the way out (a number,
+/// a string, `None`): from the site's memo while the class
+/// and its version are the ones it was read under, else looked up (in
+/// the class's own dict for `__doc__`, as `type`'s descriptor reads it)
+/// and remembered. `None` for anything else (the full lookup's then).
+fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
+    let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
+    if let Ok(memo) = site.type_attr.try_borrow() {
+        if let Some((mp, mver, v)) = memo.as_ref() {
+            if *mp == p && *mver == ver && ver != 0 {
+                // (`Unbound`: a read this path declined under that version.)
+                return (!matches!(v, Object::Unbound)).then(|| crate::clone_hot(v));
+            }
+        }
+    }
+    if ver == 0 || crate::object::exotic_str_keys_possible() {
+        return None;
+    }
+    let v = type_attr_resolve(site, cls, p, ver);
+    // A declined read (an `Enum` member, a function) is remembered too, so
+    // that the site's later misses skip the lookups.
+    if v.is_none() {
+        if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+            *memo = Some((p, ver, Object::Unbound));
+        }
+    }
+    v
+}
+
+/// [`type_attr_read`] past its memo: the class's value, memoized, or
+/// `None`.
+#[inline(never)]
+fn type_attr_resolve(
+    site: &AttrSite,
+    cls: &Rc<crate::types::TypeObject>,
+    p: usize,
+    ver: u64,
+) -> Option<Object> {
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*site.code };
+    let name: &str = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    // The metaclass reads attributes as `type` does and defines the name,
+    // if at all, as an atom (`ABCMeta`'s own docstring, which shadows
+    // `type`'s `__doc__` descriptor): the class's own value is the answer.
+    if !cls.metaclass_is_type() {
+        let meta = cls.metaclass_or_type();
+        let ty = &crate::builtin_types::builtin_types().type_;
+        let same_getattr = match (
+            meta.lookup("__getattribute__"),
+            ty.lookup("__getattribute__"),
+        ) {
+            (Some(a), Some(b)) => a.is_same(&b),
+            _ => false,
+        };
+        let meta_ok = match meta.lookup(name) {
+            None => name != "__doc__",
+            Some(Object::Str(_) | Object::None) => true,
+            Some(_) => false,
+        };
+        if !same_getattr || !meta_ok {
+            return None;
+        }
+    }
+    let v = if name == "__doc__" {
+        cls.dict
+            .try_borrow()
+            .ok()?
+            .get(&crate::object::StrKey("__doc__"))
+            .cloned()?
+    } else if name == "__new__" {
+        // A builtin constructor (`object.__new__`, as `copy`'s
+        // `cls.__new__(cls)` reads it): the builtin itself, as a class's
+        // read returns it, which the memo may hold (it outlives the class).
+        let b = match cls.lookup(name)? {
+            b @ Object::Builtin(_) => b,
+            Object::StaticMethod(w) => match w.func() {
+                b @ Object::Builtin(_) => b,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+            *memo = Some((p, ver, b.clone()));
+        }
+        return Some(b);
+    } else if name.starts_with("__") {
+        // (`type`'s own data descriptors take most of these names.)
+        return None;
+    } else {
+        cls.lookup(name)?
+    };
+    // (Atoms only: the memo holds a reference, which must not keep a
+    // replaced function or class alive for anyone to observe.)
+    let plain = matches!(
+        v,
+        Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Str(_)
+            | Object::Bytes(_)
+    );
+    if !plain {
+        return None;
+    }
+    if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+        *memo = Some((p, ver, v.clone()));
+    }
+    Some(v)
 }
 
 /// A frame's or a code object's plain attribute (`f_back`, `f_code`,
@@ -18544,6 +18771,8 @@ impl<'a> Lower<'a> {
             direct,
             cache: SlotCache::default(),
             class_attr: Cell::new(false),
+            type_attr: std::cell::RefCell::new(None),
+            builtin_attr: std::cell::RefCell::new(None),
         });
         let c = self
             .b
@@ -18882,6 +19111,17 @@ impl<'a> Lower<'a> {
             2 => self.tags.dict,
             3 => self.tags.set,
             4 => self.tags.str,
+            // The other built-in values whose variant alone decides their
+            // methods (see `builtins::method_memo_tag`): `x.as_integer_ratio()`
+            // of a float, `t.count(v)` of a tuple, `b.decode()`.
+            16.. => match tag - 16 {
+                4 => Object::new_tuple(Vec::new()).tag(),
+                7 => Object::new_bytes(Vec::new()).tag(),
+                9 => self.tags.int,
+                11 => self.tags.boolean,
+                12 => self.tags.float,
+                _ => return None,
+            },
             _ => return None,
         };
         let counted = Object::Builtin(f.clone()).tag();
