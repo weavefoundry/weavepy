@@ -2670,6 +2670,24 @@ impl Interpreter {
     /// references exist) make the park equivalent to a free. Elements
     /// are cleared in place so their refcounts fall now, exactly as a
     /// plain drop would.
+    /// Park `t`, a tuple this handle alone owns whose items were all moved
+    /// out (each slot `Unbound`), as [`Self::maybe_donate_tuple`] parks a
+    /// dead one; or free it when its bucket is full.
+    #[inline]
+    pub(crate) fn park_tuple(&self, t: ThinArc<crate::tuple_storage::TupleStorage>) {
+        const PER_LEN_CAP: usize = 8;
+        let n = t.len();
+        if n == 0 || n > 16 {
+            return;
+        }
+        if let Ok(mut pool) = self.tuple_pool.try_borrow_mut() {
+            let bucket = &mut pool[n - 1];
+            if bucket.len() < PER_LEN_CAP {
+                bucket.push(t);
+            }
+        }
+    }
+
     fn maybe_donate_tuple(&self, dropped: Object) {
         const PER_LEN_CAP: usize = 8;
         let Object::Tuple(t) = dropped else { return };
@@ -81373,6 +81391,53 @@ pub(crate) fn builtin_method_site(
     }
     let kind = slots.get(call_pc)?.get_leaf_ptr(Rc::as_ptr(b))?;
     Some((tag, kind, b.clone()))
+}
+
+/// The native method a `LOAD_ATTR` (method) site at `attr_pc` cached for
+/// an instance receiver, with the class attribute version it was cached
+/// under and the fast half its `CALL` at `call_pc` settled on (`None` for a
+/// body that is a leaf whole), for the frame JIT's instance method calls
+/// (see [`Interpreter::core_native_method`], which they replace).
+#[cfg(feature = "jit")]
+pub(crate) fn inst_builtin_method_site(
+    ext: &CodeConstObjects,
+    attr_pc: usize,
+    call_pc: usize,
+) -> Option<(
+    u64,
+    Option<leaf_builtins::Fast>,
+    Rc<crate::object::BuiltinFn>,
+)> {
+    let slots = ext.method_sites();
+    // SAFETY: GIL-serialized; the borrow ends before any refill.
+    let (ver, f) = unsafe { &*slots.get(attr_pc)?.0.get() };
+    let MethodSlotFn::Builtin(b) = f else {
+        return None;
+    };
+    if *ver == 0 || ver & MethodSlot::BUILTIN_TAG != 0 {
+        return None;
+    }
+    let fast = match slots.get(call_pc)?.get_leaf_ptr(Rc::as_ptr(b))? {
+        LeafKind::Fast(f) => Some(f),
+        LeafKind::Opaque => None,
+        _ => return None,
+    };
+    Some((*ver, fast, b.clone()))
+}
+
+/// Whether a method `cls` (an instance's class at the version its site
+/// cached) resolved stays the one an attribute read finds: the class reads
+/// attributes the default way, and `inst` holds none of its own.
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn inst_method_unshadowed(
+    cls: &crate::types::TypeObject,
+    inst: &crate::types::PyInstance,
+) -> bool {
+    inst.dict.published().is_none()
+        // SAFETY: a read between two instructions (see `GilCell::peek`).
+        && unsafe { inst.dict.split_cell().peek() }.is_some_and(|s| s.is_empty())
+        && Interpreter::default_getattribute(cls)
 }
 
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.

@@ -698,6 +698,23 @@ branch and pull request.
     making a `String` and then a string object of it per key (`logging`'s
     `%(asctime)s %(levelname)s ...` record format): `logging_mix` runs 0.2%
     fewer instructions.
+  - Compiled code calls an instance's native method (a `deque`'s `append`,
+    a future's `done`) directly where its method site cached one: a helper
+    checks the class version, the default attribute lookup and that the
+    instance holds no attributes of its own, and calls the method on the
+    arguments' places, which the code found as it compiled. The fused
+    method call it replaces looked the site's tables up twice and decoded
+    the argument loads again on every call. A deque `append` and `popleft`
+    take 54.5 ns instead of 94.3 (the frame compiler's code alone; CPython
+    36.5); `async_tree` runs 2.4% fewer instructions and `graph_search`
+    1.9%.
+  - Unpacking a tuple only the stack holds moves its items out, instead of
+    copying each and then releasing the tuple's own references.
+  - Tier 2's hot loops read and store the items of `dict` subclasses that
+    keep `dict`'s methods (a `defaultdict`, a `Counter`) directly, as the
+    frame compiler's code does, instead of through the general subscript:
+    `d[k] += 1` on a `defaultdict` takes 65.5 ns instead of 189.4 (CPython
+    68.9).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

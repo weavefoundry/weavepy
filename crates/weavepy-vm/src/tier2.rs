@@ -12981,6 +12981,16 @@ unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
             xs.get(at(*i, xs.len())?).map(super::clone_hot)
         }
         (Object::Tuple(t), Object::Int(i)) => t.get(at(*i, t.len())?).map(super::clone_hot),
+        // A `dict` subclass's instance that keeps `dict.__getitem__` (a
+        // `defaultdict`, a `Counter`) by a present key, as compiled code's
+        // `h_inst_dict_get` reads it (a miss may run `__missing__`).
+        (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+            let mut out = std::mem::MaybeUninit::<Object>::uninit();
+            // SAFETY: two initialized values, borrowed, and a free slot.
+            (unsafe { crate::h_inst_dict_get::<0>(out.as_mut_ptr(), container, key) } == 0)
+                // SAFETY: written on success.
+                .then(|| unsafe { out.assume_init() })
+        }
         // A key whose Python `__hash__` is a pure leaf, found as itself (a
         // miss is the full path's to raise).
         (Object::Dict(d), Object::Instance(_)) if crate::object::LeafProbe::new(key).is_none() => {
@@ -13145,6 +13155,20 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
         unpack_pins(*jf.call_args.add(k), *jf.call_tags.add(k), &ctx.pins)
     });
     ctx.dirty = true;
+    // A `dict` subclass's instance that keeps `dict.__setitem__`, by a key
+    // that compares natively: stored as compiled code's `h_inst_dict_set`
+    // stores it (the store runs no code, so no guard can have broken).
+    if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (&container, &index) {
+        // SAFETY: three initialized values, borrowed (the value cloned in).
+        if unsafe { crate::h_inst_dict_set::<0>(&value, &container, &index) } == 0 {
+            // (A displaced value's release may have queued a finalizer.)
+            if finalizer_queued() {
+                ctx.parked = None;
+                return 2;
+            }
+            return 0;
+        }
+    }
     match interp.subscr_set_public(&container, &index, value) {
         Err(err) => {
             ctx.raised = Some(err);

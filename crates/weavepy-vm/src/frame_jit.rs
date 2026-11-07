@@ -431,6 +431,8 @@ struct Caches {
     binops: Vec<Box<BinopSite>>,
     /// The packed calls' sites.
     calls: Vec<Box<CallSite>>,
+    /// The instance native method calls' sites.
+    inst_methods: Vec<Box<InstMethodSite>>,
 }
 
 impl Caches {
@@ -454,6 +456,7 @@ impl Caches {
         self.inline_calls.append(&mut other.inline_calls);
         self.method_notes.append(&mut other.method_notes);
         self.held_codes.append(&mut other.held_codes);
+        self.inst_methods.append(&mut other.inst_methods);
     }
 }
 
@@ -4975,6 +4978,24 @@ unsafe fn unpack_fast(
         if !fits || (owned != 0 && !unique && !droppable(s)) {
             return 1;
         }
+        // An owned tuple nothing else holds gives its items up: they move
+        // to the stack, and the emptied tuple is parked for reuse.
+        if owned != 0 && unique {
+            if let Object::Tuple(_) = s {
+                let Object::Tuple(mut t) = src.read() else {
+                    unreachable!("checked above")
+                };
+                if let Some(slots) = crate::shared_value::ThinArc::get_mut(&mut t) {
+                    for (k, item) in slots.iter_mut().rev().enumerate() {
+                        dst.add(k).write(std::mem::replace(item, Object::Unbound));
+                    }
+                    interp.park_tuple(t);
+                    return 0;
+                }
+                // (A weak reference holds it: the general path below.)
+                src.cast_mut().write(Object::Tuple(t));
+            }
+        }
         let seq = if owned != 0 { Some(src.read()) } else { None };
         let s = seq.as_ref().unwrap_or(s);
         match s {
@@ -5836,6 +5857,86 @@ unsafe extern "C" fn h_local_method(
                 0
             }
             Err(e) => {
+                st.len = len as usize;
+                st.err = Some(e);
+                RAISED
+            }
+        }
+    }
+}
+
+/// A `x.m(<arguments>)` site of compiled code whose method is native (see
+/// [`h_inst_native`]).
+pub(crate) struct InstMethodSite {
+    f: Rc<crate::object::BuiltinFn>,
+    /// The fast half the call site settled on, or `None` for a body that
+    /// is a leaf whole.
+    fast: Option<crate::leaf_builtins::Fast>,
+    /// The receiver's class attribute version the method was cached under.
+    ver: u64,
+    nargs: u32,
+    call_pc: u32,
+}
+
+/// `x.m(a, b)` (the site's `nargs` of them, at `a` and `b`) on the instance
+/// at `recv`, as `Interpreter::core_native_method` runs it from the
+/// arguments' places, which the code found as it compiled: `0` the result
+/// at `out`; `RAISED` the method raised (the error in the state, the stack
+/// `len` deep and its last instruction the call); anything else declined
+/// untouched, when the receiver's class isn't at the site's version, reads
+/// attributes its own way, or the instance holds attributes (which could
+/// shadow the method).
+unsafe extern "C" fn h_inst_native(
+    st: *mut State,
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    site: *const InstMethodSite,
+    len: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, a free slot, the receiver's
+    // and the arguments' initialized places, and its own site.
+    unsafe {
+        let site = &*site;
+        let Object::Instance(inst) = &*recv else {
+            return 1;
+        };
+        let cls = inst.cls_raw();
+        if cls.attr_version.get() != site.ver || !crate::inst_method_unshadowed(cls, inst) {
+            return 1;
+        }
+        // Bitwise views, never dropped: the method reads them (and clones
+        // what it keeps).
+        let mut ops = [const { std::mem::MaybeUninit::<Object>::uninit() }; 3];
+        ops[0].write(std::ptr::read(recv));
+        if site.nargs > 0 {
+            ops[1].write(std::ptr::read(a));
+        }
+        if site.nargs > 1 {
+            ops[2].write(std::ptr::read(b));
+        }
+        let ops =
+            std::slice::from_raw_parts(ops.as_ptr().cast::<Object>(), site.nargs as usize + 1);
+        let r = match site.fast {
+            Some(f) => match f(ops) {
+                Some(r) => r,
+                None => return 1,
+            },
+            None => match site.f.call_kw.as_ref() {
+                Some(ckw) => ckw(ops, &[]),
+                None => (site.f.call)(ops),
+            },
+        };
+        match r {
+            Ok(v) => {
+                out.write(v);
+                0
+            }
+            Err(e) => {
+                let st = &mut *st;
+                st.last = site.call_pc as usize;
+                st.pc = site.call_pc as usize + 1;
                 st.len = len as usize;
                 st.err = Some(e);
                 RAISED
@@ -13449,6 +13550,7 @@ fn lower_range(
                 truths: std::mem::take(&mut lower.truth_sites),
                 binops: std::mem::take(&mut lower.binop_sites),
                 calls: std::mem::take(&mut lower.call_sites),
+                inst_methods: std::mem::take(&mut lower.inst_methods),
             },
         };
         if done {
@@ -13962,6 +14064,9 @@ struct Lower<'a> {
     /// The method loads' sites (see [`MethodSite`]).
     #[allow(clippy::vec_box)]
     method_sites: Vec<Box<MethodSite>>,
+    /// The instance native method calls' sites (see [`InstMethodSite`]).
+    #[allow(clippy::vec_box)]
+    inst_methods: Vec<Box<InstMethodSite>>,
     /// The flushes' lists (see [`h_copies`]).
     copies: Vec<Box<[CopyItem]>>,
     /// The truth tests' sites (see [`TruthSite`]).
@@ -14205,6 +14310,7 @@ impl<'a> Lower<'a> {
             mod_caches: Vec::new(),
             attr_sites: Vec::new(),
             method_sites: Vec::new(),
+            inst_methods: Vec::new(),
             copies: Vec::new(),
             truth_sites: Vec::new(),
             binop_sites: Vec::new(),
@@ -16105,6 +16211,24 @@ impl<'a> Lower<'a> {
             return;
         }
         let Some((tag, kind, f)) = crate::builtin_method_site(self.ext, pc + 1, call_pc) else {
+            // (An inlined body raises only through its caller's paths.)
+            if self.inlining() {
+                return;
+            }
+            if let Some((ver, fast, f)) = crate::inst_builtin_method_site(self.ext, pc + 1, call_pc)
+            {
+                let args: Vec<(bool, u32)> = args
+                    .iter()
+                    .map(|a| match *a {
+                        Arg::Local(i) => (true, i),
+                        Arg::Const(c) => (false, c),
+                        Arg::Small(v) => (false, u32::MAX - v.min(u32::MAX - 1)),
+                    })
+                    .collect();
+                if args.iter().all(|&(local, v)| local || v < u32::MAX / 2) {
+                    self.inst_native_call(pc, call_pc, &args, ver, fast, f);
+                }
+            }
             return;
         };
         let Some(kernel) = kernel_for(tag, kind, args.len()) else {
@@ -16161,6 +16285,97 @@ impl<'a> Lower<'a> {
             .expect("returns");
         let ran = self.b.create_block();
         self.b.ins().brif(r, declined, &[], ran, &[]);
+        // Ran: the result in the receiver's slot, as after the `CALL`.
+        self.b.switch_to_block(ran);
+        let (depth, last) = (self.depth, self.last_pc);
+        self.push(Item::Mem(slot));
+        self.set_last(call_pc);
+        self.goto(call_pc + 1);
+        self.depth = depth;
+        self.last_pc = last;
+        self.vs.clear();
+        self.b.switch_to_block(declined);
+    }
+
+    /// `LOAD_FAST x; x.m(<local or constant arguments>); CALL` on an
+    /// instance whose method site cached a native method: the receiver's
+    /// tag checked in line and the method called through [`h_inst_native`]
+    /// on the operands in place, continuing after the `CALL`. Lowering
+    /// continues (at the general fused call) where the receiver is
+    /// something else or the helper declines.
+    fn inst_native_call(
+        &mut self,
+        pc: usize,
+        call_pc: usize,
+        args: &[(bool, u32)],
+        ver: u64,
+        fast: Option<crate::leaf_builtins::Fast>,
+        f: Rc<crate::object::BuiltinFn>,
+    ) {
+        self.flush();
+        let slot = self.depth;
+        let declined = self.b.create_block();
+        let recv = self.local_addr(self.code.instructions[pc].arg);
+        let t = self.tag_at(recv);
+        let other = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.instance));
+        self.branch_out(other, declined);
+        let mut addrs = Vec::with_capacity(2);
+        for &(local, i) in args {
+            let at = if local {
+                let at = self.local_addr(i);
+                if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
+                    let t = self.tag_at(at);
+                    let unbound =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
+                    self.branch_out(unbound, declined);
+                }
+                at
+            } else {
+                self.const_addr(i)
+            };
+            addrs.push(at);
+        }
+        let site = Box::new(InstMethodSite {
+            f,
+            fast,
+            ver,
+            nargs: args.len() as u32,
+            call_pc: call_pc as u32,
+        });
+        let sp = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref(&*site) as i64);
+        self.inst_methods.push(site);
+        let null = self.b.ins().iconst(self.ptr, 0);
+        let a = addrs.first().copied().unwrap_or(null);
+        let b = addrs.get(1).copied().unwrap_or(null);
+        let out = self.slot_addr(slot);
+        let len = self.b.ins().iconst(types::I64, slot as i64);
+        self.store_last();
+        let r = self
+            .call(
+                h_inst_native as *const () as usize,
+                &[self.st, out, recv, a, b, sp, len],
+                true,
+            )
+            .expect("returns");
+        let ran = self.b.create_block();
+        let not_ran = self.b.create_block();
+        self.b.ins().brif(r, not_ran, &[], ran, &[]);
+        // Raised: the core loop raises it.
+        self.b.switch_to_block(not_ran);
+        let raised = self.b.ins().icmp_imm(IntCC::Equal, r, i64::from(RAISED));
+        let raise_b = self.b.create_block();
+        self.b.ins().brif(raised, raise_b, &[], declined, &[]);
+        self.b.switch_to_block(raise_b);
+        let s = self.b.ins().iconst(types::I32, i64::from(RAISED));
+        self.leave(s);
         // Ran: the result in the receiver's slot, as after the `CALL`.
         self.b.switch_to_block(ran);
         let (depth, last) = (self.depth, self.last_pc);
