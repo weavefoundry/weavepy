@@ -650,6 +650,11 @@ branch and pull request.
     copy set the peak of a program with many live objects). `async_tree`
     peaks 2.5% to 5% lower and a pending task takes 3,339 bytes instead of
     3,530; instructions are unchanged.
+  - A lazily made coroutine's frame (`lazy_coro_bind`'s box) gets an
+    operand stack sized to what its code and native code need, as a
+    generator's does, instead of room for 16: a suspended coroutine keeps
+    it, and a task tree holds thousands. A pending task takes 3,179 bytes
+    instead of 3,385, and `async_tree` peaks 5% lower.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

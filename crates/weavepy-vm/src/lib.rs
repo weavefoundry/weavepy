@@ -64386,7 +64386,7 @@ impl Interpreter {
     ) -> Box<InlineAct> {
         let mut boxed = match self.lazy_boxes.pop() {
             Some(boxed) => boxed,
-            None => self.lazy_box_new(),
+            None => self.lazy_box_new(gen_stack_room(code, code.varnames.len())),
         };
         let fr: &mut Frame = &mut boxed;
         if !Rc::ptr_eq(&fr.code, code) {
@@ -64451,7 +64451,7 @@ impl Interpreter {
     /// whose coroutine was made took its box along).
     #[cold]
     #[inline(never)]
-    fn lazy_box_new(&self) -> Box<LeanFrame> {
+    fn lazy_box_new(&self, stack_room: usize) -> Box<LeanFrame> {
         let spare = self.gen_spares.borrow_mut().pop();
         let placeholder = inline_placeholder();
         let Some(GenParts {
@@ -64460,7 +64460,9 @@ impl Interpreter {
             boxed,
         }) = spare
         else {
-            let mut boxed = Box::new(parked_lean_frame());
+            // (A stack with room for what the code needs and no more: a
+            // suspended coroutine keeps it, and a task tree holds thousands.)
+            let mut boxed = Box::new(parked_lean_frame_with(stack_room));
             // SAFETY: the stale copy is overwritten without a drop.
             unsafe { std::ptr::write(&raw mut boxed.code, placeholder.code.clone()) };
             return boxed;
@@ -73210,12 +73212,17 @@ impl InlineAct {
 /// (overwritten without a drop when it's bound), and empty locals and
 /// operand stack of its own.
 fn parked_lean_frame() -> LeanFrame {
+    parked_lean_frame_with(16)
+}
+
+/// [`parked_lean_frame`] with an operand stack of room for `stack_room`.
+fn parked_lean_frame_with(stack_room: usize) -> LeanFrame {
     let placeholder = inline_placeholder();
     LeanFrame(std::mem::ManuallyDrop::new(Frame {
         code: borrowed_rc(&placeholder.code),
         locals: frame_slots::FrameLocals::from_shared(Rc::new(RefCell::new(Vec::new()))),
         cells: borrowed_rc(&placeholder.cells),
-        stack: frame_slots::FrameStack::with_capacity(16),
+        stack: frame_slots::FrameStack::with_capacity(stack_room),
         globals: borrowed_rc(&placeholder.dict),
         builtins: borrowed_rc(&placeholder.dict),
         rare: None,
