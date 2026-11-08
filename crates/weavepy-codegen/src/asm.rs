@@ -204,12 +204,31 @@ pub(crate) trait Asm {
     fn jmp(&mut self, l: Label);
     fn jcc(&mut self, c: Cond, l: Label);
     fn call(&mut self, target: Reg);
+    /// Whether a call of `target` can be direct (`call_abs`), wherever in
+    /// code memory this code is installed.
+    fn reaches(&self, _target: u64) -> bool {
+        false
+    }
+    /// Call `target`, which [`Self::reaches`].
+    fn call_abs(&mut self, _target: u64) {
+        unreachable!("no direct calls on this target");
+    }
+    /// Whether `add_mem` adds to memory in place.
+    const ADD_MEM: bool = false;
+    /// `[base + off] += imm` (8 bytes; `imm` fits 32 bits).
+    fn add_mem(&mut self, _base: Reg, _off: i32, _imm: i64) {
+        unreachable!("no in-place adds on this target");
+    }
+    /// Load from `addr`, which [`Self::reaches`], as `load` does.
+    fn load_abs(&mut self, _bytes: u8, _ext: Ext, _ty: Type, _dst: Reg, _addr: u64) {
+        unreachable!("no displacements to absolute addresses on this target");
+    }
     /// Jump to `table[idx]`, or `default` when `idx` is out of range.
     fn br_table(&mut self, idx: Reg, ty: Type, default: Label, table: &[Label]);
     /// The epilogue: the frame torn down and a return.
     fn epilogue(&mut self, frame: &Frame);
     /// The finished code, the prologue for `frame` in front of the body.
-    fn finish(self, frame: &Frame) -> Result<Vec<u8>, crate::Error>;
+    fn finish(self, frame: &Frame) -> Result<crate::Code, crate::Error>;
 
     /// The scratch registers the code generator may use between
     /// instructions: integer and float.

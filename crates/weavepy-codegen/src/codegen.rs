@@ -111,6 +111,9 @@ struct Gen<'f, A: Asm> {
     nu: Vec<u32>,
     nu_stamp: Vec<u32>,
     stamp: u32,
+    /// Instructions an earlier one generated with it (see
+    /// [`Gen::add_in_place`]): their uses are taken, nothing emitted.
+    skip: u8,
     calls_after: Vec<u32>,
     pending: Option<Pending>,
     /// Scratch buffers, kept to save allocations.
@@ -134,7 +137,7 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("WPCG_TIME").is_some())
 }
 
-pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
+pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<crate::Code, Error> {
     if f.layout.is_empty() {
         return Err(Error::Unsupported("an empty function"));
     }
@@ -186,6 +189,7 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         nu: vec![NONE; nv],
         nu_stamp: vec![u32::MAX; nv],
         stamp: 0,
+        skip: 0,
         calls_after: Vec::new(),
         pending: None,
         tmp: Vec::new(),
@@ -893,7 +897,12 @@ impl<A: Asm> Gen<'_, A> {
         for (k, &inst) in insts.iter().enumerate() {
             self.locked = 0;
             let nres = f.dfg.results(inst).len();
-            self.inst(inst, k, pos, &mut at, rat)?;
+            if self.skip > 0 {
+                self.skip -= 1;
+                self.consume(inst, &mut at);
+            } else {
+                self.inst(inst, k, pos, &mut at, rat)?;
+            }
             rat += nres;
         }
         self.locked = 0;
@@ -926,6 +935,40 @@ impl<A: Asm> Gen<'_, A> {
         false
     }
 
+    /// The immediate of an in-place add the load at `k` starts: `load`,
+    /// `iadd_imm` of it, then `store` of the sum back where it came from,
+    /// each value used once (a reference count's increment).
+    fn add_in_place(&self, k: usize) -> Option<i64> {
+        let f = self.f;
+        let insts = &f.dfg.blocks[self.cur.index()].insts;
+        let (&ld, &add, &st) = (insts.get(k)?, insts.get(k + 1)?, insts.get(k + 2)?);
+        let (dl, da, ds) = (
+            &f.dfg.insts[ld.index()],
+            &f.dfg.insts[add.index()],
+            &f.dfg.insts[st.index()],
+        );
+        let Op::Load { bytes: 8, off, .. } = dl.op else {
+            return None;
+        };
+        let Op::AluImm(Alu::Add, c) = da.op else {
+            return None;
+        };
+        let Op::Store { bytes: 8, off: so } = ds.op else {
+            return None;
+        };
+        let v = f.dfg.results(ld)[0];
+        let sum = f.dfg.results(add)[0];
+        let (la, aa, sa) = (f.dfg.slice(dl.args), f.dfg.slice(da.args), f.dfg.slice(ds.args));
+        (so == off
+            && i32::try_from(c).is_ok()
+            && aa[0] == v
+            && sa[0] == sum
+            && sa[1] == la[0]
+            && self.an.uses[v.index()] == 1
+            && self.an.uses[sum.index()] == 1)
+            .then_some(c)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn inst(
         &mut self,
@@ -945,6 +988,31 @@ impl<A: Asm> Gen<'_, A> {
                 self.consume(inst, at);
             }
             Op::Load { bytes, ext, off } => {
+                // `[a] += c`, in place.
+                if A::ADD_MEM {
+                    if let Some(c) = self.add_in_place(k) {
+                        let (base, off) = self.address(args[0], *off)?;
+                        self.a.add_mem(base, off, c);
+                        self.consume(inst, at);
+                        self.skip = 2;
+                        return Ok(());
+                    }
+                }
+                // A load from a constant address in reach (one of this
+                // program's globals): addressed from the code itself.
+                let abs = self
+                    .imm_of(args[0])
+                    .filter(|_| !self.in_reg(args[0]))
+                    .map(|c| c.wrapping_add(i64::from(*off)) as u64)
+                    .filter(|&a| self.a.reaches(a));
+                if let Some(addr) = abs {
+                    self.consume(inst, at);
+                    let v = self.res(inst, 0);
+                    let r = self.def(v, k, dn(self, 0), None)?;
+                    self.a.load_abs(*bytes, *ext, d.ty, r, addr);
+                    self.unused(v, dn(self, 0));
+                    return Ok(());
+                }
                 let (base, off) = self.address(args[0], *off)?;
                 self.consume(inst, at);
                 let v = self.res(inst, 0);
@@ -1358,6 +1426,13 @@ impl<A: Asm> Gen<'_, A> {
         for &v in args {
             srcs.push(self.src(v)?);
         }
+        // A callee at a constant address in reach is called directly, its
+        // address not loaded.
+        let near = match (direct, srcs[0]) {
+            (Some(crate::ir::FuncTarget::SelfFn), _) => None,
+            (_, Src::I(a)) => self.a.reaches(a as u64).then_some(a as u64),
+            _ => None,
+        };
         // Take the uses: what dies here needn't survive the call.
         let mut dead = std::mem::take(&mut self.tmp);
         dead.clear();
@@ -1417,7 +1492,7 @@ impl<A: Asm> Gen<'_, A> {
         self.tmp2 = survivors;
         // The arguments, and the callee.
         let mut moves: Vec<Mv> = Vec::with_capacity(srcs.len());
-        if direct != Some(crate::ir::FuncTarget::SelfFn) {
+        if direct != Some(crate::ir::FuncTarget::SelfFn) && near.is_none() {
             moves.push((Dst::R(A::CALL_REG), srcs[0]));
         }
         let locs = &self.sig_locs[si].as_ref().expect("computed").0;
@@ -1453,6 +1528,8 @@ impl<A: Asm> Gen<'_, A> {
         }
         if direct == Some(crate::ir::FuncTarget::SelfFn) {
             self.a.call_self();
+        } else if let Some(target) = near {
+            self.a.call_abs(target);
         } else {
             self.a.call(A::CALL_REG);
         }

@@ -861,7 +861,7 @@ impl Asm for A64 {
         self.put(0xD65F_03C0);
     }
 
-    fn finish(mut self, frame: &Frame) -> Result<Vec<u8>, Error> {
+    fn finish(mut self, frame: &Frame) -> Result<crate::Code, Error> {
         let mut entries = Vec::new();
         for (tl, labels) in std::mem::take(&mut self.tables) {
             self.bind(tl);
@@ -932,6 +932,6 @@ impl Asm for A64 {
         for w in pro.buf.iter().chain(&self.buf) {
             out.extend_from_slice(&w.to_le_bytes());
         }
-        Ok(out)
+        Ok(out.into())
     }
 }

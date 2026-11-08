@@ -103,6 +103,9 @@ enum Rm {
     Idx8(Reg, Reg),
     /// `[rip + disp]` to a pool constant (fixed up at the end).
     Pool(u32),
+    /// `[rip + disp]` to an absolute address, written at install (see
+    /// [`crate::Code`]): only where the displacement ends the instruction.
+    Abs(u64),
 }
 
 #[derive(Copy, Clone)]
@@ -123,6 +126,12 @@ pub(crate) struct X64 {
     tables: Vec<(Label, Vec<Label>)>,
     /// Calls of the function itself: their rel32s, to the prologue.
     self_calls: Vec<u32>,
+    /// Displacements to absolute addresses (see [`crate::Code`]): their
+    /// offsets in the body, and the addresses.
+    relocs: Vec<(u32, u64)>,
+    /// The fixups that are `jmp rel32`s and `jcc rel32`s (`true`), which
+    /// `relax` may shorten.
+    branches: Vec<(u32, bool)>,
 }
 
 impl std::fmt::Debug for Fix {
@@ -175,7 +184,7 @@ impl X64 {
             Rm::R(r) => ((r & 15) >> 3, 0),
             Rm::M(base, _) => ((base & 15) >> 3, 0),
             Rm::Idx8(base, idx) => ((base & 15) >> 3, (idx & 15) >> 3),
-            Rm::Pool(_) => (0, 0),
+            Rm::Pool(_) | Rm::Abs(_) => (0, 0),
         };
         let force =
             byte && ((4..8).contains(&reg) || matches!(rm, Rm::R(r) if (4..8).contains(&(r & 15))));
@@ -225,6 +234,11 @@ impl X64 {
                 let at = self.buf.len() as u32;
                 self.d32(0);
                 self.fixups.push((at, Fix::Pool(i)));
+            }
+            Rm::Abs(target) => {
+                self.byte(r << 3 | 5);
+                self.relocs.push((self.buf.len() as u32, target));
+                self.d32(0);
             }
         }
     }
@@ -290,6 +304,7 @@ impl X64 {
 
     fn jcc_raw(&mut self, code: u8, l: Label) {
         self.bytes(&[0x0f, 0x80 + code]);
+        self.branches.push((self.fixups.len() as u32, true));
         self.rel32(l);
     }
 
@@ -401,6 +416,8 @@ impl Asm for X64 {
             pool: Vec::new(),
             tables: Vec::new(),
             self_calls: Vec::new(),
+            relocs: Vec::new(),
+            branches: Vec::new(),
         }
     }
 
@@ -442,6 +459,14 @@ impl Asm for X64 {
         } else if fits32(imm) {
             self.emit(&[], true, &[0xc7], 0, Rm::R(dst), false);
             self.d32(imm as i32);
+        } else if crate::mem::reaches(imm as u64) {
+            // An address near the code (one of this program's functions or
+            // globals): `lea dst, [rip + disp32]`, 3 bytes shorter.
+            self.byte(0x48 | (u8::from(dst >= 8) << 2));
+            self.byte(0x8d);
+            self.byte(0x05 | ((dst & 7) << 3));
+            self.relocs.push((self.buf.len() as u32, imm as u64));
+            self.d32(0);
         } else {
             self.byte(0x48 | u8::from(dst >= 8));
             self.byte(0xb8 + (dst & 7));
@@ -484,22 +509,23 @@ impl Asm for X64 {
     }
 
     fn load(&mut self, bytes: u8, ext: Ext, ty: Type, dst: Reg, base: Reg, off: i32) {
-        let m = Rm::M(base, off);
-        if is_float(dst) {
-            let pre = if bytes == 4 { 0xf3 } else { 0xf2 };
-            self.sse(pre, 0x10, dst, m);
-            return;
+        self.load_rm(bytes, ext, ty, dst, Rm::M(base, off));
+    }
+
+    const ADD_MEM: bool = true;
+
+    fn add_mem(&mut self, base: Reg, off: i32, imm: i64) {
+        if fits8(imm) {
+            self.emit(&[], true, &[0x83], 0, Rm::M(base, off), false);
+            self.byte(imm as u8);
+        } else {
+            self.emit(&[], true, &[0x81], 0, Rm::M(base, off), false);
+            self.d32(imm as i32);
         }
-        let _ = ty;
-        match (bytes, ext) {
-            (8, _) => self.emit(&[], true, &[0x8b], dst, m, false),
-            (4, Ext::Sign) => self.emit(&[], true, &[0x63], dst, m, false),
-            (4, _) => self.emit(&[], false, &[0x8b], dst, m, false),
-            (2, Ext::Sign) => self.emit(&[], true, &[0x0f, 0xbf], dst, m, false),
-            (2, _) => self.emit(&[], false, &[0x0f, 0xb7], dst, m, false),
-            (_, Ext::Sign) => self.emit(&[], true, &[0x0f, 0xbe], dst, m, false),
-            _ => self.emit(&[], false, &[0x0f, 0xb6], dst, m, false),
-        }
+    }
+
+    fn load_abs(&mut self, bytes: u8, ext: Ext, ty: Type, dst: Reg, addr: u64) {
+        self.load_rm(bytes, ext, ty, dst, Rm::Abs(addr));
     }
 
     fn store(&mut self, bytes: u8, src: Reg, base: Reg, off: i32) {
@@ -701,6 +727,8 @@ impl Asm for X64 {
     fn cmp(&mut self, ty: Type, a: Reg, b: Opnd) {
         match b {
             Opnd::R(rb) => self.alu_rr(0x39, ty, a, rb),
+            // (`test a, a` sets the flags `cmp a, 0` does, in fewer bytes.)
+            Opnd::I(0) => self.alu_rr(0x85, ty, a, a),
             Opnd::I(i) => match ty.bits() {
                 8 => {
                     self.emit(&[], false, &[0x80], 7, Rm::R(a), true);
@@ -977,6 +1005,7 @@ impl Asm for X64 {
 
     fn jmp(&mut self, l: Label) {
         self.byte(0xe9);
+        self.branches.push((self.fixups.len() as u32, false));
         self.rel32(l);
     }
 
@@ -986,6 +1015,16 @@ impl Asm for X64 {
 
     fn call(&mut self, target: Reg) {
         self.emit(&[], false, &[0xff], 2, Rm::R(target), false);
+    }
+
+    fn reaches(&self, target: u64) -> bool {
+        crate::mem::reaches(target)
+    }
+
+    fn call_abs(&mut self, target: u64) {
+        self.byte(0xe8);
+        self.relocs.push((self.buf.len() as u32, target));
+        self.d32(0);
     }
 
     fn br_table(&mut self, idx: Reg, ty: Type, default: Label, table: &[Label]) {
@@ -1018,7 +1057,8 @@ impl Asm for X64 {
         self.byte(0xc3);
     }
 
-    fn finish(mut self, frame: &Frame) -> Result<Vec<u8>, Error> {
+    fn finish(mut self, frame: &Frame) -> Result<crate::Code, Error> {
+        self.relax();
         // The pool and the tables after the code, 8-byte aligned.
         while !self.buf.len().is_multiple_of(8) {
             self.byte(0xcc);
@@ -1081,11 +1121,132 @@ impl Asm for X64 {
         }
         let mut out = pro.buf;
         out.extend_from_slice(&self.buf);
-        Ok(out)
+        let relocs = self
+            .relocs
+            .iter()
+            .map(|&(at, target)| (p as u32 + at, target))
+            .collect();
+        Ok(crate::Code { bytes: out, relocs })
     }
 }
 
 impl X64 {
+    /// Shorten each branch whose target lies within a signed byte of it to
+    /// its 2-byte form (`jmp rel8`, `jcc rel8`), moving everything after
+    /// it back and the labels, fixups and displacements with it. Starts
+    /// from every branch short and lengthens the ones that don't fit until
+    /// none changes (each lengthening only moves targets apart).
+    fn relax(&mut self) {
+        if self.branches.is_empty() {
+            return;
+        }
+        // Each branch: its start, its old length, and its target.
+        let mut sites: Vec<(u32, u32, u32)> = Vec::with_capacity(self.branches.len());
+        for &(i, jcc) in &self.branches {
+            let (at, fix) = self.fixups[i as usize];
+            let Fix::Rel(l) = fix else { continue };
+            let target = self.labels[l.0 as usize];
+            let len = if jcc { 6 } else { 5 };
+            sites.push((at + 4 - len, len, target));
+        }
+        let n = sites.len();
+        let mut short: Vec<bool> = sites.iter().map(|s| s.2 != u32::MAX).collect();
+        // `saved[j]`: bytes the first `j` branches save.
+        let mut saved = vec![0u32; n + 1];
+        let fill = |saved: &mut Vec<u32>, short: &[bool]| {
+            for j in 0..n {
+                saved[j + 1] = saved[j] + if short[j] { sites[j].1 - 2 } else { 0 };
+            }
+        };
+        // Where offset `o` moves (the branches before it shortened).
+        let moved = |saved: &[u32], o: u32| -> u32 {
+            let j = sites.partition_point(|s| s.0 < o);
+            o - saved[j]
+        };
+        loop {
+            fill(&mut saved, &short);
+            let mut changed = false;
+            for j in 0..n {
+                if !short[j] {
+                    continue;
+                }
+                let from = i64::from(moved(&saved, sites[j].0)) + 2;
+                let to = i64::from(moved(&saved, sites[j].2));
+                if !(-128..=127).contains(&(to - from)) {
+                    short[j] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !short.iter().any(|&s| s) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.buf.len());
+        let mut prev = 0usize;
+        for (j, &(start, len, target)) in sites.iter().enumerate() {
+            if !short[j] {
+                continue;
+            }
+            out.extend_from_slice(&self.buf[prev..start as usize]);
+            let op = if len == 6 {
+                0x70 | (self.buf[start as usize + 1] & 0x0f)
+            } else {
+                0xeb
+            };
+            let from = i64::from(moved(&saved, start)) + 2;
+            let rel = i64::from(moved(&saved, target)) - from;
+            out.push(op);
+            out.push(rel as i8 as u8);
+            prev = (start + len) as usize;
+        }
+        out.extend_from_slice(&self.buf[prev..]);
+        self.buf = out;
+        let shortened: std::collections::HashSet<u32> = sites
+            .iter()
+            .zip(&short)
+            .filter(|(_, &s)| s)
+            .map(|(s, _)| s.0 + s.1 - 4)
+            .collect();
+        for l in &mut self.labels {
+            if *l != u32::MAX {
+                *l = moved(&saved, *l);
+            }
+        }
+        self.fixups.retain(|(at, _)| !shortened.contains(at));
+        for (at, _) in &mut self.fixups {
+            *at = moved(&saved, *at);
+        }
+        for at in &mut self.self_calls {
+            *at = moved(&saved, *at);
+        }
+        for (at, _) in &mut self.relocs {
+            *at = moved(&saved, *at);
+        }
+        self.branches.clear();
+    }
+
+    /// A load into `dst` from `m` (`ty` is the loaded value's).
+    fn load_rm(&mut self, bytes: u8, ext: Ext, ty: Type, dst: Reg, m: Rm) {
+        if is_float(dst) {
+            let pre = if bytes == 4 { 0xf3 } else { 0xf2 };
+            self.sse(pre, 0x10, dst, m);
+            return;
+        }
+        let _ = ty;
+        match (bytes, ext) {
+            (8, _) => self.emit(&[], true, &[0x8b], dst, m, false),
+            (4, Ext::Sign) => self.emit(&[], true, &[0x63], dst, m, false),
+            (4, _) => self.emit(&[], false, &[0x8b], dst, m, false),
+            (2, Ext::Sign) => self.emit(&[], true, &[0x0f, 0xbf], dst, m, false),
+            (2, _) => self.emit(&[], false, &[0x0f, 0xb7], dst, m, false),
+            (_, Ext::Sign) => self.emit(&[], true, &[0x0f, 0xbe], dst, m, false),
+            _ => self.emit(&[], false, &[0x0f, 0xb6], dst, m, false),
+        }
+    }
+
     /// `lea dst, [a + b]`.
     fn lea_add(&mut self, w: bool, dst: Reg, a: Reg, b: Reg) {
         let rex = 0x40 | (u8::from(w) << 3) | ((dst >> 3) << 2) | ((b >> 3) << 1) | (a >> 3);
