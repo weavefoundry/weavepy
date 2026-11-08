@@ -958,7 +958,11 @@ impl<A: Asm> Gen<'_, A> {
         };
         let v = f.dfg.results(ld)[0];
         let sum = f.dfg.results(add)[0];
-        let (la, aa, sa) = (f.dfg.slice(dl.args), f.dfg.slice(da.args), f.dfg.slice(ds.args));
+        let (la, aa, sa) = (
+            f.dfg.slice(dl.args),
+            f.dfg.slice(da.args),
+            f.dfg.slice(ds.args),
+        );
         (so == off
             && i32::try_from(c).is_ok()
             && aa[0] == v

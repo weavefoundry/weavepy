@@ -8173,7 +8173,11 @@ unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
     if ver == 0 {
         return None;
     }
-    let e = site.class_poly.iter().map(Cell::get).find(|e| e.ver == ver)?;
+    let e = site
+        .class_poly
+        .iter()
+        .map(Cell::get)
+        .find(|e| e.ver == ver)?;
     if e.val == UNMEMOIZED {
         return None;
     }
@@ -8184,9 +8188,8 @@ unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
     }
     // SAFETY: the value's own words, which its class holds while the
     // version stands; the view is never dropped.
-    let v = std::mem::ManuallyDrop::new(unsafe {
-        std::ptr::from_ref(&e.val).cast::<Object>().read()
-    });
+    let v =
+        std::mem::ManuallyDrop::new(unsafe { std::ptr::from_ref(&e.val).cast::<Object>().read() });
     Some(crate::clone_hot(&v))
 }
 
@@ -8432,7 +8435,7 @@ fn type_attr_resolve(
     };
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
         // SAFETY: a bitwise copy that owns nothing (see `TypeMemo`).
-        let borrowed = unsafe { std::ptr::read(&v) };
+        let borrowed = unsafe { std::ptr::read(&raw const v) };
         *memo = Some(TypeMemo {
             cls: p,
             ver,

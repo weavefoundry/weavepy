@@ -15,6 +15,7 @@ use crate::{Code, Error};
 /// Whether code installed anywhere in code memory reaches `target` with a
 /// 32-bit displacement.
 #[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn reaches(target: u64) -> bool {
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
