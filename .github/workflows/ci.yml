@@ -224,6 +224,13 @@ jobs:
         # weavepy-pylib: python314.dll, the runtime the Windows shim
         # exe loads (RFC 0064 WS1).
         run: cargo build --release -p weavepy-cli -p weavepy-pylib -p weavepy-bench
+      - name: Report the binary's function order
+        # scripts/link-ordered.py notes whether the link was ordered (an
+        # unordered Linux binary starts in about 22 MiB instead of 15).
+        shell: bash
+        run: |
+          rustc -vV | sed -n 's/^release: /rustc /p'
+          cat target/release/deps/weavepy-*.order-note 2>/dev/null || echo "no order note"
       - name: Build merge-base weavepy (A/B reference)
         if: github.event_name == 'pull_request'
         # A separate worktree + target dir so the two builds never
