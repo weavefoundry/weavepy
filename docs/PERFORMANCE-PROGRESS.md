@@ -7,6 +7,17 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 8, 2026, at `1cef5111` (PR #107), a PGO build against
+CPython 3.14 on the same host, interleaved in one session: warm time 0.885,
+cold time 1.031, peak memory 1.258. Since November 6's 0.916 the warm time
+moved most on `exceptions` (1.02 now), `class_creation` (1.04),
+`stdlib_utils` and `tomllib_loads` (1.05 and 1.06). The worst warm times
+are `async_tree` 1.50, `context_managers` 1.19, `deepcopy` 1.13,
+`logging_mix` 1.11 and `closures_decorators` 1.10; the best `scimark`
+0.51, `pickle_roundtrip` and `unpack_sequence` 0.59, `float_points` 0.62
+and `raytrace` 0.64. On release builds (not PGO) the suite took 0.981 of
+`a60298cb`'s cycles.
+
 Measured in the evening of November 6, 2026, at `e6cd488b` (PR #107), a PGO
 build against CPython 3.14 on the same host: warm time 0.916, cold time 1.033,
 peak memory 1.268, instructions 0.940 (on a release build). Since `02c5de6e`
