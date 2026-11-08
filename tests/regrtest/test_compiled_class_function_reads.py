@@ -194,4 +194,68 @@ def read_cm(n):
 assert read_st(500)() == "st"
 assert read_cm(500)() is S
 
+# An `Enum` member reads as itself; a descriptor instance runs its `__get__`.
+from enum import Enum
+
+
+class Kind(Enum):
+    A = 1
+    B = 2
+    C = 3
+
+
+def read_member(n):
+    out = None
+    for _ in range(n):
+        out = Kind.C
+    return out
+
+
+for _ in range(3):
+    assert read_member(500) is Kind.C
+    assert read_member(500).value == 3
+
+
+class Counting:
+    calls = 0
+
+    def __get__(self, obj, owner):
+        Counting.calls += 1
+        return ("got", owner.__name__)
+
+
+class HasDesc:
+    attr = Counting()
+
+
+def read_attr(cls, n):
+    out = None
+    for _ in range(n):
+        out = cls.attr
+    return out
+
+
+assert read_attr(HasDesc, 500) == ("got", "HasDesc")
+assert Counting.calls == 500, Counting.calls
+
+
+class Plain:
+    pass
+
+
+class Holder:
+    pass
+
+
+Holder.attr = Holder()
+first = Holder.attr
+for _ in range(3):
+    assert read_attr(Holder, 500) is first
+Holder.attr = Holder()
+assert read_attr(Holder, 500) is Holder.__dict__["attr"]
+ref = weakref.ref(first)
+del first
+gc.collect()
+assert ref() is None, "a replaced class attribute is still alive"
+
 print("ok")

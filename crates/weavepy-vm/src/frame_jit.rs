@@ -7525,6 +7525,10 @@ pub(crate) struct AttrSite {
     /// A class receiver's attribute the site read last (see
     /// [`type_attr_read`]).
     type_attr: std::cell::RefCell<Option<TypeMemo>>,
+    /// Class attributes the site read through instances of several classes
+    /// (see [`class_poly_hit`]), and the entry the next one replaces.
+    class_poly: [Cell<ClassPolyEntry>; CLASS_POLY],
+    class_poly_next: Cell<u8>,
     /// The method of an exact `list`, `dict`, `set` or `str` the site read
     /// as a value last (see [`builtin_attr_read`]): the receiver's kind
     /// and the method.
@@ -7999,13 +8003,19 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
                 }
             }
             // (A class attribute the site has read before.)
-            Object::Instance(inst) if site.class_attr.get() => {
-                let (code, ext) = (&*site.code, &*site.ext);
-                if let Some(v) =
-                    crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
-                {
+            Object::Instance(inst) => {
+                if let Some(v) = class_poly_hit(site, inst) {
                     (*st).stack.add(slot).write(v);
                     return 0;
+                }
+                if site.class_attr.get() {
+                    let (code, ext) = (&*site.code, &*site.ext);
+                    if let Some(v) =
+                        crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                    {
+                        (*st).stack.add(slot).write(v);
+                        return 0;
+                    }
                 }
             }
             _ => {}
@@ -8015,6 +8025,13 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             return 0;
         }
         let r = attr_miss(st, site, at, true);
+        if r == 0 {
+            if let Object::Instance(inst) = &*at {
+                if !class_poly_known(site, inst) {
+                    class_poly_note(site, inst, &*(*st).stack.add(slot));
+                }
+            }
+        }
         if r != CALL_DECLINED {
             return r;
         }
@@ -8112,6 +8129,130 @@ unsafe fn builtin_attr_read(
     Some(bind(&b))
 }
 
+/// The classes an attribute site's polymorphic class-attribute memo holds.
+const CLASS_POLY: usize = 4;
+
+/// A [`ClassPolyEntry`]'s value for a class whose reads at the site aren't
+/// memoized (a descriptor's, a custom lookup's): words no `Object` has.
+const UNMEMOIZED: [u64; 2] = [u64::MAX, u64::MAX];
+
+/// Whether `site`'s memo has an entry, either way, for `inst`'s class.
+fn class_poly_known(site: &AttrSite, inst: &crate::types::PyInstance) -> bool {
+    let ver = inst.cls_raw().attr_version.get();
+    site.class_poly.iter().any(|e| e.get().ver == ver)
+}
+
+/// Record `val` for the class version `ver` at `site`.
+fn class_poly_put(site: &AttrSite, ver: u64, val: [u64; 2]) {
+    let k = usize::from(site.class_poly_next.get()) % CLASS_POLY;
+    site.class_poly[k].set(ClassPolyEntry { ver, val });
+    site.class_poly_next.set((k + 1) as u8);
+}
+
+/// One class attribute an [`AttrSite`] read through an instance: the
+/// instance's class's attribute version (`0`, none) and the value's two
+/// words, borrowed from the class, which holds it while that version
+/// stands (see [`TypeMemo`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ClassPolyEntry {
+    ver: u64,
+    val: [u64; 2],
+}
+
+/// `inst.name` at `site` where `inst`'s class answered it before with a
+/// value no access binds (see [`class_poly_note`]), and the instance
+/// doesn't shadow it: the value, cloned. A site that reads a class
+/// attribute through instances of several classes (`self.unit` in a base
+/// class's method) keeps one entry per class.
+///
+/// # Safety
+///
+/// `site`'s code is live.
+unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let ver = inst.cls_raw().attr_version.get();
+    if ver == 0 {
+        return None;
+    }
+    let e = site.class_poly.iter().map(Cell::get).find(|e| e.ver == ver)?;
+    if e.val == UNMEMOIZED {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    let code = unsafe { &*site.code };
+    if crate::inst_may_shadow(inst, code, code.instructions[site.pc as usize].arg) {
+        return None;
+    }
+    // SAFETY: the value's own words, which its class holds while the
+    // version stands; the view is never dropped.
+    let v = std::mem::ManuallyDrop::new(unsafe {
+        std::ptr::from_ref(&e.val).cast::<Object>().read()
+    });
+    Some(crate::clone_hot(&v))
+}
+
+/// Remember at `site` that `inst`'s class answered the read with `v`, a
+/// value of a built-in type no access binds or calls `__get__` on (a
+/// string, a number, `None`, an exact container), when it is the class's
+/// own entry under the default lookup and the instance holds no value of
+/// the name.
+///
+/// # Safety
+///
+/// `site`'s code is live.
+unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &Object) {
+    if !matches!(
+        v,
+        Object::Str(_)
+            | Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+            | Object::FrozenSet(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+    ) {
+        return;
+    }
+    let cls = inst.cls_raw();
+    let ver = cls.attr_version.get();
+    if ver == 0
+        || site.class_poly.iter().any(|e| e.get().ver == ver)
+        || crate::object::exotic_str_keys_possible()
+    {
+        return;
+    }
+    if !Interpreter::default_getattribute(cls) {
+        class_poly_put(site, ver, UNMEMOIZED);
+        return;
+    }
+    // SAFETY: the caller's contract.
+    let code = unsafe { &*site.code };
+    let arg = code.instructions[site.pc as usize].arg;
+    let Some(name) = code.names.get(arg as usize) else {
+        return;
+    };
+    if crate::inst_may_shadow(inst, code, arg) {
+        return;
+    }
+    // The class's own entry, the very value the read gave (else the read
+    // came from a descriptor, or a `__getattr__`: never memoized here).
+    let same = cls.lookup(name).is_some_and(|found| match (v, &found) {
+        (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
+        (a, b) => a.is_same(b),
+    });
+    if !same {
+        class_poly_put(site, ver, UNMEMOIZED);
+        return;
+    }
+    // SAFETY: an `Object` is two words (a scalar's padding is never read
+    // back as anything but padding).
+    let val = unsafe { std::ptr::from_ref(v).cast::<[u64; 2]>().read() };
+    class_poly_put(site, ver, val);
+}
+
 /// `cls.name` of a class whose metaclass is `type`, where the attribute
 /// is an atom no descriptor protocol changes on the way out (a number,
 /// a string, `None`): from the site's memo while the class
@@ -8179,8 +8320,8 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
         return None;
     }
     let v = type_attr_resolve(site, cls, p, ver);
-    // A declined read (an `Enum` member, a function) is remembered too, so
-    // that the site's later misses skip the lookups.
+    // A declined read (a property, a bound class method) is remembered
+    // too, so that the site's later misses skip the lookups.
     if v.is_none() {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
             *memo = Some(TypeMemo::owned(p, ver, Object::Unbound));
@@ -8268,8 +8409,10 @@ fn type_attr_resolve(
             | Object::Str(_)
             | Object::Bytes(_)
     );
-    // A plain function (a class's read returns it as it is): borrowed, so
-    // the memo never keeps a replaced one alive.
+    // A plain function (a class's read returns it as it is), or an
+    // instance of the class itself that isn't a descriptor (an `Enum`
+    // member; adding a `__get__` would move this class's version):
+    // borrowed, so the memo never keeps a replaced one alive.
     let v = match v {
         v if plain => {
             if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
@@ -8278,6 +8421,13 @@ fn type_attr_resolve(
             return Some(v);
         }
         f @ Object::Function(_) => f,
+        Object::Instance(i)
+            if std::ptr::eq(i.cls_raw(), Rc::as_ptr(cls))
+                && !name.starts_with("__")
+                && cls.lookup("__get__").is_none() =>
+        {
+            Object::Instance(i)
+        }
         _ => return None,
     };
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
@@ -8371,11 +8521,14 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                 }
             }
             // (A class attribute the site has read before.)
-            Object::Instance(inst) if site.class_attr.get() => {
-                let (code, ext) = (&*site.code, &*site.ext);
-                if let Some(v) =
-                    crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
-                {
+            Object::Instance(inst) => {
+                let v = class_poly_hit(site, inst).or_else(|| {
+                    site.class_attr.get().then(|| {
+                        let (code, ext) = (&*site.code, &*site.ext);
+                        crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                    })?
+                });
+                if let Some(v) = v {
                     if plain_release(&*at) {
                         at.write(v);
                         return 0;
@@ -8396,7 +8549,19 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             crate::drop_hot(std::mem::replace(&mut *at, v));
             0
         } else {
-            attr_miss(st, site, at, false)
+            // (The receiver leaves with the read: held for the note.)
+            let recv = match &*at {
+                Object::Instance(inst) if !class_poly_known(site, inst) => Some(inst.clone()),
+                _ => None,
+            };
+            let r = attr_miss(st, site, at, false);
+            if let (0, Some(inst)) = (r, &recv) {
+                class_poly_note(site, inst, &*at);
+            }
+            if let Some(inst) = recv {
+                (*(*st).interp).release_hot(Object::Instance(inst));
+            }
+            r
         };
         if r == CALL_DECLINED {
             return left(st, site.pc, site.last, slot + 1);
@@ -19584,6 +19749,8 @@ impl<'a> Lower<'a> {
             cache: SlotCache::default(),
             class_attr: Cell::new(false),
             type_attr: std::cell::RefCell::new(None),
+            class_poly: Default::default(),
+            class_poly_next: Cell::new(0),
             builtin_attr: std::cell::RefCell::new(None),
         });
         let c = self

@@ -947,7 +947,30 @@ branch and pull request.
     `type` itself serves (`__name__`, `__text_signature__`, the getsets
     and members CPython's `type` has) is never memoized, as its data
     descriptor wins over the class's own entry (`test_inspect` caught a
-    first version that memoized `__text_signature__`).
+    first version that memoized `__text_signature__`). An instance of the
+    class itself that isn't a descriptor (an `Enum` member, `Kind.C`) is
+    memoized the same way, borrowed: 184 instructions instead of 695
+    (CPython 321), and `x is not Kind.C` 290 instead of 895 (CPython 672).
+  - A class attribute read through instances of several classes
+    (`self.unit` in a base class's method, as `oo_patterns`' `describe`
+    reads it for each kind of shape) took the general lookup on every
+    switch of class: the site's class-attribute stamp holds one class.
+    Each frame-JIT attribute site now also keeps four classes' values,
+    keyed by the instance's class's attribute version and borrowed as the
+    class memo's are, for values of built-in types no access binds (a
+    string, a number, `None`, an exact container). Over three classes the
+    read takes 404 instructions instead of 1,101, over two 383 instead of
+    1,747 (with tier 2 off; tier 2's own attribute reads, in a loop it
+    compiles, are unchanged). A class whose read the memo can't serve (a
+    named tuple's field, a descriptor's value) gets an entry saying so: a
+    first version looked the name up again on every such read, and
+    `collections_mix` ran 9% more instructions. Over the suite the
+    instructions are level (`comprehensions` 0.98, `oo_patterns` 0.99).
+  - Tried and dropped: tracking an instance that is about to hold a value
+    that could close a cycle (every raised exception, once its traceback
+    is stored) by putting it in its young set directly, without
+    `track`'s scan of what it holds. A raised and caught custom exception
+    took 4% more instructions.
   - `random` is now faster than CPython's C module, method by method.
     Counting which compiled attribute and method sites fall through every
     memo to the general lookup, across the suite, put `Random`'s methods
