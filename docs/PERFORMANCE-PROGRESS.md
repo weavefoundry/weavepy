@@ -913,6 +913,64 @@ branch and pull request.
     `deltablue` runs another 7.5% faster: tier 2 compiles 28 of its small
     methods for nothing (13.7 ms) and re-analyzes bodies it can't type for
     each call site (`output` 98 times).
+  - Compiled code is 17% smaller on x86-64 (`deepcopy`'s 54.5 KB to 45.2,
+    `context_managers`' 78.6 KB to 65.2). Code memory now comes from one
+    region reserved within a 32-bit displacement of the binary's own code,
+    where the system places it there (`WPCG_FAR=1` declines it): a helper
+    call is a 5-byte `call rel32` instead of a 10-byte address load and an
+    indirect call, an address in reach (a helper, a global, and on macOS
+    most of the heap) a 7-byte `lea`, and a load from a global (the
+    release gate a reference count's decrement checks) one RIP-relative
+    load. The displacements are written as the code is installed. Branches
+    whose targets lie within a signed byte take the 2-byte forms, a
+    reference count's increment is one `add qword [mem], 1`, and a compare
+    with zero is a `test`. Instructions are level, and simulated L1
+    instruction misses moved by under 1% on Linux (the compiled code's own
+    by 1% to 8%): the hot code a warm call runs is several times the
+    32 KB cache, so the misses track the whole footprint, of which compiled
+    code is a seventh. With the class-read memo below, a release build on
+    this Mac took 0.986 of `a60298cb`'s cycles over the suite
+    (`coroutines` 0.92, `context_managers` and `stdlib_utils` 0.94; single
+    workloads move by about 3% between runs) and 0.993 of its
+    instructions.
+  - A class's function read through a class (`cls.__enter__`,
+    `T.method`, as `contextlib.ExitStack.enter_context` and `super`-free
+    delegation do) is memoized at its site like the class's constants:
+    the site holds the function without owning it, valid while the class's
+    attribute version (never reused, and moved by any change to what the
+    class's attributes resolve to) stands, so a replaced function still
+    dies when the class lets it go. A dunder name `type` doesn't define
+    (`__enter__`) is memoized too, and a local class receiver checks the
+    memo before the general miss path. The read takes 165 instructions
+    instead of 377 (CPython 246), 184 through a global instead of 620
+    (CPython 279); an `ExitStack` with two callbacks 2.5% fewer. A name
+    `type` itself serves (`__name__`, `__text_signature__`, the getsets
+    and members CPython's `type` has) is never memoized, as its data
+    descriptor wins over the class's own entry (`test_inspect` caught a
+    first version that memoized `__text_signature__`).
+  - `random` is now faster than CPython's C module, method by method.
+    Counting which compiled attribute and method sites fall through every
+    memo to the general lookup, across the suite, put `Random`'s methods
+    in five workloads (`chaos`, `sorting`, `scimark`, `go`, and
+    `random.random()`). The generator's state lived as a `bytearray` in
+    the instance's `__dict__`, which made the dictionary real, so every
+    method load on a `Random` took the general path (and `vars(r)` showed
+    `_mt_state`, which CPython's doesn't): it now lives in a slot no
+    descriptor names. And a native method bound to its receiver that the
+    leaf registry vouches runs no Python code (`random.random` is a
+    module's saved `Random().random`) is called in place from compiled
+    code, as the core loop now calls it too, instead of leaving compiled
+    code for the core loop's general call. Instructions a call, before,
+    after and CPython's: `random.random()` 3,013, 917 and 573;
+    `r.random()` 1,078, 650 and 725; `r.getrandbits(8)` 1,046, 619 and
+    597; `r._randbelow(10)` 2,742, 1,350 and 1,503; `r.randrange(10)`
+    3,992, 2,724 and 2,381.
+  - Tried and dropped: a per-thread tuple free list that every
+    construction and last release used (CPython's), replacing the
+    interpreter's own pool, which only the core loop's paths reach. A
+    tuple built and dropped in a loop took 54 more instructions (the
+    thread-local access and the deep-release guard cost more than
+    mimalloc's allocation), and a caught exception 1% to 3% more.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

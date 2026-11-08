@@ -7523,8 +7523,8 @@ pub(crate) struct AttrSite {
     /// (see `inst_class_attr_quick`): the slow paths try that first.
     class_attr: Cell<bool>,
     /// A class receiver's attribute the site read last (see
-    /// [`type_attr_read`]): the class, its version and the value.
-    type_attr: std::cell::RefCell<Option<(usize, u64, Object)>>,
+    /// [`type_attr_read`]).
+    type_attr: std::cell::RefCell<Option<TypeMemo>>,
     /// The method of an exact `list`, `dict`, `set` or `str` the site read
     /// as a value last (see [`builtin_attr_read`]): the receiver's kind
     /// and the method.
@@ -7762,7 +7762,7 @@ unsafe fn inst_dict_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
         .try_borrow()
         .ok()?
         .as_ref()
-        .is_some_and(|(mp, mver, _)| *mp == p && *mver == ver && ver != 0);
+        .is_some_and(|m| m.cls == p && m.ver == ver && ver != 0);
     if !known {
         if ver == 0
             || crate::object::exotic_str_keys_possible()
@@ -7770,7 +7770,7 @@ unsafe fn inst_dict_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
         {
             return None;
         }
-        *site.type_attr.try_borrow_mut().ok()? = Some((p, ver, Object::None));
+        *site.type_attr.try_borrow_mut().ok()? = Some(TypeMemo::owned(p, ver, Object::None));
     }
     Some(Object::Dict(inst.dict_shared()))
 }
@@ -7986,6 +7986,12 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
         let at = (*st).locals.add(site.local as usize);
         let slot = site.slot as usize;
         match &*at {
+            Object::Type(cls) => {
+                if let Some(v) = type_attr_memo(site, cls) {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
+            }
             Object::Frame(_) | Object::Code(_) => {
                 if let Some(v) = frame_code_attr(st, site, &*at) {
                     (*st).stack.add(slot).write(v);
@@ -8119,20 +8125,53 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
     let memo = site.type_attr.try_borrow().ok()?;
     match memo.as_ref()? {
-        (mp, mver, v) if *mp == p && *mver == ver && ver != 0 && !matches!(v, Object::Unbound) => {
-            Some(crate::clone_hot(v))
+        m if m.cls == p && m.ver == ver && ver != 0 && !matches!(*m.val, Object::Unbound) => {
+            Some(crate::clone_hot(&m.val))
         }
         _ => None,
+    }
+}
+
+/// A class attribute an [`AttrSite`] memoized: the class's address and
+/// attribute version, and the value, which the memo owns (an atom) or
+/// borrows from the class (a function). A version is never reused and
+/// moves with any change to what the class's attributes resolve to, so
+/// while the class's version is `ver` its dictionary (or a base's) still
+/// holds a borrowed value; the memo is read only then.
+pub(crate) struct TypeMemo {
+    cls: usize,
+    ver: u64,
+    val: std::mem::ManuallyDrop<Object>,
+    owned: bool,
+}
+
+impl TypeMemo {
+    fn owned(cls: usize, ver: u64, val: Object) -> Self {
+        Self {
+            cls,
+            ver,
+            val: std::mem::ManuallyDrop::new(val),
+            owned: true,
+        }
+    }
+}
+
+impl Drop for TypeMemo {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: the memo's own reference, released once.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.val) };
+        }
     }
 }
 
 fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
     if let Ok(memo) = site.type_attr.try_borrow() {
-        if let Some((mp, mver, v)) = memo.as_ref() {
-            if *mp == p && *mver == ver && ver != 0 {
+        if let Some(m) = memo.as_ref() {
+            if m.cls == p && m.ver == ver && ver != 0 {
                 // (`Unbound`: a read this path declined under that version.)
-                return (!matches!(v, Object::Unbound)).then(|| crate::clone_hot(v));
+                return (!matches!(*m.val, Object::Unbound)).then(|| crate::clone_hot(&m.val));
             }
         }
     }
@@ -8144,7 +8183,7 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     // that the site's later misses skip the lookups.
     if v.is_none() {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some((p, ver, Object::Unbound));
+            *memo = Some(TypeMemo::owned(p, ver, Object::Unbound));
         }
     }
     v
@@ -8205,17 +8244,21 @@ fn type_attr_resolve(
             _ => return None,
         };
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some((p, ver, b.clone()));
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
         }
         return Some(b);
-    } else if name.starts_with("__") {
-        // (`type`'s own data descriptors take most of these names.)
+    } else if name.starts_with("__") && !dunder_memo_ok(name) {
+        // (`type`'s own attributes, its data descriptors among them, take
+        // these names.)
         return None;
     } else {
         cls.lookup(name)?
     };
-    // (Atoms only: the memo holds a reference, which must not keep a
-    // replaced function or class alive for anyone to observe.)
+    // A dunder name's value is memoized only as a function (below), and
+    // only a name `type` doesn't answer itself.
+    if name.starts_with("__") && !matches!(v, Object::Function(_)) {
+        return None;
+    }
     let plain = matches!(
         v,
         Object::Int(_)
@@ -8225,13 +8268,61 @@ fn type_attr_resolve(
             | Object::Str(_)
             | Object::Bytes(_)
     );
-    if !plain {
-        return None;
-    }
+    // A plain function (a class's read returns it as it is): borrowed, so
+    // the memo never keeps a replaced one alive.
+    let v = match v {
+        v if plain => {
+            if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+                *memo = Some(TypeMemo::owned(p, ver, v.clone()));
+            }
+            return Some(v);
+        }
+        f @ Object::Function(_) => f,
+        _ => return None,
+    };
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-        *memo = Some((p, ver, v.clone()));
+        // SAFETY: a bitwise copy that owns nothing (see `TypeMemo`).
+        let borrowed = unsafe { std::ptr::read(&v) };
+        *memo = Some(TypeMemo {
+            cls: p,
+            ver,
+            val: std::mem::ManuallyDrop::new(borrowed),
+            owned: false,
+        });
     }
     Some(v)
+}
+
+/// Whether a class read of the dunder `name` may be memoized: `type`
+/// neither defines it nor serves it natively (CPython's type getsets and
+/// members, whose data descriptors win over a class's own entry).
+fn dunder_memo_ok(name: &str) -> bool {
+    const TYPE_OWN: &[&str] = &[
+        "__name__",
+        "__qualname__",
+        "__module__",
+        "__doc__",
+        "__dict__",
+        "__bases__",
+        "__base__",
+        "__mro__",
+        "__abstractmethods__",
+        "__text_signature__",
+        "__annotations__",
+        "__annotate__",
+        "__type_params__",
+        "__basicsize__",
+        "__itemsize__",
+        "__flags__",
+        "__weakrefoffset__",
+        "__dictoffset__",
+        "__class__",
+    ];
+    !TYPE_OWN.contains(&name)
+        && crate::builtin_types::builtin_types()
+            .type_
+            .lookup(name)
+            .is_none()
 }
 
 /// A frame's or a code object's plain attribute (`f_back`, `f_code`,
@@ -11669,6 +11760,19 @@ unsafe extern "C" fn h_call(
                 crate::note_type_site(Some(ext), pc, &ops[0]);
                 return done(st, r);
             }
+            // A native method bound to its receiver that runs no Python
+            // code (`random.random` is a module's `Random().random`).
+            match bound_leaf_call(st, ext, pc, ops) {
+                Some(Ok(v)) => return done(st, v),
+                Some(Err(e)) => {
+                    crate::release_run(base.add(start), len - start);
+                    st.len = start;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    return RAISED;
+                }
+                None => {}
+            }
         }
         if python != 0 {
             return call_activation(st, pc, start, len, python);
@@ -12414,6 +12518,76 @@ unsafe fn direct_call_kw(
             None,
             None,
         )
+    }
+}
+
+/// `CALL` of a native method bound to its receiver (`ops`: the bound
+/// method, an empty self slot, the arguments) whose builtin the leaf
+/// registry vouches runs no Python code: its result, or its error, the
+/// operands untouched (the caller releases them); `None`, untouched, for
+/// anything else. The site remembers the builtin's kind, or that this
+/// bound method isn't one.
+///
+/// # Safety
+///
+/// `st` is the running state; `ops` are its stack's initialized slots.
+unsafe fn bound_leaf_call(
+    st: &State,
+    ext: &CodeConstObjects,
+    pc: usize,
+    ops: &[Object],
+) -> Option<Result<Object, crate::RuntimeError>> {
+    use crate::LeafKind;
+    let (Object::BoundMethod(bm), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
+        return None;
+    };
+    let args = &ops[2..];
+    if bm.redispatch_descriptor || st.sw.is_null() || args.len() > 6 {
+        return None;
+    }
+    let Object::Builtin(b) = &bm.function else {
+        return None;
+    };
+    let slot = ext.method_slot(pc)?;
+    let kind = match slot.get_leaf(b) {
+        Some(kind) => kind,
+        None => {
+            if slot.is_non_leaf(bm) {
+                return None;
+            }
+            // SAFETY: the running thread's interpreter, dormant here.
+            match unsafe { (*st.interp).leaf_call_kind(b) } {
+                Some(kind @ (LeafKind::Opaque | LeafKind::Fast(_))) => {
+                    slot.set_leaf(b, kind);
+                    kind
+                }
+                _ => {
+                    slot.set_non_leaf(bm);
+                    return None;
+                }
+            }
+        }
+    };
+    if !Interpreter::core_all_droppable(ops) {
+        return None;
+    }
+    // Bitwise views of the receiver and the arguments, never dropped: the
+    // builtin reads them (and clones what it keeps).
+    let mut views = [const { std::mem::MaybeUninit::<Object>::uninit() }; 7];
+    // SAFETY: the bound method and the stack keep them alive.
+    unsafe {
+        views[0].write(std::ptr::read(&raw const bm.receiver));
+        for (v, a) in views[1..].iter_mut().zip(args) {
+            v.write(std::ptr::read(a));
+        }
+    }
+    // SAFETY: the first `args.len() + 1` entries were written.
+    let views =
+        unsafe { std::slice::from_raw_parts(views.as_ptr().cast::<Object>(), args.len() + 1) };
+    match kind {
+        LeafKind::Fast(f) => f(views),
+        LeafKind::Opaque => Some((b.call)(views)),
+        _ => None,
     }
 }
 

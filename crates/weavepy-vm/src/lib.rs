@@ -31544,7 +31544,9 @@ impl Interpreter {
             slot.set_non_leaf(bm);
             return None;
         };
-        if !kind.retains_bound_receiver() {
+        // (An opaque leaf, one the registry vouches runs no Python code,
+        // reads its receiver as the others do: `random.random()`.)
+        if !kind.retains_bound_receiver() && !matches!(kind, LeafKind::Opaque) {
             slot.set_non_leaf(bm);
             return None;
         }
