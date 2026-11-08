@@ -872,6 +872,30 @@ branch and pull request.
     comparison checks whether its branch follows from its own position
     instead of searching the block. Code generation is 14% of a short
     `deltablue` run's instructions; this takes 1.3% off it.
+  - A compiled `d[key]` that misses an exact dict raises its `KeyError`
+    from the subscript's own helper instead of re-running the subscript
+    through the generic container path first (one dict probe fewer, and
+    no `core_container_op`): a caught `KeyError` takes 2,480 instructions
+    instead of 2,618 (CPython 1,604). What's left of it is a long tail:
+    freeing the exception instance (about 1,000 instructions: its slots,
+    `args` tuple and traceback), the unwind and the handler's three
+    exception ops, each 50 to 300.
+  - Where the warm calls' instructions go, by category, over the suite (a
+    container profile of each workload): the core loop's and the frame
+    JIT's call machinery about 25%, compiled code 16%, releasing and
+    dropping objects 9%, allocation 5%, generators 4% (`generators_tree`
+    55%, `coroutines` 48%), the collector's bookkeeping 2% (about 250
+    instructions for each list or dict born holding only scalars). Against
+    CPython 3.14, a generator's whole life (made, run to one yield, run
+    out, freed) takes 2,526 instructions to 1,265, and a `yield from`
+    delegation 5,611 to 2,414; a 2-tuple's 432 to 251 and a 1-list's 644
+    to 376, while compiled loops, calls and attribute reads take a
+    fraction of CPython's.
+  - Linux CI's binaries start in about 22 MiB against macOS's 11, the size
+    of an unordered build in the container (15.4 ordered, 22.8 unordered),
+    although a container build with CI's exact command is ordered.
+    `scripts/link-ordered.py` now notes whether it ordered the link, and
+    the bench gate's job prints the note.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

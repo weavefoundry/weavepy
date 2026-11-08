@@ -4951,6 +4951,45 @@ unsafe extern "C" fn h_super_attr(
     }
 }
 
+/// `d[key]` with the dict and key in the top two of the `len` slots of
+/// `st`'s stack: an exact dict missing a key that compares natively
+/// raises its `KeyError` here (see `h_catch`), the operands released;
+/// `None` for anything else, untouched.
+///
+/// # Safety
+///
+/// The stack's top two slots are initialized and owned there.
+#[inline(never)]
+unsafe fn subscr_raise_missing(st: &mut State, pc: u64, len: usize) -> Option<u64> {
+    if len < 2 || st.sw.is_null() {
+        return None;
+    }
+    // SAFETY: per the caller.
+    unsafe {
+        let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
+        let (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) = (c, k) else {
+            return None;
+        };
+        let probe = crate::object::LeafProbe::new(k)?;
+        if !droppable(c) {
+            return None;
+        }
+        let missing = d
+            .peek()
+            .is_some_and(|d| d.get(&probe).is_none() && probe.miss_is_exact());
+        if !missing {
+            return None;
+        }
+        let err = crate::error::key_error_object(k.clone());
+        crate::drop_hot_at(st.stack.add(len - 1));
+        crate::drop_hot_at(st.stack.add(len - 2));
+        st.len = len - 2;
+        st.pc = pc as usize + 1;
+        st.err = Some(err);
+        Some(CONTAINER_RAISED)
+    }
+}
+
 unsafe extern "C" fn h_container(
     st: *mut State,
     ins: *const weavepy_compiler::Instruction,
@@ -4980,25 +5019,9 @@ unsafe extern "C" fn h_container(
         if let Some(n) = Interpreter::core_container_op(ins, st.stack, len, st.cap) {
             return n as u64;
         }
-        // `d[key]` of an exact dict missing a key that compares natively:
-        // its `KeyError`, raised here (see `h_catch`).
-        if ins.op == OpCode::BinarySubscr && len >= 2 && can_raise != 0 && !st.sw.is_null() {
-            let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
-            if let (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) = (c, k) {
-                if let (Some(probe), true) = (crate::object::LeafProbe::new(k), droppable(c)) {
-                    let missing = d
-                        .peek()
-                        .is_some_and(|d| d.get(&probe).is_none() && probe.miss_is_exact());
-                    if missing {
-                        let err = crate::error::key_error_object(k.clone());
-                        crate::drop_hot_at(st.stack.add(len - 1));
-                        crate::drop_hot_at(st.stack.add(len - 2));
-                        st.len = len - 2;
-                        st.pc = pc as usize + 1;
-                        st.err = Some(err);
-                        return CONTAINER_RAISED;
-                    }
-                }
+        if ins.op == OpCode::BinarySubscr && can_raise != 0 {
+            if let Some(n) = subscr_raise_missing(st, pc, len) {
+                return n;
             }
         }
         // An instance whose class's `__setitem__` is a native fast store
@@ -5469,6 +5492,12 @@ unsafe extern "C" fn h_subscr_ref(
             return len - 1;
         }
         own_operands(at, &[cont, key], owned);
+        // A dict's missing key raises without the generic subscript.
+        if flags >> 8 != 0 && matches!(&*at, Object::Dict(_)) {
+            if let Some(n) = subscr_raise_missing(&mut *st, pc, len as usize) {
+                return n;
+            }
+        }
         h_container(st, ins, code, pc, len, flags >> 8)
     }
 }
