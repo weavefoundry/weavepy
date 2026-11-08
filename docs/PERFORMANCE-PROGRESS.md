@@ -892,10 +892,27 @@ branch and pull request.
     to 376, while compiled loops, calls and attribute reads take a
     fraction of CPython's.
   - Linux CI's binaries start in about 22 MiB against macOS's 11, the size
-    of an unordered build in the container (15.4 ordered, 22.8 unordered),
-    although a container build with CI's exact command is ordered.
-    `scripts/link-ordered.py` now notes whether it ordered the link, and
-    the bench gate's job prints the note.
+    of an unordered build in the container (15.4 ordered, 22.8 unordered).
+    `scripts/link-ordered.py` now notes whether it ordered the link, and the
+    bench gate's job prints the note: CI's link is ordered (6,136 symbols,
+    rustc 1.99.1), so the runner's kernel maps more per fault than the
+    container's (larger page-cache folios, likely), not a missing layout.
+  - Tier 2 leaves attribute-bound loops to the frame JIT: a loop whose
+    attribute reads and writes outnumber its typed arithmetic and compares
+    isn't compiled (`WEAVEPY_T2_ATTRS=0` turns the rule off). Each tier-2
+    attribute access is a helper call that redoes its guards (about 50
+    instructions; `wpjit_attr_get`), where the frame JIT reads or writes
+    the field in line, so `attr_access`'s loop took 1,529 instructions an
+    iteration in tier 2 against 1,371 in the frame JIT. Calls don't count
+    against a loop: a driver loop calling compiled functions (`fannkuch`'s,
+    `nbody`'s, `richards`') stays native-to-native in tier 2, which a rule
+    that counted them broke (2.1, 1.7 and 1.9 times slower). Over the bench
+    gate's fixtures (best of 5 and 8 runs on this Mac): `attr_access` 0.867,
+    `deltablue` 0.961, `call_overhead` 0.974, the rest level; the suite's
+    instructions are level (`float_points` 0.98). With tier 2 off entirely,
+    `deltablue` runs another 7.5% faster: tier 2 compiles 28 of its small
+    methods for nothing (13.7 ms) and re-analyzes bodies it can't type for
+    each call site (`output` 98 times).
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to

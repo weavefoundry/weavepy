@@ -1105,6 +1105,9 @@ fn analyze_admitted(
     if mostly_generic(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
     }
+    if attr_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("attribute-bound loop"));
+    }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
     }
@@ -1175,40 +1178,81 @@ fn mostly_generic(tfunc: &TFunc) -> bool {
         return false;
     }
     let mix = if loops_only {
-        // The blocks some back edge spans (blocks are in instruction
-        // order).
-        let mut in_loop = vec![false; tfunc.blocks.len()];
-        for (i, b) in tfunc.blocks.iter().enumerate() {
-            use crate::ir::TTerm;
-            let back = |t: usize| (t <= i).then_some(t);
-            let top = match b.term {
-                TTerm::Jump(t) => back(t),
-                TTerm::BranchFalse {
-                    target,
-                    fallthrough,
-                }
-                | TTerm::BranchTrue {
-                    target,
-                    fallthrough,
-                } => back(target).into_iter().chain(back(fallthrough)).min(),
-                _ => None,
-            };
-            if let Some(top) = top {
-                in_loop[top..=i].iter_mut().for_each(|x| *x = true);
-            }
-        }
-        mix_of(
-            tfunc
-                .blocks
-                .iter()
-                .zip(&in_loop)
-                .filter(|(_, l)| **l)
-                .map(|(b, _)| b),
-        )
+        mix_of(loop_blocks(tfunc))
     } else {
         op_mix(tfunc)
     };
     (mix.dyn_calls + mix.dyn_attrs + mix.dyn_other) * 100 > mix.total * percent
+}
+
+/// The blocks of `tfunc` that some back edge spans (blocks are in
+/// instruction order).
+fn loop_blocks(tfunc: &TFunc) -> impl Iterator<Item = &crate::ir::TBlock> {
+    let mut in_loop = vec![false; tfunc.blocks.len()];
+    for (i, b) in tfunc.blocks.iter().enumerate() {
+        use crate::ir::TTerm;
+        let back = |t: usize| (t <= i).then_some(t);
+        let top = match b.term {
+            TTerm::Jump(t) => back(t),
+            TTerm::BranchFalse {
+                target,
+                fallthrough,
+            }
+            | TTerm::BranchTrue {
+                target,
+                fallthrough,
+            } => back(target).into_iter().chain(back(fallthrough)).min(),
+            _ => None,
+        };
+        if let Some(top) = top {
+            in_loop[top..=i].iter_mut().for_each(|x| *x = true);
+        }
+    }
+    tfunc
+        .blocks
+        .iter()
+        .zip(in_loop)
+        .filter(|(_, l)| *l)
+        .map(|(b, _)| b)
+}
+
+/// Whether `tfunc`'s loops access attributes more often than they do
+/// typed arithmetic: each attribute read or write of a tier-2 loop goes
+/// through a helper that redoes its guards (about 50 host instructions),
+/// where the frame JIT reads or writes the field in line, so a loop of
+/// attribute traffic runs faster in the frame JIT unless typed work in
+/// registers repays it. (Calls don't count: a driver loop that calls
+/// compiled functions keeps them native-to-native in tier 2.)
+/// `WEAVEPY_T2_ATTRS=0` turns the rule off, a tuning aid.
+fn attr_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || ATTR_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !*ON.get_or_init(|| std::env::var_os("WEAVEPY_T2_ATTRS").is_none_or(|v| v != "0"))
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut attrs, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            TOp::AttrGet { .. }
+            | TOp::AttrSet { .. }
+            | TOp::DynAttrGet { .. }
+            | TOp::DynAttrSet { .. } => attrs += 1,
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    attrs > typed
 }
 
 /// The generic share [`mostly_generic`] admits, in percent, and whether it
@@ -1229,6 +1273,16 @@ fn generic_share_limit() -> Option<(u32, bool)> {
         };
         num.parse().ok().map(|p| (p, loops_only))
     })
+}
+
+/// Set by [`admit_attr_loops`].
+static ATTR_LOOPS_ADMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compile loops however attribute-bound they are (see [`attr_bound`]),
+/// from now on in this process: for tests of tier 2's attribute paths.
+pub fn admit_attr_loops() {
+    ATTR_LOOPS_ADMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Set by [`admit_generic_loops`].

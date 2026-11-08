@@ -16224,8 +16224,9 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
 /// test builds so it never reaches release binaries.
 #[cfg(test)]
 pub(crate) fn force_enable_for_test(threshold: u32) {
-    // (Its tests check that their calls run natively.)
+    // (Its tests check that their calls and attribute paths run natively.)
     KEEP_CALL_DENSE.with(|k| k.set(true));
+    weavepy_jit::admit_attr_loops();
     JIT_PROCESS_GATE.store(1, std::sync::atomic::Ordering::Relaxed);
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
