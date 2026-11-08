@@ -15174,6 +15174,8 @@ impl<'a> Lower<'a> {
 
     /// Branch to `out` when `cond`; continue in a fresh block otherwise.
     fn branch_out(&mut self, cond: Value, out: Block) {
+        // (The way out is the unlikely side: laid out after the hot code.)
+        self.b.set_cold_block(out);
         let ok = self.b.create_block();
         self.b.ins().brif(cond, out, &[], ok, &[]);
         self.b.switch_to_block(ok);
@@ -17772,6 +17774,7 @@ impl<'a> Lower<'a> {
         other: Block,
         done: Block,
     ) {
+        self.b.set_cold_block(other);
         self.b.switch_to_block(other);
         let slot = self.depth;
         let c = self.binop_site(pc, kind, ai, bi);
@@ -18958,6 +18961,7 @@ impl<'a> Lower<'a> {
         other: Block,
         done: Block,
     ) {
+        self.b.set_cold_block(other);
         self.b.switch_to_block(other);
         let dunder = crate::instance_site(self.ext, pc);
         // An equality of two exact strings read where they lie (a local's

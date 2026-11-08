@@ -11,8 +11,6 @@ pub(crate) struct Analysis {
     /// The reachable blocks in emission order: the hot ones in layout
     /// order, then the cold ones.
     pub order: Vec<Block>,
-    /// Each instruction's block.
-    pub inst_block: Vec<u32>,
     /// The block whose only edge enters each block, when a single-edge block
     /// takes its register state from it (see [`Analysis::inherits`]).
     pub single_pred: Vec<u32>,
@@ -151,17 +149,49 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
                         .last()
                         .is_some_and(|l| matches!(dfg.insts[l.index()].op, Op::Return))))
     };
+    // And what only cold blocks branch to (a slow path's own blocks).
+    let mut is_cold: Vec<bool> = (0..nblocks).map(|i| cold(Block(i as u32))).collect();
+    let mut hot_preds = vec![0u32; nblocks];
+    for &b in &func.layout {
+        if reach[b.index()] && !is_cold[b.index()] {
+            if let Some(&last) = dfg.blocks[b.index()].insts.last() {
+                successors(func, last, |s| hot_preds[s.index()] += 1);
+            }
+        }
+    }
+    let mut work: Vec<Block> = func
+        .layout
+        .iter()
+        .copied()
+        .filter(|&b| {
+            reach[b.index()] && b != entry && !is_cold[b.index()] && hot_preds[b.index()] == 0
+        })
+        .collect();
+    while let Some(b) = work.pop() {
+        if is_cold[b.index()] {
+            continue;
+        }
+        is_cold[b.index()] = true;
+        if let Some(&last) = dfg.blocks[b.index()].insts.last() {
+            successors(func, last, |s| {
+                hot_preds[s.index()] -= 1;
+                if hot_preds[s.index()] == 0 && s != entry && reach[s.index()] {
+                    work.push(s);
+                }
+            });
+        }
+    }
     let mut order: Vec<Block> = func
         .layout
         .iter()
         .copied()
-        .filter(|&b| reach[b.index()] && !cold(b))
+        .filter(|&b| reach[b.index()] && !is_cold[b.index()])
         .collect();
     order.extend(
         func.layout
             .iter()
             .copied()
-            .filter(|&b| reach[b.index()] && cold(b)),
+            .filter(|&b| reach[b.index()] && is_cold[b.index()]),
     );
     let mut pos = vec![NO_BLOCK; nblocks];
     for (i, b) in order.iter().enumerate() {
@@ -253,33 +283,8 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
     ue_at.push(ue.len() as u32);
     let words = globals.len().div_ceil(64).max(1);
     let mut live_in = vec![0u64; nblocks * words];
-    // Each block's definitions of the globals, flat by block as above.
-    let mut def_count = vec![0u32; order.len() + 1];
-    for &v in &globals {
-        let db = def_block(v);
-        if db != NO_BLOCK && pos[db as usize] != NO_BLOCK {
-            def_count[pos[db as usize] as usize] += 1;
-        }
-    }
-    let mut def_at = Vec::with_capacity(order.len() + 1);
-    let mut acc = 0u32;
-    for c in &def_count {
-        def_at.push(acc);
-        acc += c;
-    }
-    let mut defs = vec![0u32; acc as usize];
-    let mut fill = def_at.clone();
-    for &v in &globals {
-        let db = def_block(v);
-        if db != NO_BLOCK && pos[db as usize] != NO_BLOCK {
-            let p = pos[db as usize] as usize;
-            defs[fill[p] as usize] = gidx[v.index()];
-            fill[p] += 1;
-        }
-    }
     // Each block's predecessors among the blocks of `order`, by position
-    // (flat, as above): a block is looked at again only when the live-in of
-    // a block it branches to changed.
+    // (flat, as above).
     let mut pred_count = vec![0u32; order.len() + 1];
     for &b in &order {
         if let Some(&last) = dfg.blocks[b.index()].insts.last() {
@@ -310,37 +315,34 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
             });
         }
     }
-    let mut dirty = vec![true; order.len()];
-    let mut out = vec![0u64; words];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (p, &b) in order.iter().enumerate().rev() {
-            if !dirty[p] {
+    // Each upward-exposed use makes its value live into its block and,
+    // walking back over predecessors, into every block on a path from the
+    // definition, stopping at the defining block or at one already marked:
+    // work in proportion to the live ranges, in one pass.
+    let mut work: Vec<u32> = Vec::new();
+    for (p, &b) in order.iter().enumerate() {
+        for &g in &ue[ue_at[p] as usize..ue_at[p + 1] as usize] {
+            let (w, m) = (g as usize / 64, 1u64 << (g % 64));
+            let db = def_block(globals[g as usize]);
+            let at = b.index() * words + w;
+            if live_in[at] & m != 0 {
                 continue;
             }
-            dirty[p] = false;
-            out.iter_mut().for_each(|w| *w = 0);
-            if let Some(&last) = dfg.blocks[b.index()].insts.last() {
-                successors(func, last, |s| {
-                    let at = s.index() * words;
-                    for (o, w) in out.iter_mut().zip(&live_in[at..at + words]) {
-                        *o |= *w;
+            live_in[at] |= m;
+            work.clear();
+            work.push(p as u32);
+            while let Some(q) = work.pop() {
+                let q = q as usize;
+                for &r in &preds[pred_at[q] as usize..pred_at[q + 1] as usize] {
+                    let rb = order[r as usize];
+                    if rb.0 == db {
+                        continue;
                     }
-                });
-            }
-            for &g in &defs[def_at[p] as usize..def_at[p + 1] as usize] {
-                out[g as usize / 64] &= !(1 << (g % 64));
-            }
-            for &g in &ue[ue_at[p] as usize..ue_at[p + 1] as usize] {
-                out[g as usize / 64] |= 1 << (g % 64);
-            }
-            let at = b.index() * words;
-            if live_in[at..at + words] != out[..] {
-                live_in[at..at + words].copy_from_slice(&out);
-                changed = true;
-                for &q in &preds[pred_at[p] as usize..pred_at[p + 1] as usize] {
-                    dirty[q as usize] = true;
+                    let at = rb.index() * words + w;
+                    if live_in[at] & m == 0 {
+                        live_in[at] |= m;
+                        work.push(r);
+                    }
                 }
             }
         }
@@ -348,7 +350,6 @@ pub(crate) fn analyze(func: &Function) -> Analysis {
 
     Analysis {
         order,
-        inst_block,
         single_pred,
         uses,
         gidx,

@@ -2,7 +2,7 @@
 
     python3 tools/pybench/run.py --weavepy target/release/weavepy [--base OTHER]
         [--cpython python3.14] [--procs 3] [--reps 5] [--filter SUBSTR]
-        [--json OUT.json] [--instructions]
+        [--json OUT.json] [--instructions | --cycles]
 
 Each benchmark runs in fresh processes, interleaving the interpreters
 (CPython, WeavePy, base, CPython, ...). Within a process the first call is
@@ -15,7 +15,9 @@ CPython's: a mismatch is reported as a failure.
 ``--instructions`` instead counts instructions retired (macOS
 ``/usr/bin/time -l``) for a process doing 1 and 1 + REPS calls, and reports
 the per-call difference, which cancels startup and import work and is
-stable on a loaded machine.
+stable on a loaded machine. ``--cycles`` reports the CPU cycles those
+processes take the same way ("cycles elapsed"), which adds what instruction
+counts miss (cache misses, stalls) at the cost of some noise under load.
 
 Each interpreter gets a frozen code cache of its own under
 ``target/pybench-frozen/``, filled by one untimed warm-up run per
@@ -95,13 +97,13 @@ def run_once(interp, name, work, reps, timeout):
     return json.loads(line)
 
 
-def instructions(interp, name, work, reps, timeout):
+def instructions(interp, name, work, reps, timeout, event="instructions retired"):
     def count(r):
         proc = subprocess.run(
             ["/usr/bin/time", "-l", interp, HARNESS, name, str(work), str(r)],
             capture_output=True, text=True, timeout=timeout, env=interp_env(interp),
         )
-        m = re.search(r"(\d+)\s+instructions retired", proc.stderr)
+        m = re.search(r"(\d+)\s+" + event, proc.stderr)
         if proc.returncode != 0 or not m:
             return None
         return int(m.group(1))
@@ -129,8 +131,13 @@ def main():
     ap.add_argument("--exclude", action="append")
     ap.add_argument("--json")
     ap.add_argument("--instructions", action="store_true")
+    ap.add_argument("--cycles", action="store_true")
     ap.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args()
+    event = "instructions retired"
+    if args.cycles:
+        args.instructions = True
+        event = "cycles elapsed"
 
     interps = [("cpython", args.cpython), ("weavepy", args.weavepy)]
     if args.base:
@@ -149,7 +156,7 @@ def main():
         if args.instructions:
             row = {"name": name}
             for label, interp in interps:
-                row[label] = instructions(interp, name, work, args.reps, args.timeout)
+                row[label] = instructions(interp, name, work, args.reps, args.timeout, event)
             rows.append(row)
             c, w = row["cpython"], row["weavepy"]
             ratio = w / c if c and w else float("nan")
@@ -205,8 +212,8 @@ def main():
     if args.instructions:
         ok = [r for r in rows if r.get("ratio") == r.get("ratio") and r.get("ratio")]
         print()
-        print("geomean over %d benchmarks: instructions %.3f%s" % (
-            len(ok), geomean(r["ratio"] for r in ok),
+        print("geomean over %d benchmarks: %s %.3f%s" % (
+            len(ok), "cycles" if args.cycles else "instructions", geomean(r["ratio"] for r in ok),
             "  vs base %.3f" % geomean(r["vs_base"] for r in ok if "vs_base" in r) if args.base else ""))
     else:
         ok = [r for r in rows if r.get("status") == "ok"]

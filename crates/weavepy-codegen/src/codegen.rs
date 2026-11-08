@@ -81,6 +81,10 @@ struct Gen<'f, A: Asm> {
     explicit: u32,
     /// The values in registers or slots, in no order.
     live: Vec<Value>,
+    /// Each tracked value's index in `live`.
+    live_pos: Vec<u32>,
+    /// The block being generated.
+    cur: Block,
     holds: [u32; 64],
     pinned: u64,
     locked: u64,
@@ -160,6 +164,8 @@ pub(crate) fn compile<A: Asm>(f: &mut Function) -> Result<Vec<u8>, Error> {
         slot_offs: Vec::new(),
         explicit: 0,
         live: Vec::new(),
+        live_pos: vec![0; nv],
+        cur: Block(0),
         holds: [NONE; 64],
         pinned: 0,
         locked: 0,
@@ -381,6 +387,7 @@ impl<A: Asm> Gen<'_, A> {
         let i = v.index();
         if !self.tracked[i] {
             self.tracked[i] = true;
+            self.live_pos[i] = self.live.len() as u32;
             self.live.push(v);
         }
         self.reg_of[i] = reg;
@@ -399,8 +406,11 @@ impl<A: Asm> Gen<'_, A> {
         }
         self.drop_reg(v);
         self.tracked[i] = false;
-        if let Some(p) = self.live.iter().position(|&x| x == v) {
-            self.live.swap_remove(p);
+        let p = self.live_pos[i] as usize;
+        debug_assert_eq!(self.live[p], v);
+        self.live.swap_remove(p);
+        if let Some(&moved) = self.live.get(p) {
+            self.live_pos[moved.index()] = p as u32;
         }
         // A value of one block gives its slot back.
         if self.recyclable(v) && self.slot_of[i] != NONE {
@@ -827,6 +837,7 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn block(&mut self, b: Block, pos: usize) -> Result<(), Error> {
+        self.cur = b;
         self.next_uses(b);
         // The state at the start.
         if let Some(snap) = self.snaps[b.index()].take() {
@@ -882,8 +893,7 @@ impl<A: Asm> Gen<'_, A> {
         for (k, &inst) in insts.iter().enumerate() {
             self.locked = 0;
             let nres = f.dfg.results(inst).len();
-            let next_inst = insts.get(k + 1).copied();
-            self.inst(inst, k, pos, &mut at, rat, next_inst)?;
+            self.inst(inst, k, pos, &mut at, rat)?;
             rat += nres;
         }
         self.locked = 0;
@@ -896,20 +906,16 @@ impl<A: Asm> Gen<'_, A> {
         self.f.dfg.results(inst)[j]
     }
 
-    /// Whether `v`'s only use is as the condition of the `brif` after
-    /// `next` and any constants (which emit nothing) before it.
-    fn fuses(&self, v: Value, next: Option<Inst>) -> bool {
-        let Some(next) = next else { return false };
+    /// Whether `v`'s only use is as the condition of the `brif` after the
+    /// current block's instruction `k`, past any constants (which emit
+    /// nothing).
+    fn fuses(&self, v: Value, k: usize) -> bool {
         if self.an.uses[v.index()] != 1 {
             return false;
         }
         let f = self.f;
-        let b = self.an.inst_block[next.index()];
-        let insts = &f.dfg.blocks[b as usize].insts;
-        let Some(at) = insts.iter().position(|&i| i == next) else {
-            return false;
-        };
-        for &i in &insts[at..] {
+        let insts = &f.dfg.blocks[self.cur.index()].insts;
+        for &i in insts.get(k + 1..).unwrap_or(&[]) {
             let d = &f.dfg.insts[i.index()];
             match d.op {
                 Op::Iconst(_) | Op::Fconst(_) => {}
@@ -928,7 +934,6 @@ impl<A: Asm> Gen<'_, A> {
         pos: usize,
         at: &mut usize,
         rat: usize,
-        next: Option<Inst>,
     ) -> Result<(), Error> {
         let f = self.f;
         let d = &f.dfg.insts[inst.index()];
@@ -971,7 +976,7 @@ impl<A: Asm> Gen<'_, A> {
                 };
                 let a = self.use_reg(x)?;
                 let b = self.opnd(y, A::cmp_imm_ok)?;
-                self.compare(inst, k, at, rat, next, ty, c, a, b)?;
+                self.compare(inst, k, at, rat, ty, c, a, b)?;
             }
             Op::IcmpImm(cc, imm) => {
                 let ty = self.ty(args[0]);
@@ -984,14 +989,14 @@ impl<A: Asm> Gen<'_, A> {
                     self.locked |= bit(r);
                     Opnd::R(r)
                 };
-                self.compare(inst, k, at, rat, next, ty, Cond::from_int(*cc), a, b)?;
+                self.compare(inst, k, at, rat, ty, Cond::from_int(*cc), a, b)?;
             }
             Op::Fcmp(cc) => {
                 let ty = self.ty(args[0]);
                 let a = self.use_reg(args[0])?;
                 let b = self.use_reg(args[1])?;
                 let v = self.res(inst, 0);
-                if self.fuses(v, next) {
+                if self.fuses(v, k) {
                     self.consume(inst, at);
                     self.a.fcmp(*cc, ty, a, b);
                     self.pending = Some(Pending::Float(*cc, v));
@@ -1139,7 +1144,7 @@ impl<A: Asm> Gen<'_, A> {
                 self.consume(inst, at);
                 let (v, flag) = (self.res(inst, 0), self.res(inst, 1));
                 let r = self.def(v, k, dn(self, 0), Some(a))?;
-                if self.fuses(flag, next) {
+                if self.fuses(flag, k) {
                     let c = self.a.overflow(*op, ty, r, a, b);
                     self.pending = Some(Pending::Int(c, flag));
                 } else {
@@ -1299,14 +1304,13 @@ impl<A: Asm> Gen<'_, A> {
         k: usize,
         at: &mut usize,
         rat: usize,
-        next: Option<Inst>,
         ty: Type,
         c: Cond,
         a: Reg,
         b: Opnd,
     ) -> Result<(), Error> {
         let v = self.res(inst, 0);
-        if self.fuses(v, next) {
+        if self.fuses(v, k) {
             self.consume(inst, at);
             self.a.cmp(ty, a, b);
             self.pending = Some(Pending::Int(c, v));

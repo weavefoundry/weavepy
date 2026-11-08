@@ -844,7 +844,34 @@ branch and pull request.
     `datetime_ops` runs 6% fewer instructions with 14% fewer simulated
     instruction-cache misses, and 8% faster in the container. (CI's Linux
     gate read it 16% to 20% slower than `main`, though fewer instructions
-    ran; macOS release builds timed it level.)
+    ran; macOS release builds timed it level.) The next CI run read it
+    1.06 on Linux.
+  - Cycles, not instructions, are now the gap. `tools/pybench/run.py
+    --cycles` counts a warm call's CPU cycles as `--instructions` counts its
+    instructions. On a release build (not PGO), on a loaded machine, the
+    suite took 1.10 of CPython's cycles against 0.925 of its instructions
+    (`exceptions` 1.73, `class_creation` 1.53, `logging_mix` 1.51). The
+    simulated cache shows why: a warm call of `nqueens`, `tomllib_loads`,
+    `exceptions`, `context_managers`, `deepcopy` or `async_tree` takes 2.5
+    to 4.7 times CPython's L1 instruction misses (data misses about 2
+    times, branch mispredicts level), spread thinly over a hundred or more
+    functions each run about once a call. Compiled code is a fifth of them
+    on `nqueens` (`permutations` alone is 16.5 KB). An LLVM inline
+    threshold of 100 left the misses within 3% and added 1 to 5% more
+    instructions.
+  - Compiled code lays out its slow paths after the hot code: a guard's way
+    out (`branch_out`), and `BINARY_OP`'s and `COMPARE_OP`'s fallback
+    through their helpers, are cold blocks, and the code generator also
+    treats as cold any block only cold blocks branch to (a slow path's
+    own blocks). `nqueens` takes 5% fewer simulated instruction misses;
+    the others moved by under 1%.
+  - The code generator is a little cheaper: liveness marks each
+    upward-exposed use's value live back along the predecessors to its
+    definition, in one pass, instead of iterating a bitset dataflow to a
+    fixed point; dropping a value from the live list is O(1); and a
+    comparison checks whether its branch follows from its own position
+    instead of searching the block. Code generation is 14% of a short
+    `deltablue` run's instructions; this takes 1.3% off it.
   - Fixed: the code generator's differential fuzzer let the compiler put
     the generated function's address in a callee-saved register the test
     sequence seeds before the call, so in release builds the test jumped to
