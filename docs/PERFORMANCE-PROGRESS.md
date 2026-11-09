@@ -1082,20 +1082,42 @@ branch and pull request.
     the `inf`/`nan` spellings only when a letter is present. `float(text)`
     takes 92 ns instead of 150 (CPython 85), a failed `int(text)` caught
     as `ValueError` 2% fewer instructions in `exceptions`.
-  - Found, not yet fixed: a small function whose loop tier 2 compiles
-    (`def f(): return [x * 2 for x in t]`), called from a frame-compiled
-    loop, takes three times CPython's time (739 ns against 240). Its
-    activations run tier 2's code from the lean call path, where the frame
-    JIT never counts their heat, so the caller switches to the core loop at
-    every call; and tier 2 iterates a tuple through a helper call per
-    element (`wpjit_iter_next`, about 115 instructions). With tier 2
-    declining loops that aren't over a `range`, `f` takes 307 ns, but the
-    suite is level: `stdlib_utils` 8% and `graph_search` 4% faster,
-    `raytrace` 15% slower, whose list loops do float work tier 2 keeps
-    unboxed. Declining only short bodies (16 instructions) left the
-    instructions level too (`stdlib_utils` 0.98, `float_points` 1.04). The
-    fix is in the hand-off: a frame-compiled caller entering tier 2's code
-    directly, or the frame JIT counting those calls.
+  - A small function whose loop tier 2 compiles (`def f(): return [x * 2
+    for x in t]`), called from a frame-compiled loop, took three times
+    CPython's time (739 ns against 240). Its activations ran tier 2's code
+    from the lean call path, where the frame JIT never counted them, so the
+    inliner judged `f` "not warm" and the caller left for the core loop at
+    every call (the core loop's step, the full `CALL` handler, then tier
+    2's entry: about 2,600 of the call's 7,800 instructions). The inliner
+    now counts a callee tier 2 compiled as warm, and the core loop notes
+    such a callee in the call site's shapes when it declines an inline
+    activation for it (a function made anew at each call of its caller was
+    otherwise never known to the site, since every call after the first
+    few ran tier 2's code). The caller takes `f` in line as it does without
+    tier 2: 3,414 instructions a call instead of 7,774 (CPython 3,494), and
+    7,761 to 3,362 for a nested `f`; 286 ns instead of 724 (CPython 235),
+    and a lambda's the same (753 to 290 ns). A callee's tier 2 code still runs when
+    the interpreter or tier 2 calls it, and a body too long to inline keeps
+    it too.
+  - Tier 2's step of a list or tuple iterator into a scalar lane (its
+    commonest opaque loop) runs in a small function of its own, reading the
+    iterator and the list through guard-free views, with the rest of the
+    general step behind it: about 100 instructions an element became about
+    50, mostly the register saves of the large function and an out-of-line
+    `pack`. A comprehension over a tuple in a loop tier 2 compiles takes
+    3,476 instructions a pass instead of 4,086 (CPython 3,287), 286 ns
+    instead of 324 (CPython 228). The suite's
+    instructions are level with both changes (geomean 1.000).
+  - Tried first and kept as findings: with tier 2 off the suite runs 4.4%
+    more instructions (`scimark` 1.71, `tomllib_loads` 1.49, `logging_mix`
+    1.20, `async_tree` 1.15, `nqueens` 1.11, the rest within 4%); with tier
+    2 declining loops that aren't over a `range`, `f` took 307 ns but
+    `raytrace` 15% more time; declining only short bodies left the suite
+    level. Calling tier 2's code in place from the core loop (skipping the
+    full handler) would need the lean callers flushed first, since the
+    callee can run any Python, so the inline path is the cheaper fix. Two
+    builds of the same source can differ by 2 to 3% in `async_tree`'s
+    instructions (1.02 with tier 2 off, where the change can't act).
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000

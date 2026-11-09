@@ -16528,16 +16528,20 @@ impl Interpreter {
             // the general inline call is about to bind.
             let shape = Self::core_call_probe(frame, pc);
             let act = self.try_inline_call(frame, shell, pc);
-            if let (Some(act), Some((func, has_self, eff_argc))) = (&act, shape) {
-                let code = &act.frame.code;
-                if let Some(slot) = code_call_slot(&frame.code, pc) {
-                    slot.set(CallShape {
-                        func,
-                        code: Rc::downgrade(code),
-                        missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
-                        has_self,
-                    });
+            match (&act, shape) {
+                (Some(act), Some((func, has_self, eff_argc))) => {
+                    let code = &act.frame.code;
+                    if let Some(slot) = code_call_slot(&frame.code, pc) {
+                        slot.set(CallShape {
+                            func,
+                            code: Rc::downgrade(code),
+                            missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
+                            has_self,
+                        });
+                    }
                 }
+                (None, Some(shape)) => Self::note_tier2_callee(&frame.code, pc, shape),
+                _ => {}
             }
             act
         };
@@ -22725,6 +22729,47 @@ impl Interpreter {
             return None;
         }
         Some(Ok(Object::Bool(hit)))
+    }
+
+    /// The `CALL` at `pc` of `caller` declined an inline activation for
+    /// `shape`'s callee (see [`Self::core_call_probe`]): when its code is
+    /// tier 2 compiled (its calls run that code through the full handler,
+    /// never an activation), the site notes the callee all the same, so a
+    /// compiled caller can take it in line (see `frame_jit::inline`). The
+    /// site's own fast path still declines that code (`lean_code_ok`).
+    #[cold]
+    #[inline(never)]
+    fn note_tier2_callee(
+        caller: &CodeObject,
+        pc: usize,
+        (func, has_self, eff_argc): (crate::sync::Weak<crate::object::PyFunction>, bool, usize),
+    ) {
+        #[cfg(feature = "jit")]
+        {
+            let Some(f) = func.upgrade() else {
+                return;
+            };
+            let code = f.code();
+            if !code.jit_hint.is_compiled()
+                || code.jit_hint.is_not_jitable()
+                || crate::tier2::jit_off_for_process()
+            {
+                return;
+            }
+            let Some(slot) = code_call_slot(caller, pc) else {
+                return;
+            };
+            if slot.hit(Rc::as_ptr(&f), Rc::as_ptr(&code)).is_none() {
+                slot.set(CallShape {
+                    func,
+                    code: Rc::downgrade(&code),
+                    missing: (code.arg_count as usize).saturating_sub(eff_argc) as u32,
+                    has_self,
+                });
+            }
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = (caller, pc, func, has_self, eff_argc);
     }
 
     /// The `(function, has_self, effective argc)` of a plain-function
@@ -81618,6 +81663,7 @@ pub(crate) fn callee_warm(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     ext.frame_jit.compiled_nlocals().is_some()
         || code.jit_hint.lean_entries() >= 24
+        || (code.jit_hint.is_compiled() && !code.jit_hint.is_not_jitable())
         || ext.leaf_tries.load(Relaxed) & u64::from(u32::MAX) >= 24
 }
 

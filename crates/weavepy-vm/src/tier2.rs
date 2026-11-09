@@ -2822,6 +2822,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
 
 /// Pack a representable [`Object`] into its slot bits for `ty`, or `None`
 /// if it doesn't match the expected lane.
+#[inline(always)]
 fn pack(obj: &Object, ty: JitType) -> Option<u64> {
     match (ty, obj) {
         (JitType::Int, Object::Int(i)) => Some(*i as u64),
@@ -9797,15 +9798,18 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
         Some(SlotTag::Bool) => JitType::Bool,
         _ => return None,
     };
-    let mut it = cell.try_borrow_mut().ok()?;
-    match &mut *it {
+    // SAFETY: the views end before anything that could borrow either cell
+    // runs (reading an element and packing its bits run no code).
+    let it = unsafe { cell.peek_mut()? };
+    match it {
         PyIterator::Tuple { items, index } => {
             let bits = pack(items.get(*index)?, lane)?;
             *index += 1;
             Some(bits)
         }
         PyIterator::List { items, index, .. } => {
-            let bits = pack(items.borrow().get(*index)?, lane)?;
+            // SAFETY: as above.
+            let bits = pack(unsafe { items.peek()? }.get(*index)?, lane)?;
             *index += 1;
             Some(bits)
         }
@@ -9831,17 +9835,32 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
-    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
     // A list or tuple iterator stepping into a scalar lane, the commonest
     // opaque loop (a tuple local, a subscript's list): the element is read
-    // in place. Its end, and an element outside the lane, take the general
-    // step below.
+    // in place, in a frame small enough to cost little per element. Its
+    // end, and an element outside the lane, take the general step.
     if let Some(Pin::Obj(Object::Iter(cell))) = ctx.pins.get(pin as usize) {
         if let Some(bits) = seq_scalar_step(cell, elem_tag) {
             jf.ret_bits = bits;
             return 0;
         }
     }
+    // SAFETY: the caller's contract.
+    unsafe { iter_next_general(frame, pin, elem_tag) }
+}
+
+/// [`wpjit_iter_next`]'s general step: every iterator and lane.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+#[inline(never)]
+unsafe fn iter_next_general(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
