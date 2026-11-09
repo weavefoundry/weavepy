@@ -5627,7 +5627,15 @@ fn parse_int_string(
             (base, s)
         };
 
-    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
+    let cleaned: std::borrow::Cow<'_, str> = if digits.contains('_') {
+        digits
+            .chars()
+            .filter(|c| *c != '_')
+            .collect::<String>()
+            .into()
+    } else {
+        digits.into()
+    };
     // (The radix parsers below take a sign of their own: `int('--1')` must
     // not read as `-(-1)`.)
     if cleaned.is_empty() || cleaned.starts_with(['+', '-']) {
@@ -6845,15 +6853,22 @@ pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
     if s.is_empty() || !valid_float_underscores(s) {
         return None;
     }
-    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
-    match cleaned.to_ascii_lowercase().as_str() {
-        "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
-        "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
-        // Fresh identity per parse (CPython allocates a new float object).
-        "nan" | "+nan" => return Some(crate::object::tag_nan(f64::NAN)),
-        // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
-        "-nan" => return Some(crate::object::tag_nan(-f64::NAN)),
-        _ => {}
+    let cleaned: std::borrow::Cow<'_, str> = if s.contains('_') {
+        s.chars().filter(|&c| c != '_').collect::<String>().into()
+    } else {
+        s.into()
+    };
+    // (Only a spelling with a letter can be one of these.)
+    if cleaned.bytes().any(|b| b.is_ascii_alphabetic()) {
+        match cleaned.to_ascii_lowercase().as_str() {
+            "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
+            "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
+            // Fresh identity per parse (CPython allocates a new float object).
+            "nan" | "+nan" => return Some(crate::object::tag_nan(f64::NAN)),
+            // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
+            "-nan" => return Some(crate::object::tag_nan(-f64::NAN)),
+            _ => {}
+        }
     }
     // Reject the bare `inf`/`infinity`/`nan` tokens that Rust's parser also
     // accepts (CPython only takes the spellings handled above); everything
@@ -6873,9 +6888,9 @@ pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
 /// `float("\N{EM SPACE}3.14")` parse. Any other non-ASCII character becomes
 /// `'?'` (and truncates), which makes the subsequent parse fail with the
 /// same `ValueError` CPython raises.
-fn transform_decimal_and_space(raw: &str) -> String {
+fn transform_decimal_and_space(raw: &str) -> std::borrow::Cow<'_, str> {
     if raw.is_ascii() {
-        return raw.to_string();
+        return std::borrow::Cow::Borrowed(raw);
     }
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -6890,7 +6905,7 @@ fn transform_decimal_and_space(raw: &str) -> String {
             break;
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Decimal value (0–9) of a Unicode `Nd` (Decimal_Number) character, or

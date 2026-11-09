@@ -26514,10 +26514,12 @@ impl Interpreter {
             self_slot
         };
         if let Object::Type(ty) = &stack[callee_slot] {
-            // `range(...)` / `list(...)`: constructed directly.
+            // `range(...)` / `list(...)`: constructed directly, the site
+            // noted as a builtin type's call (for the frame JIT's helper).
             let Some(v) = self.leaf_type_call(ty, &stack[first..]) else {
                 return CoreAttr::Decline;
             };
+            note_type_site(code_vm_ext(code), pc, &stack[callee_slot]);
             stack.truncate(callee_slot);
             stack.push(v);
             return CoreAttr::Done;
@@ -29457,10 +29459,12 @@ impl Interpreter {
                         self_slot
                     };
                     if let Object::Type(ty) = &stack[callee_slot] {
-                        // `range(...)` / `list(...)`: constructed directly.
+                        // `range(...)` / `list(...)`: constructed directly,
+                        // the site noted (as in `leaf_core_call`).
                         let Some(v) = self.leaf_type_call(ty, &stack[first..]) else {
                             break;
                         };
+                        note_type_site(code_vm_ext(code), pc, &stack[callee_slot]);
                         stack.truncate(self_slot);
                         stack.pop(); // the callee
                         stack.push(v);

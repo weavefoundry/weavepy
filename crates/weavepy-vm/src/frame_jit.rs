@@ -10302,6 +10302,30 @@ unsafe extern "C" fn h_call_ctor(
         if argc == 1 && type_of_call(s, len as usize - 3) {
             return 0;
         }
+        // A builtin type's call (`int(text)`, `range(n)`, `ValueError(m)`)
+        // whose construction runs no code, in place as `h_call_type` makes
+        // it: the site was compiled before the core loop noted the type
+        // (a loop that grew hot in its first call), which it notes now.
+        let start = len as usize - argc - 2;
+        if let Object::Type(t) = &*s.stack.add(start) {
+            if t.flags.is_builtin
+                && matches!(&*s.stack.add(start + 1), Object::Unbound)
+                && !s.sw.is_null()
+            {
+                let args = std::slice::from_raw_parts(s.stack.add(start + 2), argc);
+                let interp = &*s.interp;
+                if let Some(v) = interp
+                    .leaf_type_call(t, args)
+                    .or_else(|| crate::seqiter::builtin_ctor_pure(t, args))
+                {
+                    crate::note_type_site(Some(&*ext), pc as usize, &*s.stack.add(start));
+                    crate::release_operands(interp, s.stack.add(start), len as usize - start);
+                    s.stack.add(start).write(v);
+                    s.len = start + 1;
+                    return 0;
+                }
+            }
+        }
         if ctor_store_init(s, &*code, pc as usize, argc, len as usize) {
             return 0;
         }

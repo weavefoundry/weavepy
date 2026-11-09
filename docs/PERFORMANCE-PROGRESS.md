@@ -1071,6 +1071,17 @@ branch and pull request.
     `mini_interpreter` see six classes against four entries, but five
     polymorphic entries instead of three changed its instructions by
     0.015%: those loads are served cheaply further down the same path.)
+  - A builtin type's call from compiled code (`int(text)`, `float(text)`,
+    `range(n)`, `ValueError(m)`) that the site was compiled without
+    knowing (a loop that grew hot in its first call compiles before the
+    core loop notes the type) is constructed in place by the constructor
+    helper, as the type site's helper does, and noted then; it went through
+    the general call's layers (a loop of five `int(text)` calls took 5,008
+    instructions a pass, now 3,653). `int` and `float` parsing no longer copy their text when
+    nothing in it needs normalizing (ASCII without underscores) and check
+    the `inf`/`nan` spellings only when a letter is present. `float(text)`
+    takes 92 ns instead of 150 (CPython 85), a failed `int(text)` caught
+    as `ValueError` 2% fewer instructions in `exceptions`.
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000
