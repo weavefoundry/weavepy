@@ -613,9 +613,10 @@ unsafe extern "C" fn enter_more(
             return NOT_ENTERED;
         }
         let missing = params - n;
+        let defaults = &(*fp).defaults;
         if missing != 0
             && (crate::sync::release_gates() != 0
-                || (&(*fp).defaults).len() < missing
+                || defaults.len() < missing
                 || (*fp).defaults_maybe_overridden())
         {
             return NOT_ENTERED;
@@ -634,7 +635,6 @@ unsafe extern "C" fn enter_more(
         let dst = rec.st.locals;
         move_args(slot.add(2 - usize::from(has_self)), dst, n);
         if missing != 0 {
-            let defaults = &(*fp).defaults;
             let defaults = defaults.as_ptr().add(defaults.len() - missing);
             for k in 0..missing {
                 let d = defaults.add(k);
