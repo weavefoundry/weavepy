@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
-pub(crate) struct CompactVec<T> {
+pub struct CompactVec<T> {
     ptr: NonNull<T>,
     len: u32,
     cap: u32,
@@ -23,7 +23,7 @@ unsafe impl<T: Send> Send for CompactVec<T> {}
 unsafe impl<T: Sync> Sync for CompactVec<T> {}
 
 impl<T> CompactVec<T> {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         const { assert!(std::mem::size_of::<T>() != 0) };
         CompactVec {
             ptr: NonNull::dangling(),
@@ -48,7 +48,7 @@ impl<T> CompactVec<T> {
     }
 
     /// The elements as a `Vec`, the buffer handed over.
-    pub(crate) fn into_vec(self) -> Vec<T> {
+    pub fn into_vec(self) -> Vec<T> {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: the parts are a vector's (see `from_vec`), handed over
         // once: `this` is never dropped.
@@ -82,7 +82,7 @@ impl<T> CompactVec<T> {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, value: T) {
+    pub fn push(&mut self, value: T) {
         if self.len < self.cap {
             // SAFETY: `len < cap`: the slot is allocated and unused.
             unsafe { self.ptr.as_ptr().add(self.len as usize).write(value) };
@@ -92,15 +92,30 @@ impl<T> CompactVec<T> {
         }
     }
 
-    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: the slot was initialized and is forgotten by the length.
+        Some(unsafe { self.ptr.as_ptr().add(self.len as usize).read() })
+    }
+
+    pub fn reserve_exact(&mut self, additional: usize) {
         if (self.cap - self.len) as usize >= additional {
             return;
         }
         self.with_vec(|v| v.reserve_exact(additional));
     }
 
-    pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
         self.with_vec(|v| v.retain(keep));
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CompactVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -146,6 +161,12 @@ impl<T: Clone> Clone for CompactVec<T> {
 impl<T> From<Vec<T>> for CompactVec<T> {
     fn from(v: Vec<T>) -> Self {
         Self::from_vec(v)
+    }
+}
+
+impl<T> FromIterator<T> for CompactVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
+        Self::from_vec(items.into_iter().collect())
     }
 }
 

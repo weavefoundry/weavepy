@@ -45,7 +45,7 @@ pub mod builtin_docs_data;
 pub mod builtin_types;
 pub mod builtins;
 pub mod capi_watchers;
-mod compact_vec;
+pub mod compact_vec;
 pub mod cpython_headers;
 pub mod descr_registry;
 pub mod dictmap;
@@ -39657,7 +39657,7 @@ impl Interpreter {
                         if f.defaults.is_empty() {
                             return Ok(Object::None);
                         }
-                        return Ok(Object::new_tuple(f.defaults.clone()));
+                        return Ok(Object::new_tuple(f.defaults.to_vec()));
                     }
                     "__kwdefaults__" => {
                         if f.kw_defaults.is_empty() {
@@ -39673,7 +39673,7 @@ impl Interpreter {
                         if f.closure.is_empty() {
                             return Ok(Object::None);
                         }
-                        return Ok(Object::new_tuple(f.closure.clone()));
+                        return Ok(Object::new_tuple(f.closure.to_vec()));
                     }
                     "__annotations__" => {
                         // PEP 649 (`function___annotations___get_impl`):
@@ -59230,9 +59230,9 @@ impl Interpreter {
             code: RefCell::new(code),
             globals,
             builtins,
-            defaults,
-            kw_defaults,
-            closure,
+            defaults: defaults.into(),
+            kw_defaults: kw_defaults.into(),
+            closure: closure.into(),
             attrs: RefCell::new(None),
             slots_raw: crate::sync::OnceBox::new(),
             slot_seed: RefCell::new(None),
@@ -59740,7 +59740,7 @@ impl Interpreter {
         let mut frame = self.make_frame(
             code,
             Vec::new(),
-            body_fn.closure.clone(),
+            body_fn.closure.to_vec(),
             body_fn.globals.clone(),
             Some(body_fn.builtins.clone()),
         );
@@ -60117,7 +60117,7 @@ impl Interpreter {
         let mut frame = self.make_frame(
             code,
             Vec::new(),
-            body_fn.closure.clone(),
+            body_fn.closure.to_vec(),
             body_fn.globals.clone(),
             Some(body_fn.builtins.clone()),
         );
@@ -63567,7 +63567,7 @@ impl Interpreter {
         let mut frame = self.make_frame(
             code.clone(),
             positional,
-            f.closure.clone(),
+            f.closure.to_vec(),
             f.globals.clone(),
             Some(f.builtins.clone()),
         );
@@ -63892,7 +63892,7 @@ impl Interpreter {
                 let mut frame = self.make_frame(
                     code.clone(),
                     positional,
-                    f.closure.clone(),
+                    f.closure.to_vec(),
                     f.globals.clone(),
                     Some(f.builtins.clone()),
                 );
@@ -65420,7 +65420,7 @@ impl Interpreter {
         let mut frame = self.make_frame(
             f.code(),
             args,
-            f.closure.clone(),
+            f.closure.to_vec(),
             f.globals.clone(),
             Some(f.builtins.clone()),
         );
@@ -84813,9 +84813,9 @@ fn new_function(
         // mapping CPython's `PyFunction_New` snapshots (the frame's
         // builtins came from the same globals).
         builtins: builtins.clone(),
-        defaults,
-        kw_defaults,
-        closure,
+        defaults: defaults.into(),
+        kw_defaults: kw_defaults.into(),
+        closure: closure.into(),
         attrs: RefCell::new(None),
         slots_raw: crate::sync::OnceBox::new(),
         slot_seed: RefCell::new(Some(crate::object::LazySlots(module))),

@@ -5297,10 +5297,10 @@ pub struct PyFunction {
     /// must not change resolution (test_dynamic's
     /// `test_cannot_replace_builtins_dict_between_calls`).
     pub builtins: Rc<RefCell<DictData>>,
-    pub defaults: Vec<Object>,
-    pub kw_defaults: Vec<(String, Object)>,
+    pub defaults: crate::compact_vec::CompactVec<Object>,
+    pub kw_defaults: crate::compact_vec::CompactVec<(String, Object)>,
     /// Closure cells matching `code.freevars` in order.
-    pub closure: Vec<Object>,
+    pub closure: crate::compact_vec::CompactVec<Object>,
     /// `__dict__` for arbitrary attribute assignment on the
     /// function — e.g. `@functools.wraps`, `@abstractmethod`'s
     /// `__isabstractmethod__`, or any decorator that stashes
@@ -5345,6 +5345,11 @@ pub struct PyFunction {
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,
 }
+
+// With the reference counts, the 192-byte allocation class (a program holds
+// thousands of functions).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PyFunction>() <= 176);
 
 /// A function's getset slots before their first read (see
 /// [`PyFunction::slot_seed`]): the defining globals' `__name__`, if set.

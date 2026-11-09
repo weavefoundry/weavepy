@@ -4231,7 +4231,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.defaults.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.defaults.clone()))
+                        Some(Object::new_tuple(f.defaults.to_vec()))
                     }
                 }
                 "__kwdefaults__" => {
@@ -4249,7 +4249,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.closure.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.closure.clone()))
+                        Some(Object::new_tuple(f.closure.to_vec()))
                     }
                 }
                 _ => None,
