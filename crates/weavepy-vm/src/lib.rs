@@ -76113,7 +76113,7 @@ fn gen_send_arity(receiver: &Object, n: usize) -> Result<(), RuntimeError> {
 /// `gen.send` pushes (see [`core_gen_method`]): the `.u.` sentinel a
 /// type's attribute gives (`type(gen).send`), which `Interpreter::call`
 /// runs with its first argument as the receiver. One per kind, shared.
-fn gen_send_unbound(coro: bool) -> Object {
+pub(crate) fn gen_send_unbound(coro: bool) -> Object {
     static METHODS: [std::sync::OnceLock<Object>; 2] = [const { std::sync::OnceLock::new() }; 2];
     METHODS[usize::from(coro)]
         .get_or_init(|| {

@@ -1060,6 +1060,17 @@ branch and pull request.
     resolved and then declined, as a dunder that isn't a function.
     `type(o).__doc__` takes 31 ns instead of 94 for an `ABCMeta` class
     (CPython 39), and `context_managers` runs 3% fewer instructions.
+  - A compiled `x.send(v)` site keeps a generator's or coroutine's `send`
+    as its builtin method once it has loaded one (the kind's one unbound
+    `send`, with the receiver as its self, as the core loop loads it), so
+    later loads skip the general method lookup. Tallying, across the suite,
+    which method sites fall through to that lookup put `coroutines`'
+    `avg.send(i)` and `coro.send(None)` first. `g.send(i)` takes 77 ns
+    instead of 90 (CPython 125), and `coroutines` runs 3% fewer
+    instructions. (The same tally's polymorphic `node.eval(env)` sites in
+    `mini_interpreter` see six classes against four entries, but five
+    polymorphic entries instead of three changed its instructions by
+    0.015%: those loads are served cheaply further down the same path.)
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000

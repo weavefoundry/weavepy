@@ -7078,6 +7078,31 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
     unsafe {
         let s = &mut *site;
         let top = (*st).stack.add(s.len as usize - 1);
+        // `gen.send(v)` of a generator or coroutine: the kind's one unbound
+        // `send` with the receiver as its self, as the core loop loads it
+        // (no generator has attributes of its own to shadow it), kept as
+        // the site's builtin method from here on.
+        if s.builtin_recv == u8::MAX {
+            if let r @ (Object::Generator(_) | Object::Coroutine(_)) = &*top {
+                let code = &*s.code;
+                let send = code
+                    .instructions
+                    .get(s.pc as usize)
+                    .and_then(|i| code.names.get(i.arg as usize))
+                    .is_some_and(|n| n == "send");
+                if send {
+                    let f = crate::gen_send_unbound(matches!(r, Object::Coroutine(_)));
+                    // (The kind's method lives as long as the process, so
+                    // its words need no count of their own.)
+                    s.builtin = std::ptr::from_ref(&f).cast::<[u64; 2]>().read();
+                    s.builtin_recv = r.tag();
+                    let recv = top.read();
+                    top.write(f);
+                    (*st).stack.add(s.len as usize).write(recv);
+                    return 0;
+                }
+            }
+        }
         // The instance's own value the site found last, at its position
         // among the instance's names while the class version holds (no
         // data descriptor of the name has come since): it and an empty
