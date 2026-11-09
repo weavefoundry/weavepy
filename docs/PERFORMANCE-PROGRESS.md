@@ -1017,6 +1017,17 @@ branch and pull request.
     puts their state in the 192-byte allocation class instead of 224: a
     future takes 397 bytes instead of 418, and `async_tree` peaks about 1%
     lower.
+  - A function's defaults, keyword defaults and closure are compact
+    vectors too, which puts a `PyFunction` (176 bytes) in the 192-byte
+    class instead of 224: peak RSS 0.2% to 0.8% lower where many
+    functions live (`stdlib_utils`, `logging_mix`).
+  - The linker order file is rebuilt from callgrind profiles of start-up
+    and of every workload at its full size, twice over (a single short
+    run profiles the compiles, not the compiled code's helpers): the 26
+    commits since November 6 had added hot functions (`class_poly_hit`,
+    `reduce_ex_plain`, the code generator's branch relaxation) that sat
+    scattered among cold code. Peak RSS falls about 1.2% across the
+    suite, at 0.997 of the cycles.
   - Tried and dropped: trimming a long-lived suspended generator's
     operand stack to its code's own depth when the collector compacts it
     (every native entry makes the native code's room again first).
