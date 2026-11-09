@@ -1051,6 +1051,15 @@ branch and pull request.
     registry change above) are read without bounds checks, and by a running
     counter in the passes that walk the candidates in order, which takes
     back the 7% that change had added to a collection.
+  - A class's `__doc__`, read through a compiled site as a string or
+    `None`, is memoized with the class's other attributes (its version
+    moves when the docstring is assigned). Counting which attribute sites
+    fall through to the general lookup in `context_managers` found one
+    site making nearly all of them: `contextmanager`'s
+    `type(self).__doc__`, at every construction, which the class memo
+    resolved and then declined, as a dunder that isn't a function.
+    `type(o).__doc__` takes 31 ns instead of 94 for an `ABCMeta` class
+    (CPython 39), and `context_managers` runs 3% fewer instructions.
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000

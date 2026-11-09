@@ -8399,8 +8399,12 @@ fn type_attr_resolve(
         cls.lookup(name)?
     };
     // A dunder name's value is memoized only as a function (below), and
-    // only a name `type` doesn't answer itself.
-    if name.starts_with("__") && !matches!(v, Object::Function(_)) {
+    // only a name `type` doesn't answer itself; but `__doc__`, which a
+    // class's read takes from its own dictionary (checked above), as a
+    // string or `None` (`contextmanager`'s `type(self).__doc__` at every
+    // construction). Assigning it moves the class's version.
+    let doc = name == "__doc__" && matches!(v, Object::Str(_) | Object::None);
+    if name.starts_with("__") && !doc && !matches!(v, Object::Function(_)) {
         return None;
     }
     let plain = matches!(
