@@ -7,6 +7,18 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 9, 2026, at `b88adc0f` (PR #107), a PGO build against
+CPython 3.14 on the same host: warm time 0.900, cold time 1.024, peak memory
+1.257. Against the November 8 PGO build (`1cef5111`), measured directly in
+the same session, peak RSS is 0.981 (all 33 workloads lower: `sqlite_queries`
+0.96, `scimark` 0.975), and warm time is level but for `nqueens`, whose
+1.59 is the alignment cliff described under "Done" (this binary's path puts
+pybench's environment on it; the November 8 binary's didn't). CPython's own
+peak RSS measured about 2% lower this session, so the memory ratio reads
+level. The worst warm times are `async_tree` 1.46, `context_managers` 1.21,
+`logging_mix` 1.14 and `deepcopy` 1.11; the worst cold `async_tree` 1.83,
+`stdlib_utils` 1.45 and `logging_mix` 1.38.
+
 Measured on November 8, 2026, at `1cef5111` (PR #107), a PGO build against
 CPython 3.14 on the same host, interleaved in one session: warm time 0.885,
 cold time 1.031, peak memory 1.258. Since November 6's 0.916 the warm time
