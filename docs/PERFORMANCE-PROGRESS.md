@@ -994,6 +994,33 @@ branch and pull request.
     cache for how instances answer a boolean context (`deque`'s truth in
     `ExitStack.__exit__`'s loop): level, the one-class cache wasn't
     thrashing there.
+  - Smaller generators, frames and collector entries. A peak-heap census
+    of the worst-memory workloads put suspended coroutines first: in
+    `async_tree` they were 36% of the peak heap, about 530 bytes each in
+    five allocations against CPython's 220 in one. Three layouts shrink
+    without changing what holds what, each to a smaller mimalloc class: a
+    `PyGenerator` holds its code as an `Rc<CodeObject>` and its rare
+    extras (a set name, an origin, an async generator's finalizer) behind
+    one set-once pointer, 64 bytes instead of 80; a frame's operand stack
+    keeps its depth and capacity as 32-bit counts, so the boxed `Frame` is
+    112 bytes instead of 120 (128 with rounding); and a collector registry
+    entry drops its collection-time count and node number, which a
+    collection now keeps in arrays of its own, by node (a candidate's node
+    is its generation's base plus its position in the list), 16 bytes
+    instead of 24, CPython's per-object header. A plain generator takes
+    400 bytes instead of 440, and a task parked on a future 1,352 instead
+    of 1,534 (CPython 823). Peak RSS falls on all 33 workloads, 1.6% on
+    the geometric mean (`chaos` 4.0%, `async_tree` 3.2%, `go` 2.9%), at
+    0.998 of the instructions.
+  - Where the rest of the memory is: imports are at parity (`import
+    asyncio` 19.5 MB against 20.1, and 2,000 small functions loaded and
+    run take the same footprint as CPython's), so the gap is what running
+    code holds. A `Future` takes 419 bytes against 186, a loop `Handle` 505
+    against 193, and an instance with three values 165 against CPython's
+    96: values are 16-byte `Object`s against CPython's 8-byte pointers, and
+    each object's parts (an instance's values, a future's state, a frame's
+    locals and stack) are separate allocations, so the remaining gains are
+    structural.
   - `random` is now faster than CPython's C module, method by method.
     Counting which compiled attribute and method sites fall through every
     memo to the general lookup, across the suite, put `Random`'s methods

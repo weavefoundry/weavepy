@@ -194,8 +194,8 @@ const F_FINALIZED: u8 = 1;
 /// finalizer (drained after `gc.collect()` returns) may resurrect it, and
 /// CPython only counts objects that are actually reclaimed.
 const F_QUEUED: u8 = 2;
-/// The object is a candidate of the collection in progress; the entry's
-/// `gc_refs` holds its marking count.
+/// The object is a candidate of the collection in progress; the
+/// collection's [`Nodes`] hold its marking count.
 const F_CAND: u8 = 4;
 /// The collection in progress found the candidate reachable from outside
 /// the candidates (its marking color is grey or black).
@@ -216,12 +216,6 @@ struct Entry {
     /// Position in the owning list (`gens[gen]`, or `frozen`), or the next
     /// free slot for a free one.
     pos: u32,
-    /// While [`F_CAND`] is set: the object's references from outside the
-    /// candidates, as the collection counts them (CPython's `gc_refs`).
-    gc_refs: std::cell::Cell<i32>,
-    /// While [`F_CAND`] is set: the candidate's node number in the
-    /// collection's edge lists.
-    node: std::cell::Cell<u32>,
     /// The weak handle's tag.
     kind: u8,
     /// Generation (0..N_GENERATIONS), [`GEN_FROZEN`] or [`GEN_FREE`].
@@ -230,7 +224,9 @@ struct Entry {
     flags: std::cell::Cell<u8>,
 }
 
-const _: () = assert!(std::mem::size_of::<Entry>() == 24);
+// (A collection's per-candidate counts live in its own arrays, by node,
+// rather than in every entry: see [`Nodes`].)
+const _: () = assert!(std::mem::size_of::<Entry>() == 16);
 
 /// An [`Entry`]'s weak handle, borrowed (it releases nothing).
 struct WeakView<'a>(
@@ -261,8 +257,6 @@ impl Entry {
         Self {
             weak,
             pos,
-            gc_refs: std::cell::Cell::new(0),
-            node: std::cell::Cell::new(0),
             kind,
             gen,
             flags: std::cell::Cell::new(flags),
@@ -2209,6 +2203,7 @@ impl GcState {
         // temporary), so marking what is reachable follows those instead of
         // walking every object a second time.
         let n_cands: usize = lists.iter().map(Vec::len).sum();
+        let nodes = Nodes::new(lists);
         let mut found: Vec<Object> = Vec::new();
         let mut edges: Vec<u32> = Vec::with_capacity(n_cands * 4);
         let mut starts: Vec<u32> = Vec::with_capacity(n_cands + n_cands / 2 + 1);
@@ -2216,6 +2211,7 @@ impl GcState {
             |obj: &Object, temps: &mut Vec<Temp>, found: &mut Vec<Object>, edges: &mut Vec<u32>| {
                 let mut walk = Tally {
                     reg: &reg,
+                    nodes: &nodes,
                     finder: &finder,
                     temps: &temps[..],
                     found: &mut *found,
@@ -2233,8 +2229,8 @@ impl GcState {
                     let i = match finder.find(&child) {
                         Some(Hit::Temp(i)) => i as usize,
                         Some(Hit::Real(s)) => {
-                            let e = reg.entry(s);
-                            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+                            let r = nodes.refs(reg.entry(s));
+                            r.set(r.get().wrapping_sub(1));
                             edges.push(s);
                             continue;
                         }
@@ -2255,7 +2251,7 @@ impl GcState {
             };
         for &slot in lists.iter().flatten() {
             let e = reg.list_entry(slot);
-            e.node.set(starts.len() as u32);
+            debug_assert_eq!(nodes.node(e), starts.len());
             starts.push(edges.len() as u32);
             let Some(w) = e.obj() else { continue };
             // Phase 3's outer refcount, read here while the entry is at hand:
@@ -2265,11 +2261,8 @@ impl GcState {
             if strong == 0 {
                 continue;
             }
-            e.gc_refs.set(
-                e.gc_refs
-                    .get()
-                    .wrapping_add(strong.min(i32::MAX as usize) as i32),
-            );
+            let r = nodes.refs(e);
+            r.set(r.get().wrapping_add(strong.min(i32::MAX as usize) as i32));
             // SAFETY: the object is alive (counted above), and the mark walk
             // runs no code that could release it (see `traverse_collected`).
             unsafe {
@@ -2292,6 +2285,7 @@ impl GcState {
         starts.push(edges.len() as u32);
         let graph = Graph {
             reg: &reg,
+            nodes: &nodes,
             temps: &temps,
             edges: &edges,
             starts: &starts,
@@ -2308,7 +2302,7 @@ impl GcState {
             let e = reg.list_entry(slot);
             // Phase 4: anything referenced from outside is reachable; mark
             // it and propagate.
-            if e.gc_refs.get() > 0 {
+            if nodes.refs(e).get() > 0 {
                 e.set(F_REACHED, true);
                 grey.push(slot);
             }
@@ -2328,7 +2322,7 @@ impl GcState {
                     eprintln!(
                         "[root] slot={} gc_refs={} sc={}",
                         g,
-                        e.gc_refs.get(),
+                        nodes.refs(e).get(),
                         e.obj().map_or(0, |w| w.strong_count())
                     );
                 } else {
@@ -2547,7 +2541,6 @@ impl GcState {
                     dead.push(reg.remove(slot));
                     continue;
                 }
-                e.gc_refs.set(0);
                 e.flags.set((e.flags.get() & !F_REACHED) | F_CAND);
                 i += 1;
             }
@@ -2605,13 +2598,51 @@ impl GcState {
     }
 }
 
+/// A collection's registered candidates as nodes: generation `g`'s list
+/// starts at node `bases[g]`, so a candidate's node is its generation's base
+/// plus its position in the list, and `refs[node]` counts its references
+/// from outside the candidates (CPython's `gc_refs`). Kept here for the
+/// collection only, rather than in every registry entry.
+struct Nodes {
+    bases: [u32; N_GENERATIONS],
+    refs: Vec<std::cell::Cell<i32>>,
+}
+
+impl Nodes {
+    fn new(lists: &[Vec<u32>]) -> Self {
+        let mut bases = [0; N_GENERATIONS];
+        let mut n = 0u32;
+        for (base, list) in bases.iter_mut().zip(lists) {
+            *base = n;
+            n += list.len() as u32;
+        }
+        Nodes {
+            bases,
+            refs: (0..n).map(|_| std::cell::Cell::new(0)).collect(),
+        }
+    }
+
+    /// The node of `e`, a candidate's entry.
+    #[inline(always)]
+    fn node(&self, e: &Entry) -> usize {
+        (self.bases[e.gen as usize] + e.pos) as usize
+    }
+
+    /// The outside-reference count of `e`, a candidate's entry.
+    #[inline(always)]
+    fn refs(&self, e: &Entry) -> &std::cell::Cell<i32> {
+        &self.refs[self.node(e)]
+    }
+}
+
 /// A collection's candidates and their edges to one another, as the mark
 /// walk recorded them: node `k`'s edges are `edges[starts[k]..starts[k +
 /// 1]]`, each a registered candidate's slot or a temporary's position
-/// tagged [`TEMP_BIT`]; a registered candidate's node is in its entry,
+/// tagged [`TEMP_BIT`]; a registered candidate's node is in [`Nodes`],
 /// and temporary `i`'s is `n_real + i`.
 struct Graph<'a> {
     reg: &'a Registry,
+    nodes: &'a Nodes,
     temps: &'a [Temp],
     edges: &'a [u32],
     starts: &'a [u32],
@@ -2625,7 +2656,7 @@ impl Graph<'_> {
     fn propagate(&self, grey: &mut Vec<u32>) {
         while let Some(item) = grey.pop() {
             let node = if item & TEMP_BIT == 0 {
-                self.reg.list_entry(item).node.get() as usize
+                self.nodes.node(self.reg.list_entry(item))
             } else {
                 self.n_real + (item & !TEMP_BIT) as usize
             };
@@ -2655,6 +2686,7 @@ impl Graph<'_> {
 /// cycle could route through is set aside in `found`.
 struct Tally<'a> {
     reg: &'a Registry,
+    nodes: &'a Nodes,
     finder: &'a Finder<'a>,
     temps: &'a [Temp],
     found: &'a mut Vec<Object>,
@@ -2726,8 +2758,8 @@ impl Tally<'_> {
     #[inline(always)]
     fn tally(&mut self, v: u32) {
         if v & TEMP_BIT == 0 {
-            let e = self.reg.entry(v);
-            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+            let r = self.nodes.refs(self.reg.entry(v));
+            r.set(r.get().wrapping_sub(1));
         } else {
             let t = &self.temps[(v & !TEMP_BIT) as usize];
             t.gc_refs.set(t.gc_refs.get() - 1);
@@ -4442,7 +4474,7 @@ mod tests {
     fn registry_entries_stay_compact_and_slots_are_reused() {
         let _gil = crate::gil::hold_gil();
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Entry>(), 24);
+        assert_eq!(std::mem::size_of::<Entry>(), 16);
         let state = GcState::new();
         let roots: Vec<_> = (0..3)
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))

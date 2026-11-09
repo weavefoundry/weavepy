@@ -5812,14 +5812,15 @@ pub struct PyGenerator {
     pub kind: CoroutineKind,
     /// `gi_code` — held on the generator itself (CPython keeps a
     /// strong reference) so it stays readable after the generator
-    /// finishes and the frame is dropped.
-    pub code: Object,
+    /// finishes and the frame is dropped. Read through [`Self::code`].
+    code: Option<Rc<CodeObject>>,
     /// The execution state, read through [`Self::state`].
     gen_state: RefCell<GeneratorState>,
     /// [`Self::name`] and [`Self::qualname`] when they aren't the code's,
     /// [`Self::origin`] and [`Self::finalizer`]: the state few generators
-    /// carry, allocated when first set.
-    extras: RefCell<Option<Box<GenExtras>>>,
+    /// carry, allocated when first set (and kept: a generator that has
+    /// them is never pooled).
+    extras: crate::sync::OnceBox<RefCell<GenExtras>>,
     /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
     /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
     /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
@@ -5853,6 +5854,11 @@ pub struct PyGenerator {
     /// call's operand stack holds it (see `Interpreter::make_genexp`).
     pub(crate) genexp_pending: crate::sync::Cell<bool>,
 }
+
+// Four words of fields and a word of flags: with the reference counts, the
+// 80-byte allocation class. (A suspended task tree holds tens of thousands.)
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PyGenerator>() == 64);
 
 /// The state of a [`PyGenerator`] that few carry.
 struct GenExtras {
@@ -5900,7 +5906,7 @@ impl PyGenerator {
     /// CoroutineTests.test_gen reads it through two paths and
     /// asserts `is`). Unless set otherwise, the code's interned name.
     pub fn name(&self) -> Object {
-        if let Some(name) = self.extras.borrow().as_ref().and_then(|e| e.name.clone()) {
+        if let Some(name) = self.extras.get().and_then(|e| e.borrow().name.clone()) {
             return name;
         }
         self.code_names().0
@@ -5909,12 +5915,7 @@ impl PyGenerator {
     /// `gi_qualname` (PEP 3155). Seeded from the function's
     /// `__qualname__` at call time; reassignable like [`Self::name`].
     pub fn qualname(&self) -> Object {
-        if let Some(name) = self
-            .extras
-            .borrow()
-            .as_ref()
-            .and_then(|e| e.qualname.clone())
-        {
+        if let Some(name) = self.extras.get().and_then(|e| e.borrow().qualname.clone()) {
             return name;
         }
         self.code_names().1
@@ -5934,8 +5935,8 @@ impl PyGenerator {
     /// [`Self::name`] and [`Self::qualname`].
     fn code_names(&self) -> (Object, Object) {
         match &self.code {
-            Object::Code(code) => crate::code_gen_names(code),
-            _ => (Object::from_static(""), Object::from_static("")),
+            Some(code) => crate::code_gen_names(code),
+            None => (Object::from_static(""), Object::from_static("")),
         }
     }
 
@@ -5945,9 +5946,8 @@ impl PyGenerator {
     /// stack (most recent first). `None` when tracking is off.
     pub fn origin(&self) -> Object {
         self.extras
-            .borrow()
-            .as_ref()
-            .map_or(Object::None, |e| e.origin.clone())
+            .get()
+            .map_or(Object::None, |e| e.borrow().origin.clone())
     }
 
     /// Set [`Self::origin`].
@@ -5959,9 +5959,8 @@ impl PyGenerator {
     /// [`Self::hooks_inited`]); `None` when there was none.
     pub fn finalizer(&self) -> Object {
         self.extras
-            .borrow()
-            .as_ref()
-            .map_or(Object::None, |e| e.finalizer.clone())
+            .get()
+            .map_or(Object::None, |e| e.borrow().finalizer.clone())
     }
 
     /// Set [`Self::finalizer`].
@@ -5970,14 +5969,16 @@ impl PyGenerator {
     }
 
     fn set_extra<T: ExtraField>(&self, value: T, field: impl FnOnce(&mut GenExtras) -> &mut T) {
-        let old = {
-            let mut extras = self.extras.borrow_mut();
-            if extras.is_none() && value.is_unset() {
-                return;
+        let extras = match self.extras.get() {
+            Some(extras) => extras,
+            None if value.is_unset() => return,
+            None => {
+                // (A racing set leaves the other thread's, equally empty.)
+                let _ = self.extras.set(RefCell::new(GenExtras::default()));
+                self.extras.get().expect("just set")
             }
-            let extras = extras.get_or_insert_with(Box::default);
-            std::mem::replace(field(extras), value)
         };
+        let old = std::mem::replace(field(&mut extras.borrow_mut()), value);
         // (Released outside the borrow: dropping it can run code.)
         drop(old);
     }
@@ -5987,9 +5988,12 @@ impl PyGenerator {
     pub fn new(kind: CoroutineKind, code: Object, frame: Box<crate::Frame>) -> Self {
         Self {
             kind,
-            code,
+            code: match code {
+                Object::Code(code) => Some(code),
+                _ => None,
+            },
             gen_state: RefCell::new(GeneratorState::Created(frame)),
-            extras: RefCell::new(None),
+            extras: crate::sync::OnceBox::new(),
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
             gc_slot: crate::gc_trace::GcSlot::new(),
@@ -6044,6 +6048,18 @@ impl PyGenerator {
         matches!(&*self.state().borrow(), GeneratorState::Finished)
     }
 
+    /// `gi_code`: the code the generator runs (`None` once a pooled
+    /// generator has let it go).
+    pub fn code(&self) -> Object {
+        self.code.clone().map_or(Object::None, Object::Code)
+    }
+
+    /// [`Self::code`], borrowed.
+    #[inline(always)]
+    pub fn code_ref(&self) -> Option<&Rc<CodeObject>> {
+        self.code.as_ref()
+    }
+
     /// Has the body run at all? A generator still in `Created` has
     /// executed nothing, so closing it runs nothing either — CPython's
     /// `gen_close` marks such a generator closed without throwing
@@ -6094,7 +6110,7 @@ pub(crate) fn recycle_generator(
     // SAFETY: the last reference, with no weak one (checked above):
     // nothing else can observe the generator while it changes.
     let m = unsafe { &mut *std::sync::Arc::as_ptr(&g).cast_mut() };
-    if !matches!(m.gen_state.get_mut(), GeneratorState::Finished) || m.extras.get_mut().is_some() {
+    if !matches!(m.gen_state.get_mut(), GeneratorState::Finished) || m.extras.get().is_some() {
         return Err(g);
     }
     // SAFETY: the pool's accesses are serialized (see `GenPool`).
@@ -6103,7 +6119,7 @@ pub(crate) fn recycle_generator(
         return Err(g);
     }
     // (A code object's release runs no Python code.)
-    m.code = Object::None;
+    m.code = None;
     pool.push(Rc::from_arc(g));
     Ok(())
 }
@@ -6130,7 +6146,10 @@ pub(crate) fn pooled_generator(
     // returned.
     let m = unsafe { &mut *Rc::as_ptr(&g).cast_mut() };
     m.kind = kind;
-    m.code = code;
+    m.code = match code {
+        Object::Code(code) => Some(code),
+        _ => None,
+    };
     // (The displaced `Finished` owns nothing.)
     *m.gen_state.get_mut() = GeneratorState::Created(frame);
     m.hooks_inited.set(false);

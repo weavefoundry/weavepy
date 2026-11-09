@@ -173,7 +173,7 @@ fn verdicts(code: &CodeObject, ext: &crate::CodeConstObjects) -> u8 {
 /// Whether a fast step may run `g`'s body at all (see [`code_ok`]).
 #[inline(always)]
 pub(crate) fn steps_body(g: &PyGenerator) -> bool {
-    matches!(&g.code, Object::Code(code) if code_ok(code) != CODE_NO)
+    g.code_ref().is_some_and(|code| code_ok(code) != CODE_NO)
 }
 
 /// Whether a fast step may run `g`'s body at all (see [`code_ok`]), and
@@ -1116,7 +1116,7 @@ impl Interpreter {
         // (which resumes a parked chain without settling it), and a body no
         // fast step runs declines at once, in line (its code's verdict is
         // cached: see `code_ok`). (`gi_code` is the frame's code.)
-        let Object::Code(code) = &g.code else {
+        let Some(code) = g.code_ref() else {
             return GenNext::Declined;
         };
         let Some(ext) = crate::code_vm_ext(code) else {
@@ -1141,7 +1141,7 @@ impl Interpreter {
         snap_gen: u64,
         dead: *const std::cell::Cell<bool>,
     ) -> GenNext {
-        let Object::Code(code) = &g.code else {
+        let Some(code) = g.code_ref() else {
             return GenNext::Declined;
         };
         let Some(ext) = crate::code_vm_ext(code) else {

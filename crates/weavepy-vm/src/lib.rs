@@ -283,8 +283,9 @@ struct GenParts {
 }
 
 // Every live generator holds its frame boxed for its whole life, so the
-// state few frames carry stays out of line (see `FrameRare`, `FrameExc`).
-const _: () = assert!(std::mem::size_of::<Frame>() <= 128);
+// state few frames carry stays out of line (see `FrameRare`, `FrameExc`),
+// and the box fits the 112-byte allocation class.
+const _: () = assert!(std::mem::size_of::<Frame>() <= 112);
 
 /// The state of a [`Frame`] that few frames carry.
 #[derive(Default)]
@@ -6479,8 +6480,8 @@ impl Interpreter {
     fn gen_code_object(&self, g: &Rc<PyGenerator>) -> Object {
         // The generator holds its own strong reference (CPython
         // `gi_code`), so the attribute survives exhaustion.
-        if !matches!(g.code, Object::None) {
-            return g.code.clone();
+        if g.code_ref().is_some() {
+            return g.code();
         }
         match &*g.state().borrow() {
             GeneratorState::Created(frame)
@@ -16140,7 +16141,7 @@ impl Interpreter {
                                     .is_some_and(|s| matches!(s, GeneratorState::Created(_))),
                                 // A `types.coroutine` generator is its own.
                                 Object::Generator(g) => {
-                                    matches!(&g.code, Object::Code(c) if c.is_iterable_coroutine)
+                                    g.code_ref().is_some_and(|c| c.is_iterable_coroutine)
                                 }
                                 _ => false,
                             };
@@ -47732,7 +47733,7 @@ impl Interpreter {
             // A generator function marked with `types.coroutine` produces
             // an awaitable generator (CO_ITERABLE_COROUTINE).
             Object::Generator(g) => {
-                let marked = matches!(&g.code, Object::Code(c) if c.is_iterable_coroutine);
+                let marked = g.code_ref().is_some_and(|c| c.is_iterable_coroutine);
                 if marked {
                     Ok(value)
                 } else {

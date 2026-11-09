@@ -13405,9 +13405,7 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
                     .peek()
                     .is_some_and(|s| matches!(s, crate::object::GeneratorState::Created(_))),
                 // A `types.coroutine` generator is its own.
-                Object::Generator(g) => {
-                    matches!(&g.code, Object::Code(c) if c.is_iterable_coroutine)
-                }
+                Object::Generator(g) => g.code_ref().is_some_and(|c| c.is_iterable_coroutine),
                 _ => false,
             }
         } else {
