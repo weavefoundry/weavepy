@@ -1082,6 +1082,20 @@ branch and pull request.
     the `inf`/`nan` spellings only when a letter is present. `float(text)`
     takes 92 ns instead of 150 (CPython 85), a failed `int(text)` caught
     as `ValueError` 2% fewer instructions in `exceptions`.
+  - Found, not yet fixed: a small function whose loop tier 2 compiles
+    (`def f(): return [x * 2 for x in t]`), called from a frame-compiled
+    loop, takes three times CPython's time (739 ns against 240). Its
+    activations run tier 2's code from the lean call path, where the frame
+    JIT never counts their heat, so the caller switches to the core loop at
+    every call; and tier 2 iterates a tuple through a helper call per
+    element (`wpjit_iter_next`, about 115 instructions). With tier 2
+    declining loops that aren't over a `range`, `f` takes 307 ns, but the
+    suite is level: `stdlib_utils` 8% and `graph_search` 4% faster,
+    `raytrace` 15% slower, whose list loops do float work tier 2 keeps
+    unboxed. Declining only short bodies (16 instructions) left the
+    instructions level too (`stdlib_utils` 0.98, `float_points` 1.04). The
+    fix is in the hand-off: a frame-compiled caller entering tier 2's code
+    directly, or the frame JIT counting those calls.
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000
