@@ -2251,7 +2251,8 @@ impl GcState {
             };
         for &slot in lists.iter().flatten() {
             let e = reg.list_entry(slot);
-            debug_assert_eq!(nodes.node(e), starts.len());
+            let k = starts.len();
+            debug_assert_eq!(nodes.node(e), k);
             starts.push(edges.len() as u32);
             let Some(w) = e.obj() else { continue };
             // Phase 3's outer refcount, read here while the entry is at hand:
@@ -2261,7 +2262,7 @@ impl GcState {
             if strong == 0 {
                 continue;
             }
-            let r = nodes.refs(e);
+            let r = nodes.refs_at(k);
             r.set(r.get().wrapping_add(strong.min(i32::MAX as usize) as i32));
             // SAFETY: the object is alive (counted above), and the mark walk
             // runs no code that could release it (see `traverse_collected`).
@@ -2298,11 +2299,11 @@ impl GcState {
         // the visit), less the one reference it holds of its own.
         // (Each node is pushed at most once, as it is marked.)
         let mut grey: Vec<u32> = Vec::with_capacity(n_real + temps.len());
-        for &slot in lists.iter().flatten() {
+        for (k, &slot) in lists.iter().flatten().enumerate() {
             let e = reg.list_entry(slot);
             // Phase 4: anything referenced from outside is reachable; mark
             // it and propagate.
-            if nodes.refs(e).get() > 0 {
+            if nodes.refs_at(k).get() > 0 {
                 e.set(F_REACHED, true);
                 grey.push(slot);
             }
@@ -2625,13 +2626,23 @@ impl Nodes {
     /// The node of `e`, a candidate's entry.
     #[inline(always)]
     fn node(&self, e: &Entry) -> usize {
-        (self.bases[e.gen as usize] + e.pos) as usize
+        debug_assert!((e.gen as usize) < N_GENERATIONS);
+        // SAFETY: a candidate is in one of the collected generations.
+        (unsafe { *self.bases.get_unchecked(e.gen as usize) } + e.pos) as usize
     }
 
     /// The outside-reference count of `e`, a candidate's entry.
     #[inline(always)]
     fn refs(&self, e: &Entry) -> &std::cell::Cell<i32> {
-        &self.refs[self.node(e)]
+        self.refs_at(self.node(e))
+    }
+
+    /// The outside-reference count of node `k`.
+    #[inline(always)]
+    fn refs_at(&self, k: usize) -> &std::cell::Cell<i32> {
+        debug_assert!(k < self.refs.len());
+        // SAFETY: every candidate's node is below the candidate count.
+        unsafe { self.refs.get_unchecked(k) }
     }
 }
 
@@ -2729,9 +2740,7 @@ impl Visit for Tally<'_> {
         } else if let Some(key) = child.payload_addr() {
             // Any other kind: the finder's cache answers for a child seen
             // before (a module's namespace from every frame, ...).
-            let line = Finder::line(key as ObjectId);
-            if self.finder.cache_keys[line].get() == key as ObjectId {
-                let v = self.finder.cache_vals[line].get();
+            if let Some(v) = self.finder.cached(key as ObjectId) {
                 if v != NO_SLOT {
                     self.tally(v);
                     return;
@@ -2835,7 +2844,11 @@ struct Finder<'a> {
     /// Some temporary is also a registered object (outside the
     /// candidates): a registered child may then still be a temporary.
     registered_temp: std::cell::Cell<bool>,
-    /// Payload address -> answer (see [`Finder::encode`]), direct-mapped.
+    /// Payload address -> answer (see [`Finder::encode`]), two-way set
+    /// associative (see [`Finder::set_of`]): direct-mapped, two objects
+    /// every candidate refers to (a frame's module and builtins
+    /// dictionaries) could share a line and evict each other at every
+    /// visit, depending only on where they were allocated.
     cache_keys: [std::cell::Cell<ObjectId>; FINDER_CACHE],
     cache_vals: [std::cell::Cell<u32>; FINDER_CACHE],
 }
@@ -2855,9 +2868,40 @@ impl<'a> Finder<'a> {
         }
     }
 
+    /// The first of the two cache lines `key` may occupy.
+    #[inline(always)]
+    fn set_of(key: ObjectId) -> usize {
+        (((key >> 4) ^ (key >> 13)) as usize & (FINDER_CACHE / 2 - 1)) * 2
+    }
+
+    /// The cached answer for `key`, if any.
+    #[inline(always)]
+    fn cached(&self, key: ObjectId) -> Option<u32> {
+        let at = Self::set_of(key);
+        if self.cache_keys[at].get() == key {
+            Some(self.cache_vals[at].get())
+        } else if self.cache_keys[at + 1].get() == key {
+            Some(self.cache_vals[at + 1].get())
+        } else {
+            None
+        }
+    }
+
+    /// Cache `v` as the answer for `key`: its own line if it has one, else
+    /// the set's first, the previous first moving to the second.
     #[inline]
-    fn line(key: ObjectId) -> usize {
-        ((key >> 4) ^ (key >> 13)) as usize & (FINDER_CACHE - 1)
+    fn cache(&self, key: ObjectId, v: u32) {
+        let at = Self::set_of(key);
+        if self.cache_keys[at].get() == key {
+            self.cache_vals[at].set(v);
+        } else if self.cache_keys[at + 1].get() == key {
+            self.cache_vals[at + 1].set(v);
+        } else {
+            self.cache_keys[at + 1].set(self.cache_keys[at].get());
+            self.cache_vals[at + 1].set(self.cache_vals[at].get());
+            self.cache_keys[at].set(key);
+            self.cache_vals[at].set(v);
+        }
     }
 
     /// An answer as a cache value: [`NO_SLOT`] for none, a registered
@@ -2901,13 +2945,11 @@ impl<'a> Finder<'a> {
             }
         }
         let key = child.payload_addr()? as ObjectId;
-        let line = Self::line(key);
-        if self.cache_keys[line].get() == key {
-            return Self::decode(self.cache_vals[line].get());
+        if let Some(v) = self.cached(key) {
+            return Self::decode(v);
         }
         let hit = self.find_uncached(child, key);
-        self.cache_keys[line].set(key);
-        self.cache_vals[line].set(Self::encode(hit));
+        self.cache(key, Self::encode(hit));
         hit
     }
 
@@ -2951,10 +2993,7 @@ impl<'a> Finder<'a> {
         }
         self.temp_ids.borrow_mut().insert(id_of(child), i);
         if let Some(key) = child.payload_addr() {
-            let key = key as ObjectId;
-            let line = Self::line(key);
-            self.cache_keys[line].set(key);
-            self.cache_vals[line].set(Self::encode(Some(Hit::Temp(i as u32))));
+            self.cache(key as ObjectId, Self::encode(Some(Hit::Temp(i as u32))));
         }
     }
 }

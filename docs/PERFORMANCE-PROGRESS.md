@@ -1028,6 +1028,26 @@ branch and pull request.
     `reduce_ex_plain`, the code generator's branch relaxation) that sat
     scattered among cold code. Peak RSS falls about 1.2% across the
     suite, at 0.997 of the cycles.
+  - The collector's cache of what a child object is (a candidate, a
+    temporary, or neither) is two-way set associative instead of
+    direct-mapped. Every suspended generator's frame refers to its module's
+    and the builtins' dictionaries; when those two happened to share a
+    line, each visit evicted the other and took the registry's hash
+    lookup, and a full collection over 20,000 parked generators cost 18.0
+    million instructions instead of 12.7, depending only on where the
+    dictionaries were allocated. A collection's node numbers (from the
+    registry change above) are read without bounds checks, and by a running
+    counter in the passes that walk the candidates in order, which takes
+    back the 7% that change had added to a collection.
+  - Where a first run's extra time goes (callgrind, the cold call less a
+    warm one): in `async_tree` 61% is the cycle collector, whose young
+    collections grow with the pending task tree (2,000 to 33,000
+    candidates as each finds nothing) until one of generation 1 walks all
+    67,000 live objects, at about 1,000 instructions a candidate against
+    CPython's few hundred at most. In `stdlib_utils`, `logging_mix` and
+    `tomllib_loads` a third or more is code generation (spread over a dozen
+    passes, no line hot) and most of the rest runs interpreted before the
+    compiles.
   - A measurement caveat: `nqueens` has an alignment cliff on this x86-64
     Mac. With one main-thread stack position in sixteen (set by the size
     of the environment, which the pybench runner's frozen-cache path is
