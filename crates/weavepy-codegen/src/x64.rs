@@ -1140,14 +1140,15 @@ impl X64 {
         if self.branches.is_empty() {
             return;
         }
-        // Each branch: its start, its old length, and its target.
-        let mut sites: Vec<(u32, u32, u32)> = Vec::with_capacity(self.branches.len());
+        // Each branch: its start, its old length, its target, and its
+        // fixup's index.
+        let mut sites: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(self.branches.len());
         for &(i, jcc) in &self.branches {
             let (at, fix) = self.fixups[i as usize];
             let Fix::Rel(l) = fix else { continue };
             let target = self.labels[l.0 as usize];
             let len = if jcc { 6 } else { 5 };
-            sites.push((at + 4 - len, len, target));
+            sites.push((at + 4 - len, len, target, i));
         }
         let n = sites.len();
         let mut short: Vec<bool> = sites.iter().map(|s| s.2 != u32::MAX).collect();
@@ -1186,7 +1187,7 @@ impl X64 {
         }
         let mut out = Vec::with_capacity(self.buf.len());
         let mut prev = 0usize;
-        for (j, &(start, len, target)) in sites.iter().enumerate() {
+        for (j, &(start, len, target, _)) in sites.iter().enumerate() {
             if !short[j] {
                 continue;
             }
@@ -1204,18 +1205,21 @@ impl X64 {
         }
         out.extend_from_slice(&self.buf[prev..]);
         self.buf = out;
-        let shortened: std::collections::HashSet<u32> = sites
-            .iter()
-            .zip(&short)
-            .filter(|(_, &s)| s)
-            .map(|(s, _)| s.0 + s.1 - 4)
-            .collect();
+        // The fixups of the shortened branches, which their bytes replace.
+        let mut gone = vec![false; self.fixups.len()];
+        for (site, _) in sites.iter().zip(&short).filter(|(_, &s)| s) {
+            gone[site.3 as usize] = true;
+        }
         for l in &mut self.labels {
             if *l != u32::MAX {
                 *l = moved(&saved, *l);
             }
         }
-        self.fixups.retain(|(at, _)| !shortened.contains(at));
+        let mut k = 0;
+        self.fixups.retain(|_| {
+            k += 1;
+            !gone[k - 1]
+        });
         for (at, _) in &mut self.fixups {
             *at = moved(&saved, *at);
         }

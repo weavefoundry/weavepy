@@ -11867,6 +11867,30 @@ unsafe extern "C" fn h_call(
             }
         }
         Interpreter::core_instance_callee(base.add(start));
+        // `x.__reduce_ex__(proto)` of a plain instance (`copy`'s, `pickle`'s),
+        // as a method or a saved bound method: the default reduction, in
+        // place.
+        if argc == 1 && !st.sw.is_null() {
+            let (b, recv) = match (&*base.add(start), &*base.add(start + 1)) {
+                (Object::Builtin(b), recv @ Object::Instance(_)) => (Some(b), recv),
+                (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                    match &bm.function {
+                        Object::Builtin(b) => (Some(b), &bm.receiver),
+                        _ => (None, &bm.receiver),
+                    }
+                }
+                (_, recv) => (None, recv),
+            };
+            if b.is_some_and(|b| b.name == ".object_reduce_ex") {
+                let ops = std::slice::from_raw_parts(base.add(start), 3);
+                if Interpreter::core_all_droppable(ops) {
+                    let interp = &mut *st.interp.cast_mut();
+                    if let Some(r) = interp.reduce_ex_plain(recv, &*base.add(start + 2)) {
+                        return done(st, r);
+                    }
+                }
+            }
+        }
         // The commonest settled leaf builtins first (`isinstance(x, C)`, a
         // fast half), without the shape checks below; a decline falls
         // through to them untouched.
@@ -12468,6 +12492,24 @@ unsafe extern "C" fn h_call_native(
         };
         if !hit || s.sw.is_null() {
             return h_call(st, code, ext, pc, len);
+        }
+        // `x.__reduce_ex__(proto)` of a plain instance (`copy`'s,
+        // `pickle`'s): the default reduction, in place.
+        if site.argc == 1 && (*site.f).name == ".object_reduce_ex" {
+            let recv = match (&*base.add(start), &*base.add(start + 1)) {
+                (Object::BoundMethod(bm), Object::Unbound) => &bm.receiver,
+                (_, recv) => recv,
+            };
+            let ops = std::slice::from_raw_parts(base.add(start), 3);
+            if Interpreter::core_all_droppable(ops) {
+                let interp = &mut *s.interp.cast_mut();
+                if let Some(r) = interp.reduce_ex_plain(recv, &*base.add(start + 2)) {
+                    crate::release_run(base.add(start), 3);
+                    base.add(start).write(r);
+                    s.len = start + 1;
+                    return 0;
+                }
+            }
         }
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;

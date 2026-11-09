@@ -982,6 +982,18 @@ branch and pull request.
     is stored) by putting it in its young set directly, without
     `track`'s scan of what it holds. A raised and caught custom exception
     took 4% more instructions.
+  - `x.__reduce_ex__(proto)` with `object`'s own method, for a plain
+    instance whose class keeps `object`'s `__reduce__`, at protocol 2 or
+    more (what `copy.deepcopy` calls through its saved bound method), is
+    reduced in place from compiled code instead of leaving it for the core
+    loop's lane: `deepcopy` 1% fewer instructions. Branch relaxation keys
+    its dropped fixups by index instead of hashing their offsets.
+  - Tried and dropped: recycling an empty `**kwargs` dictionary from a
+    finished call for the next (the pool the pure-leaf path uses): level
+    within noise, mimalloc's allocation being cheap; and a four-class
+    cache for how instances answer a boolean context (`deque`'s truth in
+    `ExitStack.__exit__`'s loop): level, the one-class cache wasn't
+    thrashing there.
   - `random` is now faster than CPython's C module, method by method.
     Counting which compiled attribute and method sites fall through every
     memo to the general lookup, across the suite, put `Random`'s methods

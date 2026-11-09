@@ -66530,6 +66530,25 @@ impl Interpreter {
         self.call(&helper, &[recv.clone(), Object::Int(proto)], &[], globals)
     }
 
+    /// `recv.__reduce_ex__(proto)` with `object`'s own `__reduce_ex__`, for
+    /// a plain instance whose class keeps `object`'s `__reduce__` (`copy`'s
+    /// and `pickle`'s commonest call), at protocol 2 or more: the default
+    /// newobj reduction (see [`Self::reduce_newobj_plain`]). `None` for
+    /// anything else, untouched (the full dispatch decides).
+    pub(crate) fn reduce_ex_plain(&mut self, recv: &Object, proto: &Object) -> Option<Object> {
+        let (Object::Instance(inst), Object::Int(proto)) = (recv, proto) else {
+            return None;
+        };
+        if *proto < 2 || inst.native.get().is_some() {
+            return None;
+        }
+        match inst.cls_raw().lookup("__reduce__") {
+            Some(Object::Builtin(b)) if b.name == ".object_reduce" => {}
+            _ => return None,
+        }
+        self.reduce_newobj_plain(recv)
+    }
+
     /// `copyreg._reduce_newobj(obj, protocol)` for the common instance,
     /// natively: a plain instance (no native payload) of a class with no
     /// `__slots__` anywhere on its MRO, no `__getnewargs_ex__` or
