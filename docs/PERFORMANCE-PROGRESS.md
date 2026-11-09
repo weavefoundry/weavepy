@@ -1060,17 +1060,17 @@ branch and pull request.
     `tomllib_loads` a third or more is code generation (spread over a dozen
     passes, no line hot) and most of the rest runs interpreted before the
     compiles.
-  - A measurement caveat: `nqueens` has an alignment cliff on this x86-64
-    Mac. With one main-thread stack position in sixteen (set by the size
-    of the environment, which the pybench runner's frozen-cache path is
-    part of), every warm iteration after the first takes about 160 ms
-    instead of 96, on the same instructions (callgrind on Linux counts
-    the two the same, and the frame JIT's compiles and exits match):
-    likely 4K aliasing between a hot stack location and a hot heap one.
-    Padding the environment by 128 bytes reproduces it from the plain
-    command line, and pybench's environment lands on it, so `nqueens`'
-    recorded times can read about 60% high. Other workloads sweep within a
-    few percent across the same paddings.
+  - A measurement caveat: `nqueens` has a layout cliff on this x86-64
+    Mac. At about one environment size in a hundred (sweeping it in 16-byte
+    steps), every warm iteration after the first takes about 160 ms instead
+    of 100, on the same instructions (callgrind on Linux counts the two the
+    same, and the frame JIT's compiles and exits match). The pybench
+    runner's environment, which includes its frozen-cache path, can land on
+    it, so `nqueens`' recorded times can read about 60% high. It isn't the
+    main thread's stack position: starting the interpreter at a fixed one,
+    whatever the environment, moved the cliff but kept it, so it follows the
+    heap layout, which the environment's strings shift too. Other workloads
+    sweep within a few percent.
   - Tried and dropped: trimming a long-lived suspended generator's
     operand stack to its code's own depth when the collector compacts it
     (every native entry makes the native code's room again first).
