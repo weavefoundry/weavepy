@@ -1012,6 +1012,17 @@ branch and pull request.
     of 1,534 (CPython 823). Peak RSS falls on all 33 workloads, 1.6% on
     the geometric mean (`chaos` 4.0%, `async_tree` 3.2%, `go` 2.9%), at
     0.998 of the instructions.
+  - A future's and a task's callbacks and awaiters are two-word vectors
+    (`compact_vec.rs`: a buffer and 32-bit length and capacity), which
+    puts their state in the 192-byte allocation class instead of 224: a
+    future takes 397 bytes instead of 418, and `async_tree` peaks about 1%
+    lower.
+  - Tried and dropped: trimming a long-lived suspended generator's
+    operand stack to its code's own depth when the collector compacts it
+    (every native entry makes the native code's room again first).
+    `async_tree` peaked 1 MB higher: each trim and regrowth moves the
+    stack between allocation classes, and the pages of both stay partly
+    used.
   - Where the rest of the memory is: imports are at parity (`import
     asyncio` 19.5 MB against 20.1, and 2,000 small functions loaded and
     run take the same footprint as CPython's), so the gap is what running

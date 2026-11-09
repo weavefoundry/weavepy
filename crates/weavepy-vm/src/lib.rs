@@ -45,6 +45,7 @@ pub mod builtin_docs_data;
 pub mod builtin_types;
 pub mod builtins;
 pub mod capi_watchers;
+mod compact_vec;
 pub mod cpython_headers;
 pub mod descr_registry;
 pub mod dictmap;

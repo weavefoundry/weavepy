@@ -232,17 +232,23 @@ impl FutStatus {
     }
 }
 
+// Six objects, two compact lists and two words, with the cell's header and
+// the reference counts in the 192-byte allocation class (a task tree holds
+// thousands of futures and tasks).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<FutState>() <= 160);
+
 struct FutState {
     status: FutStatus,
     result: Object,
     loop_: Object,
-    callbacks: Vec<(Object, CbContext)>,
+    callbacks: crate::compact_vec::CompactVec<(Object, CbContext)>,
     log_traceback: bool,
     blocking: bool,
     initialized: bool,
     /// 3.14 `fut_awaited_by`: the native futures/tasks currently awaiting
     /// this one (identity set; `_asyncio_awaited_by` exposes a frozenset).
-    awaited_by: Vec<Object>,
+    awaited_by: crate::compact_vec::CompactVec<Object>,
     /// Set once anything has been recorded; CPython keeps the (possibly
     /// emptied) set, so `_asyncio_awaited_by` then reports `frozenset()`
     /// rather than `None`.
@@ -367,11 +373,11 @@ impl Default for FutState {
             status: FutStatus::Pending,
             result: Object::None,
             loop_: Object::None,
-            callbacks: Vec::new(),
+            callbacks: crate::compact_vec::CompactVec::new(),
             log_traceback: false,
             blocking: false,
             initialized: false,
-            awaited_by: Vec::new(),
+            awaited_by: crate::compact_vec::CompactVec::new(),
             awaited_by_touched: false,
             cold: None,
             coro: Object::None,
@@ -822,11 +828,11 @@ fn fut_gc_clear(obj: &Object) {
         for o in fields {
             dropped.push(std::mem::replace(o, Object::None));
         }
-        for (cb, ctx) in s.callbacks.drain(..) {
+        for (cb, ctx) in std::mem::take(&mut s.callbacks) {
             dropped.push(cb);
             dropped.push(ctx.into_held());
         }
-        dropped.append(&mut s.awaited_by);
+        dropped.extend(std::mem::take(&mut s.awaited_by));
         if let Some(cold) = s.cold.as_mut() {
             let fields: [&mut Object; 5] = [
                 &mut cold.exception,
@@ -1562,7 +1568,7 @@ fn fut_remove_done_callback(args: &[Object]) -> Result<Object, RuntimeError> {
             kept.push((cb, ctx));
         }
     }
-    st.borrow_mut().callbacks = kept;
+    st.borrow_mut().callbacks = kept.into();
     Ok(Object::Int(removed))
 }
 
