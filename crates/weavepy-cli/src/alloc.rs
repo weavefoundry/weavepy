@@ -118,6 +118,27 @@ const PURGE_DELAY_MS: c_long = 50;
 /// mimalloc 3's `mi_option_arena_reserve` (its position in `mi_option_t`).
 const MI_OPTION_ARENA_RESERVE: c_int = 23;
 
+/// mimalloc 3's `mi_option_page_full_retain` (its position in
+/// `mi_option_t`).
+const MI_OPTION_PAGE_FULL_RETAIN: c_int = 36;
+
+/// How many full pages of a small size class stay in that class's queue of
+/// pages to allocate from, unless the environment sets
+/// `MIMALLOC_PAGE_FULL_RETAIN`.
+///
+/// mimalloc keeps a page that empties only when it's the only page in its
+/// queue; otherwise it frees it. With its default of two full pages kept in
+/// the queue, the page a burst of short-lived objects spills into is never
+/// alone there: each time the burst's objects die it's freed, and the next
+/// burst sets up a fresh one, over and over. Whether a workload's bursts
+/// cross a page boundary depends on where its long-lived objects happen to
+/// sit, so the cost came and went with the environment's size: `nqueens`
+/// set up 127,000 pages instead of 141 at one environment size in about
+/// twenty on macOS, and every warm iteration took 160 ms instead of 95.
+/// Full pages moved out of the queue leave the emptied page alone in it,
+/// kept for the next burst.
+const PAGE_FULL_RETAIN: c_long = 0;
+
 /// The size of each arena mimalloc reserves, in KiB, unless the
 /// environment sets `MIMALLOC_ARENA_RESERVE`.
 ///
@@ -333,6 +354,9 @@ pub extern "C" fn configure() {
     unsafe {
         if libc::getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
             mi_option_set(MI_OPTION_ARENA_RESERVE, ARENA_RESERVE_KIB);
+        }
+        if libc::getenv(c"MIMALLOC_PAGE_FULL_RETAIN".as_ptr()).is_null() {
+            mi_option_set(MI_OPTION_PAGE_FULL_RETAIN, PAGE_FULL_RETAIN);
         }
         #[cfg(not(target_os = "linux"))]
         if libc::getenv(c"MIMALLOC_ARENA_MAX_OBJECT_SIZE".as_ptr()).is_null() {

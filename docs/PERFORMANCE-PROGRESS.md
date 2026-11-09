@@ -1118,6 +1118,26 @@ branch and pull request.
     callee can run any Python, so the inline path is the cheaper fix. Two
     builds of the same source can differ by 2 to 3% in `async_tree`'s
     instructions (1.02 with tier 2 off, where the change can't act).
+  - An `Rc`'s release of its last reference runs out of line
+    (`Rc::drop_last`); only the shared release (a decrement that leaves the
+    object alive) stays in line at every drop. `Object`'s destructor and
+    every function that drops a counted reference took the finalizer test,
+    the nested release and the free in line, once per variant: the binary's
+    text is 172 KB smaller, and the suite runs 0.3% fewer instructions
+    (none more). Simulated instruction-cache misses moved within layout
+    noise (`async_tree` 1% fewer, `context_managers` and `exceptions` 2%
+    more).
+  - Where `async_tree`'s and `context_managers`' time goes, with
+    instructions near CPython's: cachegrind on release builds counts four
+    times CPython's instruction-cache misses (`async_tree` 33.5 million a
+    warm call against CPython 3.13's 8.1, `context_managers` 69 against
+    20), and twelve times its last-level misses in `async_tree`. A fifth of
+    them are in compiled code (an 8% miss rate), the rest spread thinly
+    over hundreds of functions (an event-loop step runs the loop's handle,
+    the context, the task's step, the generator's resume, compiled code and
+    `call_soon` in turn). A parked task takes 1,238 bytes against 811: its
+    context copy alone is two allocations (96 and 56 bytes) where
+    CPython's shares one immutable mapping.
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000
@@ -1127,17 +1147,27 @@ branch and pull request.
     `tomllib_loads` a third or more is code generation (spread over a dozen
     passes, no line hot) and most of the rest runs interpreted before the
     compiles.
-  - A measurement caveat: `nqueens` has a layout cliff on this x86-64
-    Mac. At about one environment size in a hundred (sweeping it in 16-byte
-    steps), every warm iteration after the first takes about 160 ms instead
-    of 100, on the same instructions (callgrind on Linux counts the two the
-    same, and the frame JIT's compiles and exits match). The pybench
-    runner's environment, which includes its frozen-cache path, can land on
-    it, so `nqueens`' recorded times can read about 60% high. It isn't the
-    main thread's stack position: starting the interpreter at a fixed one,
-    whatever the environment, moved the cliff but kept it, so it follows the
-    heap layout, which the environment's strings shift too. Other workloads
-    sweep within a few percent.
+  - `nqueens`' layout cliff was the allocator's, not the hardware's.
+    At some environment sizes (padding of 128 bytes, and the pybench
+    runner's frozen-cache path) every warm iteration after the first took
+    about 160 ms instead of 95 and, counted natively on macOS, 12% more
+    instructions; mimalloc's statistics showed 127,400 pages set up in a
+    run instead of 141. mimalloc 3 keeps a page that empties only when it's
+    the only page in its size class's queue, and by default it also keeps
+    up to two full pages in that queue (`page_full_retain`), so the page a
+    burst of short-lived objects spilled into was freed each time the
+    burst died and set up again for the next one. Whether a burst crosses a
+    page boundary depends on where the long-lived objects sit, which the
+    environment's size shifts. The interpreter now sets
+    `page_full_retain` to 0 (unless `MIMALLOC_PAGE_FULL_RETAIN` is set), so
+    full pages leave the queue and the emptied page stays for the next
+    burst. Over 32 environment sizes the instructions now vary by 0.6% at
+    most (they varied by 7.5%); in the suite `nqueens` takes 0.84 of the
+    previous build's instructions and 0.63 of its time (1.00 and 1.13 of
+    CPython's), and the rest is level (time 0.987 of the previous build's
+    geomean, peak memory 1.0016, instructions within 1%). Callgrind on
+    Linux never showed the cliff because valgrind's own layout differs, and
+    an earlier timing sweep there that seemed to was contention.
   - Tried and dropped: trimming a long-lived suspended generator's
     operand stack to its code's own depth when the collector compacts it
     (every native entry makes the native code's room again first).
