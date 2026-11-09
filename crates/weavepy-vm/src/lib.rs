@@ -46328,8 +46328,15 @@ impl Interpreter {
             return result;
         };
         let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
+        // `key=len`: each length as `len(x)` takes it, without the general
+        // call's dispatch per item (as the call arms recognize the builtin).
+        let len_key = matches!(f, Object::Builtin(b) if b.name == "len");
         for item in items.iter() {
-            let k = self.call(f, std::slice::from_ref(item), &[], globals)?;
+            let k = if len_key {
+                self.do_len_call(item, globals)?
+            } else {
+                self.call(f, std::slice::from_ref(item), &[], globals)?
+            };
             decorated.push((k, item.clone()));
         }
         if reverse {
