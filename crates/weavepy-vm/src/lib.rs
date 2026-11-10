@@ -16981,6 +16981,37 @@ impl Interpreter {
                     None => (b.call)(args),
                 }
             };
+            // A signal the body tripped (`os.kill` of this process, an
+            // interrupted write) runs its handler as the call returns, as
+            // CPython's calls of C functions check the eval breaker, with
+            // the activation still waiting; a handler that raises raises
+            // from the call.
+            let result = match result {
+                Ok(v)
+                    if crate::stdlib::signal_mod::signals_pending()
+                        && crate::gil::is_main_thread() =>
+                {
+                    // (The handler gets the frame: the waiting activation's
+                    // shell goes on the spine first.)
+                    let ran = if lazy.is_null() {
+                        self.flush_pending_callers();
+                        match self.materialize_top_py_frame() {
+                            Some(py) => self.run_pending_signals(&py),
+                            None => self.run_pending_signals_public(),
+                        }
+                    } else {
+                        self.run_pending_signals_public()
+                    };
+                    match ran {
+                        Ok(()) => Ok(v),
+                        Err(e) => {
+                            self.release(v);
+                            Err(e)
+                        }
+                    }
+                }
+                r => r,
+            };
             let pending = if lazy.is_null() {
                 pending
             } else {
@@ -77085,8 +77116,27 @@ pub(crate) fn str_format_impl(
     keyword: &[(String, Object)],
 ) -> Result<String, RuntimeError> {
     let mut auto_idx = 0usize;
-    str_format_auto(template, positional, keyword, &mut auto_idx)
+    match str_format_auto(template, positional, keyword, &mut auto_idx) {
+        Ok(s) => Ok(s),
+        // A malformed template's error is the interpreter's formatter's,
+        // which checks it as CPython does, in CPython's order.
+        Err(e) => match crate::builtins::reentrant_interp() {
+            Ok(interp) => {
+                let globals = interp.builtins_dict();
+                interp.do_str_format(template, positional, keyword, &globals)
+            }
+            Err(_) => Err(e),
+        },
+    }
 }
+
+/// [`str_format_auto`]'s counter's flags: a field took automatic
+/// numbering, or a manual index (the two don't mix).
+const FMT_AUTO_USED: usize = 1 << 62;
+const FMT_MANUAL_USED: usize = 1 << 61;
+/// Set while a nested format spec expands: one inside it is too deep.
+const FMT_NESTED: usize = 1 << 60;
+const FMT_COUNT: usize = FMT_NESTED - 1;
 
 /// [`str_format_impl`] continuing an automatic-numbering counter: a
 /// nested format spec shares the outer template's (CPython's
@@ -77239,7 +77289,17 @@ fn render_format_field(
         Some(s) if s.contains('{') => {
             // Nested format spec — interpolated with the *same*
             // automatic numbering as the outer template.
-            str_format_auto(s, positional, keyword, auto_idx)?
+            {
+                // CPython expands one level of nesting (`'{0:{1}}'`), and a
+                // field inside that is "Max string recursion exceeded".
+                if *auto_idx & FMT_NESTED != 0 {
+                    return Err(value_error("Max string recursion exceeded"));
+                }
+                *auto_idx |= FMT_NESTED;
+                let r = str_format_auto(s, positional, keyword, auto_idx);
+                *auto_idx &= !FMT_NESTED;
+                r?
+            }
         }
         Some(s) => s.to_owned(),
         None => String::new(),
@@ -77300,14 +77360,25 @@ fn resolve_field_name(
     // Split into base + trailers (`.attr`/`[idx]`).
     let (base, trailers) = split_name_trailers(name);
     let mut value = if base.is_empty() {
-        let idx = *auto_idx;
-        *auto_idx += 1;
+        if *auto_idx & FMT_MANUAL_USED != 0 {
+            return Err(value_error(
+                "cannot switch from manual field specification to automatic field numbering",
+            ));
+        }
+        let idx = *auto_idx & FMT_COUNT;
+        *auto_idx = (idx + 1) | (*auto_idx & !FMT_COUNT) | FMT_AUTO_USED;
         positional.get(idx).cloned().ok_or_else(|| {
             index_error(format!(
                 "Replacement index {idx} out of range for positional args tuple"
             ))
         })?
     } else if let Ok(idx) = base.parse::<usize>() {
+        if *auto_idx & FMT_AUTO_USED != 0 {
+            return Err(value_error(
+                "cannot switch from automatic field numbering to manual field specification",
+            ));
+        }
+        *auto_idx |= FMT_MANUAL_USED;
         // An index that overflows Py_ssize_t is a malformed format string
         // (ValueError), not a lookup miss (test_format_huge_item_number).
         if idx > isize::MAX as usize {
@@ -77385,6 +77456,16 @@ fn split_name_trailers(name: &str) -> (&str, Vec<&str>) {
 fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
     if trailer.starts_with('.') {
         let attr = &trailer[1..];
+        // `'{0.}'.format(x)` is a malformed format string, not an attribute
+        // miss (as `apply_trailer_interp` reports it).
+        if attr.is_empty() {
+            return Err(value_error("Empty attribute in format string"));
+        }
+        // The full attribute lookup when an interpreter runs (a builtin
+        // type's attribute, `'{0.real}'`; a property).
+        if let Ok(interp) = crate::builtins::reentrant_interp() {
+            return interp.load_attr_public(&value, attr);
+        }
         match &value {
             Object::Module(m) => m
                 .dict

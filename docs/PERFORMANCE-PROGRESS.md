@@ -1248,15 +1248,15 @@ branch and pull request.
   - `f(*args, **kwargs)` of a native method bound to its receiver runs
     from compiled code. A wrapper forwarding to a saved `log.append` took
     1,132 ns a call against CPython's 159: a spread call of a bound native
-    method found no in-place path, and a forwarding wrapper (`return
-    f(*args, **kwargs)` with no keywords) whose callee wasn't a Python
-    function left compiled code for the core loop at its `BUILD_MAP`. A
-    bound leaf method now runs in place, its receiver first as a `CALL`
-    passes it, and a forward with no keywords goes on as its
-    `CALL_FUNCTION_EX` without the mapping: 291 ns. A non-leaf method
+    method found no in-place path. A bound leaf method now runs in place,
+    its receiver first as a `CALL` passes it: 291 ns. A non-leaf method
     (`ExitStack.callback(log.clear)`) still takes the core loop's lane,
     494 ns against 119. The suite's instructions are level: no workload
-    forwards to a native method in its loop.
+    forwards to a native method in its loop. (Sending a forwarding wrapper's
+    non-leaf native callee through `CALL_FUNCTION_EX`'s lane too, instead
+    of leaving compiled code at its `BUILD_MAP`, broke `test_io`'s
+    interrupted-write test, whose `write` then finished before the alarm,
+    and was taken back out.)
   - A blocking native call (`select`, `time.sleep`, a lock) puts the
     thread's lazily running activations on the spine first only when
     something could read its frames while it blocks: another thread
@@ -1323,6 +1323,27 @@ branch and pull request.
     instead of 8,457 (CPython 3,632). Calling such a function still costs
     about 3,000 instructions over CPython's: `vars(o)` takes 4,695 against
     915.
+  - Fixed: a signal that a native function trips (`os.kill` of this
+    process) now runs its handler as the call returns when the core loop's
+    lane runs the function, as CPython's calls of C functions check the
+    eval breaker, with the activation's frame for the handler; it ran at
+    the next instruction boundary the general loop reached. And
+    `str.format`'s native body, which direct calls and compiled code use,
+    now raises CPython's errors for an empty attribute (`'{0.}'`), for
+    switching between automatic and manual numbering (`'{}{1}'`), and for
+    a format spec nested twice, looks up attributes through the
+    interpreter (`'{0.real}'`), and reruns any template it rejects through
+    the interpreter's formatter for the exact error; only a spread call
+    (`f(*args)`) reached that formatter before.
+  - Tried and dropped: letting every native function whose body is the
+    whole call (`native_call_ic_safe`) take the core loop's lane from
+    compiled code instead of the allowlist of about 150 names. Calling
+    `functools.reduce` over a pair took 1,295 instructions instead of
+    4,070 (CPython 1,122), but `test_unittest`'s
+    `testAssertRaisesRefcount` found two references to the function
+    `assertRaises` called left behind after the class's earlier tests
+    had warmed the paths (some native among them keeps the frames alive
+    that `traceback.clear_frames` should clear).
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

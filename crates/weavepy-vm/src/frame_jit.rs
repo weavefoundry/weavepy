@@ -13461,13 +13461,6 @@ unsafe extern "C" fn h_call_forward(
             if let Some(r) = spread_on_frame(st, pc + 3, start) {
                 return r;
             }
-            // The empty mapping's merge would change nothing: the call
-            // goes on as its `CALL_FUNCTION_EX` without one (a native
-            // method's, say), rather than the core loop running the four
-            // instructions.
-            if !matches!(&*st.stack.add(start), Object::Function(_)) {
-                return call_ex_general(st, pc + 3, start);
-            }
         } else if len < st.cap {
             // Keywords to forward: the merge into the call's fresh mapping
             // is a copy of `kwargs` alone, so `kwargs` itself stands in for
