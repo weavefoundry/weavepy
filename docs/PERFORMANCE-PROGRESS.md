@@ -1198,6 +1198,28 @@ branch and pull request.
     runs 1.41 of CPython's instructions (frame materialization, about
     1,900 a call), and `ExitStack` 1.47 and `suppress` 1.21 (constructor
     and `*args` binding, closure creation, spread thinly).
+  - Which generator paths the workloads take, per warm call (callgrind
+    call counts): the frame JIT's lazy resume carries nearly all of them
+    (`generators_tree` 640,000 resumes, 295,000 of them a collapsed `yield
+    from` chain's; `sudoku` 130,000; `nqueens` 40,000; `async_tree` 15,500
+    by fast step, 15,500 lazily and 18,700 through the task step's
+    `generator_send_lean`), and in `sudoku` and `nqueens` every
+    `h_for_iter_gen` first tries a fast step that declines. Resumes aren't
+    where the generator gap is: summing a depth-15 tree through recursive
+    `yield from` costs 2,901 instructions an item against CPython's 3,123
+    (a collapsed chain resumes its innermost generator in constant time,
+    where CPython's sends pass every level), and a flat generator 864
+    against 1,045. What costs is each generator's life outside its body:
+    creation about 870 instructions over a dozen helpers, the end about
+    230, the object's free about 170, against CPython's few hundred in all.
+    Forcing the creation helpers in line changed that by -1% to +3%, so
+    function boundaries aren't the cost either: the work is spread over
+    the pools (the generator object, the frame box, the locals and the
+    stack each kept apart), the reference counts a frame takes and drops
+    (code, globals, builtins, cells), and the collector's bookkeeping
+    (about 150). The next step is to pool a finished generator's frame with
+    its code's references kept, per code object, so a new generator of the
+    same function resets a frame instead of assembling one.
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,
