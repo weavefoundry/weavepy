@@ -12214,6 +12214,18 @@ unsafe extern "C" fn h_call(
                 Some(via_call)
             });
             if let Some(via_call) = settled {
+                // The receiver as the core loop's lane admits it, the body
+                // run on the operands in place as `h_call_native` runs it:
+                // a lazily running activation stays lazy unless something
+                // looks while the body runs.
+                let admitted = match (&ops[0], &ops[1], recv) {
+                    (Object::Builtin(_), Object::Unbound, None) => !b.binds_instance,
+                    (_, _, Some(r)) => crate::lane_recv_ok(b, r, via_call),
+                    _ => false,
+                };
+                if admitted {
+                    return native_body_here(st, pc, start, len, Rc::as_ptr(b), via_call);
+                }
                 sync(st);
                 settle(st);
                 let sw = &mut *st.sw;

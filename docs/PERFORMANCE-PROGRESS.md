@@ -1323,6 +1323,15 @@ branch and pull request.
     instead of 8,457 (CPython 3,632). Calling such a function still costs
     about 3,000 instructions over CPython's: `vars(o)` takes 4,695 against
     915.
+  - On a PGO build at `8ebbbdeb` (November 10, 2026): 1.000 of the
+    `57960cea` build's warm time (`stdlib_utils` 0.94 to 0.96,
+    `class_creation`, `deepcopy` and `async_tree` 0.95; `generators_tree`
+    and `float_points` 1.07, traced to the cache-table change tried and
+    dropped below) and 0.991 of its peak memory. CPython's own numbers moved
+    between the two sessions (its peak memory 0.84 of the earlier
+    session's, its times up to 1.15 of them), so this run's ratios to it
+    (warm 0.789, cold 0.884, peak memory 1.497) aren't comparable with the
+    earlier checkpoint's.
   - On a PGO build at `57960cea` (November 10, 2026): warm time 0.873 of
     CPython's, cold 0.980 (from 1.007), peak memory 1.266 (1.253 the
     previous session; CPython's own moves between sessions), and 0.991 of
@@ -1386,20 +1395,22 @@ branch and pull request.
     on the way: builtins that take no keywords (`abs`, `len`, `divmod`,
     `hash` and others) ignored any they were given; they now raise
     CPython's `TypeError`.
-  - Less memory per code object that runs. The inline cache table (16
-    bytes an instruction) is allocated once the code runs an instruction
-    again (a loop's next iteration, a second call), not at its first cache
-    write: code an import runs once from top to bottom writes its caches
-    at rising pcs and never reads them. The per-site side tables of code
-    that never warms (most of it) cost a word each instead of four, and
-    three rarely built values (a generator's names, `co_name` and its
+  - Less memory per code object that runs: the per-site side tables of
+    code that never warms (most of it) cost a word each instead of four,
+    and three rarely built values (a generator's names, `co_name` and its
     neighbors as objects, `co_positions()`) a word instead of up to seven.
-    Peak memory after `import logging, io` drops 248 KB (17,232 to 16,984
-    KB; CPython 13,316), after `import asyncio` 224 KB, and after `import
-    dataclasses, enum, typing` 160 KB. The heap after `import logging`
-    still holds 6.4 MB more than at start-up (sampled): about 3 MB of it
-    for the code that ran (its decoded bodies, constants, names, caches and
-    tables), 1 MB for classes and 0.5 MB for functions.
+    The heap after `import logging` holds 6.4 MB more than at start-up
+    (sampled): about 3 MB of it for the code that ran (its decoded bodies,
+    constants, names, caches and tables), 1 MB for classes and 0.5 MB for
+    functions.
+  - Tried and dropped: allocating the inline cache table (16 bytes an
+    instruction) only once the code runs an instruction again, dropping
+    the writes of code that runs once from top to bottom. With the boxed
+    tables above it cut peak memory after `import logging, io` by 248 KB
+    (of 17,232; CPython 13,316), but blocks that ran once before a compile
+    then looked as if they never ran (their sites unresolved), so the frame
+    JIT compiled them as exits: `generators_tree` retired 5% more
+    instructions and `float_points` 3%.
   - A keyword call lowers in line when its keywords aren't the callee's
     next parameters in order: a keyword past a defaulted parameter
     (`f(a, c=3)`), keywords in another order, or a keyword-only parameter
@@ -1451,6 +1462,18 @@ branch and pull request.
     848, `defaultdict(list)` 5,073 against 1,989 (the general type call, a
     native `__init__` reached through a bound method), and `deque()` 4,018
     against 1,910 (its `__init__` is Python, over four slots).
+  - `super().__init__()` or `dict.__init__(self, ...)` in a `dict`
+    subclass's `__init__` runs `dict.__init__`'s body in the core loop's
+    lane (it reads the receiver's payload itself), and a compiled call of
+    a builtin the lane runs (`object.__setattr__(self, name, value)`) runs
+    its body as the settled-builtin helper does, leaving a lazily running
+    caller lazy. `dict.__init__` on a dict payload went to the full call,
+    and the compiled call registered its caller first. Constructing a
+    `dict` subclass whose `__init__` calls `super().__init__()` takes 3,247
+    instructions instead of 7,667 (CPython 3,107), one calling
+    `dict.__init__(self)` 3,350 instead of 7,475 (2,664), and a
+    `__slots__` class setting two fields through `object.__setattr__`
+    5,104 instead of 5,602 (3,859).
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an
