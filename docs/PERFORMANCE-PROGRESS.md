@@ -1286,6 +1286,23 @@ branch and pull request.
     line: the class's version, no published `__dict__`, values unborrowed
     and laid over the proved names, then the value's copy. 111
     instructions (a field's read takes 99). The suite is level.
+  - A positional call of a function with keyword-only parameters, all
+    defaulted (`def f(a, *, key=None)`), lowers in line like any other:
+    the inliner refused every callee with extended parameters, so such a
+    call took the frameless-leaf evaluator, matching each keyword-only
+    default to its parameter by name on every call. The plan now binds them
+    with the positional defaults in one helper (a rebound
+    `__kwdefaults__` declines it), and the defaults, which the compiler
+    lists in the parameters' order, are taken in that order when the names
+    line up. A call of `def f(a, b=2, *, c=3): return a` takes 352
+    instructions instead of 927 (CPython about 595), one whose body calls
+    `len` 598 instead of 1,391 (about 905). A keyword-only parameter given
+    by keyword still takes the evaluator: 1,026 against about 550.
+  - `functools.reduce` reads a tuple's items, or a list's by index, without
+    an iterator, and calls a native function's leaf half (`operator.add`)
+    before the general call: ten additions take 8,457 instructions instead
+    of 11,673. CPython's take 3,632, and each element still costs about
+    400 here.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

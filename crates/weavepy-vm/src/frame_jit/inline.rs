@@ -189,6 +189,9 @@ pub(super) struct Plan {
     never_ran: Vec<bool>,
     has_self: bool,
     missing: usize,
+    /// Its keyword-only parameters, which a positional call binds to their
+    /// defaults.
+    kwonly: usize,
     nlocals: usize,
     /// The locals its body rebinds.
     stored: Vec<bool>,
@@ -228,7 +231,7 @@ fn getter_plan(
     };
     let callee = f.code();
     let mut p = admit(&f, &callee, false, 1, None, false, path, budget)?;
-    if p.missing != 0 {
+    if p.missing != 0 || p.kwonly != 0 {
         return Err("defaults");
     }
     p.getter = Some((ver, cell as i64));
@@ -248,7 +251,7 @@ fn dunder_plan(
     };
     let callee = f.code();
     let mut p = admit(&f, &callee, false, 2, None, false, path, budget)?;
-    if p.missing != 0 {
+    if p.missing != 0 || p.kwonly != 0 {
         return Err("defaults");
     }
     p.dunder = Some(Dunder {
@@ -698,8 +701,14 @@ fn admit(
     if code.is_generator || code.is_coroutine || code.is_async_generator {
         return Err("generator");
     }
-    if Interpreter::has_extended_params(code) {
+    if code.has_varargs || code.has_varkeywords {
         return Err("extended parameters");
+    }
+    // Keyword-only parameters take their defaults (a keyword given for one
+    // isn't in place, below).
+    let kwonly = code.kwonly_count as usize;
+    if kwonly > 0 && !Interpreter::kwonly_defaults_cover(f, code) {
+        return Err("keyword-only defaults");
     }
     if !code.cellvars.is_empty() || f.lean_cells_ref(code).is_none() {
         return Err("cells");
@@ -880,6 +889,7 @@ fn admit(
         never_ran,
         has_self,
         missing,
+        kwonly,
         nlocals,
         stored,
         inner,
@@ -1679,7 +1689,25 @@ impl<'a> Lower<'a> {
         let bad = self.b.ins().bor(bad, deep);
         self.branch_out(bad, slow);
         // The defaults (`__defaults__` may have been rebound).
-        if plan.missing > 0 {
+        if plan.kwonly > 0 {
+            // (Both kinds at once: a decline leaves nothing written.)
+            let given = argc + self_slot;
+            let dst = self.slot_addr(first + given);
+            let n = self.b.ins().iconst(types::I64, plan.missing as i64);
+            let kw_dst = self.slot_addr(first + code.arg_count as usize);
+            let at = match method_at {
+                Some(a) => self.b.ins().iconst(ptr, a),
+                None => self.slot_addr(start),
+            };
+            let r = self
+                .call(
+                    h_inline_all_defaults as *const () as usize,
+                    &[at, dst, n, kw_dst],
+                    true,
+                )
+                .expect("returns");
+            self.branch_out(r, slow);
+        } else if plan.missing > 0 {
             let given = argc + self_slot;
             let dst = self.slot_addr(first + given);
             let n = self.b.ins().iconst(types::I64, plan.missing as i64);
@@ -1704,7 +1732,7 @@ impl<'a> Lower<'a> {
                 self.b.ins().store(FLAGS, l, sv, IS_ROOT_LAST);
             }
         }
-        for i in code.arg_count as usize..nlocals {
+        for i in code.arg_count as usize + plan.kwonly..nlocals {
             let at = self.slot_addr(first + i);
             self.write_tag(at, self.tags.unbound);
         }
@@ -2511,6 +2539,59 @@ unsafe extern "C" fn h_inline_defaults(callee: *const Object, dst: *mut Object, 
         }
         for (k, d) in f.defaults[f.defaults.len() - n..].iter().enumerate() {
             dst.add(k).write(crate::clone_hot(d));
+        }
+        0
+    }
+}
+
+/// [`h_inline_defaults`] for a callee with keyword-only parameters: its `n`
+/// trailing positional defaults to `dst` and each keyword-only parameter's
+/// default, in the locals' order, to `kw_dst`: `0` done, anything else
+/// declined with nothing written (a default rebound or missing).
+unsafe extern "C" fn h_inline_all_defaults(
+    callee: *const Object,
+    dst: *mut Object,
+    n: u64,
+    kw_dst: *mut Object,
+) -> u32 {
+    // SAFETY: the code passes the callable's slot and free stack slots.
+    unsafe {
+        let Object::Function(f) = &*callee else {
+            return 1;
+        };
+        let n = n as usize;
+        let code: &CodeObject = &*f.code.as_ptr();
+        if n > 0 && !Interpreter::defaults_cover(f, n) {
+            return 1;
+        }
+        // The compiler lists the keyword-only defaults in the parameters'
+        // order: when every one has a default, the names line up.
+        let npos = code.arg_count as usize;
+        let kwonly = code.kwonly_count as usize;
+        let kd = &f.kw_defaults;
+        let aligned = !f.defaults_maybe_overridden()
+            && kd.len() == kwonly
+            && kd
+                .iter()
+                .zip(&code.varnames[npos..npos + kwonly])
+                .all(|((name, _), v)| name.as_str() == v.as_str());
+        if !aligned && !Interpreter::kwonly_defaults_cover(f, code) {
+            return 1;
+        }
+        if n > 0 {
+            for (k, d) in f.defaults[f.defaults.len() - n..].iter().enumerate() {
+                dst.add(k).write(crate::clone_hot(d));
+            }
+        }
+        if aligned {
+            for (k, (_, d)) in kd.iter().enumerate() {
+                kw_dst.add(k).write(crate::clone_hot(d));
+            }
+        } else {
+            for (k, d) in Interpreter::kwonly_defaults(f, code).enumerate() {
+                let d = d.expect("covered above");
+                kw_dst.add(k).write(crate::clone_hot(d));
+            }
         }
         0
     }

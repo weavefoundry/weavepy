@@ -9679,14 +9679,22 @@ impl Interpreter {
         code: &'a CodeObject,
     ) -> impl Iterator<Item = Option<&'a Object>> + 'a {
         let npos = code.arg_count as usize;
-        code.varnames[npos..npos + code.kwonly_count as usize]
-            .iter()
-            .map(|name| {
-                f.kw_defaults
-                    .iter()
-                    .find(|(n, _)| n == name.as_str())
-                    .map(|(_, v)| v)
-            })
+        let names = &code.varnames[npos..npos + code.kwonly_count as usize];
+        // The compiler lists them in the parameters' order: when every one
+        // has a default, the names line up and none is searched for.
+        let kd = &f.kw_defaults;
+        let aligned = kd.len() == names.len()
+            && kd
+                .iter()
+                .zip(names)
+                .all(|((n, _), v)| n.as_str() == v.as_str());
+        names.iter().enumerate().map(move |(j, name)| {
+            if aligned {
+                kd.get(j).map(|(_, v)| v)
+            } else {
+                kd.iter().find(|(n, _)| n == name.as_str()).map(|(_, v)| v)
+            }
+        })
     }
 
     /// Move a shape-checked lean call's operands off `frame`'s stack: the
