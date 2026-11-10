@@ -1179,6 +1179,25 @@ branch and pull request.
     `WEAVEPY_FRAME_JIT_SYNC=1`: valgrind runs one thread at a time, so the
     worker's compiles land far later and `async_tree`'s warm call counted
     817 million instructions instead of 566.
+  - Where the asyncio and generator gap is, and what would close it: on
+    the PGO build a `sleep(0)` round trip runs 1.10 of CPython's
+    instructions but 1.58 of its time, and cachegrind counts 4.5 times
+    CPython's instruction-cache misses (about 83 KB of code touched a step
+    against 18.5 KB). CPython runs a coroutine's whole send chain in one
+    eval loop; here a step passes through some thirty helpers (the task
+    step, `generator_send_lean`, `lazy_await`, `lazy_gen_resume`,
+    `core_gen_make`, `gen_native_yield`, `retire_gen_frame`, ...), each
+    building its own state: a resume from compiled code builds and drops a
+    30-field native `State` and a resume record, and a trivial generator's
+    life costs 2,380 instructions (creation about 790 over a dozen helpers,
+    each resume about 470, the end about 340) against CPython's 1,210. No
+    one piece is large: the lever is a lighter resume protocol, a compiled
+    consumer entering a parked generator's compiled body directly (as
+    `FOR_ITER_GEN` pushes a frame) with the generator's state kept in a
+    form the native code reloads cheaply. Smaller findings: `findCaller`
+    runs 1.41 of CPython's instructions (frame materialization, about
+    1,900 a call), and `ExitStack` 1.47 and `suppress` 1.21 (constructor
+    and `*args` binding, closure creation, spread thinly).
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,
