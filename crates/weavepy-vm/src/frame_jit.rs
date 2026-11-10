@@ -4078,7 +4078,33 @@ unsafe extern "C" fn h_for_iter_rest(
                 return 3;
             };
             if !inner.pure_ready() {
-                return 3;
+                // Exhausted over a list, a tuple or a range: an iterator
+                // only the stack holds leaves it, as the core loop's arm
+                // retires it, when its release frees nothing that could
+                // finalize (the list or tuple lives on).
+                let frees_nothing = unique
+                    && match &*inner {
+                        PyIterator::List {
+                            items,
+                            index,
+                            owner: None,
+                        } => {
+                            crate::sync::Rc::strong_count(items) > 1
+                                && items.try_borrow().is_ok_and(|v| *index >= v.len())
+                        }
+                        PyIterator::Tuple { items, index } => {
+                            *index >= items.len()
+                                && crate::shared_value::ThinArc::strong_count(items) > 1
+                        }
+                        PyIterator::Range { .. } => true,
+                        _ => false,
+                    };
+                if !frees_nothing {
+                    return 3;
+                }
+                // SAFETY: the iterator leaves the stack.
+                drop(unsafe { it.read() });
+                return 2;
             }
             let Some(x) = inner.next_value() else {
                 return 3;

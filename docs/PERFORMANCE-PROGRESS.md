@@ -1474,6 +1474,31 @@ branch and pull request.
     `dict.__init__(self)` 3,350 instead of 7,475 (2,664), and a
     `__slots__` class setting two fields through `object.__setattr__`
     5,104 instead of 5,602 (3,859).
+  - Three everyday operations off the slow path, found by a sweep of 57
+    common operations against CPython: `getattr(point, "x")` of a named
+    tuple reads the field through its tuplegetter (1,957 instructions to
+    724; CPython 546), `dict.setdefault` with a `str` or `int` key is a
+    leaf half that probes once (1,577 to 1,105; 784; an unused default
+    that could finalize, `d.setdefault(k, Noisy())`, keeps the full path,
+    which runs its `__del__` before the next statement), and a
+    `for i, x in enumerate(xs)` loop over a list, tuple or range retires
+    its iterator at the end in compiled code instead of leaving for the
+    core loop (a five-item loop 4,369 to 2,741; 2,594). `comprehensions`
+    retires 5% fewer instructions. Still behind in the sweep:
+    `functools.partial(f, 1)` construction (3.0 times CPython's
+    instructions: a native class's general construction, its slots set by
+    name), `struct.pack` (2.7), a small `json.loads` (1.9),
+    `io.StringIO(...).read()` (1.8), `A & B` of small sets (1.5), and
+    `list(enumerate(xs))` and `zip` loops (1.4 to 1.6).
+  - Calls from native code into Python code, measured again: a plain
+    function or a pure leaf is at parity (`map(f, xs)`), but a method that
+    changes state (`map(obj.step, xs)`) costs about 2,800 instructions a
+    call against CPython's 1,300, most of it tier 2's native entry
+    (`try_call_native_direct`: about 550 of its own, the pooled argument
+    buffers, guards and a dozen reference-counted clones into its context).
+    Iterating an instance with a Python `__next__` costs 32,882
+    instructions for five items against 10,255, and a dict lookup keyed by
+    a frozen dataclass instance 15,281 against 3,351.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

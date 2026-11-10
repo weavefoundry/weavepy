@@ -14229,6 +14229,66 @@ pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     Some(Ok(Object::None))
 }
 
+/// `dict.setdefault`'s leaf half: a `str`/`int` key's entry read, or the
+/// default stored under it when no stored key could equal it (one probe, as
+/// CPython's). Anything that could run Python (an exotic stored key, a dict
+/// watcher) takes the full path.
+pub(crate) fn dict_setdefault_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, key, default) = match args {
+        [r, k] => (r, k, None),
+        [r, k, d] => (r, k, Some(d)),
+        _ => return None,
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let cell = leaf_dict_of(recv)?;
+    let mut d = cell.try_borrow_mut().ok()?;
+    match d.probe_entry(&probe) {
+        // (A default that dies unused is released with the call's operands,
+        // which reap a finalizer only on the full path: one that could
+        // queue one takes it, as `d.setdefault(k, Noisy())` must finalize
+        // before the next statement.)
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            if default.is_some_and(|v| !dies_quietly(v)) {
+                return None;
+            }
+            Some(Ok(e.into_mut().clone()))
+        }
+        crate::dictmap::ProbeEntry::Vacant(e) => {
+            if !probe.miss_is_exact() {
+                return None;
+            }
+            let v = default.cloned().unwrap_or(Object::None);
+            e.insert(DictKey(key.clone()), v.clone());
+            drop(d);
+            crate::object::dict_watch_bump(cell);
+            crate::object::dict_mutation_event(cell);
+            Some(Ok(v))
+        }
+    }
+}
+
+/// Whether releasing the stack's reference to `v` frees nothing whose
+/// finalizer could run: a value another reference keeps alive, a scalar or
+/// a string, or an empty list, dict or set.
+fn dies_quietly(v: &Object) -> bool {
+    match v {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => true,
+        Object::List(l) => Rc::strong_count(l) > 1 || l.try_borrow().is_ok_and(|l| l.is_empty()),
+        Object::Dict(d) => Rc::strong_count(d) > 1 || d.try_borrow().is_ok_and(|d| d.is_empty()),
+        Object::Set(s) => Rc::strong_count(s) > 1 || s.try_borrow().is_ok_and(|s| s.is_empty()),
+        Object::Instance(i) => Rc::strong_count(i) > 1,
+        _ => false,
+    }
+}
+
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = args

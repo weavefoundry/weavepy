@@ -31215,6 +31215,10 @@ impl Interpreter {
                     &[
                         ("__len__", LeafKind::Len),
                         ("get", LeafKind::DictGet),
+                        (
+                            "setdefault",
+                            LeafKind::Fast(crate::builtins::dict_setdefault_leaf),
+                        ),
                         ("keys", LeafKind::DictKeys),
                         ("values", LeafKind::DictValues),
                         ("items", LeafKind::DictItems),
@@ -31837,6 +31841,19 @@ impl Interpreter {
             return Self::leaf_builtin_dunder_attr(inst, recv, name);
         }
         let cls = inst.cls_raw();
+        // A named tuple's field (`getattr(point, "x")`): the class's
+        // tuplegetter, a data descriptor no instance dictionary shadows,
+        // reads the tuple's item, as `point.x` does.
+        if let (Some(Object::Tuple(items)), 0) = (inst.native.get(), cls.native_kind.get()) {
+            if Self::default_getattribute(cls) {
+                if let Some(Object::Instance(g)) = cls.lookup(name) {
+                    if let Some(ix) = crate::stdlib::collections_native::tuplegetter_index(&g) {
+                        return items.get(ix).cloned();
+                    }
+                }
+            }
+            return None;
+        }
         if cls.native_kind.get() != 0
             || inst.native.get().is_some()
             || !Self::default_getattribute(cls)
