@@ -1436,6 +1436,21 @@ branch and pull request.
     version also counted loop-free code as short and compiled
     `with_segments`, which takes `*args`, for one local too many, so its
     every call found no body: `p / "x"` took 42% longer.)
+  - Reading a protocol dunder or a native method off a class is memoized
+    at the site: `dict.__setitem__`, an inherited `D.__setitem__` and
+    `type(self).__setitem__` (as `OrderedDict.update` checks at every call),
+    `list.append` read for a call. The class-attribute fast paths admitted
+    only a short list of dunders, though `type` defines none of the
+    container, iteration, comparison and arithmetic ones as a data
+    descriptor, and kept a native method found on the class only for
+    `__new__`. `dict.__setitem__` takes 187 instructions instead of 2,283
+    (CPython 301), `OrderedDict()` 5,473 instead of 7,519 (CPython's is C:
+    1,162), and `list.append(lst, x)` 1,663 instead of 1,932 (756): calling
+    a native method unbound still takes the core loop's lane.
+  - Construction costs left: `object()` takes 2,194 instructions against
+    848, `defaultdict(list)` 5,073 against 1,989 (the general type call, a
+    native `__init__` reached through a bound method), and `deque()` 4,018
+    against 1,910 (its `__init__` is Python, over four slots).
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

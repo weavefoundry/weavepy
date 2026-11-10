@@ -33146,8 +33146,16 @@ impl Interpreter {
                 Object::Function(f),
             )))),
             // A native method or a property read off the class is the
-            // descriptor itself (`descriptor_get` with no instance).
-            LeafAttr::BuiltinMethod(b) => Some(Object::Builtin(b)),
+            // descriptor itself (`descriptor_get` with no instance). The
+            // site remembers a native one as it does a non-binding native
+            // function (`list.append(lst, x)`, `dict.__init__(self)`).
+            LeafAttr::BuiltinMethod(b) => {
+                let v = Object::Builtin(b);
+                if let Some(s) = slot {
+                    s.set_class_value(ver, 0, &v);
+                }
+                Some(v)
+            }
             LeafAttr::Property(p) => Some(Object::Property(p)),
             LeafAttr::InstanceOnly | LeafAttr::TupleField(_) => None,
         }
@@ -33379,6 +33387,12 @@ impl Interpreter {
     /// keeps its own exception at the call site), with the context-manager
     /// protocol's methods, which neither `type` nor `object` defines
     /// (`ExitStack.enter_context` reads them off the class).
+    /// The container, iteration, comparison and arithmetic protocols'
+    /// methods are admitted too: `type` defines none of them as a data
+    /// descriptor (its `__or__` and `__call__` are plain methods, which a
+    /// class's own MRO entry overrides), so a plain metaclass leaves their
+    /// reads to the class's MRO (`dict.__setitem__`, `type(self).__setitem__
+    /// is ...` in `OrderedDict.update`).
     fn type_dunder_transparent(name: &str) -> bool {
         matches!(
             name,
@@ -33387,6 +33401,33 @@ impl Interpreter {
                 | "__exit__"
                 | "__aenter__"
                 | "__aexit__"
+                | "__getitem__"
+                | "__setitem__"
+                | "__delitem__"
+                | "__contains__"
+                | "__len__"
+                | "__iter__"
+                | "__next__"
+                | "__reversed__"
+                | "__bool__"
+                | "__missing__"
+                | "__lt__"
+                | "__le__"
+                | "__gt__"
+                | "__ge__"
+                | "__add__"
+                | "__sub__"
+                | "__mul__"
+                | "__truediv__"
+                | "__floordiv__"
+                | "__mod__"
+                | "__format__"
+                | "__getattr__"
+                | "__get__"
+                | "__set__"
+                | "__delete__"
+                | "__copy__"
+                | "__deepcopy__"
                 | "__setattr__"
                 | "__delattr__"
                 | "__getattribute__"

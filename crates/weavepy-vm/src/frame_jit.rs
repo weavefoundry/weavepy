@@ -8540,8 +8540,18 @@ fn type_attr_resolve(
     // string or `None` (`contextmanager`'s `type(self).__doc__` at every
     // construction). Assigning it moves the class's version.
     let doc = name == "__doc__" && matches!(v, Object::Str(_) | Object::None);
-    if name.starts_with("__") && !doc && !matches!(v, Object::Function(_)) {
+    if name.starts_with("__") && !doc && !matches!(v, Object::Function(_) | Object::Builtin(_)) {
         return None;
+    }
+    // A native method or function (`dict.__setitem__`, `object.__setattr__`,
+    // `list.append`): not a descriptor through a class, so the class's
+    // read returns it as it is. Owned, as `__new__`'s: builtins outlive
+    // the classes that hold them.
+    if let b @ Object::Builtin(_) = v {
+        if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
+        }
+        return Some(b);
     }
     let plain = matches!(
         v,
