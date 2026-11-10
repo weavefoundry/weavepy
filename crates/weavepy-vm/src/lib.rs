@@ -82890,6 +82890,20 @@ pub(crate) fn inst_class_attr_quick(
     ))))
 }
 
+/// Whether the `LOAD_ATTR` at `pc` has read a scalar class attribute
+/// through an instance (see [`class_attr_fill_via`]): the frame JIT reads
+/// such a site's value in line.
+pub(crate) fn class_attr_via_instance_site(ext: &CodeConstObjects, pc: usize) -> bool {
+    ext.stamp_slot(pc).is_some_and(|s| {
+        let [ver, tag, _] = s.get();
+        ver != 0
+            && matches!(
+                tag ^ CLASS_ATTR_VIA_INSTANCE,
+                CLASS_ATTR_INT | CLASS_ATTR_FLOAT | CLASS_ATTR_BOOL | CLASS_ATTR_NONE
+            )
+    })
+}
+
 fn class_attr_hit_via(
     slot: &StampSlot,
     cls: &crate::types::TypeObject,

@@ -1274,6 +1274,18 @@ branch and pull request.
     `sleep`'s coroutine suspends), and a few compiled sites take their slow
     helper every step (`h_method`'s `method_slow`, `attr_stack_slow`, an
     instance's truth).
+  - A class's scalar attribute read through an instance (`self.LIMIT`)
+    runs in compiled code. It took 238 instructions a read against
+    CPython's 63: compiled code called the attribute helper, which missed
+    its field cache, called its slow half, and found the class's value in
+    the site's memo after proving by a name lookup that the instance
+    doesn't shadow it. The site now remembers what proves that without a
+    lookup (the class's shared names and how many precede the attribute's,
+    as a leaf method site does), and a site the interpreter has seen read
+    a class's scalar through an instance checks its first memo entry in
+    line: the class's version, no published `__dict__`, values unborrowed
+    and laid over the proved names, then the value's copy. 111
+    instructions (a field's read takes 99). The suite is level.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

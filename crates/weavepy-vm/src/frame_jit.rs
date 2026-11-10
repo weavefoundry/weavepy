@@ -7618,6 +7618,12 @@ pub(crate) struct AttrSite {
     /// (see [`class_poly_hit`]), and the entry the next one replaces.
     class_poly: [Cell<ClassPolyEntry>; CLASS_POLY],
     class_poly_next: Cell<u8>,
+    /// What proves an instance can't shadow the site's name without a
+    /// lookup (see `inst_may_shadow_bounded`): a class's shared names (`0`
+    /// none yet) and how many of them precede the site's name. Compiled
+    /// code reads both (see `Lower::class_attr_guards`).
+    no_shadow_keys: Cell<usize>,
+    no_shadow_limit: Cell<usize>,
     /// The method of an exact `list`, `dict`, `set` or `str` the site read
     /// as a value last (see [`builtin_attr_read`]): the receiver's kind
     /// and the method.
@@ -8272,14 +8278,39 @@ unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
     }
     // SAFETY: the caller's contract.
     let code = unsafe { &*site.code };
-    if crate::inst_may_shadow(inst, code, code.instructions[site.pc as usize].arg) {
+    let arg = code.instructions[site.pc as usize].arg;
+    let (keys, limit) = (site.no_shadow_keys.get(), site.no_shadow_limit.get());
+    if crate::inst_may_shadow_bounded(inst, code, arg, keys, limit) {
         return None;
+    }
+    if keys == 0 {
+        class_poly_prove(site, inst, code, arg);
     }
     // SAFETY: the value's own words, which its class holds while the
     // version stands; the view is never dropped.
     let v =
         std::mem::ManuallyDrop::new(unsafe { std::ptr::from_ref(&e.val).cast::<Object>().read() });
     Some(crate::clone_hot(&v))
+}
+
+/// Remember what proves, at `site`, that an instance of `inst`'s class
+/// laid over its class's shared names doesn't hold the site's name (see
+/// [`AttrSite::no_shadow`]), so the next read compares two words instead
+/// of looking the name up.
+#[cold]
+#[inline(never)]
+fn class_poly_prove(site: &AttrSite, inst: &crate::types::PyInstance, code: &CodeObject, arg: u32) {
+    let Some(keys) = inst.cls_raw().shared_keys.get() else {
+        return;
+    };
+    let Some(ext) = crate::code_vm_ext(code) else {
+        return;
+    };
+    let i = arg as usize;
+    if let (Some(Object::Str(n)), Some(&h)) = (ext.name_objs.get(i), ext.name_hashes.get(i)) {
+        site.no_shadow_limit.set(keys.names_before(n, h));
+        site.no_shadow_keys.set(std::ptr::from_ref(keys) as usize);
+    }
 }
 
 /// Remember at `site` that `inst`'s class answered the read with `v`, a
@@ -16068,6 +16099,78 @@ impl<'a> Lower<'a> {
     /// `*dst = (*src).clone()`, in line: a scalar's two words copied, a
     /// counted value's count bumped first while one thread owns every
     /// count (see `crate::rc`), and anything else through `h_clone`.
+    /// The guards of a read at the site `site` (its address) of a class
+    /// attribute through the instance at `at` (a local's slot), as
+    /// [`class_poly_hit`] checks them for the site's first entry: an
+    /// instance whose class's version is the entry's (a value memoized),
+    /// with no published `__dict__`, its values unborrowed and either none
+    /// or laid over the names the site proved can't hold its name, while
+    /// counts aren't shared between threads. The value's address; any
+    /// failure goes to `out`.
+    fn class_attr_guards(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        at: Value,
+        site: Value,
+        out: Block,
+    ) -> Value {
+        let ptr = self.ptr;
+        let entry_at = std::mem::offset_of!(AttrSite, class_poly) as i32;
+        let ver_at = entry_at + std::mem::offset_of!(ClassPolyEntry, ver) as i32;
+        let val_at = entry_at + std::mem::offset_of!(ClassPolyEntry, val) as i32;
+        let keys_at = std::mem::offset_of!(AttrSite, no_shadow_keys) as i32;
+        let limit_at = std::mem::offset_of!(AttrSite, no_shadow_limit) as i32;
+        let otag = self.tag_at(at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, out);
+        let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let cver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let ever = self.b.ins().load(types::I64, FLAGS, site, ver_at);
+        let w0 = self.b.ins().load(types::I64, FLAGS, site, val_at);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ever);
+        let unset = self.b.ins().icmp_imm(IntCC::Equal, ever, 0);
+        let unmemo = self.b.ins().icmp_imm(IntCC::Equal, w0, -1);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+        let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+        let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+        let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+        let other = self.b.ins().bor(lazy, shared);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+        let bad = self.b.ins().bor(stale, unset);
+        let bad = self.b.ins().bor(bad, unmemo);
+        let bad = self.b.ins().bor(bad, busy);
+        let bad = self.b.ins().bor(bad, other);
+        self.branch_out(bad, out);
+        // Values, if any, over the names the site proved don't hold its
+        // name.
+        let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+        let check = self.b.create_block();
+        let ok = self.b.create_block();
+        self.b.ins().brif(block, check, &[], ok, &[]);
+        self.b.switch_to_block(check);
+        let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
+        let want = self.b.ins().load(ptr, FLAGS, site, keys_at);
+        let limit = self.b.ins().load(types::I64, FLAGS, site, limit_at);
+        let len = self.b.ins().uload32(FLAGS, block, l.split_len);
+        let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, want);
+        let unproved = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
+        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
+        let bad = self.b.ins().bor(foreign, unproved);
+        let bad = self.b.ins().bor(bad, over);
+        self.branch_out(bad, out);
+        self.b.ins().jump(ok, &[]);
+        self.b.switch_to_block(ok);
+        self.b.ins().iadd_imm(site, i64::from(val_at))
+    }
+
     fn copy_value(&mut self, dst: Value, src: Value) {
         if cfg!(debug_assertions) {
             // (A debug build's counts are atomic throughout.)
@@ -20193,6 +20296,8 @@ impl<'a> Lower<'a> {
             type_attr: std::cell::RefCell::new(None),
             class_poly: Default::default(),
             class_poly_next: Cell::new(0),
+            no_shadow_keys: Cell::new(0),
+            no_shadow_limit: Cell::new(0),
             builtin_attr: std::cell::RefCell::new(None),
         });
         let c = self
@@ -20257,6 +20362,26 @@ impl<'a> Lower<'a> {
                 let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
                 let n = self.b.ins().iadd_imm(n, -1);
                 self.b.ins().store(FLAGS, n, inst, 0);
+                self.b.ins().jump(done, &[]);
+                self.b.set_cold_block(helper_block);
+                self.b.switch_to_block(helper_block);
+                Some(done)
+            }
+            // A class's scalar read through an instance local the site has
+            // read before: its first memo entry's value, in line.
+            (Item::Local(i), _, Some(l))
+                if !in_line
+                    && !cfg!(debug_assertions)
+                    && !crate::property_site(self.ext, pc)
+                    && crate::class_attr_via_instance_site(self.ext, pc) =>
+            {
+                let l = *l;
+                let helper_block = self.b.create_block();
+                let done = self.b.create_block();
+                let at = self.local_addr(i);
+                let v = self.class_attr_guards(&l, at, c, helper_block);
+                let dst = self.slot_addr(slot);
+                self.copy_value(dst, v);
                 self.b.ins().jump(done, &[]);
                 self.b.set_cold_block(helper_block);
                 self.b.switch_to_block(helper_block);
