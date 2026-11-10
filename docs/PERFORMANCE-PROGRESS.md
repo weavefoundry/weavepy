@@ -1217,9 +1217,34 @@ branch and pull request.
     the pools (the generator object, the frame box, the locals and the
     stack each kept apart), the reference counts a frame takes and drops
     (code, globals, builtins, cells), and the collector's bookkeeping
-    (about 150). The next step is to pool a finished generator's frame with
-    its code's references kept, per code object, so a new generator of the
-    same function resets a frame instead of assembling one.
+    (about 150). Pooling a finished generator's frame per code object, with
+    its references kept, would leak: the pooled frame holds the module's
+    globals, which lead back to the function and its code, so code made at
+    run time (`dataclasses`' methods) would never be freed, and breaking
+    that loop gives back most of the saving.
+  - A task's context costs nothing until something uses it. A task keeps a
+    copy of its creator's context, which CPython makes as one small object
+    over a shared immutable mapping; here a `Context` is an instance and a
+    block of slots (152 bytes, two allocations), made for every task and
+    entered and left on every step. A task now keeps the copied mapping
+    itself, and its steps run over it as an unnamed current context
+    (`contextvars_native::run_in_snapshot`). The `Context` is built only
+    when Python code can see it (a `ContextVar.set` or `reset`, the task's
+    `get_context()`, a handle's `get_context()`, a context-switch watcher,
+    a loop whose `call_soon` is Python code), and the task keeps the one
+    built during a step; a step scheduled before it was built runs in it
+    too. A future's done callbacks scheduled natively keep their copied
+    mapping the same way. `ContextVar.get` and `decimal`'s context lookup
+    read the mapping directly. Over a tree of 7,776 sleeping tasks each
+    parked leaf takes 2,420 bytes instead of 2,745 (CPython 1,530), and
+    the tree runs in 0.89 of the time; in the suite `async_tree` takes
+    0.93 of the previous build's time and its peak memory ratio falls from
+    1.47 to 1.39, the rest level (geomean 0.990). The rest of a parked
+    task is its three coroutines (`leaf`, `sleep` and `__sleep0`, about
+    1,090 bytes over nine allocations; a lazily awaited coroutine that
+    suspends keeps its activation's box and a stack sized for compiled
+    code), its state (184 bytes reached through a handle slot and a
+    registry), and the loop's `Handle` (216 bytes) and step callable.
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,

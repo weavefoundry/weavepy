@@ -122,7 +122,7 @@ fn handle_run(hs: &HandleState, args: &[Object]) -> Result<Object, RuntimeError>
         // A cancelled or malformed handle: the Python body's errors.
         return call(&hs.run_py, args, &[]);
     };
-    match crate::stdlib::contextvars_native::run_in_context(&ctx, &cb, &cb_args) {
+    match crate::stdlib::asyncio_mod::run_handle_callback(&ctx, &cb, &cb_args) {
         Ok(_) => Ok(Object::None),
         Err(RuntimeError::PyException(pe))
             if !is_exc(&pe.instance, "SystemExit")
@@ -133,6 +133,34 @@ fn handle_run(hs: &HandleState, args: &[Object]) -> Result<Object, RuntimeError>
         }
         Err(e) => Err(e),
     }
+}
+
+/// `Handle.get_context(self)`: `self._context`, built (and kept) if a
+/// native caller scheduled a snapshot (see
+/// [`crate::stdlib::contextvars_native::snapshot`]).
+fn handle_get_context(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(h)) = args.first() else {
+        return Err(type_error("Handle.get_context() needs a Handle"));
+    };
+    let (ctx, cb) = {
+        let s = h.slots.borrow();
+        (
+            s.get_hinted(H_CONTEXT, "_context").cloned(),
+            s.get_hinted(H_CALLBACK, "_callback").cloned(),
+        )
+    };
+    let Some(ctx) = ctx else {
+        return Err(crate::error::attribute_error("_context"));
+    };
+    if !matches!(ctx, Object::Dict(_)) {
+        return Ok(ctx);
+    }
+    let cb = cb.unwrap_or(Object::None);
+    let built = crate::stdlib::asyncio_mod::context_for_python(&cb, ctx)?;
+    if let Some(slot) = h.slots.borrow_mut().get_hinted_mut(H_CONTEXT, "_context") {
+        *slot = built.clone();
+    }
+    Ok(built)
 }
 
 /// A `Handle(callback, args, loop, context)` built natively for a loop
@@ -203,6 +231,15 @@ fn install_handle(args: &[Object]) -> Result<Object, RuntimeError> {
     cls.dict
         .borrow_mut()
         .insert(DictKey(Object::from_static("_run")), native);
+    let get_context = Object::Builtin(Rc::new(BuiltinFn {
+        name: "get_context",
+        binds_instance: true,
+        call: Box::new(handle_get_context),
+        call_kw: None,
+    }));
+    cls.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("get_context")), get_context);
     cls.bump_attr_version();
     drop(HANDLE.write().replace(st));
     Ok(Object::None)
@@ -405,6 +442,9 @@ fn loop_call_soon_method(
     for (k, v) in kwargs {
         if k == "context" {
             ctx = v.clone();
+            // (A mapping isn't a context: the Python body's handle fails
+            // to run it, as CPython's does.)
+            plain &= !matches!(ctx, Object::Dict(_));
         } else {
             plain = false;
         }
@@ -435,6 +475,7 @@ pub(crate) fn call_soon(
             if let Some(h) = fast_call_soon(ls, loop_, &cb, cb_args, &ctx)? {
                 return Ok(h);
             }
+            let ctx = crate::stdlib::asyncio_mod::context_for_python(&cb, ctx)?;
             let mut all = Vec::with_capacity(cb_args.len() + 2);
             all.push(loop_.clone());
             all.push(cb);
@@ -442,6 +483,7 @@ pub(crate) fn call_soon(
             return call(&ls.call_soon_py, &all, &[("context".to_owned(), ctx)]);
         }
     }
+    let ctx = crate::stdlib::asyncio_mod::context_for_python(&cb, ctx)?;
     let interp = interp()?;
     let m = interp.load_attr_public(loop_, "call_soon")?;
     let mut all = Vec::with_capacity(cb_args.len() + 1);

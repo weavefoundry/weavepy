@@ -288,12 +288,21 @@ enum CbContext {
 const _: () = assert!(std::mem::size_of::<CbContext>() == std::mem::size_of::<Object>());
 
 impl CbContext {
-    /// The context, built if need be.
-    fn into_context(self) -> Result<Object, RuntimeError> {
-        match self {
-            Self::Given(ctx) => Ok(ctx),
-            Self::Copied(data) => crate::stdlib::contextvars_native::context_over(data),
-        }
+    /// The context a callback added with `context` (`None`: a copy of
+    /// the current one) runs in. A task's context may be a snapshot not
+    /// yet built (see [`crate::stdlib::contextvars_native::snapshot`]).
+    fn new(context: Object) -> Result<Self, RuntimeError> {
+        Ok(match context {
+            Object::None => Self::Copied(crate::stdlib::contextvars_native::current_data()?),
+            Object::Dict(data) => Self::Copied(data),
+            ctx => Self::Given(ctx),
+        })
+    }
+
+    /// The context, or the snapshot it stands for, for `call_soon`
+    /// (whose native handles run a snapshot as it is).
+    fn into_snapshot(self) -> Object {
+        self.into_held()
     }
 
     /// The object this holds (the copied context's mapping, if unbuilt).
@@ -1174,7 +1183,7 @@ fn schedule_callbacks(
             &loop_,
             cb,
             std::slice::from_ref(self_obj),
-            ctx.into_context()?,
+            ctx.into_snapshot(),
         )?;
     }
     Ok(())
@@ -1383,18 +1392,14 @@ fn future_add_done_callback_impl(
     context: Object,
 ) -> Result<(), RuntimeError> {
     ensure_initialized(interp, st)?;
-    let ctx = if matches!(context, Object::None) {
-        CbContext::Copied(crate::stdlib::contextvars_native::current_data()?)
-    } else {
-        CbContext::Given(context)
-    };
+    let ctx = CbContext::new(context)?;
     if future_done_st(st) {
         let loop_ = st.borrow().loop_.clone();
         call_soon(
             &loop_,
             cb,
             std::slice::from_ref(self_obj),
-            ctx.into_context()?,
+            ctx.into_snapshot(),
         )?;
     } else {
         let mut s = st.borrow_mut();
@@ -2145,8 +2150,10 @@ fn task_name_counter() -> i64 {
 /// through a loop handle or a future's callback list is a *visible*
 /// edge and task↔future reference cycles stay collectible (CPython's
 /// `TaskStepMethWrapper_traverse`; test_log_destroyed_pending_task).
+static STEP_FN: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+static WAKEUP_FN: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+
 fn task_step_callable(task: Object) -> Object {
-    static STEP_FN: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
     let f = STEP_FN.get_or_init(|| {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "Task.__step",
@@ -2171,7 +2178,6 @@ fn task_step_callable(task: Object) -> Object {
 /// The `self.__wakeup` done-callback. Same `BoundMethod` shape as
 /// [`task_step_callable`], for the same GC-visibility reason.
 fn task_wakeup_callable(task: Object) -> Object {
-    static WAKEUP_FN: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
     let f = WAKEUP_FN.get_or_init(|| {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "Task.__wakeup",
@@ -2205,6 +2211,91 @@ fn task_wakeup_callable(task: Object) -> Object {
         }))
     });
     Object::BoundMethod(Rc::new(BoundMethod::new(task, f.clone())))
+}
+
+/// The task whose `__step` or `__wakeup` `cb` is.
+fn step_task(cb: &Object) -> Option<&Object> {
+    let Object::BoundMethod(bm) = cb else {
+        return None;
+    };
+    let is = |f: &std::sync::OnceLock<Object>| f.get().is_some_and(|f| f.is_same(&bm.function));
+    (is(&STEP_FN) || is(&WAKEUP_FN)).then_some(&bm.receiver)
+}
+
+/// A task's context, built (and kept) if it's still a snapshot: while
+/// the task runs over it unnamed, the current context it stands for.
+fn task_context(task: &Object, st: &Rc<RefCell<FutState>>) -> Result<Object, RuntimeError> {
+    let ctx = st.borrow().context.clone();
+    let Object::Dict(data) = ctx else {
+        return Ok(ctx);
+    };
+    let running = THREAD_TASK.with(|slot| slot.lock().task.is_same(task));
+    let current = if running {
+        crate::stdlib::contextvars_native::current_for(&data)?
+    } else {
+        None
+    };
+    let built = match current {
+        Some(ctx) => ctx,
+        None => crate::stdlib::contextvars_native::context_over(data)?,
+    };
+    let mut s = st.borrow_mut();
+    if matches!(s.context, Object::Dict(_)) {
+        s.context = built.clone();
+    }
+    Ok(built)
+}
+
+/// Keep `made`, the `Context` a run of `st`'s task built for its
+/// snapshot (see [`crate::stdlib::contextvars_native::run_in_snapshot`]).
+fn adopt_context(st: &Rc<RefCell<FutState>>, made: Option<Object>) {
+    if let Some(made) = made {
+        let old = {
+            let mut s = st.borrow_mut();
+            if matches!(s.context, Object::Dict(_)) {
+                std::mem::replace(&mut s.context, made)
+            } else {
+                made
+            }
+        };
+        drop(old);
+    }
+}
+
+/// `Handle._run`'s `ctx.run(cb, *args)`, `ctx` a handle's context or a
+/// snapshot. A task's step or wakeup runs in the task's context as it is
+/// now (a snapshot scheduled before the task's context was built is
+/// stale), and the task keeps a `Context` built on the way.
+pub(crate) fn run_handle_callback(
+    ctx: &Object,
+    cb: &Object,
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let cv = crate::stdlib::contextvars_native::run_in_snapshot;
+    if !matches!(ctx, Object::Dict(_)) {
+        return crate::stdlib::contextvars_native::run_in_context(ctx, cb, args);
+    }
+    let Some(st) = step_task(cb).and_then(|t| state_of_obj(t).ok()) else {
+        return cv(ctx, cb, args).0;
+    };
+    let own = st.borrow().context.clone();
+    let (result, made) = cv(&own, cb, args);
+    adopt_context(&st, made);
+    result
+}
+
+/// `ctx` for a `call_soon` that isn't native: a snapshot is built (a
+/// task's in the task, which keeps it).
+pub(crate) fn context_for_python(cb: &Object, ctx: Object) -> Result<Object, RuntimeError> {
+    if !matches!(ctx, Object::Dict(_)) {
+        return Ok(ctx);
+    }
+    if let Some(task) = step_task(cb) {
+        if let Ok(st) = state_of_obj(task) {
+            return task_context(task, &st);
+        }
+    }
+    crate::stdlib::contextvars_native::built(ctx)
 }
 
 fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -2277,7 +2368,7 @@ fn task_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
         call(interp, &str_type, &[name])?
     };
     let ctx = if matches!(context, Object::None) {
-        crate::stdlib::contextvars_native::copy_current()?
+        crate::stdlib::contextvars_native::snapshot()?
     } else {
         context
     };
@@ -2329,7 +2420,9 @@ fn task_eager_start(
             call_kw: None,
         }))
     };
-    let run_result = crate::stdlib::contextvars_native::run_in_context(&ctx, &step_fn, &[]);
+    let (run_result, made) =
+        crate::stdlib::contextvars_native::run_in_snapshot(&ctx, &step_fn, &[]);
+    adopt_context(st, made);
     let unregister_result = unregister_eager_task_impl(interp, self_obj);
     swap_current_task_impl(&loop_, &prev);
     run_result?;
@@ -2601,12 +2694,13 @@ fn task_step_handle_result(
                         schedule_step_with_exc(interp, task, loop_, context, new_exc)
                     } else {
                         set_future_blocking_false(interp, &result)?;
+                        let context = task_context(task, st)?;
                         call_method_kw(
                             interp,
                             &result,
                             "add_done_callback",
                             &[task_wakeup_callable(task.clone())],
-                            &[("context".to_owned(), context.clone())],
+                            &[("context".to_owned(), context)],
                         )?;
                         st.borrow_mut().fut_waiter = result.clone();
                         awaited_by_add(&result, task);
@@ -2783,9 +2877,8 @@ fn task_get_coro(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn task_get_context(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (_inst, st) = state_of(args)?;
-    let out = st.borrow().context.clone();
-    Ok(out)
+    let (inst, st) = state_of(args)?;
+    task_context(&Object::Instance(inst), &st)
 }
 
 fn task_get_name(args: &[Object]) -> Result<Object, RuntimeError> {
