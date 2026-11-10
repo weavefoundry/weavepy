@@ -80915,6 +80915,10 @@ struct CodeConstObjects {
     /// Whether the body may call itself (see [`code_recurses`]): `0` not
     /// yet decided, `1` no, `2` yes.
     calls: std::sync::atomic::AtomicU8,
+    /// The loop iterations an activation ran while the code was cold, as
+    /// tier 2 measured them when it compiled the code, plus one (`0` not
+    /// measured; saturating). See [`short_loops`].
+    loop_iters: std::sync::atomic::AtomicU8,
     /// Per `co_names` entry, its position among the shared names of the
     /// instances last checked for shadowing it (see [`inst_may_shadow`]).
     name_memos: std::sync::OnceLock<Box<[crate::inst_dict::NameMemo]>>,
@@ -81861,6 +81865,49 @@ pub fn set_jit_worker_idle_hook(hook: extern "C" fn()) {
     frame_jit::background::set_idle_hook(hook);
     #[cfg(not(feature = "jit"))]
     let _ = hook;
+}
+
+/// The most loop iterations a call (as tier 2 measured them, see
+/// `JitHint::short_loops`) for which a compiled caller calls the code's own
+/// native body directly though tier 2 compiled it: a call into tier 2's
+/// framed entry costs several thousand instructions, as much as dozens of
+/// iterations, while tier 2 keeps the interpreter's calls and its own.
+#[cfg(feature = "jit")]
+pub(crate) const SHORT_LOOP_ITERS: u8 = 16;
+
+/// Whether calls of `code` from compiled code belong to tier 2's compiled
+/// form: it compiled the code, and its loops run long enough a call to pay
+/// for the framed entry (see [`SHORT_LOOP_ITERS`]).
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn tier2_takes_calls(code: &CodeObject) -> bool {
+    let hint = &code.jit_hint;
+    hint.is_compiled()
+        && !hint.is_not_jitable()
+        && !crate::tier2::jit_off_for_process()
+        && !short_loops(code)
+}
+
+/// Record the loop iterations an activation of `code` ran while it was
+/// cold (back edges per call, as tier 2's compile measured them).
+#[cfg(feature = "jit")]
+pub(crate) fn note_loop_iters(code: &CodeObject, iters: u32) {
+    if let Some(ext) = code_vm_ext_existing(code) {
+        let v = u8::try_from(iters.saturating_add(1)).unwrap_or(u8::MAX);
+        ext.loop_iters
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether `code` has loops, and they ran at most [`SHORT_LOOP_ITERS`]
+/// iterations a call while it was cold (see [`note_loop_iters`]).
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn short_loops(code: &CodeObject) -> bool {
+    code_vm_ext_existing(code).is_some_and(|ext| {
+        let v = ext.loop_iters.load(std::sync::atomic::Ordering::Relaxed);
+        v != 0 && v - 1 <= SHORT_LOOP_ITERS && !code.jit_hint.loop_free(code)
+    })
 }
 
 /// Whether the code `ext` is the extension of has run often enough for a
@@ -84859,6 +84906,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             returns_none: std::sync::atomic::AtomicU8::new(0),
             store_init: std::sync::OnceLock::new(),
             calls: std::sync::atomic::AtomicU8::new(0),
+            loop_iters: std::sync::atomic::AtomicU8::new(0),
             name_memos: std::sync::OnceLock::new(),
             gen_names: std::sync::OnceLock::new(),
             ident_strs: std::sync::OnceLock::new(),

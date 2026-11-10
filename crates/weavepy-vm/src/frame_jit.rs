@@ -706,6 +706,21 @@ impl Slot {
         }
     }
 
+    /// Compile this code now if it has no native body yet: tier 2 compiled
+    /// it, and its loops run a few iterations a call (see
+    /// `crate::short_loops`), so a compiled caller's direct call of a body
+    /// of its own costs less than tier 2's framed entry.
+    pub(crate) fn warm_now(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
+        if self.native.get().is_some() {
+            return;
+        }
+        if self.pending.busy() {
+            self.poll_pending(code);
+            return;
+        }
+        self.try_compile(code, ext, nlocals, Heat::Call);
+    }
+
     /// Count a native caller's call of this code (a builtin's or a
     /// constructor's Python callee, whose nested run gains most from a
     /// native body): a third of the code's length, between a compiled
@@ -764,7 +779,8 @@ impl Slot {
             || hint.is_not_jitable()
             || crate::tier2::jit_off_for_process()
             || hint.loop_free(code)
-            || hint.is_backedge_quiet())
+            || hint.is_backedge_quiet()
+            || crate::short_loops(code))
         {
             if stats::enabled() {
                 eprintln!("frame jit: {} left to tier 2", code.qualname);
@@ -10967,6 +10983,21 @@ unsafe fn direct_call<const CALL: bool>(
             });
             if native == 0 {
                 crate::burst_stats::note_decline("no body", &code_rc.qualname);
+                // A callee tier 2 compiled whose loops run a few iterations
+                // a call: a body of its own, for compiled callers to call
+                // directly (see `crate::SHORT_LOOP_ITERS`).
+                if CALL && crate::short_loops(code_rc) {
+                    if let Some(ext) = crate::code_vm_ext(code_rc) {
+                        // (Extended parameters bind exactly the code's
+                        // locals, as `direct_body` counts them.)
+                        let nlocals = if Interpreter::has_extended_params(code_rc) {
+                            code_rc.varnames.len()
+                        } else {
+                            code_rc.varnames.len().max(nargs)
+                        };
+                        ext.frame_jit.warm_now(code_rc, ext, nlocals);
+                    }
+                }
                 // A callee with no body (a frameless leaf) leaves the site's
                 // compiled callees alone.
                 if site.native == 0 {
@@ -11011,9 +11042,7 @@ unsafe fn direct_call<const CALL: bool>(
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
             || !(*st.sw).calls_ok
-            || (code.jit_hint.is_compiled()
-                && !code.jit_hint.is_not_jitable()
-                && !crate::tier2::jit_off_for_process())
+            || crate::tier2_takes_calls(code)
         {
             crate::burst_stats::note_decline(
                 if interp.recs.full_at(nested) {
@@ -12874,9 +12903,7 @@ unsafe fn direct_call_kw(
             || crate::hot_gates::loop_gen() != st.snap_gen
             || !native.enters_at(0)
             || !(*st.sw).calls_ok
-            || (callee.jit_hint.is_compiled()
-                && !callee.jit_hint.is_not_jitable()
-                && !crate::tier2::jit_off_for_process())
+            || crate::tier2_takes_calls(callee)
         {
             return None;
         }

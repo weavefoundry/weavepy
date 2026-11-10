@@ -423,7 +423,7 @@ pub(super) fn note_direct(code: &CodeObject, native: &super::Native, packed: usi
         || (code.arg_count as usize) > FAST_ARGS
         || room > 0x1fff
         || hint.lean_entries() <= crate::tier2::LEAN_WARM_COMPILE_THRESHOLD_CAP
-        || (hint.is_compiled() && !hint.is_not_jitable() && !crate::tier2::jit_off_for_process())
+        || crate::tier2_takes_calls(code)
     {
         return;
     }

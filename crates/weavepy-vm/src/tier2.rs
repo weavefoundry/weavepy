@@ -1231,8 +1231,9 @@ impl JitState {
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         // Whether the code's calls run enough iterations of its loops for
-        // a native entry to pay for the general call.
+        // a native entry to pay for the general call, and how many.
         let long_calls;
+        let iters_per_call;
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1317,7 +1318,8 @@ impl JitState {
                 .calls
                 .wrapping_add(code.jit_hint.lean_entries())
                 .max(1);
-            long_calls = entry.backedges / calls >= LOOP_CALL_ITERATIONS;
+            iters_per_call = entry.backedges / calls;
+            long_calls = iters_per_call >= LOOP_CALL_ITERATIONS;
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
         // The engine is built once an analysis admits some code (see
@@ -1766,6 +1768,20 @@ impl JitState {
                     let hot_loop = long_calls
                         && cf.interp_entry
                         && !(code.is_generator || code.is_coroutine || code.is_async_generator);
+                    // A loop that calls no Python function or method
+                    // natively: a compiled caller's direct call of the
+                    // frame JIT's body serves it better than this one's
+                    // framed entry when it runs a few iterations a call
+                    // (see `crate::SHORT_LOOP_ITERS`). One that does
+                    // (`raytrace`'s `first_hit`) runs its calls better
+                    // here.
+                    if callees.is_empty()
+                        && methods
+                            .iter()
+                            .all(|m| !matches!(m.callee, MethodCallee::Py { .. }))
+                    {
+                        super::note_loop_iters(code, iters_per_call);
+                    }
                     if recursive || hot_loop {
                         code.jit_hint.mark_compiled();
                     } else if !long_calls {

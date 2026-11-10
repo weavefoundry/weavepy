@@ -1417,6 +1417,25 @@ branch and pull request.
     _stacklevel=2)`) costs about 700 instructions in the direct call's
     binding; in `pathlib` much of the work runs in the core loop, its
     short comprehension loops left to tier 2 (item 12 below).
+  - A function whose loops run a few iterations a call and call no Python
+    function or method natively (a filtered comprehension over a short
+    split, `pathlib`'s `_parse_path`) gets a frame-JIT body, and compiled
+    callers call it directly, though tier 2 compiled it. Tier 2's compile
+    now records the iterations a call it measured for such code; at 16 or
+    fewer, a compiled caller's direct call that finds no body compiles one,
+    and the direct call no longer declines that callee (tier 2 keeps the
+    interpreter's calls and its own). Each such call went out to the core
+    loop and into tier 2's framed entry, which costs several thousand
+    instructions. `[x for x in s.split("/") if x]` as a function takes
+    4,735 instructions a call instead of 7,041 (CPython about 4,400), and
+    `PurePosixPath(...).parts` of a new path 37,925 instead of 41,991;
+    `stdlib_utils` retires 2% fewer instructions, and the rest of the suite
+    is level. A loop that calls Python code stays with tier 2, which runs
+    its calls better: with it, `raytrace` (whose `first_hit` loops over
+    four objects calling a method) retired 9% more instructions. (A first
+    version also counted loop-free code as short and compiled
+    `with_segments`, which takes `*args`, for one local too many, so its
+    every call found no body: `p / "x"` took 42% longer.)
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

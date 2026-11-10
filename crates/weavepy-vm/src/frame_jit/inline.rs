@@ -422,6 +422,9 @@ fn keyword_map(
     if nparams > 64 || positional > npos {
         return Err("keywords");
     }
+    if f.defaults_maybe_overridden() {
+        return Err("defaults");
+    }
     let bit = |j: usize| 1u64 << j;
     let mut filled = (0..positional).fold(0, |m, j| m | bit(j));
     let mut slots: Vec<u8> = (0..positional).map(|j| j as u8).collect();
@@ -2690,6 +2693,11 @@ unsafe extern "C" fn h_inline_mask_defaults(
         let Object::Function(f) = &*callee else {
             return 1;
         };
+        // (A rebound `__defaults__` or `__kwdefaults__` lives in the
+        // override, which the full call reads.)
+        if f.defaults_maybe_overridden() {
+            return 1;
+        }
         let code: &CodeObject = &*f.code.as_ptr();
         let npos = code.arg_count as usize;
         let nparams = npos + code.kwonly_count as usize;
