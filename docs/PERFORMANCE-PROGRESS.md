@@ -1323,6 +1323,14 @@ branch and pull request.
     instead of 8,457 (CPython 3,632). Calling such a function still costs
     about 3,000 instructions over CPython's: `vars(o)` takes 4,695 against
     915.
+  - On a PGO build at `57960cea` (November 10, 2026): warm time 0.873 of
+    CPython's, cold 0.980 (from 1.007), peak memory 1.266 (1.253 the
+    previous session; CPython's own moves between sessions), and 0.991 of
+    the previous PGO build's time. `async_tree` takes 1.27 of CPython's
+    time (from 1.45, 0.92 of the previous build). The worst warm times are
+    `async_tree` 1.27, `logging_mix` 1.15, `context_managers` 1.14,
+    `deepcopy` 1.12 (its instructions unchanged; its time moved 2 to 5%
+    between runs), `closures_decorators` 1.08 and `collections_mix` 1.07.
   - Fixed: a signal that a native function trips (`os.kill` of this
     process) now runs its handler as the call returns when the core loop's
     lane runs the function, as CPython's calls of C functions check the
