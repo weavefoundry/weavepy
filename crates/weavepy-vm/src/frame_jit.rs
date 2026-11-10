@@ -13336,6 +13336,22 @@ unsafe extern "C" fn h_call_ex(
         if let Some(r) = spread_on_frame(st, pc, start) {
             return r;
         }
+        call_ex_general(st, pc, start)
+    }
+}
+
+/// The rest of [`h_call_ex`] once neither a direct call nor a call on the
+/// frame alone took the `CALL_FUNCTION_EX` at `pc` (its operands from
+/// `start`, synced on the frame, `frame.pc` at it): the core loop's arm,
+/// else its lane, else its full handler.
+///
+/// # Safety
+///
+/// As [`h_call_ex`]'s.
+#[inline(never)]
+unsafe fn call_ex_general(st: &mut State, pc: usize, start: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
         settle(st);
         let sw = &mut *st.sw;
         *sw.last = st.last;
@@ -13413,6 +13429,13 @@ unsafe extern "C" fn h_call_forward(
             frame.pc = pc as u32 + 3;
             if let Some(r) = spread_on_frame(st, pc + 3, start) {
                 return r;
+            }
+            // The empty mapping's merge would change nothing: the call
+            // goes on as its `CALL_FUNCTION_EX` without one (a native
+            // method's, say), rather than the core loop running the four
+            // instructions.
+            if !matches!(&*st.stack.add(start), Object::Function(_)) {
+                return call_ex_general(st, pc + 3, start);
             }
         } else if len < st.cap {
             // Keywords to forward: the merge into the call's fresh mapping

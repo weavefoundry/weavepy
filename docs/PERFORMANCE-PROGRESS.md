@@ -1245,6 +1245,18 @@ branch and pull request.
     suspends keeps its activation's box and a stack sized for compiled
     code), its state (184 bytes reached through a handle slot and a
     registry), and the loop's `Handle` (216 bytes) and step callable.
+  - `f(*args, **kwargs)` of a native method bound to its receiver runs
+    from compiled code. A wrapper forwarding to a saved `log.append` took
+    1,132 ns a call against CPython's 159: a spread call of a bound native
+    method found no in-place path, and a forwarding wrapper (`return
+    f(*args, **kwargs)` with no keywords) whose callee wasn't a Python
+    function left compiled code for the core loop at its `BUILD_MAP`. A
+    bound leaf method now runs in place, its receiver first as a `CALL`
+    passes it, and a forward with no keywords goes on as its
+    `CALL_FUNCTION_EX` without the mapping: 291 ns. A non-leaf method
+    (`ExitStack.callback(log.clear)`) still takes the core loop's lane,
+    494 ns against 119. The suite's instructions are level: no workload
+    forwards to a native method in its loop.
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,

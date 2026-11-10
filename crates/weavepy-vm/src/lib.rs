@@ -18618,26 +18618,40 @@ impl Interpreter {
     ) -> Option<Result<(), RuntimeError>> {
         let n = frame.stack.len();
         let callee_slot = n.checked_sub(4)?;
-        let [Object::Builtin(b), Object::Unbound, spread, mapping] = &frame.stack[callee_slot..]
-        else {
+        let [callee, Object::Unbound, spread, mapping] = &frame.stack[callee_slot..] else {
             return None;
+        };
+        // A builtin, or a native method bound to its receiver
+        // (`callback(*args, **kwds)` of a saved `log.append`), which takes
+        // the receiver first, as a `CALL` of the method passes it.
+        let (b, receiver) = match callee {
+            Object::Builtin(b) if !b.binds_instance => (b, None),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Builtin(b) if b.binds_instance => (b, Some(&bm.receiver)),
+                _ => return None,
+            },
+            _ => return None,
         };
         let empty_kw = match mapping {
             Object::Unbound => true,
             Object::Dict(d) => d.try_borrow().is_ok_and(|d| d.is_empty()),
             _ => false,
         };
-        if !empty_kw || b.binds_instance {
+        if !empty_kw {
             return None;
         }
-        let items: Vec<Object> = match spread {
-            Object::Tuple(t) => t.to_vec(),
+        let mut items: Vec<Object> = Vec::new();
+        if let Some(r) = receiver {
+            items.push(r.clone());
+        }
+        match spread {
+            Object::Tuple(t) => items.extend(t.iter().cloned()),
             Object::List(l) => match l.try_borrow() {
-                Ok(l) => l.clone(),
+                Ok(l) => items.extend(l.iter().cloned()),
                 Err(_) => return None,
             },
             _ => return None,
-        };
+        }
         // As the core loop's `CALL` arm runs a leaf builtin.
         let r = match self.leaf_call_kind(b) {
             Some(LeafKind::Fast(f)) => f(&items),
