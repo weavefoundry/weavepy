@@ -19361,6 +19361,15 @@ impl<'a> Lower<'a> {
         let key = self.pop();
         let cont = self.pop();
         let slot = self.depth;
+        // A site that has run an instance's Python `__getitem__`: that
+        // first, the native containers' paths only when it declines.
+        if !self.inlining()
+            && self.code.instructions[pc].op == OpCode::BinarySubscr
+            && crate::instance_site(self.ext, pc)
+            && self.vs.iter().all(|i| matches!(i, Item::Mem(_)))
+        {
+            return self.subscr_dunder_first(pc, slot, cont, key);
+        }
         let tuple = self.seq_index_site(pc, cont);
         let key_int = match key {
             Item::Int(v) => Some(v),
@@ -19388,6 +19397,55 @@ impl<'a> Lower<'a> {
         self.set_last(pc);
         // (The helper released the owned operands; a finalizer that queued
         // runs before the next instruction.)
+        self.check_released(pc + 1);
+        true
+    }
+
+    /// [`Self::subscr_ref`] at a site that has run an instance's Python
+    /// `__getitem__`: the operands into their slots from `slot`, the
+    /// method called directly ([`h_subscr_dunder`]), and the ordinary
+    /// subscript's helpers only when it declines.
+    fn subscr_dunder_first(&mut self, pc: usize, slot: usize, cont: Item, key: Item) -> bool {
+        self.materialize(cont, slot);
+        self.materialize(key, slot + 1);
+        let code = self.code_ptr();
+        let pcv = self.b.ins().iconst(types::I64, pc as i64);
+        let slotv = self.b.ins().iconst(types::I64, slot as i64);
+        let site: Box<DirectSite> = Box::default();
+        let site_at = self
+            .b
+            .ins()
+            .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+        self.direct_sites.push(site);
+        let d = self
+            .call(
+                h_subscr_dunder as *const () as usize,
+                &[self.st, code, pcv, slotv, site_at],
+                true,
+            )
+            .expect("returns");
+        let other = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(d, other, &[], done, &[]);
+        self.b.switch_to_block(other);
+        let declined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+        let generic = self.b.create_block();
+        let leave = self.b.create_block();
+        self.b.ins().brif(declined, generic, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.leave(d);
+        self.b.set_cold_block(generic);
+        self.b.switch_to_block(generic);
+        let pcont = self.slot_addr(slot);
+        let pkey = self.slot_addr(slot + 1);
+        self.subscr_call(pc, slot, pcont, pkey, 3);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        self.push(Item::Mem(slot));
+        self.set_last(pc);
         self.check_released(pc + 1);
         true
     }
