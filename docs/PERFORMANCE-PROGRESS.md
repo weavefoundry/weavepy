@@ -1400,6 +1400,23 @@ branch and pull request.
     still holds 6.4 MB more than at start-up (sampled): about 3 MB of it
     for the code that ran (its decoded bodies, constants, names, caches and
     tables), 1 MB for classes and 0.5 MB for functions.
+  - A keyword call lowers in line when its keywords aren't the callee's
+    next parameters in order: a keyword past a defaulted parameter
+    (`f(a, c=3)`), keywords in another order, or a keyword-only parameter
+    given by keyword. The plan maps each argument to its parameter, and one
+    helper fills the rest from the defaults before any argument is
+    written (a rebound `__defaults__` or `__kwdefaults__` declines it). Only
+    keywords that continued the positional ones lowered in line before;
+    the rest took the frameless-leaf evaluator or a direct call. `f("ab",
+    c=3)` of `def f(a, b=1, c=2): return len(a)` takes 477 instructions
+    instead of 1,314 (CPython 841).
+  - Where `stdlib_utils`' time goes: `pathlib` and `urllib.parse` take
+    about 1.9 times CPython's time on their own (1.25 to 1.35 times its
+    instructions), and `datetime`, native here, a tenth of it. A
+    `urllib.parse` keyword call of a long function (`parse_qsl(...,
+    _stacklevel=2)`) costs about 700 instructions in the direct call's
+    binding; in `pathlib` much of the work runs in the core loop, its
+    short comprehension loops left to tier 2 (item 12 below).
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an
