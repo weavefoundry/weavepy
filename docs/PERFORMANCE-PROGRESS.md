@@ -1257,6 +1257,35 @@ branch and pull request.
     (`ExitStack.callback(log.clear)`) still takes the core loop's lane,
     494 ns against 119. The suite's instructions are level: no workload
     forwards to a native method in its loop.
+  - A blocking native call (`select`, `time.sleep`, a lock) puts the
+    thread's lazily running activations on the spine first only when
+    something could read its frames while it blocks: another thread
+    (which turns shared reference counts on before it starts, as
+    faulthandler's watchdog does) or a faulthandler dump armed for a
+    signal. An event loop's `select` blocks once a step, and its pending
+    callers (`KqueueSelector.select`, `BaseEventLoop._run_once`)
+    registered each time: a `sleep(0)` step runs 39,700 instructions
+    instead of 41,500 (CPython 33,400, most of it the system call on both).
+  - Where the rest of a step goes: a `sleep(0)` round trip, the loop's
+    iteration included, runs 24,300 instructions over 1,916 distinct cache
+    lines of code (120 KB, four times the L1 instruction cache) in 232
+    functions, none above 96 lines. The direct call `_run_once` makes to
+    `handle._run()` still registers once a step (the lazily awaited
+    `sleep`'s coroutine suspends), and a few compiled sites take their slow
+    helper every step (`h_method`'s `method_slow`, `attr_stack_slow`, an
+    instance's truth).
+  - Why caught exceptions cost more inside a function another compiled
+    one calls: catching runs the handler search with the activation on the
+    switch (`h_catch` settles it), so a direct call whose body catches an
+    exception registers, and so does every lazily running caller above it.
+    In `exceptions` the `lookup` and `guarded` calls register 119,000
+    times a warm call. Raising out of a callee and catching in the caller
+    runs 6,700 instructions against CPython's 3,650, of which the crossing
+    costs 3,090 against 1,270. A traceback entry refers to its
+    activation's shell, which a direct call doesn't have; catching without
+    registering needs entries that name the record and are made whole only
+    if they outlive the call (on its return or raise), so a clean return
+    checks for them.
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,

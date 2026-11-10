@@ -833,8 +833,16 @@ impl<T> Drop for ReleaseUnderGil<T> {
 /// (`PyEval_SaveThread()` / `PyEval_RestoreThread()`) lands here.
 pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
     // Other threads may look at this one's frames while it blocks: lean
-    // activations waiting for their shells get them first.
-    crate::builtins::sync_frame_spine();
+    // activations waiting for their shells get them first. With no other
+    // thread (a second thread turns shared reference counts on before it
+    // starts) and no dump armed, nothing can look until this thread runs
+    // again, and whatever looks then makes the spine whole first (an event
+    // loop's `select` blocks once a step).
+    if crate::sync::rc_shared_flag().load(Ordering::Relaxed)
+        || crate::stdlib::faulthandler_mod::may_read_frames()
+    {
+        crate::builtins::sync_frame_spine();
+    }
     // Pop every guard we currently hold (a worker calls
     // `start_new_thread` -> builtin -> `allow_threads_then` with
     // exactly one guard; nested cases pop them all).
