@@ -3204,55 +3204,104 @@ fn reachable_blocks(raw: &[RawBlock], roots: &[usize]) -> Vec<usize> {
     order
 }
 
-/// Compute the live-in local set via a definite-assignment must-analysis.
-fn compute_livein(
+/// A set of local slots, a bit each (the definite-assignment analyses'
+/// sets: their fixpoints intersect and compare them over and over).
+#[derive(Clone, PartialEq, Eq)]
+struct SlotBits(Vec<u64>);
+
+impl SlotBits {
+    fn empty(width: u32) -> SlotBits {
+        SlotBits(vec![0; (width as usize).div_ceil(64)])
+    }
+
+    /// Slots `0..n` (of a set `width` wide).
+    fn prefix(width: u32, n: u32) -> SlotBits {
+        let mut bits = SlotBits::empty(width);
+        for s in 0..n.min(width) {
+            bits.insert(s);
+        }
+        bits
+    }
+
+    fn insert(&mut self, slot: u32) {
+        if let Some(w) = self.0.get_mut(slot as usize / 64) {
+            *w |= 1 << (slot % 64);
+        }
+    }
+
+    fn contains(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
+    }
+}
+
+/// For each of `reachable`'s blocks, the local slots every path from the
+/// entry (or from one of `roots`, which assign nothing) has stored on
+/// entering it: the greatest fixpoint, from every slot, of the meet over
+/// a block's predecessors of what each leaves assigned. The sets are
+/// `width` slots wide.
+fn assigned_on_entry(
     code: &CodeObject,
     raw: &[RawBlock],
     reachable: &[usize],
-    n_locals: u32,
-) -> HashSet<u32> {
-    let param_slots: HashSet<u32> = (0..code.arg_count).collect();
-    let reachset: HashSet<usize> = reachable.iter().copied().collect();
-
+    roots: Option<&HashSet<usize>>,
+    params: u32,
+    full: u32,
+    width: u32,
+) -> Vec<SlotBits> {
+    let mut is_reachable = vec![false; raw.len()];
+    for &b in reachable {
+        is_reachable[b] = true;
+    }
     // Predecessors among reachable blocks.
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); raw.len()];
     for &b in reachable {
         for &s in &raw[b].succs {
-            if reachset.contains(&s) {
+            if is_reachable.get(s).copied().unwrap_or(false) {
                 preds[s].push(b);
             }
         }
     }
-
-    let full: HashSet<u32> = (0..n_locals).collect();
+    // What each block stores.
+    let stores: Vec<SlotBits> = (0..raw.len())
+        .map(|b| {
+            let mut bits = SlotBits::empty(width);
+            if is_reachable[b] {
+                for i in raw[b].start..raw[b].end {
+                    let ins = code.instructions[i];
+                    if ins.op == OpCode::StoreFast {
+                        bits.insert(ins.arg);
+                    }
+                }
+            }
+            bits
+        })
+        .collect();
     let entry = block_index_at(raw, 0);
-    let mut assigned_in: Vec<HashSet<u32>> = vec![full.clone(); raw.len()];
-    if let Some(slot) = assigned_in.get_mut(entry) {
-        *slot = param_slots.clone();
-    }
-
-    // Fixpoint: assigned_in[b] = ∩ assigned_out[pred].
+    let param_bits = SlotBits::prefix(width, params);
+    let mut assigned_in: Vec<SlotBits> = vec![SlotBits::prefix(width, full); raw.len()];
+    let mut acc = SlotBits::empty(width);
     loop {
         let mut changed = false;
         for &b in reachable {
-            let new_in = if b == entry {
-                param_slots.clone()
+            if roots.is_some_and(|r| r.contains(&b)) {
+                acc.0.fill(0);
+            } else if b == entry {
+                acc.0.copy_from_slice(&param_bits.0);
             } else if preds[b].is_empty() {
                 // Unreachable-but-listed guard; treat as empty.
-                HashSet::default()
+                acc.0.fill(0);
             } else {
-                let mut acc: Option<HashSet<u32>> = None;
-                for &p in &preds[b] {
-                    let out = assigned_out(code, &raw[p], &assigned_in[p]);
-                    acc = Some(match acc {
-                        None => out,
-                        Some(a) => a.intersection(&out).copied().collect(),
-                    });
+                for (k, &p) in preds[b].iter().enumerate() {
+                    let (pin, pst) = (&assigned_in[p].0, &stores[p].0);
+                    for (w, (i, s)) in acc.0.iter_mut().zip(pin.iter().zip(pst)) {
+                        *w = if k == 0 { i | s } else { *w & (i | s) };
+                    }
                 }
-                acc.unwrap_or_default()
-            };
-            if new_in != assigned_in[b] {
-                assigned_in[b] = new_in;
+            }
+            if acc != assigned_in[b] {
+                std::mem::swap(&mut assigned_in[b], &mut acc);
                 changed = true;
             }
         }
@@ -3260,15 +3309,43 @@ fn compute_livein(
             break;
         }
     }
+    assigned_in
+}
 
+/// The width of the slot sets for `code`: its locals, and any slot an
+/// instruction names past them.
+fn slot_width(code: &CodeObject, n_locals: u32) -> u32 {
+    code.instructions
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.op,
+                OpCode::LoadFast | OpCode::StoreFast | OpCode::DeleteFast
+            )
+        })
+        .map(|i| i.arg + 1)
+        .fold(n_locals, u32::max)
+}
+
+/// Compute the live-in local set via a definite-assignment must-analysis.
+fn compute_livein(
+    code: &CodeObject,
+    raw: &[RawBlock],
+    reachable: &[usize],
+    n_locals: u32,
+) -> HashSet<u32> {
+    let width = slot_width(code, n_locals.max(code.arg_count));
+    let assigned_in =
+        assigned_on_entry(code, raw, reachable, None, code.arg_count, n_locals, width);
     // Collect live-in: a load of a slot not definitely assigned yet.
     let mut livein = HashSet::default();
+    let mut cur = SlotBits::empty(width);
     for &b in reachable {
-        let mut cur = assigned_in[b].clone();
+        cur.0.copy_from_slice(&assigned_in[b].0);
         for i in raw[b].start..raw[b].end {
             let ins = code.instructions[i];
             match ins.op {
-                OpCode::LoadFast if !cur.contains(&ins.arg) => {
+                OpCode::LoadFast if !cur.contains(ins.arg) => {
                     livein.insert(ins.arg);
                 }
                 OpCode::StoreFast => {
@@ -3290,54 +3367,25 @@ fn root_livein(
     reachable: &[usize],
     roots: &HashSet<usize>,
 ) -> Vec<u32> {
-    let reachset: HashSet<usize> = reachable.iter().copied().collect();
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); raw.len()];
-    for &b in reachable {
-        for &s in &raw[b].succs {
-            if reachset.contains(&s) {
-                preds[s].push(b);
-            }
-        }
-    }
     let n_real = code.varnames.len() as u32;
-    let full: HashSet<u32> = (0..n_real).collect();
-    let params: HashSet<u32> = (0..code.arg_count.min(n_real)).collect();
-    let entry = block_index_at(raw, 0);
-    let mut assigned_in: Vec<HashSet<u32>> = vec![full; raw.len()];
-    loop {
-        let mut changed = false;
-        for &b in reachable {
-            let new_in = if roots.contains(&b) {
-                HashSet::default()
-            } else if b == entry {
-                params.clone()
-            } else {
-                let mut acc: Option<HashSet<u32>> = None;
-                for &p in &preds[b] {
-                    let out = assigned_out(code, &raw[p], &assigned_in[p]);
-                    acc = Some(match acc {
-                        None => out,
-                        Some(a) => a.intersection(&out).copied().collect(),
-                    });
-                }
-                acc.unwrap_or_default()
-            };
-            if new_in != assigned_in[b] {
-                assigned_in[b] = new_in;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let width = slot_width(code, n_real);
+    let assigned_in = assigned_on_entry(
+        code,
+        raw,
+        reachable,
+        Some(roots),
+        code.arg_count.min(n_real),
+        n_real,
+        width,
+    );
     let mut live: BTreeSet<u32> = BTreeSet::new();
+    let mut cur = SlotBits::empty(width);
     for &b in reachable {
-        let mut cur = assigned_in[b].clone();
+        cur.0.copy_from_slice(&assigned_in[b].0);
         for i in raw[b].start..raw[b].end {
             let ins = code.instructions[i];
             match ins.op {
-                OpCode::LoadFast | OpCode::DeleteFast if !cur.contains(&ins.arg) => {
+                OpCode::LoadFast | OpCode::DeleteFast if !cur.contains(ins.arg) => {
                     live.insert(ins.arg);
                 }
                 OpCode::StoreFast => {
@@ -3367,18 +3415,6 @@ fn control_succs(code: &CodeObject, pc: usize) -> Vec<usize> {
         | OpCode::ForIter => vec![pc + 1, forward_target(pc, ins.arg)],
         _ => vec![pc + 1],
     }
-}
-
-/// `assigned_in ∪ {slots stored in this block}`.
-fn assigned_out(code: &CodeObject, b: &RawBlock, assigned_in: &HashSet<u32>) -> HashSet<u32> {
-    let mut out = assigned_in.clone();
-    for i in b.start..b.end {
-        let ins = code.instructions[i];
-        if matches!(ins.op, OpCode::StoreFast) {
-            out.insert(ins.arg);
-        }
-    }
-    out
 }
 
 /// What a callee marker stands for (RFC 0065 WS5): a burned-in Python

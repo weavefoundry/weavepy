@@ -1159,6 +1159,14 @@ branch and pull request.
     cost 2.5% and an unbounded queue held each waiting compile's functions
     (40 compiles at once held 2.4 MB). `WEAVEPY_FRAME_JIT_SYNC=1`
     generates in line.
+  - Tier 2's definite-assignment analyses (a region's live-in slots, and
+    what interpreted code leaves an OSR root to read) run their fixpoints
+    over bit sets, each block's stores collected once, instead of cloning
+    and intersecting hash sets on every pass. In `class_creation`'s first
+    call tier 2's analysis was 9% of all instructions (it analyzes the
+    fresh methods `dataclasses` builds), the two fixpoints 18M of them; the
+    whole first run now takes 1.8% fewer instructions (`comprehensions`
+    0.6%, the rest level).
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,
