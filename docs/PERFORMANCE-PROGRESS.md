@@ -1352,6 +1352,16 @@ branch and pull request.
     `assertRaises` called left behind after the class's earlier tests
     had warmed the paths (some native among them keeps the frames alive
     that `traceback.clear_frames` should clear).
+  - Tried and dropped: `LOAD_GLOBAL`'s cache hit checked in compiled code
+    instead of in `h_global` (1.1% of the suite's instructions, averaged
+    over the workloads): the suite came out level (1.001), `raytrace`
+    1% lower and `class_creation` 3% higher, its fresh code compiling the
+    longer sequence at every global load.
+  - Where the suite's instructions go, by function, averaged over the 33
+    workloads' warm calls (callgrind): nothing takes more than 1.3%
+    (`Object`'s drop glue, `mi_free`, the allocation, `h_call_site`,
+    `h_site_leaf`, `h_global`, `core_store_init`), and the first fifty
+    together take about 30%.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an
