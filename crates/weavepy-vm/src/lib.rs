@@ -81655,6 +81655,15 @@ pub(crate) fn method_site_callees(
     out
 }
 
+/// Have the JIT's code-generation worker run `hook` whenever it runs out of
+/// work (the executable's allocator collecting the worker's free pages).
+pub fn set_jit_worker_idle_hook(hook: extern "C" fn()) {
+    #[cfg(feature = "jit")]
+    frame_jit::background::set_idle_hook(hook);
+    #[cfg(not(feature = "jit"))]
+    let _ = hook;
+}
+
 /// Whether the code `ext` is the extension of has run often enough for a
 /// compiled caller to take it in line: activations and frameless leaf
 /// evaluations, or a body of its own.

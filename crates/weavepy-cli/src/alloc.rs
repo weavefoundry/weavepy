@@ -85,6 +85,7 @@ unsafe impl GlobalAlloc for Mimalloc {
 
 extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
+    fn mi_collect(force: bool);
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     fn mi_manage_memory(
@@ -371,4 +372,12 @@ pub extern "C" fn configure() {
     reserve_lean_arena();
     #[cfg(target_vendor = "apple")]
     reserve_first_arena();
+    weavepy_vm::set_jit_worker_idle_hook(collect_thread_heap);
+}
+
+/// Hand the calling thread's free pages back (the JIT worker's, between
+/// compiles): another thread's allocations can then take them.
+extern "C" fn collect_thread_heap() {
+    // SAFETY: collects the calling thread's own heap.
+    unsafe { mi_collect(true) };
 }

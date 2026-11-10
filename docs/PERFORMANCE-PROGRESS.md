@@ -1138,6 +1138,41 @@ branch and pull request.
     `call_soon` in turn). A parked task takes 1,238 bytes against 811: its
     context copy alone is two allocations (96 and 56 bytes) where
     CPython's shares one immutable mapping.
+  - The frame JIT generates machine code on a worker thread. A compile's
+    lowering reads the code's caches and the objects they hold, so it stays
+    on the interpreter's thread, but its functions are plain data: the
+    worker generates their machine code (about two-thirds of a compile's
+    time) while the code goes on running as it was, and the code's next
+    activation or back edge installs and publishes it. At most one job is
+    in flight (a compile that gets hot while the worker is busy waits for
+    its heat's next trigger), the worker hands its allocator pages back
+    whenever it runs out of work, and installing stays with the
+    interpreter's thread, so the worker holds no lock of the VM's; a forked
+    child drops the compiles its parent's worker had (a fork handler bumps
+    a generation) and compiles them again, and `os.fork()`'s many-threads
+    warning doesn't count the worker. Against generating in line, the same
+    binary's first calls take 0.972 of the time (`stdlib_utils` 0.90,
+    `chaos` 0.90, `scimark` 0.91, `raytrace` 0.92, `class_creation` 0.92),
+    warm instructions are identical, and peak memory is 1.4% higher
+    (`raytrace` 8%, `chaos` 5%): the worker's scratch and the
+    interpreter's allocations are now alive at once. Two jobs in flight
+    cost 2.5% and an unbounded queue held each waiting compile's functions
+    (40 compiles at once held 2.4 MB). `WEAVEPY_FRAME_JIT_SYNC=1`
+    generates in line.
+  - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
+    CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
+    the previous PGO build). The worst warm times are `async_tree` 1.45,
+    `context_managers` 1.19, `logging_mix` 1.10, `deepcopy`,
+    `collections_mix` and `sudoku` 1.09. Peak memory isn't heap: in
+    `tomllib_loads` the live heap peaks at 6.3 MB of 19.2 MB resident
+    (CPython 14.1), the frame JIT's share is about 1.5 MB though its code
+    is 100 to 400 KB per workload, and the purge delay doesn't change it.
+    In `async_tree` the collector costs 25 ms of the first call (CPython's
+    10), and with it off the first call still takes 107 ms against 59: a
+    `sleep(0)` round trip runs 19,100 instructions against 15,500 and
+    16,200 cycles against 9,400, and a trivial generator's life 2,493
+    instructions against 1,210 (creation about 790, each resume about 450,
+    the end about 340).
   - Where a first run's extra time goes (callgrind, the cold call less a
     warm one): in `async_tree` 61% is the cycle collector, whose young
     collections grow with the pending task tree (2,000 to 33,000

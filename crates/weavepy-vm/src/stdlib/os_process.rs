@@ -671,6 +671,10 @@ pub fn process_is_multithreaded() -> bool {
     }
     if THREAD_BASELINE_SET.load(std::sync::atomic::Ordering::Acquire) {
         if let Some(now) = count_os_threads() {
+            // (The JIT's code-generation worker isn't a thread of the
+            // program's.)
+            #[cfg(feature = "jit")]
+            let now = now.saturating_sub(crate::frame_jit::background::worker_threads());
             return now > THREAD_BASELINE.load(std::sync::atomic::Ordering::Acquire);
         }
     }

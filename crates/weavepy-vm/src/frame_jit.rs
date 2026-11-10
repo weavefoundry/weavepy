@@ -614,6 +614,9 @@ pub(crate) struct Slot {
     /// How many times the code got hot while start-up or an import ran
     /// (see `try_compile`).
     deferred: AtomicU32,
+    /// A compile whose machine code a worker is generating (see
+    /// [`background`]).
+    pending: background::Pending,
 }
 
 impl Slot {
@@ -640,6 +643,10 @@ impl Slot {
     #[inline(always)]
     pub(crate) fn warm(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize, at: Heat) {
         if self.native.get().is_some() {
+            return;
+        }
+        if self.pending.busy() {
+            self.poll_pending(code);
             return;
         }
         // The heat estimates the interpreting so far: a back edge counts its
@@ -683,6 +690,10 @@ impl Slot {
         if self.native.get().is_some() {
             return;
         }
+        if self.pending.busy() {
+            self.poll_pending(code);
+            return;
+        }
         let n = code.instructions.len() as u32;
         let h = self
             .heat
@@ -707,6 +718,10 @@ impl Slot {
     #[inline]
     pub(crate) fn warm_native(&self, code: &CodeObject, ext: &CodeConstObjects, nlocals: usize) {
         if self.native.get().is_some() {
+            return;
+        }
+        if self.pending.busy() {
+            self.poll_pending(code);
             return;
         }
         let n = code.instructions.len() as u32;
@@ -764,13 +779,62 @@ impl Slot {
             // (Another loop may yet get hot.)
             return;
         }
+        // (A busy worker: the code compiles at its heat's next trigger, a
+        // twentieth of the way on.)
+        if background::saturated() {
+            let n = code.instructions.len() as u32;
+            let at_hot = hot().saturating_mul(n);
+            self.heat.store(at_hot - at_hot / 20, Ordering::Relaxed);
+            return;
+        }
         let t0 = stats::enabled().then(std::time::Instant::now);
         let Some(lowered) = compile(code, ext, nlocals, at) else {
             let _ = self.native.set(None);
             return;
         };
         let Compile { units, parts } = lowered;
+        // The machine code is generated off this thread when a worker can
+        // take it: the code goes on running as it was until its next
+        // activation or back edge finds the code ready (see `poll_pending`).
+        let units = match background::submit(units) {
+            Ok(job) => {
+                self.pending.park(parts, job, t0);
+                return;
+            }
+            Err(units) => units,
+        };
         let compiled = publish(self, install(parts, units));
+        if let Some(t0) = t0 {
+            eprintln!(
+                "frame jit: {} compiled: {} ({} instructions, {:?})",
+                code.qualname,
+                compiled,
+                code.instructions.len(),
+                t0.elapsed()
+            );
+        }
+    }
+
+    /// The compile a worker took (see [`background::submit`]): published
+    /// once its machine code is ready; dropped, for the heat to compile
+    /// the code again, when it never will be (a forked child's, whose
+    /// worker didn't survive the fork).
+    #[cold]
+    #[inline(never)]
+    fn poll_pending(&self, code: &CodeObject) {
+        let Some((ready, parts, t0)) = self.pending.take_ready() else {
+            return;
+        };
+        let compiled = match ready {
+            background::Ready::Code(codes) => publish(self, install_codes(parts, codes)),
+            background::Ready::Failed => publish(self, Err(Box::new(parts))),
+            // (An orphaned compile publishes nothing: the code compiles
+            // again once it gets hot again.)
+            background::Ready::Orphaned => {
+                drop(parts);
+                return;
+            }
+        };
         if let Some(t0) = t0 {
             eprintln!(
                 "frame jit: {} compiled: {} ({} instructions, {:?})",
@@ -14356,6 +14420,241 @@ fn verify() -> bool {
     *VERIFY.get_or_init(|| std::env::var_os("WEAVEPY_FRAME_JIT_VERIFY").is_some())
 }
 
+/// Machine code generated off the interpreter's thread. A compile's
+/// lowering reads the code's caches and the objects they hold, so it runs
+/// where the code does, but its functions are plain data: one worker
+/// thread generates their machine code (most of a compile's time) while
+/// the code goes on running as it was, and the slot's next look at its
+/// heat installs and publishes the result (see `Slot::poll_pending`). The
+/// worker touches nothing of the interpreter's and takes no lock of its
+/// own while it works, and installing stays with the interpreter's
+/// thread, so a fork never leaves a lock held; a forked child's compiles
+/// that were waiting on the parent's worker are dropped (see
+/// [`FORK_GEN`]) and compile again once hot.
+/// (`WEAVEPY_FRAME_JIT_SYNC=1` generates in line, a tuning aid.)
+pub(crate) mod background {
+    use super::{generate, Parts, Unit};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    /// A compile handed to the worker.
+    pub(super) struct Job {
+        done: AtomicBool,
+        out: Mutex<Option<Vec<weavepy_codegen::Code>>>,
+        /// The fork generation it was handed over in.
+        gen: u64,
+    }
+
+    /// Bumped in a forked child, where the parent's worker doesn't exist:
+    /// jobs from an earlier generation never finish.
+    static FORK_GEN: AtomicU64 = AtomicU64::new(0);
+
+    /// Jobs handed over and not yet done, and how many there may be: each
+    /// waiting job holds its lowered functions, which a burst of compiles
+    /// would otherwise pile up (40 at once held 2.4 MB more than compiling
+    /// each in line).
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    const MAX_IN_FLIGHT: usize = 1;
+
+    /// Whether the worker already has all the jobs it may: a compile then
+    /// waits (the code stays as it is, its heat about to trigger again).
+    #[inline]
+    pub(super) fn saturated() -> bool {
+        IN_FLIGHT.load(Ordering::Relaxed) >= MAX_IN_FLIGHT
+    }
+
+    struct Worker {
+        gen: u64,
+        tx: mpsc::Sender<(Vec<Unit>, Arc<Job>)>,
+    }
+
+    static WORKER: Mutex<Option<Worker>> = Mutex::new(None);
+
+    /// What the worker runs whenever it runs out of work (see
+    /// [`set_idle_hook`]): `0` for nothing.
+    static IDLE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Have the worker run `hook` whenever it runs out of work: the
+    /// executable's allocator hands the worker's free pages back, which the
+    /// interpreter's thread would otherwise not reuse while code keeps
+    /// compiling beside it (its peak then adds the compiles' scratch).
+    pub(crate) fn set_idle_hook(hook: extern "C" fn()) {
+        IDLE_HOOK.store(hook as usize, Ordering::Relaxed);
+    }
+
+    fn idle() {
+        let hook = IDLE_HOOK.load(Ordering::Relaxed);
+        if hook != 0 {
+            // SAFETY: stored from an `extern "C" fn()` by `set_idle_hook`.
+            let hook = unsafe { std::mem::transmute::<usize, extern "C" fn()>(hook) };
+            hook();
+        }
+    }
+
+    #[cfg(unix)]
+    extern "C" fn after_fork_child() {
+        FORK_GEN.fetch_add(1, Ordering::Relaxed);
+        // (The parent's jobs never finish here.)
+        IN_FLIGHT.store(0, Ordering::Relaxed);
+    }
+
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            !cfg!(test)
+                && !super::verify()
+                && std::env::var_os("WEAVEPY_FRAME_JIT_SYNC").is_none_or(|v| v == "0")
+        })
+    }
+
+    /// Whether this process has a live worker (which `os.fork()`'s
+    /// many-threads warning doesn't count).
+    pub(crate) fn worker_threads() -> usize {
+        match WORKER.try_lock() {
+            Ok(w) => usize::from(
+                w.as_ref()
+                    .is_some_and(|w| w.gen == FORK_GEN.load(Ordering::Relaxed)),
+            ),
+            Err(_) => 0,
+        }
+    }
+
+    /// Hand `units` to the worker (started on first use): the job, or the
+    /// units back when no worker takes them.
+    pub(super) fn submit(units: Vec<Unit>) -> Result<Arc<Job>, Vec<Unit>> {
+        if !enabled() {
+            return Err(units);
+        }
+        let gen = FORK_GEN.load(Ordering::Relaxed);
+        let Ok(mut worker) = WORKER.lock() else {
+            return Err(units);
+        };
+        if worker.as_ref().is_none_or(|w| w.gen != gen) {
+            // (A forked child's inherited sender has no receiver running:
+            // it's forgotten untouched.)
+            if let Some(stale) = worker.take() {
+                std::mem::forget(stale);
+            }
+            #[cfg(unix)]
+            {
+                static AT_FORK: std::sync::Once = std::sync::Once::new();
+                // SAFETY: registers a handler that only bumps an atomic.
+                AT_FORK.call_once(|| unsafe {
+                    libc::pthread_atfork(None, None, Some(after_fork_child));
+                });
+            }
+            let (tx, rx) = mpsc::channel::<(Vec<Unit>, Arc<Job>)>();
+            let spawned = std::thread::Builder::new()
+                .name("weavepy-jit".into())
+                .stack_size(16 << 20)
+                .spawn(move || loop {
+                    let (units, job) = match rx.try_recv() {
+                        Ok(next) => next,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            idle();
+                            match rx.recv() {
+                                Ok(next) => next,
+                                Err(_) => return,
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    };
+                    // (A panic fails the one compile, not the worker.)
+                    let codes =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generate(units)))
+                            .unwrap_or(None);
+                    if let Ok(mut out) = job.out.lock() {
+                        *out = codes;
+                    }
+                    job.done.store(true, Ordering::Release);
+                    if job.gen == FORK_GEN.load(Ordering::Relaxed) {
+                        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
+            if spawned.is_err() {
+                return Err(units);
+            }
+            *worker = Some(Worker { gen, tx });
+        }
+        let job = Arc::new(Job {
+            done: AtomicBool::new(false),
+            out: Mutex::new(None),
+            gen,
+        });
+        let tx = &worker.as_ref().expect("started above").tx;
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        match tx.send((units, job.clone())) {
+            Ok(()) => Ok(job),
+            Err(mpsc::SendError((units, _))) => {
+                IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+                *worker = None;
+                Err(units)
+            }
+        }
+    }
+
+    /// How a parked compile stands.
+    pub(super) enum Ready {
+        /// Its machine code, one per unit.
+        Code(Vec<weavepy_codegen::Code>),
+        /// A unit failed to compile.
+        Failed,
+        /// Its worker didn't survive a fork.
+        Orphaned,
+    }
+
+    struct Parked {
+        parts: Parts,
+        job: Arc<Job>,
+        t0: Option<std::time::Instant>,
+    }
+
+    // SAFETY: a parked compile's parts are touched only with the GIL held,
+    // as a published `Native`'s are.
+    unsafe impl Send for Parked {}
+
+    /// A slot's compile waiting on the worker.
+    #[derive(Default)]
+    pub(crate) struct Pending {
+        busy: AtomicBool,
+        parked: Mutex<Option<Box<Parked>>>,
+    }
+
+    impl Pending {
+        #[inline(always)]
+        pub(super) fn busy(&self) -> bool {
+            self.busy.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn park(&self, parts: Parts, job: Arc<Job>, t0: Option<std::time::Instant>) {
+            if let Ok(mut parked) = self.parked.lock() {
+                *parked = Some(Box::new(Parked { parts, job, t0 }));
+                self.busy.store(true, Ordering::Relaxed);
+            }
+        }
+
+        /// The parked compile, taken, once it no longer waits on the
+        /// worker.
+        pub(super) fn take_ready(&self) -> Option<(Ready, Parts, Option<std::time::Instant>)> {
+            let mut parked = self.parked.lock().ok()?;
+            let job = &parked.as_ref()?.job;
+            let ready = if job.done.load(Ordering::Acquire) {
+                match job.out.lock().ok().and_then(|mut out| out.take()) {
+                    Some(codes) => Ready::Code(codes),
+                    None => Ready::Failed,
+                }
+            } else if job.gen != FORK_GEN.load(Ordering::Relaxed) {
+                Ready::Orphaned
+            } else {
+                return None;
+            };
+            let Parked { parts, t0, .. } = *parked.take()?;
+            self.busy.store(false, Ordering::Relaxed);
+            Some((ready, parts, t0))
+        }
+    }
+}
+
 /// One function of a compile: the code's, or one of its chunks'.
 struct Unit {
     func: Function,
@@ -14785,31 +15084,55 @@ fn define(
 /// code's slot is settled: the caches may hold the last references to
 /// objects, the code's own among them).
 fn install(parts: Parts, units: Vec<Unit>) -> Result<Native, Box<Parts>> {
-    let mut funcs = Vec::with_capacity(units.len());
+    match generate(units) {
+        Some(codes) => install_codes(parts, codes),
+        None => Err(Box::new(parts)),
+    }
+}
+
+/// A compile's machine code, one per unit, uninstalled (on any thread: it
+/// touches nothing but the units); `None` when a unit failed.
+fn generate(units: Vec<Unit>) -> Option<Vec<weavepy_codegen::Code>> {
+    let mut codes = Vec::with_capacity(units.len());
     for mut unit in units {
         let t1 = unit.lowered.map(|_| std::time::Instant::now());
-        let built = weavepy_codegen::compile(&mut unit.func).and_then(|bytes| {
-            let n = bytes.len();
-            weavepy_codegen::install(&bytes).map(|p| (p, n))
-        });
-        match built {
-            Ok((p, n)) => {
+        match weavepy_codegen::compile(&mut unit.func) {
+            Ok(bytes) => {
                 if let (Some(lowered), Some(t1)) = (unit.lowered, t1) {
                     eprintln!(
-                        "frame jit: {} lowered in {lowered:?} ({} IR instructions, {} blocks, {n} bytes), compiled in {:?}",
+                        "frame jit: {} lowered in {lowered:?} ({} IR instructions, {} blocks, {} bytes), compiled in {:?}",
                         unit.label,
                         unit.func.dfg.num_insts(),
                         unit.func.dfg.num_blocks(),
+                        bytes.len(),
                         t1.elapsed()
                     );
                 }
-                // SAFETY: `p` is the entry of machine code generated for
-                // exactly this signature, never freed.
-                funcs.push(unsafe { std::mem::transmute::<*const u8, NativeFn>(p) });
+                codes.push(bytes);
             }
             Err(e) => {
                 if verify() || stats::enabled() {
                     eprintln!("weavepy: frame {:?} failed to compile: {e}", unit.label);
+                }
+                return None;
+            }
+        }
+    }
+    Some(codes)
+}
+
+/// Install a compile's machine code (see [`generate`]) and finish its
+/// native form, or hand its parts back (see [`install`]).
+fn install_codes(parts: Parts, codes: Vec<weavepy_codegen::Code>) -> Result<Native, Box<Parts>> {
+    let mut funcs = Vec::with_capacity(codes.len());
+    for bytes in &codes {
+        match weavepy_codegen::install(bytes) {
+            // SAFETY: `p` is the entry of machine code generated for
+            // exactly this signature, never freed.
+            Ok(p) => funcs.push(unsafe { std::mem::transmute::<*const u8, NativeFn>(p) }),
+            Err(e) => {
+                if verify() || stats::enabled() {
+                    eprintln!("weavepy: frame {:?} failed to install: {e}", parts.name);
                 }
                 return Err(Box::new(parts));
             }
