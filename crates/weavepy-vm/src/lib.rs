@@ -80743,6 +80743,10 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "warn"
             // asyncio (`gather` reads the running loop's current task)
             | "current_task"
+            // json's accelerators: a decoder's `scan_once` and an encoder's
+            // `_iterencode` (which may call `object_hook`, `default` and the
+            // like, through the interpreter's reentrant calls)
+            | "scanner" | "encoder"
     )
 }
 

@@ -1490,6 +1490,14 @@ branch and pull request.
     name), `struct.pack` (2.7), a small `json.loads` (1.9),
     `io.StringIO(...).read()` (1.8), `A & B` of small sets (1.5), and
     `list(enumerate(xs))` and `zip` loops (1.4 to 1.6).
+  - `json.loads` and `json.dumps` called from compiled code run the native
+    scanner and encoder in the core loop's lane: a decoder's `scan_once`
+    and an encoder's `_iterencode` are builtins the lane didn't know, so
+    every call left compiled code, registering the lazily running
+    `loads`, `decode` and `raw_decode` on the way. `json.loads` of a
+    one-key document takes 14,961 instructions instead of 21,544 (CPython
+    12,153), of a three-key one 18,053 instead of 25,114 (16,451), and a
+    small `json.dumps` 27,841 instead of 30,236 (23,233).
   - Calls from native code into Python code, measured again: a plain
     function or a pure leaf is at parity (`map(f, xs)`), but a method that
     changes state (`map(obj.step, xs)`) costs about 2,800 instructions a
