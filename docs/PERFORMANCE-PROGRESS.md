@@ -1352,6 +1352,16 @@ branch and pull request.
     `assertRaises` called left behind after the class's earlier tests
     had warmed the paths (some native among them keeps the frames alive
     that `traceback.clear_frames` should clear).
+  - A keyword call of a native function or method costs about 3,000
+    instructions over CPython's: `xs.sort(key=None)` takes 3,770 against
+    880, `s.split(maxsplit=1)` 4,016 against 1,488, `int("ff", base=16)`
+    3,957 against 1,989. Compiled code leaves for the full handler there,
+    but sending those calls through the core loop's lane instead (its
+    general call takes keywords) saved only `sort`'s exit (3,361): the
+    cost is the general keyword call itself (the `String` per keyword, the
+    dispatch by name), which is the next thing to make cheaper there.
+    Fixed on the way: `str.split` and `str.rsplit` ignored a keyword they
+    don't take (`'a'.split(bogus=1)`).
   - Tried and dropped: `LOAD_GLOBAL`'s cache hit checked in compiled code
     instead of in `h_global` (1.1% of the suite's instructions, averaged
     over the workloads): the suite came out level (1.001), `raytrace`

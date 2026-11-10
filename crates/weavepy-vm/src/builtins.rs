@@ -11304,8 +11304,19 @@ fn new_str_split_list(items: Vec<Object>) -> Object {
     result
 }
 
+/// `str.split`'s and `str.rsplit`'s keywords: `sep` and `maxsplit` only.
+fn split_keywords(name: &str, kwargs: &[(String, Object)]) -> Result<(), RuntimeError> {
+    match kwargs.iter().find(|(k, _)| k != "sep" && k != "maxsplit") {
+        Some((k, _)) => Err(type_error(format!(
+            "{name}() got an unexpected keyword argument '{k}'"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("split", args, 0, 2)?;
+    split_keywords("split", kwargs)?;
     let s = str_self(args)?;
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
@@ -12205,6 +12216,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("rsplit", args, 0, 2)?;
+    split_keywords("rsplit", kwargs)?;
     let s = str_self(args)?;
     let s = s.as_ref();
     let sep = arg_or_kw(args, 1, kwargs, "sep");
