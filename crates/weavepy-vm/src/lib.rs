@@ -1072,6 +1072,10 @@ pub struct Interpreter {
     /// The registered leaf builtins (see [`leaf_builtins`]) as last
     /// snapshotted, with the registry generation they reflect.
     leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap)>,
+    /// The last builtin [`Interpreter::leaf_call_kind`] found no leaf, by
+    /// address, and the registry generation it looked under: a call path
+    /// asks for the same builtin several times over.
+    leaf_miss: std::cell::Cell<(usize, u64)>,
     /// The core loop's last native iterator `__next__`, keyed by the
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]): a whole-body leaf with its
@@ -1327,6 +1331,7 @@ impl Default for Interpreter {
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            leaf_miss: std::cell::Cell::new((0, 0)),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
@@ -1462,6 +1467,7 @@ impl Interpreter {
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
             leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            leaf_miss: std::cell::Cell::new((0, 0)),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
@@ -31565,28 +31571,37 @@ impl Interpreter {
     /// Which leaf builtin `b` is, if any (pointer identity).
     fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
         let p = Rc::as_ptr(b) as usize;
+        let gen = leaf_builtins::generation();
+        // (A builtin freed and another made at its address meanwhile only
+        // misses its fast path once.)
+        if self.leaf_miss.get() == (p, gen) {
+            return None;
+        }
         if let Some(k) = self.leaf_fns().calls.get(&p) {
             return Some(*k);
         }
-        let gen = leaf_builtins::generation();
-        let mut opaque = self.leaf_opaque.borrow_mut();
-        if opaque.0 != gen {
-            opaque.1 = leaf_builtins::snapshot();
-            opaque.0 = gen;
+        let found = {
+            let mut opaque = self.leaf_opaque.borrow_mut();
+            if opaque.0 != gen {
+                opaque.1 = leaf_builtins::snapshot();
+                opaque.0 = gen;
+            }
+            // The registered builtin must still be *this* allocation: a
+            // recycled address (a torn-down interpreter's module surface)
+            // fails the upgrade or the identity check.
+            opaque.1.get(&p).and_then(|(w, fast)| {
+                let live = w.upgrade()?;
+                Rc::ptr_eq(&live, b).then(|| match fast {
+                    leaf_builtins::Entry::Fast(f) => LeafKind::Fast(*f),
+                    leaf_builtins::Entry::Opaque => LeafKind::Opaque,
+                    leaf_builtins::Entry::Scalar => LeafKind::Scalar,
+                })
+            })
+        };
+        if found.is_none() {
+            self.leaf_miss.set((p, gen));
         }
-        // The registered builtin must still be *this* allocation: a
-        // recycled address (a torn-down interpreter's module surface)
-        // fails the upgrade or the identity check.
-        let (w, fast) = opaque.1.get(&p)?;
-        let live = w.upgrade()?;
-        if !Rc::ptr_eq(&live, b) {
-            return None;
-        }
-        Some(match fast {
-            leaf_builtins::Entry::Fast(f) => LeafKind::Fast(*f),
-            leaf_builtins::Entry::Opaque => LeafKind::Opaque,
-            leaf_builtins::Entry::Scalar => LeafKind::Scalar,
-        })
+        found
     }
 
     /// A saved native method with no explicit arguments. Only the quiet,
@@ -80437,7 +80452,33 @@ fn builtin_method_via_call(name: &str) -> bool {
 /// frame readers make it whole themselves (`sync_frame_spine`), the
 /// calling activation waiting on the pending list with its `lasti` at the
 /// call.
-fn builtin_fn_lane_ok(name: &str) -> bool {
+fn builtin_fn_lane_ok(name: &'static str) -> bool {
+    use std::cell::Cell;
+    /// Memoized answers by the name's address and length, as
+    /// [`builtin_needs_interp`] keeps its: the list below is about 150
+    /// names, and a name it doesn't hold compares against all of them.
+    const WAYS: usize = 128;
+    thread_local! {
+        static MEMO: [Cell<(usize, u32)>; WAYS] =
+            const { [const { Cell::new((0, 0)) }; WAYS] };
+    }
+    let key = name.as_ptr() as usize;
+    let len = name.len() as u32;
+    let i = ((key >> 3) ^ (key >> 11) ^ len as usize) % WAYS;
+    MEMO.with(|m| {
+        // The length's top bit holds the answer, the next one validity.
+        let (k, l) = m[i].get();
+        if k == key && l & !(3 << 30) == len && l & (1 << 30) != 0 {
+            return l & (1 << 31) != 0;
+        }
+        let r = builtin_fn_lane_ok_uncached(name);
+        m[i].set((key, len | (1 << 30) | (u32::from(r) << 31)));
+        r
+    })
+}
+
+/// [`builtin_fn_lane_ok`] without the memo.
+fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
     matches!(
         name,
         // builtins

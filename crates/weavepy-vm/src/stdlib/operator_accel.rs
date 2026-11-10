@@ -295,7 +295,28 @@ fn one_arg<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeErro
 /// [`binary`]); `None` for any other operands.
 #[inline(always)]
 fn binary_fast(args: &[Object], op: BinOpKind) -> Option<Result<Object, RuntimeError>> {
+    use BinOpKind as B;
     match args {
+        // The commonest shapes without the general operation's promotions.
+        [Object::Int(x), Object::Int(y)] => {
+            let r = match op {
+                B::Add => x.checked_add(*y),
+                B::Sub => x.checked_sub(*y),
+                B::Mult => x.checked_mul(*y),
+                _ => None,
+            };
+            Some(match r {
+                Some(v) => Ok(Object::Int(v)),
+                None => crate::binary_op(&args[0], &args[1], op),
+            })
+        }
+        [Object::Float(x), Object::Float(y)] if matches!(op, B::Add | B::Sub | B::Mult) => {
+            Some(Ok(Object::Float(match op {
+                B::Add => x + y,
+                B::Sub => x - y,
+                _ => x * y,
+            })))
+        }
         [a @ (Object::Int(_) | Object::Float(_)), b @ (Object::Int(_) | Object::Float(_))] => {
             Some(crate::binary_op(a, b, op))
         }

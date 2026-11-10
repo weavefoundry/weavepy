@@ -1303,6 +1303,26 @@ branch and pull request.
     before the general call: ten additions take 8,457 instructions instead
     of 11,673. CPython's take 3,632, and each element still costs about
     400 here.
+  - A subscript site that has run an instance's Python `__getitem__`
+    calls it first from compiled code. The method was the last resort:
+    compiled code tried the native containers' helpers in turn (six of
+    them, each checking and declining) before the direct call. `o[1]` takes
+    439 instructions instead of 727 (CPython about 258), and a
+    `__getitem__` that indexes its own list 789 instead of 1,097 (about
+    359).
+  - Calling a native function that isn't a leaf from compiled code asked
+    the leaf registry about it seven times over (two hash lookups each)
+    and matched its name against the core loop's list of about 150 lane
+    names twice, failing every comparison for a name the list doesn't
+    hold. The registry's last miss is memoized (by address and registry
+    generation), and the lane verdict by the name's address, as
+    `builtin_needs_interp`'s is; `operator`'s leaf halves add or
+    multiply two small ints or floats without the general operation's
+    promotions. Calling `functools.reduce` over a pair takes 4,070
+    instructions instead of 5,170, and ten additions through it 5,392
+    instead of 8,457 (CPython 3,632). Calling such a function still costs
+    about 3,000 instructions over CPython's: `vars(o)` takes 4,695 against
+    915.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an
