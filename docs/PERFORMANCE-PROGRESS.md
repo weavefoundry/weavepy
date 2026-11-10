@@ -1167,6 +1167,18 @@ branch and pull request.
     fresh methods `dataclasses` builds), the two fixpoints 18M of them; the
     whole first run now takes 1.8% fewer instructions (`comprehensions`
     0.6%, the rest level).
+  - Tried and dropped: one out-of-line copy of the quiet loop
+    (`quiet_run_from`), which `#[inline(always)]` copies into its four
+    callers (about 25 KB each: calls, generator steps on both sides of the
+    stack-growth check, and native callers' callbacks). The text shrank 82
+    KB, but simulated instruction-cache misses fell only 1% to 2% and the
+    warm time rose 0.8% (`context_managers` 9.7%, `async_tree` 3.9% less):
+    the copies are rarely in the cache together, and each caller's copy
+    folds its constant arguments.
+  - Cachegrind of a build that generates code on a worker thread needs
+    `WEAVEPY_FRAME_JIT_SYNC=1`: valgrind runs one thread at a time, so the
+    worker's compiles land far later and `async_tree`'s warm call counted
+    817 million instructions instead of 566.
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,
