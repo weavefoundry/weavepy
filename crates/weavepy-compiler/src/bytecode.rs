@@ -1513,16 +1513,25 @@ impl PartialEq for CacheSlot {
     }
 }
 
-/// Per-instruction cache storage allocated on the first cache write.
+/// Per-instruction cache storage allocated once the code runs an
+/// instruction again.
 ///
 /// The atomic pointer owns either no allocation or exactly `len` slots. An
 /// acquire load both checks initialization and obtains the published storage.
 /// Only exclusive access can resize or release it. Publication synchronizes
 /// initialization; individual cache values also use coherent atomic loads and stores.
+///
+/// Code that runs once from top to bottom (most of what an import runs: a
+/// decorator, a class factory, a module's setup helpers) writes its caches
+/// at rising pcs and never reads them, so the table drops those writes,
+/// remembering how far they reached (`cold_end`). A write at or before that
+/// point means the code is running an instruction again (a loop's second
+/// iteration, a second call), and allocates the table.
 #[derive(Default)]
 pub struct CacheTable {
     slots: std::sync::atomic::AtomicPtr<CacheSlot>,
-    len: usize,
+    len: u32,
+    cold_end: std::sync::atomic::AtomicU32,
 }
 
 impl CacheTable {
@@ -1530,7 +1539,8 @@ impl CacheTable {
     pub fn with_len(n: usize) -> Self {
         Self {
             slots: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-            len: n,
+            len: u32::try_from(n).expect("a code object's instruction count fits in 32 bits"),
+            cold_end: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1543,7 +1553,7 @@ impl CacheTable {
             // SAFETY: a nonnull pointer owns `len` initialized slots. Acquire
             // observes their publication, and this shared borrow prevents
             // resize/drop. CacheSlot provides the slots' interior mutability.
-            Some(unsafe { std::slice::from_raw_parts(slots, self.len) })
+            Some(unsafe { std::slice::from_raw_parts(slots, self.len as usize) })
         }
     }
 
@@ -1556,10 +1566,31 @@ impl CacheTable {
         }
     }
 
+    /// A write at `pc` to the unallocated table: the storage once the code
+    /// is running an instruction again, else `None` (the write dropped).
+    #[cold]
+    #[inline(never)]
+    fn cold_write(&self, pc: u32) -> Option<&[CacheSlot]> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let end = self.cold_end.load(Relaxed);
+        if pc >= end {
+            self.cold_end.store(pc + 1, Relaxed);
+            return None;
+        }
+        Some(self.allocate())
+    }
+
+    /// Allocate the storage now, as a write the code repeats would.
+    pub fn warm(&self) {
+        if self.initialized().is_none() && self.len != 0 {
+            self.allocate();
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn allocate(&self) -> &[CacheSlot] {
-        let storage: Box<[CacheSlot]> = (0..self.len)
+        let storage: Box<[CacheSlot]> = (0..self.len as usize)
             .map(|_| CacheSlot::new(InlineCache::Empty))
             .collect();
         let allocation = Box::into_raw(storage).cast::<CacheSlot>();
@@ -1575,7 +1606,8 @@ impl CacheTable {
                 // Restore its exact slice metadata and release it once.
                 unsafe {
                     drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        allocation, self.len,
+                        allocation,
+                        self.len as usize,
                     )));
                 }
                 published
@@ -1584,18 +1616,23 @@ impl CacheTable {
         // SAFETY: the winning allocation has `len` initialized slots. This
         // thread either initialized it or acquired its publication. Shared
         // access prevents exclusive resize/drop for the returned lifetime.
-        unsafe { std::slice::from_raw_parts(slots, self.len) }
+        unsafe { std::slice::from_raw_parts(slots, self.len as usize) }
     }
 
-    /// Set a cache, allocating on its first valid write. Invalid writes are no-ops.
+    /// Set a cache. A cold table drops writes while they come at rising pcs
+    /// and allocates on the first that doesn't (see [`CacheTable`]).
+    /// Invalid writes are no-ops.
     #[inline(always)]
     pub fn set(&self, pc: u32, value: InlineCache) {
-        if pc as usize >= self.len {
+        if pc >= self.len {
             return;
         }
         let slots = match self.initialized() {
             Some(slots) => slots,
-            None => self.allocate(),
+            None => match self.cold_write(pc) {
+                Some(slots) => slots,
+                None => return,
+            },
         };
         if let Some(slot) = slots.get(pc as usize) {
             slot.set(value);
@@ -1619,17 +1656,19 @@ impl CacheTable {
             // SAFETY: exclusive access prevents outstanding storage borrows
             // or concurrent publication. Take ownership with the original
             // length, clearing the pointer so it cannot be released twice.
-            Some(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(slots, self.len)) })
+            Some(unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(slots, self.len as usize))
+            })
         }
     }
 
     /// Update the instruction count, preserving initialized slots in range.
     pub fn resize(&mut self, n: usize) {
-        if n == self.len {
+        if n == self.len as usize {
             return;
         }
         let previous = self.take_slots();
-        self.len = n;
+        self.len = u32::try_from(n).expect("a code object's instruction count fits in 32 bits");
         if let Some(slots) = previous {
             if n != 0 {
                 let mut slots = slots.into_vec();
@@ -1663,6 +1702,7 @@ impl Clone for CacheTable {
         Self {
             slots: std::sync::atomic::AtomicPtr::new(slots),
             len: self.len,
+            cold_end: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -1686,6 +1726,7 @@ mod cache_tests {
     fn cache_table_round_trip() {
         let t = CacheTable::with_len(4);
         assert_eq!(t.get(0), InlineCache::Empty);
+        t.warm();
         t.set(2, InlineCache::BinOpAddInt);
         assert_eq!(t.get(2), InlineCache::BinOpAddInt);
         // Out-of-range reads are defensive.
@@ -1695,12 +1736,28 @@ mod cache_tests {
     #[test]
     fn cache_table_clone_copies_state() {
         let t = CacheTable::with_len(2);
+        t.warm();
         t.set(0, InlineCache::CompareOpInt);
         let u = t.clone();
         assert_eq!(u.get(0), InlineCache::CompareOpInt);
         // Subsequent mutations to `t` don't bleed into `u`.
         t.set(0, InlineCache::Empty);
         assert_eq!(u.get(0), InlineCache::CompareOpInt);
+    }
+
+    #[test]
+    fn cache_table_allocates_when_code_runs_again() {
+        let t = CacheTable::with_len(8);
+        // Writes at rising pcs (code running once) are dropped.
+        t.set(1, InlineCache::BinOpAddInt);
+        t.set(4, InlineCache::CompareOpInt);
+        assert_eq!(t.get(1), InlineCache::Empty);
+        assert_eq!(t.get(4), InlineCache::Empty);
+        // One at or before the furthest (a loop's next iteration) allocates.
+        t.set(4, InlineCache::CompareOpInt);
+        assert_eq!(t.get(4), InlineCache::CompareOpInt);
+        t.set(1, InlineCache::BinOpAddInt);
+        assert_eq!(t.get(1), InlineCache::BinOpAddInt);
     }
 
     #[test]
@@ -1743,6 +1800,10 @@ mod lazy_cache_tests {
         table.resize(2000);
         assert!(table.initialized().is_none());
         assert!(copied.initialized().is_none());
+        // A first write is dropped (the code may run only once); the same
+        // instruction's next one allocates.
+        table.set(1999, InlineCache::CompareOpInt);
+        assert!(table.initialized().is_none());
         table.set(1999, InlineCache::CompareOpInt);
         assert_eq!(table.initialized().unwrap().len(), 2000);
         assert_eq!(table.get(1999), InlineCache::CompareOpInt);
@@ -1753,6 +1814,7 @@ mod lazy_cache_tests {
     #[test]
     fn warm_resize_preserves_slots_and_discards_removed_entries() {
         let mut table = CacheTable::with_len(4);
+        table.warm();
         table.set(0, InlineCache::BinOpAddInt);
         table.set(3, InlineCache::CompareOpInt);
         table.resize(8);
@@ -1768,6 +1830,7 @@ mod lazy_cache_tests {
         table.resize(0);
         assert!(table.initialized().is_none());
         table.resize(5);
+        table.warm();
         table.set(4, InlineCache::CompareOpInt);
         assert_eq!(table.get(4), InlineCache::CompareOpInt);
     }
@@ -1810,8 +1873,9 @@ mod cache_publication_tests {
     }
 
     #[test]
-    fn concurrent_first_writes_to_disjoint_slots_survive_resize_and_drop() {
+    fn concurrent_writes_to_disjoint_slots_survive_resize_and_drop() {
         let table = Arc::new(CacheTable::with_len(8));
+        table.warm();
         let barrier = Arc::new(Barrier::new(8));
         std::thread::scope(|scope| {
             for pc in 0..8 {

@@ -57287,6 +57287,20 @@ impl Interpreter {
                 // IMPORTANT: any `b.name == "..."` / `matches!(b.name, ...)`
                 // added inside this block must also be added to
                 // `builtin_needs_interp` above, or the new arm is dead code.
+                //
+                // A positional-only builtin function (CPython's
+                // `_PyArg_NoKeywords`): `abs(1, x=1)` raises, where the
+                // dispatch by name below would drop the keywords.
+                if !kwargs.is_empty()
+                    && !b.binds_instance
+                    && b.call_kw.is_none()
+                    && builtin_takes_no_keywords(b.name)
+                {
+                    return Err(type_error(format!(
+                        "{}() takes no keyword arguments",
+                        b.name
+                    )));
+                }
                 // The hottest interpreter-aware builtins by one `match` (a
                 // length switch and a compare), ahead of the gate and the
                 // chain's sequential comparisons: each arm is the chain's
@@ -80356,6 +80370,44 @@ pub(crate) fn builtin_needs_interp(name: &'static str) -> bool {
     })
 }
 
+/// Whether the builtin function `name` takes no keyword arguments in
+/// CPython (its parameters are positional-only), so a call with keywords
+/// raises rather than reaching a body that ignores them.
+#[cold]
+fn builtin_takes_no_keywords(name: &str) -> bool {
+    matches!(
+        name,
+        "abs"
+            | "all"
+            | "any"
+            | "ascii"
+            | "bin"
+            | "callable"
+            | "chr"
+            | "delattr"
+            | "dir"
+            | "divmod"
+            | "format"
+            | "getattr"
+            | "globals"
+            | "hasattr"
+            | "hash"
+            | "hex"
+            | "id"
+            | "isinstance"
+            | "issubclass"
+            | "iter"
+            | "len"
+            | "locals"
+            | "next"
+            | "oct"
+            | "ord"
+            | "repr"
+            | "setattr"
+            | "vars"
+    )
+}
+
 fn builtin_needs_interp_uncached(name: &str) -> bool {
     name.starts_with("__vm:")
         || name.starts_with(".u.")
@@ -80769,7 +80821,7 @@ fn fusion_enabled() -> bool {
 /// instead of a per-execution `Constant` deep-clone (string constants
 /// allocated twice per execution before this).
 struct CodeConstObjects {
-    objects: Vec<Object>,
+    objects: Box<[Object]>,
     /// The local slot of each `co_cellvars` entry that is an argument, whose
     /// value moves into its cell as a call starts, `u32::MAX` for the others
     /// (a call's cells are made and released by these slots).
@@ -80778,13 +80830,13 @@ struct CodeConstObjects {
     /// attribute-name dict probes the eval loop issues per execution of a
     /// site (inline-cache shadow guards, generic lookups) hash the
     /// interned name once per process instead of once per probe.
-    name_hashes: Vec<i64>,
+    name_hashes: Box<[i64]>,
     /// RFC 0077 WS4: each `co_names` entry as the *interned* `Object::Str`
     /// (`sys.intern` pool). Instance-dict keys are interned on insert, so
     /// a cached-slot name check can usually settle on `Rc` identity
     /// before falling back to a byte compare, and `STORE_ATTR` inserts
     /// the pooled key without a per-store pool lookup.
-    name_objs: Vec<Object>,
+    name_objs: Box<[Object]>,
     /// Each instruction's rank among the code's *sites* (see
     /// [`site_ranks`]), which index the per-site tables below, or
     /// [`NO_SITE`]; built with the first of those tables.
@@ -80869,13 +80921,13 @@ struct CodeConstObjects {
     /// The code's name and qualified name as interned strings: a fresh
     /// generator's `gi_name` and `gi_qualname` while its function's names
     /// are untouched.
-    gen_names: std::sync::OnceLock<(Object, Object)>,
+    gen_names: std::sync::OnceLock<Box<(Object, Object)>>,
     /// `co_name`, `co_qualname` and `co_filename` as the str objects every
     /// read returns (CPython stores them; logging reads two per record).
-    ident_strs: std::sync::OnceLock<[Object; 3]>,
+    ident_strs: std::sync::OnceLock<Box<[Object; 3]>>,
     /// `co_positions()` entries, as a tuple of 4-tuples, and the
     /// debug-ranges setting they were built under.
-    positions: std::sync::OnceLock<(bool, Object)>,
+    positions: std::sync::OnceLock<Box<(bool, Object)>>,
     /// The code's native form for the core loop (see [`frame_jit`]).
     #[cfg(feature = "jit")]
     frame_jit: frame_jit::Slot,
@@ -80945,8 +80997,11 @@ fn site_ranks(code: &CodeObject) -> std::sync::Arc<[u16]> {
 
 /// A per-site table of [`CodeConstObjects`]: an entry per site (see
 /// [`site_ranks`]), allocated on first use. [`Self::get`] and
-/// [`Self::view`] map an instruction's pc to its entry.
-struct SiteSlots<T>(std::sync::OnceLock<SiteTable<T>>);
+/// [`Self::view`] map an instruction's pc to its entry. The table is boxed:
+/// most code that runs never warms its tables (see [`site_tables_warm`]),
+/// and each unallocated one costs its code a word and the lock's state
+/// instead of the table's four words.
+struct SiteSlots<T>(std::sync::OnceLock<Box<SiteTable<T>>>);
 
 /// An allocated [`SiteSlots`]: the code's site ranks (shared by its
 /// tables, and kept here so that a lookup checks one initialization) and
@@ -81036,10 +81091,10 @@ impl CodeConstObjects {
         table.0.get_or_init(|| {
             let ranks = self.site_ranks.get_or_init(|| site_ranks(code)).clone();
             let n = ranks.iter().filter(|&&r| r != NO_SITE).count();
-            SiteTable {
+            Box::new(SiteTable {
                 ranks,
                 slots: (0..n).map(|_| empty()).collect(),
-            }
+            })
         });
         table.view()
     }
@@ -84687,7 +84742,7 @@ pub(crate) fn code_gen_names(code: &CodeObject) -> (Object, Object) {
         )
     };
     match code_vm_ext(code) {
-        Some(ext) => ext.gen_names.get_or_init(intern).clone(),
+        Some(ext) => (**ext.gen_names.get_or_init(|| Box::new(intern()))).clone(),
         None => intern(),
     }
 }

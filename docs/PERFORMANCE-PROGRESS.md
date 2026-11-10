@@ -1372,6 +1372,34 @@ branch and pull request.
     (`Object`'s drop glue, `mi_free`, the allocation, `h_call_site`,
     `h_site_leaf`, `h_global`, `core_store_init`), and the first fifty
     together take about 30%.
+  - A spread call of a builtin, or of a native method bound to its
+    receiver, from compiled code (`callback(*args, **kwds)` of a saved
+    `log.clear`, as `ExitStack.callback` wraps it) spreads the items over
+    the call's operands and runs as a `CALL` of them would: a leaf half in
+    place, any other body the core loop's lane takes through that body.
+    Only a leaf builtin's spread ran on the frame, collecting the items
+    and the operands into two vectors; the rest left for the core loop's
+    general call. `cb(*a)` of a bound `list.clear` takes 931 instructions
+    instead of 2,394 (CPython 172), `cb(*a, **k)` with an empty `k` 924
+    instead of 5,098 (779), `len(*a)` 617 instead of 1,232 (491), and an
+    `ExitStack` with a callback 24,432 instead of 27,026 (16,391). Fixed
+    on the way: builtins that take no keywords (`abs`, `len`, `divmod`,
+    `hash` and others) ignored any they were given; they now raise
+    CPython's `TypeError`.
+  - Less memory per code object that runs. The inline cache table (16
+    bytes an instruction) is allocated once the code runs an instruction
+    again (a loop's next iteration, a second call), not at its first cache
+    write: code an import runs once from top to bottom writes its caches
+    at rising pcs and never reads them. The per-site side tables of code
+    that never warms (most of it) cost a word each instead of four, and
+    three rarely built values (a generator's names, `co_name` and its
+    neighbors as objects, `co_positions()`) a word instead of up to seven.
+    Peak memory after `import logging, io` drops 248 KB (17,232 to 16,984
+    KB; CPython 13,316), after `import asyncio` 224 KB, and after `import
+    dataclasses, enum, typing` 160 KB. The heap after `import logging`
+    still holds 6.4 MB more than at start-up (sampled): about 3 MB of it
+    for the code that ran (its decoded bodies, constants, names, caches and
+    tables), 1 MB for classes and 0.5 MB for functions.
   - Why caught exceptions cost more inside a function another compiled
     one calls: catching runs the handler search with the activation on the
     switch (`h_catch` settles it), so a direct call whose body catches an

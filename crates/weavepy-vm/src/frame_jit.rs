@@ -12659,6 +12659,30 @@ unsafe extern "C" fn h_call_native(
                 }
             }
         }
+        native_body_here(s, pcu, start, lenu, site.f, site.via_call)
+    }
+}
+
+/// [`Interpreter::core_native_body`] of the builtin `f` (`via_call` as
+/// settled for it) for the call at `pcu` whose operands run from `start` up
+/// the `lenu`-deep stack, a `CALL`'s or a spread `CALL_FUNCTION_EX`'s
+/// ([`spread_native`]), the frame synced first: [`h_call_native`]'s
+/// results.
+///
+/// # Safety
+///
+/// As [`h_call_native`]'s, the operands in a shape
+/// `Interpreter::core_builtin_lane` admits for `f`.
+unsafe fn native_body_here(
+    s: &mut State,
+    pcu: usize,
+    start: usize,
+    lenu: usize,
+    f: *const crate::object::BuiltinFn,
+    via_call: bool,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
         // The frame synced, as the core loop's arm syncs it.
         let frame = &mut *s.frame;
         frame.stack.set_len(lenu);
@@ -12678,8 +12702,8 @@ unsafe extern "C" fn h_call_native(
             frame,
             pcu,
             start,
-            site.f,
-            site.via_call,
+            f,
+            via_call,
             if lazy {
                 std::ptr::from_mut(s)
             } else {
@@ -13315,6 +13339,132 @@ unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32
     }
 }
 
+/// The `CALL_FUNCTION_EX` at `pc` (its operands from `start`, the frame not
+/// yet synced) of a builtin function, or of a native method bound to its
+/// receiver, over an exact tuple or list with no `**` mapping or an empty
+/// one (`callback(*args, **kwds)` of a saved `log.clear`, as
+/// `ExitStack.callback` makes it): the items spread over the call's
+/// operands and it runs as a `CALL` of them would, a leaf builtin's half in
+/// place, any other builtin the `CALL` arm's lane takes through its body
+/// ([`native_body_here`]). The spread and the mapping leave after the call,
+/// as CPython's handler releases them. `None`, with the operands as they
+/// were, when the call doesn't qualify or a leaf half declines.
+///
+/// # Safety
+///
+/// As [`h_call_ex`]'s, `st.sw` set.
+#[inline(never)]
+unsafe fn spread_native(st: &mut State, pc: usize, start: usize) -> Option<u32> {
+    use crate::LeafKind;
+    // SAFETY: the caller's contract: four initialized operand slots, and
+    // room up to `st.cap`.
+    unsafe {
+        let base = st.stack;
+        let (b, recv) = match (&*base.add(start), &*base.add(start + 1)) {
+            (Object::Builtin(b), Object::Unbound) if !b.binds_instance => (b, None),
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match &bm.function {
+                    Object::Builtin(b) if b.binds_instance => (b, Some(&bm.receiver)),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        match &*base.add(start + 3) {
+            Object::Unbound => {}
+            Object::Dict(d) if d.try_borrow().is_ok_and(|d| d.is_empty()) => {}
+            _ => return None,
+        }
+        let n = match &*base.add(start + 2) {
+            Object::Tuple(t) => t.len(),
+            Object::List(l) => l.try_borrow().ok()?.len(),
+            _ => return None,
+        };
+        let len = start + 2 + n;
+        if len > st.cap {
+            return None;
+        }
+        let interp = &mut *st.interp.cast_mut();
+        let kind = interp.leaf_call_kind(b);
+        // As the `CALL` arm settles it: a leaf half, else the lane's body.
+        let lane = match kind {
+            Some(LeafKind::Fast(_) | LeafKind::Isinstance | LeafKind::Opaque) => None,
+            Some(k) if k.runs_in_core() || matches!(k, LeafKind::ObjectNew) => None,
+            Some(_) => return None,
+            None => {
+                let via_call = interp.builtin_lane(b, recv)?;
+                if recv.is_some_and(|r| !crate::lane_recv_ok(b, r, via_call)) {
+                    return None;
+                }
+                Some(via_call)
+            }
+        };
+        let f = Rc::as_ptr(b);
+        // The receiver fills the empty self slot (a `CALL` of the bound
+        // method expands it so), the items the argument slots.
+        let had_recv = recv.is_some();
+        if let Some(r) = recv {
+            base.add(start + 1).write(r.clone());
+        }
+        let spread = base.add(start + 2).read();
+        let mapping = base.add(start + 3).read();
+        let items: &[Object] = match &spread {
+            Object::Tuple(t) => t,
+            Object::List(l) => &(*l.as_ptr()),
+            _ => unreachable!("checked above"),
+        };
+        for (k, v) in items.iter().enumerate() {
+            base.add(start + 2 + k).write(crate::clone_hot(v));
+        }
+        let Some(via_call) = lane else {
+            let first = if had_recv { start + 1 } else { start + 2 };
+            let args = std::slice::from_raw_parts(base.add(first), len - first);
+            let b = &*f;
+            let r = match kind {
+                Some(LeafKind::Fast(fast)) => fast(args),
+                Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
+                Some(LeafKind::Opaque) => Some((b.call)(args)),
+                Some(k) => interp.leaf_builtin_call(k, b, args),
+                None => unreachable!("a leaf kind"),
+            };
+            let Some(r) = r else {
+                // Declined: the operands as they were.
+                for k in start + 2..len {
+                    drop(base.add(k).read());
+                }
+                if had_recv {
+                    drop(base.add(start + 1).read());
+                    base.add(start + 1).write(Object::Unbound);
+                }
+                base.add(start + 2).write(spread);
+                base.add(start + 3).write(mapping);
+                return None;
+            };
+            crate::release_run(base.add(start), len - start);
+            interp.release(spread);
+            interp.release(mapping);
+            return Some(match r {
+                Ok(v) => {
+                    base.add(start).write(v);
+                    st.len = start + 1;
+                    0
+                }
+                Err(e) => {
+                    st.len = start;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    RAISED
+                }
+            });
+        };
+        let r = native_body_here(st, pc, start, len, f, via_call);
+        let interp = &mut *st.interp.cast_mut();
+        interp.release(spread);
+        interp.release(mapping);
+        Some(r)
+    }
+}
+
 /// Whether the running frame's operand stack moved (a lane that spread a
 /// call's arguments over it grew it past its room), the state's view of it
 /// refreshed: the compiled code, which loaded the stack's address on entry,
@@ -13357,6 +13507,10 @@ unsafe extern "C" fn h_call_ex(
         let start = len - 4;
         // A plain function's call over a tuple or list: a direct call.
         if let Some(r) = spread_direct(st, pc, start, &mut *site) {
+            return r;
+        }
+        // A builtin's: as a `CALL` of the items runs it.
+        if let Some(r) = spread_native(st, pc, start) {
             return r;
         }
         let frame = &mut *st.frame;
@@ -13453,6 +13607,9 @@ unsafe extern "C" fn h_call_forward(
         {
             st.stack.add(len).write(Object::Unbound);
             if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
+                return r;
+            }
+            if let Some(r) = spread_native(st, pc + 3, start) {
                 return r;
             }
             let frame = &mut *st.frame;

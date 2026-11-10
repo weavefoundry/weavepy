@@ -4333,7 +4333,7 @@ pub(crate) fn code_synthetic_attr(
     let ident = |k: usize| {
         crate::code_vm_ext(c).map(|ext| {
             ext.ident_strs.get_or_init(|| {
-                [
+                Box::new([
                     Object::from_str(&c.name),
                     Object::from_str(if c.qualname.is_empty() {
                         &c.name
@@ -4341,7 +4341,7 @@ pub(crate) fn code_synthetic_attr(
                         &c.qualname
                     }),
                     Object::from_str(&*c.filename),
-                ]
+                ])
             })[k]
                 .clone()
         })
@@ -5093,9 +5093,9 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
     // every frame's, then reads one entry): an iterator over one shared
     // immutable tuple of them.
     if let Some(ext) = crate::code_vm_ext(&c) {
-        let (ranges, all) = ext
+        let (ranges, all) = &**ext
             .positions
-            .get_or_init(|| (debug_ranges, Object::new_tuple(build())));
+            .get_or_init(|| Box::new((debug_ranges, Object::new_tuple(build()))));
         if *ranges == debug_ranges {
             let it = all.make_iter()?;
             return Ok(Object::Iter(Rc::new(RefCell::new(it))));
