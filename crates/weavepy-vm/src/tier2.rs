@@ -12385,7 +12385,7 @@ fn dyn_bound_leaf(
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
         staged[j + 1] = unpack_pins(bits, tag, &ctx.pins);
     }
-    match interp.leaf_builtin_call(kind, b, &staged[..argc as usize + 1])? {
+    match interp.leaf_builtin_call(kind, b, &staged[..=(argc as usize)])? {
         Ok(v) => Some(dyn_leaf_result(jf, ctx, v, int_result)),
         Err(e) => {
             ctx.raised = Some(e);

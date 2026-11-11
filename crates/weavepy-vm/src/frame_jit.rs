@@ -7409,9 +7409,7 @@ unsafe fn note_method_desc(
     } else {
         matches!(self_slot, Object::Unbound)
     };
-    if bound_ok
-        && (matches!(func, Object::Function(_)) || plain_builtin)
-        && func.is_same(callable)
+    if bound_ok && (matches!(func, Object::Function(_)) || plain_builtin) && func.is_same(callable)
     {
         s.desc = Some((ver, binds_class, func));
     } else {
@@ -8750,7 +8748,9 @@ unsafe fn module_attr_note(site: &AttrSite, m: &crate::object::PyModule) {
         let (code, ext, pc) = (&*site.code, &*site.ext, site.pc as usize);
         mod_attr_note(ext, m, pc, &site.cache);
         let fresh = site.cache.mvalue.get() != 0
-            && m.dict.peek().is_some_and(|d| d.mutation_stamp() == site.cache.mstamp.get());
+            && m.dict
+                .peek()
+                .is_some_and(|d| d.mutation_stamp() == site.cache.mstamp.get());
         if !fresh {
             let arg = code.instructions[pc].arg;
             if let Some(v) = Interpreter::core_module_attr(code, m, pc, arg) {

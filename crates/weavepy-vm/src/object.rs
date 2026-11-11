@@ -4532,9 +4532,7 @@ pub(crate) fn dict_reentrant_probe(
         }
         // (A pure `__hash__`'s answer, as the full call would give it.)
         Err(Some(hash)) => hash,
-        Err(None) => {
-            key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key))
-        }
+        Err(None) => key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key)),
     };
     let mut memo: Vec<(Object, bool)> = Vec::new();
     loop {

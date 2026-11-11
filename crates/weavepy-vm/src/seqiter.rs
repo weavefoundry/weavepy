@@ -1846,9 +1846,7 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
     // A plain instance whose class keeps `object`'s `__hash__`: its identity
     // hash, as the dict probes hash it (`LeafProbe`).
     if let Object::Instance(i) = x {
-        if i.native.get().is_none()
-            && i.class_dunder(crate::types::Dunder::Hash).object_owner()
-        {
+        if i.native.get().is_none() && i.class_dunder(crate::types::Dunder::Hash).object_owner() {
             return Some(Ok(Object::Int(crate::object::identity_hash(x))));
         }
     }

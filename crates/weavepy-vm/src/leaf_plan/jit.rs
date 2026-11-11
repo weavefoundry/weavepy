@@ -1932,7 +1932,11 @@ impl Lower<'_> {
                 self.set(fl, dst, t, p);
             }
             Op::Attr { dst, src, pc, name }
-                if fl.code.names.get(usize::from(name)).is_some_and(|n| &**n == "__class__") =>
+                if fl
+                    .code
+                    .names
+                    .get(usize::from(name))
+                    .is_some_and(|n| &**n == "__class__") =>
             {
                 let (t, p) = self.get(fl, src);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
