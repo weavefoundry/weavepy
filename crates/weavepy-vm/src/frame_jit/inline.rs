@@ -849,6 +849,14 @@ fn admit(
     if !crate::callee_warm(code, ext) {
         return Err("not warm");
     }
+    // A callee whose loops tier 2 compiled and runs better than this
+    // caller's code would (they run more than a few iterations a call, or
+    // call Python code), as direct calls decline it: in line, its loop
+    // runs as the frame JIT lowers it (`jitkernels`' 200-iteration
+    // kernels took 35% longer).
+    if crate::tier2_takes_calls(code) {
+        return Err("tier 2 loops");
+    }
     let depths = weavepy_compiler::cpython_code::compute_startdepths(code);
     if depths.len() != n {
         return Err("depths");

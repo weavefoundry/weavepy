@@ -1602,6 +1602,16 @@ branch and pull request.
     dict view is a leaf call too, as of the dict: `len(d.values())` takes
     656 instructions instead of 1,679 (1,053) and 219 cycles instead of
     515 (337).
+  - The inliner no longer takes a callee whose loops tier 2 runs better
+    (`tier2_takes_calls`: tier 2 compiled it, and its loops run more
+    than a few iterations a call or call Python code), as direct calls
+    already declined it. Counting every tier-2 compiled callee as warm
+    (`714ecf5f`) inlined `jitkernels`' 200-iteration kernels into the
+    frame JIT's `bench`, where their loops ran as the frame JIT lowers
+    them: the bench gate's `jitkernels` took 35 to 47% longer on every
+    platform (279M to 367M instructions). The short comprehension that
+    change was for still goes in line (7,811 instructions a call against
+    21,147 before it).
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took
