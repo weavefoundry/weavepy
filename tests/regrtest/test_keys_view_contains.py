@@ -2,7 +2,8 @@
 does: `int` and `str` keys present and absent, `1.0` and `True` against
 `int` keys, a view kept in a local, a view of a dict that dies with it, a
 dict subclass's view (which keeps its instance alive), keys added and
-removed between tests, and `values()` and `items()` views."""
+removed between tests, `values()` and `items()` views, and `len()` of
+each view, a subclass's included."""
 
 
 class D(dict):
@@ -70,4 +71,19 @@ def others(n):
 
 for _ in range(3):
     assert others(2000) == 4000
+
+
+def lengths(n):
+    d = {1: 1, 2: 2, 3: 3}
+    t = 0
+    for i in range(n):
+        t += len(d.values()) + len(d.keys()) + len(d.items())
+        D.log.clear()
+        t += len(D({1: 2}).values())
+        t += len(D.log)
+    return t
+
+
+for _ in range(3):
+    assert lengths(2000) == 2000 * (9 + 1 + 1)
 print("ok")

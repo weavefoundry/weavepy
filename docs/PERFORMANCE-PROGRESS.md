@@ -1598,8 +1598,10 @@ branch and pull request.
     else (its dict lives on; no subclass instance rides on it). The view
     went to the general membership, which also left compiled code for the
     core loop. Over a loop, 469 instructions an iteration instead of 1,565
-    (CPython 888) and 170 cycles instead of 501 (259). `len(d.values())`
-    still takes 1,737 against 1,053.
+    (CPython 888) and 170 cycles instead of 501 (259). `len()` of a
+    dict view is a leaf call too, as of the dict: `len(d.values())` takes
+    656 instructions instead of 1,679 (1,053) and 219 cycles instead of
+    515 (337).
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

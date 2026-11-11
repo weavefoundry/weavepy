@@ -12565,6 +12565,8 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             [Object::Dict(d)] => d.peek()?.len(),
             [Object::Set(s)] => s.peek()?.len(),
             [Object::Bytes(b)] => b.len(),
+            // A dict's keys, values or items view: the dict's size.
+            [Object::DictView(v)] => v.dict.peek()?.len(),
             _ => return None,
         }
     };

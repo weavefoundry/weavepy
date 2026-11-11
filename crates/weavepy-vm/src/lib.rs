@@ -32108,6 +32108,7 @@ impl Interpreter {
                             | O::ByteArray(_)
                             | O::Set(_)
                             | O::FrozenSet(_)
+                            | O::DictView(_)
                     )
             }
             K::Isinstance => return Self::core_isinstance(args),
