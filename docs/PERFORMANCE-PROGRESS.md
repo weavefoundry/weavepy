@@ -1585,6 +1585,13 @@ branch and pull request.
     `findCaller` and `posixpath` read modules a dozen times a record.
     Instructions: `logging_mix`, `stdlib_utils`, `deepcopy`,
     `graph_search` and `tomllib_loads` 0.99, the suite level.
+  - A compiled method call of a builtin function kept on the class and
+    called through an instance (`logging.Formatter`'s
+    `self.converter(t)`, `converter = time.localtime`) loads it from the
+    site's descriptor memo, as a `staticmethod`'s function is, with the
+    same version and shadowing checks. It went to the slow path every
+    time. A method descriptor kept on a class (`app = list.append`) still
+    binds, through the full path.
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

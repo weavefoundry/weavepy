@@ -7374,8 +7374,10 @@ unsafe fn note_method_desc(
     self_slot: &Object,
 ) {
     // (Only a result shaped as a descriptor's is worth a lookup: a plain
-    // method's has the instance in the self slot.)
-    if !matches!(callable, Object::Function(_))
+    // method's has the instance in the self slot. A builtin function kept
+    // on the class, `converter = time.localtime`, binds nothing either.)
+    let plain_builtin = matches!(callable, Object::Builtin(b) if !b.binds_instance);
+    if !(matches!(callable, Object::Function(_)) || plain_builtin)
         || !matches!(self_slot, Object::Unbound | Object::Type(_))
     {
         return;
@@ -7393,21 +7395,24 @@ unsafe fn note_method_desc(
     else {
         return;
     };
-    let (wrapper, binds_class) = match cls.lookup(name) {
-        Some(Object::StaticMethod(w)) => (w, false),
-        Some(Object::ClassMethod(w)) => (w, true),
+    let (func, binds_class) = match cls.lookup(name) {
+        Some(Object::StaticMethod(w)) => (w.func(), false),
+        Some(Object::ClassMethod(w)) => (w.func(), true),
+        Some(b @ Object::Builtin(_)) if plain_builtin => (b, false),
         _ => {
             s.desc_miss = ver;
             return;
         }
     };
-    let func = wrapper.func();
     let bound_ok = if binds_class {
         matches!(self_slot, Object::Type(t) if std::ptr::eq(Rc::as_ptr(t), cls))
     } else {
         matches!(self_slot, Object::Unbound)
     };
-    if bound_ok && matches!(func, Object::Function(_)) && func.is_same(callable) {
+    if bound_ok
+        && (matches!(func, Object::Function(_)) || plain_builtin)
+        && func.is_same(callable)
+    {
         s.desc = Some((ver, binds_class, func));
     } else {
         s.desc_miss = ver;
