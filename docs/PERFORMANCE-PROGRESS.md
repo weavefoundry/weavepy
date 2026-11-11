@@ -1555,6 +1555,17 @@ branch and pull request.
     (2,130). The suite's instructions and cycles are level (`float_points`,
     whose `bench` loops tier 2 rejects, retires 4% more instructions in
     0.99 of the cycles).
+  - Tier 2's dynamic call of a native method bound to its exact builtin
+    receiver (`groups[k].append(x)`, `parts[i].strip()`, a method read off
+    a value it can't type) runs the call as the core loop's leaf lane does,
+    for the kinds whose releases can't finalize anything (not a removal).
+    It went through the general call with an activation shell, about 600
+    instructions more. `groups[k].append(i)` with `groups` a
+    `defaultdict(list)` takes 2,751 instructions an iteration instead of
+    3,380 (CPython 1,853); the suite is level (`raytrace` 0.98). Tier 2's
+    other dynamic calls still pay that shell: constructing a Python class
+    (`ChainMap(...)`, 14,200 instructions an iteration against 9,100)
+    and a dunder's dispatch.
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

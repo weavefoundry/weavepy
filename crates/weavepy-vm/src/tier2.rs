@@ -12004,6 +12004,17 @@ unsafe fn call_dyn_impl(
         Some(p) => p.to_object(),
         None => return CallStatus::Reject as i64,
     };
+    // A native method bound to its exact builtin receiver whose call the
+    // core loop's leaf lane runs (`groups[k].append(x)`, `s.strip()`):
+    // run as the lane runs it, with no bound-method call or activation
+    // shell. (Only the kinds whose releases can't finalize anything.)
+    if kwc == 0 && argc < 4 {
+        if let Object::BoundMethod(bm) = &callee {
+            if let Some(status) = dyn_bound_leaf(jf, ctx, interp, bm, argc, int_result) {
+                return status;
+            }
+        }
+    }
     // RFC 0076 WS7 — the per-kind fast path: a compiled Python callee
     // (a function, a fully-bound method over one, a class whose
     // burned constructor plan carries a compiled `__init__`) enters
@@ -12345,6 +12356,44 @@ unsafe fn dyn_kw_pure_leaf(
 
 /// Deliver a pure leaf's result at a dynamic call site: it ran no Python,
 /// so the activation's guards still hold.
+/// [`call_dyn_impl`]'s call of a native method `bm` bound to its exact
+/// builtin receiver, over the `argc` marshaled arguments, when the core
+/// loop's leaf lane runs it in place (see `LeafKind::runs_in_core`): the
+/// call's status, or `None` (nothing done) for the general call.
+fn dyn_bound_leaf(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &super::Interpreter,
+    bm: &crate::object::BoundMethod,
+    argc: u32,
+    int_result: bool,
+) -> Option<i64> {
+    let Object::Builtin(b) = &bm.function else {
+        return None;
+    };
+    if bm.redispatch_descriptor
+        || !b.binds_instance
+        || crate::builtins::method_memo_tag(&bm.receiver).is_none()
+    {
+        return None;
+    }
+    let kind = interp.leaf_call_kind(b).filter(|k| k.runs_in_core())?;
+    let mut staged = [const { Object::None }; 4];
+    staged[0] = bm.receiver.clone();
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        staged[j + 1] = unpack_pins(bits, tag, &ctx.pins);
+    }
+    match interp.leaf_builtin_call(kind, b, &staged[..argc as usize + 1])? {
+        Ok(v) => Some(dyn_leaf_result(jf, ctx, v, int_result)),
+        Err(e) => {
+            ctx.raised = Some(e);
+            Some(CallStatus::Raised as i64)
+        }
+    }
+}
+
 fn dyn_leaf_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, int_result: bool) -> i64 {
     if int_result {
         if let Object::Int(value) = &v {
