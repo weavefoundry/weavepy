@@ -100,6 +100,10 @@ pub(crate) const DIRECT_YIELD: u32 = 8;
 /// state synced at its target: [`Native::run`] goes on there.
 const CHAIN: u32 = 7;
 
+/// How many times code whose loops tier 2 may take gets hot before the
+/// frame JIT takes it anyway (see `Slot::try_compile`).
+const LEFT_TO_TIER2: u32 = 16;
+
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid). With
 /// the code generator a quarter of Cranelift's cost, 500 took 8% off the
@@ -614,6 +618,9 @@ pub(crate) struct Slot {
     /// How many times the code got hot while start-up or an import ran
     /// (see `try_compile`).
     deferred: AtomicU32,
+    /// How many times the code got hot while its loops waited for tier 2
+    /// (see `try_compile`).
+    left: AtomicU32,
     /// A compile whose machine code a worker is generating (see
     /// [`background`]).
     pending: background::Pending,
@@ -773,7 +780,13 @@ impl Slot {
         }
         // Loops the tier-2 compiler may still take keep their back edges'
         // consultation in the core loop (a generator body the fast steps
-        // run never reaches it).
+        // run never reaches it). Tier 2 tries a loop after about fifty
+        // back edges: a loop that got hot this many times since, in code
+        // for which it holds no compiled code, is one it didn't take (a
+        // function run once whose main loop it rejected, its other loops
+        // never run), which would otherwise stay interpreted. (Heat from
+        // calls says nothing of the kind: tier 2 may yet take a loop that
+        // runs a few times a call.)
         let hint = &code.jit_hint;
         if !(matches!(at, Heat::Step)
             || hint.is_not_jitable()
@@ -782,10 +795,23 @@ impl Slot {
             || hint.is_backedge_quiet()
             || crate::short_loops(code))
         {
-            if stats::enabled() {
-                eprintln!("frame jit: {} left to tier 2", code.qualname);
+            let left = match at {
+                Heat::BackEdge(_) => self.left.load(Ordering::Relaxed).saturating_add(1),
+                _ => 0,
+            };
+            if left > 0 {
+                self.left.store(left, Ordering::Relaxed);
             }
-            return;
+            if left < LEFT_TO_TIER2 || crate::tier2::holds_compiled(code) {
+                if stats::enabled() {
+                    let kind = if left > 0 { "loop" } else { "call" };
+                    eprintln!("frame jit: {} left to tier 2 ({kind})", code.qualname);
+                }
+                return;
+            }
+            if stats::enabled() {
+                eprintln!("frame jit: {} taken from tier 2", code.qualname);
+            }
         }
         if !name_admitted(&code.qualname) {
             let _ = self.native.set(None);

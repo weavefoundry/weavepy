@@ -16298,6 +16298,18 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
     })
 }
 
+/// Whether this thread's tier-2 state holds compiled code for `code` (an
+/// entry that may run its loops), or can't say right now.
+pub(crate) fn holds_compiled(code: &CodeObject) -> bool {
+    JIT.with(|cell| {
+        cell.try_borrow().map_or(true, |st| {
+            st.cache
+                .get(&std::ptr::from_ref(code))
+                .is_some_and(|entry| matches!(entry.tier, Tier::Compiled(_)))
+        })
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn code_compiled_for_test(code: &Rc<CodeObject>) -> bool {
     JIT.with(|cell| {

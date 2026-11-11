@@ -1541,6 +1541,20 @@ branch and pull request.
     75,000), and `sum(map(attrgetter("x"), xs))` 135,000 instead of
     313,000 (46,000). Calling the getter from compiled code still costs
     3,600 a call against 790, most of it tier 2's native entry.
+  - A loop tier 2 didn't take no longer stays interpreted. The frame JIT
+    leaves code whose loops tier 2 may still take to it, and tier 2 stops
+    asking only once every loop header has missed; in a function run
+    once whose main loop it rejected, the loops of branches that never
+    ran never miss, so the main loop ran in the core loop for good. A
+    loop that got hot sixteen times at its back edge, in code for which
+    tier 2 holds no compiled code, now compiles in the frame JIT. (Heat
+    from calls doesn't count: tier 2 rejected `raytrace`'s `trace` at
+    first and compiled its loop later, and taking it then cost 9%.) In
+    such a loop, `all(x for x in t)` takes 4,059 instructions instead of
+    8,532 (CPython 4,471) and making a generator 2,633 instead of 3,597
+    (2,130). The suite's instructions and cycles are level (`float_points`,
+    whose `bench` loops tier 2 rejects, retires 4% more instructions in
+    0.99 of the cycles).
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took
