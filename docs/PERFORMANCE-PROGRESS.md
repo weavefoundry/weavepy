@@ -1574,6 +1574,17 @@ branch and pull request.
     takes 5,093 instructions instead of 7,435 (CPython 5,394) and 1,859
     cycles instead of 2,652 (1,979); building a `ChainMap` and reading
     two keys, 11,798 instead of 14,245 (9,132).
+  - A module's attribute read at a compiled site (`os.path`,
+    `sys.modules`, `time.time_ns` read as a value) and a module function's
+    method-form load (`os.path.basename(p)`) answer in the fast helpers
+    from the site's module entry while the module's dict is unchanged.
+    The site's entry for a module was read but never filled, so every
+    read took the slow path, and method-form loads reached the module
+    entry only past `method_slow`'s preamble. Found by counting slow-path
+    reads by site in `logging_mix`, where `LogRecord.__init__`,
+    `findCaller` and `posixpath` read modules a dozen times a record.
+    Instructions: `logging_mix`, `stdlib_utils`, `deepcopy`,
+    `graph_search` and `tomllib_loads` 0.99, the suite level.
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

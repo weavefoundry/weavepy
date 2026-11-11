@@ -7174,6 +7174,23 @@ unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
     unsafe {
         let s = &mut *site;
         let top = (*st).stack.add(s.len as usize - 1);
+        // `module.func(...)`: the entry the site last read, while the
+        // module's dict is exactly as it was then, with an empty self slot
+        // (as `method_slow` reaches it through the site's `ModCache`).
+        if let Object::Module(m) = &*top {
+            let mc = &s.mods;
+            let hit = m.dict.peek().and_then(|d| {
+                (std::ptr::eq(Rc::as_ptr(&m.dict).cast::<u8>(), mc.dict.get() as *const u8)
+                    && d.mutation_stamp() == mc.stamp.get())
+                .then(|| d.get_index(mc.idx.get()).map(|(_, v)| crate::clone_hot(v)))
+                .flatten()
+            });
+            if let Some(v) = hit {
+                crate::drop_hot(std::mem::replace(&mut *top, v));
+                (*st).stack.add(s.len as usize).write(Object::Unbound);
+                return 0;
+            }
+        }
         let hit = match &*top {
             Object::Instance(inst) => {
                 let c = &s.cache;
@@ -8134,11 +8151,14 @@ unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 
     unsafe {
         let s = &*site;
         let at = (*st).locals.add(s.local as usize);
-        if let Object::Instance(inst) = &*at {
-            if let Some(v) = field_hit(s, inst) {
-                (*st).stack.add(s.slot as usize).write(crate::clone_hot(v));
-                return 0;
-            }
+        let v = match &*at {
+            Object::Instance(inst) => field_hit(s, inst),
+            Object::Module(_) => attr_hit(s, &*at),
+            _ => None,
+        };
+        if let Some(v) = v {
+            (*st).stack.add(s.slot as usize).write(crate::clone_hot(v));
+            return 0;
         }
         attr_local_slow(st, site)
     }
@@ -8181,6 +8201,7 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
                     }
                 }
             }
+            Object::Module(m) => module_attr_note(site, m),
             _ => {}
         }
         if let Some(v) = attr_hit(site, &*at) {
@@ -8218,6 +8239,8 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
             Object::Instance(inst) => field_hit(s, inst).map(crate::clone_hot),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
+            // A module's value the site noted (`os.path`).
+            Object::Module(_) => attr_hit(s, &*at).map(crate::clone_hot),
             _ => None,
         };
         if let Some(v) = v {
@@ -8707,6 +8730,32 @@ unsafe fn frame_code_attr(st: *mut State, site: &AttrSite, recv: &Object) -> Opt
     }
 }
 
+/// Fill `site`'s module entry (see [`attr_hit`]) for a read of `m`, as the
+/// core loop resolves the site (its stamp slot, which
+/// `Interpreter::core_module_attr` fills): the fast helpers then read the
+/// value off the module's dict while it is unchanged.
+///
+/// # Safety
+///
+/// As [`attr_hit`]'s.
+#[cold]
+unsafe fn module_attr_note(site: &AttrSite, m: &crate::object::PyModule) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (code, ext, pc) = (&*site.code, &*site.ext, site.pc as usize);
+        mod_attr_note(ext, m, pc, &site.cache);
+        let fresh = site.cache.mvalue.get() != 0
+            && m.dict.peek().is_some_and(|d| d.mutation_stamp() == site.cache.mstamp.get());
+        if !fresh {
+            let arg = code.instructions[pc].arg;
+            if let Some(v) = Interpreter::core_module_attr(code, m, pc, arg) {
+                drop(v);
+                mod_attr_note(ext, m, pc, &site.cache);
+            }
+        }
+    }
+}
+
 /// [`h_attr_stack`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -8741,6 +8790,7 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                     drop(v);
                 }
             }
+            Object::Module(m) => module_attr_note(site, m),
             _ => {}
         }
         let r = if let Some(v) = attr_hit(site, &*at).or_else(|| match &*at {
