@@ -735,6 +735,7 @@ pub(crate) mod vm_key {
     pub(crate) const ABC_HOOK: u32 = 19;
     pub(crate) const ABC_CLASS: u32 = 20;
     pub(crate) const CHAINMAP_MAPS: u32 = 21;
+    pub(crate) const NATIVE_GETITEM_ANY: u32 = 22;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the

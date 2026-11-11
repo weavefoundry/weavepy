@@ -46955,7 +46955,25 @@ impl Interpreter {
                 }
                 return self.call(&Object::Function(f), &[v.clone(), i.clone()], &[], &g);
             }
-            let user_getitem = (!Self::native_payload_getitem(inst))
+            let payload = Self::native_payload_getitem(inst);
+            // A native `__getitem__` with a registered fast half (a
+            // `ChainMap`'s): the half first, as the core loop's lane runs
+            // it, with no bound method built.
+            if !payload {
+                if let Some(b) = Self::instance_native_dunder(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::NATIVE_GETITEM_ANY),
+                    "__getitem__",
+                    false,
+                ) {
+                    if let Some(LeafKind::Fast(f)) = self.leaf_call_kind(&b) {
+                        if let Some(r) = f(&[v.clone(), i.clone()]) {
+                            return r;
+                        }
+                    }
+                }
+            }
+            let user_getitem = (!payload)
                 .then(|| inst.cls().lookup_with_owner("__getitem__"))
                 .flatten()
                 .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.get().is_none())

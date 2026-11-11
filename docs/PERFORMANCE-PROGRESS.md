@@ -1566,6 +1566,14 @@ branch and pull request.
     other dynamic calls still pay that shell: constructing a Python class
     (`ChainMap(...)`, 14,200 instructions an iteration against 9,100)
     and a dunder's dispatch.
+  - A subscript of an instance whose class's `__getitem__` is a native
+    method with a registered fast half (a `ChainMap`'s) runs the half
+    first, found through the class's memo, as the core loop's lane does.
+    The general subscript (tier 2's, a native caller's) looked the method
+    up by name, built a bound method and called it. `cm["a"] + cm["b"]`
+    takes 5,093 instructions instead of 7,435 (CPython 5,394) and 1,859
+    cycles instead of 2,652 (1,979); building a `ChainMap` and reading
+    two keys, 11,798 instead of 14,245 (9,132).
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took
