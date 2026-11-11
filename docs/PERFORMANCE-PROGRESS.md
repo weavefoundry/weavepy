@@ -1592,6 +1592,14 @@ branch and pull request.
     same version and shadowing checks. It went to the slow path every
     time. A method descriptor kept on a class (`app = list.append`) still
     binds, through the full path.
+  - `k in d.keys()` with a plain `int` or `str` key probes the dict
+    natively in the commonest-shapes helper compiled code and the core
+    loop share, freeing the temporary view there when that frees nothing
+    else (its dict lives on; no subclass instance rides on it). The view
+    went to the general membership, which also left compiled code for the
+    core loop. Over a loop, 469 instructions an iteration instead of 1,565
+    (CPython 888) and 170 cycles instead of 501 (259). `len(d.values())`
+    still takes 1,737 against 1,053.
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

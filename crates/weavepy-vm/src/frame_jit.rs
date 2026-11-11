@@ -8907,8 +8907,64 @@ unsafe extern "C" fn h_contains_hot<const OWNED: u32>(a: *const Object, b: *cons
             (Object::Dict(_) | Object::Set(_), Object::Type(_)) => {
                 crate::h_type_contains::<OWNED>(a, b)
             }
+            (Object::DictView(_), Object::Int(_) | Object::Str(_)) => {
+                h_keys_view_contains::<OWNED>(a, b)
+            }
             _ => 2,
         }
+    }
+}
+
+/// `CONTAINS_OP` of a plain `int` or `str` in a dict's keys view (`k in
+/// d.keys()`), probed natively as the dict's own membership is: `1` found,
+/// `0` not, `2` declined untouched. A temporary view (the stack's only
+/// reference) is freed here when that frees nothing else: its dict lives
+/// on and it keeps no subclass instance alive.
+///
+/// # Safety
+///
+/// As [`h_contains_hot`]'s.
+#[inline(never)]
+unsafe fn h_keys_view_contains<const OWNED: u32>(a: *const Object, b: *const Object) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::DictView(v) = &*b else {
+            return 2;
+        };
+        if v.kind != crate::object::DictViewKind::Keys {
+            return 2;
+        }
+        let Some(ri) = crate::PlainRelease::of(&*a, OWNED & 1 != 0) else {
+            return 2;
+        };
+        let view_owned = OWNED & 2 != 0;
+        // The stack's only reference to the view: freed below, if that
+        // frees nothing else; any other: a plain release.
+        let frees_view = view_owned && Rc::strong_count(v) == 1;
+        let rv = if frees_view {
+            if v.owner.is_some() || crate::sync::Rc::strong_count(&v.dict) < 2 {
+                return 2;
+            }
+            None
+        } else {
+            match crate::PlainRelease::of(&*b, view_owned) {
+                Some(rv) => Some(rv),
+                None => return 2,
+            }
+        };
+        let Some(d) = v.dict.peek() else {
+            return 2;
+        };
+        let Some(found) = d.find_object_native(&*a) else {
+            return 2;
+        };
+        let found = found.1.is_ok();
+        match rv {
+            Some(rv) => rv.run(),
+            None => drop(b.cast_mut().read()),
+        }
+        ri.run();
+        u32::from(found)
     }
 }
 
