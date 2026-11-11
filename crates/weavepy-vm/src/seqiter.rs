@@ -1843,6 +1843,15 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
     let [x] = args else {
         return None;
     };
+    // A plain instance whose class keeps `object`'s `__hash__`: its identity
+    // hash, as the dict probes hash it (`LeafProbe`).
+    if let Object::Instance(i) = x {
+        if i.native.get().is_none()
+            && i.class_dunder(crate::types::Dunder::Hash).object_owner()
+        {
+            return Some(Ok(Object::Int(crate::object::identity_hash(x))));
+        }
+    }
     // An instance whose Python `__hash__` evaluates as a pure leaf (a frozen
     // dataclass's `hash((self.a, self.b))`).
     if let Object::Instance(_) = x {
@@ -2052,7 +2061,7 @@ fn cursor_advance(c: &Rc<RefCell<PyIterator>>) -> Option<()> {
 /// Python function (or a method over one) whose code isn't a pure leaf,
 /// one load where that verdict is recorded.
 #[inline]
-fn pure_callback_maybe(func: &Object) -> bool {
+pub(crate) fn pure_callback_maybe(func: &Object) -> bool {
     let f = match func {
         Object::Function(f) => f,
         Object::BoundMethod(bm) => match &bm.function {
@@ -2141,6 +2150,21 @@ impl Interpreter {
                 }
                 _ => None,
             },
+            // An instance whose class's `__call__` is a registered leaf
+            // half (`key=attrgetter("x")`, `map(itemgetter(0), ...)`).
+            Object::Instance(i) if !crate::gil::free_threading_enabled() => {
+                let Object::Builtin(b) = i.cls_raw().lookup("__call__")? else {
+                    return None;
+                };
+                let LeafKind::Fast(f) = admit(self.leaf_call_kind(&b)?)? else {
+                    return None;
+                };
+                let call = match args {
+                    [a] => [func.clone(), a.clone()],
+                    _ => return None,
+                };
+                f(&call)?.ok()
+            }
             _ => None,
         }
     }

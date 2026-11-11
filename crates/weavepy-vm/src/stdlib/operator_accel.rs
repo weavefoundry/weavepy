@@ -177,6 +177,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 // Native containers subscripted by plain keys, in place.
                 crate::leaf_builtins::register_fast(&b, itemgetter_fast);
             }
+            if name == ".attrgetter.__call__" {
+                // A plain attribute read that runs no code, in place.
+                crate::leaf_builtins::register_fast(&b, attrgetter_fast);
+            }
             d.insert(DictKey(Object::from_static(export)), Object::Builtin(b));
         }
 
@@ -473,6 +477,30 @@ fn itemgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::new_tuple(results))
         }
     })
+}
+
+/// `attrgetter.__call__`'s leaf half: one attribute name without dots, read
+/// off the operand as `getattr(obj, name)`'s leaf reads it (an instance's
+/// own value, a class function bound, a plain class value, a named tuple's
+/// field) when that runs no code. Anything else declines to the full body.
+fn attrgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), obj] = args else {
+        return None;
+    };
+    // SAFETY: a read that runs no code.
+    let Object::Tuple(attrs) = unsafe { inst.slots.peek() }?
+        .get_hinted(0, "_attrs")?
+        .clone()
+    else {
+        return None;
+    };
+    let [name @ Object::Str(s)] = &attrs[..] else {
+        return None;
+    };
+    if s.contains('.') {
+        return None;
+    }
+    crate::Interpreter::leaf_getattr_value(obj, name).map(Ok)
 }
 
 /// [`itemgetter_call`]'s pure fast half (the dispatch loop's leaf call):

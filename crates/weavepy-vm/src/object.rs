@@ -4525,7 +4525,17 @@ pub(crate) fn dict_reentrant_probe(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<ReentrantProbe, RuntimeError> {
-    let kh = key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key));
+    let kh = match leaf_instance_probe(d, key) {
+        Ok((hash, i)) => {
+            let stored = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+            return Ok(ReentrantProbe { hash, stored });
+        }
+        // (A pure `__hash__`'s answer, as the full call would give it.)
+        Err(Some(hash)) => hash,
+        Err(None) => {
+            key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key))
+        }
+    };
     let mut memo: Vec<(Object, bool)> = Vec::new();
     loop {
         // Same-hash candidates, collected under a short borrow with a
@@ -4646,9 +4656,7 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
-    if let Some(found) = leaf_hashed_instance_get(d, key) {
-        return Ok(found);
-    }
+    // (An instance key's pure-leaf phase runs inside the probe.)
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
@@ -4662,29 +4670,63 @@ pub(crate) fn dict_reentrant_get(
 }
 
 /// [`dict_reentrant_get`] of an instance whose class's Python `__hash__`
-/// evaluates as a pure leaf (see `Interpreter::leaf_instance_hash`), found
-/// only as itself, as CPython's probe tries identity before `__eq__`: the
-/// stored value, or (`Some(None)`) none when no stored key shared its hash.
-/// `None` when another key with that hash would need `__eq__`, or the hash
-/// isn't settled natively.
+/// evaluates as a pure leaf (see `Interpreter::leaf_instance_hash`): the
+/// stored value, or (`Some(None)`) none when no stored key is equal. `None`
+/// when a stored key with that hash needs a comparison that isn't settled
+/// natively, or the hash isn't.
 pub(crate) fn leaf_hashed_instance_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Option<Option<Object>> {
+    let (_, i) = leaf_instance_probe(d, key).ok()?;
+    let m = d.try_borrow().ok()?;
+    Some(i.and_then(|i| m.get_index(i)).map(|(_, v)| v.clone()))
+}
+
+/// The pure-leaf phase of a probe for an instance key: its hash, as
+/// `Interpreter::leaf_instance_hash` evaluates it, and the position of the
+/// stored key it matches, found as itself (CPython's probe tries identity
+/// first) or, for another instance of its class, by a `__eq__` that
+/// evaluates as a pure leaf (`Interpreter::leaf_instance_eq`). `Err` with
+/// the hash, when one was found, for a probe a stored key's comparison
+/// leaves to the full path.
+fn leaf_instance_probe(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<(i64, Option<usize>), Option<i64>> {
     if !matches!(key, Object::Instance(_)) {
-        return None;
+        return Err(None);
     }
     // SAFETY: the running thread's interpreter, under the GIL; the
-    // evaluation runs no Python and takes no frame.
-    let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
-    let hash = interp.leaf_instance_hash(key)?;
+    // evaluations run no Python and take no frame.
+    let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr().ok_or(None)? };
+    let hash = interp.leaf_instance_hash(key).ok_or(None)?;
     let probe = LeafProbe::with_hash(key, hash);
-    let m = d.try_borrow().ok()?;
-    match m.get_index_of(&probe) {
-        Some(i) => Some(m.get_index(i).map(|(_, v)| v.clone())),
-        None if probe.miss_is_exact() => Some(None),
-        None => None,
+    let m = d.try_borrow().map_err(|_| Some(hash))?;
+    if let Some(i) = m.get_index_of(&probe) {
+        return Ok((hash, Some(i)));
     }
+    if probe.miss_is_exact() {
+        return Ok((hash, None));
+    }
+    // (A pure `__eq__` reads, and never writes, what the table holds.)
+    let declined = Cell::new(false);
+    let i = m.find_by_hash(hash, |k| {
+        if declined.get() {
+            return false;
+        }
+        if k.0.is_same(key) {
+            return true;
+        }
+        interp.leaf_instance_eq(&k.0, key).unwrap_or_else(|| {
+            declined.set(true);
+            false
+        })
+    });
+    if declined.get() {
+        return Err(Some(hash));
+    }
+    Ok((hash, i))
 }
 
 /// The position of `key` in `d`, honouring keys whose `__hash__`/`__eq__`

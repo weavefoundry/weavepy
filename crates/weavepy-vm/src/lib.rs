@@ -30758,6 +30758,47 @@ impl Interpreter {
         }
     }
 
+    /// `stored == key` for two instances of one class whose Python
+    /// `__eq__` evaluates as a pure leaf (a dataclass's field comparisons),
+    /// as a dict probe takes it: `Some` only for a `bool` answer. `None`
+    /// for anything else (`NotImplemented`, another class, a native
+    /// payload), which the full comparison settles.
+    pub(crate) fn leaf_instance_eq(&self, stored: &Object, key: &Object) -> Option<bool> {
+        let (Object::Instance(a), Object::Instance(b)) = (stored, key) else {
+            return None;
+        };
+        if a.native.get().is_some()
+            || b.native.get().is_some()
+            || crate::object::exotic_str_keys_possible()
+            || crate::gil::free_threading_enabled()
+        {
+            return None;
+        }
+        let cls = a.cls_raw();
+        if !std::ptr::eq(cls, b.cls_raw()) {
+            return None;
+        }
+        let Some(Object::Function(f)) = cls.lookup("__eq__") else {
+            return None;
+        };
+        let code = f.code();
+        if !code_is_pure_leaf(&code)
+            || !pure_leaf_warm(&code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let r = self.pure_leaf_eval::<false, false>(
+            &code,
+            &f,
+            &[std::ptr::from_ref(stored), std::ptr::from_ref(key)],
+        );
+        match r? {
+            Object::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
     fn leaf_instance_truth(&self, v: &Object) -> Option<bool> {
         let Object::Instance(inst) = v else {
             return None;
@@ -31766,6 +31807,13 @@ impl Interpreter {
             s.set_leaf(rc, kind);
         }
         Some(kind)
+    }
+
+    /// `getattr(obj, name)` as [`Self::leaf_getattr`] reads it, for native
+    /// callers (`operator.attrgetter`): `None` for what the full path must
+    /// decide.
+    pub(crate) fn leaf_getattr_value(obj: &Object, name: &Object) -> Option<Object> {
+        Self::leaf_getattr_parts(obj, name, None, false)
     }
 
     /// `getattr(obj, name[, default])` on a plain instance whose lookup
@@ -46503,10 +46551,20 @@ impl Interpreter {
         // `key=len`: each length as `len(x)` takes it, without the general
         // call's dispatch per item (as the call arms recognize the builtin).
         let len_key = matches!(f, Object::Builtin(b) if b.name == "len");
+        // A key that runs no code (a pure-leaf function, `attrgetter("x")`)
+        // evaluates in place, as `map`'s callback does; after one decline
+        // the rest take the full call.
+        let mut pure = !len_key && crate::seqiter::pure_callback_maybe(f);
         for item in items.iter() {
             let k = if len_key {
                 self.do_len_call(item, globals)?
+            } else if let Some(k) = pure
+                .then(|| self.pure_callback(f, std::slice::from_ref(item), true))
+                .flatten()
+            {
+                k
             } else {
+                pure = false;
                 self.call(f, std::slice::from_ref(item), &[], globals)?
             };
             decorated.push((k, item.clone()));

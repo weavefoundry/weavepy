@@ -478,6 +478,36 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
     }
 }
 
+/// [`h_attr`] of `obj.__class__`: a plain instance's class (its class
+/// keeps `object`'s `__class__` and `__getattribute__`), without the
+/// general read (`other.__class__ is self.__class__` in a dataclass's
+/// `__eq__`).
+unsafe extern "C" fn h_class<const EFFECT: bool>(
+    ctx: *mut Ctx<'static>,
+    fr: *const Frame,
+    t: u64,
+    p: u64,
+    pc_name: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    if t == T_R {
+        // SAFETY: as `norm`.
+        let obj = unsafe { &*(p as *const Object) };
+        if let Object::Instance(inst) = obj {
+            let pending = EFFECT && c.pend.n > 0 && c.pend.stores_to(obj, pc_name >> 16);
+            if !pending && inst.cls_raw().class_attr_is_plain() {
+                if let Some(v) = c.owned.own(Object::Type(inst.cls())) {
+                    c.put(v);
+                    return 0;
+                }
+            }
+        }
+    }
+    // SAFETY: forwarded.
+    unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) }
+}
+
 /// [`h_attr`] through the site's [`FieldCache`]: a split field of a plain
 /// instance whose class the site has seen answers without the general
 /// read; a general read that found the instance's own field remembers it.
@@ -1900,6 +1930,23 @@ impl Lower<'_> {
                 let t = self.b.ins().load(types::I64, flags, self.ctx, 0);
                 let p = self.b.ins().load(types::I64, flags, self.ctx, 8);
                 self.set(fl, dst, t, p);
+            }
+            Op::Attr { dst, src, pc, name }
+                if fl.code.names.get(usize::from(name)).is_some_and(|n| &**n == "__class__") =>
+            {
+                let (t, p) = self.get(fl, src);
+                let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
+                let addr = if effect {
+                    h_class::<true> as *const () as usize
+                } else {
+                    h_class::<false> as *const () as usize
+                };
+                let st = self.call(addr, &[self.ctx, fl.fr, t, p, pn]);
+                self.check(st);
+                let flags = MemFlags::trusted();
+                let rt = self.b.ins().load(types::I64, flags, self.ctx, 0);
+                let rp = self.b.ins().load(types::I64, flags, self.ctx, 8);
+                self.set(fl, dst, rt, rp);
             }
             Op::Attr { dst, src, pc, name } => {
                 let (t, p) = self.get(fl, src);

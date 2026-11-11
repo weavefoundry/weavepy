@@ -1519,6 +1519,32 @@ branch and pull request.
     registering needs entries that name the record and are made whole only
     if they outlive the call (on its return or raise), so a clean return
     checks for them.
+  - A dict probe keyed by an instance whose `__hash__` and `__eq__` are
+    small Python functions (a frozen dataclass) settles in the leaf
+    evaluator when the stored key is an equal instance of the same class,
+    not only the same one: its `__eq__` runs as a pure leaf in the table
+    walk. Before, the probe hashed the key up to three times (compiled
+    code's quick probe, the subscript's, then the full probe's) and ran
+    `__eq__` through the full comparison. A compiled leaf plan reads
+    `obj.__class__` of a plain instance directly instead of through the
+    general attribute read, whose field cache never holds it (the
+    dataclass `__eq__` compares `other.__class__ is self.__class__`).
+    Warm, `d[K(1, "a")]` takes 4,144 instructions instead of 12,085
+    (CPython 3,139), and `k == other` 1,831 instead of 3,571 (1,795).
+    `hash(obj)` of an instance hashed by identity is a leaf half (2,624 to
+    370; CPython 429).
+  - `operator.attrgetter("x")` called on an instance reads the attribute
+    as `getattr`'s leaf half does, and an adapter's callback or a
+    `sorted` key that's an `attrgetter` or `itemgetter`, or a pure-leaf
+    function, runs in place. `sorted(xs, key=attrgetter("x"))` over 100
+    instances takes 143,000 instructions instead of 251,000 (CPython
+    75,000), and `sum(map(attrgetter("x"), xs))` 135,000 instead of
+    313,000 (46,000). Calling the getter from compiled code still costs
+    3,600 a call against 790, most of it tier 2's native entry.
+  - Tried and dropped: calling a Python `__next__` from the core loop's
+    `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
+    which the bound-method call reaches, and a warm five-item loop took
+    28,800 instructions instead of 18,200 (CPython 6,100).
   - On a PGO build at `0a538196` (November 9, 2026): warm time 0.875 of
     CPython's, cold 1.007, peak memory 1.253 (`nqueens` 0.98, from 1.59 on
     the previous PGO build). The worst warm times are `async_tree` 1.45,
