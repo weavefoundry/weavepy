@@ -62,9 +62,13 @@ fn margin(highest: usize) -> usize {
 }
 
 /// How much file-backed memory the resident set gains, over what the last
-/// release left of it, before another: the code a program keeps running
-/// comes back to 2 or 3 MB of that.
-const WORTH: usize = 4 << 20;
+/// release left of it, before another. The code a program keeps running
+/// comes back to about 2.5 MB of that in a profile-guided build, so less
+/// than this is a release that frees nothing for long: at 4 MB the first
+/// calls of the suite's workloads took 2.0% longer than with no releases
+/// and peak RSS came to 0.787 of theirs, with no such condition 3.2% and
+/// 0.766.
+const WORTH: usize = 3 << 20;
 
 /// A process's resident memory: all of it, and the part files back (code,
 /// constants and mapped files).
