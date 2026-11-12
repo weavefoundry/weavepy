@@ -816,6 +816,13 @@ struct Carve {
 #[derive(Debug, Default)]
 pub struct Carved(Option<CarveState>);
 
+impl Carved {
+    /// How many carving steps are kept.
+    pub fn steps(&self) -> usize {
+        self.0.as_ref().map_or(0, |state| state.steps)
+    }
+}
+
 /// Where a carving stands (see [`analyze_impl`]): the cold exits, the
 /// loops left to the interpreter, the steps taken, and the verdict that
 /// started it.
