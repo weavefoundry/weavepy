@@ -14536,8 +14536,9 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
-                    // Rebinding an existing module-scope name whose old value
-                    // leaves by a plain drop; a new name, a finalizer's
+                    // Binding a module-scope name: a new one (what a module's
+                    // body does all the way down), or an existing one whose
+                    // old value leaves by a plain drop. A finalizer's
                     // candidate or a watched dict takes the full handler.
                     OpCode::StoreName | OpCode::StoreGlobal
                         if ins.op == OpCode::StoreGlobal || self.core_name_scope(frame) =>
@@ -14553,27 +14554,46 @@ impl Interpreter {
                         let Some(g) = (unsafe { frame.globals.peek_mut() }) else {
                             break None;
                         };
-                        let i = match g.get_index_of(&probe) {
-                            Some(i) if !probe.saw_exotic() => i,
-                            _ => break None,
-                        };
-                        if !g
-                            .get_index(i)
-                            .is_some_and(|(_, old)| Self::core_droppable(old))
-                        {
-                            break None;
+                        match g.get_index_of(&probe) {
+                            Some(_) if probe.saw_exotic() => break None,
+                            Some(i) => {
+                                if !g
+                                    .get_index(i)
+                                    .is_some_and(|(_, old)| Self::core_droppable(old))
+                                {
+                                    break None;
+                                }
+                                // The key layout stays: no stamp (every cached
+                                // global load stands), but the value epoch
+                                // moves.
+                                let Some((_, slot)) = g.map_mut_value_store().get_index_mut(i)
+                                else {
+                                    break None;
+                                };
+                                crate::object::bump_global_value_epoch();
+                                // SAFETY: `len > 0`; the value moves into the
+                                // binding and the displaced one was checked
+                                // droppable.
+                                let old =
+                                    std::mem::replace(slot, unsafe { base.add(len - 1).read() });
+                                drop_hot(old);
+                            }
+                            None => {
+                                // The key is the code's interned name, as the
+                                // full handler's.
+                                let (Some(key @ Object::Str(_)), false) =
+                                    (code_name_obj(code, ins.arg), probe.saw_exotic())
+                                else {
+                                    break None;
+                                };
+                                // SAFETY: `len > 0`; the value moves into the
+                                // new binding.
+                                let v = unsafe { base.add(len - 1).read() };
+                                let displaced = g.insert(DictKey(key.clone()), v);
+                                debug_assert!(displaced.is_none());
+                            }
                         }
-                        // The key layout stays: no stamp (every cached global
-                        // load stands), but the value epoch moves.
-                        let Some((_, slot)) = g.map_mut_value_store().get_index_mut(i) else {
-                            break None;
-                        };
-                        crate::object::bump_global_value_epoch();
-                        // SAFETY: `len > 0`; the value moves into the binding and
-                        // the displaced one was checked droppable.
-                        let old = std::mem::replace(slot, unsafe { base.add(len - 1).read() });
                         len -= 1;
-                        drop_hot(old);
                         last = pc;
                         pc += 1;
                     }
@@ -85267,7 +85287,13 @@ fn set_function_attribute(func: Object, value: Object, flag: u32) -> Result<Obje
             "SET_FUNCTION_ATTRIBUTE expects a function on top".to_owned(),
         ));
     };
-    gc_trace::untrack(&Object::Function(pf.clone()));
+    // The collector holds a young function (where `MAKE_FUNCTION` just put
+    // it) by its address alone, so it changes in place and stays there; a
+    // registered one leaves the registry while it changes.
+    let young = pf.gc_slot.is_young();
+    if !young {
+        gc_trace::untrack(&Object::Function(pf.clone()));
+    }
     {
         let f = Rc::get_mut(&mut pf).ok_or_else(|| {
             RuntimeError::Internal("SET_FUNCTION_ATTRIBUTE on a shared function".to_owned())
@@ -85328,7 +85354,9 @@ fn set_function_attribute(func: Object, value: Object, flag: u32) -> Result<Obje
         }
     }
     let obj = Object::Function(pf);
-    gc_trace::track(&obj);
+    if !young {
+        gc_trace::track(&obj);
+    }
     Ok(obj)
 }
 
