@@ -10,9 +10,7 @@
 #    the linker order file target/pgo/weavepy.order from what the
 #    training ran (tools/pgo/order.py).
 # 4. Build the optimized binary into target/pgo/use, linked in that
-#    order, with the code the training never reached split out of the
-#    functions it did; it is printed at the end
-#    (target/pgo/use/release/weavepy).
+#    order; it is printed at the end (target/pgo/use/release/weavepy).
 #
 # Needs the toolchain's llvm-profdata: `rustup component add llvm-tools`.
 #
@@ -70,9 +68,8 @@ python3 "$root/tools/pgo/order.py" "$profdata" "$merged" \
     "$root/crates/weavepy-cli/weavepy.order" "$order" --runs "$runs"
 
 echo "== optimized build"
-# Code no training run reached leaves the functions that did run, for a
-# section of its own behind everything else (`-hot-cold-split`): a
-# function's pages then hold what runs, not what might.
+# (WEAVEPY_PGO_RUSTFLAGS: more flags for this build alone, for trying
+# variants against one training run.)
 CFLAGS="-fno-profile-instr-use" \
 WEAVEPY_ORDER_FILE="$order" \
 RUSTFLAGS="-Cprofile-use=$merged -Cllvm-args=-pgo-warn-missing-function=false ${WEAVEPY_PGO_RUSTFLAGS:-}" \
