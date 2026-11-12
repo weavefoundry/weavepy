@@ -294,6 +294,16 @@ pub fn attribute_error(message: impl Into<String>) -> RuntimeError {
 /// CPython's C raise sites populate (PEP 3134-adjacent; used by
 /// suggestion machinery and asserted on by `test_exceptions`).
 pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
+    attribute_error_named_obj(obj, name, None)
+}
+
+/// [`attribute_error_named`] whose `name` field is `name_obj` when given
+/// (see [`attribute_error_parts`]).
+pub(crate) fn attribute_error_named_obj(
+    obj: &Object,
+    name: &str,
+    name_obj: Option<&Object>,
+) -> RuntimeError {
     // Built in one step (message, `args` and both fields): a failing
     // lookup under `getattr(o, n, default)` or `except AttributeError`
     // is a hot path.
@@ -310,25 +320,41 @@ pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
             &owned
         }
     };
-    attribute_error_typed(obj, name, type_name)
+    attribute_error_parts(obj, name, name_obj, type_name)
 }
 
 /// [`attribute_error_named`] whose message names the type `type_name`
 /// (a `__slots__` member's error names the class by its qualified name,
 /// as CPython's `member_get` does).
 pub fn attribute_error_typed(obj: &Object, name: &str, type_name: &str) -> RuntimeError {
-    let mut message = String::with_capacity(type_name.len() + name.len() + 30);
-    message.push('\'');
-    message.push_str(type_name);
-    message.push_str("' object has no attribute '");
-    message.push_str(name);
-    message.push('\'');
+    attribute_error_parts(obj, name, None, type_name)
+}
+
+/// [`attribute_error_typed`] whose `name` field is `name_obj` when given
+/// (the code's interned name, shared rather than copied).
+pub(crate) fn attribute_error_parts(
+    obj: &Object,
+    name: &str,
+    name_obj: Option<&Object>,
+    type_name: &str,
+) -> RuntimeError {
+    let message = crate::shared_value::SharedStr::concat(&[
+        "'",
+        type_name,
+        "' object has no attribute '",
+        name,
+        "'",
+    ]);
+    let name_obj = match name_obj {
+        Some(n @ Object::Str(s)) if &**s == name => n.clone(),
+        _ => Object::from_str(name),
+    };
     let instance = crate::builtin_types::exception_from_parts_with(
         crate::builtin_types::builtin_types()
             .attribute_error
             .clone(),
-        Some(Object::from_str(message)),
-        [("name", Object::from_str(name)), ("obj", obj.clone())],
+        Some(Object::Str(message)),
+        [("name", name_obj), ("obj", obj.clone())],
     );
     RuntimeError::PyException(PyException::new(instance))
 }
@@ -594,13 +620,13 @@ pub fn blocking_io_error_written(
     let pe = PyException::from_builtin("BlockingIOError", strerror.to_owned());
     if let Object::Instance(inst) = &pe.instance {
         inst.slot_set("errno", Object::Int(i64::from(errno)));
-        inst.slot_set("strerror", Object::from_str(strerror.to_owned()));
+        inst.slot_set("strerror", Object::from_str(strerror));
         inst.slot_set("characters_written", Object::Int(characters_written));
         inst.slot_set(
             "args",
             Object::new_tuple_array([
                 Object::Int(i64::from(errno)),
-                Object::from_str(strerror.to_owned()),
+                Object::from_str(strerror),
                 Object::Int(characters_written),
             ]),
         );
@@ -711,10 +737,10 @@ pub fn os_error_from_parts(
                 inst.slot_set("winerror", Object::Int(w));
             }
             if let Some(f) = filename {
-                inst.slot_set("filename", Object::from_str(f.to_owned()));
+                inst.slot_set("filename", Object::from_str(f));
             }
             if let Some(f2) = filename2 {
-                inst.slot_set("filename2", Object::from_str(f2.to_owned()));
+                inst.slot_set("filename2", Object::from_str(f2));
             }
         }
     }
@@ -873,10 +899,10 @@ pub fn io_error_to_py_named2(
             }
             inst.slot_set("strerror", Object::from_str(strerror));
             if let Some(f) = filename {
-                inst.slot_set("filename", Object::from_str(f.to_owned()));
+                inst.slot_set("filename", Object::from_str(f));
             }
             if let Some(f2) = filename2 {
-                inst.slot_set("filename2", Object::from_str(f2.to_owned()));
+                inst.slot_set("filename2", Object::from_str(f2));
             }
         }
     }

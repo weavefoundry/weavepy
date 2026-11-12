@@ -1,4 +1,4 @@
-//! RFC 0032 — the VM side of the tier-2 Cranelift JIT.
+//! RFC 0032 — the VM side of the tier-2 JIT.
 //!
 //! This module is compiled only with the `jit` feature. It owns a
 //! per-thread [`weavepy_jit::JitEngine`] and a hot-counter cache keyed by
@@ -476,6 +476,22 @@ struct Artifacts {
     /// round-trips they made (see [`note_callee_exit`]).
     callee_entries: Cell<u32>,
     callee_roundtrips: Cell<u32>,
+    /// Whether the body works on floats in their lanes (a float local,
+    /// field or return, or a `math` intrinsic): see [`float_work`].
+    float_work: bool,
+}
+
+/// Whether `cf` keeps floats unboxed: a float local, field site or
+/// return, or a `math` intrinsic. The frame JIT boxes each float it
+/// computes, so a loop calling such a body stays native even when it's
+/// dense with calls (see `try_native_call`): `float_math`'s loops took
+/// 1.27 times as long under the frame JIT on AMD runners, 1.16 on Intel.
+fn float_work(cf: &CompiledFrame) -> bool {
+    let float = |t: &JitType| matches!(t, JitType::Float);
+    !cf.math_guards.is_empty()
+        || cf.ret_lane.as_ref().is_some_and(float)
+        || cf.local_types.iter().flatten().any(float)
+        || cf.attr_sites.iter().any(|a| float(&a.lane))
 }
 
 /// RFC 0073 WS4 — source of [`Artifacts::compile_id`].
@@ -838,119 +854,6 @@ struct JitState {
 /// edge; with the JIT off they answer from this one relaxed load instead
 /// of a thread-local borrow.
 static JIT_PROCESS_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Warm the code generator on a background thread (see
-/// [`prewarm_codegen`]), once per process: as start-up begins for a script
-/// or module (see [`prewarm_at_startup`]), or else when the first code
-/// object is halfway to its frame-JIT compile (see [`prewarm_on_heat`]) or
-/// to its tier-2 threshold.
-fn spawn_codegen_prewarm() {
-    static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(handle) = std::thread::Builder::new()
-        .name("weavepy-jit-warm".to_owned())
-        .spawn(prewarm_codegen)
-    {
-        if let Ok(mut slot) = PREWARM_THREAD.lock() {
-            *slot = Some(handle);
-        }
-    }
-}
-
-/// Start the code generator's warm-up when the first code object is
-/// halfway to its frame-JIT compile (the first compile most programs
-/// make), when the JIT may run. Starting it with start-up instead spares
-/// a short hot program's first compile some of the cold start (about
-/// 0.7 ms) but keeps the code generator's pages resident in every
-/// process, about 2.4 MB for one that never compiles and 0.2 to 0.5 MB
-/// for one that does (the warm-up touches code no frame compile uses).
-#[cold]
-#[inline(never)]
-pub(crate) fn prewarm_on_heat() {
-    if !jit_off_for_process() {
-        spawn_codegen_prewarm();
-    }
-}
-
-/// Whether [`prewarm_at_startup`] should start the warm-up as start-up
-/// begins (see [`warm_codegen_at_startup`]).
-static PREWARM_AT_STARTUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Ask for the code generator's warm-up to start with start-up, for a
-/// program (a script or `-m` module) likely to compile. A hot loop gets
-/// from its first iterations to its compile in far less time than the
-/// warm-up takes (about 0.7 ms), so a warm-up started on the way there
-/// leaves the first compile paying most of the cold start: short hot
-/// programs ran 6% to 18% slower. `-c` code and the REPL keep the warm-up
-/// for when code gets halfway hot, sparing a process that never compiles
-/// the code generator's pages.
-pub(crate) fn warm_codegen_at_startup() {
-    PREWARM_AT_STARTUP.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Start the code generator's warm-up as start-up begins, when
-/// [`warm_codegen_at_startup`] asked for it and the JIT may run.
-pub(crate) fn prewarm_at_startup() {
-    if PREWARM_AT_STARTUP.load(std::sync::atomic::Ordering::Relaxed) && !jit_off_for_process() {
-        spawn_codegen_prewarm();
-    }
-}
-
-/// The warm-up thread [`spawn_codegen_prewarm`] started, until joined.
-static PREWARM_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
-
-/// Wait for the code generator's warm-up, and the background frame
-/// compiler's queued jobs, to finish before `fork()`: the child then
-/// inherits no thread partway through either (holding a lock the child
-/// would wait on forever), and `os.fork` doesn't count them as threads of
-/// a multi-threaded process.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn join_codegen_prewarm() {
-    let handle = PREWARM_THREAD.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(handle) = handle {
-        let _ = handle.join();
-    }
-    crate::frame_jit::quiesce_compiler();
-}
-
-/// Compile, on a throwaway engine, a small counted loop of the shape hot
-/// code takes, and discard it. A process's first compile otherwise pays
-/// the code generator's cold start (its code paged in and its tables
-/// built: about 0.7 ms on the development host, most of the first
-/// compile) on the thread that needs the compiled code. Touches no
-/// interpreter state.
-fn prewarm_codegen() {
-    const SOURCE: &str =
-        "def f(n):\n    t = 0\n    for i in range(n):\n        t = t + i * 2\n    return t\n";
-    let _ = std::panic::catch_unwind(|| {
-        let Ok(module) = weavepy_parser::parse_module(SOURCE) else {
-            return;
-        };
-        let Ok(code) = weavepy_compiler::compile_module(&module) else {
-            return;
-        };
-        let Some(f) = code.constants.iter().find_map(|c| match c {
-            weavepy_compiler::Constant::Code(f) => Some(f.clone()),
-            _ => None,
-        }) else {
-            return;
-        };
-        let Some(mut engine) = JitEngine::new() else {
-            return;
-        };
-        let _ = engine.compile(&f, &mut |name| {
-            if name == "range" {
-                weavepy_jit::ResolvedGlobal::RangeBuiltin
-            } else {
-                weavepy_jit::ResolvedGlobal::Opaque
-            }
-        });
-    });
-}
 
 /// The `WEAVEPY_JIT` / free-threading verdict shared by every thread.
 fn jit_enabled_by_config() -> bool {
@@ -1344,8 +1247,9 @@ impl JitState {
     ) -> Option<CompiledEntry> {
         let key = Rc::as_ptr(code).cast::<CodeObject>();
         // Whether the code's calls run enough iterations of its loops for
-        // a native entry to pay for the general call.
+        // a native entry to pay for the general call, and how many.
         let long_calls;
+        let iters_per_call;
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1402,18 +1306,6 @@ impl JitState {
                     if entry_pc == 0 {
                         entry.calls = entry.calls.wrapping_add(1);
                     }
-                    // Halfway to the work this phase admits a compile at
-                    // (start-up and imports need far more first). (The
-                    // phase is read only at the two counts it can be.)
-                    let half = self.threshold / 2;
-                    if (entry.counter == half
-                        || entry.counter
-                            == self.threshold.saturating_mul(IMPORT_THRESHOLD_FACTOR) / 2)
-                        && entry.counter == admit_at(self.threshold) / 2
-                        && self.engine.is_none()
-                    {
-                        spawn_codegen_prewarm();
-                    }
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                         || entry.counter < import_size_budget(code, admit_at(self.threshold))
@@ -1442,7 +1334,8 @@ impl JitState {
                 .calls
                 .wrapping_add(code.jit_hint.lean_entries())
                 .max(1);
-            long_calls = entry.backedges / calls >= LOOP_CALL_ITERATIONS;
+            iters_per_call = entry.backedges / calls;
+            long_calls = iters_per_call >= LOOP_CALL_ITERATIONS;
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
         // The engine is built once an analysis admits some code (see
@@ -1787,7 +1680,6 @@ impl JitState {
             (r, callees.into_inner(), methods.into_inner(), obj_names)
         };
         let (res, callees, methods, obj_names) = {
-            let _compile_heap = crate::malloc_stats::CompileHeap::enter();
             let first = run(false);
             if matches!(
                 first.0,
@@ -1892,6 +1784,20 @@ impl JitState {
                     let hot_loop = long_calls
                         && cf.interp_entry
                         && !(code.is_generator || code.is_coroutine || code.is_async_generator);
+                    // A loop that calls no Python function or method
+                    // natively: a compiled caller's direct call of the
+                    // frame JIT's body serves it better than this one's
+                    // framed entry when it runs a few iterations a call
+                    // (see `crate::SHORT_LOOP_ITERS`). One that does
+                    // (`raytrace`'s `first_hit`) runs its calls better
+                    // here.
+                    if callees.is_empty()
+                        && methods
+                            .iter()
+                            .all(|m| !matches!(m.callee, MethodCallee::Py { .. }))
+                    {
+                        super::note_loop_iters(code, iters_per_call);
+                    }
                     if recursive || hot_loop {
                         code.jit_hint.mark_compiled();
                     } else if !long_calls {
@@ -1917,6 +1823,7 @@ impl JitState {
                             _ => None,
                         })
                         .collect();
+                    let float_work = float_work(&cf);
                     let artifacts = StdRc::new(Artifacts {
                         code: code.clone(),
                         cf: StdRc::new(cf),
@@ -1931,6 +1838,7 @@ impl JitState {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         callee_entries: Cell::new(0),
                         callee_roundtrips: Cell::new(0),
+                        float_work,
                     });
                     // RFC 0067 WS1 — a fresh compile can flip a
                     // `None` native-callee slot in *other* frames'
@@ -2948,6 +2856,7 @@ fn unpack_ty(bits: u64, ty: JitType, pins: &PinTable) -> Object {
 
 /// Pack a representable [`Object`] into its slot bits for `ty`, or `None`
 /// if it doesn't match the expected lane.
+#[inline(always)]
 fn pack(obj: &Object, ty: JitType) -> Option<u64> {
     match (ty, obj) {
         (JitType::Int, Object::Int(i)) => Some(*i as u64),
@@ -3560,15 +3469,22 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     if word(std::ptr::from_ref(&cls_obj).cast::<u8>(), 8) != cls_arc {
         return None;
     }
-    // The native body's word: a `Cell<usize>` alone in its wrapper,
+    // The native body's flag: a `Cell<bool>` alone in its wrapper,
     // checked on a sample.
     let inst_c_body = arc_data + std::mem::offset_of!(PyInstance, c_body);
     {
         let sample = crate::types::CBody::default();
         sample.set(0x5eed_c0de);
-        if std::mem::size_of::<crate::types::CBody>() != 8
-            || word(std::ptr::from_ref(&sample).cast::<u8>(), 0) != 0x5eed_c0de
-            || word(arc as *const u8, inst_c_body) != inst.c_body.get()
+        let flag = |p: *const u8, off: usize| -> u8 {
+            // SAFETY: a byte inside a live value.
+            unsafe { p.add(off).read() }
+        };
+        let set = flag(std::ptr::from_ref(&sample).cast::<u8>(), 0);
+        sample.set(0);
+        if std::mem::size_of::<crate::types::CBody>() != 1
+            || set != 1
+            || flag(std::ptr::from_ref(&sample).cast::<u8>(), 0) != 0
+            || flag(arc as *const u8, inst_c_body) != u8::from(inst.c_body.get() != 0)
         {
             return None;
         }
@@ -3683,27 +3599,18 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     }
     let update = std::mem::offset_of!(MethodEntry, update);
     let ctx_pins = std::mem::offset_of!(CallCtx, pins);
-    // The member slots' cell: its borrow counter, and where the laid-out
-    // form keeps its layout and values (see `laid_out_slots_layout`).
+    // The member slots' cell: its borrow counter, and its storage word
+    // (see `laid_out_slots_layout`).
     let inst_slots = arc_data + std::mem::offset_of!(PyInstance, slots);
     let slots_borrow = inst_slots + GilCell::<crate::types::SlotStorage>::BORROW_OFFSET;
     let slots_at = inst_slots + GilCell::<crate::types::SlotStorage>::DATA_OFFSET;
-    let slots = laid_out_slots_layout().and_then(|(tag, fixed, layout, values)| {
-        Some((
-            i32_of(slots_at + tag)?,
-            fixed,
-            i32_of(slots_at + layout)?,
-            i32_of(slots_at + values)?,
-        ))
-    });
+    let slots = laid_out_slots_layout();
     Some(weavepy_jit::ObjLayout {
         slots_ok: slots.is_some(),
         tag_unbound: tag(&Object::Unbound),
         inst_slots_borrow: i32_of(slots_borrow)?,
-        inst_slots_tag: slots.map_or(0, |s| s.0),
-        slots_laid_out: slots.map_or(0, |s| s.1),
-        inst_slots_layout: slots.map_or(0, |s| s.2),
-        inst_slots_values: slots.map_or(0, |s| s.3),
+        inst_slots: i32_of(slots_at)?,
+        slots_values: slots.unwrap_or(0),
         ctx_pins_ptr: i32_of(ctx_pins + vec_ptr)?,
         ctx_pins_len: i32_of(ctx_pins + vec_len)?,
         pin_size: i32_of(std::mem::size_of::<Pin>())?,
@@ -3761,88 +3668,55 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
     })
 }
 
-/// Where slot storage keeps a laid-out instance's member slots (see
-/// [`crate::types::TypeObject::fresh_slots`]), measured on samples of
-/// every form it takes: the offset of the byte that tells the laid-out
-/// form apart and its value there, then the offsets of the layout's
-/// pointer and the values' pointer. `None` when the forms don't measure
-/// as expected.
-///
-/// The storage is an enum whose laid-out form fills three of its four
-/// words, so the fourth holds what tells the forms apart: in the
-/// single-slot form, an object's tag byte (the slot's name's or value's),
-/// and so in the laid-out form a value no object's tag takes. Each sample
-/// checks that reading.
+/// Where a laid-out slot storage block keeps its values (see
+/// [`crate::types::SlotStorage`]), measured on samples of every form the
+/// storage takes. Compiled code reads the storage word, checks its tag
+/// bits clear and the block's first word against the class's layout,
+/// and finds the values this many bytes on. `None` when the forms don't
+/// measure as expected.
 #[cfg(target_pointer_width = "64")]
-fn laid_out_slots_layout() -> Option<(usize, u8, usize, usize)> {
+fn laid_out_slots_layout() -> Option<i32> {
     use crate::types::SlotStorage;
-    const WORDS: usize = 4;
-    if std::mem::size_of::<SlotStorage>() != WORDS * 8
+    if std::mem::size_of::<SlotStorage>() != 8
         || std::mem::size_of::<crate::shared_value::SharedSlice<DictKey>>() != 8
     {
         return None;
     }
-    let words = |s: &SlotStorage| -> [usize; WORDS] {
-        let p = std::ptr::from_ref(s).cast::<u8>();
-        // SAFETY: four words inside a live value.
-        std::array::from_fn(|k| unsafe { p.add(k * 8).cast::<usize>().read_unaligned() })
+    let word = |s: &SlotStorage| -> usize {
+        // SAFETY: the one word of a live value.
+        unsafe { std::ptr::from_ref(s).cast::<usize>().read() }
     };
-    let byte = |s: &SlotStorage, at: usize| -> u8 {
-        // SAFETY: a byte inside a live value.
-        unsafe { *std::ptr::from_ref(s).cast::<u8>().add(at) }
-    };
-    let tag = |v: &Object| -> u8 {
-        // SAFETY: `Object` is `repr(u8)`: its first byte is the tag.
-        unsafe { *std::ptr::from_ref(v).cast::<u8>() }
+    let first = |w: usize| -> usize {
+        // SAFETY: every form's word is a readable address (see
+        // `SlotStorage`); the word there is what compiled code reads.
+        unsafe { (w as *const usize).read_unaligned() }
     };
     let name = |s: &str| DictKey(crate::stdlib::sys::intern_name(s));
     let layout = crate::shared_value::SharedSlice::from(vec![name("a"), name("b"), name("c")]);
     let layout_addr = crate::shared_value::SharedSlice::word(&layout);
-    let fixed = SlotStorage::from_layout(
-        layout.clone(),
-        vec![Object::Int(1), Object::Unbound, Object::Float(2.0)],
-    );
-    let values = fixed.values_for_layout(&layout)?.as_ptr() as usize;
-    let w = words(&fixed);
-    let find = |want: usize| -> Option<usize> {
-        let mut hits = (0..WORDS).filter(|&k| w[k] == want);
-        let k = hits.next()?;
-        hits.next().is_none().then_some(k * 8)
+    let reads_laid_out = |s: &SlotStorage| {
+        let w = word(s);
+        w.trailing_zeros() >= 3 && first(w) == layout_addr
     };
-    let (layout_at, values_at, len_at) = (find(layout_addr)?, find(values)?, find(3)?);
-    let free = (0..WORDS)
-        .map(|k| k * 8)
-        .find(|o| ![layout_at, values_at, len_at].contains(o))?;
-    let laid_out = byte(&fixed, free);
-    // The single-slot form: the discriminating byte is the tag of its name
-    // or of its value, whatever the value.
-    let mut name_tag = None;
-    let mut value_tag = None;
-    for value in [
-        Object::Int(5),
-        Object::Float(0.5),
-        Object::None,
-        Object::Bool(true),
-        Object::Str(crate::shared_value::SharedStr::from("v")),
+    let values_at = crate::types::SLOT_VALUES_AT;
+    for fixed in [
+        SlotStorage::from_layout(
+            layout.clone(),
+            vec![Object::Int(1), Object::Unbound, Object::Float(2.0)],
+        ),
+        SlotStorage::from_layout(layout.clone(), vec![Object::Unbound; 3]),
     ] {
-        let mut single = SlotStorage::default();
-        single.insert("a", value.clone());
-        let b = byte(&single, free);
-        let key_tag = tag(&Object::Str(crate::shared_value::SharedStr::from("a")));
-        if b == key_tag && value_tag.is_none() {
-            name_tag = Some(b);
-        } else if b == tag(&value) && name_tag.is_none() {
-            value_tag = Some(b);
-        } else {
-            return None;
-        }
-        if b == laid_out {
+        let values = fixed.values_for_layout(&layout)?.as_ptr() as usize;
+        if !reads_laid_out(&fixed) || values != word(&fixed) + values_at {
             return None;
         }
     }
-    // Every other form reads differently there.
+    // Every other form reads differently.
+    let mut single = SlotStorage::default();
+    single.insert("a", Object::Int(5));
     let others = [
         SlotStorage::default(),
+        single,
         SlotStorage::from_entries(vec![
             (name("a"), Object::Int(1)),
             (name("b"), Object::Int(2)),
@@ -3855,24 +3729,15 @@ fn laid_out_slots_layout() -> Option<(usize, u8, usize, usize)> {
     ];
     if others
         .iter()
-        .any(|s| byte(s, free) == laid_out || s.values_for_layout(&layout).is_some())
+        .any(|s| reads_laid_out(s) || s.values_for_layout(&layout).is_some())
     {
         return None;
     }
-    // A second laid-out sample reads the same.
-    let unset = SlotStorage::from_layout(layout.clone(), vec![Object::Unbound; 3]);
-    let w2 = words(&unset);
-    if byte(&unset, free) != laid_out
-        || w2[layout_at / 8] != layout_addr
-        || w2[values_at / 8] != unset.values_for_layout(&layout)?.as_ptr() as usize
-    {
-        return None;
-    }
-    Some((free, laid_out, layout_at, values_at))
+    i32::try_from(values_at).ok()
 }
 
 #[cfg(not(target_pointer_width = "64"))]
-fn laid_out_slots_layout() -> Option<(usize, u8, usize, usize)> {
+fn laid_out_slots_layout() -> Option<i32> {
     None
 }
 
@@ -4885,8 +4750,13 @@ pub(crate) fn sync_native_locals(locals: &Rc<GilRefCell<Vec<Object>>>) {
     });
 }
 
-/// The size of [`CallCtx::pin_memo`].
-const PIN_MEMO: usize = 32;
+/// The size of [`CallCtx::pin_memo`]: sets of [`PIN_MEMO_WAYS`] slots.
+const PIN_MEMO: usize = 64;
+
+/// The slots an identity may sit in (the home slot's set). Two let three
+/// objects of a loop whose addresses share a set thrash it, each miss
+/// pinning anew (`richards`' eight tasks, as allocation addresses fell).
+const PIN_MEMO_WAYS: usize = 4;
 
 /// The identity [`pin_reusing`] keys an object by (`0` for objects whose
 /// pins aren't reused).
@@ -4899,13 +4769,14 @@ fn pin_identity(v: &Object) -> usize {
     }
 }
 
-/// The [`CallCtx::pin_memo`] pair of entries for an object identity (`s`
-/// and `s ^ 1`). The address is mixed multiplicatively: allocations a
+/// The [`CallCtx::pin_memo`] home entry for an object identity, whose set
+/// (`s ^ w` for each of [`PIN_MEMO_WAYS`]) it may sit in. The address is mixed multiplicatively: allocations a
 /// fixed stride apart (a loop's few instances) would otherwise share
 /// entries, and each would evict the other on every read.
 #[inline]
 fn pin_memo_slot(id: usize) -> usize {
-    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize >> (usize::BITS - 5)
+    (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize
+        >> (usize::BITS - PIN_MEMO.trailing_zeros())
 }
 
 /// The identity of the object `pins[ix]` holds (`0` for none).
@@ -4928,7 +4799,7 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
         return None;
     }
     let s = pin_memo_slot(id);
-    [s, s ^ 1].into_iter().find_map(|k| {
+    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
         let hint = memo[k] as usize;
         match pins.get(hint) {
             Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
@@ -4946,7 +4817,7 @@ fn list_pin_memo_hit(
     memo: &[u32; PIN_MEMO],
 ) -> Option<u64> {
     let s = pin_memo_slot(Rc::as_ptr(l) as usize);
-    [s, s ^ 1].into_iter().find_map(|k| {
+    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
         let hint = memo[k] as usize;
         match pins.get(hint) {
             Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
@@ -4967,8 +4838,14 @@ fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]
         return;
     }
     let s = pin_memo_slot(id);
-    let held = pin_memo_holds(pins, memo[s]);
-    let k = if held == 0 || held == id { s } else { s ^ 1 };
+    // A free entry of the set, or this identity's own; else one by the
+    // pin's index, so that a set's entries take turns.
+    let k = (0..PIN_MEMO_WAYS)
+        .map(|w| s ^ w)
+        .find(|&k| {
+            matches!(pin_memo_holds(pins, memo[k]), 0) || pin_memo_holds(pins, memo[k]) == id
+        })
+        .unwrap_or(s ^ (ix % PIN_MEMO_WAYS));
     memo[k] = ix as u32;
 }
 
@@ -6170,6 +6047,17 @@ unsafe fn try_native_call(
                 return Some(CallStatus::Boxed as i64);
             }
         }
+    }
+    // A loop-free body (a method, an `__init__`, a helper taking
+    // objects) costs several times less as a frame-JIT direct call than
+    // as the framed call below (3x for a one-call loop): a loop dense
+    // with them belongs to tier 1 too. (A pure leaf was charged above;
+    // the tests of these calls keep them native.) Not a body working on
+    // floats in their lanes, which the frame JIT would box (see
+    // `float_work`).
+    if !pure_leaf && !nc.float_work && nc.code.jit_hint.loop_free(&nc.code) && call_dense_retires()
+    {
+        ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     // Keep disjoint regions in one pooled owner per element width, as
     // direct native entry does. Owners stay live through every native or
@@ -7846,6 +7734,24 @@ fn retire_native_driver(ctx: &CallCtx) {
     // SAFETY: the activation's code object outlives the activation (see
     // the field docs).
     unsafe { (*ctx.code_ptr).jit_hint.mark_not_jitable() };
+}
+
+/// Whether a framed call of a loop-free callee counts toward the
+/// call-density judgment (see `try_native_call`): not for the tests of
+/// those calls, which keep them native.
+#[inline(always)]
+fn call_dense_retires() -> bool {
+    #[cfg(test)]
+    if KEEP_CALL_DENSE.with(std::cell::Cell::get) {
+        return false;
+    }
+    !weavepy_jit::generic_loops_admitted()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by `force_enable_for_test` on its thread.
+    static KEEP_CALL_DENSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Recompiles one code object may take after cold exits (see
@@ -9929,15 +9835,18 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
         Some(SlotTag::Bool) => JitType::Bool,
         _ => return None,
     };
-    let mut it = cell.try_borrow_mut().ok()?;
-    match &mut *it {
+    // SAFETY: the views end before anything that could borrow either cell
+    // runs (reading an element and packing its bits run no code).
+    let it = unsafe { cell.peek_mut()? };
+    match it {
         PyIterator::Tuple { items, index } => {
             let bits = pack(items.get(*index)?, lane)?;
             *index += 1;
             Some(bits)
         }
         PyIterator::List { items, index, .. } => {
-            let bits = pack(items.borrow().get(*index)?, lane)?;
+            // SAFETY: as above.
+            let bits = pack(unsafe { items.peek()? }.get(*index)?, lane)?;
             *index += 1;
             Some(bits)
         }
@@ -9963,17 +9872,32 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
     // SAFETY: see wpjit_call_py — same live-buffer contract.
     let jf = unsafe { &mut *frame };
     #[allow(clippy::cast_ptr_alignment)]
-    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
     // A list or tuple iterator stepping into a scalar lane, the commonest
     // opaque loop (a tuple local, a subscript's list): the element is read
-    // in place. Its end, and an element outside the lane, take the general
-    // step below.
+    // in place, in a frame small enough to cost little per element. Its
+    // end, and an element outside the lane, take the general step.
     if let Some(Pin::Obj(Object::Iter(cell))) = ctx.pins.get(pin as usize) {
         if let Some(bits) = seq_scalar_step(cell, elem_tag) {
             jf.ret_bits = bits;
             return 0;
         }
     }
+    // SAFETY: the caller's contract.
+    unsafe { iter_next_general(frame, pin, elem_tag) }
+}
+
+/// [`wpjit_iter_next`]'s general step: every iterator and lane.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+#[inline(never)]
+unsafe fn iter_next_general(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
@@ -12101,6 +12025,17 @@ unsafe fn call_dyn_impl(
         Some(p) => p.to_object(),
         None => return CallStatus::Reject as i64,
     };
+    // A native method bound to its exact builtin receiver whose call the
+    // core loop's leaf lane runs (`groups[k].append(x)`, `s.strip()`):
+    // run as the lane runs it, with no bound-method call or activation
+    // shell. (Only the kinds whose releases can't finalize anything.)
+    if kwc == 0 && argc < 4 {
+        if let Object::BoundMethod(bm) = &callee {
+            if let Some(status) = dyn_bound_leaf(jf, ctx, interp, bm, argc, int_result) {
+                return status;
+            }
+        }
+    }
     // RFC 0076 WS7 — the per-kind fast path: a compiled Python callee
     // (a function, a fully-bound method over one, a class whose
     // burned constructor plan carries a compiled `__init__`) enters
@@ -12442,6 +12377,44 @@ unsafe fn dyn_kw_pure_leaf(
 
 /// Deliver a pure leaf's result at a dynamic call site: it ran no Python,
 /// so the activation's guards still hold.
+/// [`call_dyn_impl`]'s call of a native method `bm` bound to its exact
+/// builtin receiver, over the `argc` marshaled arguments, when the core
+/// loop's leaf lane runs it in place (see `LeafKind::runs_in_core`): the
+/// call's status, or `None` (nothing done) for the general call.
+fn dyn_bound_leaf(
+    jf: &mut JitFrame,
+    ctx: &mut CallCtx,
+    interp: &super::Interpreter,
+    bm: &crate::object::BoundMethod,
+    argc: u32,
+    int_result: bool,
+) -> Option<i64> {
+    let Object::Builtin(b) = &bm.function else {
+        return None;
+    };
+    if bm.redispatch_descriptor
+        || !b.binds_instance
+        || crate::builtins::method_memo_tag(&bm.receiver).is_none()
+    {
+        return None;
+    }
+    let kind = interp.leaf_call_kind(b).filter(|k| k.runs_in_core())?;
+    let mut staged = [const { Object::None }; 4];
+    staged[0] = bm.receiver.clone();
+    for j in 0..argc as usize {
+        // SAFETY: native code wrote `argc` entries.
+        let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+        staged[j + 1] = unpack_pins(bits, tag, &ctx.pins);
+    }
+    match interp.leaf_builtin_call(kind, b, &staged[..=(argc as usize)])? {
+        Ok(v) => Some(dyn_leaf_result(jf, ctx, v, int_result)),
+        Err(e) => {
+            ctx.raised = Some(e);
+            Some(CallStatus::Raised as i64)
+        }
+    }
+}
+
 fn dyn_leaf_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, int_result: bool) -> i64 {
     if int_result {
         if let Object::Int(value) = &v {
@@ -13125,6 +13098,21 @@ unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
             xs.get(at(*i, xs.len())?).map(super::clone_hot)
         }
         (Object::Tuple(t), Object::Int(i)) => t.get(at(*i, t.len())?).map(super::clone_hot),
+        // A `dict` subclass's instance that keeps `dict.__getitem__` (a
+        // `defaultdict`, a `Counter`) by a present key, as compiled code's
+        // `h_inst_dict_get` reads it (a miss may run `__missing__`).
+        (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
+            let mut out = std::mem::MaybeUninit::<Object>::uninit();
+            // SAFETY: two initialized values, borrowed, and a free slot.
+            (unsafe { crate::h_inst_dict_get::<0>(out.as_mut_ptr(), container, key) } == 0)
+                // SAFETY: written on success.
+                .then(|| unsafe { out.assume_init() })
+        }
+        // A key whose Python `__hash__` is a pure leaf, found as itself (a
+        // miss is the full path's to raise).
+        (Object::Dict(d), Object::Instance(_)) if crate::object::LeafProbe::new(key).is_none() => {
+            crate::object::leaf_hashed_instance_get(d, key)?
+        }
         (Object::Dict(d), _) => {
             let probe = crate::object::LeafProbe::new(key)?;
             // SAFETY: as above.
@@ -13284,6 +13272,23 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
         unpack_pins(*jf.call_args.add(k), *jf.call_tags.add(k), &ctx.pins)
     });
     ctx.dirty = true;
+    // A `dict` subclass's instance that keeps `dict.__setitem__`, by a key
+    // that compares natively: stored as compiled code's `h_inst_dict_set`
+    // stores it (the store runs no code, so no guard can have broken).
+    if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (&container, &index) {
+        // SAFETY: three initialized values, borrowed (the value cloned in).
+        if unsafe {
+            crate::h_inst_dict_set::<0>(&raw const value, &raw const container, &raw const index)
+        } == 0
+        {
+            // (A displaced value's release may have queued a finalizer.)
+            if finalizer_queued() {
+                ctx.parked = None;
+                return 2;
+            }
+            return 0;
+        }
+    }
     match interp.subscr_set_public(&container, &index, value) {
         Err(err) => {
             ctx.raised = Some(err);
@@ -16324,6 +16329,9 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
 /// test builds so it never reaches release binaries.
 #[cfg(test)]
 pub(crate) fn force_enable_for_test(threshold: u32) {
+    // (Its tests check that their calls and attribute paths run natively.)
+    KEEP_CALL_DENSE.with(|k| k.set(true));
+    weavepy_jit::admit_attr_loops();
     JIT_PROCESS_GATE.store(1, std::sync::atomic::Ordering::Relaxed);
     JIT.with(|cell| {
         let mut st = cell.borrow_mut();
@@ -16357,6 +16365,18 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
     JIT.with(|cell| {
         let s = &cell.borrow().stats;
         (s.frames_compiled, s.native_entries, s.deopts)
+    })
+}
+
+/// Whether this thread's tier-2 state holds compiled code for `code` (an
+/// entry that may run its loops), or can't say right now.
+pub(crate) fn holds_compiled(code: &CodeObject) -> bool {
+    JIT.with(|cell| {
+        cell.try_borrow().map_or(true, |st| {
+            st.cache
+                .get(&std::ptr::from_ref(code))
+                .is_some_and(|entry| matches!(entry.tier, Tier::Compiled(_)))
+        })
     })
 }
 

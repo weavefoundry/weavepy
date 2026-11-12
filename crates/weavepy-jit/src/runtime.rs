@@ -222,8 +222,8 @@ pub struct ObjLayout {
     pub split_len: i32,
     pub split_cap: i32,
     pub split_values: i32,
-    /// An instance value's payload pointer → its native body's pointer
-    /// (a word; zero for an ordinary instance).
+    /// An instance value's payload pointer → whether it has a native body
+    /// (a byte; zero for an ordinary instance).
     pub inst_c_body: i32,
     /// The byte that is nonzero once cells are shared between threads.
     pub cells_unguarded: usize,
@@ -274,16 +274,17 @@ pub struct ObjLayout {
     pub recursion_limit: usize,
     pub ctx_depth_cell: i32,
     /// An instance value's payload pointer → its member slots' borrow
-    /// counter (`i32`), the byte that reads [`Self::slots_laid_out`] while
-    /// they are laid out over a class's names, and then the names' pointer
-    /// and the values' pointer (words). `slots_ok` is false when the
-    /// embedder couldn't measure them (no slot reads run in line).
+    /// counter (`i32`) and their storage word. While the slots are laid
+    /// out over a class's names, the word's low three bits are clear and
+    /// it points at the names' pointer, with the values
+    /// [`Self::slots_values`] bytes on; every other form's word is a
+    /// readable address whose first word isn't a layout's, or has a tag
+    /// bit set. `slots_ok` is false when the embedder couldn't measure
+    /// them (no slot reads run in line).
     pub slots_ok: bool,
     pub inst_slots_borrow: i32,
-    pub inst_slots_tag: i32,
-    pub slots_laid_out: u8,
-    pub inst_slots_layout: i32,
-    pub inst_slots_values: i32,
+    pub inst_slots: i32,
+    pub slots_values: i32,
     /// An unset member slot holds the "no value" object, whose tag this
     /// is.
     pub tag_unbound: u8,

@@ -88,7 +88,7 @@ fn copyfile(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = path_arg(args.first())?;
     let dst = path_arg(args.get(1))?;
     std::fs::copy(&src, &dst).map_err(|e| io_error_to_py(&e))?;
-    Ok(Object::from_str(dst.to_string_lossy().into_owned()))
+    Ok(Object::from_str(dst.to_string_lossy()))
 }
 
 fn rmtree(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -119,7 +119,7 @@ fn copytree(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = path_arg(args.first())?;
     let dst = path_arg(args.get(1))?;
     copy_recursive(&src, &dst).map_err(|e| io_error_to_py(&e))?;
-    Ok(Object::from_str(dst.to_string_lossy().into_owned()))
+    Ok(Object::from_str(dst.to_string_lossy()))
 }
 
 fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -168,13 +168,13 @@ fn which(args: &[Object]) -> Result<Object, RuntimeError> {
     for entry in path.split(sep) {
         let candidate = Path::new(entry).join(&cmd);
         if candidate.is_file() {
-            return Ok(Object::from_str(candidate.to_string_lossy().into_owned()));
+            return Ok(Object::from_str(candidate.to_string_lossy()));
         }
         if cfg!(windows) {
             let mut with_exe = candidate.clone();
             with_exe.set_extension("exe");
             if with_exe.is_file() {
-                return Ok(Object::from_str(with_exe.to_string_lossy().into_owned()));
+                return Ok(Object::from_str(with_exe.to_string_lossy()));
             }
         }
     }

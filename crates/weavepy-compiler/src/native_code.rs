@@ -217,6 +217,8 @@ struct Module<'a> {
     names_at: usize,
     tables_at: usize,
     len: usize,
+    /// The identifiers' text, checked as UTF-8 once per buffer.
+    names_text: Option<&'a str>,
 }
 
 impl<'a> Module<'a> {
@@ -230,16 +232,39 @@ impl<'a> Module<'a> {
         }
         let tables_at = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
         let names_at = u32::from_le_bytes(bytes.get(5..9)?.try_into().ok()?) as usize;
-        (PREAMBLE <= names_at && names_at <= tables_at && tables_at <= bytes.len()).then_some(
-            Module {
-                filename,
-                buffer,
-                bytes,
-                names_at,
-                tables_at,
-                len: bytes.len(),
-            },
-        )
+        if !(PREAMBLE <= names_at && names_at <= tables_at && tables_at <= bytes.len()) {
+            return None;
+        }
+        // The identifiers' text: the ends table's length, then the text.
+        // (Anything amiss leaves each identifier to its own check.)
+        let raw = bytes
+            .get(names_at..names_at + 4)
+            .and_then(|c| c.try_into().ok())
+            .map(|c: [u8; 4]| u32::from_le_bytes(c) as usize)
+            .and_then(|count| (names_at + 4).checked_add(count.checked_mul(4)?))
+            .and_then(|text| bytes.get(text..tables_at));
+        let names_text = raw.and_then(|raw| match buffer.names_utf8() {
+            1 => {
+                // SAFETY: checked as UTF-8 when the buffer was first read
+                // (the same bytes: a view of a buffer shows its contents).
+                Some(unsafe { std::str::from_utf8_unchecked(raw) })
+            }
+            2 => None,
+            _ => {
+                let s = std::str::from_utf8(raw).ok();
+                buffer.set_names_utf8(s.is_some());
+                s
+            }
+        });
+        Some(Module {
+            filename,
+            buffer,
+            bytes,
+            names_at,
+            tables_at,
+            len: bytes.len(),
+            names_text,
+        })
     }
 
     /// The table of `len` bytes at `start` in the table section.
@@ -272,7 +297,11 @@ impl<'a> Module<'a> {
         if range.end > self.tables_at {
             return None;
         }
-        std::str::from_utf8(bytes.get(range)?).ok()
+        // (A slice of the checked text at char boundaries is UTF-8.)
+        match self.names_text {
+            Some(names) => names.get(start..end),
+            None => std::str::from_utf8(bytes.get(range)?).ok(),
+        }
     }
 }
 

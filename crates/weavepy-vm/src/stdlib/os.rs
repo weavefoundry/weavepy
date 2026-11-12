@@ -51,7 +51,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         if let Some(dir) = crate::stdlib_tree::stdlib_dir() {
             d.insert(
                 DictKey(Object::from_static("__file__")),
-                Object::from_str(dir.join("os.py").to_string_lossy().into_owned()),
+                Object::from_str(dir.join("os.py").to_string_lossy()),
             );
         }
 
@@ -1154,7 +1154,7 @@ fn fsdecode_osstr(s: &std::ffi::OsStr) -> Object {
     {
         use std::os::unix::ffi::OsStrExt;
         crate::stdlib::codecs_mod::decode_bytes_obj(s.as_bytes(), "utf-8", "surrogateescape")
-            .unwrap_or_else(|_| Object::from_str(s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|_| Object::from_str(s.to_string_lossy()))
     }
     #[cfg(not(unix))]
     {
@@ -1185,7 +1185,7 @@ fn initial_environ() -> Object {
 fn os_getcwd(args: &[Object]) -> Result<Object, RuntimeError> {
     require_no_args(args, "getcwd")?;
     let cwd = std::env::current_dir().map_err(getcwd_error)?;
-    Ok(Object::from_str(cwd.to_string_lossy().into_owned()))
+    Ok(Object::from_str(cwd.to_string_lossy()))
 }
 
 /// CPython's `os._get_exports_list(module)`: `list(module.__all__)`, or
@@ -1255,9 +1255,7 @@ fn os_getenv(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("getenv() first arg must be str")),
     };
     let default = args.get(1).cloned().unwrap_or(Object::None);
-    Ok(std::env::var_os(&key).map_or(default, |v| {
-        Object::from_str(v.to_string_lossy().into_owned())
-    }))
+    Ok(std::env::var_os(&key).map_or(default, |v| Object::from_str(v.to_string_lossy())))
 }
 
 /// Coerce an `os.putenv`/`os.unsetenv` argument (str or bytes-like) to a
@@ -2021,7 +2019,7 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
                 name.to_string_lossy().into_owned().into_bytes(),
             ));
         } else {
-            out.push(Object::from_str(name.to_string_lossy().into_owned()));
+            out.push(Object::from_str(name.to_string_lossy()));
         }
     }
     Ok(Object::new_list(out))
@@ -3103,7 +3101,7 @@ fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
             return Ok(Object::new_bytes(t.into_os_string().into_encoded_bytes()));
         }
     }
-    Ok(Object::from_str(t.to_string_lossy().into_owned()))
+    Ok(Object::from_str(t.to_string_lossy()))
 }
 
 /// Resolve a path argument to a concrete `str`/`bytes` object, honouring the
@@ -3121,9 +3119,7 @@ fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> 
         Object::WStr(cps) => {
             let bytes =
                 crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
-            Ok(Object::from_str(
-                String::from_utf8_lossy(&bytes).into_owned(),
-            ))
+            Ok(Object::from_str(String::from_utf8_lossy(&bytes)))
         }
         Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
         Object::Instance(_) => {
@@ -3386,7 +3382,7 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
                 (dir_entry_name_bytes(&entry), dir_entry_path_bytes(&entry))
             } else {
                 (
-                    Object::from_str(entry.file_name().to_string_lossy().into_owned()),
+                    Object::from_str(entry.file_name().to_string_lossy()),
                     Object::from_str(fs_path.clone()),
                 )
             };
@@ -5479,7 +5475,7 @@ fn os_uname(args: &[Object]) -> Result<Object, RuntimeError> {
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8)
             .collect();
-        Object::from_str(String::from_utf8_lossy(&bytes).into_owned())
+        Object::from_str(String::from_utf8_lossy(&bytes))
     }
     Ok(struct_seq_instance(
         uname_result_type(),
@@ -5669,10 +5665,7 @@ fn os_cpu_count(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_get_exec_path(_args: &[Object]) -> Result<Object, RuntimeError> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let path = std::env::var("PATH").unwrap_or_default();
-    let parts: Vec<Object> = path
-        .split(sep)
-        .map(|s| Object::from_str(s.to_owned()))
-        .collect();
+    let parts: Vec<Object> = path.split(sep).map(Object::from_str).collect();
     Ok(Object::new_list(parts))
 }
 
@@ -7867,11 +7860,11 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
             let (root, tail) = s.split_at(n);
             Object::new_tuple_array([
                 Object::from_static(""),
-                Object::from_str(root.to_owned()),
+                Object::from_str(root),
                 if n == 0 {
                     p.clone()
                 } else {
-                    Object::from_str(tail.to_owned())
+                    Object::from_str(tail)
                 },
             ])
         }
@@ -8014,7 +8007,7 @@ fn path_join(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(Object::from_str(path.to_string_lossy().into_owned()))
+    Ok(Object::from_str(path.to_string_lossy()))
 }
 
 fn path_split(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8037,8 +8030,8 @@ fn path_splitext(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(dot) = find_ext_dot(&s) {
         let (root, ext) = s.split_at(dot);
         Ok(Object::new_tuple_array([
-            Object::from_str(root.to_owned()),
-            Object::from_str(ext.to_owned()),
+            Object::from_str(root),
+            Object::from_str(ext),
         ]))
     } else {
         Ok(Object::new_tuple_array([
@@ -8138,7 +8131,7 @@ fn path_abspath(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|e| os_error(format!("abspath: {e}")))?
             .join(p)
     };
-    Ok(Object::from_str(abs.to_string_lossy().into_owned()))
+    Ok(Object::from_str(abs.to_string_lossy()))
 }
 
 /// `os.path.realpath` — resolve symlinks via `fs::canonicalize`
@@ -8155,7 +8148,7 @@ fn path_realpath(args: &[Object]) -> Result<Object, RuntimeError> {
             .join(p)
     };
     if let Ok(c) = std::fs::canonicalize(&abs) {
-        return Ok(Object::from_str(c.to_string_lossy().into_owned()));
+        return Ok(Object::from_str(c.to_string_lossy()));
     }
     let mut prefix = abs.clone();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -8347,7 +8340,7 @@ fn path_commonprefix(args: &[Object]) -> Result<Object, RuntimeError> {
             break;
         }
     }
-    Ok(Object::from_str(first[..end].to_owned()))
+    Ok(Object::from_str(&first[..end]))
 }
 
 fn path_getsize(args: &[Object]) -> Result<Object, RuntimeError> {

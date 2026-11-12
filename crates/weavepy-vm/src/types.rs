@@ -196,6 +196,13 @@ pub(crate) enum Verdict {
     /// awaits through (see `stdlib::asyncio_mod::behaves_native`); `name`
     /// unused.
     NativeFutureLike = 9,
+    /// The class's `__lt__`, `__le__`, `__gt__` and `__ge__` are `int`'s
+    /// (see `object::int_order_value`); `name` unused.
+    IntOrder = 10,
+    /// `name` is a `__slots__` member without a default that the default
+    /// lookup finds first, under `object`'s own `__getattribute__` (see
+    /// `slot_member_unset`).
+    SlotMember = 11,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -728,6 +735,7 @@ pub(crate) mod vm_key {
     pub(crate) const ABC_HOOK: u32 = 19;
     pub(crate) const ABC_CLASS: u32 = 20;
     pub(crate) const CHAINMAP_MAPS: u32 = 21;
+    pub(crate) const NATIVE_GETITEM_ANY: u32 = 22;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the
@@ -1337,6 +1345,11 @@ pub struct InstancePlan {
     /// and not a module or generic-alias subclass (whose allocators
     /// differ).
     pub bare_alloc: bool,
+    /// `C()` with no arguments of a `dict`, `list` or `set` subclass that
+    /// keeps its base's allocator and `__init__`, not abstract: the
+    /// allocation with an empty payload (the base's `__init__` without
+    /// arguments leaves the container empty).
+    pub empty_container: bool,
     /// `object.__new__(cls)` (just the class) is a plain allocation: no
     /// native payload or abstract methods, not an exception, built-in,
     /// `type`, module or generic-alias class (see
@@ -1668,7 +1681,7 @@ impl TypeObject {
         // Register the new class as a (weak) direct subclass of each of
         // its bases so `base.__subclasses__()` reports it.
         for base in &bases {
-            base.subclasses.borrow_mut().push(Rc::downgrade(&ty));
+            base.add_subclass(&ty);
         }
         // RFC 0024: user classes join the cycle collector. Every class
         // is born in a self-cycle (its own `mro` holds an `Rc` to
@@ -1774,16 +1787,17 @@ impl TypeObject {
     }
 
     /// Whether the class is one whose native method bodies read its slots
-    /// by the position its `__init__` sets them in (`collections.deque`,
-    /// `contextvars.Context`, asyncio's handles and futures): those keep
-    /// the per-key form their fast paths expect.
+    /// by the position its `__init__` sets them in (`contextvars.Context`,
+    /// asyncio's handles and futures): those keep the per-key form their
+    /// fast paths expect. (`collections.deque` declares its slots in the
+    /// order its `__init__` sets them, so its layout serves both.)
     fn slots_served_natively(&self) -> bool {
         let dict = self.dict.borrow();
         let Some(Object::Str(m)) = dict.get(&DictKey(Object::from_static("__module__"))) else {
             return false;
         };
         let m: &str = m;
-        m == "collections" || m == "contextvars" || m == "asyncio" || m.starts_with("asyncio.")
+        m == "contextvars" || m == "asyncio" || m.starts_with("asyncio.")
     }
 
     /// [`Self::fresh_slots`]'s layout: the member slots the MRO declares,
@@ -2266,6 +2280,19 @@ impl TypeObject {
         }
     }
 
+    /// Register `sub` as a direct subclass. A dead entry still holds its
+    /// class's memory, so they are dropped whenever the list fills, with
+    /// room left for as many again (`object` gets every class).
+    pub fn add_subclass(&self, sub: &Rc<TypeObject>) {
+        let mut subs = self.subclasses.borrow_mut();
+        if subs.len() == subs.capacity() {
+            subs.retain(|w| w.strong_count() > 0);
+            let room = subs.len().max(4);
+            subs.reserve(room);
+        }
+        subs.push(Rc::downgrade(sub));
+    }
+
     /// Live direct subclasses, in registration order. Dead weak refs
     /// (subclasses that have been dropped) are pruned as a side effect.
     pub fn subclasses(&self) -> Vec<Rc<TypeObject>> {
@@ -2588,6 +2615,26 @@ impl TypeObject {
     /// CPython's `_PyType_GetFullyQualifiedName(type, '.')` (the `%T`
     /// format): [`Self::qualified_display_name`], but without a
     /// `__main__` prefix either.
+    /// `f` of [`Self::fully_qualified_name`], borrowed from the memo when
+    /// it stands (no copy).
+    pub fn with_fully_qualified_name<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let ver = self.attr_version.get();
+        let stamp = self.dict.try_borrow().map_or(0, |d| d.mutation_stamp());
+        let tp_name = self.c_tp_name.get().map_or(0, |n| n.as_ptr() as usize);
+        if let Ok(memo) = self.display_name_memo.try_borrow() {
+            if let Some((v, s, t, name, main)) = &*memo {
+                if *v == ver && *s == stamp && *t == tp_name && stamp != 0 {
+                    let name = match name.strip_prefix("__main__.") {
+                        Some(rest) if *main => rest,
+                        _ => name,
+                    };
+                    return f(name);
+                }
+            }
+        }
+        f(&self.fully_qualified_name())
+    }
+
     pub fn fully_qualified_name(&self) -> String {
         let (full, main) = self.display_names();
         match full.strip_prefix("__main__.") {
@@ -2752,9 +2799,14 @@ fn compute_c3(
 
 /// The stable, layout-faithful C "inline body" a C-extension instance
 /// owns once it has crossed into an extension that reads its fields at
-/// fixed offsets (RFC 0045, wave 3). Holds the body pointer as a
-/// `usize` (`0` = no body). `Send + Sync` because the underlying
-/// [`Cell`] is.
+/// fixed offsets (RFC 0045, wave 3). `0` means no body. `Send + Sync`
+/// because the underlying [`Cell`] is.
+///
+/// Only a flag lives in the instance: the pointer itself sits in a
+/// process-wide table keyed by the cell's address (which is stable while
+/// the instance lives), since every instance would otherwise carry a word
+/// that pure-Python code never uses. The flag answers the common "has no
+/// body" question without a lookup.
 ///
 /// **Excluded from the structural clone of [`PyInstance`].** A cloned
 /// instance is a *distinct* object that owns no body — most importantly
@@ -2764,24 +2816,58 @@ fn compute_c3(
 /// freshly-cloned instance lazily mints its own body if it ever crosses
 /// into C again.
 #[derive(Debug, Default)]
-pub struct CBody(Cell<usize>);
+pub struct CBody(Cell<bool>);
+
+/// The body pointers of the instances whose [`CBody`] flag is set, by the
+/// flag's address.
+fn c_bodies() -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, usize>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl CBody {
     /// The body pointer (`0` when the instance has no faithful body).
     #[inline]
     pub fn get(&self) -> usize {
-        self.0.get()
+        if self.0.get() {
+            self.get_slow()
+        } else {
+            0
+        }
     }
-    /// Record the body pointer this instance now owns.
-    #[inline]
+
+    #[cold]
+    #[inline(never)]
+    fn get_slow(&self) -> usize {
+        c_bodies()
+            .get(&(std::ptr::from_ref(self) as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record the body pointer this instance now owns (`0` forgets it).
+    #[inline(never)]
     pub fn set(&self, p: usize) {
-        self.0.set(p);
+        let key = std::ptr::from_ref(self) as usize;
+        if p == 0 {
+            if self.0.get() {
+                c_bodies().remove(&key);
+                self.0.set(false);
+            }
+        } else {
+            c_bodies().insert(key, p);
+            self.0.set(true);
+        }
     }
 }
 
 impl Clone for CBody {
     fn clone(&self) -> Self {
-        CBody(Cell::new(0))
+        CBody(Cell::new(false))
     }
 }
 
@@ -2800,50 +2886,336 @@ pub fn register_instance_body_free(f: fn(usize)) {
 
 /// Slot values stored separately from an instance's `__dict__`.
 ///
-/// Empty and single-slot instances need no dictionary allocation. A
-/// second distinct slot promotes to a small ordered vector; the ninth
-/// promotes to the same ordered table used by larger instances. Rust can
-/// place the single-entry payload in the table representation's unused niche
-/// without enlarging the field on 64-bit targets. Smaller targets retain
-/// ordinary table storage.
+/// One tagged word, so that every instance (most have no slots) pays a
+/// single word for the field:
+///
+/// - the address of [`EMPTY_SLOTS`]: no slots;
+/// - a [`FixedHead`] block (tag `0`): the values of a layout shared
+///   across instances (one owner for the names instead of a key per slot
+///   per instance), in the same allocation as the layout's owner, an
+///   unset slot holding `Unbound`;
+/// - a boxed [`SlotData`] (tag [`TAG_KEYED`]): slots stored per key;
+/// - a boxed packed value (tag [`TAG_PACKED`], see [`SlotData`]'s
+///   former packed form, [`crate::stdlib::datetime_native::PackedSlots`]).
+///
+/// Every form's word is a readable address (the empty form's is a static
+/// zero word), which compiled code relies on: it reads the first word of
+/// the block before it has checked the tag, and a laid-out block's first
+/// word is its layout's address, which no other form's word can match.
 #[cfg(target_pointer_width = "64")]
-#[derive(Debug, Clone)]
 pub struct SlotStorage {
-    data: SlotData,
+    word: usize,
 }
 
+/// The tag bits of a [`SlotStorage`] word.
+#[cfg(target_pointer_width = "64")]
+const TAG_MASK: usize = 7;
+/// A [`SlotStorage`] word's tag for a boxed [`SlotData`].
+#[cfg(target_pointer_width = "64")]
+const TAG_KEYED: usize = 1;
+/// A [`SlotStorage`] word's tag for a boxed packed value.
+#[cfg(target_pointer_width = "64")]
+const TAG_PACKED: usize = 2;
+
+/// The empty [`SlotStorage`]'s target: one zero word, which reads as no
+/// layout.
+#[cfg(target_pointer_width = "64")]
+#[repr(C, align(8))]
+struct EmptySlots(usize);
+
+#[cfg(target_pointer_width = "64")]
+static EMPTY_SLOTS: EmptySlots = EmptySlots(0);
+
+/// The header of a laid-out [`SlotStorage`] block: the layout, followed
+/// in the same allocation by one value per name.
+#[cfg(target_pointer_width = "64")]
+#[repr(C)]
+struct FixedHead {
+    layout: SharedSlice<DictKey>,
+}
+
+/// The `__slots__` layout a native caller found led by its names (see
+/// [`SlotStorage::leading_memo`]): later calls compare the layout's word
+/// instead of the names. The first such layout is kept for good, and
+/// alive, so its word can't come back as another layout's (the classes
+/// these callers serve have one layout, a subclass's aside).
+#[derive(Debug, Default)]
+pub struct LayoutMemo {
+    word: std::sync::atomic::AtomicUsize,
+}
+
+impl LayoutMemo {
+    pub const fn new() -> Self {
+        LayoutMemo {
+            word: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[inline(always)]
+    fn word(&self) -> usize {
+        self.word.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember `layout` if none is remembered yet and it leads with
+    /// `names` (interned, as a layout's keys are).
+    #[cold]
+    #[inline(never)]
+    fn note(&self, layout: &SharedSlice<DictKey>, names: &[&crate::shared_value::SharedStr]) {
+        if self.word() != 0 {
+            return;
+        }
+        let leads = layout.len() >= names.len()
+            && layout.iter().zip(names).all(|(key, name)| {
+                matches!(&key.0, Object::Str(s)
+                    if crate::shared_value::SharedStr::ptr_eq(s, name))
+            });
+        let word = SharedSlice::word(layout);
+        if leads
+            && self
+                .word
+                .compare_exchange(
+                    0,
+                    word,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            // Held for good (see above).
+            std::mem::forget(layout.clone());
+        }
+    }
+}
+
+/// Where a laid-out block's values start.
+#[cfg(target_pointer_width = "64")]
+pub(crate) const SLOT_VALUES_AT: usize = std::mem::size_of::<FixedHead>();
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<SlotStorage>() == 8);
+    assert!(SLOT_VALUES_AT == 8);
+    assert!(std::mem::align_of::<Object>() <= 8);
+    assert!(std::mem::align_of::<SlotData>() >= 8);
+    assert!(std::mem::align_of::<crate::stdlib::datetime_native::PackedSlots>() >= 8);
+};
+
+/// Slots stored per key (a [`SlotStorage`]'s boxed form).
 #[cfg(target_pointer_width = "64")]
 #[derive(Debug, Clone)]
 enum SlotData {
     Single {
-        key: Option<DictKey>,
+        key: DictKey,
         value: Object,
     },
     Small(Vec<(DictKey, Object)>),
-    /// Boxed: this variant is for instances with more than eight slots,
-    /// and inline it would set the size of *every* instance's slot field
-    /// (a `DictData` is 72 bytes) — `SlotStorage` sits in `PyInstance`
-    /// by value.
+    /// Boxed, for instances with more than sixteen slots: inline it would
+    /// enlarge every keyed form (a `DictData` is 72 bytes).
     Many(Box<DictData>),
-    /// Every slot of a layout shared across instances (one owner for the
-    /// names instead of a key per slot per instance), all populated, for
-    /// natively built instances of `datetime`'s classes. Adding or
-    /// removing a key converts to [`Self::Small`] / [`Self::Many`].
-    Fixed {
-        // Keep the owner one word wide so this variant fits in the
-        // single-entry representation without enlarging every instance.
+}
+
+/// A [`SlotStorage`]'s form, borrowed.
+#[cfg(target_pointer_width = "64")]
+enum SlotsRef<'a> {
+    Empty,
+    Fixed(&'a SharedSlice<DictKey>, &'a [Object]),
+    Keyed(&'a SlotData),
+    /// A natively built `datetime` or `decimal` value's fields, packed
+    /// into words (see [`crate::stdlib::datetime_native::PackedSlots`]).
+    /// Readers that need `&Object`s get a lazily built copy; any write
+    /// first converts to the laid-out form.
+    Packed(&'a crate::stdlib::datetime_native::PackedSlots),
+}
+
+/// A [`SlotStorage`]'s form, borrowed mutably.
+#[cfg(target_pointer_width = "64")]
+enum SlotsMut<'a> {
+    Empty,
+    Fixed(&'a mut SharedSlice<DictKey>, &'a mut [Object]),
+    Keyed(&'a mut SlotData),
+    /// (Read through [`SlotStorage::as_packed_mut`].)
+    Packed,
+}
+
+// SAFETY: the storage owns its block exclusively, as the enum it replaces
+// owned its fields; shared access is read-only.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Send for SlotStorage {}
+// SAFETY: as above.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Sync for SlotStorage {}
+
+#[cfg(target_pointer_width = "64")]
+impl SlotStorage {
+    #[inline(always)]
+    fn empty_word() -> usize {
+        std::ptr::from_ref(&EMPTY_SLOTS) as usize
+    }
+
+    /// The allocation layout of a laid-out block of `n` values.
+    #[inline]
+    fn fixed_alloc(n: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(SLOT_VALUES_AT + n * std::mem::size_of::<Object>(), 8)
+            .expect("a slot block's size")
+    }
+
+    /// A laid-out block over `layout` whose values `fill(i)` makes.
+    #[inline]
+    fn fixed_with(layout: SharedSlice<DictKey>, mut fill: impl FnMut(usize) -> Object) -> Self {
+        let n = layout.len();
+        // SAFETY: every value is written.
+        unsafe {
+            Self::fixed_with_raw(layout, |values| {
+                for i in 0..n {
+                    values.add(i).write(fill(i));
+                }
+            })
+        }
+    }
+
+    /// A laid-out block over `layout` whose values `write` initializes.
+    ///
+    /// # Safety
+    ///
+    /// `write` must initialize all `layout.len()` values at its pointer.
+    #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn fixed_with_raw(
         layout: SharedSlice<DictKey>,
-        values: Box<[Object]>,
-    },
-    /// A natively built `datetime` value's fields, packed into words (see
-    /// [`crate::stdlib::datetime_native::PackedSlots`]). Readers that
-    /// need `&Object`s get a lazily built copy; any write first converts
-    /// to [`Self::Fixed`].
-    Packed(crate::stdlib::datetime_native::PackedSlots),
+        write: impl FnOnce(*mut Object),
+    ) -> Self {
+        let n = layout.len();
+        // SAFETY: a nonzero size (the header); the caller writes the
+        // values before the word is published.
+        unsafe {
+            let p = std::alloc::alloc(Self::fixed_alloc(n));
+            if p.is_null() {
+                std::alloc::handle_alloc_error(Self::fixed_alloc(n));
+            }
+            p.cast::<FixedHead>().write(FixedHead { layout });
+            write(p.add(SLOT_VALUES_AT).cast::<Object>());
+            Self { word: p as usize }
+        }
+    }
+
+    /// A laid-out block holding `values` under `layout` (one per name).
+    #[inline]
+    fn fixed(layout: SharedSlice<DictKey>, values: impl IntoIterator<Item = Object>) -> Self {
+        let mut values = values.into_iter();
+        Self::fixed_with(layout, |_| values.next().expect("one value per name"))
+    }
+
+    #[inline]
+    fn keyed(data: SlotData) -> Self {
+        Self {
+            word: Box::into_raw(Box::new(data)) as usize | TAG_KEYED,
+        }
+    }
+
+    #[inline(always)]
+    fn view(&self) -> SlotsRef<'_> {
+        let w = self.word;
+        // SAFETY: the word is one of the forms the type docs list, owned
+        // by `self` and borrowed for its lifetime.
+        unsafe {
+            match w & TAG_MASK {
+                0 if w == Self::empty_word() => SlotsRef::Empty,
+                0 => {
+                    let head = &*(w as *const FixedHead);
+                    let values = std::slice::from_raw_parts(
+                        (w + SLOT_VALUES_AT) as *const Object,
+                        head.layout.len(),
+                    );
+                    SlotsRef::Fixed(&head.layout, values)
+                }
+                TAG_KEYED => SlotsRef::Keyed(&*((w & !TAG_MASK) as *const SlotData)),
+                _ => SlotsRef::Packed(
+                    &*((w & !TAG_MASK) as *const crate::stdlib::datetime_native::PackedSlots),
+                ),
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn view_mut(&mut self) -> SlotsMut<'_> {
+        let w = self.word;
+        // SAFETY: as `view`, borrowed exclusively.
+        unsafe {
+            match w & TAG_MASK {
+                0 if w == Self::empty_word() => SlotsMut::Empty,
+                0 => {
+                    let head = &mut *(w as *mut FixedHead);
+                    let values = std::slice::from_raw_parts_mut(
+                        (w + SLOT_VALUES_AT) as *mut Object,
+                        head.layout.len(),
+                    );
+                    SlotsMut::Fixed(&mut head.layout, values)
+                }
+                TAG_KEYED => SlotsMut::Keyed(&mut *((w & !TAG_MASK) as *mut SlotData)),
+                _ => SlotsMut::Packed,
+            }
+        }
+    }
+
+    /// The form's name, for tests.
+    #[cfg(test)]
+    fn form(&self) -> &'static str {
+        match self.view() {
+            SlotsRef::Empty => "empty",
+            SlotsRef::Fixed(..) => "fixed",
+            SlotsRef::Keyed(SlotData::Single { .. }) => "single",
+            SlotsRef::Keyed(SlotData::Small(_)) => "small",
+            SlotsRef::Keyed(SlotData::Many(_)) => "many",
+            SlotsRef::Packed(_) => "packed",
+        }
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<SlotStorage>() == 32);
+impl Drop for SlotStorage {
+    fn drop(&mut self) {
+        let w = std::mem::replace(&mut self.word, Self::empty_word());
+        // SAFETY: the storage owned the form its word names.
+        unsafe {
+            match w & TAG_MASK {
+                0 if w == Self::empty_word() => {}
+                0 => {
+                    let p = w as *mut FixedHead;
+                    let n = (&*p).layout.len();
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        (w + SLOT_VALUES_AT) as *mut Object,
+                        n,
+                    ));
+                    std::ptr::drop_in_place(p);
+                    std::alloc::dealloc(p.cast(), Self::fixed_alloc(n));
+                }
+                TAG_KEYED => drop(Box::from_raw((w & !TAG_MASK) as *mut SlotData)),
+                _ => drop(Box::from_raw(
+                    (w & !TAG_MASK) as *mut crate::stdlib::datetime_native::PackedSlots,
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl Clone for SlotStorage {
+    fn clone(&self) -> Self {
+        match self.view() {
+            SlotsRef::Empty => Self::default(),
+            SlotsRef::Fixed(layout, values) => Self::fixed(layout.clone(), values.iter().cloned()),
+            SlotsRef::Keyed(data) => Self::keyed(data.clone()),
+            SlotsRef::Packed(p) => Self::from_packed(p.clone()),
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl std::fmt::Debug for SlotStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
 
 /// Is `key` the slot name `name`? (Interned names usually share the
 /// probe's storage, settled without reading either length.)
@@ -3007,20 +3379,13 @@ impl SlotStorage {
         #[cfg(target_pointer_width = "64")]
         if let Some(layout) = exception_layout(&names) {
             // Written in place: `args`, the fields, then the unset tail.
-            let mut values = Box::<[Object]>::new_uninit_slice(layout.len());
-            values[0].write(args);
-            for (slot, (_, v)) in values[1..].iter_mut().zip(extra) {
-                slot.write(v);
-            }
-            for slot in &mut values[1 + N..] {
-                slot.write(Object::Unbound);
-            }
-            // SAFETY: every element was written above (the layout holds
-            // `args`, the `N` fields and the tail).
-            let values = unsafe { values.assume_init() };
-            return Self {
-                data: SlotData::Fixed { layout, values },
-            };
+            let mut args = Some(args);
+            let mut extra = extra.into_iter().map(|(_, v)| v);
+            return Self::fixed_with(layout, |i| match i {
+                0 => args.take().expect("`args` once"),
+                i if i <= N => extra.next().expect("one value per field"),
+                _ => Object::Unbound,
+            });
         }
         let _ = names;
         let mut entries = Vec::with_capacity(N + 2);
@@ -3032,11 +3397,8 @@ impl SlotStorage {
     /// Storage holding exactly `entries` (distinct `str` keys, in slot
     /// order), built in one step.
     pub fn from_entries(entries: Vec<(DictKey, Object)>) -> Self {
-        let data = match entries.len() {
-            0 => SlotData::Single {
-                key: None,
-                value: Object::None,
-            },
+        Self::keyed(match entries.len() {
+            0 => return Self::default(),
             1..=16 => SlotData::Small(entries),
             n => {
                 let mut table =
@@ -3044,8 +3406,7 @@ impl SlotStorage {
                 table.extend(entries);
                 SlotData::Many(Box::new(table))
             }
-        };
-        Self { data }
+        })
     }
 }
 
@@ -3057,11 +3418,35 @@ impl SlotStorage {
         if layout.len() != values.len() {
             return Self::from_entries(layout.iter().cloned().zip(values).collect());
         }
-        Self {
-            data: SlotData::Fixed {
-                layout,
-                values: values.into_boxed_slice(),
-            },
+        let mut values = std::mem::ManuallyDrop::new(values);
+        // SAFETY: the values move into the block (one per name), and the
+        // vector, emptied, frees only its buffer.
+        unsafe {
+            let src = values.as_ptr();
+            let n = values.len();
+            values.set_len(0);
+            let out =
+                Self::fixed_with_raw(layout, |dst| std::ptr::copy_nonoverlapping(src, dst, n));
+            std::mem::ManuallyDrop::drop(&mut values);
+            out
+        }
+    }
+
+    /// [`Self::from_layout`] of exactly `N` values, written in place.
+    #[inline]
+    pub fn from_layout_array<const N: usize>(
+        layout: SharedSlice<DictKey>,
+        values: [Object; N],
+    ) -> Self {
+        if layout.len() != N {
+            return Self::from_layout(layout, values.into());
+        }
+        let values = std::mem::ManuallyDrop::new(values);
+        // SAFETY: the `N` values move into the block (one per name).
+        unsafe {
+            Self::fixed_with_raw(layout, |dst| {
+                std::ptr::copy_nonoverlapping(values.as_ptr(), dst, N);
+            })
         }
     }
 
@@ -3069,11 +3454,25 @@ impl SlotStorage {
     /// allocation. Equal user-defined slot names aren't sufficient.
     #[inline(always)]
     pub(crate) fn values_for_layout(&self, expected: &SharedSlice<DictKey>) -> Option<&[Object]> {
-        match &self.data {
-            SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
-                Some(values)
+        let w = self.word;
+        if w & TAG_MASK == 0 {
+            // (Compiled code's test: the block's first word is the
+            // layout's, which the empty form's zero word never is.)
+            // SAFETY: every form's word is a readable address (see the
+            // type docs); a match makes it a block laid out over
+            // `expected`, which holds one value per name.
+            unsafe {
+                if (w as *const usize).read() == SharedSlice::word(expected) {
+                    return Some(std::slice::from_raw_parts(
+                        (w + SLOT_VALUES_AT) as *const Object,
+                        expected.len(),
+                    ));
+                }
             }
-            SlotData::Packed(p) if SharedSlice::ptr_eq(p.layout(), expected) => Some(p.values()),
+            return None;
+        }
+        match self.as_packed() {
+            Some(p) if SharedSlice::ptr_eq(p.layout(), expected) => Some(p.values()),
             _ => None,
         }
     }
@@ -3083,11 +3482,17 @@ impl SlotStorage {
         expected: &SharedSlice<DictKey>,
     ) -> Option<&mut [Object]> {
         self.unpack();
-        match &mut self.data {
-            SlotData::Fixed { layout, values } if SharedSlice::ptr_eq(layout, expected) => {
-                Some(values)
-            }
-            _ => None,
+        let w = self.word;
+        // SAFETY: as `values_for_layout`, borrowed exclusively.
+        unsafe {
+            (w & TAG_MASK == 0 && (w as *const usize).read() == SharedSlice::word(expected)).then(
+                || {
+                    std::slice::from_raw_parts_mut(
+                        (w + SLOT_VALUES_AT) as *mut Object,
+                        expected.len(),
+                    )
+                },
+            )
         }
     }
 
@@ -3095,23 +3500,14 @@ impl SlotStorage {
     /// out over `layout` (see [`TypeObject::fresh_slots`]). An unset slot
     /// holds `Unbound`, which every reader takes as absent.
     pub(crate) fn unset_over(layout: SharedSlice<DictKey>) -> Self {
-        let values = vec![Object::Unbound; layout.len()].into_boxed_slice();
-        Self {
-            data: SlotData::Fixed { layout, values },
-        }
+        Self::fixed_with(layout, |_| Object::Unbound)
     }
 
     /// Whether this is the empty [`Default`] storage, which a reset to the
     /// default would only rebuild (through the enum's drop glue).
     #[inline(always)]
     pub(crate) fn is_empty_default(&self) -> bool {
-        matches!(
-            self.data,
-            SlotData::Single {
-                key: None,
-                value: Object::None
-            }
-        )
+        self.word == Self::empty_word()
     }
 
     /// Empty the storage of a retiring instance whose values are all
@@ -3119,7 +3515,7 @@ impl SlotStorage {
     /// place, keeping their allocation for the next tenant (see
     /// [`Self::reuse_unset_over`]); any other form becomes the default.
     pub(crate) fn retire(&mut self) {
-        if let SlotData::Fixed { values, .. } = &mut self.data {
+        if let SlotsMut::Fixed(_, values) = self.view_mut() {
             for v in values.iter_mut() {
                 *v = Object::Unbound;
             }
@@ -3133,11 +3529,7 @@ impl SlotStorage {
     /// that size (the caller builds fresh storage).
     #[inline]
     pub(crate) fn reuse_unset_over(&mut self, layout: &SharedSlice<DictKey>) -> bool {
-        let SlotData::Fixed {
-            layout: own,
-            values,
-        } = &mut self.data
-        else {
+        let SlotsMut::Fixed(own, values) = self.view_mut() else {
             return false;
         };
         if values.len() != layout.len() {
@@ -3150,20 +3542,21 @@ impl SlotStorage {
         true
     }
 
-    /// Storage holding a natively packed value (see [`SlotData::Packed`]).
+    /// Storage holding a natively packed value (see [`SlotsRef::Packed`]).
     pub(crate) fn from_packed(packed: crate::stdlib::datetime_native::PackedSlots) -> Self {
         Self {
-            data: SlotData::Packed(packed),
+            word: Box::into_raw(Box::new(packed)) as usize | TAG_PACKED,
         }
     }
 
     /// The packed value, while the storage still holds one.
     #[inline]
     pub(crate) fn as_packed(&self) -> Option<&crate::stdlib::datetime_native::PackedSlots> {
-        match &self.data {
-            SlotData::Packed(p) => Some(p),
-            _ => None,
-        }
+        let w = self.word;
+        // SAFETY: the tag names a boxed packed value, owned by `self`.
+        (w & TAG_MASK == TAG_PACKED).then(|| unsafe {
+            &*((w & !TAG_MASK) as *const crate::stdlib::datetime_native::PackedSlots)
+        })
     }
 
     /// [`Self::as_packed`], mutably.
@@ -3171,17 +3564,18 @@ impl SlotStorage {
     pub(crate) fn as_packed_mut(
         &mut self,
     ) -> Option<&mut crate::stdlib::datetime_native::PackedSlots> {
-        match &mut self.data {
-            SlotData::Packed(p) => Some(p),
-            _ => None,
-        }
+        let w = self.word;
+        // SAFETY: as `as_packed`, borrowed exclusively.
+        (w & TAG_MASK == TAG_PACKED).then(|| unsafe {
+            &mut *((w & !TAG_MASK) as *mut crate::stdlib::datetime_native::PackedSlots)
+        })
     }
 
-    /// Turn a [`SlotData::Packed`] storage into [`SlotData::Fixed`]
-    /// (before a slot is written).
+    /// Turn a packed storage into the laid-out form (before a slot is
+    /// written).
     #[inline]
     fn unpack(&mut self) {
-        if let SlotData::Packed(_) = &self.data {
+        if self.word & TAG_MASK == TAG_PACKED {
             self.unpack_slow();
         }
     }
@@ -3189,25 +3583,29 @@ impl SlotStorage {
     #[cold]
     #[inline(never)]
     fn unpack_slow(&mut self) {
-        if let SlotData::Packed(p) = std::mem::take(self).data {
-            let layout = p.layout().clone();
-            self.data = SlotData::Fixed {
-                layout,
-                values: p.into_values(),
-            };
-        }
+        let w = std::mem::replace(&mut self.word, Self::empty_word());
+        debug_assert_eq!(w & TAG_MASK, TAG_PACKED);
+        // SAFETY: the word was a boxed packed value, now taken over.
+        let p = unsafe {
+            *Box::from_raw((w & !TAG_MASK) as *mut crate::stdlib::datetime_native::PackedSlots)
+        };
+        let layout = p.layout().clone();
+        *self = Self::fixed(layout, p.into_values().into_vec());
     }
 
-    /// Turn a [`SlotData::Fixed`] storage into the per-key form (before
-    /// a key is added or removed).
+    /// Turn a laid-out storage into the per-key form (before a key is
+    /// added or removed).
     fn unfix(&mut self) {
         self.unpack();
-        if let SlotData::Fixed { layout, values } = &mut self.data {
-            let values = std::mem::take(values);
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
             let entries: Vec<(DictKey, Object)> = layout
                 .iter()
                 .cloned()
-                .zip(values.into_vec())
+                .zip(
+                    values
+                        .iter_mut()
+                        .map(|v| std::mem::replace(v, Object::Unbound)),
+                )
                 .filter(|(_, value)| !matches!(value, Object::Unbound))
                 .collect();
             *self = Self::from_entries(entries);
@@ -3298,12 +3696,10 @@ impl SlotStorage {
 
 #[cfg(target_pointer_width = "64")]
 impl Default for SlotStorage {
+    #[inline]
     fn default() -> Self {
         Self {
-            data: SlotData::Single {
-                key: None,
-                value: Object::None,
-            },
+            word: Self::empty_word(),
         }
     }
 }
@@ -3313,31 +3709,23 @@ impl SlotStorage {
     /// The current ordered position of a populated slot. Positions can
     /// change after deletion or differ between instances of the same class.
     pub fn index_of(&self, name: &str) -> Option<u32> {
-        match &self.data {
-            SlotData::Single { .. } => self.get(name).map(|_| 0),
-            SlotData::Small(entries) => entries
+        let named = |key: &DictKey| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name));
+        match self.view() {
+            SlotsRef::Empty => None,
+            SlotsRef::Keyed(SlotData::Single { key, .. }) => named(key).then_some(0),
+            SlotsRef::Keyed(SlotData::Small(entries)) => entries
                 .iter()
-                .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .position(|(key, _)| named(key))
                 .map(|index| index as u32),
-            SlotData::Many(table) => table
+            SlotsRef::Keyed(SlotData::Many(table)) => table
                 .get_index_of(&crate::object::StrKey(name))
                 .and_then(|index| u32::try_from(index).ok()),
-            SlotData::Fixed { layout, values } => layout
+            SlotsRef::Fixed(layout, values) => layout
                 .iter()
-                .position(
-                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .position(named)
                 .filter(|&i| !matches!(values[i], Object::Unbound))
                 .map(|index| index as u32),
-            SlotData::Packed(p) => p
-                .layout()
-                .iter()
-                .position(
-                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
-                .map(|index| index as u32),
+            SlotsRef::Packed(p) => p.layout().iter().position(named).map(|index| index as u32),
         }
     }
 
@@ -3345,7 +3733,7 @@ impl SlotStorage {
     /// members read in line (a cached member load's hot path).
     #[inline(always)]
     pub fn get_index_hot(&self, index: usize) -> Option<(&DictKey, &Object)> {
-        if let SlotData::Small(entries) = &self.data {
+        if let SlotsRef::Keyed(SlotData::Small(entries)) = self.view() {
             return entries.get(index).map(|(key, value)| (key, value));
         }
         self.get_index(index)
@@ -3355,15 +3743,17 @@ impl SlotStorage {
     /// its key; the class identity alone does not determine slot order.
     #[inline]
     pub fn get_index(&self, index: usize) -> Option<(&DictKey, &Object)> {
-        match &self.data {
-            SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
-            SlotData::Small(entries) => entries.get(index).map(|(key, value)| (key, value)),
-            SlotData::Many(table) => table.get_index(index),
-            SlotData::Fixed { layout, values } => layout
+        match self.view() {
+            SlotsRef::Keyed(SlotData::Single { key, value }) if index == 0 => Some((key, value)),
+            SlotsRef::Keyed(SlotData::Small(entries)) => {
+                entries.get(index).map(|(key, value)| (key, value))
+            }
+            SlotsRef::Keyed(SlotData::Many(table)) => table.get_index(index),
+            SlotsRef::Fixed(layout, values) => layout
                 .get(index)
                 .zip(values.get(index))
                 .filter(|(_, value)| !matches!(value, Object::Unbound)),
-            SlotData::Packed(p) => p.layout().get(index).zip(p.values().get(index)),
+            SlotsRef::Packed(p) => p.layout().get(index).zip(p.values().get(index)),
             _ => None,
         }
     }
@@ -3371,11 +3761,13 @@ impl SlotStorage {
     #[inline]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&DictKey, &mut Object)> {
         self.unpack();
-        match &mut self.data {
-            SlotData::Single { key, value } if index == 0 => key.as_ref().map(|key| (key, value)),
-            SlotData::Small(entries) => entries.get_mut(index).map(|(key, value)| (&*key, value)),
-            SlotData::Many(table) => table.get_index_mut(index),
-            SlotData::Fixed { layout, values } => layout
+        match self.view_mut() {
+            SlotsMut::Keyed(SlotData::Single { key, value }) if index == 0 => Some((&*key, value)),
+            SlotsMut::Keyed(SlotData::Small(entries)) => {
+                entries.get_mut(index).map(|(key, value)| (&*key, value))
+            }
+            SlotsMut::Keyed(SlotData::Many(table)) => table.get_index_mut(index),
+            SlotsMut::Fixed(layout, values) => layout
                 .get(index)
                 .zip(values.get_mut(index))
                 .filter(|(_, value)| !matches!(value, Object::Unbound)),
@@ -3384,28 +3776,22 @@ impl SlotStorage {
     }
 
     pub fn get(&self, name: &str) -> Option<&Object> {
-        match &self.data {
-            SlotData::Single {
-                key: Some(DictKey(Object::Str(stored))),
-                value,
-            } if slot_name_eq(stored.as_ref(), name) => Some(value),
-            SlotData::Small(entries) => entries.iter().find_map(|(key, value)| {
-                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
-            }),
-            SlotData::Many(table) => table.get(&crate::object::StrKey(name)),
-            SlotData::Fixed { layout, values } => layout
+        let named = |key: &DictKey| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name));
+        match self.view() {
+            SlotsRef::Keyed(SlotData::Single { key, value }) if named(key) => Some(value),
+            SlotsRef::Keyed(SlotData::Small(entries)) => entries
                 .iter()
-                .position(
-                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .find_map(|(key, value)| named(key).then_some(value)),
+            SlotsRef::Keyed(SlotData::Many(table)) => table.get(&crate::object::StrKey(name)),
+            SlotsRef::Fixed(layout, values) => layout
+                .iter()
+                .position(named)
                 .and_then(|i| values.get(i))
                 .filter(|value| !matches!(value, Object::Unbound)),
-            SlotData::Packed(p) => p
+            SlotsRef::Packed(p) => p
                 .layout()
                 .iter()
-                .position(
-                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .position(named)
                 .and_then(|i| p.values().get(i)),
             _ => None,
         }
@@ -3428,7 +3814,7 @@ impl SlotStorage {
     /// Where a store of slot `name` lands: its laid-out position (see
     /// [`Self::unset_over`]), set or not, else its populated position.
     pub fn store_position(&self, name: &str) -> Option<u32> {
-        if let SlotData::Fixed { layout, .. } = &self.data {
+        if let SlotsRef::Fixed(layout, _) = self.view() {
             if let Some(i) = layout.iter().position(
                 |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
             ) {
@@ -3443,7 +3829,7 @@ impl SlotStorage {
     /// [`Self::unset_over`]) with `name` there.
     #[inline]
     pub fn laid_out_mut(&mut self, idx: usize, name: &str) -> Option<&mut Object> {
-        let SlotData::Fixed { layout, values } = &mut self.data else {
+        let SlotsMut::Fixed(layout, values) = self.view_mut() else {
             return None;
         };
         match &layout.get(idx)?.0 {
@@ -3488,8 +3874,8 @@ impl SlotStorage {
         &self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&Object; N]> {
-        match &self.data {
-            SlotData::Small(entries) => {
+        match self.view() {
+            SlotsRef::Keyed(SlotData::Small(entries)) => {
                 let entries = entries.get(..N)?;
                 if !entries
                     .iter()
@@ -3500,7 +3886,7 @@ impl SlotStorage {
                 }
                 Some(std::array::from_fn(|i| &entries[i].1))
             }
-            SlotData::Fixed { layout, values } => {
+            SlotsRef::Fixed(layout, values) => {
                 let (keys, values) = (layout.get(..N)?, values.get(..N)?);
                 if !keys
                     .iter()
@@ -3514,7 +3900,7 @@ impl SlotStorage {
                 }
                 Some(std::array::from_fn(|i| &values[i]))
             }
-            SlotData::Packed(p) => {
+            SlotsRef::Packed(p) => {
                 let (keys, values) = (p.layout().get(..N)?, p.values().get(..N)?);
                 if !keys
                     .iter()
@@ -3537,7 +3923,7 @@ impl SlotStorage {
         &self,
         names: &[&crate::shared_value::SharedStr; N],
     ) -> bool {
-        let SlotData::Small(entries) = &self.data else {
+        let SlotsRef::Keyed(SlotData::Small(entries)) = self.view() else {
             return false;
         };
         if entries.len() < N {
@@ -3560,7 +3946,7 @@ impl SlotStorage {
         &self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&Object; N]> {
-        if let SlotData::Fixed { layout, values } = &self.data {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
             if let (Some(keys), Some(values)) = (layout.get(..N), values.get(..N)) {
                 let mut same = true;
                 for (key, name) in keys.iter().zip(names) {
@@ -3576,12 +3962,60 @@ impl SlotStorage {
         if !self.leads_with_interned(&names) {
             return self.leading(names);
         }
-        let SlotData::Small(entries) = &self.data else {
+        let SlotsRef::Keyed(SlotData::Small(entries)) = self.view() else {
             return None;
         };
         let base = entries.as_ptr();
         // SAFETY: the store holds at least `N` entries (checked above).
         Some(std::array::from_fn(|i| unsafe { &(*base.add(i)).1 }))
+    }
+
+    /// [`Self::leading_interned`] for a caller that remembers in `memo`
+    /// the `__slots__` layout it found led by `names`: a store with
+    /// that layout skips the names' comparison (a deque's methods and
+    /// iterators run it at every call).
+    #[inline(always)]
+    pub fn leading_memo<const N: usize>(
+        &self,
+        memo: &LayoutMemo,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
+            if SharedSlice::word(layout) == memo.word() {
+                // (The memo's layout leads with `names`.)
+                let values = values.get(..N)?;
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return None;
+                }
+                return Some(std::array::from_fn(|i| &values[i]));
+            }
+            memo.note(layout, &names);
+        }
+        self.leading_interned(names)
+    }
+
+    /// [`Self::leading_memo`], mutably.
+    #[inline(always)]
+    pub fn leading_memo_mut<const N: usize>(
+        &mut self,
+        memo: &LayoutMemo,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
+            if SharedSlice::word(layout) == memo.word() {
+                // (The memo's layout leads with `names`.)
+                let values = values.get_mut(..N)?;
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return None;
+                }
+                let base = values.as_mut_ptr();
+                // SAFETY: `N` distinct in-range values, borrowed from
+                // `self` for the result's lifetime.
+                return Some(std::array::from_fn(|i| unsafe { &mut *base.add(i) }));
+            }
+            memo.note(layout, &names);
+        }
+        self.leading_interned_mut(names)
     }
 
     /// [`Self::leading_interned`], mutably.
@@ -3590,10 +4024,27 @@ impl SlotStorage {
         &mut self,
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&mut Object; N]> {
+        // A `__slots__` layout led by the names themselves (a deque's).
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
+            if let (Some(keys), Some(values)) = (layout.get(..N), values.get_mut(..N)) {
+                let mut same = true;
+                for (key, name) in keys.iter().zip(names) {
+                    same &= matches!(&key.0, Object::Str(s)
+                        if crate::shared_value::SharedStr::ptr_eq(s, name));
+                }
+                if same && !values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    let base = values.as_mut_ptr();
+                    // SAFETY: `N` distinct in-range values, borrowed from
+                    // `self` for the result's lifetime.
+                    return Some(std::array::from_fn(|i| unsafe { &mut *base.add(i) }));
+                }
+            }
+            return self.leading_mut(names);
+        }
         if !self.leads_with_interned(&names) {
             return self.leading_mut(names);
         }
-        let SlotData::Small(entries) = &mut self.data else {
+        let SlotsMut::Keyed(SlotData::Small(entries)) = self.view_mut() else {
             return None;
         };
         let base = entries.as_mut_ptr();
@@ -3609,8 +4060,8 @@ impl SlotStorage {
         names: [&crate::shared_value::SharedStr; N],
     ) -> Option<[&mut Object; N]> {
         self.unpack();
-        let values: &mut [Object] = match &mut self.data {
-            SlotData::Small(entries) => {
+        let values: &mut [Object] = match self.view_mut() {
+            SlotsMut::Keyed(SlotData::Small(entries)) => {
                 let entries = entries.get_mut(..N)?;
                 if !entries
                     .iter()
@@ -3622,7 +4073,7 @@ impl SlotStorage {
                 let mut values = entries.iter_mut().map(|(_, value)| value);
                 return Some(std::array::from_fn(|_| values.next().expect("N entries")));
             }
-            SlotData::Fixed { layout, values } => {
+            SlotsMut::Fixed(layout, values) => {
                 let keys = layout.get(..N)?;
                 if !keys
                     .iter()
@@ -3646,20 +4097,16 @@ impl SlotStorage {
     /// Mutable access to a populated slot's value, by name.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
         self.unpack();
-        match &mut self.data {
-            SlotData::Single {
-                key: Some(DictKey(Object::Str(stored))),
-                value,
-            } if slot_name_eq(stored.as_ref(), name) => Some(value),
-            SlotData::Small(entries) => entries.iter_mut().find_map(|(key, value)| {
-                matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)).then_some(value)
-            }),
-            SlotData::Many(table) => table.get_mut(&crate::object::StrKey(name)),
-            SlotData::Fixed { layout, values } => layout
+        let named = |key: &DictKey| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name));
+        match self.view_mut() {
+            SlotsMut::Keyed(SlotData::Single { key, value }) if named(key) => Some(value),
+            SlotsMut::Keyed(SlotData::Small(entries)) => entries
+                .iter_mut()
+                .find_map(|(key, value)| named(key).then_some(value)),
+            SlotsMut::Keyed(SlotData::Many(table)) => table.get_mut(&crate::object::StrKey(name)),
+            SlotsMut::Fixed(layout, values) => layout
                 .iter()
-                .position(
-                    |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .position(named)
                 .and_then(|i| values.get_mut(i))
                 .filter(|value| !matches!(value, Object::Unbound)),
             _ => None,
@@ -3672,7 +4119,7 @@ impl SlotStorage {
     /// `None` for any other storage.
     #[inline]
     pub(crate) fn exc_tail_mut(&mut self, which: ExcTail) -> Option<&mut Object> {
-        let SlotData::Fixed { layout, values } = &mut self.data else {
+        let SlotsMut::Fixed(layout, values) = self.view_mut() else {
             return None;
         };
         let i = layout.len().checked_sub(EXC_TAIL_LEN)? + which as usize;
@@ -3684,6 +4131,26 @@ impl SlotStorage {
             }
             _ => None,
         }
+    }
+
+    /// [`Self::get`] of the exception pseudo-slot `which`: by its laid-out
+    /// place (see [`Self::exc_tail_mut`]) when the storage has an
+    /// exception layout, without comparing names.
+    #[inline]
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<&Object> {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
+            if let Some(i) = layout.len().checked_sub(EXC_TAIL_LEN) {
+                let i = i + which as usize;
+                if let (Object::Str(laid), Object::Str(key)) =
+                    (&layout[i].0, &common_slot_keys()[1 + which as usize])
+                {
+                    if crate::shared_value::SharedStr::ptr_eq(laid, key) {
+                        return values.get(i).filter(|v| !matches!(v, Object::Unbound));
+                    }
+                }
+            }
+        }
+        self.get(which.name())
     }
 
     /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
@@ -3701,15 +4168,15 @@ impl SlotStorage {
     /// add the slot.
     pub fn place_mut(&mut self, name: &str) -> Option<&mut Object> {
         self.unpack();
-        let laid_out = match &self.data {
-            SlotData::Fixed { layout, .. } => Some(layout.iter().position(
+        let laid_out = match self.view() {
+            SlotsRef::Fixed(layout, _) => Some(layout.iter().position(
                 |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
             )?),
             _ => None,
         };
         match laid_out {
-            Some(i) => match &mut self.data {
-                SlotData::Fixed { values, .. } => values.get_mut(i),
+            Some(i) => match self.view_mut() {
+                SlotsMut::Fixed(_, values) => values.get_mut(i),
                 _ => None,
             },
             None => self.get_mut(name),
@@ -3724,7 +4191,7 @@ impl SlotStorage {
         a: &str,
         b: &str,
     ) -> Option<(&mut Object, &mut Object)> {
-        let SlotData::Fixed { layout, values } = &mut self.data else {
+        let SlotsMut::Fixed(layout, values) = self.view_mut() else {
             return None;
         };
         let pos = |name: &str| {
@@ -3766,33 +4233,29 @@ impl SlotStorage {
         value: Object,
         make_key: impl FnOnce() -> DictKey,
     ) -> Option<Object> {
+        let named = |key: &DictKey| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name));
         self.unpack();
-        if let SlotData::Fixed { layout, values } = &mut self.data {
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
             // A laid-out name fills its slot, set or not.
-            if let Some(i) = layout.iter().position(
-                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-            ) {
+            if let Some(i) = layout.iter().position(named) {
                 let old = std::mem::replace(&mut values[i], value);
                 return (!matches!(old, Object::Unbound)).then_some(old);
             }
             self.unfix();
         }
-        match &mut self.data {
-            SlotData::Single { key, value: slot } if key.is_none() => {
-                *key = Some(make_key());
-                *slot = value;
+        match self.view_mut() {
+            SlotsMut::Empty => {
+                *self = Self::keyed(SlotData::Single {
+                    key: make_key(),
+                    value,
+                });
                 return None;
             }
-            SlotData::Single {
-                key: Some(DictKey(Object::Str(stored))),
-                value: slot,
-            } if slot_name_eq(stored.as_ref(), name) => {
-                return Some(std::mem::replace(slot, value))
+            SlotsMut::Keyed(SlotData::Single { key, value: slot }) if named(key) => {
+                return Some(std::mem::replace(slot, value));
             }
-            SlotData::Small(entries) => {
-                if let Some((_, slot)) = entries.iter_mut().find(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                ) {
+            SlotsMut::Keyed(SlotData::Small(entries)) => {
+                if let Some((_, slot)) = entries.iter_mut().find(|(key, _)| named(key)) {
                     return Some(std::mem::replace(slot, value));
                 }
                 if entries.len() < 16 {
@@ -3800,7 +4263,7 @@ impl SlotStorage {
                     return None;
                 }
             }
-            SlotData::Many(table) => {
+            SlotsMut::Keyed(SlotData::Many(table)) => {
                 // Updating a populated slot keeps its existing key allocation.
                 if let Some(slot) = table.get_mut(&crate::object::StrKey(name)) {
                     return Some(std::mem::replace(slot, value));
@@ -3810,9 +4273,12 @@ impl SlotStorage {
             }
             _ => {}
         }
-        self.data = match std::mem::take(self).data {
+        let SlotsMut::Keyed(data) = self.view_mut() else {
+            unreachable!("only populated single or small slots need promotion");
+        };
+        *data = match std::mem::replace(data, SlotData::Small(Vec::new())) {
             SlotData::Single {
-                key: Some(key),
+                key,
                 value: previous,
             } => SlotData::Small(vec![(key, previous), (make_key(), value)]),
             SlotData::Small(entries) => {
@@ -3826,49 +4292,51 @@ impl SlotStorage {
                 table.insert(make_key(), value);
                 SlotData::Many(Box::new(table))
             }
-            _ => unreachable!("only populated single or small slots need promotion"),
+            SlotData::Many(_) => {
+                unreachable!("only populated single or small slots need promotion")
+            }
         };
         None
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Object> {
+        let named = |key: &DictKey| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name));
         self.unpack();
-        if let SlotData::Fixed { layout, values } = &mut self.data {
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
             // A laid-out slot is unset in place.
-            if let Some(i) = layout.iter().position(
-                |key| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-            ) {
+            if let Some(i) = layout.iter().position(named) {
                 let old = std::mem::replace(&mut values[i], Object::Unbound);
                 return (!matches!(old, Object::Unbound)).then_some(old);
             }
         }
         self.unfix();
-        match &mut self.data {
-            SlotData::Single { key, value } if matches!(key.as_ref(), Some(DictKey(Object::Str(stored))) if slot_name_eq(stored.as_ref(), name)) =>
-            {
-                *key = None;
-                Some(std::mem::replace(value, Object::None))
+        match self.view_mut() {
+            SlotsMut::Keyed(SlotData::Single { key, value }) if named(key) => {
+                let old = std::mem::replace(value, Object::None);
+                *self = Self::default();
+                Some(old)
             }
-            SlotData::Small(entries) => entries
+            SlotsMut::Keyed(SlotData::Small(entries)) => entries
                 .iter()
-                .position(
-                    |(key, _)| matches!(&key.0, Object::Str(stored) if slot_name_eq(stored.as_ref(), name)),
-                )
+                .position(|(key, _)| named(key))
                 .map(|index| entries.remove(index).1),
-            SlotData::Many(table) => table.shift_remove(&crate::object::StrKey(name)),
+            SlotsMut::Keyed(SlotData::Many(table)) => {
+                table.shift_remove(&crate::object::StrKey(name))
+            }
             _ => None,
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DictKey, &Object)> {
-        let (single, small, many, fixed) = match &self.data {
-            SlotData::Single { key, value } => {
-                (key.as_ref().map(|key| (key, value)), None, None, None)
+        let (single, small, many, fixed) = match self.view() {
+            SlotsRef::Empty => (None, None, None, None),
+            SlotsRef::Keyed(SlotData::Single { key, value }) => {
+                (Some((key, value)), None, None, None)
             }
-            SlotData::Small(entries) => (None, Some(entries), None, None),
-            SlotData::Many(table) => (None, None, Some(table), None),
-            SlotData::Fixed { layout, values } => (None, None, None, Some((layout, &values[..]))),
-            SlotData::Packed(p) => (None, None, None, Some((p.layout(), p.values()))),
+            SlotsRef::Keyed(SlotData::Small(entries)) => (None, Some(entries), None, None),
+            SlotsRef::Keyed(SlotData::Many(table)) => (None, None, Some(&**table), None),
+            SlotsRef::Fixed(layout, values) => (None, None, None, Some((layout, values))),
+            SlotsRef::Packed(p) => (None, None, None, Some((p.layout(), p.values()))),
         };
         single
             .into_iter()
@@ -3892,28 +4360,25 @@ impl SlotStorage {
                 f(k, v);
             }
         };
-        match &self.data {
-            SlotData::Single { key, value } => {
-                if let Some(key) = key {
-                    each(key, value);
-                }
-            }
-            SlotData::Small(entries) => {
+        match self.view() {
+            SlotsRef::Empty => {}
+            SlotsRef::Keyed(SlotData::Single { key, value }) => each(key, value),
+            SlotsRef::Keyed(SlotData::Small(entries)) => {
                 for (k, v) in entries {
                     each(k, v);
                 }
             }
-            SlotData::Many(table) => {
+            SlotsRef::Keyed(SlotData::Many(table)) => {
                 for (k, v) in table.iter() {
                     each(k, v);
                 }
             }
-            SlotData::Fixed { layout, values } => {
+            SlotsRef::Fixed(layout, values) => {
                 for (k, v) in layout.iter().zip(values.iter()) {
                     each(k, v);
                 }
             }
-            SlotData::Packed(p) => {
+            SlotsRef::Packed(p) => {
                 for (k, v) in p.layout().iter().zip(p.values().iter()) {
                     each(k, v);
                 }
@@ -3926,16 +4391,15 @@ impl SlotStorage {
     /// and passes over an unset slot's [`Object::Unbound`] itself.
     #[inline]
     pub(crate) fn values_view(&self) -> SlotValues<'_> {
-        match &self.data {
-            SlotData::Single {
-                key: Some(_),
-                value,
-            } => SlotValues::Values(std::slice::from_ref(value)),
-            SlotData::Single { key: None, .. } => SlotValues::Values(&[]),
-            SlotData::Small(entries) => SlotValues::Pairs(entries),
-            SlotData::Many(table) => SlotValues::Table(table),
-            SlotData::Fixed { values, .. } => SlotValues::Values(values),
-            SlotData::Packed(p) => SlotValues::Values(p.values()),
+        match self.view() {
+            SlotsRef::Empty => SlotValues::Values(&[]),
+            SlotsRef::Keyed(SlotData::Single { value, .. }) => {
+                SlotValues::Values(std::slice::from_ref(value))
+            }
+            SlotsRef::Keyed(SlotData::Small(entries)) => SlotValues::Pairs(entries),
+            SlotsRef::Keyed(SlotData::Many(table)) => SlotValues::Table(table),
+            SlotsRef::Fixed(_, values) => SlotValues::Values(values),
+            SlotsRef::Packed(p) => SlotValues::Values(p.values()),
         }
     }
 }
@@ -4010,6 +4474,12 @@ impl SlotStorage {
     #[inline]
     pub(crate) fn exc_tail_place(&mut self, which: ExcTail) -> Option<&mut Object> {
         self.get_mut(which.name())
+    }
+
+    /// The populated pseudo-slot `which` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<&Object> {
+        self.get(which.name())
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
@@ -4549,6 +5019,12 @@ impl PyInstance {
         self.slots.borrow().get(name).cloned()
     }
 
+    /// [`Self::slot_get`] of an exception pseudo-slot (see
+    /// `SlotStorage::exc_tail_get`).
+    pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<Object> {
+        self.slots.borrow().exc_tail_get(which).cloned()
+    }
+
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
         self.note_slot_store(&value);
@@ -4640,10 +5116,9 @@ mod slot_storage_tests {
 
     #[test]
     fn shared_layout_keeps_slot_storage_compact() {
-        assert_eq!(std::mem::size_of::<SlotStorage>(), 32);
-        // The split `__dict__` values pointer and its cell: with the
-        // `Arc`'s two counts the instance fits the 128-byte class.
-        assert_eq!(std::mem::size_of::<PyInstance>(), 112);
+        assert_eq!(std::mem::size_of::<SlotStorage>(), 8);
+        // With the `Arc`'s two counts the instance fits the 96-byte class.
+        assert_eq!(std::mem::size_of::<PyInstance>(), 80);
     }
 
     #[test]
@@ -4711,7 +5186,7 @@ mod slot_storage_tests {
             );
             assert!(matches!(second.get(&names[1]), Some(Object::Str(_))));
             assert_eq!(weak_value.strong_count(), 2 * len - 2);
-            assert!(matches!(first.data, SlotData::Fixed { .. }));
+            assert_eq!(first.form(), "fixed");
             assert!(first.get_index(len).is_none());
             assert!(first.get_index_mut(usize::MAX).is_none());
 
@@ -4719,15 +5194,15 @@ mod slot_storage_tests {
             assert_eq!(weak_layout.strong_count(), 1);
             assert_eq!(first.index_of("extra"), Some(len as u32));
             assert!(second.get("extra").is_none());
-            assert_eq!(matches!(first.data, SlotData::Small(_)), len == 4);
-            assert_eq!(matches!(first.data, SlotData::Many(_)), len == 24);
+            assert_eq!(first.form() == "small", len == 4);
+            assert_eq!(first.form() == "many", len == 24);
             // Removing a laid-out slot unsets it in place: the layout
             // stays shared, and the slot reads as absent.
             assert!(second.remove(&names[0]).is_some());
             assert!(second.remove(&names[0]).is_none());
             assert!(second.get(&names[0]).is_none());
             assert!(second.index_of(&names[0]).is_none());
-            assert!(matches!(second.data, SlotData::Fixed { .. }));
+            assert_eq!(second.form(), "fixed");
             assert_eq!(weak_layout.strong_count(), 1);
             assert_eq!(weak_value.strong_count(), 2 * len - 3);
             for (index, (key, _)) in first.iter().take(len).enumerate() {
@@ -4769,7 +5244,7 @@ mod slot_storage_tests {
         // A store fills its laid-out slot in place.
         assert!(slots.insert("b", Object::Int(2)).is_none());
         *slots.laid_out_mut(2, "c").unwrap() = Object::Int(3);
-        assert!(matches!(slots.data, SlotData::Fixed { .. }));
+        assert_eq!(slots.form(), "fixed");
         assert_eq!(slots.get("b").and_then(Object::as_i64), Some(2));
         assert_eq!(slots.index_of("c"), Some(2));
         let set: Vec<i64> = slots.iter().filter_map(|(_, v)| v.as_i64()).collect();
@@ -4777,7 +5252,7 @@ mod slot_storage_tests {
         assert!(slots.leading([&SharedStr::from("a")]).is_none());
         // A name off the layout moves the set slots to the per-key form.
         slots.insert("d", Object::Int(4));
-        assert!(!matches!(slots.data, SlotData::Fixed { .. }));
+        assert_ne!(slots.form(), "fixed");
         assert!(slots.get("a").is_none());
         assert_eq!(slots.iter().count(), 3);
     }
@@ -4793,7 +5268,7 @@ mod slot_storage_tests {
             let slots =
                 SlotStorage::from_layout(layout.clone(), (0..count).map(Object::Int).collect());
             assert_eq!(slots.iter().count(), count.min(2) as usize);
-            assert_eq!(matches!(slots.data, SlotData::Fixed { .. }), count == 2);
+            assert_eq!(slots.form() == "fixed", count == 2);
             for (index, (key, value)) in slots.iter().enumerate() {
                 assert!(key.0.is_same(&layout[index].0));
                 assert_eq!(value.as_i64(), Some(index as i64));
@@ -4897,14 +5372,14 @@ mod slot_storage_tests {
                 .and_then(|v| v.as_i64()),
             Some(1)
         );
-        assert!(matches!(slots.data, SlotData::Single { .. }));
+        assert_eq!(slots.form(), "single");
         assert!(slots.remove("missing").is_none());
         assert_eq!(slots.remove("value").and_then(|v| v.as_i64()), Some(2));
         assert_eq!(slots.iter().count(), 0);
         assert!(slots.insert("α", Object::None).is_none());
         assert!(matches!(slots.get("α"), Some(Object::None)));
         assert_eq!(slots.iter().count(), 1);
-        assert!(matches!(slots.data, SlotData::Single { .. }));
+        assert_eq!(slots.form(), "single");
     }
 
     #[test]
@@ -4916,9 +5391,9 @@ mod slot_storage_tests {
             assert!(slots.insert(&name, Object::Int(i)).is_none());
             keys.push(slots.iter().last().unwrap().0 .0.clone());
             match i {
-                0 => assert!(matches!(slots.data, SlotData::Single { .. })),
-                1..=15 => assert!(matches!(slots.data, SlotData::Small(_))),
-                _ => assert!(matches!(slots.data, SlotData::Many(_))),
+                0 => assert_eq!(slots.form(), "single"),
+                1..=15 => assert_eq!(slots.form(), "small"),
+                _ => assert_eq!(slots.form(), "many"),
             }
             for (index, (key, value)) in slots.iter().enumerate() {
                 assert!(key.0.is_same(&keys[index]));
@@ -4945,10 +5420,12 @@ mod slot_storage_tests {
         ] {
             slots.insert(name, Object::None);
         }
-        assert!(matches!(&slots.data, SlotData::Small(entries) if entries.len() == 8));
+        assert_eq!(slots.form(), "small");
+        assert_eq!(slots.iter().count(), 8);
         assert!(slots.remove("two").is_some());
         slots.insert("α", Object::Int(9));
-        assert!(matches!(&slots.data, SlotData::Small(entries) if entries.len() == 8));
+        assert_eq!(slots.form(), "small");
+        assert_eq!(slots.iter().count(), 8);
         assert!(
             matches!(&slots.iter().last().unwrap().0 .0, Object::Str(name) if name.as_ref() == "α")
         );
@@ -4995,7 +5472,7 @@ mod slot_storage_tests {
         slots.insert("first", Object::Int(1));
         let original_key = slots.iter().next().unwrap().0 .0.clone();
         slots.insert("second", Object::Int(2));
-        assert!(matches!(slots.data, SlotData::Small(_)));
+        assert_eq!(slots.form(), "small");
         assert!(slots.iter().next().unwrap().0 .0.is_same(&original_key));
         let names = |slots: &SlotStorage| {
             slots

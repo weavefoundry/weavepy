@@ -1020,7 +1020,7 @@ pub unsafe fn run_multiphase_init(
             let mut d = m.dict.borrow_mut();
             d.insert(
                 DictKey(Object::from_static("__name__")),
-                Object::from_str(full_name.to_owned()),
+                Object::from_str(full_name),
             );
             let package = match full_name.rsplit_once('.') {
                 Some((head, _)) => head.to_owned(),
@@ -1281,7 +1281,7 @@ unsafe fn build_module_spec(full_name: &str) -> *mut PyObject {
         crate::errors::clear_thread_local();
         return ptr::null_mut();
     }
-    let name_obj = crate::object::into_owned(Object::from_str(full_name.to_owned()));
+    let name_obj = crate::object::into_owned(Object::from_str(full_name));
     let args = unsafe { crate::containers::PyTuple_New(2) };
     unsafe {
         crate::containers::PyTuple_SetItem(args, 0, name_obj);

@@ -1712,6 +1712,15 @@ fn scan_items(args: &[Object], multi: bool) -> Option<Vec<Object>> {
 fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, RuntimeError>> {
     let items = scan_items(args, true)?;
     let (first, rest) = items.split_first()?;
+    // Ints, big ints and `int` subclasses that keep `int`'s ordering
+    // (`re`'s `min(hi, MAXWIDTH)`, its widths against `1 << 64`): by value,
+    // the first of equal ones winning.
+    if items
+        .iter()
+        .any(|x| matches!(x, Object::Instance(_) | Object::Long(_)))
+    {
+        return min_max_integers(&items, want_max).map(Ok);
+    }
     let mut best = first;
     match first {
         Object::Int(_) if rest.iter().all(|x| matches!(x, Object::Int(_))) => {
@@ -1763,6 +1772,39 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
     Some(Ok(best.clone()))
 }
 
+/// [`min_max_fast`] over integers: machine ints, big ints, and instances
+/// of `int` subclasses that keep `int`'s ordering (see
+/// `object::int_order_value`). `None` if any item is anything else.
+fn min_max_integers(items: &[Object], want_max: bool) -> Option<Object> {
+    use std::cmp::Ordering;
+    enum Key<'a> {
+        Small(i64),
+        Big(&'a num_bigint::BigInt),
+    }
+    fn key(o: &Object) -> Option<Key<'_>> {
+        match o {
+            Object::Long(b) => Some(Key::Big(b)),
+            _ => crate::object::int_order_value(o).map(Key::Small),
+        }
+    }
+    let cmp = |a: &Key<'_>, b: &Key<'_>| match (a, b) {
+        (Key::Small(x), Key::Small(y)) => x.cmp(y),
+        (Key::Small(x), Key::Big(y)) => num_bigint::BigInt::from(*x).cmp(y),
+        (Key::Big(x), Key::Small(y)) => (*x).cmp(&num_bigint::BigInt::from(*y)),
+        (Key::Big(x), Key::Big(y)) => x.cmp(y),
+    };
+    let (first, rest) = items.split_first()?;
+    let mut best = (first, key(first)?);
+    for x in rest {
+        let k = key(x)?;
+        let ord = cmp(&k, &best.1);
+        if (want_max && ord == Ordering::Greater) || (!want_max && ord == Ordering::Less) {
+            best = (x, k);
+        }
+    }
+    Some(best.0.clone())
+}
+
 /// `int(text)` for plain decimal text (ASCII digits, an optional sign,
 /// surrounding ASCII whitespace) that fits a machine int; `None` for
 /// anything else, which the full constructor parses (or rejects).
@@ -1801,6 +1843,21 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
     let [x] = args else {
         return None;
     };
+    // A plain instance whose class keeps `object`'s `__hash__`: its identity
+    // hash, as the dict probes hash it (`LeafProbe`).
+    if let Object::Instance(i) = x {
+        if i.native.get().is_none() && i.class_dunder(crate::types::Dunder::Hash).object_owner() {
+            return Some(Ok(Object::Int(crate::object::identity_hash(x))));
+        }
+    }
+    // An instance whose Python `__hash__` evaluates as a pure leaf (a frozen
+    // dataclass's `hash((self.a, self.b))`).
+    if let Object::Instance(_) = x {
+        // SAFETY: the running thread's interpreter, under the GIL; the
+        // evaluation runs no Python and takes no frame.
+        let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+        return interp.leaf_instance_hash(x).map(|h| Ok(Object::Int(h)));
+    }
     let native = match x {
         Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
         // (A NaN hashes by identity.)
@@ -1998,6 +2055,24 @@ fn cursor_advance(c: &Rc<RefCell<PyIterator>>) -> Option<()> {
     unsafe { c.peek_mut() }?.pure_skip().then_some(())
 }
 
+/// Whether [`Interpreter::pure_callback`] could run `func` at all: not a
+/// Python function (or a method over one) whose code isn't a pure leaf,
+/// one load where that verdict is recorded.
+#[inline]
+pub(crate) fn pure_callback_maybe(func: &Object) -> bool {
+    let f = match func {
+        Object::Function(f) => f,
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Function(f) => f,
+            _ => return true,
+        },
+        _ => return true,
+    };
+    // SAFETY: a function's code is only replaced under the GIL, and the
+    // reference ends here.
+    crate::code_is_pure_leaf(unsafe { &*f.code.as_ptr() })
+}
+
 impl Interpreter {
     /// `func(*args)` for an adapter's callback when the call runs no Python
     /// code: a warm pure-leaf function or a bound method over one (evaluated
@@ -2073,6 +2148,21 @@ impl Interpreter {
                 }
                 _ => None,
             },
+            // An instance whose class's `__call__` is a registered leaf
+            // half (`key=attrgetter("x")`, `map(itemgetter(0), ...)`).
+            Object::Instance(i) if !crate::gil::free_threading_enabled() => {
+                let Object::Builtin(b) = i.cls_raw().lookup("__call__")? else {
+                    return None;
+                };
+                let LeafKind::Fast(f) = admit(self.leaf_call_kind(&b)?)? else {
+                    return None;
+                };
+                let call = match args {
+                    [a] => [func.clone(), a.clone()],
+                    _ => return None,
+                };
+                f(&call)?.ok()
+            }
             _ => None,
         }
     }
@@ -2107,6 +2197,13 @@ impl Interpreter {
         // (pure callbacks call nothing); the view ends with this call.
         let st = unsafe { l.state.peek_mut() }?;
         match st {
+            // (A callback that can't run as a pure leaf, a Python function
+            // that isn't one say, skips the item's peek.)
+            LazyIterKind::Map { func, .. } | LazyIterKind::Filter { func, .. }
+                if !pure_callback_maybe(func) =>
+            {
+                None
+            }
             LazyIterKind::Map { func, iters, .. } => match iters.as_slice() {
                 [Object::Iter(c)] => {
                     let v = cursor_peek(c)?;

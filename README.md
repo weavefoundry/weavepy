@@ -61,7 +61,8 @@ target/release/weavepy -m venv .venv
 - **Native extensions.** A CPython-compatible C API and ABI let compiled wheels
   such as NumPy, pandas, and lxml load and run.
 - **Tiered execution.** Hot code moves from the interpreter to a baseline frame
-  JIT and a Cranelift-based optimizing JIT. Both are on by default.
+  JIT and an optimizing JIT for numeric loops, both generating machine code
+  through WeavePy's own one-pass code generator. Both are on by default.
   `WEAVEPY_FRAME_JIT=0` turns off the former and `WEAVEPY_JIT=0` the latter.
 - **Experimental free threading.** `-X gil=0` or `PYTHON_GIL=0` runs without the
   GIL. See the [design note](docs/FREETHREADING.md) for its current limits.
@@ -150,7 +151,8 @@ WeavePy is a Cargo workspace organized along the interpreter pipeline.
 | `weavepy-parser` | Turns tokens into an AST |
 | `weavepy-compiler` | Compiles the AST to bytecode |
 | `weavepy-vm` | Runs the interpreter, object model, frame JIT, and native standard library modules |
-| `weavepy-jit` | Implements the Cranelift optimizing JIT |
+| `weavepy-jit` | Implements the optimizing JIT for numeric loops |
+| `weavepy-codegen` | Generates the JITs' machine code (x86-64 and AArch64) |
 | `weavepy-capi` | Provides the C API for native extensions |
 | `weavepy-pylib` | Packages the runtime as a CPython-ABI shared library |
 | `weavepy-version` | Defines the CPython version WeavePy implements |

@@ -52,13 +52,13 @@ use super::{
     direct_call, droppable, field_hit, h_call_kw, h_for_iter, h_stack_store_attr, kernel_for, left,
     left_marked, maybe_unbound_locals, never_ran_blocks, plain_release, settle, stats, truth_at,
     type_of_call, AttrSite, BinOpKind, Block, BuiltinSite, Cell, CodeConstObjects, CodeObject,
-    DirectSite, FieldSlot, GlobalCache, InstBuilder, IntCC, Interpreter, Item, Lower, Object,
-    OpCode, PyIterator, Rc, SlotWord, State, TruthSite, Value, CALL_DECLINED, DICT_STAMP,
-    EXIT_LAST_SHIFT, EXIT_PC_SHIFT, FLAGS, INTERP, LEFT_MARKED, MARKED, NO_LAST, RAISED, RELOAD,
-    S_LAST, S_SNAP, S_SW,
+    DirectSite, FieldSlot, GlobalCache, IntCC, Interpreter, Item, Lower, Object, OpCode,
+    PyIterator, Rc, SlotWord, State, TruthSite, Value, CALL_DECLINED, DICT_STAMP, EXIT_LAST_SHIFT,
+    EXIT_PC_SHIFT, FLAGS, INTERP, LEFT_MARKED, MARKED, NO_LAST, RAISED, RELOAD, S_LAST, S_SNAP,
+    S_SW,
 };
 use super::{fill_method_cache, MethodCache, MC_VER};
-use cranelift_codegen::ir::types;
+use weavepy_codegen::types;
 
 /// How many callees deep a site's inlining goes.
 const MAX_LEVELS: usize = 3;
@@ -189,6 +189,12 @@ pub(super) struct Plan {
     never_ran: Vec<bool>,
     has_self: bool,
     missing: usize,
+    /// Its keyword-only parameters, which a positional call binds to their
+    /// defaults.
+    kwonly: usize,
+    /// Where a `CALL_KW`'s arguments bind when its keywords aren't the next
+    /// parameters in order (see [`keyword_map`]).
+    kw_map: Option<Box<KwMap>>,
     nlocals: usize,
     /// The locals its body rebinds.
     stored: Vec<bool>,
@@ -228,7 +234,7 @@ fn getter_plan(
     };
     let callee = f.code();
     let mut p = admit(&f, &callee, false, 1, None, false, path, budget)?;
-    if p.missing != 0 {
+    if p.missing != 0 || p.kwonly != 0 {
         return Err("defaults");
     }
     p.getter = Some((ver, cell as i64));
@@ -248,7 +254,7 @@ fn dunder_plan(
     };
     let callee = f.code();
     let mut p = admit(&f, &callee, false, 2, None, false, path, budget)?;
-    if p.missing != 0 {
+    if p.missing != 0 || p.kwonly != 0 {
         return Err("defaults");
     }
     p.dunder = Some(Dunder {
@@ -388,6 +394,105 @@ fn kw_names<'e>(code: &CodeObject, ext: &'e CodeConstObjects, pc: usize) -> Opti
     }
 }
 
+/// How a `CALL_KW`'s arguments bind to a callee's parameters when its
+/// keywords aren't the next ones in order (`f(a, c=3)` past a defaulted `b`,
+/// a keyword-only parameter given by keyword, keywords in another order).
+pub(super) struct KwMap {
+    /// The local each argument binds, by its place in the call (a bound
+    /// receiver first).
+    slots: Box<[u8]>,
+    /// The parameters that take their defaults, as a bit mask.
+    defaults: u64,
+}
+
+/// [`KwMap`] for a call of `f` (running `code`) passing `positional`
+/// arguments (a bound receiver included) and then keywords `names`: each
+/// keyword names a parameter the positional ones didn't fill, at most once,
+/// and every parameter left has a default. Positional-only parameters can't
+/// be given by keyword, and a callee with more than 64 parameters keeps the
+/// general call.
+fn keyword_map(
+    f: &crate::object::PyFunction,
+    code: &CodeObject,
+    positional: usize,
+    names: &[Object],
+) -> Result<KwMap, &'static str> {
+    let npos = code.arg_count as usize;
+    let nparams = npos + code.kwonly_count as usize;
+    if nparams > 64 || positional > npos {
+        return Err("keywords");
+    }
+    if f.defaults_maybe_overridden() {
+        return Err("defaults");
+    }
+    let bit = |j: usize| 1u64 << j;
+    let mut filled = (0..positional).fold(0, |m, j| m | bit(j));
+    let mut slots: Vec<u8> = (0..positional).map(|j| j as u8).collect();
+    for name in names {
+        let Object::Str(n) = name else {
+            return Err("keywords");
+        };
+        let Some(j) =
+            (code.posonly_count as usize..nparams).find(|&j| code.varnames[j].as_str() == &**n)
+        else {
+            return Err("keywords");
+        };
+        if filled & bit(j) != 0 {
+            return Err("keywords");
+        }
+        filled |= bit(j);
+        slots.push(j as u8);
+    }
+    let defaults = (0..nparams).fold(0, |m, j| m | bit(j)) & !filled;
+    for j in (0..nparams).filter(|&j| defaults & bit(j) != 0) {
+        let ok = if j < npos {
+            j + f.defaults.len() >= npos
+        } else {
+            kw_default(f, code, j).is_some()
+        };
+        if !ok {
+            return Err("defaults");
+        }
+    }
+    Ok(KwMap {
+        slots: slots.into(),
+        defaults,
+    })
+}
+
+/// The default of `f`'s keyword-only parameter at local `j` of `code`, if
+/// it has one. The compiler lists the defaults in the parameters' order, so
+/// the aligned entry is tried first.
+fn kw_default<'f>(
+    f: &'f crate::object::PyFunction,
+    code: &CodeObject,
+    j: usize,
+) -> Option<&'f Object> {
+    let name = code.varnames[j].as_str();
+    let k = j.checked_sub(code.arg_count as usize)?;
+    if let Some((n, v)) = f.kw_defaults.get(k) {
+        if n.as_str() == name {
+            return Some(v);
+        }
+    }
+    f.kw_defaults
+        .iter()
+        .find(|(n, _)| n.as_str() == name)
+        .map(|(_, v)| v)
+}
+
+/// Whether `plan` may bind `args` (a call's arguments past its self slot,
+/// `self_slot` of them before) where its body expects them: an argument
+/// already in memory binds only to the slot it lies in.
+fn binds_in_place(plan: &Plan, args: &[Item], self_slot: usize) -> bool {
+    match &plan.kw_map {
+        None => true,
+        Some(m) => args.iter().enumerate().all(|(k, a)| {
+            !matches!(a, Item::Mem(_)) || usize::from(m.slots[k + self_slot]) == k + self_slot
+        }),
+    }
+}
+
 /// Whether keywords `names`, after the `given` positional arguments, are the
 /// next parameters of `code` in order, so they bind as positional arguments.
 fn keywords_in_place(code: &CodeObject, given: usize, names: &[Object]) -> bool {
@@ -469,8 +574,9 @@ pub(super) fn plan(
     budget: usize,
 ) -> Plans {
     let mut plans = Plans::default();
+    // (A generator's body inlines its callees too: an exit registers the
+    // lazily running generator before its levels bind, see `bind_levels`.)
     if !enabled()
-        || code.is_generator
         || code.is_coroutine
         || code.is_async_generator
         || depths.len() != code.instructions.len()
@@ -482,8 +588,14 @@ pub(super) fn plan(
         .iter()
         .enumerate()
         .filter(|&(pc, i)| {
-            (i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
-                || (i.op == OpCode::LoadAttr && depths[pc] >= 1 && crate::property_site(ext, pc))
+            // (A generator's body takes its calls in line, not a property's
+            // getter or an operator's method.)
+            let plain = !code.is_generator;
+            (plain && i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
+                || (plain
+                    && i.op == OpCode::LoadAttr
+                    && depths[pc] >= 1
+                    && crate::property_site(ext, pc))
                 || (matches!(i.op, OpCode::Call | OpCode::CallKw)
                     && call_start(code, ext, pc, depths[pc]) >= 0
                     && crate::await_send_after(code, pc).is_none())
@@ -691,8 +803,21 @@ fn admit(
     if code.is_generator || code.is_coroutine || code.is_async_generator {
         return Err("generator");
     }
-    if Interpreter::has_extended_params(code) {
+    if code.has_varargs || code.has_varkeywords {
         return Err("extended parameters");
+    }
+    // Keyword-only parameters take their defaults, unless the call's
+    // keywords name them (see `keyword_map`).
+    let kwonly = code.kwonly_count as usize;
+    let given = argc + usize::from(has_self);
+    let kw_map = match names {
+        Some(names) if !keywords_in_place(code, given - names.len(), names) => {
+            Some(Box::new(keyword_map(f, code, given - names.len(), names)?))
+        }
+        _ => None,
+    };
+    if kw_map.is_none() && kwonly > 0 && !Interpreter::kwonly_defaults_cover(f, code) {
+        return Err("keyword-only defaults");
     }
     if !code.cellvars.is_empty() || f.lean_cells_ref(code).is_none() {
         return Err("cells");
@@ -700,18 +825,19 @@ fn admit(
     if code.wire.as_ref().is_some_and(|w| w.exec_error.is_some()) {
         return Err("wire");
     }
-    let given = argc + usize::from(has_self);
-    let Some(missing) = (code.arg_count as usize).checked_sub(given) else {
-        return Err("surplus arguments");
-    };
-    if let Some(names) = names {
-        if !keywords_in_place(code, given - names.len(), names) {
-            return Err("keywords");
+    // (A keyword map binds every parameter itself.)
+    let missing = match kw_map {
+        Some(_) => 0,
+        None => {
+            let Some(missing) = (code.arg_count as usize).checked_sub(given) else {
+                return Err("surplus arguments");
+            };
+            if missing > 0 && !Interpreter::defaults_cover(f, missing) {
+                return Err("defaults");
+            }
+            missing
         }
-    }
-    if missing > 0 && !Interpreter::defaults_cover(f, missing) {
-        return Err("defaults");
-    }
+    };
     let Some(ext) = crate::code_vm_ext(code) else {
         return Err("no extension");
     };
@@ -722,6 +848,14 @@ fn admit(
     // shows little of what it does.
     if !crate::callee_warm(code, ext) {
         return Err("not warm");
+    }
+    // A callee whose loops tier 2 compiled and runs better than this
+    // caller's code would (they run more than a few iterations a call, or
+    // call Python code), as direct calls decline it: in line, its loop
+    // runs as the frame JIT lowers it (`jitkernels`' 200-iteration
+    // kernels took 35% longer).
+    if crate::tier2_takes_calls(code) {
+        return Err("tier 2 loops");
     }
     let depths = weavepy_compiler::cpython_code::compute_startdepths(code);
     if depths.len() != n {
@@ -873,6 +1007,8 @@ fn admit(
         never_ran,
         has_self,
         missing,
+        kwonly,
+        kw_map,
         nlocals,
         stored,
         inner,
@@ -914,7 +1050,7 @@ enum Place {
 /// What a field read proved about its receiver, for the next read of the
 /// same receiver up to the next operation that isn't [`pure_op`].
 #[derive(Clone, Copy)]
-enum FieldMemo {
+pub(super) enum FieldMemo {
     /// Its split values block and their count.
     Split { block: Value, len: Value },
     /// Its laid-out `__slots__` values.
@@ -1087,68 +1223,11 @@ impl<'a> Lower<'a> {
         }
         let item = self.pop();
         let out = self.exit_with(pc, &[item], INTERP);
-        let ptr = self.ptr;
         let memo = match self.field_memo(i) {
             Some(m) => m,
             None => {
                 let at = self.local_addr(i);
-                let otag = self.tag_at(at);
-                let not_inst =
-                    self.b
-                        .ins()
-                        .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
-                self.branch_out(not_inst, out);
-                let inst = self.b.ins().load(ptr, FLAGS, at, 8);
-                let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
-                let cver = self
-                    .b
-                    .ins()
-                    .load(types::I64, FLAGS, cls, l.type_attr_version);
-                let want = self.b.ins().iconst(types::I64, ver as i64);
-                let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
-                let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
-                let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
-                let m = if slots {
-                    let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(&l));
-                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
-                    let form = self
-                        .b
-                        .ins()
-                        .uload8(types::I32, FLAGS, inst, l.inst_slots_tag);
-                    let names = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_layout);
-                    let values = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots_values);
-                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-                    let other =
-                        self.b
-                            .ins()
-                            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
-                    let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
-                    let unsafe_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
-                    let bad = self.b.ins().bor(stale, busy);
-                    let bad = self.b.ins().bor(bad, other);
-                    let bad = self.b.ins().bor(bad, foreign);
-                    let bad = self.b.ins().bor(bad, unsafe_now);
-                    self.branch_out(bad, out);
-                    FieldMemo::Slots { values }
-                } else {
-                    let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
-                    let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
-                    let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
-                    let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-                    let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
-                    let other = self.b.ins().bor(lazy, shared);
-                    let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
-                    let bad = self.b.ins().bor(stale, busy);
-                    let bad = self.b.ins().bor(bad, empty);
-                    let bad = self.b.ins().bor(bad, other);
-                    self.branch_out(bad, out);
-                    let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
-                    let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
-                    let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
-                    self.branch_out(foreign, out);
-                    let len = self.b.ins().uload32(FLAGS, block, l.split_len);
-                    FieldMemo::Split { block, len }
-                };
+                let m = self.field_guards(&l, at, ver, slots, out);
                 self.inl
                     .last_mut()
                     .expect("in an inlined body")
@@ -1157,7 +1236,88 @@ impl<'a> Lower<'a> {
                 m
             }
         };
-        let v = match memo {
+        let v = self.field_place(memo, idx, out);
+        let f = self.inl.last_mut().expect("in an inlined body");
+        let temp = f.places.len() as u32;
+        f.places.push(Place::Temp(v));
+        self.push(Item::Local(temp));
+        self.set_last(pc);
+        Some(true)
+    }
+
+    /// The guards of a read of one field of the instance at `at` (a local's
+    /// slot), as a site settled it: an instance of the class version `ver`
+    /// whose values (`slots`: its laid-out `__slots__` members) are laid out
+    /// over its class's, unborrowed, with no published `__dict__`, while
+    /// counts aren't shared between threads. Any failure goes to `out`.
+    pub(super) fn field_guards(
+        &mut self,
+        l: &weavepy_jit::ObjLayout,
+        at: Value,
+        ver: u64,
+        slots: bool,
+        out: Block,
+    ) -> FieldMemo {
+        let ptr = self.ptr;
+        let otag = self.tag_at(at);
+        let not_inst = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, otag, i64::from(self.tags.instance));
+        self.branch_out(not_inst, out);
+        let inst = self.b.ins().load(ptr, FLAGS, at, 8);
+        let cls = self.b.ins().load(ptr, FLAGS, inst, l.inst_class);
+        let cver = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, cls, l.type_attr_version);
+        let want = self.b.ins().iconst(types::I64, ver as i64);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, want);
+        let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
+        let shared = self.b.ins().uload8(types::I64, FLAGS, flag, 0);
+        if slots {
+            let clayout = self.b.ins().load(ptr, FLAGS, cls, type_slot_layout(l));
+            let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_slots_borrow);
+            let word = self.b.ins().load(ptr, FLAGS, inst, l.inst_slots);
+            let form = self.b.ins().band_imm(word, 7);
+            let names = self.b.ins().load(ptr, FLAGS, word, 0);
+            let values = self.b.ins().iadd_imm(word, i64::from(l.slots_values));
+            let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, form, 0);
+            let foreign = self.b.ins().icmp(IntCC::NotEqual, names, clayout);
+            let unsafe_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(stale, busy);
+            let bad = self.b.ins().bor(bad, other);
+            let bad = self.b.ins().bor(bad, foreign);
+            let bad = self.b.ins().bor(bad, unsafe_now);
+            self.branch_out(bad, out);
+            FieldMemo::Slots { values }
+        } else {
+            let lazy = self.b.ins().load(ptr, FLAGS, inst, l.inst_dict_lazy);
+            let borrow = self.b.ins().sload32(FLAGS, inst, l.inst_split_borrow);
+            let block = self.b.ins().load(ptr, FLAGS, inst, l.inst_split_block);
+            let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
+            let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
+            let other = self.b.ins().bor(lazy, shared);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, other, 0);
+            let bad = self.b.ins().bor(stale, busy);
+            let bad = self.b.ins().bor(bad, empty);
+            let bad = self.b.ins().bor(bad, other);
+            self.branch_out(bad, out);
+            let keys = self.b.ins().load(ptr, FLAGS, block, l.split_keys);
+            let ckeys = self.b.ins().load(ptr, FLAGS, cls, l.type_shared_keys);
+            let foreign = self.b.ins().icmp(IntCC::NotEqual, keys, ckeys);
+            self.branch_out(foreign, out);
+            let len = self.b.ins().uload32(FLAGS, block, l.split_len);
+            FieldMemo::Split { block, len }
+        }
+    }
+
+    /// The address of the field at position `idx` (a site's, with its
+    /// `SLOT_FIELD` bit) of the values `memo` proved, `out` when it's unset.
+    pub(super) fn field_place(&mut self, memo: FieldMemo, idx: u32, out: Block) -> Value {
+        let l = *self.layout.expect("a field's guards ran");
+        match memo {
             FieldMemo::Slots { values } => {
                 let off = i64::from(idx & !crate::SLOT_FIELD) * 16;
                 let v = self.b.ins().iadd_imm(values, off);
@@ -1178,13 +1338,7 @@ impl<'a> Lower<'a> {
                 let off = i64::from(idx) * 16 + i64::from(l.split_values);
                 self.b.ins().iadd_imm(block, off)
             }
-        };
-        let f = self.inl.last_mut().expect("in an inlined body");
-        let temp = f.places.len() as u32;
-        f.places.push(Place::Temp(v));
-        self.push(Item::Local(temp));
-        self.set_last(pc);
-        Some(true)
+        }
     }
 
     /// An inlined body's parameter `i`, where its value is known unboxed.
@@ -1241,7 +1395,10 @@ impl<'a> Lower<'a> {
         let call_last = self.last_pc;
         let join = self.b.create_block();
         let mut slow = None;
-        for plan in plans {
+        for plan in plans
+            .iter()
+            .filter(|p| binds_in_place(p, &args, usize::from(p.has_self)))
+        {
             let next = self.b.create_block();
             self.vs.clear();
             self.depth = start + 2;
@@ -1355,7 +1512,7 @@ impl<'a> Lower<'a> {
             name: ins[attr_pc].arg,
         });
         let mut slow = None;
-        for plan in plans {
+        for plan in plans.iter().filter(|p| binds_in_place(p, &items, 0)) {
             let next = self.b.create_block();
             let mut caches = Vec::new();
             for _ in 0..plan.classes.min(2) {
@@ -1587,6 +1744,23 @@ impl<'a> Lower<'a> {
             }
             (None, None) => {
                 let at = self.slot_addr(start);
+                // A method cached in a local (`get = source.get`): its bound
+                // method unpacked first, as the call's own path unpacks it.
+                if plan.has_self {
+                    let tag = self.tag_at(at);
+                    let is_bound =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::Equal, tag, i64::from(self.tags.bound));
+                    let unpack = self.b.create_block();
+                    let unpacked = self.b.create_block();
+                    self.b.ins().brif(is_bound, unpack, &[], unpacked, &[]);
+                    self.b.switch_to_block(unpack);
+                    self.call(super::h_unpack_bound as *const () as usize, &[at], true);
+                    self.b.ins().jump(unpacked, &[]);
+                    self.b.switch_to_block(unpacked);
+                }
+                let at = self.slot_addr(start);
                 let tag = self.tag_at(at);
                 let not_fn =
                     self.b
@@ -1637,7 +1811,43 @@ impl<'a> Lower<'a> {
         let bad = self.b.ins().bor(bad, deep);
         self.branch_out(bad, slow);
         // The defaults (`__defaults__` may have been rebound).
-        if plan.missing > 0 {
+        if let Some(map) = &plan.kw_map {
+            // (Before any argument is written: they bind to other slots.)
+            if map.defaults != 0 {
+                let dst = self.slot_addr(first);
+                let mask = self.b.ins().iconst(types::I64, map.defaults as i64);
+                let at = match method_at {
+                    Some(a) => self.b.ins().iconst(ptr, a),
+                    None => self.slot_addr(start),
+                };
+                let r = self
+                    .call(
+                        h_inline_mask_defaults as *const () as usize,
+                        &[at, dst, mask],
+                        true,
+                    )
+                    .expect("returns");
+                self.branch_out(r, slow);
+            }
+        } else if plan.kwonly > 0 {
+            // (Both kinds at once: a decline leaves nothing written.)
+            let given = argc + self_slot;
+            let dst = self.slot_addr(first + given);
+            let n = self.b.ins().iconst(types::I64, plan.missing as i64);
+            let kw_dst = self.slot_addr(first + code.arg_count as usize);
+            let at = match method_at {
+                Some(a) => self.b.ins().iconst(ptr, a),
+                None => self.slot_addr(start),
+            };
+            let r = self
+                .call(
+                    h_inline_all_defaults as *const () as usize,
+                    &[at, dst, n, kw_dst],
+                    true,
+                )
+                .expect("returns");
+            self.branch_out(r, slow);
+        } else if plan.missing > 0 {
             let given = argc + self_slot;
             let dst = self.slot_addr(first + given);
             let n = self.b.ins().iconst(types::I64, plan.missing as i64);
@@ -1662,7 +1872,7 @@ impl<'a> Lower<'a> {
                 self.b.ins().store(FLAGS, l, sv, IS_ROOT_LAST);
             }
         }
-        for i in code.arg_count as usize..nlocals {
+        for i in code.arg_count as usize + plan.kwonly..nlocals {
             let at = self.slot_addr(first + i);
             self.write_tag(at, self.tags.unbound);
         }
@@ -1673,7 +1883,10 @@ impl<'a> Lower<'a> {
         let mut owned = vec![true; nlocals];
         let mut borrowed: Vec<(usize, Place)> = Vec::new();
         for (k, &item) in args.iter().enumerate() {
-            let li = k + self_slot;
+            let li = match &plan.kw_map {
+                Some(map) => usize::from(map.slots[k + self_slot]),
+                None => k + self_slot,
+            };
             let home = first + li;
             let keep = !plan.stored[li];
             match item {
@@ -2469,6 +2682,109 @@ unsafe extern "C" fn h_inline_defaults(callee: *const Object, dst: *mut Object, 
         }
         for (k, d) in f.defaults[f.defaults.len() - n..].iter().enumerate() {
             dst.add(k).write(crate::clone_hot(d));
+        }
+        0
+    }
+}
+
+/// The defaults of the parameters in `mask` (bit `j` for local `j`) of the
+/// function at stack slot `callee`, each to its local's slot from `dst`
+/// (see [`KwMap`]): `0` done, anything else declined with nothing written
+/// (a default rebound or missing).
+unsafe extern "C" fn h_inline_mask_defaults(
+    callee: *const Object,
+    dst: *mut Object,
+    mask: u64,
+) -> u32 {
+    // SAFETY: the code passes the callable's slot and free stack slots.
+    unsafe {
+        let Object::Function(f) = &*callee else {
+            return 1;
+        };
+        // (A rebound `__defaults__` or `__kwdefaults__` lives in the
+        // override, which the full call reads.)
+        if f.defaults_maybe_overridden() {
+            return 1;
+        }
+        let code: &CodeObject = &*f.code.as_ptr();
+        let npos = code.arg_count as usize;
+        let nparams = npos + code.kwonly_count as usize;
+        let nd = f.defaults.len();
+        let default = |j: usize| -> Option<&Object> {
+            if j >= nparams {
+                None
+            } else if j < npos {
+                (j + nd >= npos).then(|| &f.defaults[j + nd - npos])
+            } else {
+                kw_default(f, code, j)
+            }
+        };
+        let mut m = mask;
+        while m != 0 {
+            if default(m.trailing_zeros() as usize).is_none() {
+                return 1;
+            }
+            m &= m - 1;
+        }
+        let mut m = mask;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            let d = default(j).expect("checked above");
+            dst.add(j).write(crate::clone_hot(d));
+            m &= m - 1;
+        }
+        0
+    }
+}
+
+/// [`h_inline_defaults`] for a callee with keyword-only parameters: its `n`
+/// trailing positional defaults to `dst` and each keyword-only parameter's
+/// default, in the locals' order, to `kw_dst`: `0` done, anything else
+/// declined with nothing written (a default rebound or missing).
+unsafe extern "C" fn h_inline_all_defaults(
+    callee: *const Object,
+    dst: *mut Object,
+    n: u64,
+    kw_dst: *mut Object,
+) -> u32 {
+    // SAFETY: the code passes the callable's slot and free stack slots.
+    unsafe {
+        let Object::Function(f) = &*callee else {
+            return 1;
+        };
+        let n = n as usize;
+        let code: &CodeObject = &*f.code.as_ptr();
+        if n > 0 && !Interpreter::defaults_cover(f, n) {
+            return 1;
+        }
+        // The compiler lists the keyword-only defaults in the parameters'
+        // order: when every one has a default, the names line up.
+        let npos = code.arg_count as usize;
+        let kwonly = code.kwonly_count as usize;
+        let kd = &f.kw_defaults;
+        let aligned = !f.defaults_maybe_overridden()
+            && kd.len() == kwonly
+            && kd
+                .iter()
+                .zip(&code.varnames[npos..npos + kwonly])
+                .all(|((name, _), v)| name.as_str() == v.as_str());
+        if !aligned && !Interpreter::kwonly_defaults_cover(f, code) {
+            return 1;
+        }
+        if n > 0 {
+            for (k, d) in f.defaults[f.defaults.len() - n..].iter().enumerate() {
+                dst.add(k).write(crate::clone_hot(d));
+            }
+        }
+        if aligned {
+            for (k, (_, d)) in kd.iter().enumerate() {
+                kw_dst.add(k).write(crate::clone_hot(d));
+            }
+        } else {
+            for (k, d) in Interpreter::kwonly_defaults(f, code).enumerate() {
+                let d = d.expect("covered above");
+                kw_dst.add(k).write(crate::clone_hot(d));
+            }
         }
         0
     }

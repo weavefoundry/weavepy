@@ -141,7 +141,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             let cls = inst.cls();
             // (A `__getattr__` answers only what these shapes don't find. A
             // builtin class's own, a module's, is left to its fast paths.)
-            if type_has_lookup_override(&cls)
+            if type_has_read_override(&cls)
                 || (cls.flags.is_builtin && cls.dunder(crate::types::Dunder::GetAttr).present())
             {
                 return InlineCache::Cooldown(COOLDOWN);
@@ -574,11 +574,11 @@ fn specialize_call_kw_by<'a>(
 ) -> InlineCache {
     let code = f.code();
     // (A closure binds the same way: its cells are the function's, not the
-    // call's. Cell variables of the code's own are bound by name.)
+    // call's. The code's own cell variables are made from the bound locals
+    // by every binder that takes the permutation, or the binder declines.)
     if code.is_generator
         || code.is_coroutine
         || code.is_async_generator
-        || !code.cellvars.is_empty()
         || code.freevars.len() != f.closure.len()
     {
         return InlineCache::Cooldown(COOLDOWN);
@@ -748,6 +748,16 @@ pub(crate) fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
 /// found: a `__getattr__` doesn't matter there, as it answers only a miss,
 /// which the shape's guard sends down the generic path.
 fn type_has_lookup_override(ty: &Rc<TypeObject>) -> bool {
+    // `object.__setattr__` is the stock default every class inherits (a bare
+    // `is_some()` disabled the STORE_ATTR fast paths for *every class in the
+    // program*): only a genuine user override disqualifies the type.
+    type_has_read_override(ty) || !ty.setattr_is_default()
+}
+
+/// [`type_has_lookup_override`] for a read: a class's own `__setattr__`
+/// (a frozen dataclass's, say) intercepts only stores, so it leaves reads'
+/// shapes alone.
+fn type_has_read_override(ty: &Rc<TypeObject>) -> bool {
     // A `super` proxy resolves attributes along its target's MRO (CPython's
     // `super_getattro`), never its own class's.
     if ty.is_super_proxy_type() {
@@ -758,15 +768,10 @@ fn type_has_lookup_override(ty: &Rc<TypeObject>) -> bool {
     // (anything other than that sentinel) should disable the dict-slot fast
     // path — the default lookup is exactly what the fast path reproduces.
     match ty.lookup("__getattribute__") {
-        Some(Object::Builtin(b)) if b.name == ".object_getattribute" => {}
-        Some(_) => return true,
-        None => {}
+        Some(Object::Builtin(b)) => b.name != ".object_getattribute",
+        Some(_) => true,
+        None => false,
     }
-    // Same story for `__setattr__`: `object.__setattr__` is the stock
-    // default every class inherits — a bare `is_some()` disabled the
-    // LOAD_ATTR/STORE_ATTR fast paths for *every class in the program*.
-    // Only a genuine user override disqualifies the type.
-    !ty.setattr_is_default()
 }
 
 // ---------- per-opcode dispatch stats (`WEAVEPY_VM_STATS=1`) ----------

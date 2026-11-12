@@ -3741,6 +3741,10 @@ impl<'a> LeafProbe<'a> {
     #[inline(never)]
     fn other_hash(key: &Object) -> Option<i64> {
         Some(match key {
+            // An `int` subclass keeping `int`'s hash: its value's.
+            Object::Instance(i) if int_like_value(i).is_some() => {
+                py_hash_long_i64(int_like_value(i)?)
+            }
             Object::Instance(i)
                 if i.native.get().is_none()
                     && i.class_dunder(crate::types::Dunder::Hash).object_owner() =>
@@ -3756,6 +3760,9 @@ impl<'a> LeafProbe<'a> {
             {
                 py_hash_value(key)?
             }
+            // A tuple of those, `None`, `int`-like instances and such tuples
+            // (`re`'s `(LITERAL, 97)` and `(RANGE, (48, 57))`): the same.
+            Object::Tuple(t) if t.iter().all(|x| leaf_tuple_item(x, 0)) => py_hash_value(key)?,
             Object::Bytes(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
@@ -3775,6 +3782,98 @@ impl<'a> LeafProbe<'a> {
     #[inline]
     pub fn miss_is_exact(&self) -> bool {
         !self.foreign.get()
+    }
+}
+
+/// The value of an instance of an `int` subclass that keeps `int`'s
+/// `__hash__`, `__eq__` and `__ne__` (`re`'s `_NamedIntConstant` opcodes;
+/// not an `IntEnum` member, whose `Enum` defines `__hash__`): it hashes and
+/// compares as that value, running no Python code.
+#[inline]
+pub(crate) fn int_like_value(i: &crate::types::PyInstance) -> Option<i64> {
+    use crate::types::Dunder;
+    let Some(Object::Int(v)) = i.native.get() else {
+        return None;
+    };
+    let cls = i.cls_raw();
+    (cls.native_kind.get() == 0
+        && cls.c_ext_ptr.get() == 0
+        && cls.dunder(Dunder::Hash).builtin_owner()
+        && cls.dunder(Dunder::Eq).builtin_owner()
+        && cls.dunder(Dunder::Ne).builtin_owner())
+    .then_some(*v)
+}
+
+/// The value a machine `int`, or an instance of an `int` subclass that
+/// keeps `int`'s ordering (`__lt__`, `__le__`, `__gt__`, `__ge__`), orders
+/// by: `min(hi, MAXWIDTH)` of `re`'s opcodes runs no Python code.
+pub(crate) fn int_order_value(o: &Object) -> Option<i64> {
+    match o {
+        Object::Int(v) => Some(*v),
+        Object::Instance(i) => {
+            let Some(Object::Int(v)) = i.native.get() else {
+                return None;
+            };
+            let cls = i.cls_raw();
+            (cls.native_kind.get() == 0
+                && cls.c_ext_ptr.get() == 0
+                && cls.memo_verdict(crate::types::Verdict::IntOrder, "", || {
+                    let int = &crate::builtin_types::builtin_types().int_;
+                    ["__lt__", "__le__", "__gt__", "__ge__"].iter().all(|n| {
+                        cls.lookup_with_owner(n)
+                            .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, int))
+                    })
+                }))
+            .then_some(*v)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `o` may sit in a tuple key [`LeafProbe`] hashes and compares
+/// natively: a machine `int`, a `str`, `bytes`, `None`, an
+/// [`int_like_value`] instance, or a (shallowly nested) tuple of those.
+fn leaf_tuple_item(o: &Object, depth: u32) -> bool {
+    match o {
+        Object::Int(_) | Object::Str(_) | Object::Bytes(_) | Object::None => true,
+        Object::Instance(i) => int_like_value(i).is_some(),
+        Object::Tuple(t) => depth < 3 && t.iter().all(|x| leaf_tuple_item(x, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Item-by-item equality of two tuples as Python decides it, where every
+/// pairing settles natively (see [`leaf_tuple_item`]); `None` when one
+/// might need an `__eq__` (an equal `True` or `1.0`, say), or pairs an
+/// `int`-like instance with anything but itself.
+fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
+    let mut equal = true;
+    for (x, y) in a.iter().zip(b.iter()) {
+        equal &= match (x, y) {
+            (Object::Int(p), Object::Int(q)) => p == q,
+            (Object::Str(p), Object::Str(q)) => p.as_bytes() == q.as_bytes(),
+            (Object::Bytes(p), Object::Bytes(q)) => p[..] == q[..],
+            (Object::None, Object::None) => true,
+            (Object::Instance(p), Object::Instance(q)) if Rc::ptr_eq(p, q) => true,
+            (Object::Tuple(p), Object::Tuple(q)) if depth < 3 => {
+                p.len() == q.len() && leaf_tuples_eq(p, q, depth + 1)?
+            }
+            // (An `int`-like instance inside a tuple equals only itself
+            // here: the native `lru_cache` trusts a native match not to be
+            // a subclass's, whose stored owner it guards.)
+            _ => return None,
+        };
+    }
+    Some(equal)
+}
+
+/// A machine `int`'s value, or an [`int_like_value`] instance's.
+#[inline]
+fn int_like(o: &Object) -> Option<i64> {
+    match o {
+        Object::Int(v) => Some(*v),
+        Object::Instance(i) => int_like_value(i),
+        _ => None,
     }
 }
 
@@ -3836,6 +3935,13 @@ impl LeafProbe<'_> {
             // Identity settles an instance probe (CPython compares keys
             // with `is` first); any other pairing may need `__eq__`.
             (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
+            // `int`'s equality, which an `int` subclass that keeps it shares
+            // (`re`'s opcodes against each other and against plain ints).
+            (Object::Instance(_) | Object::Int(_), Object::Instance(_) | Object::Int(_))
+                if int_like(self.key).is_some() && int_like(&key.0).is_some() =>
+            {
+                int_like(self.key) == int_like(&key.0)
+            }
             (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
             (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
             (Object::Generator(a), Object::Generator(b))
@@ -3846,19 +3952,13 @@ impl LeafProbe<'_> {
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
-                let mut equal = true;
-                for (x, y) in a.iter().zip(b.iter()) {
-                    match (x, y) {
-                        (Object::Int(p), Object::Int(q)) => equal &= p == q,
-                        (Object::Str(p), Object::Str(q)) => equal &= p.as_bytes() == q.as_bytes(),
-                        (Object::Bytes(p), Object::Bytes(q)) => equal &= p[..] == q[..],
-                        _ => {
-                            self.foreign.set(true);
-                            return false;
-                        }
+                match leaf_tuples_eq(a, b, 0) {
+                    Some(equal) => equal,
+                    None => {
+                        self.foreign.set(true);
+                        false
                     }
                 }
-                equal
             }
             _ => {
                 self.foreign.set(true);
@@ -4425,7 +4525,15 @@ pub(crate) fn dict_reentrant_probe(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<ReentrantProbe, RuntimeError> {
-    let kh = key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key));
+    let kh = match leaf_instance_probe(d, key) {
+        Ok((hash, i)) => {
+            let stored = i.and_then(|i| d.borrow().get_index(i).map(|(k, _)| k.0.clone()));
+            return Ok(ReentrantProbe { hash, stored });
+        }
+        // (A pure `__hash__`'s answer, as the full call would give it.)
+        Err(Some(hash)) => hash,
+        Err(None) => key_cmp_scope(|| py_hash_value(key))?.unwrap_or_else(|| identity_hash(key)),
+    };
     let mut memo: Vec<(Object, bool)> = Vec::new();
     loop {
         // Same-hash candidates, collected under a short borrow with a
@@ -4546,6 +4654,7 @@ pub(crate) fn dict_reentrant_get(
     d: &RefCell<DictData>,
     key: &Object,
 ) -> Result<Option<Object>, RuntimeError> {
+    // (An instance key's pure-leaf phase runs inside the probe.)
     let probe = dict_reentrant_probe(d, key)?;
     match probe.stored {
         Some(stored) => {
@@ -4556,6 +4665,66 @@ pub(crate) fn dict_reentrant_get(
         }
         None => Ok(None),
     }
+}
+
+/// [`dict_reentrant_get`] of an instance whose class's Python `__hash__`
+/// evaluates as a pure leaf (see `Interpreter::leaf_instance_hash`): the
+/// stored value, or (`Some(None)`) none when no stored key is equal. `None`
+/// when a stored key with that hash needs a comparison that isn't settled
+/// natively, or the hash isn't.
+pub(crate) fn leaf_hashed_instance_get(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Option<Option<Object>> {
+    let (_, i) = leaf_instance_probe(d, key).ok()?;
+    let m = d.try_borrow().ok()?;
+    Some(i.and_then(|i| m.get_index(i)).map(|(_, v)| v.clone()))
+}
+
+/// The pure-leaf phase of a probe for an instance key: its hash, as
+/// `Interpreter::leaf_instance_hash` evaluates it, and the position of the
+/// stored key it matches, found as itself (CPython's probe tries identity
+/// first) or, for another instance of its class, by a `__eq__` that
+/// evaluates as a pure leaf (`Interpreter::leaf_instance_eq`). `Err` with
+/// the hash, when one was found, for a probe a stored key's comparison
+/// leaves to the full path.
+fn leaf_instance_probe(
+    d: &RefCell<DictData>,
+    key: &Object,
+) -> Result<(i64, Option<usize>), Option<i64>> {
+    if !matches!(key, Object::Instance(_)) {
+        return Err(None);
+    }
+    // SAFETY: the running thread's interpreter, under the GIL; the
+    // evaluations run no Python and take no frame.
+    let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr().ok_or(None)? };
+    let hash = interp.leaf_instance_hash(key).ok_or(None)?;
+    let probe = LeafProbe::with_hash(key, hash);
+    let m = d.try_borrow().map_err(|_| Some(hash))?;
+    if let Some(i) = m.get_index_of(&probe) {
+        return Ok((hash, Some(i)));
+    }
+    if probe.miss_is_exact() {
+        return Ok((hash, None));
+    }
+    // (A pure `__eq__` reads, and never writes, what the table holds.)
+    let declined = Cell::new(false);
+    let i = m.find_by_hash(hash, |k| {
+        if declined.get() {
+            return false;
+        }
+        if k.0.is_same(key) {
+            return true;
+        }
+        interp.leaf_instance_eq(&k.0, key).unwrap_or_else(|| {
+            declined.set(true);
+            false
+        })
+    });
+    if declined.get() {
+        return Err(Some(hash));
+    }
+    Ok((hash, i))
 }
 
 /// The position of `key` in `d`, honouring keys whose `__hash__`/`__eq__`
@@ -5168,10 +5337,10 @@ pub struct PyFunction {
     /// must not change resolution (test_dynamic's
     /// `test_cannot_replace_builtins_dict_between_calls`).
     pub builtins: Rc<RefCell<DictData>>,
-    pub defaults: Vec<Object>,
-    pub kw_defaults: Vec<(String, Object)>,
+    pub defaults: crate::compact_vec::CompactVec<Object>,
+    pub kw_defaults: crate::compact_vec::CompactVec<(String, Object)>,
     /// Closure cells matching `code.freevars` in order.
-    pub closure: Vec<Object>,
+    pub closure: crate::compact_vec::CompactVec<Object>,
     /// `__dict__` for arbitrary attribute assignment on the
     /// function — e.g. `@functools.wraps`, `@abstractmethod`'s
     /// `__isabstractmethod__`, or any decorator that stashes
@@ -5216,6 +5385,11 @@ pub struct PyFunction {
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,
 }
+
+// With the reference counts, the 192-byte allocation class (a program holds
+// thousands of functions).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PyFunction>() <= 176);
 
 /// A function's getset slots before their first read (see
 /// [`PyFunction::slot_seed`]): the defining globals' `__name__`, if set.
@@ -5683,14 +5857,15 @@ pub struct PyGenerator {
     pub kind: CoroutineKind,
     /// `gi_code` — held on the generator itself (CPython keeps a
     /// strong reference) so it stays readable after the generator
-    /// finishes and the frame is dropped.
-    pub code: Object,
+    /// finishes and the frame is dropped. Read through [`Self::code`].
+    code: Option<Rc<CodeObject>>,
     /// The execution state, read through [`Self::state`].
     gen_state: RefCell<GeneratorState>,
     /// [`Self::name`] and [`Self::qualname`] when they aren't the code's,
     /// [`Self::origin`] and [`Self::finalizer`]: the state few generators
-    /// carry, allocated when first set.
-    extras: RefCell<Option<Box<GenExtras>>>,
+    /// carry, allocated when first set (and kept: a generator that has
+    /// them is never pooled).
+    extras: crate::sync::OnceBox<RefCell<GenExtras>>,
     /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
     /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
     /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
@@ -5724,6 +5899,11 @@ pub struct PyGenerator {
     /// call's operand stack holds it (see `Interpreter::make_genexp`).
     pub(crate) genexp_pending: crate::sync::Cell<bool>,
 }
+
+// Four words of fields and a word of flags: with the reference counts, the
+// 80-byte allocation class. (A suspended task tree holds tens of thousands.)
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PyGenerator>() == 64);
 
 /// The state of a [`PyGenerator`] that few carry.
 struct GenExtras {
@@ -5771,7 +5951,7 @@ impl PyGenerator {
     /// CoroutineTests.test_gen reads it through two paths and
     /// asserts `is`). Unless set otherwise, the code's interned name.
     pub fn name(&self) -> Object {
-        if let Some(name) = self.extras.borrow().as_ref().and_then(|e| e.name.clone()) {
+        if let Some(name) = self.extras.get().and_then(|e| e.borrow().name.clone()) {
             return name;
         }
         self.code_names().0
@@ -5780,12 +5960,7 @@ impl PyGenerator {
     /// `gi_qualname` (PEP 3155). Seeded from the function's
     /// `__qualname__` at call time; reassignable like [`Self::name`].
     pub fn qualname(&self) -> Object {
-        if let Some(name) = self
-            .extras
-            .borrow()
-            .as_ref()
-            .and_then(|e| e.qualname.clone())
-        {
+        if let Some(name) = self.extras.get().and_then(|e| e.borrow().qualname.clone()) {
             return name;
         }
         self.code_names().1
@@ -5805,8 +5980,8 @@ impl PyGenerator {
     /// [`Self::name`] and [`Self::qualname`].
     fn code_names(&self) -> (Object, Object) {
         match &self.code {
-            Object::Code(code) => crate::code_gen_names(code),
-            _ => (Object::from_static(""), Object::from_static("")),
+            Some(code) => crate::code_gen_names(code),
+            None => (Object::from_static(""), Object::from_static("")),
         }
     }
 
@@ -5816,9 +5991,8 @@ impl PyGenerator {
     /// stack (most recent first). `None` when tracking is off.
     pub fn origin(&self) -> Object {
         self.extras
-            .borrow()
-            .as_ref()
-            .map_or(Object::None, |e| e.origin.clone())
+            .get()
+            .map_or(Object::None, |e| e.borrow().origin.clone())
     }
 
     /// Set [`Self::origin`].
@@ -5830,9 +6004,8 @@ impl PyGenerator {
     /// [`Self::hooks_inited`]); `None` when there was none.
     pub fn finalizer(&self) -> Object {
         self.extras
-            .borrow()
-            .as_ref()
-            .map_or(Object::None, |e| e.finalizer.clone())
+            .get()
+            .map_or(Object::None, |e| e.borrow().finalizer.clone())
     }
 
     /// Set [`Self::finalizer`].
@@ -5841,14 +6014,16 @@ impl PyGenerator {
     }
 
     fn set_extra<T: ExtraField>(&self, value: T, field: impl FnOnce(&mut GenExtras) -> &mut T) {
-        let old = {
-            let mut extras = self.extras.borrow_mut();
-            if extras.is_none() && value.is_unset() {
-                return;
+        let extras = match self.extras.get() {
+            Some(extras) => extras,
+            None if value.is_unset() => return,
+            None => {
+                // (A racing set leaves the other thread's, equally empty.)
+                let _ = self.extras.set(RefCell::new(GenExtras::default()));
+                self.extras.get().expect("just set")
             }
-            let extras = extras.get_or_insert_with(Box::default);
-            std::mem::replace(field(extras), value)
         };
+        let old = std::mem::replace(field(&mut extras.borrow_mut()), value);
         // (Released outside the borrow: dropping it can run code.)
         drop(old);
     }
@@ -5858,9 +6033,12 @@ impl PyGenerator {
     pub fn new(kind: CoroutineKind, code: Object, frame: Box<crate::Frame>) -> Self {
         Self {
             kind,
-            code,
+            code: match code {
+                Object::Code(code) => Some(code),
+                _ => None,
+            },
             gen_state: RefCell::new(GeneratorState::Created(frame)),
-            extras: RefCell::new(None),
+            extras: crate::sync::OnceBox::new(),
             hooks_inited: crate::sync::Cell::new(false),
             finalize_ran: crate::sync::Cell::new(false),
             gc_slot: crate::gc_trace::GcSlot::new(),
@@ -5915,6 +6093,18 @@ impl PyGenerator {
         matches!(&*self.state().borrow(), GeneratorState::Finished)
     }
 
+    /// `gi_code`: the code the generator runs (`None` once a pooled
+    /// generator has let it go).
+    pub fn code(&self) -> Object {
+        self.code.clone().map_or(Object::None, Object::Code)
+    }
+
+    /// [`Self::code`], borrowed.
+    #[inline(always)]
+    pub fn code_ref(&self) -> Option<&Rc<CodeObject>> {
+        self.code.as_ref()
+    }
+
     /// Has the body run at all? A generator still in `Created` has
     /// executed nothing, so closing it runs nothing either — CPython's
     /// `gen_close` marks such a generator closed without throwing
@@ -5965,7 +6155,7 @@ pub(crate) fn recycle_generator(
     // SAFETY: the last reference, with no weak one (checked above):
     // nothing else can observe the generator while it changes.
     let m = unsafe { &mut *std::sync::Arc::as_ptr(&g).cast_mut() };
-    if !matches!(m.gen_state.get_mut(), GeneratorState::Finished) || m.extras.get_mut().is_some() {
+    if !matches!(m.gen_state.get_mut(), GeneratorState::Finished) || m.extras.get().is_some() {
         return Err(g);
     }
     // SAFETY: the pool's accesses are serialized (see `GenPool`).
@@ -5974,7 +6164,7 @@ pub(crate) fn recycle_generator(
         return Err(g);
     }
     // (A code object's release runs no Python code.)
-    m.code = Object::None;
+    m.code = None;
     pool.push(Rc::from_arc(g));
     Ok(())
 }
@@ -6001,7 +6191,10 @@ pub(crate) fn pooled_generator(
     // returned.
     let m = unsafe { &mut *Rc::as_ptr(&g).cast_mut() };
     m.kind = kind;
-    m.code = code;
+    m.code = match code {
+        Object::Code(code) => Some(code),
+        _ => None,
+    };
     // (The displaced `Finished` owns nothing.)
     *m.gen_state.get_mut() = GeneratorState::Created(frame);
     m.hooks_inited.set(false);
@@ -9436,7 +9629,11 @@ pub enum LazyIterKind {
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
+///
+/// (`repr(u8)`: the discriminant is the first byte, which the frame JIT's
+/// in-line `FOR_ITER` steps test; see `frame_jit::iter_layout`.)
 #[derive(Debug, Clone)]
+#[repr(u8)]
 pub enum PyIterator {
     List {
         items: Rc<RefCell<Vec<Object>>>,
@@ -14425,8 +14622,8 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 // ---------- factory helpers ----------
 
 impl Object {
-    pub fn from_str(s: impl Into<String>) -> Self {
-        Object::Str(SharedStr::from(s.into().as_str()))
+    pub fn from_str(s: impl AsRef<str>) -> Self {
+        Object::Str(SharedStr::from(s.as_ref()))
     }
 
     /// A one-character `str`. Latin-1 characters come from a shared table
@@ -14488,11 +14685,11 @@ impl Object {
     /// stored string with stable identity — e.g. `cls.__name__`, which
     /// `inspect.classify_class_attrs` compares with `is`.
     pub fn interned_str(s: &str) -> Self {
-        use std::collections::HashSet;
+        use crate::fasthash::FxHashSet;
         use std::sync::{Mutex, OnceLock};
         // The canonical string is also the key; don't duplicate its text.
-        static TABLE: OnceLock<Mutex<HashSet<SharedStr>>> = OnceLock::new();
-        let table = TABLE.get_or_init(|| Mutex::new(HashSet::new()));
+        static TABLE: OnceLock<Mutex<FxHashSet<SharedStr>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(FxHashSet::default()));
         let mut t = table.lock().unwrap();
         if let Some(rc) = t.get(s) {
             return Object::Str(rc.clone());
@@ -14766,7 +14963,7 @@ mod tests {
             (Object::Bool(true), 2),
             (Object::Int(7), 3),
             (Object::Float(1.5), 4),
-            (Object::from_str("a fresh string".to_owned()), 7),
+            (Object::from_str("a fresh string"), 7),
             (Object::new_tuple(vec![Object::Int(1), Object::None]), 9),
             (Object::new_bytes(vec![1, 2, 3]), 27),
             (Object::new_list(vec![Object::Int(1)]), 10),

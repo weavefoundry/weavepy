@@ -761,12 +761,6 @@ fn run_on_large_stack(entry: fn() -> i32) -> i32 {
         // fork-warning check measures additional threads against.
         weavepy::vm::stdlib::os_process::capture_thread_baseline();
         pcprof::start();
-        weavepy::vm::malloc_stats::set_allocator_hooks(weavepy::vm::malloc_stats::AllocatorHooks {
-            release_free_memory: alloc::release_free_memory,
-            enter_compile_heap: alloc::enter_compile_heap,
-            restore_heap: alloc::restore_heap,
-            collect_compile_heap: alloc::collect_compile_heap,
-        });
         #[cfg(all(feature = "alloc-profile", target_os = "macos"))]
         alloc_profile::start();
         let code = entry();
@@ -1088,12 +1082,6 @@ fn real_main() -> Result<i32> {
         // into a namespace-sharing REPL after the program body.
         run_source_with_options(&source, &opts)?;
         return Ok(0);
-    }
-
-    // A script or module is likely to compile: warm the JIT's code
-    // generator from start-up (`-c` code and the REPL wait for hot code).
-    if cli.module.is_some() || cli.script.as_deref().is_some_and(|p| p.as_os_str() != "-") {
-        weavepy::vm::Interpreter::warm_jit_at_startup();
     }
 
     if let Some(module) = cli.module.clone() {

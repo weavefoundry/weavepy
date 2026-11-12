@@ -233,7 +233,9 @@ class deque:
     # the list, so the queue-shaped `append`/`popleft` traffic asyncio's
     # ready queue and `queue.Queue` generate is amortized O(1) per
     # operation. Every other method flattens through `_flat()` first.
-    __slots__ = ("_data", "_maxlen", "_state", "_head", "__weakref__")
+    # (Declared in the order `__init__` sets them: the native methods read
+    # them by these positions.)
+    __slots__ = ("_data", "_head", "_maxlen", "_state", "__weakref__")
 
     # CPython's C deque carries Py_TPFLAGS_SEQUENCE, so `case [..]:`
     # patterns match deques (PEP 634). WeavePy's VM reads the flag off

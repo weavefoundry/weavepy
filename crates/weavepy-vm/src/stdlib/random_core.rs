@@ -225,9 +225,11 @@ impl MtBytes<'_> {
 }
 
 // ===================================================================
-// Instance-state plumbing. The state lives in a bytearray in the
-// instance dict (so Python-level subclasses share it): the 624 key
-// words, then the cursor. The generator runs on it in place.
+// Instance-state plumbing. The state lives in a bytearray in a slot of
+// the instance's own that no descriptor names (so Python-level
+// subclasses share it, and the instance's `__dict__` holds only what
+// Python stored there, as CPython's does): the 624 key words, then the
+// cursor. The generator runs on it in place.
 // ===================================================================
 
 const STATE_KEY: &str = "_mt_state";
@@ -245,15 +247,10 @@ fn self_instance(args: &[Object], what: &str) -> Result<Rc<PyInstance>, RuntimeE
 /// is missing (a subclass skipping `__init__`), as CPython does at
 /// allocation time.
 fn state_buffer(inst: &Rc<PyInstance>) -> Rc<RefCell<Vec<u8>>> {
-    thread_local! {
-        /// The state key as a `str` object, whose hash it caches (every
-        /// draw looks the state up).
-        static KEY: DictKey = DictKey(Object::from_static(STATE_KEY));
-    }
-    let found = KEY.with(|key| match inst.dict_cell().borrow().get(key) {
+    let found = match inst.slots.borrow().get(STATE_KEY) {
         Some(Object::ByteArray(b)) if b.borrow().len() == STATE_LEN => Some(b.clone()),
         _ => None,
-    });
+    };
     found.unwrap_or_else(|| store_mt(inst, &seed_from_entropy()))
 }
 
@@ -267,10 +264,7 @@ fn store_mt(inst: &Rc<PyInstance>, mt: &Mt) -> Rc<RefCell<Vec<u8>>> {
     let mut bytes = vec![0u8; STATE_LEN];
     MtBytes(&mut bytes).write(mt);
     let buf = Rc::new(RefCell::new(bytes));
-    inst.dict_cell().borrow_mut().insert(
-        DictKey(Object::from_static(STATE_KEY)),
-        Object::ByteArray(buf.clone()),
-    );
+    inst.slot_set(STATE_KEY, Object::ByteArray(buf.clone()));
     buf
 }
 

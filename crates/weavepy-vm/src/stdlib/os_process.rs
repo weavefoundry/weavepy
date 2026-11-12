@@ -475,8 +475,6 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
     // runs after `PyOS_AfterFork_Parent`. The child therefore inherits the
     // pre-fork `warnings` state (an empty `catch_warnings(record=True)` list),
     // which is what `test_fork_warns_when_non_python_thread_exists` asserts.
-    #[cfg(feature = "jit")]
-    crate::tier2::join_codegen_prewarm();
     let multithreaded = process_is_multithreaded();
     run_atfork(AtForkPhase::Before);
     // `PyOS_BeforeFork` (after the Python before-handlers): take the
@@ -673,6 +671,10 @@ pub fn process_is_multithreaded() -> bool {
     }
     if THREAD_BASELINE_SET.load(std::sync::atomic::Ordering::Acquire) {
         if let Some(now) = count_os_threads() {
+            // (The JIT's code-generation worker isn't a thread of the
+            // program's.)
+            #[cfg(feature = "jit")]
+            let now = now.saturating_sub(crate::frame_jit::background::worker_threads());
             return now > THREAD_BASELINE.load(std::sync::atomic::Ordering::Acquire);
         }
     }

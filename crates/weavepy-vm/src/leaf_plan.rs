@@ -185,6 +185,16 @@ enum Op {
         a: u8,
         b: u8,
     },
+    /// `regs[dst]` a new tuple of the first `n` (one to three) of
+    /// `regs[a]`, `regs[b]`, `regs[c]`, held by the owned scratch (see
+    /// [`new_tuple`]).
+    Tuple {
+        dst: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
     /// Exchange two registers.
     Swap {
         a: u8,
@@ -247,6 +257,8 @@ pub(crate) struct LeafPlan {
     /// reassigned), each to a different name: the buffered stores share
     /// one receiver and each is the latest to its attribute.
     unique_stores: bool,
+    /// The plan calls something (a `Call` operation).
+    calls: bool,
     /// Evaluations so far, toward compiling the plan (see [`jit`]).
     #[cfg(feature = "jit")]
     runs: std::sync::atomic::AtomicU32,
@@ -528,6 +540,23 @@ impl Builder<'_> {
                 let dst = self.push_new()?;
                 self.ops.push(Op::Subscr { dst, a, b });
             }
+            // (`return (x, 1)`, a key function's pair: the items are read
+            // before the tuple's register, their lowest, is written.)
+            OpCode::BuildTuple if (1..=3).contains(&arg) => {
+                let n = arg as usize;
+                let at = self.stack.len().checked_sub(n)?;
+                let items: Vec<Opnd> = self.stack[at..].to_vec();
+                self.stack.truncate(at);
+                let dst = self.push_new()?;
+                let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
+                self.ops.push(Op::Tuple {
+                    dst,
+                    a: item(0),
+                    b: item(1),
+                    c: item(2),
+                    n: n as u8,
+                });
+            }
             OpCode::CopyTop => {
                 let n = (arg as usize).max(1);
                 let depth = self.stack.len();
@@ -711,7 +740,9 @@ impl Builder<'_> {
                 _ => return None,
             }
         }
+        let calls = self.ops.iter().any(|op| matches!(op, Op::Call { .. }));
         Some(LeafPlan {
+            calls,
             ops: self.ops.into_boxed_slice(),
             consts: self.consts.into_boxed_slice(),
             nargs: u8::try_from(crate::leaf_arity(self.code)).ok()?,
@@ -1056,10 +1087,16 @@ impl Interpreter {
         if args.len() != nargs {
             return None;
         }
-        // A warm plan runs as native code (a getter's or constructor's
-        // evaluation stays here).
+        // A warm plan runs as native code (a getter's evaluation stays
+        // here). A constructor's that calls something runs as any effect
+        // leaf's: its stores are buffered and land at the end, so a decline
+        // leaves the fresh instance untouched (the caller discards it
+        // anyway), and a read of a buffered field answers through the
+        // general read. One that only computes and stores runs here, where
+        // its stores land at once (buffering them costs more than the
+        // native code saves).
         #[cfg(feature = "jit")]
-        if !GETTER && !FRESH {
+        if !GETTER && (!FRESH || plan.calls) {
             if let Some(r) = jit::run::<EFFECT>(self, code, ext, plan, f, args, nest) {
                 return r;
             }
@@ -1136,6 +1173,9 @@ impl Interpreter {
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
                 Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
                 Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
+                Op::Tuple { dst, a, b, c, n } => {
+                    set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
+                }
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
                     set!(a, y);
@@ -1503,6 +1543,25 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
 /// the core loop's and held by the owned scratch. An allocation that would
 /// trigger a collection is left to the core loop.
 #[inline(always)]
+/// A tuple of the first `n` (one to three) of `items`, held by `owned`.
+/// (Tuples are never collector-tracked at build time, as the core loop's
+/// `BUILD_TUPLE` arm builds them.)
+fn new_tuple(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
+    if crate::stdlib::tracemalloc_real::is_tracking()
+        || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+    {
+        return None;
+    }
+    let [a, b, c] = items;
+    let t = match n {
+        1 => Object::new_tuple_array([to_object(a)?]),
+        2 => Object::new_tuple_array([to_object(a)?, to_object(b)?]),
+        3 => Object::new_tuple_array([to_object(a)?, to_object(b)?, to_object(c)?]),
+        _ => return None,
+    };
+    owned.own(t)
+}
+
 fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {
     if crate::stdlib::tracemalloc_real::is_tracking()
         || crate::stdlib::testinternalcapi_mod::reftrace_print_active()

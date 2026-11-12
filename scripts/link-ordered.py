@@ -69,11 +69,31 @@ def defined(inputs):
     return names
 
 
+def note(args, text):
+    """Record why the `weavepy` link was or wasn't ordered, next to its
+    output (`<output>.order-note`), for CI to print."""
+    try:
+        output = args[args.index("-o") + 1]
+        with open(output + ".order-note", "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except (ValueError, IndexError, OSError):
+        pass
+
+
 def remap(args):
+    flat = list(args)
     # (A link long enough for rustc to pass a response file is left alone.)
     if any(a.startswith("@") for a in args):
+        expanded = []
+        for a in args:
+            if a.startswith("@") and os.path.isfile(a[1:]):
+                with open(a[1:], encoding="utf-8", errors="replace") as f:
+                    expanded.extend(line.strip().strip('"') for line in f)
+            else:
+                expanded.append(a)
+        if any("weavepy.order" in a for a in expanded):
+            note(expanded, "skipped: response file")
         return None
-    flat = list(args)
     for i, arg in enumerate(flat):
         for prefix in ("-Wl,--symbol-ordering-file=", "-Wl,-order_file,"):
             if arg.startswith(prefix):
@@ -86,13 +106,16 @@ def remap(args):
         return None
     if prefix.startswith("-Wl,--") and not any(a.startswith("-fuse-ld=lld") for a in flat):
         # Only lld takes `--symbol-ordering-file` (GNU ld rejects it).
+        note(flat, "skipped: not linking with lld: " + " ".join(a for a in flat if a.startswith("-fuse-ld") or a.startswith("-B")))
         return [a for a in flat if a != arg and a != "-Wl,--no-warn-symbol-ordering"]
     output = flat[flat.index("-o") + 1] if "-o" in flat else None
     if output is None or not os.path.isfile(order_path):
+        note(flat, "skipped: no output or order file")
         return None
     inputs = [a for a in flat if a.endswith((".o", ".rlib", ".a")) and os.path.isfile(a)]
     names = defined(inputs)
     if not names:
+        note(flat, "skipped: no symbols from %d inputs" % len(inputs))
         return None
     ordered = []
     with open(order_path, encoding="utf-8") as f:
@@ -103,6 +126,7 @@ def remap(args):
                 if name is not None:
                     ordered.append(name)
     ordered = list(dict.fromkeys(ordered))
+    note(flat, "ordered %d symbols" % len(ordered))
     mapped = output + ".order"
     with open(mapped, "w", encoding="utf-8") as f:
         f.write("".join(name + "\n" for name in ordered))
@@ -114,7 +138,8 @@ def main():
     args = sys.argv[1:]
     try:
         remapped = remap(args)
-    except Exception:  # noqa: BLE001 - linking must not depend on this
+    except Exception as e:  # noqa: BLE001 - linking must not depend on this
+        note(list(args), "skipped: %r" % e)
         remapped = None
     os.execvp(CC, [CC] + (remapped if remapped is not None else args))
 

@@ -656,7 +656,7 @@ fn normalize_module(filename: &Object) -> Object {
     if s.is_empty() {
         Object::from_static("<unknown>")
     } else if let Some(stem) = s.strip_suffix(".py") {
-        Object::from_str(stem.to_owned())
+        Object::from_str(stem)
     } else {
         filename.clone()
     }
@@ -878,7 +878,7 @@ fn bless_my_loader(mg: &Rc<RefCell<DictData>>) -> Result<Option<Object>, Runtime
             .deprecation_warning
             .clone();
         warn_with_context(
-            Object::from_str(msg.to_owned()),
+            Object::from_str(msg),
             Object::Type(cls),
             1,
             Object::None,

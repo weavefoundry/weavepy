@@ -112,7 +112,7 @@ fn set_system_error(msg: &str) {
                 .system_error
                 .clone(),
         ),
-        Object::from_str(msg.to_owned()),
+        Object::from_str(msg),
     );
 }
 
@@ -173,7 +173,7 @@ pub unsafe extern "C" fn PyType_GetModule(ty: *mut PyObject) -> *mut PyObject {
                     .system_error
                     .clone(),
             ),
-            Object::from_str("PyType_GetModule: type_getmodule".to_owned()),
+            Object::from_str("PyType_GetModule: type_getmodule"),
         );
     }
     module

@@ -736,7 +736,7 @@ fn imp_is_frozen(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `test_failure` asserts both).
 fn no_such_frozen_object(name: &str) -> RuntimeError {
     let err = import_error(format!("No such frozen object named '{name}'"));
-    crate::error::set_exception_attr(&err, "name", Object::from_str(name.to_owned()));
+    crate::error::set_exception_attr(&err, "name", Object::from_str(name));
     err
 }
 

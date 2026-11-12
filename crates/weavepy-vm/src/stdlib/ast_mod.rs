@@ -21,7 +21,13 @@
 //! the bridge value-based (rather than re-`eval`-ing a dumped string)
 //! makes arbitrary string/bytes literals and source locations round-trip
 //! losslessly.
+//!
+//! `compile(..., PyCF_ONLY_AST)` skips the spec while the `ast` module and
+//! its node classes are as they were defined: [`parse_with`] then builds
+//! the instances that rebuilding would make, in the same attribute order
+//! (see [`Direct`]).
 
+use crate::fasthash::FxHashMap;
 use crate::shared_value::SharedStr;
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -97,6 +103,22 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 
 /// `_ast.parse(source, filename='<unknown>', mode='exec')` → spec tree.
 pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
+    parse_into(args, None)
+}
+
+/// [`parse`], building the node instances themselves when `direct` is
+/// given (see [`Direct`]): the tree, and the builder state, whose
+/// [`Direct::failed`] means the tree is to be discarded.
+pub(crate) fn parse_with(
+    args: &[Object],
+    direct: Direct,
+) -> (Result<Object, RuntimeError>, Direct) {
+    let direct = RefCell::new(direct);
+    let result = parse_into(args, Some(&direct));
+    (result, direct.into_inner())
+}
+
+fn parse_into(args: &[Object], direct: Option<&RefCell<Direct>>) -> Result<Object, RuntimeError> {
     let source = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
         Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
@@ -123,15 +145,16 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
             tc_stmts: std::collections::HashMap::default(),
             tc_args: std::collections::HashMap::default(),
             tc_ignores: Vec::new(),
+            direct,
         };
-        let spec = node_noloc(
+        let spec = b.node_noloc(
             "FunctionType",
             vec![
                 ("argtypes", list_of(&argtypes, |e| b.expr(e))),
                 ("returns", b.expr(&returns)),
             ],
         );
-        fix_contexts(&spec);
+        b.fix_contexts(&spec);
         return Ok(spec);
     }
     // PyCF_TYPE_COMMENTS (`ast.parse(..., type_comments=True)`): the
@@ -173,30 +196,67 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
         tc_stmts,
         tc_args,
         tc_ignores,
+        direct,
     };
     let spec = b.module(&module, &mode);
-    fix_contexts(&spec);
+    b.fix_contexts(&spec);
     Ok(spec)
 }
 
-/// A field of a spec-node dict, by key.
+/// A field of a node (a spec dict or a built instance), by key.
 fn spec_field(node: &Object, key: &'static str) -> Option<Object> {
     match node {
         Object::Dict(d) => d.borrow().get(&DictKey(Object::from_static(key))).cloned(),
+        Object::Instance(inst) => inst.attr_get_str(key),
         _ => None,
     }
 }
 
-/// The `_type` tag of a spec-node dict.
-fn spec_type(node: &Object) -> Option<SharedStr> {
-    match spec_field(node, "_type") {
-        Some(Object::Str(s)) => Some(s),
-        _ => None,
+/// Replace a field of a node.
+fn set_field(node: &Object, key: &'static str, value: Object) {
+    match node {
+        Object::Dict(d) => {
+            d.borrow_mut()
+                .insert(DictKey(Object::from_static(key)), value);
+        }
+        Object::Instance(inst) => {
+            if let Object::Str(key) = crate::stdlib::sys::intern_name(key) {
+                drop(store(inst, &key, value));
+            }
+        }
+        _ => {}
     }
 }
 
-/// The string payload of a `Constant` spec node (`None` for any other
-/// node shape or a non-str constant).
+/// A node's type name: a spec dict's `_type`, or a built node's class.
+enum NodeType {
+    Spec(SharedStr),
+    Class(Rc<crate::types::TypeObject>),
+}
+
+impl std::ops::Deref for NodeType {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            NodeType::Spec(name) => name,
+            NodeType::Class(cls) => &cls.name,
+        }
+    }
+}
+
+fn spec_type(node: &Object) -> Option<NodeType> {
+    match node {
+        Object::Instance(inst) => Some(NodeType::Class(inst.cls())),
+        _ => match spec_field(node, "_type") {
+            Some(Object::Str(s)) => Some(NodeType::Spec(s)),
+            _ => None,
+        },
+    }
+}
+
+/// The string payload of a `Constant` node (`None` for any other node
+/// shape or a non-str constant).
 fn const_str_of(node: &Object) -> Option<SharedStr> {
     if !matches!(spec_type(node).as_deref(), Some("Constant")) {
         return None;
@@ -207,98 +267,105 @@ fn const_str_of(node: &Object) -> Option<SharedStr> {
     }
 }
 
-/// Stamp `ctx` onto an expression in a store/del position, recursing
-/// through tuple/list/starred targets (CPython's `set_context`).
-/// `Attribute`/`Subscript` only flip their own `ctx`; their
-/// `.value`/`.slice` stay `Load`.
-fn set_ctx(node: &Object, ctx: &'static str) {
-    let Some(ty) = spec_type(node) else { return };
-    if !matches!(
-        &*ty,
-        "Name" | "Attribute" | "Subscript" | "Starred" | "List" | "Tuple"
-    ) {
-        return;
-    }
-    if let Object::Dict(d) = node {
-        d.borrow_mut()
-            .insert(DictKey(Object::from_static("ctx")), singleton(ctx));
-    }
-    match &*ty {
-        "List" | "Tuple" => {
-            if let Some(Object::List(elts)) = spec_field(node, "elts") {
-                let elts = elts.borrow().clone();
-                for elt in &elts {
-                    set_ctx(elt, ctx);
+impl Builder<'_> {
+    /// Stamp `ctx` onto an expression in a store/del position, recursing
+    /// through tuple/list/starred targets (CPython's `set_context`).
+    /// `Attribute`/`Subscript` only flip their own `ctx`; their
+    /// `.value`/`.slice` stay `Load`.
+    fn set_ctx(&self, node: &Object, ctx: &'static str) {
+        let Some(ty) = spec_type(node) else { return };
+        if !matches!(
+            &*ty,
+            "Name" | "Attribute" | "Subscript" | "Starred" | "List" | "Tuple"
+        ) {
+            return;
+        }
+        set_field(node, "ctx", self.singleton(ctx));
+        match &*ty {
+            "List" | "Tuple" => {
+                if let Some(Object::List(elts)) = spec_field(node, "elts") {
+                    let elts = elts.borrow().clone();
+                    for elt in &elts {
+                        self.set_ctx(elt, ctx);
+                    }
                 }
             }
-        }
-        "Starred" => {
-            if let Some(v) = spec_field(node, "value") {
-                set_ctx(&v, ctx);
+            "Starred" => {
+                if let Some(v) = spec_field(node, "value") {
+                    self.set_ctx(&v, ctx);
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
-}
 
-/// The parser doesn't track expression contexts, and the [`Builder`]
-/// stamps `Load` everywhere; rewrite `ctx` to `Store`/`Del` for
-/// assignment/deletion targets so `ast.dump` matches CPython. Done here,
-/// on the spec dicts, rather than in `ast.py` — the Python tree re-walk
-/// used to dominate `ast.parse` (~3x the cost of node construction).
-fn fix_contexts(root: &Object) {
-    let mut todo: Vec<Object> = vec![root.clone()];
-    while let Some(cur) = todo.pop() {
-        match &cur {
-            Object::List(items) => todo.extend(items.borrow().iter().cloned()),
-            Object::Dict(d) => {
-                if let Some(ty) = spec_type(&cur) {
-                    match &*ty {
-                        "Assign" => {
-                            if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
-                                let ts = ts.borrow().clone();
-                                for t in &ts {
-                                    set_ctx(t, "Store");
-                                }
-                            }
-                        }
-                        "AugAssign" | "AnnAssign" | "NamedExpr" | "For" | "AsyncFor"
-                        | "comprehension" => {
-                            if let Some(t) = spec_field(&cur, "target") {
-                                set_ctx(&t, "Store");
-                            }
-                        }
-                        "Delete" => {
-                            if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
-                                let ts = ts.borrow().clone();
-                                for t in &ts {
-                                    set_ctx(t, "Del");
-                                }
-                            }
-                        }
-                        "With" | "AsyncWith" => {
-                            if let Some(Object::List(items)) = spec_field(&cur, "items") {
-                                let items = items.borrow().clone();
-                                for item in &items {
-                                    match spec_field(item, "optional_vars") {
-                                        Some(Object::None) | None => {}
-                                        Some(ov) => set_ctx(&ov, "Store"),
+    /// The parser doesn't track expression contexts, and the builder
+    /// stamps `Load` everywhere; rewrite `ctx` to `Store`/`Del` for
+    /// assignment/deletion targets so `ast.dump` matches CPython. Done
+    /// here, on the built tree, rather than in `ast.py`: the Python tree
+    /// re-walk used to dominate `ast.parse` (~3x the cost of node
+    /// construction).
+    fn fix_contexts(&self, root: &Object) {
+        let mut todo: Vec<Object> = vec![root.clone()];
+        while let Some(cur) = todo.pop() {
+            match &cur {
+                Object::List(items) => todo.extend(items.borrow().iter().cloned()),
+                Object::Dict(_) | Object::Instance(_) => {
+                    if let Some(ty) = spec_type(&cur) {
+                        match &*ty {
+                            "Assign" => {
+                                if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
+                                    let ts = ts.borrow().clone();
+                                    for t in &ts {
+                                        self.set_ctx(t, "Store");
                                     }
                                 }
                             }
+                            "AugAssign" | "AnnAssign" | "NamedExpr" | "For" | "AsyncFor"
+                            | "comprehension" => {
+                                if let Some(t) = spec_field(&cur, "target") {
+                                    self.set_ctx(&t, "Store");
+                                }
+                            }
+                            "Delete" => {
+                                if let Some(Object::List(ts)) = spec_field(&cur, "targets") {
+                                    let ts = ts.borrow().clone();
+                                    for t in &ts {
+                                        self.set_ctx(t, "Del");
+                                    }
+                                }
+                            }
+                            "With" | "AsyncWith" => {
+                                if let Some(Object::List(items)) = spec_field(&cur, "items") {
+                                    let items = items.borrow().clone();
+                                    for item in &items {
+                                        match spec_field(item, "optional_vars") {
+                                            Some(Object::None) | None => {}
+                                            Some(ov) => self.set_ctx(&ov, "Store"),
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
+                    }
+                    let nested = |v: &Object| {
+                        matches!(v, Object::Dict(_) | Object::List(_) | Object::Instance(_))
+                    };
+                    match &cur {
+                        Object::Dict(d) => {
+                            todo.extend(d.borrow().values().filter(|v| nested(v)).cloned());
+                        }
+                        Object::Instance(inst) => inst.for_each_attr(|_, v| {
+                            if nested(v) {
+                                todo.push(v.clone());
+                            }
+                        }),
                         _ => {}
                     }
                 }
-                let children: Vec<Object> = d
-                    .borrow()
-                    .values()
-                    .filter(|v| matches!(v, Object::Dict(_) | Object::List(_)))
-                    .cloned()
-                    .collect();
-                todo.extend(children);
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -353,36 +420,24 @@ struct Builder<'a> {
     tc_args: std::collections::HashMap<u32, String>,
     /// `# type: ignore<tag>` comments: (comment start offset, tag).
     tc_ignores: Vec<(u32, String)>,
+    /// Build node instances rather than spec dicts.
+    direct: Option<&'a RefCell<Direct>>,
 }
 
-/// Build a node `dict` with `_type`, the given fields, and the four
-/// location attributes derived from `span`.
-fn node(ty: &str, fields: Vec<(&str, Object)>, span: Span, lm: &LineMap) -> Object {
-    let mut d = DictData::default();
-    d.insert(DictKey(Object::from_static("_type")), Object::from_str(ty));
-    for (k, v) in fields {
-        d.insert(DictKey(Object::from_str(k)), v);
-    }
+/// The location attributes of `span`, in CPython's order.
+fn location(span: Span, lm: &LineMap) -> [(&'static str, Object); 4] {
     let (lineno, col) = lm.pos(span.start.0);
     let (end_lineno, end_col) = lm.pos(span.end.0);
-    d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
-    d.insert(DictKey(Object::from_static("col_offset")), Object::Int(col));
-    d.insert(
-        DictKey(Object::from_static("end_lineno")),
-        Object::Int(end_lineno),
-    );
-    d.insert(
-        DictKey(Object::from_static("end_col_offset")),
-        Object::Int(end_col),
-    );
-    Object::Dict(Rc::new(RefCell::new(d)))
+    [
+        ("lineno", Object::Int(lineno)),
+        ("col_offset", Object::Int(col)),
+        ("end_lineno", Object::Int(end_lineno)),
+        ("end_col_offset", Object::Int(end_col)),
+    ]
 }
 
-/// Build a node `dict` with no location attributes (used for the handful
-/// of CPython nodes that carry no positions: `arguments`, `comprehension`,
-/// `keyword`*, `alias`*, `withitem`, `match_case`). (* some do carry
-/// positions in 3.13; WeavePy lacks spans for them, so we omit.)
-fn node_noloc(ty: &str, fields: Vec<(&str, Object)>) -> Object {
+/// A spec `dict`: `_type`, then the fields in order.
+fn spec_dict<'f>(ty: &str, fields: impl Iterator<Item = (&'f str, Object)>) -> Object {
     let mut d = DictData::default();
     d.insert(DictKey(Object::from_static("_type")), Object::from_str(ty));
     for (k, v) in fields {
@@ -391,9 +446,253 @@ fn node_noloc(ty: &str, fields: Vec<(&str, Object)>) -> Object {
     Object::Dict(Rc::new(RefCell::new(d)))
 }
 
-/// A bare singleton node (operators / contexts): `Add()`, `Load()`, …
-fn singleton(ty: &str) -> Object {
-    node_noloc(ty, vec![])
+/// Node classes the frozen `ast` builder would instantiate with nothing
+/// observable in between: `cls.__new__` is `AST.__new__` (so
+/// `object.__new__`), each `setattr` is the generic store into the
+/// instance dictionary, and no finalizer can run. [`crate::stdlib::
+/// ast_build::direct`] establishes the module-level half; the classes
+/// are checked here as the parse first reaches each one.
+pub(crate) struct Direct {
+    /// `_NODE_TYPES`.
+    registry: Rc<RefCell<DictData>>,
+    /// `AST.__dict__['__new__']` as the module defined it.
+    new: Object,
+    /// This parse's classes by the address and length of their name's
+    /// text (the builder's names are literals): indices into `classes`.
+    index: FxHashMap<(usize, usize), Option<usize>>,
+    classes: Vec<(Rc<crate::types::TypeObject>, Checked)>,
+    failed: bool,
+}
+
+/// A class's checks, by the attribute version they held at (versions are
+/// never reused, so a class changed since has another), kept between
+/// parses without keeping the classes.
+#[derive(Default)]
+struct CheckedClasses(FxHashMap<u64, Checked>);
+
+thread_local! {
+    static CHECKED: std::cell::RefCell<CheckedClasses> = std::cell::RefCell::default();
+}
+
+struct Checked {
+    version: u64,
+    /// The `AST.__new__` checked against.
+    new: Object,
+    /// Whether instances can be built directly.
+    ok: bool,
+    /// Whether the class's construction plan proved `object.__new__(cls)`
+    /// the plain allocation.
+    plain: bool,
+    /// Attribute names checked, as text address and length, with the
+    /// interned key when a store of it is the plain dictionary store.
+    names: Vec<(usize, usize, Option<SharedStr>)>,
+}
+
+impl Direct {
+    pub(crate) fn new(registry: Rc<RefCell<DictData>>, new: Object) -> Self {
+        Self {
+            registry,
+            new,
+            index: FxHashMap::default(),
+            classes: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// Whether some node could not be built directly.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn class(&mut self, ty: &str) -> Option<usize> {
+        let at = (ty.as_ptr() as usize, ty.len());
+        if let Some(&class) = self.index.get(&at) {
+            return class;
+        }
+        let class = self.lookup(ty);
+        self.index.insert(at, class);
+        class
+    }
+
+    /// The registry's class named `ty`, checked.
+    fn lookup(&mut self, ty: &str) -> Option<usize> {
+        let probe = crate::object::LeafNameProbe::new(ty, crate::object::py_str_hash(ty));
+        let cls = {
+            let registry = self.registry.borrow();
+            let value = registry.get(&probe);
+            if probe.saw_exotic() {
+                return None;
+            }
+            match value {
+                Some(Object::Type(cls)) => cls.clone(),
+                _ => return None,
+            }
+        };
+        // (A metaclass assignment leaves the version.)
+        if !cls.metaclass_is_type() {
+            return None;
+        }
+        if let Some(at) = self.classes.iter().position(|(c, _)| Rc::ptr_eq(c, &cls)) {
+            return self.classes[at].1.ok.then_some(at);
+        }
+        let version = cls.attr_version.get();
+        let cached = CHECKED
+            .try_with(|c| c.try_borrow_mut().ok()?.0.remove(&version))
+            .ok()
+            .flatten()
+            .filter(|checked| checked.new.is_same(&self.new));
+        let checked = cached.unwrap_or_else(|| {
+            let ok = Self::eligible(&cls, &self.new);
+            // Memoize the plan `object.__new__` consults, as a call of
+            // the class would have.
+            let plain = ok
+                && crate::vm_singletons::current_interpreter_ptr().is_some_and(|vm| {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    unsafe { &*vm }.instance_plan(&cls).object_new_plain
+                });
+            Checked {
+                version,
+                new: self.new.clone(),
+                ok,
+                plain,
+                names: Vec::new(),
+            }
+        });
+        let ok = checked.ok;
+        self.classes.push((cls, checked));
+        ok.then_some(self.classes.len() - 1)
+    }
+
+    fn eligible(cls: &crate::types::TypeObject, new: &Object) -> bool {
+        let types = crate::builtin_types::builtin_types();
+        !cls.flags.is_builtin
+            && !cls.forbids_dict
+            && cls.native_kind.get() == 0
+            && cls.c_ext_ptr.get() == 0
+            && !cls.is_subclass_of(&types.base_exception)
+            && cls.setattr_is_default()
+            && cls
+                .lookup("__new__")
+                .is_some_and(|found| found.is_same(new))
+            && cls.lookup("__del__").is_none()
+    }
+
+    /// The interned key for storing `name` on `class`'s instances, when
+    /// the store is the plain dictionary store (no data descriptor).
+    fn key(&mut self, class: usize, name: &str) -> Option<SharedStr> {
+        let at = (name.as_ptr() as usize, name.len());
+        let (cls, class) = &mut self.classes[class];
+        if let Some((_, _, key)) = class.names.iter().find(|n| (n.0, n.1) == at) {
+            return key.clone();
+        }
+        let plain = !matches!(name, "__class__" | "__dict__")
+            && matches!(
+                cls.lookup(name),
+                None | Some(
+                    Object::None
+                        | Object::Bool(_)
+                        | Object::Int(_)
+                        | Object::Str(_)
+                        | Object::Tuple(_)
+                )
+            );
+        let key = match plain.then(|| crate::stdlib::sys::intern_name(name)) {
+            Some(Object::Str(key)) => Some(key),
+            _ => None,
+        };
+        class.names.push((at.0, at.1, key.clone()));
+        key
+    }
+
+    fn node<'f>(&mut self, ty: &str, fields: impl Iterator<Item = (&'f str, Object)>) -> Object {
+        if self.failed {
+            return Object::None;
+        }
+        let built = self.class(ty).and_then(|class| {
+            let (cls, Checked { plain, .. }) = &self.classes[class];
+            let node = if *plain {
+                crate::builtin_types::plain_instance(cls.clone())
+            } else {
+                crate::builtin_types::object_new(&[Object::Type(cls.clone())]).ok()?
+            };
+            let Object::Instance(inst) = &node else {
+                return None;
+            };
+            for (name, value) in fields {
+                let key = self.key(class, name)?;
+                drop(store(inst, &key, value));
+            }
+            Some(node)
+        });
+        built.unwrap_or_else(|| {
+            self.failed = true;
+            Object::None
+        })
+    }
+}
+
+impl Drop for Direct {
+    fn drop(&mut self) {
+        let classes = std::mem::take(&mut self.classes);
+        // (Not while a nested parse, or the thread's teardown, holds it.)
+        let _ = CHECKED.try_with(|c| {
+            if let Ok(mut c) = c.try_borrow_mut() {
+                // Versions of changed classes never return: bound them.
+                if c.0.len() > 1024 {
+                    c.0.clear();
+                }
+                for (_, checked) in classes {
+                    c.0.insert(checked.version, checked);
+                }
+            }
+        });
+    }
+}
+
+/// The generic attribute store of a fresh node: the displaced value.
+fn store(inst: &crate::types::PyInstance, key: &SharedStr, value: Object) -> Option<Object> {
+    let value = match inst.split_store(key, value) {
+        Ok(old) => return old,
+        Err(value) => value,
+    };
+    let mut dict = inst.dict_cell().borrow_mut();
+    let dict = &mut *dict;
+    let dict = if value.is_gc_atomic() {
+        dict.map_mut_atomic_store()
+    } else {
+        &mut **dict
+    };
+    dict.insert(DictKey(Object::Str(key.clone())), value)
+}
+
+impl Builder<'_> {
+    /// A node with `_type`, the given fields, and the four location
+    /// attributes derived from `span`.
+    fn node(&self, ty: &str, fields: Vec<(&str, Object)>, span: Span, lm: &LineMap) -> Object {
+        let fields = fields.into_iter().chain(location(span, lm));
+        match self.direct {
+            Some(direct) => direct.borrow_mut().node(ty, fields),
+            None => spec_dict(ty, fields),
+        }
+    }
+
+    /// A node with no location attributes (used for the handful of
+    /// CPython nodes that carry no positions: `arguments`,
+    /// `comprehension`, `keyword`*, `alias`*, `withitem`, `match_case`).
+    /// (* some do carry positions in 3.13; WeavePy lacks spans for them,
+    /// so we omit.)
+    fn node_noloc(&self, ty: &str, fields: Vec<(&str, Object)>) -> Object {
+        match self.direct {
+            Some(direct) => direct.borrow_mut().node(ty, fields.into_iter()),
+            None => spec_dict(ty, fields.into_iter()),
+        }
+    }
+
+    /// A bare singleton node (operators / contexts): `Add()`, `Load()`, …
+    fn singleton(&self, ty: &str) -> Object {
+        self.node_noloc(ty, vec![])
+    }
 }
 
 /// An ASDL `identifier`: pegen's `_PyPegen_new_identifier` interns it,
@@ -437,18 +736,18 @@ impl Builder<'_> {
                 past::StmtKind::Expr(e) => Some(self.expr(e)),
                 _ => None,
             });
-            return node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))]);
+            return self.node_noloc("Expression", vec![("body", inner.unwrap_or(Object::None))]);
         }
         let body = list_of(&m.body, |s| self.stmt(s));
         match mode {
-            "single" => node_noloc("Interactive", vec![("body", body)]),
+            "single" => self.node_noloc("Interactive", vec![("body", body)]),
             _ => {
                 let ignores = self
                     .tc_ignores
                     .iter()
                     .map(|(off, tag)| {
                         let (lineno, _) = self.lm.pos(*off);
-                        node_noloc(
+                        self.node_noloc(
                             "TypeIgnore",
                             vec![
                                 ("lineno", Object::Int(lineno)),
@@ -457,7 +756,7 @@ impl Builder<'_> {
                         )
                     })
                     .collect();
-                node_noloc(
+                self.node_noloc(
                     "Module",
                     vec![("body", body), ("type_ignores", Object::new_list(ignores))],
                 )
@@ -476,7 +775,7 @@ impl Builder<'_> {
                 decorator_list,
                 returns,
                 type_params,
-            } => node(
+            } => self.node(
                 "FunctionDef",
                 vec![
                     ("name", ident(name)),
@@ -500,7 +799,7 @@ impl Builder<'_> {
                 decorator_list,
                 returns,
                 type_params,
-            } => node(
+            } => self.node(
                 "AsyncFunctionDef",
                 vec![
                     ("name", ident(name)),
@@ -524,7 +823,7 @@ impl Builder<'_> {
                 body,
                 decorator_list,
                 type_params,
-            } => node(
+            } => self.node(
                 "ClassDef",
                 vec![
                     ("name", ident(name)),
@@ -542,14 +841,14 @@ impl Builder<'_> {
                 name_span,
                 type_params,
                 value,
-            } => node(
+            } => self.node(
                 "TypeAlias",
                 vec![
                     (
                         "name",
-                        node(
+                        self.node(
                             "Name",
-                            vec![("id", ident(name)), ("ctx", singleton("Store"))],
+                            vec![("id", ident(name)), ("ctx", self.singleton("Store"))],
                             *name_span,
                             self.lm,
                         ),
@@ -560,13 +859,13 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::Return(value) => node(
+            S::Return(value) => self.node(
                 "Return",
                 vec![("value", self.opt_expr(value.as_ref()))],
                 sp,
                 self.lm,
             ),
-            S::Assign { targets, value } => node(
+            S::Assign { targets, value } => self.node(
                 "Assign",
                 vec![
                     ("targets", list_of(targets, |x| self.expr(x))),
@@ -576,11 +875,11 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::AugAssign { target, op, value } => node(
+            S::AugAssign { target, op, value } => self.node(
                 "AugAssign",
                 vec![
                     ("target", self.expr(target)),
-                    ("op", singleton(op.as_str())),
+                    ("op", self.singleton(op.as_str())),
                     ("value", self.expr(value)),
                 ],
                 sp,
@@ -591,7 +890,7 @@ impl Builder<'_> {
                 annotation,
                 value,
                 simple,
-            } => node(
+            } => self.node(
                 "AnnAssign",
                 vec![
                     ("target", self.expr(target)),
@@ -602,7 +901,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::If { test, body, orelse } => node(
+            S::If { test, body, orelse } => self.node(
                 "If",
                 vec![
                     ("test", self.expr(test)),
@@ -612,7 +911,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::While { test, body, orelse } => node(
+            S::While { test, body, orelse } => self.node(
                 "While",
                 vec![
                     ("test", self.expr(test)),
@@ -627,7 +926,7 @@ impl Builder<'_> {
                 iter,
                 body,
                 orelse,
-            } => node(
+            } => self.node(
                 "For",
                 vec![
                     ("target", self.expr(target)),
@@ -644,7 +943,7 @@ impl Builder<'_> {
                 iter,
                 body,
                 orelse,
-            } => node(
+            } => self.node(
                 "AsyncFor",
                 vec![
                     ("target", self.expr(target)),
@@ -665,7 +964,7 @@ impl Builder<'_> {
                 // CPython models `try/except*` as a distinct `TryStar`
                 // node; WeavePy carries the star flag on each handler.
                 let is_star = handlers.iter().any(|h| h.is_star);
-                node(
+                self.node(
                     if is_star { "TryStar" } else { "Try" },
                     vec![
                         ("body", list_of(body, |x| self.stmt(x))),
@@ -677,7 +976,7 @@ impl Builder<'_> {
                     self.lm,
                 )
             }
-            S::Raise { exc, cause } => node(
+            S::Raise { exc, cause } => self.node(
                 "Raise",
                 vec![
                     ("exc", self.opt_expr(exc.as_ref())),
@@ -686,7 +985,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::With { items, body } => node(
+            S::With { items, body } => self.node(
                 "With",
                 vec![
                     ("items", list_of(items, |i| self.withitem(i))),
@@ -696,7 +995,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::AsyncWith { items, body } => node(
+            S::AsyncWith { items, body } => self.node(
                 "AsyncWith",
                 vec![
                     ("items", list_of(items, |i| self.withitem(i))),
@@ -706,7 +1005,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::Import(aliases) => node(
+            S::Import(aliases) => self.node(
                 "Import",
                 vec![("names", list_of(aliases, |a| self.alias(a)))],
                 sp,
@@ -716,7 +1015,7 @@ impl Builder<'_> {
                 module,
                 names,
                 level,
-            } => node(
+            } => self.node(
                 "ImportFrom",
                 vec![
                     ("module", opt_ident(module.as_deref())),
@@ -726,19 +1025,19 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::Global(names) => node(
+            S::Global(names) => self.node(
                 "Global",
                 vec![("names", list_of(names, |n| ident(n)))],
                 sp,
                 self.lm,
             ),
-            S::Nonlocal(names) => node(
+            S::Nonlocal(names) => self.node(
                 "Nonlocal",
                 vec![("names", list_of(names, |n| ident(n)))],
                 sp,
                 self.lm,
             ),
-            S::Match { subject, cases } => node(
+            S::Match { subject, cases } => self.node(
                 "Match",
                 vec![
                     ("subject", self.expr(subject)),
@@ -747,17 +1046,17 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            S::Expr(e) => node("Expr", vec![("value", self.expr(e))], sp, self.lm),
-            S::Pass => node("Pass", vec![], sp, self.lm),
-            S::Break => node("Break", vec![], sp, self.lm),
-            S::Continue => node("Continue", vec![], sp, self.lm),
-            S::Delete(targets) => node(
+            S::Expr(e) => self.node("Expr", vec![("value", self.expr(e))], sp, self.lm),
+            S::Pass => self.node("Pass", vec![], sp, self.lm),
+            S::Break => self.node("Break", vec![], sp, self.lm),
+            S::Continue => self.node("Continue", vec![], sp, self.lm),
+            S::Delete(targets) => self.node(
                 "Delete",
                 vec![("targets", list_of(targets, |x| self.expr(x)))],
                 sp,
                 self.lm,
             ),
-            S::Assert { test, msg } => node(
+            S::Assert { test, msg } => self.node(
                 "Assert",
                 vec![
                     ("test", self.expr(test)),
@@ -794,40 +1093,40 @@ impl Builder<'_> {
                     }
                     _ => Object::None,
                 };
-                node(
+                self.node(
                     "Constant",
                     vec![("value", constant(c)), ("kind", kind)],
                     sp,
                     self.lm,
                 )
             }
-            E::Name(id) => node(
+            E::Name(id) => self.node(
                 "Name",
-                vec![("id", ident(id)), ("ctx", singleton("Load"))],
+                vec![("id", ident(id)), ("ctx", self.singleton("Load"))],
                 sp,
                 self.lm,
             ),
-            E::Attribute { value, attr } => node(
+            E::Attribute { value, attr } => self.node(
                 "Attribute",
                 vec![
                     ("value", self.expr(value)),
                     ("attr", ident(attr)),
-                    ("ctx", singleton("Load")),
+                    ("ctx", self.singleton("Load")),
                 ],
                 sp,
                 self.lm,
             ),
-            E::Subscript { value, slice } => node(
+            E::Subscript { value, slice } => self.node(
                 "Subscript",
                 vec![
                     ("value", self.expr(value)),
                     ("slice", self.expr(slice)),
-                    ("ctx", singleton("Load")),
+                    ("ctx", self.singleton("Load")),
                 ],
                 sp,
                 self.lm,
             ),
-            E::Slice { lower, upper, step } => node(
+            E::Slice { lower, upper, step } => self.node(
                 "Slice",
                 vec![
                     ("lower", self.opt_boxed(lower.as_deref())),
@@ -837,29 +1136,29 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::BinOp { left, op, right } => node(
+            E::BinOp { left, op, right } => self.node(
                 "BinOp",
                 vec![
                     ("left", self.expr(left)),
-                    ("op", singleton(op.as_str())),
+                    ("op", self.singleton(op.as_str())),
                     ("right", self.expr(right)),
                 ],
                 sp,
                 self.lm,
             ),
-            E::BoolOp { op, values } => node(
+            E::BoolOp { op, values } => self.node(
                 "BoolOp",
                 vec![
-                    ("op", singleton(op.as_str())),
+                    ("op", self.singleton(op.as_str())),
                     ("values", list_of(values, |x| self.expr(x))),
                 ],
                 sp,
                 self.lm,
             ),
-            E::UnaryOp { op, operand } => node(
+            E::UnaryOp { op, operand } => self.node(
                 "UnaryOp",
                 vec![
-                    ("op", singleton(op.as_str())),
+                    ("op", self.singleton(op.as_str())),
                     ("operand", self.expr(operand)),
                 ],
                 sp,
@@ -869,17 +1168,17 @@ impl Builder<'_> {
                 left,
                 ops,
                 comparators,
-            } => node(
+            } => self.node(
                 "Compare",
                 vec![
                     ("left", self.expr(left)),
-                    ("ops", list_of(ops, |o| singleton(o.as_str()))),
+                    ("ops", list_of(ops, |o| self.singleton(o.as_str()))),
                     ("comparators", list_of(comparators, |x| self.expr(x))),
                 ],
                 sp,
                 self.lm,
             ),
-            E::IfExp { test, body, orelse } => node(
+            E::IfExp { test, body, orelse } => self.node(
                 "IfExp",
                 vec![
                     ("test", self.expr(test)),
@@ -889,7 +1188,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::NamedExpr { target, value } => node(
+            E::NamedExpr { target, value } => self.node(
                 "NamedExpr",
                 vec![("target", self.expr(target)), ("value", self.expr(value))],
                 sp,
@@ -898,7 +1197,7 @@ impl Builder<'_> {
             // `TypeParamFn` is compiler-generated (PEP 695 lowering)
             // and never reaches user-visible ASTs, but render it as
             // the lambda it is shaped like just in case.
-            E::Lambda { args, body } | E::TypeParamFn { args, body } => node(
+            E::Lambda { args, body } | E::TypeParamFn { args, body } => self.node(
                 "Lambda",
                 vec![("args", self.arguments(args)), ("body", self.expr(body))],
                 sp,
@@ -908,7 +1207,7 @@ impl Builder<'_> {
                 func,
                 args,
                 keywords,
-            } => node(
+            } => self.node(
                 "Call",
                 vec![
                     ("func", self.expr(func)),
@@ -918,31 +1217,31 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::Tuple(items) => node(
+            E::Tuple(items) => self.node(
                 "Tuple",
                 vec![
                     ("elts", list_of(items, |x| self.expr(x))),
-                    ("ctx", singleton("Load")),
+                    ("ctx", self.singleton("Load")),
                 ],
                 sp,
                 self.lm,
             ),
-            E::List(items) => node(
+            E::List(items) => self.node(
                 "List",
                 vec![
                     ("elts", list_of(items, |x| self.expr(x))),
-                    ("ctx", singleton("Load")),
+                    ("ctx", self.singleton("Load")),
                 ],
                 sp,
                 self.lm,
             ),
-            E::Set(items) => node(
+            E::Set(items) => self.node(
                 "Set",
                 vec![("elts", list_of(items, |x| self.expr(x)))],
                 sp,
                 self.lm,
             ),
-            E::Dict { keys, values } => node(
+            E::Dict { keys, values } => self.node(
                 "Dict",
                 vec![
                     ("keys", list_of(keys, |k| self.opt_expr(k.as_ref()))),
@@ -951,7 +1250,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::ListComp { elt, generators } => node(
+            E::ListComp { elt, generators } => self.node(
                 "ListComp",
                 vec![
                     ("elt", self.expr(elt)),
@@ -960,7 +1259,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::SetComp { elt, generators } => node(
+            E::SetComp { elt, generators } => self.node(
                 "SetComp",
                 vec![
                     ("elt", self.expr(elt)),
@@ -973,7 +1272,7 @@ impl Builder<'_> {
                 key,
                 value,
                 generators,
-            } => node(
+            } => self.node(
                 "DictComp",
                 vec![
                     ("key", self.expr(key)),
@@ -983,7 +1282,7 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::GeneratorExp { elt, generators } => node(
+            E::GeneratorExp { elt, generators } => self.node(
                 "GeneratorExp",
                 vec![
                     ("elt", self.expr(elt)),
@@ -992,23 +1291,23 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            E::Starred(value) => node(
+            E::Starred(value) => self.node(
                 "Starred",
-                vec![("value", self.expr(value)), ("ctx", singleton("Load"))],
+                vec![("value", self.expr(value)), ("ctx", self.singleton("Load"))],
                 sp,
                 self.lm,
             ),
-            E::Yield(value) => node(
+            E::Yield(value) => self.node(
                 "Yield",
                 vec![("value", self.opt_boxed(value.as_deref()))],
                 sp,
                 self.lm,
             ),
             E::YieldFrom(value) => {
-                node("YieldFrom", vec![("value", self.expr(value))], sp, self.lm)
+                self.node("YieldFrom", vec![("value", self.expr(value))], sp, self.lm)
             }
-            E::Await(value) => node("Await", vec![("value", self.expr(value))], sp, self.lm),
-            E::JoinedStr(parts) => node(
+            E::Await(value) => self.node("Await", vec![("value", self.expr(value))], sp, self.lm),
+            E::JoinedStr(parts) => self.node(
                 "JoinedStr",
                 vec![("values", self.joinedstr_values(parts))],
                 sp,
@@ -1018,7 +1317,7 @@ impl Builder<'_> {
                 value,
                 conversion,
                 format_spec,
-            } => node(
+            } => self.node(
                 "FormattedValue",
                 vec![
                     ("value", self.expr(value)),
@@ -1031,7 +1330,7 @@ impl Builder<'_> {
             // PEP 750 t-strings (`-X lang=next`): CPython 3.14 node
             // shapes (`TemplateStr(values)`, `Interpolation(value, str,
             // conversion, format_spec)`).
-            E::TemplateStr(parts) => node(
+            E::TemplateStr(parts) => self.node(
                 "TemplateStr",
                 vec![("values", self.joinedstr_values(parts))],
                 sp,
@@ -1042,7 +1341,7 @@ impl Builder<'_> {
                 text,
                 conversion,
                 format_spec,
-            } => node(
+            } => self.node(
                 "Interpolation",
                 vec![
                     ("value", self.expr(value)),
@@ -1068,19 +1367,13 @@ impl Builder<'_> {
             let built = self.expr(p);
             if let Some(prev) = out.last() {
                 if let (Some(a), Some(b)) = (const_str_of(prev), const_str_of(&built)) {
-                    if let Object::Dict(d) = prev {
-                        let mut d = d.borrow_mut();
-                        d.insert(
-                            DictKey(Object::from_static("value")),
-                            Object::from_str(format!("{a}{b}")),
-                        );
-                        // Extend the merged constant's span to the end of
-                        // the absorbed part (compile-from-AST maps
-                        // locations back to source bytes).
-                        for key in ["end_lineno", "end_col_offset"] {
-                            if let Some(v) = spec_field(&built, key) {
-                                d.insert(DictKey(Object::from_static(key)), v);
-                            }
+                    set_field(prev, "value", Object::from_str(format!("{a}{b}")));
+                    // Extend the merged constant's span to the end of the
+                    // absorbed part (compile-from-AST maps locations back
+                    // to source bytes).
+                    for key in ["end_lineno", "end_col_offset"] {
+                        if let Some(v) = spec_field(&built, key) {
+                            set_field(prev, key, v);
                         }
                     }
                     continue;
@@ -1106,7 +1399,7 @@ impl Builder<'_> {
     }
 
     fn keyword(&self, k: &past::Keyword) -> Object {
-        node(
+        self.node(
             "keyword",
             vec![
                 ("arg", opt_ident(k.arg.as_deref())),
@@ -1141,12 +1434,12 @@ impl Builder<'_> {
                 past::TypeParamKind::TypeVarTuple => "TypeVarTuple",
                 past::TypeParamKind::ParamSpec => "ParamSpec",
             };
-            node(ty, fields, tp.span, self.lm)
+            self.node(ty, fields, tp.span, self.lm)
         })
     }
 
     fn comprehension(&self, c: &past::Comprehension) -> Object {
-        node_noloc(
+        self.node_noloc(
             "comprehension",
             vec![
                 ("target", self.expr(&c.target)),
@@ -1160,7 +1453,7 @@ impl Builder<'_> {
     fn handler(&self, h: &past::ExceptHandler) -> Object {
         // Both `except` and `except*` use the `ExceptHandler` node class;
         // the star-ness lives on the enclosing `Try`/`TryStar`.
-        node(
+        self.node(
             "ExceptHandler",
             vec![
                 ("type", self.opt_expr(h.type_.as_ref())),
@@ -1173,7 +1466,7 @@ impl Builder<'_> {
     }
 
     fn withitem(&self, w: &past::WithItem) -> Object {
-        node_noloc(
+        self.node_noloc(
             "withitem",
             vec![
                 ("context_expr", self.expr(&w.context_expr)),
@@ -1183,7 +1476,7 @@ impl Builder<'_> {
     }
 
     fn match_case(&self, c: &past::MatchCase) -> Object {
-        node_noloc(
+        self.node_noloc(
             "match_case",
             vec![
                 ("pattern", self.pattern(&c.pattern)),
@@ -1197,9 +1490,11 @@ impl Builder<'_> {
         use past::PatternKind as P;
         let sp = p.span;
         match &p.kind {
-            P::Value(e) => node("MatchValue", vec![("value", self.expr(e))], sp, self.lm),
-            P::Singleton(c) => node("MatchSingleton", vec![("value", constant(c))], sp, self.lm),
-            P::Capture(name) => node(
+            P::Value(e) => self.node("MatchValue", vec![("value", self.expr(e))], sp, self.lm),
+            P::Singleton(c) => {
+                self.node("MatchSingleton", vec![("value", constant(c))], sp, self.lm)
+            }
+            P::Capture(name) => self.node(
                 "MatchAs",
                 vec![
                     ("pattern", Object::None),
@@ -1208,13 +1503,13 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            P::Sequence(items) => node(
+            P::Sequence(items) => self.node(
                 "MatchSequence",
                 vec![("patterns", list_of(items, |x| self.pattern(x)))],
                 sp,
                 self.lm,
             ),
-            P::Star(name) => node(
+            P::Star(name) => self.node(
                 "MatchStar",
                 vec![("name", opt_ident(name.as_deref()))],
                 sp,
@@ -1224,7 +1519,7 @@ impl Builder<'_> {
                 keys,
                 patterns,
                 rest,
-            } => node(
+            } => self.node(
                 "MatchMapping",
                 vec![
                     ("keys", list_of(keys, |k| self.expr(k))),
@@ -1244,7 +1539,7 @@ impl Builder<'_> {
                 cls,
                 positionals,
                 keywords,
-            } => node(
+            } => self.node(
                 "MatchClass",
                 vec![
                     ("cls", self.expr(cls)),
@@ -1255,13 +1550,13 @@ impl Builder<'_> {
                 sp,
                 self.lm,
             ),
-            P::Or(items) => node(
+            P::Or(items) => self.node(
                 "MatchOr",
                 vec![("patterns", list_of(items, |x| self.pattern(x)))],
                 sp,
                 self.lm,
             ),
-            P::As { pattern, name } => node(
+            P::As { pattern, name } => self.node(
                 "MatchAs",
                 vec![("pattern", self.pattern(pattern)), ("name", ident(name))],
                 sp,
@@ -1271,7 +1566,7 @@ impl Builder<'_> {
     }
 
     fn arguments(&self, a: &past::Arguments) -> Object {
-        node_noloc(
+        self.node_noloc(
             "arguments",
             vec![
                 ("posonlyargs", list_of(&a.posonlyargs, |x| self.arg(x))),
@@ -1294,7 +1589,7 @@ impl Builder<'_> {
             None => Object::None,
         };
         let type_comment = self.arg_type_comment(a.span);
-        node(
+        self.node(
             "arg",
             vec![
                 ("arg", ident(&a.name)),
@@ -1314,7 +1609,7 @@ impl Builder<'_> {
     }
 
     fn alias(&self, a: &past::Alias) -> Object {
-        node(
+        self.node(
             "alias",
             vec![
                 ("name", ident(&a.name)),

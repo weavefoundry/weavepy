@@ -2901,22 +2901,19 @@ fn assemble_type_dict(
 ) -> DictData {
     let mut dict = DictData::default();
     if let Some(d) = doc {
-        dict.insert(
-            DictKey(Object::from_static("__doc__")),
-            Object::from_str(d.to_owned()),
-        );
+        dict.insert(DictKey(Object::from_static("__doc__")), Object::from_str(d));
     }
     dict.insert(
         DictKey(Object::from_static("__module__")),
         if let Some(idx) = qualified.rfind('.') {
-            Object::from_str(qualified[..idx].to_owned())
+            Object::from_str(&qualified[..idx])
         } else {
             Object::from_static("builtins")
         },
     );
     dict.insert(
         DictKey(Object::from_static("__qualname__")),
-        Object::from_str(bare.to_owned()),
+        Object::from_str(bare),
     );
     for entry in methods {
         dict.insert(

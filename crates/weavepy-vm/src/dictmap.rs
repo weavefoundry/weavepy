@@ -236,6 +236,66 @@ fn mix(hash: i64) -> u64 {
     (hash as u64).wrapping_mul(MIX)
 }
 
+/// Where a dict table's parts sit in it, and an entry's in an entry (byte
+/// offsets), with the slot mixing constants: compiled code's in-line
+/// first probe (see `frame_jit::DictLayout`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TableLayout {
+    pub(crate) entries_ptr: usize,
+    pub(crate) slots_ptr: usize,
+    pub(crate) slots_len: usize,
+    pub(crate) shift: usize,
+    pub(crate) bucket_size: usize,
+    pub(crate) bucket_hash: usize,
+    pub(crate) bucket_key: usize,
+    pub(crate) bucket_value: usize,
+    pub(crate) mix: u64,
+    pub(crate) ix_mask: u64,
+}
+
+/// [`TableLayout`], read off a sample table (`None` if it isn't the shape
+/// the code assumes: a vector's and a boxed slice's words told apart by
+/// their values, a 32-bit shift).
+pub(crate) fn table_layout() -> Option<TableLayout> {
+    let n = SMALL + 4;
+    let mut t: Table<Object> = Table::with_capacity(n);
+    for i in 0..n as i64 {
+        t.insert_hashed(i, DictKey(Object::Int(i)), Object::Int(i));
+    }
+    if t.slots.is_empty()
+        || t.entries.capacity() == t.entries.len() && t.entries.len() == t.slots.len()
+    {
+        return None;
+    }
+    let base = std::ptr::from_ref(&t) as usize;
+    // SAFETY: words inside the live sample.
+    let word = |off: usize| unsafe { *((base + off) as *const usize) };
+    let vec_at = std::mem::offset_of!(Table<Object>, entries);
+    let entries_ptr = (0..3)
+        .map(|k| vec_at + 8 * k)
+        .find(|&off| word(off) == t.entries.as_ptr() as usize)?;
+    let slots_at = std::mem::offset_of!(Table<Object>, slots);
+    let slots_ptr = (0..2)
+        .map(|k| slots_at + 8 * k)
+        .find(|&off| word(off) == t.slots.as_ptr() as usize)?;
+    let slots_len = (0..2)
+        .map(|k| slots_at + 8 * k)
+        .find(|&off| word(off) == t.slots.len())?;
+    (std::mem::size_of::<u32>() == std::mem::size_of_val(&t.shift)).then_some(())?;
+    Some(TableLayout {
+        entries_ptr,
+        slots_ptr,
+        slots_len,
+        shift: std::mem::offset_of!(Table<Object>, shift),
+        bucket_size: std::mem::size_of::<Bucket<Object>>(),
+        bucket_hash: std::mem::offset_of!(Bucket<Object>, hash),
+        bucket_key: std::mem::offset_of!(Bucket<Object>, key),
+        bucket_value: std::mem::offset_of!(Bucket<Object>, value),
+        mix: MIX,
+        ix_mask: IX_MASK,
+    })
+}
+
 /// The slot count for `n` entries: at most two thirds full.
 fn slots_for(n: usize) -> usize {
     (n.max(SMALL + 1) * 3 / 2 + 1).next_power_of_two()
@@ -1699,6 +1759,27 @@ impl SetMap {
                 v.insert(make(), ());
                 true
             }
+        }
+    }
+
+    /// [`Self::insert_probe`] that adds the key only when `exact` says the
+    /// probe's miss is final (asked after the probe ran): `Some(true)` it was
+    /// added, `Some(false)` an equal key was present, `None` the miss can't
+    /// be trusted and nothing changed.
+    #[inline]
+    pub fn insert_probe_if<Q: Probe + ?Sized>(
+        &mut self,
+        key: &Q,
+        exact: impl FnOnce(&Q) -> bool,
+        make: impl FnOnce() -> DictKey,
+    ) -> Option<bool> {
+        match self.0.probe_entry(key) {
+            ProbeEntry::Occupied(_) => Some(false),
+            ProbeEntry::Vacant(v) if exact(key) => {
+                v.insert(make(), ());
+                Some(true)
+            }
+            ProbeEntry::Vacant(_) => None,
         }
     }
 

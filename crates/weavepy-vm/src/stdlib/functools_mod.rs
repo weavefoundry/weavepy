@@ -1844,6 +1844,58 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
     let interp = unsafe { &mut *ptr };
     let function = &args[0];
     let globals = interp.builtins_dict();
+    // A native function with a leaf half (`operator.add`) runs that half,
+    // which declines what it can't do without the full call.
+    let fast = match function {
+        Object::Builtin(b) if !b.binds_instance => match interp.leaf_call_kind(b) {
+            Some(crate::LeafKind::Fast(f)) => Some(f),
+            _ => None,
+        },
+        _ => None,
+    };
+    let step = |interp: &mut crate::Interpreter, acc: Object, x: Object| {
+        let pair = [acc, x];
+        match fast.and_then(|f| f(&pair)) {
+            Some(r) => r,
+            None => interp.call(function, &pair, &[], &globals),
+        }
+    };
+    // A tuple's items, or a list's read by index as its iterator reads
+    // them (the function may change the list).
+    match &args[1] {
+        Object::Tuple(t) => {
+            let mut items = t.iter().cloned();
+            let mut acc = match args.get(2) {
+                Some(initial) => initial.clone(),
+                None => items.next().ok_or_else(|| {
+                    type_error("reduce() of empty iterable with no initial value")
+                })?,
+            };
+            for x in items {
+                acc = step(interp, acc, x)?;
+            }
+            return Ok(acc);
+        }
+        Object::List(l) => {
+            let item = |i: usize| l.borrow().get(i).cloned();
+            let mut i = 0;
+            let mut acc = match args.get(2) {
+                Some(initial) => initial.clone(),
+                None => {
+                    i = 1;
+                    item(0).ok_or_else(|| {
+                        type_error("reduce() of empty iterable with no initial value")
+                    })?
+                }
+            };
+            while let Some(x) = item(i) {
+                acc = step(interp, acc, x)?;
+                i += 1;
+            }
+            return Ok(acc);
+        }
+        _ => {}
+    }
     let it = match interp.make_iter(&args[1], &globals) {
         Ok(it) => it,
         Err(e) if crate::is_type_error(&e) => {
@@ -1863,7 +1915,7 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
         },
     };
     while let Some(x) = interp.iter_next(&it, &globals)? {
-        acc = interp.call(function, &[acc, x], &[], &globals)?;
+        acc = step(interp, acc, x)?;
     }
     Ok(acc)
 }

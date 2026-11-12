@@ -18,21 +18,17 @@
 //! natively too once the callee's own plan is compiled).
 
 use super::{
-    binary, compare, is_same, new_container, norm, plan_store, subscr, truth, unary, LeafPlan,
-    LeafRet, Op, Owned, Pending, NEST, V,
+    binary, compare, is_same, new_container, new_tuple, norm, plan_store, subscr, truth, unary,
+    LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
 use crate::{CodeConstObjects, Interpreter};
-use cranelift_codegen::ir::{
-    condcodes::{FloatCC, IntCC},
-    types, AbiParam, Block, InstBuilder, MemFlags, SigRef, Signature, StackSlotData, StackSlotKind,
-    Value,
+use weavepy_codegen::ir::condcodes::{FloatCC, IntCC};
+use weavepy_codegen::{
+    types, AbiParam, Block, Function, FunctionBuilder, MemFlags, SigRef, Signature, StackSlotData,
+    StackSlotKind, Value, Variable,
 };
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
 use weavepy_compiler::{BinOpKind, CodeObject, CompareKind};
 
 /// Evaluations of a plan (per effect mode) before it is compiled. A
@@ -482,6 +478,36 @@ unsafe extern "C" fn h_attr<const EFFECT: bool>(
     }
 }
 
+/// [`h_attr`] of `obj.__class__`: a plain instance's class (its class
+/// keeps `object`'s `__class__` and `__getattribute__`), without the
+/// general read (`other.__class__ is self.__class__` in a dataclass's
+/// `__eq__`).
+unsafe extern "C" fn h_class<const EFFECT: bool>(
+    ctx: *mut Ctx<'static>,
+    fr: *const Frame,
+    t: u64,
+    p: u64,
+    pc_name: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    if t == T_R {
+        // SAFETY: as `norm`.
+        let obj = unsafe { &*(p as *const Object) };
+        if let Object::Instance(inst) = obj {
+            let pending = EFFECT && c.pend.n > 0 && c.pend.stores_to(obj, pc_name >> 16);
+            if !pending && inst.cls_raw().class_attr_is_plain() {
+                if let Some(v) = c.owned.own(Object::Type(inst.cls())) {
+                    c.put(v);
+                    return 0;
+                }
+            }
+        }
+    }
+    // SAFETY: forwarded.
+    unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) }
+}
+
 /// [`h_attr`] through the site's [`FieldCache`]: a split field of a plain
 /// instance whose class the site has seen answers without the general
 /// read; a general read that found the instance's own field remembers it.
@@ -701,6 +727,30 @@ unsafe extern "C" fn h_new(ctx: *mut Ctx<'static>, dict: u32) -> u32 {
     }
 }
 
+/// A tuple of the first `n` of three operands (see [`new_tuple`]).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_tuple(
+    ctx: *mut Ctx<'static>,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    tc: u64,
+    pc: u64,
+    n: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    let items = [value(ta, pa), value(tb, pb), value(tc, pc)];
+    match new_tuple(&mut c.owned, items, n as u8) {
+        Some(v) => {
+            c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
 /// `a[b]` (see [`subscr`]).
 unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64, pb: u64) -> u32 {
     // SAFETY: called by native code with its context.
@@ -905,65 +955,26 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
 /// process: plans are shared between threads, and their code is never
 /// freed.
 struct Engine {
-    module: JITModule,
-    ctx: cranelift_codegen::Context,
-    fbctx: FunctionBuilderContext,
+    func: Function,
     ptr: types::Type,
-    next: u32,
 }
-
-// SAFETY: the engine is only used under its mutex.
-unsafe impl Send for Engine {}
 
 static ENGINE: std::sync::Mutex<Option<Option<Engine>>> = std::sync::Mutex::new(None);
 
 impl Engine {
-    /// Drop the function and builder contexts for empty ones (see the
-    /// frame compiler's `Engine::release`).
+    /// Drop the function for an empty one (see the frame compiler's
+    /// `Engine::release`).
     fn release(&mut self) {
-        self.ctx = self.module.make_context();
-        self.fbctx = FunctionBuilderContext::new();
+        self.func = Function::new();
     }
 
     fn new() -> Option<Engine> {
-        if !tags_match() {
+        if !tags_match() || !weavepy_codegen::SUPPORTED {
             return None;
         }
-        let mut flags = settings::builder();
-        flags.set("use_colocated_libcalls", "false").ok()?;
-        flags.set("is_pic", "false").ok()?;
-        // No mid-end optimization: a plan's lowering emits the code it
-        // wants, and the pass cost more to run than it saved.
-        // `WEAVEPY_JIT_OPT=1` turns it on.
-        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "1") {
-            "speed"
-        } else {
-            "none"
-        };
-        flags.set("opt_level", opt).ok()?;
-        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
-            flags.set("opt_level", "none").ok()?;
-            flags.set("regalloc_algorithm", "single_pass").ok()?;
-        }
-        if !cfg!(debug_assertions) && !verify() {
-            flags.set("enable_verifier", "false").ok()?;
-        }
-        let isa = cranelift_native::builder()
-            .ok()?
-            .finish(settings::Flags::new(flags))
-            .ok()?;
-        let module = JITModule::new(JITBuilder::with_isa(
-            isa,
-            cranelift_module::default_libcall_names(),
-        ));
-        let ptr = module.target_config().pointer_type();
-        let ctx = module.make_context();
         Some(Engine {
-            module,
-            ctx,
-            fbctx: FunctionBuilderContext::new(),
-            ptr,
-            next: 0,
+            func: Function::new(),
+            ptr: types::I64,
         })
     }
 }
@@ -1010,20 +1021,14 @@ fn compile_with(
     f: &Rc<PyFunction>,
     effect: bool,
 ) -> Option<Native> {
-    engine.module.clear_context(&mut engine.ctx);
+    engine.func.clear();
     let ptr = engine.ptr;
-    let sig = &mut engine.ctx.func.signature;
+    let sig = &mut engine.func.signature;
     sig.params.push(AbiParam::new(ptr));
     sig.params.push(AbiParam::new(ptr));
     sig.returns.push(AbiParam::new(types::I32));
-    let name = format!("wpplan_{}", engine.next);
-    engine.next += 1;
-    let id = engine
-        .module
-        .declare_function(&name, Linkage::Local, &engine.ctx.func.signature)
-        .ok()?;
     let lowered = {
-        let b = FunctionBuilder::new(&mut engine.ctx.func, &mut engine.fbctx);
+        let b = FunctionBuilder::new(&mut engine.func);
         let mut lower = Lower {
             b,
             effect,
@@ -1059,19 +1064,20 @@ fn compile_with(
         engine.release();
         return None;
     };
-    let defined = engine.module.define_function(id, &mut engine.ctx);
+    let mut func = std::mem::take(&mut engine.func);
+    let defined =
+        weavepy_codegen::compile(&mut func).and_then(|bytes| weavepy_codegen::install(&bytes));
     if let (Err(e), true) = (&defined, verify()) {
         eprintln!(
-            "weavepy: plan for {:?} failed to compile: {e:?}",
+            "weavepy: plan for {:?} failed to compile: {e}",
             code.qualname
         );
     }
     engine.release();
-    defined.ok()?;
-    engine.module.finalize_definitions().ok()?;
-    let func = engine.module.get_finalized_function(id);
-    // SAFETY: `func` is a finalized function with exactly the signature
-    // declared above, and the module (never dropped) keeps it alive.
+    let func = defined.ok()?;
+    // SAFETY: `func` is the entry of machine code generated for exactly
+    // the signature declared above, in the process's code arena (never
+    // freed).
     let func = unsafe { std::mem::transmute::<*const u8, NativeFn>(func) };
     Some(Native {
         func,
@@ -1200,14 +1206,12 @@ impl Lower<'_> {
     ) -> (Value, Value) {
         let f = MemFlags::trusted();
         let borrow = self.b.ins().sload32(f, inst, l.inst_slots_borrow);
-        let form = self.b.ins().uload8(types::I32, f, inst, l.inst_slots_tag);
-        let names = self.b.ins().load(self.ptr, f, inst, l.inst_slots_layout);
-        let vals = self.b.ins().load(self.ptr, f, inst, l.inst_slots_values);
+        let word = self.b.ins().load(self.ptr, f, inst, l.inst_slots);
+        let form = self.b.ins().band_imm(word, 7);
+        let names = self.b.ins().load(self.ptr, f, word, 0);
+        let vals = self.b.ins().iadd_imm(word, i64::from(l.slots_values));
         let busy = self.b.ins().icmp_imm(IntCC::SignedLessThan, borrow, 0);
-        let other = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, form, i64::from(l.slots_laid_out));
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, form, 0);
         let foreign = self.b.ins().icmp(IntCC::NotEqual, names, layout);
         let bad = self.b.ins().bor(busy, other);
         let bad = self.b.ins().bor(bad, foreign);
@@ -1927,6 +1931,27 @@ impl Lower<'_> {
                 let p = self.b.ins().load(types::I64, flags, self.ctx, 8);
                 self.set(fl, dst, t, p);
             }
+            Op::Attr { dst, src, pc, name }
+                if fl
+                    .code
+                    .names
+                    .get(usize::from(name))
+                    .is_some_and(|n| &**n == "__class__") =>
+            {
+                let (t, p) = self.get(fl, src);
+                let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
+                let addr = if effect {
+                    h_class::<true> as *const () as usize
+                } else {
+                    h_class::<false> as *const () as usize
+                };
+                let st = self.call(addr, &[self.ctx, fl.fr, t, p, pn]);
+                self.check(st);
+                let flags = MemFlags::trusted();
+                let rt = self.b.ins().load(types::I64, flags, self.ctx, 0);
+                let rp = self.b.ins().load(types::I64, flags, self.ctx, 8);
+                self.set(fl, dst, rt, rp);
+            }
             Op::Attr { dst, src, pc, name } => {
                 let (t, p) = self.get(fl, src);
                 let pn = self.u32c(u32::from(pc) | u32::from(name) << 16);
@@ -2262,6 +2287,18 @@ impl Lower<'_> {
                 let (ta, pa) = self.get(fl, a);
                 let (tb, pb) = self.get(fl, b);
                 let st = self.call(h_subscr as *const () as usize, &[self.ctx, ta, pa, tb, pb]);
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
+            Op::Tuple { dst, a, b, c, n } => {
+                let (ta, pa) = self.get(fl, a);
+                let (tb, pb) = self.get(fl, b);
+                let (tc, pc) = self.get(fl, c);
+                let nv = self.u32c(u32::from(n));
+                let st = self.call(
+                    h_tuple as *const () as usize,
+                    &[self.ctx, ta, pa, tb, pb, tc, pc, nv],
+                );
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }

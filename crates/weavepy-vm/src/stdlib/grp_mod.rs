@@ -33,11 +33,7 @@ unsafe fn group_to_object(g: *const libc::group) -> Object {
         if p.is_null() {
             Object::from_static("")
         } else {
-            Object::from_str(
-                unsafe { std::ffi::CStr::from_ptr(p) }
-                    .to_string_lossy()
-                    .into_owned(),
-            )
+            Object::from_str(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy())
         }
     }
     let mut members = Vec::new();

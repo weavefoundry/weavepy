@@ -2019,7 +2019,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
 /// class's construction allocates one: a natively served class's never
 /// tracked, any other's tracked once it could hold a non-atomic value
 /// (eagerly when its instances need finalizing).
-fn plain_instance(cls: Rc<TypeObject>) -> Object {
+pub(crate) fn plain_instance(cls: Rc<TypeObject>) -> Object {
     use crate::types::PyInstance;
     if cls.native_kind.get() != 0 {
         return Object::Instance(Rc::new(PyInstance::new(cls)));

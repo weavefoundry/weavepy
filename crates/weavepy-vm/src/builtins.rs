@@ -4231,7 +4231,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.defaults.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.defaults.clone()))
+                        Some(Object::new_tuple(f.defaults.to_vec()))
                     }
                 }
                 "__kwdefaults__" => {
@@ -4249,7 +4249,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.closure.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.closure.clone()))
+                        Some(Object::new_tuple(f.closure.to_vec()))
                     }
                 }
                 _ => None,
@@ -4333,7 +4333,7 @@ pub(crate) fn code_synthetic_attr(
     let ident = |k: usize| {
         crate::code_vm_ext(c).map(|ext| {
             ext.ident_strs.get_or_init(|| {
-                [
+                Box::new([
                     Object::from_str(&c.name),
                     Object::from_str(if c.qualname.is_empty() {
                         &c.name
@@ -4341,7 +4341,7 @@ pub(crate) fn code_synthetic_attr(
                         &c.qualname
                     }),
                     Object::from_str(&*c.filename),
-                ]
+                ])
             })[k]
                 .clone()
         })
@@ -5093,9 +5093,9 @@ fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
     // every frame's, then reads one entry): an iterator over one shared
     // immutable tuple of them.
     if let Some(ext) = crate::code_vm_ext(&c) {
-        let (ranges, all) = ext
+        let (ranges, all) = &**ext
             .positions
-            .get_or_init(|| (debug_ranges, Object::new_tuple(build())));
+            .get_or_init(|| Box::new((debug_ranges, Object::new_tuple(build()))));
         if *ranges == debug_ranges {
             let it = all.make_iter()?;
             return Ok(Object::Iter(Rc::new(RefCell::new(it))));
@@ -5627,7 +5627,15 @@ fn parse_int_string(
             (base, s)
         };
 
-    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
+    let cleaned: std::borrow::Cow<'_, str> = if digits.contains('_') {
+        digits
+            .chars()
+            .filter(|c| *c != '_')
+            .collect::<String>()
+            .into()
+    } else {
+        digits.into()
+    };
     // (The radix parsers below take a sign of their own: `int('--1')` must
     // not read as `-(-1)`.)
     if cleaned.is_empty() || cleaned.starts_with(['+', '-']) {
@@ -6845,15 +6853,22 @@ pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
     if s.is_empty() || !valid_float_underscores(s) {
         return None;
     }
-    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
-    match cleaned.to_ascii_lowercase().as_str() {
-        "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
-        "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
-        // Fresh identity per parse (CPython allocates a new float object).
-        "nan" | "+nan" => return Some(crate::object::tag_nan(f64::NAN)),
-        // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
-        "-nan" => return Some(crate::object::tag_nan(-f64::NAN)),
-        _ => {}
+    let cleaned: std::borrow::Cow<'_, str> = if s.contains('_') {
+        s.chars().filter(|&c| c != '_').collect::<String>().into()
+    } else {
+        s.into()
+    };
+    // (Only a spelling with a letter can be one of these.)
+    if cleaned.bytes().any(|b| b.is_ascii_alphabetic()) {
+        match cleaned.to_ascii_lowercase().as_str() {
+            "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
+            "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
+            // Fresh identity per parse (CPython allocates a new float object).
+            "nan" | "+nan" => return Some(crate::object::tag_nan(f64::NAN)),
+            // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
+            "-nan" => return Some(crate::object::tag_nan(-f64::NAN)),
+            _ => {}
+        }
     }
     // Reject the bare `inf`/`infinity`/`nan` tokens that Rust's parser also
     // accepts (CPython only takes the spellings handled above); everything
@@ -6873,9 +6888,9 @@ pub(crate) fn parse_float_text(raw: &str) -> Option<f64> {
 /// `float("\N{EM SPACE}3.14")` parse. Any other non-ASCII character becomes
 /// `'?'` (and truncates), which makes the subsequent parse fail with the
 /// same `ValueError` CPython raises.
-fn transform_decimal_and_space(raw: &str) -> String {
+fn transform_decimal_and_space(raw: &str) -> std::borrow::Cow<'_, str> {
     if raw.is_ascii() {
-        return raw.to_string();
+        return std::borrow::Cow::Borrowed(raw);
     }
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -6890,7 +6905,7 @@ fn transform_decimal_and_space(raw: &str) -> String {
             break;
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Decimal value (0–9) of a Unicode `Nd` (Decimal_Number) character, or
@@ -11289,8 +11304,19 @@ fn new_str_split_list(items: Vec<Object>) -> Object {
     result
 }
 
+/// `str.split`'s and `str.rsplit`'s keywords: `sep` and `maxsplit` only.
+fn split_keywords(name: &str, kwargs: &[(String, Object)]) -> Result<(), RuntimeError> {
+    match kwargs.iter().find(|(k, _)| k != "sep" && k != "maxsplit") {
+        Some((k, _)) => Err(type_error(format!(
+            "{name}() got an unexpected keyword argument '{k}'"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("split", args, 0, 2)?;
+    split_keywords("split", kwargs)?;
     let s = str_self(args)?;
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
@@ -12190,6 +12216,7 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("rsplit", args, 0, 2)?;
+    split_keywords("rsplit", kwargs)?;
     let s = str_self(args)?;
     let s = s.as_ref();
     let sep = arg_or_kw(args, 1, kwargs, "sep");
@@ -14071,6 +14098,42 @@ pub(crate) fn int_to_bytes_leaf(args: &[Object]) -> Option<Result<Object, Runtim
 
 /// `int.from_bytes(data[, byteorder])` for the exact `int` class over a
 /// `bytes` buffer.
+/// `dict.fromkeys(keys[, value])` for the exact `dict` over a list or a
+/// tuple whose keys hash and compare natively (see
+/// [`crate::object::LeafProbe`]): `re._parser._uniq`'s
+/// `list(dict.fromkeys(items))`, the dedup idiom. `None` for anything else
+/// (a key a probe can't settle among them), which the full path builds.
+pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(t), keys, rest @ ..] = args else {
+        return None;
+    };
+    if !Rc::ptr_eq(t, &builtin_types().dict_) {
+        return None;
+    }
+    let value = match rest {
+        [] => Object::None,
+        [v] => v.clone(),
+        _ => return None,
+    };
+    let keys: Vec<Object> = match keys {
+        Object::List(l) => l.try_borrow().ok()?.clone(),
+        Object::Tuple(t) => t.to_vec(),
+        _ => return None,
+    };
+    let mut d = DictData::default();
+    for k in &keys {
+        let probe = crate::object::LeafProbe::new(k)?;
+        match d.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(_) => {}
+            crate::dictmap::ProbeEntry::Vacant(v) if probe.miss_is_exact() => {
+                v.insert(DictKey(k.clone()), value.clone());
+            }
+            crate::dictmap::ProbeEntry::Vacant(_) => return None,
+        }
+    }
+    Some(Ok(Object::Dict(Rc::new(RefCell::new(d)))))
+}
+
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     // One to seven bytes in either order: the machine int, with no byte
     // order string or copy of the data built.
@@ -14164,6 +14227,66 @@ pub(crate) fn dict_setitem_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     }
     drop(old);
     Some(Ok(Object::None))
+}
+
+/// `dict.setdefault`'s leaf half: a `str`/`int` key's entry read, or the
+/// default stored under it when no stored key could equal it (one probe, as
+/// CPython's). Anything that could run Python (an exotic stored key, a dict
+/// watcher) takes the full path.
+pub(crate) fn dict_setdefault_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, key, default) = match args {
+        [r, k] => (r, k, None),
+        [r, k, d] => (r, k, Some(d)),
+        _ => return None,
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let cell = leaf_dict_of(recv)?;
+    let mut d = cell.try_borrow_mut().ok()?;
+    match d.probe_entry(&probe) {
+        // (A default that dies unused is released with the call's operands,
+        // which reap a finalizer only on the full path: one that could
+        // queue one takes it, as `d.setdefault(k, Noisy())` must finalize
+        // before the next statement.)
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            if default.is_some_and(|v| !dies_quietly(v)) {
+                return None;
+            }
+            Some(Ok(e.into_mut().clone()))
+        }
+        crate::dictmap::ProbeEntry::Vacant(e) => {
+            if !probe.miss_is_exact() {
+                return None;
+            }
+            let v = default.cloned().unwrap_or(Object::None);
+            e.insert(DictKey(key.clone()), v.clone());
+            drop(d);
+            crate::object::dict_watch_bump(cell);
+            crate::object::dict_mutation_event(cell);
+            Some(Ok(v))
+        }
+    }
+}
+
+/// Whether releasing the stack's reference to `v` frees nothing whose
+/// finalizer could run: a value another reference keeps alive, a scalar or
+/// a string, or an empty list, dict or set.
+fn dies_quietly(v: &Object) -> bool {
+    match v {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => true,
+        Object::List(l) => Rc::strong_count(l) > 1 || l.try_borrow().is_ok_and(|l| l.is_empty()),
+        Object::Dict(d) => Rc::strong_count(d) > 1 || d.try_borrow().is_ok_and(|d| d.is_empty()),
+        Object::Set(s) => Rc::strong_count(s) > 1 || s.try_borrow().is_ok_and(|s| s.is_empty()),
+        Object::Instance(i) => Rc::strong_count(i) > 1,
+        _ => false,
+    }
 }
 
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {

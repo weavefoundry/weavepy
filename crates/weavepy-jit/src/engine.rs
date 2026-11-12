@@ -1,20 +1,14 @@
-//! The Cranelift JIT module lifecycle and the compiled-frame entry
-//! point.
+//! The compiled-frame engine and entry point.
 //!
-//! A [`JitEngine`] owns one [`JITModule`]; every compiled frame is a
-//! native function defined into it. The engine is intended to be a
-//! per-thread singleton (the VM keeps it in thread-local storage, under
-//! the GIL), so the function pointers stay valid for the thread's
-//! lifetime and there is no cross-thread aliasing.
+//! A [`JitEngine`] lowers each frame to `weavepy-codegen`'s IR and installs
+//! its machine code in the process's code arena, which is never freed, so
+//! a compiled frame's function pointer stays valid for the process. The
+//! engine is intended to be a per-thread singleton (the VM keeps it in
+//! thread-local storage, under the GIL).
 
-use std::mem::{self, ManuallyDrop};
+use std::mem;
 
-use cranelift_codegen::ir::{types, AbiParam, FuncRef, Type};
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
-use cranelift_frontend::FunctionBuilderContext;
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use weavepy_codegen::{types, AbiParam, ExtFuncData, FuncRef, FuncTarget, Function, Type};
 
 use crate::analyze::{JitVerdict, Probes};
 use crate::ir::{
@@ -128,7 +122,8 @@ pub struct CompiledFrame {
     op_mix: OpMix,
     /// The engine's handle for this function, for direct calls from
     /// frames compiled later (see [`Self::direct_leaf`]).
-    func_id: FuncId,
+    /// The machine code's entry, for direct callers.
+    code: usize,
 }
 
 /// A compiled scalar leaf another frame may call directly (see
@@ -136,7 +131,8 @@ pub struct CompiledFrame {
 /// the lanes of its parameters and result.
 #[derive(Clone, Debug)]
 pub struct DirectLeaf {
-    func_id: FuncId,
+    /// The machine code's entry, for direct callers.
+    code: usize,
     n_locals: u32,
     max_stack: u32,
     params: Vec<JitType>,
@@ -429,7 +425,7 @@ impl CompiledFrame {
             .map(|t| t.filter(|&t| scalar(t)))
             .collect::<Option<Vec<_>>>()?;
         Some(DirectLeaf {
-            func_id: self.func_id,
+            code: self.code,
             n_locals: self.n_locals,
             max_stack: self.max_stack,
             defaults: vec![None; params.len()],
@@ -463,7 +459,7 @@ impl CompiledFrame {
             .map(|t| t.filter(|&t| scalar(t)))
             .collect::<Option<Vec<_>>>()?;
         Some(DirectLeaf {
-            func_id: self.func_id,
+            code: self.code,
             n_locals: self.n_locals,
             max_stack: self.max_stack,
             defaults: vec![None; params.len()],
@@ -506,26 +502,13 @@ impl CompiledFrame {
     }
 }
 
-/// Owns the Cranelift JIT module and reusable codegen contexts.
+/// Lowers frames and installs their code, keeping the function buffer.
+/// Dropping the engine unmaps its code.
 pub struct JitEngine {
-    module: ManuallyDrop<JITModule>,
-    ctx: Context,
-    fbctx: FunctionBuilderContext,
+    func: Function,
+    code: weavepy_codegen::CodeArena,
     ptr_ty: Type,
     next_id: u32,
-}
-
-impl Drop for JitEngine {
-    fn drop(&mut self) {
-        // SAFETY: CompiledFrame::enter requires its owning engine to remain
-        // alive. The VM's thread-local engine outlives all native entries on
-        // that thread. Parked generators retain buffers and a compilation id,
-        // not code pointers; another thread materializes their saved state.
-        // Worker teardown abandons suspended greenlet stacks before TLS drops.
-        // Take the module exactly once to reclaim mappings that Cranelift's
-        // default Drop deliberately leaves allocated.
-        unsafe { ManuallyDrop::take(&mut self.module).free_memory() };
-    }
 }
 
 impl std::fmt::Debug for JitEngine {
@@ -543,52 +526,21 @@ impl JitEngine {
     /// which case the VM simply never tiers up.
     #[must_use]
     pub fn new() -> Option<JitEngine> {
-        let mut flag_builder = settings::builder();
-        // A JIT that emits absolute addresses and resolves libcalls
-        // in-process.
-        flag_builder.set("use_colocated_libcalls", "false").ok()?;
-        flag_builder.set("is_pic", "false").ok()?;
-        // Cranelift's mid-end pays for itself in numeric loops: without it
-        // `jitloop` ran 2x and `spectral_norm` 1.2x slower, for a few
-        // percent of compile time saved. `WEAVEPY_JIT_OPT=0` turns it off.
-        let opt = if std::env::var_os("WEAVEPY_JIT_OPT").is_some_and(|v| v == "0") {
-            "none"
-        } else {
-            "speed"
-        };
-        flag_builder.set("opt_level", opt).ok()?;
-        if std::env::var_os("WEAVEPY_JIT_QUICK").is_some() {
-            flag_builder.set("opt_level", "none").ok()?;
-            flag_builder.set("regalloc_algorithm", "single_pass").ok()?;
+        if !weavepy_codegen::SUPPORTED {
+            return None;
         }
-        // The IR verifier re-checks every function it compiles: a debug
-        // aid whose cost lands on every warm-up in release builds.
-        if !cfg!(debug_assertions) {
-            flag_builder.set("enable_verifier", "false").ok()?;
-        }
-        let isa_builder = cranelift_native::builder().ok()?;
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .ok()?;
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder);
-        let ptr_ty = module.target_config().pointer_type();
-        let ctx = module.make_context();
         Some(JitEngine {
-            module: ManuallyDrop::new(module),
-            ctx,
-            fbctx: FunctionBuilderContext::new(),
-            ptr_ty,
+            func: Function::new(),
+            code: weavepy_codegen::CodeArena::new(),
+            ptr_ty: types::I64,
             next_id: 0,
         })
     }
 
-    /// Drop the function and builder contexts for empty ones: clearing
-    /// them keeps their buffers' capacity, the largest function's size,
-    /// for the rest of the thread (and under the next compile's peak).
+    /// Drop the function for an empty one: clearing it keeps its buffers'
+    /// capacity, the largest function's size, for the rest of the thread.
     fn release(&mut self) {
-        self.ctx = self.module.make_context();
-        self.fbctx = FunctionBuilderContext::new();
+        self.func = Function::new();
     }
 
     /// Analyze and compile a code object. `resolve` reports what each
@@ -902,31 +854,25 @@ impl JitEngine {
                 "float floordiv/mod (no helper registered)",
             ));
         }
-        self.module.clear_context(&mut self.ctx);
+        self.func.clear();
 
         // Signature: (frame: ptr) -> i64.
-        self.ctx
-            .func
-            .signature
-            .params
-            .push(AbiParam::new(self.ptr_ty));
-        self.ctx
-            .func
-            .signature
-            .returns
-            .push(AbiParam::new(types::I64));
-
+        self.func.signature.params.push(AbiParam::new(self.ptr_ty));
+        self.func.signature.returns.push(AbiParam::new(types::I64));
         let name = format!("wpjit_{}", self.next_id);
         self.next_id += 1;
-        let id = self
-            .module
-            .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
-            .map_err(|_| JitVerdict::NotConverged)?;
-        // A scalar frame calls itself directly (declared above so the body
-        // can name its own function).
+        // Every compiled frame has this signature: a direct call of one
+        // (the frame itself, or a leaf) names it.
+        let own_sig = self.func.signature.clone();
+        let import = |func: &mut Function, target: FuncTarget| -> FuncRef {
+            let mut b = weavepy_codegen::FunctionBuilder::new(func);
+            let sig = b.import_signature(own_sig.clone());
+            b.import_function(ExtFuncData { target, sig })
+        };
+        // A scalar frame calls itself directly.
         let self_func = (runtime::self_call_helper_addrs().is_some()
             && self_direct_eligible(tfunc))
-        .then(|| self.module.declare_func_in_func(id, &mut self.ctx.func));
+        .then(|| import(&mut self.func, FuncTarget::SelfFn));
         // Direct leaf targets, per call token whose sites agree with the
         // leaf's arity and result lane (the lowering checks the argument
         // lanes at each site).
@@ -956,9 +902,7 @@ impl JitEngine {
                 }
                 if let Some(leaf) = direct(token) {
                     if leaf.params.len() >= argc as usize && leaf.ret == ret {
-                        let fref = self
-                            .module
-                            .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
+                        let fref = import(&mut self.func, FuncTarget::Addr(leaf.code));
                         leaves.push((token, fref, leaf));
                     }
                 }
@@ -985,9 +929,7 @@ impl JitEngine {
                 seen.push(token);
                 if let Some(leaf) = direct_method(token) {
                     if leaf.receiver && leaf.params.len() == argc as usize && leaf.ret == ret {
-                        let fref = self
-                            .module
-                            .declare_func_in_func(leaf.func_id, &mut self.ctx.func);
+                        let fref = import(&mut self.func, FuncTarget::Addr(leaf.code));
                         leaves.push((token, fref, leaf));
                     }
                 }
@@ -995,8 +937,7 @@ impl JitEngine {
         }
 
         let sound = build_function(
-            &mut self.ctx.func,
-            &mut self.fbctx,
+            &mut self.func,
             tfunc,
             self.ptr_ty,
             self_func,
@@ -1019,47 +960,22 @@ impl JitEngine {
             return Err(JitVerdict::NotConverged);
         }
         if std::env::var_os("WEAVEPY_JIT_CLIF_DUMP").is_some() {
-            eprintln!("jit clif {name}:\n{}", self.ctx.func.display());
+            eprintln!("jit ir {name}:\n{}", self.func.display());
         }
-        if std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some() {
-            let f = &self.ctx.func;
-            let insts: usize = f
-                .layout
-                .blocks()
-                .map(|b| f.layout.block_insts(b).count())
-                .sum();
-            eprintln!(
-                "jit clif {name}: {} blocks, {insts} insts, {} values",
-                f.layout.blocks().count(),
-                f.dfg.num_values()
-            );
-        }
-
         let stats = std::env::var_os("WEAVEPY_JIT_CLIF_STATS").is_some();
-        if stats {
-            let _ = cranelift_codegen::timing::take_current();
-        }
         let t0 = stats.then(std::time::Instant::now);
-        let defined = self.module.define_function(id, &mut self.ctx);
-        let t1 = stats.then(std::time::Instant::now);
+        let n_insts = self.func.dfg.num_insts();
+        let mut func = mem::take(&mut self.func);
+        let built = weavepy_codegen::compile(&mut func).and_then(|bytes| self.code.install(&bytes));
+        self.func = func;
         self.release();
-        defined.map_err(|_| JitVerdict::NotConverged)?;
-        self.module
-            .finalize_definitions()
-            .map_err(|_| JitVerdict::NotConverged)?;
-        if let (Some(t0), Some(t1)) = (t0, t1) {
-            eprintln!(
-                "jit define {name}: {:?}, finalize {:?}\n{}",
-                t1 - t0,
-                t1.elapsed(),
-                cranelift_codegen::timing::take_current()
-            );
+        let code_ptr = built.map_err(|_| JitVerdict::NotConverged)?;
+        if let Some(t0) = t0 {
+            eprintln!("jit compile {name}: {n_insts} insts in {:?}", t0.elapsed());
         }
-
-        let code_ptr = self.module.get_finalized_function(id);
-        // SAFETY: `code_ptr` is a finalized function with exactly the
-        // `(*mut JitFrame) -> i64` signature declared above; the module
-        // keeps the code alive for the engine's lifetime.
+        // SAFETY: `code_ptr` is the entry of machine code generated for
+        // exactly the `(*mut JitFrame) -> i64` signature declared above,
+        // in a code arena never freed.
         let func: NativeFn = unsafe { mem::transmute::<*const u8, NativeFn>(code_ptr) };
 
         let has_loop = tfunc.blocks.iter().enumerate().any(|(bi, b)| match b.term {
@@ -1128,7 +1044,7 @@ impl JitEngine {
             ret_none: tfunc.ret_none,
             scalar_leaf: is_scalar_leaf(tfunc),
             op_mix: op_mix(tfunc),
-            func_id: id,
+            code: code_ptr as usize,
         })
     }
 }
@@ -1188,6 +1104,9 @@ fn analyze_admitted(
     }
     if mostly_generic(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("mostly generic operations"));
+    }
+    if attr_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("attribute-bound loop"));
     }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
@@ -1259,40 +1178,81 @@ fn mostly_generic(tfunc: &TFunc) -> bool {
         return false;
     }
     let mix = if loops_only {
-        // The blocks some back edge spans (blocks are in instruction
-        // order).
-        let mut in_loop = vec![false; tfunc.blocks.len()];
-        for (i, b) in tfunc.blocks.iter().enumerate() {
-            use crate::ir::TTerm;
-            let back = |t: usize| (t <= i).then_some(t);
-            let top = match b.term {
-                TTerm::Jump(t) => back(t),
-                TTerm::BranchFalse {
-                    target,
-                    fallthrough,
-                }
-                | TTerm::BranchTrue {
-                    target,
-                    fallthrough,
-                } => back(target).into_iter().chain(back(fallthrough)).min(),
-                _ => None,
-            };
-            if let Some(top) = top {
-                in_loop[top..=i].iter_mut().for_each(|x| *x = true);
-            }
-        }
-        mix_of(
-            tfunc
-                .blocks
-                .iter()
-                .zip(&in_loop)
-                .filter(|(_, l)| **l)
-                .map(|(b, _)| b),
-        )
+        mix_of(loop_blocks(tfunc))
     } else {
         op_mix(tfunc)
     };
     (mix.dyn_calls + mix.dyn_attrs + mix.dyn_other) * 100 > mix.total * percent
+}
+
+/// The blocks of `tfunc` that some back edge spans (blocks are in
+/// instruction order).
+fn loop_blocks(tfunc: &TFunc) -> impl Iterator<Item = &crate::ir::TBlock> {
+    let mut in_loop = vec![false; tfunc.blocks.len()];
+    for (i, b) in tfunc.blocks.iter().enumerate() {
+        use crate::ir::TTerm;
+        let back = |t: usize| (t <= i).then_some(t);
+        let top = match b.term {
+            TTerm::Jump(t) => back(t),
+            TTerm::BranchFalse {
+                target,
+                fallthrough,
+            }
+            | TTerm::BranchTrue {
+                target,
+                fallthrough,
+            } => back(target).into_iter().chain(back(fallthrough)).min(),
+            _ => None,
+        };
+        if let Some(top) = top {
+            in_loop[top..=i].iter_mut().for_each(|x| *x = true);
+        }
+    }
+    tfunc
+        .blocks
+        .iter()
+        .zip(in_loop)
+        .filter(|(_, l)| *l)
+        .map(|(b, _)| b)
+}
+
+/// Whether `tfunc`'s loops access attributes more often than they do
+/// typed arithmetic: each attribute read or write of a tier-2 loop goes
+/// through a helper that redoes its guards (about 50 host instructions),
+/// where the frame JIT reads or writes the field in line, so a loop of
+/// attribute traffic runs faster in the frame JIT unless typed work in
+/// registers repays it. (Calls don't count: a driver loop that calls
+/// compiled functions keeps them native-to-native in tier 2.)
+/// `WEAVEPY_T2_ATTRS=0` turns the rule off, a tuning aid.
+fn attr_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || ATTR_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !*ON.get_or_init(|| std::env::var_os("WEAVEPY_T2_ATTRS").is_none_or(|v| v != "0"))
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut attrs, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            TOp::AttrGet { .. }
+            | TOp::AttrSet { .. }
+            | TOp::DynAttrGet { .. }
+            | TOp::DynAttrSet { .. } => attrs += 1,
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    attrs > typed
 }
 
 /// The generic share [`mostly_generic`] admits, in percent, and whether it
@@ -1315,6 +1275,16 @@ fn generic_share_limit() -> Option<(u32, bool)> {
     })
 }
 
+/// Set by [`admit_attr_loops`].
+static ATTR_LOOPS_ADMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compile loops however attribute-bound they are (see [`attr_bound`]),
+/// from now on in this process: for tests of tier 2's attribute paths.
+pub fn admit_attr_loops() {
+    ATTR_LOOPS_ADMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Set by [`admit_generic_loops`].
 static GENERIC_LOOPS_ADMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1324,6 +1294,12 @@ static GENERIC_LOOPS_ADMITTED: std::sync::atomic::AtomicBool =
 /// loops (see [`mostly_generic`]).
 pub fn admit_generic_loops() {
     GENERIC_LOOPS_ADMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`admit_generic_loops`] ran: the VM then keeps call-dense
+/// loops native too, for the tests of its native calls.
+pub fn generic_loops_admitted() -> bool {
+    GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether `tfunc` loops (a rewritten loop, or a backward jump).

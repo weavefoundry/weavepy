@@ -1243,7 +1243,6 @@ struct Names {
     traps: SharedStr,
     flags: SharedStr,
     owner: SharedStr,
-    data: SharedStr,
 }
 
 fn interned(s: &str) -> SharedStr {
@@ -1270,7 +1269,6 @@ impl Names {
             traps: interned("traps"),
             flags: interned("flags"),
             owner: interned("_owner"),
-            data: interned("_data"),
         }
     }
 }
@@ -1678,17 +1676,12 @@ impl State {
     /// (an exact `Context`): the thread's current `contextvars.Context`'s
     /// `_data[var]`.
     fn current(&self) -> Option<Rc<PyInstance>> {
-        let Object::Instance(cv) = crate::stdlib::contextvars_native::peek_current() else {
-            return None;
-        };
+        let data = crate::stdlib::contextvars_native::peek_current_data()?;
         // SAFETY: reads that run no code (the key is a plain instance,
         // which hashes and compares natively); the context is cloned
         // before anything else runs.
         unsafe {
-            let data = match cv.slots.peek()?.get_hinted(0, &self.names.data)? {
-                Object::Dict(d) => d.peek()?,
-                _ => return None,
-            };
+            let data = data.peek()?;
             let Object::Instance(var) = &self.var else {
                 return None;
             };

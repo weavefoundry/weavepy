@@ -716,9 +716,9 @@ fn fileio_open_raw(
                 &[],
                 &globals,
             )?;
-            crate::builtins::b_open(&[fd, Object::from_str(binmode.to_owned())])
+            crate::builtins::b_open(&[fd, Object::from_str(binmode)])
         }
-        None => crate::builtins::b_open(&[file.clone(), Object::from_str(binmode.to_owned())]),
+        None => crate::builtins::b_open(&[file.clone(), Object::from_str(binmode)]),
     }
 }
 

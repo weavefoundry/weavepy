@@ -337,6 +337,10 @@ pub struct Expr {
     pub span: Span,
 }
 
+// The parser moves expressions by value through every precedence level,
+// so their size becomes copying: large payloads go behind a `Box`.
+const _: () = assert!(std::mem::size_of::<Expr>() <= 72);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     /// Literal constant: `None`, `True`, `42`, `"hello"`, etc.
@@ -390,7 +394,7 @@ pub enum ExprKind {
     },
     /// `lambda args: body`
     Lambda {
-        args: Arguments,
+        args: Box<Arguments>,
         body: Box<Expr>,
     },
     /// A compiler-generated PEP 695 *annotation scope* function — never
@@ -401,7 +405,7 @@ pub enum ExprKind {
     /// TypeVar bounds/constraints/defaults, `type X = …` alias values,
     /// and the per-parameter binder lambdas of a generic alias.
     TypeParamFn {
-        args: Arguments,
+        args: Box<Arguments>,
         body: Box<Expr>,
     },
     Call {

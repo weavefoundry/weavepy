@@ -42,11 +42,7 @@ unsafe fn passwd_to_object(p: *const libc::passwd) -> Object {
         if p.is_null() {
             Object::from_static("")
         } else {
-            Object::from_str(
-                unsafe { std::ffi::CStr::from_ptr(p) }
-                    .to_string_lossy()
-                    .into_owned(),
-            )
+            Object::from_str(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy())
         }
     }
     let values = unsafe {

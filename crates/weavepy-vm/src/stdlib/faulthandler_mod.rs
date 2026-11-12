@@ -959,6 +959,17 @@ unsafe impl Send for UserSignal {}
 
 #[cfg(unix)]
 static USER_SIGNALS: Mutex<Option<HashMap<i32, UserSignal>>> = Mutex::new(None);
+/// A user signal was ever registered (see [`may_read_frames`]).
+static USER_SIGNAL_EVER: AtomicBool = AtomicBool::new(false);
+
+/// Whether a dump may read this thread's frames from outside its own
+/// evaluation (a fatal signal's handler, a registered user signal's): the
+/// frames must be on the spine whenever the thread blocks (see
+/// `gil::allow_threads_then`). The watchdog of `dump_traceback_later`
+/// counts through the shared reference counts it turns on.
+pub(crate) fn may_read_frames() -> bool {
+    ENABLED.load(Ordering::Relaxed) || USER_SIGNAL_EVER.load(Ordering::Relaxed)
+}
 
 #[cfg(unix)]
 extern "C" fn user_signal_handler(sig: libc::c_int) {
@@ -1040,6 +1051,7 @@ fn fh_register(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     #[cfg(unix)]
     {
         ensure_altstack();
+        USER_SIGNAL_EVER.store(true, Ordering::Relaxed);
         let mut guard = USER_SIGNALS.lock().unwrap();
         let map = guard.get_or_insert_with(HashMap::new);
         let old_action = install_user_handler(signum, chain);

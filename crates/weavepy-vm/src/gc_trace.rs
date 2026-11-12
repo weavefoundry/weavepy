@@ -194,8 +194,8 @@ const F_FINALIZED: u8 = 1;
 /// finalizer (drained after `gc.collect()` returns) may resurrect it, and
 /// CPython only counts objects that are actually reclaimed.
 const F_QUEUED: u8 = 2;
-/// The object is a candidate of the collection in progress; the entry's
-/// `gc_refs` holds its marking count.
+/// The object is a candidate of the collection in progress; the
+/// collection's [`Nodes`] hold its marking count.
 const F_CAND: u8 = 4;
 /// The collection in progress found the candidate reachable from outside
 /// the candidates (its marking color is grey or black).
@@ -209,24 +209,84 @@ const F_REACHED: u8 = 8;
 /// reserved until then, so the address the index keys it by can't be
 /// reused by another object meanwhile.
 struct Entry {
-    /// The object, held weakly; `None` for a free slot.
-    obj: Option<WeakObject>,
+    /// The object's weak handle, packed with [`Self::kind`] (see
+    /// [`WeakObject::into_parts`]), or `0` for a free slot: as a
+    /// `WeakObject`, the handle's tag would take a word of its own.
+    weak: usize,
     /// Position in the owning list (`gens[gen]`, or `frozen`), or the next
     /// free slot for a free one.
     pos: u32,
-    /// While [`F_CAND`] is set: the object's references from outside the
-    /// candidates, as the collection counts them (CPython's `gc_refs`).
-    gc_refs: std::cell::Cell<i32>,
-    /// While [`F_CAND`] is set: the candidate's node number in the
-    /// collection's edge lists.
-    node: std::cell::Cell<u32>,
+    /// The weak handle's tag.
+    kind: u8,
     /// Generation (0..N_GENERATIONS), [`GEN_FROZEN`] or [`GEN_FREE`].
     gen: u8,
     /// [`F_FINALIZED`], [`F_QUEUED`] and [`F_CAND`].
     flags: std::cell::Cell<u8>,
 }
 
+// (A collection's per-candidate counts live in its own arrays, by node,
+// rather than in every entry: see [`Nodes`].)
+const _: () = assert!(std::mem::size_of::<Entry>() == 16);
+
+/// An [`Entry`]'s weak handle, borrowed (it releases nothing).
+struct WeakView<'a>(
+    std::mem::ManuallyDrop<WeakObject>,
+    std::marker::PhantomData<&'a Entry>,
+);
+
+impl std::ops::Deref for WeakView<'_> {
+    type Target = WeakObject;
+
+    #[inline(always)]
+    fn deref(&self) -> &WeakObject {
+        &self.0
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        drop(self.take_obj());
+    }
+}
+
 impl Entry {
+    /// A slot holding `obj`.
+    #[inline]
+    fn holding(obj: WeakObject, pos: u32, gen: u8, flags: u8) -> Self {
+        let (kind, weak) = obj.into_parts();
+        Self {
+            weak,
+            pos,
+            kind,
+            gen,
+            flags: std::cell::Cell::new(flags),
+        }
+    }
+
+    /// The object's handle; `None` for a free slot.
+    #[inline(always)]
+    fn obj(&self) -> Option<WeakView<'_>> {
+        // SAFETY: the parts are the handle this entry owns; the view
+        // never drops it.
+        (self.weak != 0).then(|| {
+            WeakView(
+                std::mem::ManuallyDrop::new(unsafe {
+                    WeakObject::from_parts(self.kind, self.weak)
+                }),
+                std::marker::PhantomData,
+            )
+        })
+    }
+
+    /// Take the handle out, leaving a free slot's.
+    #[inline]
+    fn take_obj(&mut self) -> Option<WeakObject> {
+        let weak = std::mem::replace(&mut self.weak, 0);
+        // SAFETY: the parts were this entry's handle, which it no longer
+        // holds.
+        (weak != 0).then(|| unsafe { WeakObject::from_parts(self.kind, weak) })
+    }
+
     #[inline]
     fn has(&self, flag: u8) -> bool {
         self.flags.get() & flag != 0
@@ -391,8 +451,87 @@ impl<T: YoungKind> YoungSet<T> {
 /// generation without hashing. An instance records its slot itself
 /// ([`crate::types::PyInstance::gc_slot`]), so registering one, finding
 /// it from an edge, and its death's removal never touch the index.
+/// [`Registry`]'s entries, in chunks of [`SLAB_CHUNK`] that never move:
+/// growing appends a chunk instead of copying every entry into a buffer
+/// twice the size (whose copy, alongside the old one, set the peak of a
+/// program with many live objects).
+#[derive(Default)]
+struct Slab {
+    chunks: Vec<Box<[std::mem::MaybeUninit<Entry>; SLAB_CHUNK]>>,
+    len: usize,
+}
+
+/// Entries per [`Slab`] chunk.
+const SLAB_CHUNK: usize = 1024;
+
+impl Slab {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, e: Entry) {
+        let (c, i) = (self.len / SLAB_CHUNK, self.len % SLAB_CHUNK);
+        if c == self.chunks.len() {
+            // SAFETY: an array of `MaybeUninit`s needs no initialization.
+            let chunk = unsafe {
+                Box::<[std::mem::MaybeUninit<Entry>; SLAB_CHUNK]>::new_uninit().assume_init()
+            };
+            self.chunks.push(chunk);
+        }
+        self.chunks[c][i].write(e);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&Entry> {
+        // SAFETY: the first `len` entries are initialized.
+        (i < self.len).then(|| unsafe { self.get_unchecked(i) })
+    }
+
+    /// # Safety
+    ///
+    /// `i < self.len()`.
+    #[inline(always)]
+    unsafe fn get_unchecked(&self, i: usize) -> &Entry {
+        // SAFETY: per the caller, the entry is initialized.
+        unsafe {
+            self.chunks
+                .get_unchecked(i / SLAB_CHUNK)
+                .get_unchecked(i % SLAB_CHUNK)
+                .assume_init_ref()
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Slab {
+    type Output = Entry;
+    #[inline]
+    fn index(&self, i: usize) -> &Entry {
+        self.get(i).expect("collector slot in range")
+    }
+}
+
+impl std::ops::IndexMut<usize> for Slab {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Entry {
+        assert!(i < self.len, "collector slot in range");
+        // SAFETY: the first `len` entries are initialized.
+        unsafe { self.chunks[i / SLAB_CHUNK][i % SLAB_CHUNK].assume_init_mut() }
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        for i in 0..self.len {
+            // SAFETY: the first `len` entries are initialized, each dropped once.
+            unsafe { self.chunks[i / SLAB_CHUNK][i % SLAB_CHUNK].assume_init_drop() };
+        }
+    }
+}
+
 struct Registry {
-    slab: Vec<Entry>,
+    slab: Slab,
     /// Head of the free-slot list (threaded through `Entry::pos`).
     free: u32,
     gens: [Vec<u32>; N_GENERATIONS],
@@ -404,7 +543,7 @@ struct Registry {
 impl Registry {
     fn new() -> Self {
         Self {
-            slab: Vec::new(),
+            slab: Slab::default(),
             free: NO_SLOT,
             gens: Default::default(),
             frozen: Vec::new(),
@@ -453,14 +592,7 @@ impl Registry {
     /// Add `obj` to list `gen` in a fresh slot.
     fn insert(&mut self, obj: WeakObject, gen: u8, flags: u8) -> u32 {
         let pos = self.list_mut(gen).len() as u32;
-        let entry = Entry {
-            obj: Some(obj),
-            pos,
-            gc_refs: std::cell::Cell::new(0),
-            node: std::cell::Cell::new(0),
-            gen,
-            flags: std::cell::Cell::new(flags),
-        };
+        let entry = Entry::holding(obj, pos, gen, flags);
         let slot = if self.free != NO_SLOT {
             let slot = self.free;
             let e = &mut self.slab[slot as usize];
@@ -497,7 +629,7 @@ impl Registry {
     fn release(&mut self, slot: u32) -> Option<WeakObject> {
         let free = self.free;
         let e = &mut self.slab[slot as usize];
-        let w = e.obj.take();
+        let w = e.take_obj();
         e.gen = GEN_FREE;
         e.flags.set(0);
         e.pos = free;
@@ -515,11 +647,11 @@ impl Registry {
 
     /// Drop the index entry (or a live instance's record) naming `slot`.
     fn forget_key(&mut self, slot: u32) {
-        let Some(w) = self.slab[slot as usize].obj.as_ref() else {
+        let Some(w) = self.slab[slot as usize].obj() else {
             return;
         };
-        if slot_is_intrusive(w) {
-            clear_intrusive_slot(w);
+        if slot_is_intrusive(&w) {
+            clear_intrusive_slot(&w);
         } else {
             let key = w.addr() as ObjectId;
             if self.index.get(&key) == Some(&slot) {
@@ -1357,7 +1489,7 @@ impl GcState {
         addr: usize,
     ) -> Option<WeakObject> {
         let e = reg.slab.get(slot as usize)?;
-        match &e.obj {
+        match e.obj().as_deref() {
             Some(WeakObject::Instance(w)) if w.as_ptr() as usize == addr => {}
             _ => return None,
         }
@@ -1418,7 +1550,7 @@ impl GcState {
     /// the young sets.
     fn untrack_slot(&self, slot: u32, id: ObjectId, young: bool) {
         let remove = |reg: &mut Registry| {
-            let dead = reg.entry(slot).obj.as_ref().is_none_or(WeakObject::is_dead);
+            let dead = reg.entry(slot).obj().is_none_or(|w| w.is_dead());
             (reg.remove(slot), dead)
         };
         // SAFETY (both views): nothing runs code while they live.
@@ -1503,12 +1635,7 @@ impl GcState {
         while examined < budget && i < reg.gens[gen].len() {
             examined += 1;
             let slot = reg.gens[gen][i];
-            if reg
-                .list_entry(slot)
-                .obj
-                .as_ref()
-                .is_none_or(WeakObject::is_dead)
-            {
+            if reg.list_entry(slot).obj().is_none_or(|w| w.is_dead()) {
                 // (The swap brings the list's last member to `i`.)
                 drop(reg.remove(slot));
                 removed += 1;
@@ -1604,7 +1731,7 @@ impl GcState {
             if e.has(F_FINALIZED) || e.has(F_QUEUED) {
                 continue;
             }
-            if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
+            if let Some(obj) = e.obj().and_then(|w| w.upgrade()) {
                 if has_finalizer(&obj) {
                     out.push(obj);
                 }
@@ -1834,7 +1961,7 @@ impl GcState {
         let reg = self.reg.borrow();
         let mut out = Vec::new();
         let mut push = |s: &u32| {
-            out.extend(reg.entry(*s).obj.as_ref().and_then(WeakObject::upgrade));
+            out.extend(reg.entry(*s).obj().and_then(|w| w.upgrade()));
         };
         match generation {
             Some(g) if g < N_GENERATIONS => reg.gens[g].iter().for_each(&mut push),
@@ -2076,6 +2203,7 @@ impl GcState {
         // temporary), so marking what is reachable follows those instead of
         // walking every object a second time.
         let n_cands: usize = lists.iter().map(Vec::len).sum();
+        let nodes = Nodes::new(lists);
         let mut found: Vec<Object> = Vec::new();
         let mut edges: Vec<u32> = Vec::with_capacity(n_cands * 4);
         let mut starts: Vec<u32> = Vec::with_capacity(n_cands + n_cands / 2 + 1);
@@ -2083,6 +2211,7 @@ impl GcState {
             |obj: &Object, temps: &mut Vec<Temp>, found: &mut Vec<Object>, edges: &mut Vec<u32>| {
                 let mut walk = Tally {
                     reg: &reg,
+                    nodes: &nodes,
                     finder: &finder,
                     temps: &temps[..],
                     found: &mut *found,
@@ -2100,8 +2229,8 @@ impl GcState {
                     let i = match finder.find(&child) {
                         Some(Hit::Temp(i)) => i as usize,
                         Some(Hit::Real(s)) => {
-                            let e = reg.entry(s);
-                            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+                            let r = nodes.refs(reg.entry(s));
+                            r.set(r.get().wrapping_sub(1));
                             edges.push(s);
                             continue;
                         }
@@ -2122,9 +2251,10 @@ impl GcState {
             };
         for &slot in lists.iter().flatten() {
             let e = reg.list_entry(slot);
-            e.node.set(starts.len() as u32);
+            let k = starts.len();
+            debug_assert_eq!(nodes.node(e), k);
             starts.push(edges.len() as u32);
-            let Some(w) = e.obj.as_ref() else { continue };
+            let Some(w) = e.obj() else { continue };
             // Phase 3's outer refcount, read here while the entry is at hand:
             // the walk takes no reference to a candidate that outlives the
             // visit, so the count is the one it will be after the walk.
@@ -2132,11 +2262,8 @@ impl GcState {
             if strong == 0 {
                 continue;
             }
-            e.gc_refs.set(
-                e.gc_refs
-                    .get()
-                    .wrapping_add(strong.min(i32::MAX as usize) as i32),
-            );
+            let r = nodes.refs_at(k);
+            r.set(r.get().wrapping_add(strong.min(i32::MAX as usize) as i32));
             // SAFETY: the object is alive (counted above), and the mark walk
             // runs no code that could release it (see `traverse_collected`).
             unsafe {
@@ -2159,6 +2286,7 @@ impl GcState {
         starts.push(edges.len() as u32);
         let graph = Graph {
             reg: &reg,
+            nodes: &nodes,
             temps: &temps,
             edges: &edges,
             starts: &starts,
@@ -2171,11 +2299,11 @@ impl GcState {
         // the visit), less the one reference it holds of its own.
         // (Each node is pushed at most once, as it is marked.)
         let mut grey: Vec<u32> = Vec::with_capacity(n_real + temps.len());
-        for &slot in lists.iter().flatten() {
+        for (k, &slot) in lists.iter().flatten().enumerate() {
             let e = reg.list_entry(slot);
             // Phase 4: anything referenced from outside is reachable; mark
             // it and propagate.
-            if e.gc_refs.get() > 0 {
+            if nodes.refs_at(k).get() > 0 {
                 e.set(F_REACHED, true);
                 grey.push(slot);
             }
@@ -2195,8 +2323,8 @@ impl GcState {
                     eprintln!(
                         "[root] slot={} gc_refs={} sc={}",
                         g,
-                        e.gc_refs.get(),
-                        e.obj.as_ref().map_or(0, WeakObject::strong_count)
+                        nodes.refs(e).get(),
+                        e.obj().map_or(0, |w| w.strong_count())
                     );
                 } else {
                     let t = &temps[(g & !TEMP_BIT) as usize];
@@ -2230,7 +2358,7 @@ impl GcState {
         for &slot in lists.iter().flatten() {
             let e = reg.list_entry(slot);
             if !e.has(F_REACHED) {
-                if let Some(obj) = e.obj.as_ref().and_then(WeakObject::upgrade) {
+                if let Some(obj) = e.obj().and_then(|w| w.upgrade()) {
                     unreachable.push((slot, obj));
                 }
             }
@@ -2409,12 +2537,11 @@ impl GcState {
             while i < reg.gens[g].len() {
                 let slot = reg.gens[g][i];
                 let e = reg.list_entry(slot);
-                if e.obj.as_ref().is_none_or(WeakObject::is_dead) {
+                if e.obj().is_none_or(|w| w.is_dead()) {
                     // (The swap brings the list's last member to `i`.)
                     dead.push(reg.remove(slot));
                     continue;
                 }
-                e.gc_refs.set(0);
                 e.flags.set((e.flags.get() & !F_REACHED) | F_CAND);
                 i += 1;
             }
@@ -2472,13 +2599,61 @@ impl GcState {
     }
 }
 
+/// A collection's registered candidates as nodes: generation `g`'s list
+/// starts at node `bases[g]`, so a candidate's node is its generation's base
+/// plus its position in the list, and `refs[node]` counts its references
+/// from outside the candidates (CPython's `gc_refs`). Kept here for the
+/// collection only, rather than in every registry entry.
+struct Nodes {
+    bases: [u32; N_GENERATIONS],
+    refs: Vec<std::cell::Cell<i32>>,
+}
+
+impl Nodes {
+    fn new(lists: &[Vec<u32>]) -> Self {
+        let mut bases = [0; N_GENERATIONS];
+        let mut n = 0u32;
+        for (base, list) in bases.iter_mut().zip(lists) {
+            *base = n;
+            n += list.len() as u32;
+        }
+        Nodes {
+            bases,
+            refs: (0..n).map(|_| std::cell::Cell::new(0)).collect(),
+        }
+    }
+
+    /// The node of `e`, a candidate's entry.
+    #[inline(always)]
+    fn node(&self, e: &Entry) -> usize {
+        debug_assert!((e.gen as usize) < N_GENERATIONS);
+        // SAFETY: a candidate is in one of the collected generations.
+        (unsafe { *self.bases.get_unchecked(e.gen as usize) } + e.pos) as usize
+    }
+
+    /// The outside-reference count of `e`, a candidate's entry.
+    #[inline(always)]
+    fn refs(&self, e: &Entry) -> &std::cell::Cell<i32> {
+        self.refs_at(self.node(e))
+    }
+
+    /// The outside-reference count of node `k`.
+    #[inline(always)]
+    fn refs_at(&self, k: usize) -> &std::cell::Cell<i32> {
+        debug_assert!(k < self.refs.len());
+        // SAFETY: every candidate's node is below the candidate count.
+        unsafe { self.refs.get_unchecked(k) }
+    }
+}
+
 /// A collection's candidates and their edges to one another, as the mark
 /// walk recorded them: node `k`'s edges are `edges[starts[k]..starts[k +
 /// 1]]`, each a registered candidate's slot or a temporary's position
-/// tagged [`TEMP_BIT`]; a registered candidate's node is in its entry,
+/// tagged [`TEMP_BIT`]; a registered candidate's node is in [`Nodes`],
 /// and temporary `i`'s is `n_real + i`.
 struct Graph<'a> {
     reg: &'a Registry,
+    nodes: &'a Nodes,
     temps: &'a [Temp],
     edges: &'a [u32],
     starts: &'a [u32],
@@ -2492,7 +2667,7 @@ impl Graph<'_> {
     fn propagate(&self, grey: &mut Vec<u32>) {
         while let Some(item) = grey.pop() {
             let node = if item & TEMP_BIT == 0 {
-                self.reg.list_entry(item).node.get() as usize
+                self.nodes.node(self.reg.list_entry(item))
             } else {
                 self.n_real + (item & !TEMP_BIT) as usize
             };
@@ -2522,6 +2697,7 @@ impl Graph<'_> {
 /// cycle could route through is set aside in `found`.
 struct Tally<'a> {
     reg: &'a Registry,
+    nodes: &'a Nodes,
     finder: &'a Finder<'a>,
     temps: &'a [Temp],
     found: &'a mut Vec<Object>,
@@ -2564,9 +2740,7 @@ impl Visit for Tally<'_> {
         } else if let Some(key) = child.payload_addr() {
             // Any other kind: the finder's cache answers for a child seen
             // before (a module's namespace from every frame, ...).
-            let line = Finder::line(key as ObjectId);
-            if self.finder.cache_keys[line].get() == key as ObjectId {
-                let v = self.finder.cache_vals[line].get();
+            if let Some(v) = self.finder.cached(key as ObjectId) {
                 if v != NO_SLOT {
                     self.tally(v);
                     return;
@@ -2593,8 +2767,8 @@ impl Tally<'_> {
     #[inline(always)]
     fn tally(&mut self, v: u32) {
         if v & TEMP_BIT == 0 {
-            let e = self.reg.entry(v);
-            e.gc_refs.set(e.gc_refs.get().wrapping_sub(1));
+            let r = self.nodes.refs(self.reg.entry(v));
+            r.set(r.get().wrapping_sub(1));
         } else {
             let t = &self.temps[(v & !TEMP_BIT) as usize];
             t.gc_refs.set(t.gc_refs.get() - 1);
@@ -2670,7 +2844,11 @@ struct Finder<'a> {
     /// Some temporary is also a registered object (outside the
     /// candidates): a registered child may then still be a temporary.
     registered_temp: std::cell::Cell<bool>,
-    /// Payload address -> answer (see [`Finder::encode`]), direct-mapped.
+    /// Payload address -> answer (see [`Finder::encode`]), two-way set
+    /// associative (see [`Finder::set_of`]): direct-mapped, two objects
+    /// every candidate refers to (a frame's module and builtins
+    /// dictionaries) could share a line and evict each other at every
+    /// visit, depending only on where they were allocated.
     cache_keys: [std::cell::Cell<ObjectId>; FINDER_CACHE],
     cache_vals: [std::cell::Cell<u32>; FINDER_CACHE],
 }
@@ -2690,9 +2868,40 @@ impl<'a> Finder<'a> {
         }
     }
 
+    /// The first of the two cache lines `key` may occupy.
+    #[inline(always)]
+    fn set_of(key: ObjectId) -> usize {
+        (((key >> 4) ^ (key >> 13)) as usize & (FINDER_CACHE / 2 - 1)) * 2
+    }
+
+    /// The cached answer for `key`, if any.
+    #[inline(always)]
+    fn cached(&self, key: ObjectId) -> Option<u32> {
+        let at = Self::set_of(key);
+        if self.cache_keys[at].get() == key {
+            Some(self.cache_vals[at].get())
+        } else if self.cache_keys[at + 1].get() == key {
+            Some(self.cache_vals[at + 1].get())
+        } else {
+            None
+        }
+    }
+
+    /// Cache `v` as the answer for `key`: its own line if it has one, else
+    /// the set's first, the previous first moving to the second.
     #[inline]
-    fn line(key: ObjectId) -> usize {
-        ((key >> 4) ^ (key >> 13)) as usize & (FINDER_CACHE - 1)
+    fn cache(&self, key: ObjectId, v: u32) {
+        let at = Self::set_of(key);
+        if self.cache_keys[at].get() == key {
+            self.cache_vals[at].set(v);
+        } else if self.cache_keys[at + 1].get() == key {
+            self.cache_vals[at + 1].set(v);
+        } else {
+            self.cache_keys[at + 1].set(self.cache_keys[at].get());
+            self.cache_vals[at + 1].set(self.cache_vals[at].get());
+            self.cache_keys[at].set(key);
+            self.cache_vals[at].set(v);
+        }
     }
 
     /// An answer as a cache value: [`NO_SLOT`] for none, a registered
@@ -2736,13 +2945,11 @@ impl<'a> Finder<'a> {
             }
         }
         let key = child.payload_addr()? as ObjectId;
-        let line = Self::line(key);
-        if self.cache_keys[line].get() == key {
-            return Self::decode(self.cache_vals[line].get());
+        if let Some(v) = self.cached(key) {
+            return Self::decode(v);
         }
         let hit = self.find_uncached(child, key);
-        self.cache_keys[line].set(key);
-        self.cache_vals[line].set(Self::encode(hit));
+        self.cache(key, Self::encode(hit));
         hit
     }
 
@@ -2786,10 +2993,7 @@ impl<'a> Finder<'a> {
         }
         self.temp_ids.borrow_mut().insert(id_of(child), i);
         if let Some(key) = child.payload_addr() {
-            let key = key as ObjectId;
-            let line = Self::line(key);
-            self.cache_keys[line].set(key);
-            self.cache_vals[line].set(Self::encode(Some(Hit::Temp(i as u32))));
+            self.cache(key as ObjectId, Self::encode(Some(Hit::Temp(i as u32))));
         }
     }
 }
@@ -3757,6 +3961,15 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: &Object) {
+    // A fresh empty list (`[]`, the commonest container born) holds nothing
+    // that could close a cycle: deferred without the element scan.
+    if let Object::List(l) = obj {
+        // SAFETY: a guard-free view that ends before anything runs.
+        if unsafe { l.peek() }.is_some_and(Vec::is_empty) {
+            track_inert(obj);
+            return;
+        }
+    }
     if let Object::Instance(inst) = obj {
         // The instance may have been born with deferred tracking; its
         // `__dict__` no longer needs to guard it.
@@ -4300,7 +4513,7 @@ mod tests {
     fn registry_entries_stay_compact_and_slots_are_reused() {
         let _gil = crate::gil::hold_gil();
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Entry>(), 32);
+        assert_eq!(std::mem::size_of::<Entry>(), 16);
         let state = GcState::new();
         let roots: Vec<_> = (0..3)
             .map(|_| Object::Dict(Rc::new(RefCell::new(DictData::default()))))

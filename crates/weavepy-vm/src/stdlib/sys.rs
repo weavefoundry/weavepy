@@ -661,7 +661,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `bin/python` must keep its symlink identity here or venv
         // detection (pyvenv.cfg next to the executable) never fires.
         let executable = crate::stdlib_tree::program_exe().map_or(Object::from_static(""), |p| {
-            Object::from_str(p.to_string_lossy().into_owned())
+            Object::from_str(p.to_string_lossy())
         });
         // getpath: `PYTHONEXECUTABLE` (macOS only) or `__PYVENV_LAUNCHER__`
         // override `sys.executable` (a venv launcher / framework stub
@@ -674,7 +674,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         .iter()
         .filter(|(_, enabled)| *enabled)
         .find_map(|(var, _)| std::env::var_os(var).filter(|v| !v.is_empty()))
-        .map(|v| Object::from_str(v.to_string_lossy().into_owned()));
+        .map(|v| Object::from_str(v.to_string_lossy()));
         d.insert(
             DictKey(Object::from_static("executable")),
             launcher_override.unwrap_or_else(|| executable.clone()),
@@ -712,17 +712,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                     })
                 })
                 .map_or(Object::from_static(""), |p| {
-                    Object::from_str(p.to_string_lossy().into_owned())
+                    Object::from_str(p.to_string_lossy())
                 });
             // Inside a venv, getpath sets `prefix`/`exec_prefix` to the
             // directory holding pyvenv.cfg while the `base_*` pair keeps
             // the installation (3.14's `site.venv()` only checks this;
             // it no longer assigns it — test_venv, test_sysconfig
             // test_makefile_overwrites_config_vars).
-            let venv_prefix = venv_prefix_dir().map_or_else(
-                || prefix.clone(),
-                |p| Object::from_str(p.to_string_lossy().into_owned()),
-            );
+            let venv_prefix = venv_prefix_dir()
+                .map_or_else(|| prefix.clone(), |p| Object::from_str(p.to_string_lossy()));
             for name in ["prefix", "exec_prefix"] {
                 d.insert(DictKey(Object::from_static(name)), venv_prefix.clone());
             }
@@ -749,9 +747,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `sys._stdlib_dir`). `None` when the tree is unavailable.
         d.insert(
             DictKey(Object::from_static("_stdlib_dir")),
-            crate::stdlib_tree::stdlib_dir().map_or(Object::None, |p| {
-                Object::from_str(p.to_string_lossy().into_owned())
-            }),
+            crate::stdlib_tree::stdlib_dir()
+                .map_or(Object::None, |p| Object::from_str(p.to_string_lossy())),
         );
         d.insert(
             DictKey(Object::from_static("implementation")),
@@ -1872,7 +1869,7 @@ pub fn audit_event(event: &str, args: &[Object]) -> Result<(), RuntimeError> {
                 }
             }
         };
-        let call_args = [Object::from_str(event.to_string()), arg_tuple.clone()];
+        let call_args = [Object::from_str(event), arg_tuple.clone()];
         let result = if can_trace {
             let _allow = crate::trace::TracingAllowGuard::enter();
             interp.call_object_with_globals(&hook, &call_args, &[], &outer)

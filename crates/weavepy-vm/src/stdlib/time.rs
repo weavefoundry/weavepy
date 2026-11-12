@@ -362,7 +362,7 @@ fn zone_str(bytes: &[u8]) -> Object {
                 return z.clone();
             }
         }
-        let z = Object::from_str(String::from_utf8_lossy(bytes).into_owned());
+        let z = Object::from_str(String::from_utf8_lossy(bytes));
         *last.borrow_mut() = Some((bytes.to_vec(), z.clone()));
         z
     })
@@ -1205,7 +1205,7 @@ fn with_tz_extras(obj: Object, gmtoff: i64, zone: &str) -> Object {
         );
         d.insert(
             crate::stdlib::os::static_name_key("tm_zone"),
-            Object::from_str(zone.to_owned()),
+            Object::from_str(zone),
         );
     }
     obj

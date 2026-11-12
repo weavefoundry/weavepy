@@ -16,13 +16,50 @@ use crate::sync::{Rc, Weak};
 macro_rules! weak_object {
     ($($variant:ident),* $(,)?) => {
         /// A weak handle on a heap-backed [`Object`]; see the module docs.
+        ///
+        /// `repr(C, u8)`, with one pointer in every variant: a tag byte,
+        /// then the pointer a word on (see [`Self::into_parts`]).
         #[allow(missing_debug_implementations)]
+        #[repr(C, u8)]
         pub enum WeakObject {
             Tuple(ThinWeak<crate::tuple_storage::TupleStorage>),
             $($variant(weak_object!(@payload $variant)),)*
         }
 
+        const _: () = assert!(std::mem::size_of::<WeakObject>() == 16);
+
         impl WeakObject {
+            /// The handle as its variant's tag and its pointer (never `0`),
+            /// for a table that packs them beside other fields.
+            #[inline]
+            #[allow(clippy::cast_ptr_alignment)]
+            pub(crate) fn into_parts(self) -> (u8, usize) {
+                let this = std::mem::ManuallyDrop::new(self);
+                let p = std::ptr::from_ref(&*this).cast::<u8>();
+                // SAFETY: `repr(C, u8)`: the tag is the first byte, and
+                // every variant's payload is one pointer, a word on.
+                unsafe { (p.read(), p.add(8).cast::<usize>().read()) }
+            }
+
+            /// The handle [`Self::into_parts`] split.
+            ///
+            /// # Safety
+            ///
+            /// `tag` and `ptr` came from `into_parts`, and the handle they
+            /// own is rebuilt (and so released) once.
+            #[inline]
+            #[allow(clippy::cast_ptr_alignment)]
+            pub(crate) unsafe fn from_parts(tag: u8, ptr: usize) -> Self {
+                let mut out = std::mem::MaybeUninit::<Self>::uninit();
+                let p = out.as_mut_ptr().cast::<u8>();
+                // SAFETY: as `into_parts`; the caller's contract.
+                unsafe {
+                    p.write(tag);
+                    p.add(8).cast::<usize>().write(ptr);
+                    out.assume_init()
+                }
+            }
+
             /// A weak handle on `obj`, or `None` for a value with no heap
             /// allocation of its own (scalars, strings, bytes).
             pub fn new(obj: &Object) -> Option<Self> {

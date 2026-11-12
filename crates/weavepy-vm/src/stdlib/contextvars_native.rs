@@ -18,6 +18,16 @@
 //! Each OS thread has its own current context, created empty on first
 //! use (a new thread doesn't inherit its creator's values). Greenlets
 //! swap it through [`take_current`] and [`set_current`].
+//!
+//! A copy no Python code can see yet needn't be a `Context` at all: a
+//! [`snapshot`] is the copied mapping itself (an `Object::Dict`), which
+//! asyncio keeps for a task and for the callbacks it schedules, and
+//! [`run_in_snapshot`] runs code over it as an unnamed current context.
+//! The `Context` is built only when something asks for one (a
+//! `ContextVar.set` or `reset`, `copy_context()`'s caller doesn't count:
+//! it gets a copy), and the run hands it back so its owner keeps it. A
+//! task's context so costs nothing until it's used (CPython's costs one
+//! small object; a `Context` here is an instance and its slots).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -87,6 +97,13 @@ thread_local! {
         const { std::mem::ManuallyDrop::new(std::cell::RefCell::new(Object::None)) };
 }
 
+thread_local! {
+    /// The last unnamed snapshot [`current`] built a `Context` for: the
+    /// snapshot's mapping and the `Context`, by address (see
+    /// [`current_for`]).
+    static BUILT_FROM: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// The context-switch watcher (`_testcapi`'s `PyContext_AddWatcher`
 /// fixture), called with the new current context after every switch.
 static SWITCH_HOOK: parking_lot::Mutex<Option<Object>> = parking_lot::Mutex::new(None);
@@ -144,22 +161,26 @@ fn new_dict() -> Object {
 
 /// A natively built `Context` over `data` (shared, not copied).
 fn new_context(st: &State, data: Object) -> Object {
-    let mut inst = PyInstance::new(st.context_cls.clone());
-    inst.slots = RefCell::new(SlotStorage::from_layout(
-        st.context_layout.clone(),
-        vec![data, Object::Bool(false), Object::None],
-    ));
+    let inst = PyInstance::with_slots(
+        st.context_cls.clone(),
+        SlotStorage::from_layout_array(
+            st.context_layout.clone(),
+            [data, Object::Bool(false), Object::None],
+        ),
+    );
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     obj
 }
 
 fn new_token(st: &State, var: Object, old: Object, ctx: Object) -> Object {
-    let mut inst = PyInstance::new(st.token_cls.clone());
-    inst.slots = RefCell::new(SlotStorage::from_layout(
-        st.token_layout.clone(),
-        vec![var, old, Object::Bool(false), ctx],
-    ));
+    let inst = PyInstance::with_slots(
+        st.token_cls.clone(),
+        SlotStorage::from_layout_array(
+            st.token_layout.clone(),
+            [var, old, Object::Bool(false), ctx],
+        ),
+    );
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     obj
@@ -173,26 +194,72 @@ fn data_of(ctx: &PyInstance) -> Option<Rc<RefCell<DictData>>> {
     }
 }
 
-/// The thread's current context, created (empty) on first use.
+/// The thread's current context, created (empty) on first use, and
+/// built if it's a [`snapshot`] running unnamed (the run that entered it
+/// finds the `Context` in its place when it leaves).
 fn current(st: &State) -> Object {
     CURRENT.with(|c| {
         let mut c = c.borrow_mut();
-        if matches!(*c, Object::None) {
-            *c = new_context(st, new_dict());
+        match &*c {
+            Object::None => *c = new_context(st, new_dict()),
+            Object::Dict(d) => {
+                let from = Rc::as_ptr(d) as usize;
+                let data = std::mem::replace(&mut *c, Object::None);
+                *c = new_entered_context(st, data);
+                if let Object::Instance(i) = &*c {
+                    BUILT_FROM.with(|b| b.set((from, Rc::as_ptr(i) as usize)));
+                }
+            }
+            _ => {}
         }
         c.clone()
     })
 }
 
+/// A `Context` over `data`, already entered (it stands for the unnamed
+/// one a [`run_in_snapshot`] entered).
+fn new_entered_context(st: &State, data: Object) -> Object {
+    let ctx = new_context(st, data);
+    if let Object::Instance(i) = &ctx {
+        if let Some(slot) = i.slots.borrow_mut().get_hinted_mut(CTX_ENTERED, "_entered") {
+            *slot = Object::Bool(true);
+        }
+    }
+    ctx
+}
+
+/// The thread's current context, built if it's an unnamed snapshot
+/// (`None` if there's none yet).
+fn current_built() -> Object {
+    let unnamed = CURRENT.with(|c| matches!(*c.borrow(), Object::Dict(_)));
+    if unnamed {
+        if let Ok(st) = state() {
+            return current(&st);
+        }
+    }
+    CURRENT.with(|c| c.borrow().clone())
+}
+
 /// The thread's current context, or `None` before one exists. For
 /// greenlet switches: the slot is emptied.
 pub(crate) fn take_current() -> Object {
+    let _ = current_built();
     CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), Object::None))
 }
 
 /// The thread's current context without creating one (`None` if none).
 pub(crate) fn peek_current() -> Object {
-    CURRENT.with(|c| c.borrow().clone())
+    current_built()
+}
+
+/// The current context's mapping, if there's a current context, for a
+/// reader that runs no code (see [`peek_current`]).
+pub(crate) fn peek_current_data() -> Option<Rc<RefCell<DictData>>> {
+    CURRENT.with(|c| match &*c.borrow() {
+        Object::Dict(d) => Some(d.clone()),
+        Object::Instance(i) => data_of(i),
+        _ => None,
+    })
 }
 
 /// Make `ctx` (a context or `None`) the thread's current one.
@@ -206,11 +273,104 @@ pub(crate) fn copy_current() -> Result<Object, RuntimeError> {
     context_over(current_data()?)
 }
 
+/// A copy of the current context that no Python code sees yet: its
+/// mapping (an `Object::Dict`), which [`run_in_snapshot`] runs code over
+/// and [`built`] makes a `Context` of. (A `Context` while a switch hook
+/// watches, which must be handed the context each switch enters.)
+pub(crate) fn snapshot() -> Result<Object, RuntimeError> {
+    if HOOK_SET.load(Ordering::Relaxed) {
+        return copy_current();
+    }
+    Ok(Object::Dict(current_data()?))
+}
+
+/// `ctx`, a context or a [`snapshot`], as a `Context`.
+pub(crate) fn built(ctx: Object) -> Result<Object, RuntimeError> {
+    match ctx {
+        Object::Dict(d) => context_over(d),
+        ctx => Ok(ctx),
+    }
+}
+
+/// Whether the current context is `data` running unnamed (see
+/// [`run_in_snapshot`]), not yet built.
+pub(crate) fn running_unnamed(data: &Rc<RefCell<DictData>>) -> bool {
+    CURRENT.with(|c| matches!(&*c.borrow(), Object::Dict(d) if Rc::ptr_eq(d, data)))
+}
+
+/// The current context, built, if it stands for the snapshot `data`: the
+/// snapshot runs unnamed, or the current `Context` was built for it (see
+/// [`run_in_snapshot`]). For the snapshot's owner, which keeps it.
+pub(crate) fn current_for(data: &Rc<RefCell<DictData>>) -> Result<Option<Object>, RuntimeError> {
+    if running_unnamed(data) {
+        let st = state()?;
+        return Ok(Some(current(&st)));
+    }
+    let (from, built) = BUILT_FROM.with(std::cell::Cell::get);
+    if from != Rc::as_ptr(data) as usize {
+        return Ok(None);
+    }
+    Ok(CURRENT.with(|c| match &*c.borrow() {
+        cur @ Object::Instance(i) if Rc::as_ptr(i) as usize == built => Some(cur.clone()),
+        _ => None,
+    }))
+}
+
+/// `ctx.run(f, *args)` for native callers, `ctx` a context or a
+/// [`snapshot`]: a snapshot runs as an unnamed current context, and the
+/// `Context` built for it on the way (if anything asked for one) comes
+/// back with the result, for the snapshot's owner to keep.
+pub(crate) fn run_in_snapshot(
+    ctx: &Object,
+    f: &Object,
+    args: &[Object],
+) -> (Result<Object, RuntimeError>, Option<Object>) {
+    let Object::Dict(_) = ctx else {
+        return (run_in_context(ctx, f, args), None);
+    };
+    let prev = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx.clone()));
+    let hooked = HOOK_SET.load(Ordering::Relaxed);
+    let mut result = if hooked {
+        // The hook is handed the context: build it.
+        let entered = state().map(|st| current(&st));
+        match entered.and_then(|c| fire_switch_hook(&c)) {
+            Ok(()) => call(f, args, &[]),
+            Err(e) => Err(e),
+        }
+    } else {
+        call(f, args, &[])
+    };
+    let me = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev.clone()));
+    let made = match me {
+        Object::Instance(i) => {
+            if let Some(slot) = i.slots.borrow_mut().get_hinted_mut(CTX_ENTERED, "_entered") {
+                *slot = Object::Bool(false);
+            }
+            Some(Object::Instance(i))
+        }
+        _ => None,
+    };
+    if hooked {
+        if let Err(e) = fire_switch_hook(&prev) {
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
+    }
+    (result, made)
+}
+
 /// The current context's mapping, shared: a snapshot of it, as
 /// [`copy_current`] would take, for a caller that may never need the
 /// `Context` itself (a later `ContextVar.set` copies a shared mapping
 /// before writing, so the snapshot never changes).
 pub(crate) fn current_data() -> Result<Rc<RefCell<DictData>>, RuntimeError> {
+    if let Some(d) = CURRENT.with(|c| match &*c.borrow() {
+        Object::Dict(d) => Some(d.clone()),
+        _ => None,
+    }) {
+        return Ok(d);
+    }
     let st = state()?;
     let cur = current(&st);
     let Object::Instance(i) = &cur else {
@@ -288,6 +448,7 @@ fn var_get(args: &[Object]) -> Result<Object, RuntimeError> {
         let c = c.borrow();
         match &*c {
             Object::Instance(ctx) => data_of(ctx).and_then(|d| d.borrow().get(&key).cloned()),
+            Object::Dict(d) => d.borrow().get(&key).cloned(),
             _ => None,
         }
     });
@@ -648,6 +809,10 @@ fn set_switch_hook(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `clear_context_stack` in `Modules/_testcapi/watchers.c`: drop the
 /// thread's base context so the next switch reports `None` on exit.
 fn clear_context_stack(_args: &[Object]) -> Result<Object, RuntimeError> {
+    if CURRENT.with(|c| matches!(*c.borrow(), Object::Dict(_))) {
+        // An unnamed snapshot runs: some run entered it.
+        return Err(runtime_error("must first exit all non-base contexts"));
+    }
     let cur = peek_current();
     if let Object::Instance(ctx) = &cur {
         let entered = ctx

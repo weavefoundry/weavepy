@@ -494,11 +494,29 @@ impl<T: ?Sized + 'static> Drop for Rc<T> {
     #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: this owner holds one strong reference, released exactly
-        // once: either here, or by Arc's own drop, or by handing it on.
+        // once: either here, or by `drop_last`.
         unsafe {
             if try_release_shared(Arc::as_ptr(&self.0)) {
                 return;
             }
+            self.drop_last();
+        }
+    }
+}
+
+impl<T: ?Sized + 'static> Rc<T> {
+    /// [`Drop::drop`]'s release of what may be the last strong reference,
+    /// out of line: every drop of an `Rc` (each of `Object`'s variants
+    /// among them) takes only the shared release in line, so the code
+    /// that drops values stays small.
+    ///
+    /// # Safety
+    ///
+    /// Called once, from `drop`, with this owner's reference unreleased.
+    #[inline(never)]
+    unsafe fn drop_last(&mut self) {
+        // SAFETY: the caller's contract.
+        unsafe {
             // The last reference to an object that owes a finalizer moves
             // to the finalizer queue instead: the object stays alive, at
             // its address, until its `__del__` (or generator close) has

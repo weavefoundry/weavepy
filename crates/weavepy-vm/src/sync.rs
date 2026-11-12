@@ -410,6 +410,21 @@ pub(crate) fn object_cell_offsets() -> (usize, usize) {
     )
 }
 
+/// A list's `GilCell` (around its vector): its borrow counter's and
+/// vector's byte offsets, for compiled code.
+pub(crate) fn list_cell_offsets() -> (usize, usize) {
+    cell_offsets::<Vec<crate::object::Object>>()
+}
+
+/// Where a `GilCell<T>`'s borrow counter and its value sit in it.
+pub(crate) fn cell_offsets<T>() -> (usize, usize) {
+    type Cell<T> = GilCell<T>;
+    (
+        std::mem::offset_of!(Cell<T>, borrow),
+        std::mem::offset_of!(Cell<T>, data),
+    )
+}
+
 /// The flag [`GilCell::peek`] tests, for native code that peeks (a byte:
 /// nonzero once cells are shared between threads).
 pub(crate) fn cells_unguarded_flag() -> *const bool {
@@ -444,6 +459,11 @@ pub(crate) fn release_gates() -> u32 {
     // says why that's sound): the observers' flags are set between
     // operations, by the thread that then observes.
     unsafe { std::ptr::from_ref(&RELEASE_GATES).cast::<u32>().read() }
+}
+
+/// The word [`release_gates`] reads, for native code that reads it in line.
+pub(crate) fn release_gates_ptr() -> *const u32 {
+    std::ptr::from_ref(&RELEASE_GATES).cast::<u32>()
 }
 
 /// The [`release_gates`] bits of the release observers alone (every flag
@@ -519,18 +539,20 @@ fn biased_here() -> bool {
     if cells_shared() {
         return false;
     }
-    // Debug builds -- which is what the unit-test binary is -- keep the
-    // identity check as a *steer*: that binary runs many VM threads at
-    // once with no GIL between them (every test is its own interpreter),
-    // so the invariant above does not hold there, and only the first
-    // registered thread may take the lock-free path. A release build has
-    // one VM thread under the GIL and pays nothing.
-    #[cfg(debug_assertions)]
+    // Debug and test builds keep the identity check as a *steer*: the
+    // unit-test binary (optimized or not) runs many VM threads at once
+    // with no GIL between them (every test is its own interpreter), so the
+    // invariant above does not hold there, and only the first registered
+    // thread may take the lock-free path. (Without it, two threads' plain
+    // updates of `SOLE_GUARDS` can lose one, and the next thread to
+    // register spins in `revoke_bias` forever, holding the GIL.) A release
+    // build has one VM thread under the GIL and pays nothing.
+    #[cfg(any(debug_assertions, test))]
     {
         let first = FIRST.load(Ordering::Relaxed);
         first != 0 && CELL_TLS.try_with(|t| t.thread_id.get()).unwrap_or(0) == first
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, test)))]
     {
         true
     }
@@ -556,9 +578,13 @@ fn publish_sole_guard() {
 
 /// Whether [`heavy_barrier`] can make *every* thread execute a full
 /// memory barrier: `membarrier(2)` on Linux, `FlushProcessWriteBuffers`
-/// on Windows. Set once, at process start-up, only after the platform
-/// facility is confirmed to work; a thread that reads it stale (`false`)
-/// simply fences itself, which is always sound.
+/// on Windows. Set once, by the first revocation (the only caller of the
+/// barrier), only after the platform facility is confirmed to work.
+///
+/// (Not at start-up: Linux registers a process that already has more
+/// than one thread, as the interpreter's large-stack thread makes it, by
+/// waiting out an RCU grace period, which took 10 to 20 ms of every
+/// start. A program that never shares cells never registers.)
 ///
 /// This is what keeps the biased borrow path free of barriers: the
 /// ordering the revocation handshake needs is paid by the revoker, at
@@ -664,7 +690,9 @@ fn revoke_bias() {
     // After this every thread has executed a full barrier: a borrow that
     // read the flag as clear did so before it, and its guard store --
     // program-ordered before that read and compiler-fenced -- is therefore
-    // visible to the drain below.
+    // visible to the drain below. (The facility is registered here, the
+    // first time a barrier is due.)
+    enable_asymmetric_barrier();
     heavy_barrier();
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
@@ -679,7 +707,7 @@ pub fn note_vm_thread(thread_id: u64) {
         return;
     }
     match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => enable_asymmetric_barrier(),
+        Ok(_) => {}
         Err(first) if first == thread_id => {}
         Err(first) => {
             if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {

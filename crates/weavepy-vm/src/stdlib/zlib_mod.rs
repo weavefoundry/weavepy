@@ -278,10 +278,31 @@ fn zlib_compress(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // Share the low-level deflate path with `compressobj` so that
     // `compress(x)` and `compressobj().compress(x) + .flush()` produce
     // byte-identical output (`test_pair` asserts this equality).
-    let mut c = build_compress(level, wbits, &[]);
-    let mut out = deflate_step(&mut c, &data, FlushCompress::None)?;
-    out.extend(deflate_step(&mut c, &[], FlushCompress::Finish)?);
-    Ok(Object::new_bytes(out))
+    let key = (level, wbits);
+    let mut c = ONE_SHOT
+        .with(|s| s.borrow_mut().take())
+        .filter(|(k, _)| *k == key)
+        .map(|(_, mut c)| {
+            c.reset();
+            c
+        })
+        .unwrap_or_else(|| build_compress(level, wbits, &[]));
+    let out = deflate_step(&mut c, &data, FlushCompress::None).and_then(|mut out| {
+        out.extend(deflate_step(&mut c, &[], FlushCompress::Finish)?);
+        Ok(out)
+    });
+    ONE_SHOT.with(|s| *s.borrow_mut() = Some((key, c)));
+    Ok(Object::new_bytes(out?))
+}
+
+thread_local! {
+    /// The last one-shot `compress()`'s compressor and its `(level,
+    /// wbits)`: reset for the next call with the same parameters (zlib's
+    /// `deflateReset`, the same stream a fresh one writes), instead of
+    /// allocating and zeroing its window and tables again, which for a
+    /// short input cost more than the compression.
+    static ONE_SHOT: std::cell::RefCell<Option<((i64, i64), Compress)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Decompress with optional `wbits`:

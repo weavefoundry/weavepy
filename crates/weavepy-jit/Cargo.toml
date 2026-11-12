@@ -1,6 +1,6 @@
 [package]
 name = "weavepy-jit"
-description = "RFC 0032 — tier-2 Cranelift JIT for WeavePy's unboxed numeric frames."
+description = "RFC 0032 — tier-2 JIT for WeavePy's unboxed numeric frames."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -14,11 +14,7 @@ publish = false
 
 [dependencies]
 weavepy-compiler   = { workspace = true }
-cranelift-codegen  = { workspace = true }
-cranelift-frontend = { workspace = true }
-cranelift-jit      = { workspace = true }
-cranelift-module   = { workspace = true }
-cranelift-native   = { workspace = true }
+weavepy-codegen    = { workspace = true }
 
 [dev-dependencies]
 # Analyzer tests parse + compile real Python shapes (RFC 0058 WS4).
