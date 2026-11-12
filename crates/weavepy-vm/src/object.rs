@@ -1250,7 +1250,16 @@ impl<T: Clone> FrameSlot<T> {
     /// Turn a borrowed slot into an owning one. Idempotent.
     pub(crate) fn upgrade(&self) {
         if let Some(value) = &self.value {
-            if !self.owned.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // (With the reference-count bias held only this thread touches
+            // the flag: a plain test and store instead of a locked swap.)
+            let was_owned = if crate::rc::refcounts_biased() {
+                let owned = self.owned.load(std::sync::atomic::Ordering::Relaxed);
+                self.owned.store(true, std::sync::atomic::Ordering::Relaxed);
+                owned
+            } else {
+                self.owned.swap(true, std::sync::atomic::Ordering::AcqRel)
+            };
+            if !was_owned {
                 // The slot's bitwise copy becomes a real handle by taking
                 // the count it never had.
                 std::mem::forget(T::clone(value));
@@ -1670,18 +1679,30 @@ pub(crate) struct LazyShellRef(Rc<FrameShell>);
 
 impl LazyShellRef {
     pub(crate) fn new(shell: Rc<FrameShell>) -> Self {
-        shell
-            .tb_refs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::count(&shell, 1);
         Self(shell)
+    }
+
+    /// Add `by` (plus or minus one) to `shell`'s count of holds: a plain
+    /// load and store with the reference-count bias held (only this thread
+    /// touches the count then), a locked update otherwise.
+    #[inline]
+    fn count(shell: &FrameShell, by: i32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::rc::refcounts_biased() {
+            let n = shell.tb_refs.load(Relaxed);
+            shell.tb_refs.store(n.wrapping_add_signed(by), Relaxed);
+        } else if by > 0 {
+            shell.tb_refs.fetch_add(1, Relaxed);
+        } else {
+            shell.tb_refs.fetch_sub(1, Relaxed);
+        }
     }
 }
 
 impl Drop for LazyShellRef {
     fn drop(&mut self) {
-        self.0
-            .tb_refs
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        Self::count(&self.0, -1);
     }
 }
 

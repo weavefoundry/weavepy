@@ -147,6 +147,19 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
     }
 
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if crate::rc::refcounts_biased() {
+            // `Arc::get_mut` locks the weak count against another thread's
+            // `downgrade`, which the bias rules out (see `rc::sole_owner`):
+            // the sole owner reads the two counts ahead of the payload.
+            // SAFETY: this owner keeps the allocation alive, and a sole
+            // owner's exclusive borrow is the payload's only access.
+            unsafe {
+                let counts = this.data.as_ptr().cast::<std::sync::atomic::AtomicUsize>();
+                let sole = (*counts).load(std::sync::atomic::Ordering::Relaxed) == 1
+                    && (*counts.add(1)).load(std::sync::atomic::Ordering::Relaxed) == 1;
+                return sole.then(|| &mut *this.raw().cast_mut());
+            }
+        }
         let mut view = this.arc_view();
         let raw = ptr::from_mut(Arc::get_mut(&mut view)?);
         // SAFETY: Arc checked uniqueness of both strong and weak ownership.
