@@ -82081,7 +82081,7 @@ pub(crate) fn memory_tick_from_countdown() {
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.load(Relaxed).wrapping_add(1);
     COUNT.store(n, Relaxed);
-    if n % MEMORY_TICK_EVERY == 0 {
+    if n.is_multiple_of(MEMORY_TICK_EVERY) {
         memory_tick();
     }
 }
