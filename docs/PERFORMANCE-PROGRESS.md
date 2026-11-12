@@ -1612,6 +1612,35 @@ branch and pull request.
     platform (279M to 367M instructions). The short comprehension that
     change was for still goes in line (7,811 instructions a call against
     21,147 before it).
+  - The Ubuntu bench gate's `float_math` (1.11 to 1.27 of the merge base
+    over twelve CI runs) and `deque_ops` (1.05 to 1.15) were real, not
+    runner noise. A throwaway workflow timed builds along the branch's
+    history on `ubuntu-latest` runners, interleaved on one machine, and
+    bisected each to commits; neither reproduces on this development
+    host (an i9-9980HK), and the runners expose no hardware counters.
+    - `float_math`: `d30367eb` counted tier 2's framed calls of loop-free
+      callees toward its call-density judgment, which hands the loop to
+      the frame JIT. `float_math`'s constructor and methods work on float
+      fields and `math` calls, which tier 2 keeps in their lanes and the
+      frame JIT boxes: the frame JIT's code took 1.27 to 1.36 times the
+      merge base's time on AMD EPYC runners and 1.16 on an Intel Xeon
+      (Ice Lake), against 0.89 to 0.96 for tier 2's. (On the development
+      host the frame JIT's is 7% faster.) A callee whose body keeps
+      floats in their lanes (a float local, field site or return, or a
+      `math` intrinsic) no longer counts toward the judgment:
+      `float_math` takes 0.95 to 0.99 of the merge base's time on the
+      runners, from 1.14 to 1.16.
+    - `deque_ops`: `f33a6f89` gave a deque a `__slots__` layout, whose
+      lookup by name ran a slow path (17% more instructions), and
+      `146c040b`'s fast path compared the four names at every native
+      call, about 40M of the fixture's 640M instructions with the
+      iterator's lookups. The deque's and its iterator's native methods
+      now remember the layout they found led by their names
+      (`LayoutMemo`) and compare its address: 576M instructions, and
+      0.83 to 0.88 of the merge base's time on the runners, from 1.08 to
+      1.18.
+    - With both, the bench gate passed on three runners (two EPYC 9V45,
+      one EPYC 9V74), its suite at 0.903 to 0.937 of the merge base.
   - Tried and dropped: calling a Python `__next__` from the core loop's
     `FOR_ITER` without a bound method. It skipped tier 2's direct entry,
     which the bound-method call reaches, and a warm five-item loop took

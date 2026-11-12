@@ -476,6 +476,22 @@ struct Artifacts {
     /// round-trips they made (see [`note_callee_exit`]).
     callee_entries: Cell<u32>,
     callee_roundtrips: Cell<u32>,
+    /// Whether the body works on floats in their lanes (a float local,
+    /// field or return, or a `math` intrinsic): see [`float_work`].
+    float_work: bool,
+}
+
+/// Whether `cf` keeps floats unboxed: a float local, field site or
+/// return, or a `math` intrinsic. The frame JIT boxes each float it
+/// computes, so a loop calling such a body stays native even when it's
+/// dense with calls (see `try_native_call`): `float_math`'s loops took
+/// 1.27 times as long under the frame JIT on AMD runners, 1.16 on Intel.
+fn float_work(cf: &CompiledFrame) -> bool {
+    let float = |t: &JitType| matches!(t, JitType::Float);
+    !cf.math_guards.is_empty()
+        || cf.ret_lane.as_ref().is_some_and(float)
+        || cf.local_types.iter().flatten().any(float)
+        || cf.attr_sites.iter().any(|a| float(&a.lane))
 }
 
 /// RFC 0073 WS4 — source of [`Artifacts::compile_id`].
@@ -1807,6 +1823,7 @@ impl JitState {
                             _ => None,
                         })
                         .collect();
+                    let float_work = float_work(&cf);
                     let artifacts = StdRc::new(Artifacts {
                         code: code.clone(),
                         cf: StdRc::new(cf),
@@ -1821,6 +1838,7 @@ impl JitState {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         callee_entries: Cell::new(0),
                         callee_roundtrips: Cell::new(0),
+                        float_work,
                     });
                     // RFC 0067 WS1 — a fresh compile can flip a
                     // `None` native-callee slot in *other* frames'
@@ -6034,8 +6052,11 @@ unsafe fn try_native_call(
     // objects) costs several times less as a frame-JIT direct call than
     // as the framed call below (3x for a one-call loop): a loop dense
     // with them belongs to tier 1 too. (A pure leaf was charged above;
-    // the tests of these calls keep them native.)
-    if !pure_leaf && nc.code.jit_hint.loop_free(&nc.code) && call_dense_retires() {
+    // the tests of these calls keep them native.) Not a body working on
+    // floats in their lanes, which the frame JIT would box (see
+    // `float_work`).
+    if !pure_leaf && !nc.float_work && nc.code.jit_hint.loop_free(&nc.code) && call_dense_retires()
+    {
         ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
     }
     // Keep disjoint regions in one pooled owner per element width, as

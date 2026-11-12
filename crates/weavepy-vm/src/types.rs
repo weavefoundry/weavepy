@@ -2934,6 +2934,59 @@ struct FixedHead {
     layout: SharedSlice<DictKey>,
 }
 
+/// The `__slots__` layout a native caller found led by its names (see
+/// [`SlotStorage::leading_memo`]): later calls compare the layout's word
+/// instead of the names. The first such layout is kept for good, and
+/// alive, so its word can't come back as another layout's (the classes
+/// these callers serve have one layout, a subclass's aside).
+#[derive(Debug, Default)]
+pub struct LayoutMemo {
+    word: std::sync::atomic::AtomicUsize,
+}
+
+impl LayoutMemo {
+    pub const fn new() -> Self {
+        LayoutMemo {
+            word: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[inline(always)]
+    fn word(&self) -> usize {
+        self.word.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember `layout` if none is remembered yet and it leads with
+    /// `names` (interned, as a layout's keys are).
+    #[cold]
+    #[inline(never)]
+    fn note(&self, layout: &SharedSlice<DictKey>, names: &[&crate::shared_value::SharedStr]) {
+        if self.word() != 0 {
+            return;
+        }
+        let leads = layout.len() >= names.len()
+            && layout.iter().zip(names).all(|(key, name)| {
+                matches!(&key.0, Object::Str(s)
+                    if crate::shared_value::SharedStr::ptr_eq(s, name))
+            });
+        let word = SharedSlice::word(layout);
+        if leads
+            && self
+                .word
+                .compare_exchange(
+                    0,
+                    word,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            // Held for good (see above).
+            std::mem::forget(layout.clone());
+        }
+    }
+}
+
 /// Where a laid-out block's values start.
 #[cfg(target_pointer_width = "64")]
 pub(crate) const SLOT_VALUES_AT: usize = std::mem::size_of::<FixedHead>();
@@ -3915,6 +3968,54 @@ impl SlotStorage {
         let base = entries.as_ptr();
         // SAFETY: the store holds at least `N` entries (checked above).
         Some(std::array::from_fn(|i| unsafe { &(*base.add(i)).1 }))
+    }
+
+    /// [`Self::leading_interned`] for a caller that remembers in `memo`
+    /// the `__slots__` layout it found led by `names`: a store with
+    /// that layout skips the names' comparison (a deque's methods and
+    /// iterators run it at every call).
+    #[inline(always)]
+    pub fn leading_memo<const N: usize>(
+        &self,
+        memo: &LayoutMemo,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&Object; N]> {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
+            if SharedSlice::word(layout) == memo.word() {
+                // (The memo's layout leads with `names`.)
+                let values = values.get(..N)?;
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return None;
+                }
+                return Some(std::array::from_fn(|i| &values[i]));
+            }
+            memo.note(layout, &names);
+        }
+        self.leading_interned(names)
+    }
+
+    /// [`Self::leading_memo`], mutably.
+    #[inline(always)]
+    pub fn leading_memo_mut<const N: usize>(
+        &mut self,
+        memo: &LayoutMemo,
+        names: [&crate::shared_value::SharedStr; N],
+    ) -> Option<[&mut Object; N]> {
+        if let SlotsMut::Fixed(layout, values) = self.view_mut() {
+            if SharedSlice::word(layout) == memo.word() {
+                // (The memo's layout leads with `names`.)
+                let values = values.get_mut(..N)?;
+                if values.iter().any(|v| matches!(v, Object::Unbound)) {
+                    return None;
+                }
+                let base = values.as_mut_ptr();
+                // SAFETY: `N` distinct in-range values, borrowed from
+                // `self` for the result's lifetime.
+                return Some(std::array::from_fn(|i| unsafe { &mut *base.add(i) }));
+            }
+            memo.note(layout, &names);
+        }
+        self.leading_interned_mut(names)
     }
 
     /// [`Self::leading_interned`], mutably.

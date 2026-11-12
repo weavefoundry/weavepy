@@ -140,6 +140,11 @@ impl DequeState<'_> {
     }
 }
 
+/// The slot layouts a deque's and its iterators' native methods found led
+/// by their names (see `SlotStorage::leading_memo`).
+static DEQUE_LAYOUT: crate::types::LayoutMemo = crate::types::LayoutMemo::new();
+static ITER_LAYOUT: crate::types::LayoutMemo = crate::types::LayoutMemo::new();
+
 /// A deque's slot storage and backing list, borrowed without guards
 /// when nothing holds either (the end operations run no Python code
 /// while they use them; the free-threaded build's shared cells always
@@ -158,7 +163,7 @@ fn fast_parts(args: &[Object]) -> Option<Fast<'_>> {
     let slots = unsafe { inst.slots.peek_mut() }?;
     let n = names();
     let [data, head, maxlen, state] =
-        slots.leading_interned_mut([&n.data, &n.head, &n.maxlen, &n.state])?;
+        slots.leading_memo_mut(&DEQUE_LAYOUT, [&n.data, &n.head, &n.maxlen, &n.state])?;
     let Object::List(data) = data else {
         return None;
     };
@@ -689,7 +694,8 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     // distinct objects.
     let its = unsafe { iterator.slots.peek_mut() }?;
     let n = names();
-    let [deque, index, it_state] = its.leading_interned_mut([&n.deq, &n.index, &n.deq_state])?;
+    let [deque, index, it_state] =
+        its.leading_memo_mut(&ITER_LAYOUT, [&n.deq, &n.index, &n.deq_state])?;
     let Object::Instance(deque) = deque else {
         return None;
     };
@@ -700,7 +706,8 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     };
     // SAFETY: as above.
     let ds = unsafe { (*deque).slots.peek() }?;
-    let [data, head, _, state] = ds.leading_interned([&n.data, &n.head, &n.maxlen, &n.state])?;
+    let [data, head, _, state] =
+        ds.leading_memo(&DEQUE_LAYOUT, [&n.data, &n.head, &n.maxlen, &n.state])?;
     let Object::List(data) = data else {
         return None;
     };
