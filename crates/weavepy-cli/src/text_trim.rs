@@ -16,18 +16,21 @@
 //! (as `alloc.rs` releases heap pages there, and for the same reason:
 //! nothing else takes pages out of the resident set at once). On Linux that
 //! part is larger still, since a fault there maps the sixteen pages around
-//! the one touched. The pages stay in the file
-//! cache, and the code the program is still running comes back a soft fault
-//! a page, which costs too little to measure: six thousand of them in a
-//! second-long run left its cycles where they were. What doesn't come back
-//! is everything the process only passed through.
+//! the one touched. The pages stay in the file cache, and the code the
+//! program is still running comes back a soft fault a page, about a
+//! microsecond each. What doesn't come back is everything the process only
+//! passed through.
 //!
-//! The first release waits for the resident set to reach [`FIRST_AT`], so an
-//! interpreter that only starts up, or runs a small script, pays nothing.
-//! Each one after that waits twice as long as the one before, from
-//! [`FIRST_WAIT`] up: a program's one-time code runs mostly early (its
-//! imports, then its compiles), and however long it runs, it releases only a
-//! handful of times more.
+//! A release costs the process about a millisecond, most of it those
+//! faults, so it happens only where it lowers the most memory the process
+//! ever holds: when the resident set is about to pass its highest so far
+//! (within [`margin`] of it). A process that has stopped growing keeps what
+//! it has. The first release also waits for the resident set to reach
+//! [`FIRST_AT`], so an interpreter that only starts up, or runs a small
+//! script, pays nothing; and each one waits twice as long after the last
+//! as that one did, from [`FIRST_WAIT`] up, so a process that grows steadily
+//! (and is always at its highest) releases a handful of times, not at every
+//! megabyte.
 //!
 //! The pages are the file's, so nothing is lost: with one exception, a
 //! debugger's breakpoints, which live in private copies of code pages. A
@@ -49,9 +52,11 @@ const FIRST_AT: usize = 10 << 20;
 const FIRST_WAIT: u64 = 2_000;
 const LONGEST_WAIT: u64 = 30_000_000;
 
-/// The least the resident set grows between two releases: with less than
-/// this back since the last one, there's nothing to release.
-const STEP: usize = 1 << 20;
+/// How near its highest so far the resident set comes before a release:
+/// about what a busy process grows between two looks.
+fn margin(highest: usize) -> usize {
+    (highest / 16).max(1 << 20)
+}
 
 const UNSET: u8 = 0;
 const READY: u8 = 1;
@@ -63,9 +68,12 @@ static STATE: AtomicU8 = AtomicU8::new(UNSET);
 static RANGE: [[AtomicUsize; 2]; RANGES] =
     [const { [AtomicUsize::new(0), AtomicUsize::new(0)] }; RANGES];
 const RANGES: usize = 4;
-/// The resident set size from which the next release may happen, and when
-/// (in microseconds since [`started`]), with the wait after it.
+/// The resident set size from which the first release may happen, and the
+/// highest the resident set has been seen.
 static NEXT_AT: AtomicUsize = AtomicUsize::new(FIRST_AT);
+static HIGHEST: AtomicUsize = AtomicUsize::new(0);
+/// When the next release may happen (in microseconds since [`started`]),
+/// with the wait after it.
 static NEXT_TIME: AtomicU64 = AtomicU64::new(0);
 static NEXT_WAIT: AtomicU64 = AtomicU64::new(FIRST_WAIT);
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -134,7 +142,14 @@ fn whole_pages(span: (usize, usize), page: usize) -> Option<(usize, usize)> {
 /// The process's resident set is `resident` bytes: release the code's pages
 /// if it's time (see the module docs).
 pub(crate) fn grown(resident: usize) {
-    if STATE.load(Ordering::Acquire) != READY || resident < NEXT_AT.load(Ordering::Relaxed) {
+    if STATE.load(Ordering::Acquire) != READY {
+        return;
+    }
+    let highest = HIGHEST.load(Ordering::Relaxed);
+    if resident > highest {
+        HIGHEST.store(resident, Ordering::Relaxed);
+    }
+    if resident < NEXT_AT.load(Ordering::Relaxed) || resident + margin(highest) < highest {
         return;
     }
     let at = started().elapsed().as_micros() as u64;
@@ -168,7 +183,6 @@ pub(crate) fn grown(resident: usize) {
             wait / 1000
         );
     }
-    NEXT_AT.store(now + STEP, Ordering::Relaxed);
     NEXT_TIME.store(at + wait, Ordering::Relaxed);
     NEXT_WAIT.store(wait.saturating_mul(2).min(LONGEST_WAIT), Ordering::Relaxed);
     BUSY.store(false, Ordering::Release);
