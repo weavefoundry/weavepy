@@ -78421,7 +78421,13 @@ pub(crate) fn percent_format_with(
                     .ok()
                     .and_then(|m| {
                         let mut probe: Vec<u8> = Vec::new();
-                        probe.try_reserve_exact(m).ok()
+                        let reserved = probe.try_reserve_exact(m).ok();
+                        // (The reservation has to happen: an optimizer
+                        // drops an allocation nothing reads, and the
+                        // failure with it. A profile-guided build did, and
+                        // the padding's own allocation then aborted.)
+                        std::hint::black_box(&mut probe);
+                        reserved
                     })
                     .is_none()
                 {
