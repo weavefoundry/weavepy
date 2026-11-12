@@ -24,8 +24,13 @@
 //! A release costs the process two or three milliseconds, nearly all of it
 //! those faults (a program in the middle of its imports runs through about
 //! 5 MB of code pages, 1,300 of them), so it happens only where it lowers
-//! the most memory the process ever holds, and has something to free:
+//! the most memory the process ever holds, has something to free, and is a
+//! small part of the time the process has already taken:
 //!
+//! - the process is at least [`FIRST_AFTER`] old. A script that's over in
+//!   tens of milliseconds would spend a tenth of them on a release (and a
+//!   kernel of a millisecond or two, timed right after one, takes half as
+//!   long again), for memory it's about to give back anyway;
 //! - the resident set is about to pass its highest so far (within
 //!   [`margin`] of it), and is at least [`FIRST_AT`], so an interpreter that
 //!   only starts up, or runs a small script, pays nothing;
@@ -44,8 +49,8 @@
 //! - and the last release was a while ago, twice as long as the one before
 //!   it was from its own, from [`FIRST_WAIT`] up.
 //!
-//! Most programs so release once, a millisecond or two after their last
-//! import.
+//! Most programs that live that long so release once: a millisecond or two
+//! after their last import, or when they turn [`FIRST_AFTER`] old.
 //!
 //! The pages are the file's, so nothing is lost: with one exception, a
 //! debugger's breakpoints, which live in private copies of code pages. A
@@ -60,6 +65,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// The resident set size below which a process is left alone.
 const FIRST_AT: usize = 10 << 20;
+
+/// How old the process is at its first release, at the youngest, in
+/// microseconds: fifty times what a release costs it.
+const FIRST_AFTER: u64 = 100_000;
 
 /// How long after the first release the second may happen, in microseconds;
 /// each later one waits twice as long as the one before, up to
@@ -123,7 +132,7 @@ static SETTLED: AtomicBool = AtomicBool::new(true);
 static IMPORTS: AtomicUsize = AtomicUsize::new(0);
 /// When the next release may happen (in the tick's microseconds), with the
 /// wait after it.
-static NEXT_TIME: AtomicU64 = AtomicU64::new(0);
+static NEXT_TIME: AtomicU64 = AtomicU64::new(FIRST_AFTER);
 static NEXT_WAIT: AtomicU64 = AtomicU64::new(FIRST_WAIT);
 /// See [`QUIET`] and [`WORTH`] (tuning aids set them).
 static QUIET_FOR: AtomicU64 = AtomicU64::new(QUIET);
@@ -145,14 +154,17 @@ pub(crate) fn install() {
         _ => {}
     }
     // (Tuning aids: the resident set size of the first release and the
-    // file-backed growth of a later one, in bytes, and the wait after the
-    // first and after an import, in microseconds.)
+    // file-backed growth of a later one, in bytes, and the process's age at
+    // the first and the wait after it and after an import, in microseconds.)
     let tuned = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     if let Some(at) = tuned("WEAVEPY_TEXT_TRIM_AT") {
         NEXT_AT.store(at as usize, Ordering::Relaxed);
     }
     if let Some(worth) = tuned("WEAVEPY_TEXT_TRIM_WORTH") {
         WORTH_OF.store(worth as usize, Ordering::Relaxed);
+    }
+    if let Some(after) = tuned("WEAVEPY_TEXT_TRIM_AFTER") {
+        NEXT_TIME.store(after, Ordering::Relaxed);
     }
     if let Some(wait) = tuned("WEAVEPY_TEXT_TRIM_WAIT") {
         NEXT_WAIT.store(wait.max(1), Ordering::Relaxed);
