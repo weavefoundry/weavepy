@@ -1012,6 +1012,11 @@ pub struct Interpreter {
     /// out as an operand stack would make every push in the new frame
     /// re-grow it (the profile's `finish_grow` storm).
     scratch_pool: ThreadCell<Vec<Vec<Object>>>,
+    /// Recycled keyword-pair vectors for
+    /// [`Self::core_builtin_kw_lane`]: a pooled vector keeps its name
+    /// strings (and `None` values), so a call site's next call compares its
+    /// names instead of allocating them.
+    kw_scratch_pool: ThreadCell<Vec<Vec<(String, Object)>>>,
     /// RFC 0061 (WS3a) — recycled [`FrameShell`](crate::object::FrameShell)
     /// allocations. Every Python call used to `Arc`-allocate a fresh
     /// shell for the call-stack spine; a completed activation whose
@@ -1318,6 +1323,7 @@ impl Default for Interpreter {
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
+            kw_scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
             sum_fold: None,
             fuse_off: false,
@@ -1454,6 +1460,7 @@ impl Interpreter {
             frame_shell_pool: ThreadCell::new(Vec::new()),
             frame_stack_pool: ThreadCell::new(Vec::new()),
             scratch_pool: ThreadCell::new(Vec::new()),
+            kw_scratch_pool: ThreadCell::new(Vec::new()),
             gil_countdown: crate::gil::GIL_CHECK_INTERVAL,
             sum_fold: None,
             fuse_off: false,
@@ -14800,6 +14807,19 @@ impl Interpreter {
                                     1
                                 }
                                 Object::Type(t) if !t.flags.is_builtin => 2,
+                                // A builtin type's method on its receiver
+                                // (`xs.sort(reverse=True)`), or a builtin
+                                // type (`int(s, base=2)`).
+                                Object::Builtin(b)
+                                    if b.binds_instance && !matches!(&ops[1], Object::Unbound) =>
+                                {
+                                    1
+                                }
+                                Object::BoundMethod(_) | Object::Type(_)
+                                    if Self::kw_lane_callee(&ops[0], &ops[1]) =>
+                                {
+                                    1
+                                }
                                 _ => break None,
                             };
                             // SAFETY: `len <= cap`, every slot initialized.
@@ -17457,14 +17477,46 @@ impl Interpreter {
         true
     }
 
-    /// [`Self::core_builtin_lane`] for the `CALL_KW` at `pc` of a builtin
-    /// function the lane admits (`sorted(xs, key=f)`), in `sw`'s synced
-    /// running activation: the operands leave the stack, the call runs
-    /// through [`Self::call`] with the activation on the pending list, and
-    /// its result (or raise) lands as the full handler's would. `false`
-    /// touches nothing.
+    /// Whether a `CALL_KW`'s callee and self slot are a shape
+    /// [`Self::core_builtin_kw_lane`] calls: a builtin function, a builtin
+    /// type's method with its receiver (in the self slot, or bound), or a
+    /// builtin type other than `super` and `type` (which read the calling
+    /// frame, or build a class). (Which builtin functions may run without
+    /// the whole frame stack is the caller's to decide: see
+    /// `builtin_fn_lane_ok`.)
+    #[inline]
+    pub(crate) fn kw_lane_callee(callee: &Object, slot: &Object) -> bool {
+        match (callee, slot) {
+            (Object::Builtin(_), Object::Unbound) => true,
+            (Object::Builtin(b), _) => b.binds_instance,
+            (Object::BoundMethod(bm), Object::Unbound) => {
+                !bm.redispatch_descriptor && matches!(&bm.function, Object::Builtin(_))
+            }
+            (Object::Type(t), Object::Unbound) => {
+                let bt = builtin_types();
+                t.flags.is_builtin
+                    && t.metaclass_is_type()
+                    && !Rc::ptr_eq(t, &bt.super_)
+                    && !Rc::ptr_eq(t, &bt.type_)
+            }
+            _ => false,
+        }
+    }
+
+    /// [`Self::core_builtin_lane`] for the `CALL_KW` at `pc` of a native
+    /// callee (see [`Self::kw_lane_callee`]: `sorted(xs, key=f)`,
+    /// `xs.sort(reverse=True)`, `int(s, base=2)`), in `sw`'s synced running
+    /// activation: the operands leave the stack, the call runs through
+    /// [`Self::call`] as the full handler's does (a receiver in the self
+    /// slot its first argument) with the activation on the pending list,
+    /// and its result (or raise) lands as the full handler's would. The
+    /// keyword pairs are a pooled vector's, whose name strings a site's
+    /// next call finds already written. `false` touches nothing.
     #[inline(never)]
     fn core_builtin_kw_lane(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+        /// Pooled keyword vectors, and the most pairs one keeps.
+        const POOL_CAP: usize = 8;
+        const KEPT_PAIRS: usize = 8;
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
         let frame = unsafe { &mut *sw.cur };
@@ -17482,34 +17534,64 @@ impl Interpreter {
         let Some(callee_at) = n.checked_sub(argc + kwc + 3) else {
             return false;
         };
-        let (Object::Builtin(b), Object::Unbound) =
-            (&frame.stack[callee_at], &frame.stack[callee_at + 1])
-        else {
+        if !Self::kw_lane_callee(&frame.stack[callee_at], &frame.stack[callee_at + 1])
+            || !names.iter().all(|name| matches!(name, Object::Str(_)))
+        {
             return false;
-        };
-        let mut kwargs = Vec::with_capacity(kwc);
-        for name in names.iter() {
-            let Object::Str(name) = name else {
-                return false;
-            };
-            kwargs.push((name.to_string(), Object::None));
         }
         // Committed: the operands leave the stack.
-        let b = b.clone();
-        let mut ops: Vec<Object> = frame.stack.drain(callee_at..).collect();
-        drop(ops.pop()); // the names tuple
-        for (slot, v) in kwargs.iter_mut().zip(ops.drain(2 + argc..)) {
-            slot.1 = v;
+        let mut kwargs: Vec<(String, Object)> =
+            self.kw_scratch_pool.borrow_mut().pop().unwrap_or_default();
+        kwargs.truncate(kwc);
+        for (j, name) in names.iter().enumerate() {
+            let Object::Str(name) = name else {
+                unreachable!("checked above")
+            };
+            let name: &str = name;
+            match kwargs.get_mut(j) {
+                Some(pair) if pair.0 == name => {}
+                Some(pair) => {
+                    pair.0.clear();
+                    pair.0.push_str(name);
+                }
+                None => kwargs.push((name.to_owned(), Object::None)),
+            }
         }
-        let args: Vec<Object> = ops.drain(2..).collect();
+        let names = frame.stack.pop();
+        for pair in kwargs.iter_mut().rev() {
+            pair.1 = frame.stack.pop().expect("a keyword value");
+        }
+        let mut args: Vec<Object> = self.pooled_scratch();
+        let callee = {
+            let mut ops = frame.stack.drain(callee_at..);
+            let callee = ops.next().expect("the callee");
+            match ops.next() {
+                Some(Object::Unbound) | None => {}
+                Some(receiver) => args.push(receiver),
+            }
+            args.extend(ops);
+            callee
+        };
         frame.pc = pc as u32 + 1;
         let globals = frame.globals.clone();
         let pending = self.core_pending_enter(sw, frame, pc);
-        let result = self.call(&Object::Builtin(b), &args, &kwargs, &globals);
+        let result = self.call(&callee, &args, &kwargs, &globals);
         self.core_pending_exit(sw, pending);
-        drop(ops);
-        for v in args.into_iter().chain(kwargs.into_iter().map(|(_, v)| v)) {
+        drop(names);
+        for v in args.drain(..) {
             self.release(v);
+        }
+        self.recycle_scratch(args);
+        for pair in &mut kwargs {
+            let v = std::mem::replace(&mut pair.1, Object::None);
+            self.release(v);
+        }
+        self.release(callee);
+        if kwargs.len() <= KEPT_PAIRS {
+            let mut pool = self.kw_scratch_pool.borrow_mut();
+            if pool.len() < POOL_CAP {
+                pool.push(kwargs);
+            }
         }
         match result {
             Ok(v) => {
@@ -46599,12 +46681,23 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let list = match args.first() {
             Some(Object::List(l)) => l.clone(),
+            // A `list` subclass's instance sorts its payload
+            // (`super().sort(reverse=True)` in the subclass's own `sort`).
+            Some(Object::Instance(inst)) => match inst.native.get() {
+                Some(Object::List(l)) => l.clone(),
+                _ => return Err(type_error("list.sort expects a list receiver")),
+            },
             _ => return Err(type_error("list.sort expects a list receiver")),
         };
         // `list.sort(*, key=None, reverse=False)` is keyword-only:
         // `[].sort(42, 42)` is a TypeError, not a silent no-op.
         if args.len() > 1 {
             return Err(type_error("sort() takes no positional arguments"));
+        }
+        if let Some((name, _)) = kwargs.iter().find(|(k, _)| k != "key" && k != "reverse") {
+            return Err(type_error(format!(
+                "sort() got an unexpected keyword argument '{name}'"
+            )));
         }
         let reverse = kwargs
             .iter()

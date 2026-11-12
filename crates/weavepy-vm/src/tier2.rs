@@ -12269,15 +12269,15 @@ unsafe fn call_dyn_impl(
         }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
-    // WS1's dirtiness discipline). A keyword call of a builtin or a class
-    // pays the same generic binder in tier-1, so it doesn't count against
-    // the native driver; every other call does.
+    // WS1's dirtiness discipline), and the call counts against the native
+    // driver. A keyword call of a builtin or a class counts too: the frame
+    // JIT runs one in place (`Interpreter::core_builtin_kw_lane`) or binds
+    // a class's `__init__` directly (`ctor_direct_kw`) at a third to a half
+    // of this round trip's instructions, so a loop dense in them runs
+    // better there.
     let native_callee = matches!(&callee, Object::Builtin(_))
         || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
-    let charged = kwc == 0 || !(native_callee || matches!(&callee, Object::Type(_)));
-    if charged {
-        note_generic_dyn_call(ctx);
-    }
+    note_generic_dyn_call(ctx);
     ctx.dirty = true;
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
@@ -12294,7 +12294,7 @@ unsafe fn call_dyn_impl(
         }
     }
     // SAFETY: as above.
-    unsafe { dyn_call_result(jf, ctx, called, native_callee, charged, int_result) }
+    unsafe { dyn_call_result(jf, ctx, called, native_callee, true, int_result) }
 }
 
 /// `call_dyn_impl`'s result protocol: park a raise, or deliver the

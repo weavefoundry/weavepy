@@ -13252,12 +13252,11 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };
         let Some(r) = r else {
-            // A builtin whose keyword call may run Python code (`sorted`
-            // with a `key=` lambda): the core loop's lane for it, the
+            // A native callee whose keyword call may run Python code
+            // (`sorted` with a `key=` lambda, `xs.sort(key=f)`,
+            // `enumerate(xs, start=1)`): the core loop's lane for it, the
             // activation published, the result in place.
-            if matches!((&ops[0], &ops[1]), (Object::Builtin(_), Object::Unbound))
-                && !st.sw.is_null()
-            {
+            if Interpreter::kw_lane_callee(&ops[0], &ops[1]) && !st.sw.is_null() {
                 let frame = &mut *st.frame;
                 frame.stack.set_len(len);
                 frame.pc = pc as u32;
