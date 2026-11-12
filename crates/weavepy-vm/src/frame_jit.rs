@@ -817,16 +817,18 @@ impl Slot {
             let _ = self.native.set(None);
             return;
         }
-        if !worth_compiling(code, ext, at) {
-            // (Another loop may yet get hot.)
-            return;
-        }
         // (A busy worker: the code compiles at its heat's next trigger, a
-        // twentieth of the way on.)
+        // twentieth of the way on. Asked before the code's worth, which
+        // reads every instruction: on a machine with no core to spare the
+        // worker stays busy, and each trigger would weigh the code again.)
         if background::saturated() {
             let n = code.instructions.len() as u32;
             let at_hot = hot().saturating_mul(n);
             self.heat.store(at_hot - at_hot / 20, Ordering::Relaxed);
+            return;
+        }
+        if !worth_compiling(code, ext, at) {
+            // (Another loop may yet get hot.)
             return;
         }
         let t0 = stats::enabled().then(std::time::Instant::now);
@@ -14870,7 +14872,10 @@ pub(crate) mod background {
     /// Jobs handed over and not yet done, and how many there may be: each
     /// waiting job holds its lowered functions, which a burst of compiles
     /// would otherwise pile up (40 at once held 2.4 MB more than compiling
-    /// each in line).
+    /// each in line). Even two at once cost more memory than time: first
+    /// calls retire 0.3% to 0.9% fewer instructions (the code is ready
+    /// sooner), and `go`'s peak footprint is 1.2 MB higher, `tomllib_loads`'s
+    /// 0.4 MB.
     static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     const MAX_IN_FLIGHT: usize = 1;
 
