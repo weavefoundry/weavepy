@@ -75650,6 +75650,11 @@ static CORE_LEAF_OPS: [bool; 256] = {
         OpCode::BuildList,
         OpCode::ContainsOp,
         OpCode::UnaryOp,
+        // (What a module's or class's body does with the function or
+        // class the leaf arms just made.)
+        OpCode::LoadName,
+        OpCode::StoreName,
+        OpCode::StoreGlobal,
     ];
     let mut i = 0;
     while i < ops.len() {

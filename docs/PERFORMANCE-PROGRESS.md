@@ -2611,8 +2611,10 @@ slowdown in that run was the even-sized chunks, since fixed.
   class body, ended the burst: one full step and a fresh entry each. A
   module-level `x = 1; y = x` pair took 2,900 instructions against
   CPython's 730 and takes 850; a class with two methods goes from 43,400
-  to 39,200 (CPython 64,000). The imports measured retire 2% to 4% fewer
-  instructions. `itertools`, a Python module over native cores here, also
+  to 39,200 (CPython 64,000). The leaf arms that make a function also hand
+  the `STORE_NAME` after it back to the core loop now, a quarter off a
+  `def` (3,970 to 2,880 instructions on a plain release build). The
+  imports measured retire 3% fewer instructions in all. `itertools`, a Python module over native cores here, also
   stopped defining its nineteen pure-Python fallback classes when the
   native ones exist (1.3 ms to import, now 0.85).
 - **Wall time trails instructions through instructions per cycle.** On a
@@ -2649,8 +2651,9 @@ slowdown in that run was the even-sized chunks, since fixed.
   dataclasses), `typing` 5.6 against 3.0, `ast` 2.7 against 0.5, `enum` 3.1
   against 1.8. A code object's first use costs about 30,000 instructions
   (decoding its body from the cache 15,000, building its constants and
-  name tables 15,000), a fifth of `import logging`; a `def` costs 3,000
-  instructions against 1,500 and an annotated one 11,400 against 3,900.
+  name tables 15,000), a fifth of `import logging`; a `def` cost 3,000
+  instructions against 1,500 before the change above, and an annotated one
+  still costs 11,400 against 3,900.
   Modules that are C in CPython and Python here add their own
   (`itertools`, `_collections`, `_stat`, `codecs`).
 - **Tried and dropped in the memory work (November 11)**:
