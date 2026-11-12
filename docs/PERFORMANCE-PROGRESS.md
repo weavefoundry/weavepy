@@ -7,7 +7,26 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
-Measured on November 12, 2026, at `672cca59` (this PR), a PGO build against
+Measured on November 12, 2026, at `3765dc75` (this PR), a PGO build from a
+fresh training run against CPython 3.14.8 on the same host: warm time
+0.845, cold time 0.945, peak RSS 1.215. Whole processes (start-up, import,
+the first call and three more) take 0.90 of CPython's time, `-c pass`
+0.74, and a script that imports a module of its own 0.75 (0.86 before:
+see "Done"). Peak footprint is 1.24 of CPython's in a session where the
+`672cca59` build's is 1.24 too (CPython's own footprint read lower when
+that build's ratio was first measured, at 1.29). Against that build the
+cold time is the figure that moved (0.977 then), with whole processes
+(0.95 then); peak RSS went from 1.08 back to 1.22, the price of leaving
+short processes' code pages alone. WeavePy is ahead on 23 of the 33
+workloads warm and 18 cold. The best warm times are `scimark` 0.50,
+`pickle_roundtrip` 0.57, `raytrace` and `unpack_sequence` 0.60, and
+`float_points` and `json_roundtrip` 0.62; the worst `async_tree` 1.19,
+`context_managers` 1.13, `class_creation` 1.10, and `deepcopy` and
+`closures_decorators` 1.07. The worst cold times are `async_tree` 1.38,
+`logging_mix` 1.37, `stdlib_utils` 1.30, `tomllib_loads` 1.27 and
+`mini_interpreter` 1.25.
+
+Measured earlier on November 12, 2026, at `672cca59` (this PR), a PGO build against
 CPython 3.14.8 on the same host: warm time 0.854, cold time 0.977, peak RSS
 1.081 (1.266 on November 10). Whole processes (start-up, import, the first
 call and three more) take 0.95 of CPython's time, and `-c pass` 0.73. Peak
@@ -376,9 +395,20 @@ branch and pull request.
     Whole processes take about 1% longer than with no release, first calls
     1% to 2%, warm calls the same, and peak RSS is 0.87 of theirs (the
     timer's was 0.765, for the costs above).
-  - Peak RSS comes to 1.12 of CPython's that way (1.30 with no release, and
-    0.99 with the timer), but RSS counts clean, file-backed pages the
-    kernel can drop at no cost. By peak footprint (`/usr/bin/time -l`'s
+  - And it waits for the process to be 100 ms old. The rule above fired a
+    millisecond after a short script's last import, which is where CI's
+    bench gate times its kernels: those of a millisecond or two ran 15%
+    longer on Linux (`sumvm` 1.1 to 1.5 ms, `nested_loops` 2.2 to 2.6),
+    and on Apple Silicon start-up took a quarter longer (12.9 to 16.1 ms).
+    A release is two or three milliseconds for memory a short process is
+    about to give back anyway, so the first one now waits until that's a
+    fiftieth of the time the process has taken. Over the suite's
+    half-second processes the release then takes 4% off peak RSS instead
+    of 13% (most of them peak in their first 100 ms); a process that
+    lives longer releases as before.
+  - Peak RSS came to 1.12 of CPython's before the wait (1.30 with no
+    release, and 0.99 with the timer), but RSS counts clean, file-backed
+    pages the kernel can drop at no cost. By peak footprint (`/usr/bin/time -l`'s
     figure: private, dirty memory) WeavePy takes 1.29 of CPython's whatever
     the rule, and that's the gap that is left: see "What the measurements
     say".
@@ -400,6 +430,57 @@ branch and pull request.
   - A process past 32 MB keeps freed arena ranges resident for 500 ms
     instead of 50: `async_tree` builds and drops about 13 MB a call, which
     was purged and faulted back in every time.
+- **Tier 2 analyzes a large body only after work in proportion to its
+  length** (this PR). Tier 2 tries code after fifty calls or loop
+  iterations, whatever its size, and an analysis costs four to seven
+  microseconds an instruction, more when it carves loops out and starts
+  over. Over the suite's first calls that's 741 attempts, 140 of which
+  compile, and 3.7% of the time; with tier 2 off the first calls take the
+  same time in all (1.002: `scimark` 1.51, `tomllib_loads` 1.37 and
+  `nqueens` 1.19 against `float_points` 0.90, `regex_mix` 0.91 and
+  `chaos` 0.92) and the imports 0.96 of it. The largest single costs were
+  bodies it then rejects: `regex_mix` spent 15 of its first call's 64 ms
+  on `re`'s compiler (`_parse`'s 1,700 instructions, `_optimize_charset`
+  six times over), and `dataclasses._process_class` took 3 ms. A body
+  past 256 instructions now needs sixteen calls or iterations for each
+  instruction past that, in any phase. `class_creation`'s first call
+  retires 13.5% fewer instructions and `regex_mix`'s 6.6%; the other
+  workloads and the bench fixtures retire what they did. Asking every
+  body for work in proportion to its length (eight an instruction) saved
+  more there (20% and 7%) but moved which entries tier 2 compiled and
+  when the frame JIT took over elsewhere: `chaos` retired 4% more
+  instructions over four calls, `tomllib_loads` and `stdlib_utils` 2% to
+  3%.
+- **A program's own modules import without `importlib`** (this PR). The
+  native importer loads a source file itself, but then built the module's
+  `__spec__` and `__loader__` before running its body, and building them
+  is what imports the machinery: `importlib`, its two bootstrap halves,
+  `zipimport` (and `time`), `importlib.util` and `types`. That was 4.9 ms
+  on a program's first import of a file of its own, where the import
+  itself takes 0.4 (CPython takes 0.3 for all of it: its machinery is part
+  of start-up). `-c pass` doesn't show it, and the suite's harness paid
+  it in every process. The pair is now built before the body only when
+  `importlib.machinery` is already loaded (then it's a call); otherwise
+  it's built when something reads `module.__spec__` or
+  `module.__loader__`, as the frozen standard library's modules have
+  theirs built and as `__main__`'s loader already was. Until then the
+  module's `__dict__` holds neither name, where CPython's holds both: a
+  program that reads them as dictionary entries without ever importing
+  `importlib` (or `inspect`, `pkgutil`, `unittest`, ..., which do) sees
+  the difference. A script that imports one module of its own starts in
+  0.75 of CPython's time, where it took 0.86 (22.1 ms against 25.4, with
+  CPython at 29.7).
+- **A busy worker is noticed before a compile's worth is weighed** (this
+  PR). The frame JIT keeps one compile in flight, so while the worker
+  generates code every other hot function's trigger comes back a
+  twentieth of its heat later. Each of those weighed the code first, a
+  pass over every instruction: nothing on an idle machine, but where the
+  worker gets no core of its own (under valgrind, `go` weighed code
+  39,000 times a call, 4% of its instructions) the interpreter's thread
+  spent its time deciding again. Two compiles in flight instead of one
+  would have code ready sooner (first calls retire 0.3% to 0.9% fewer
+  instructions), for 1.2 MB more peak footprint on `go` and 0.4 MB on
+  `tomllib_loads`: left at one.
 - **f-strings compiled, frameless property setters, and big ints in
   compiled arithmetic** (PR #107). Instructions on Linux.
   - The frame JIT runs `CONVERT_VALUE`, spec-less `FORMAT_VALUE` and
@@ -2375,6 +2456,76 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **Where an object-heavy program loses to CPython** (November 12,
+  `deltablue`, the one bench fixture that does: 1.5 times CPython's time
+  in CI). On a quiet machine a run of 50 iterations takes 99 ms against
+  68, in two parts.
+  - Steady state is 1.63 ms an iteration against 1.33, on 0.93 of the
+    instructions: 2.3 instructions a cycle against 3.0. Cachegrind's
+    simulation gives 287,000 instruction-cache misses an iteration
+    against 14,000 (CPython's whole loop fits its first-level cache, a
+    0.08% miss rate), and 185,000 data-cache misses against 53,000.
+    Compiled code is 38% of the instructions and 44% of those misses: the
+    program's 1,064 bytecode instructions become 47,000 IR instructions
+    and 220 KB of machine code, since a callee's whole tree is lowered
+    again into each caller (each of three `__init__`s carries 13 to 17
+    KB). Inlining still pays for itself: without it the program retires
+    44% more instructions, because a call that isn't in line costs about
+    250.
+  - A quarter of the instructions are attribute reads that go through a
+    helper: 53,000 calls an iteration at about 72 instructions each. They
+    are reads in inlined bodies at sites that have seen several classes
+    (160 of 252 field sites: a base class's methods run on four
+    subclasses), which the in-line read declines, though the site's
+    one-entry cache hits 98% of the time in the helper; and class
+    constants (`Strength.REQUIRED`: a global read's 37 instructions, then
+    69 in `h_attr_stack`'s class memo).
+  - The first 50 iterations cost 17.5 ms over steady state. With compiles
+    synchronous the run retires 1,121 million instructions, of which
+    code generation is 106 million (the worker's, natively), lowering
+    about 33 million and tier-2 attempts 25 million: 2,250 instructions
+    of code generation an IR instruction, spread over simplification,
+    liveness, the generator's own loop and 35,000 reallocations.
+- **A whole-program view of the same thing** (`context_managers`, a quick
+  build): 5.6 times CPython's instruction-cache misses a call and 5.4
+  times its data-cache misses, at similar branch misprediction rates. The
+  code run at least 1,000 times a call covers 208 KB in 390 functions
+  (compiled code about 30 KB of it), and no source line has more than
+  2.4% of the data misses: they're reads of per-site records, code
+  objects' side tables, counts and free lists.
+- **The frame JIT's first-call page faults are heap growth, not churn.**
+  `chaos`'s first call takes 1,955 page faults; 452 with the frame JIT
+  off and 1,320 with its compiles synchronous. Neither a ten-second purge
+  delay nor keeping large blocks in the arenas changes that, and the heap
+  ends 2.7 MB larger for nine functions' 97 KB of code. The worker's
+  forced collection when it goes idle is 400 of the faults, for 1 MB less
+  resident. Handing each lowered function's tables back for the next
+  lowering saved 95 faults and no instructions, and was dropped.
+- **A fifth of an import is a code object's first use.** `import
+  logging` retires 139 million instructions over start-up's 20 million
+  (Linux, a quick build; CPython 3.13, whose `traceback` doesn't build
+  dataclasses, retires 48 million over its 35). The profile is flat
+  (the core loop 7%, then nothing above 2%), but two inclusive costs
+  stand out: decoding the 966 bodies the import runs, 15,200 instructions
+  each (570 a constant, 1,350 a name table), and building their VM
+  extensions, 15,300 each (each constant made an object, each name
+  hashed, then interned at 240 instructions). Names and string constants
+  are decoded into the compiler's form and then made objects one code
+  object at a time; a table of interned objects per module, indexed as
+  the cache file indexes its identifiers, would do it once. Class
+  creation is 40% inclusive (441 classes, with what their bodies and
+  metaclasses run).
+- **Tried and dropped: an in-line field read at polymorphic sites.**
+  Reading the class version and position from the site's cache as the
+  code runs (the helper for anything else) took `deltablue`'s helper
+  calls from 33,000 to 3,700 an iteration, but the in-line read is itself
+  about 43 instructions (nine guards and a counted copy), so the program
+  retired 3.3% fewer instructions at equal inlining and, at the default
+  budget, 4.5% more: the larger IR put twelve more callees over the
+  inlining budget. What a field read needs first is fewer guards (one
+  word on the instance that says "split, over the class's names,
+  unborrowed, no `__dict__` published" in place of five loads).
+
 - **The gap is spread thin.** A direct call costs about 480 instructions,
   a core-loop call and return about 400, generator creation and teardown
   about 1,200, a dict subscript from compiled code about 200, a young
@@ -2736,6 +2887,25 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What the `deltablue` measurements above point at, ahead of the list below:
+
+- Compiled code that is smaller and does less per operation: a field
+  read's guards in one compare, class constants and module globals read
+  in line as borrowed values (a global is 37 instructions through its
+  helper in an inlined body), and inlining by how hot a call site is
+  rather than by size alone, so that a constructor's tree isn't lowered
+  into every subclass's `__init__`.
+- Tier 2's compiles of loop-free callees wait for a native caller: 26 of
+  `deltablue`'s and most of `class_creation`'s 128 attempts are methods
+  compiled in case a tier-2 loop calls them, in programs with no such
+  loop. (A caller's analysis would have to ask for the callee and try
+  again, since it types a call from the callee's compiled return lane.)
+- Release only the code a process is done with, off its own thread: with
+  the pages start-up and imports alone run laid out together (profiles
+  dumped at the end of the imports would tell them apart), a release
+  costs the program no faults and can happen as soon as imports are over
+  again.
 
 Two items the November 12 measurements put ahead of the list below:
 
