@@ -520,6 +520,10 @@ struct CacheEntry {
     /// (it would observe the same frame state); other entries still
     /// do, with their own live values.
     probe_misses: Vec<u32>,
+    /// What the analyses so far carved out of the code for reasons of its
+    /// own, for the next attempt to start from (see
+    /// [`weavepy_jit::Carved`]): kept while the code stays cold.
+    carved: weavepy_jit::Carved,
     /// A compiled frame took a cold exit (see `CompiledFrame::cold_exits`):
     /// the code after it was unsupported *with the values live when it was
     /// compiled* (typically a later loop's receiver, still unbound when an
@@ -625,6 +629,7 @@ impl CacheEntry {
             no_interp_entry: false,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
+            carved: weavepy_jit::Carved::default(),
             recompile_at_osr: false,
             cold_recompiles: 0,
             osr_absent: Vec::new(),
@@ -1250,6 +1255,7 @@ impl JitState {
         // a native entry to pay for the general call, and how many.
         let long_calls;
         let iters_per_call;
+        let mut carved = weavepy_jit::Carved::default();
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1328,6 +1334,7 @@ impl JitState {
                     if entry.probe_misses.contains(&entry_pc) {
                         return None;
                     }
+                    carved = std::mem::take(&mut entry.carved);
                 }
             }
             let calls = entry
@@ -1589,6 +1596,7 @@ impl JitState {
                 pairs: &mut **pairs,
                 entry_pc: Some(entry_pc),
                 carve_env: seed_params,
+                carved: Some(&mut carved),
                 paths: &mut path_arena,
             };
             let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
@@ -1868,6 +1876,7 @@ impl JitState {
                     // RFC 0073 WS1 — retriable: stay Cold, charge this
                     // entry pc so only *other* entries re-attempt.
                     if let Some(entry) = self.cache.get_mut(&key) {
+                        entry.carved = carved;
                         if !entry.probe_misses.contains(&entry_pc) {
                             entry.probe_misses.push(entry_pc);
                         }
@@ -2682,6 +2691,7 @@ fn method_ret_info(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut path_arena,
     };
     match weavepy_jit::analyze_frame(fcode, &mut classify, &mut probes) {
@@ -4068,6 +4078,7 @@ fn inline_method_body(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut path_arena,
     };
     let tf = weavepy_jit::analyze_frame(code, &mut classify, &mut probes).ok()?;

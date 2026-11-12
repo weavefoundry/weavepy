@@ -276,6 +276,10 @@ pub struct Probes<'a> {
     /// seeded attempt, so an unseeded first attempt still fails with the
     /// verdict that asks for seeding.
     pub carve_env: bool,
+    /// What earlier analyses of this code object carved out (see
+    /// [`Carved`]), for this one to start from and add to; `None` to
+    /// start from nothing.
+    pub carved: Option<&'a mut Carved>,
     /// RFC 0071 WS3 — the analysis-local attribute-path interner (the
     /// analyzer owns the entries; it lives here so both passes and the
     /// probe adapters share it without threading another parameter).
@@ -631,6 +635,7 @@ pub fn analyze_with_probes(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -664,6 +669,7 @@ pub fn analyze_for_ret(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut arena,
     };
     analyze_impl(code, resolve, &mut probes)
@@ -784,7 +790,7 @@ fn stmt_start(code: &CodeObject, p: usize, for_setup: bool) -> Option<usize> {
 
 /// The region carving state (see [`analyze_impl`]): loops whose code
 /// stays with the interpreter, and why.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct Carve {
     /// Header pcs of the excluded loops. An excluded loop's own code
     /// runs interpreted; each loop nested in it that is not excluded
@@ -795,6 +801,39 @@ struct Carve {
     /// receiver, an unseeded iterator), so a later request from inside
     /// the loop may compile it.
     env: HashSet<usize>,
+}
+
+/// The carving a code object needs before its plan can be made at all: the
+/// loops whose shape tier 2 doesn't compile (see `plan_rewrite`). Carving
+/// finds them one re-analysis at a time, and a code object is analyzed
+/// again for each kind of attempt (unseeded, then seeded, each with and
+/// without typed `[]` accumulators) and for each loop that asks to enter
+/// it. The plan reads the code and its globals, not the requesting
+/// activation, so every one of those analyses would carve the same loops
+/// first: the embedder keeps this with the code object and each starts
+/// from it (see [`Probes::carved`]). Steps taken for what inference found
+/// aren't kept, nor any step after one.
+#[derive(Debug, Default)]
+pub struct Carved(Option<CarveState>);
+
+/// Where a carving stands (see [`analyze_impl`]): the cold exits, the
+/// loops left to the interpreter, the steps taken, and the verdict that
+/// started it.
+#[derive(Debug, Default, Clone)]
+struct CarveState {
+    cold: HashSet<usize>,
+    carve: Carve,
+    steps: usize,
+    first_err: Option<JitVerdict>,
+}
+
+/// Where an analysis's carving starts.
+fn carve_start(probes: &Probes<'_>) -> CarveState {
+    probes
+        .carved
+        .as_deref()
+        .and_then(|carved| carved.0.clone())
+        .unwrap_or_default()
 }
 
 /// The native region one analysis attempt compiles, derived from the
@@ -869,6 +908,18 @@ impl Region {
     }
 }
 
+/// Whether tier 2 compiles code of this kind and signature at all. Sync
+/// generator bodies are admitted (RFC 0070 WS2: yields become `Yielded`
+/// side exits; entry is OSR-only); coroutines and async generators aren't.
+fn signature_admitted(code: &CodeObject) -> bool {
+    !(code.is_coroutine
+        || code.is_async_generator
+        || code.is_class_body
+        || code.has_varargs
+        || code.has_varkeywords
+        || code.kwonly_count > 0)
+}
+
 /// Whether a failure verdict depends on the activation the compile ran
 /// for rather than on the code alone.
 fn environmental(v: &JitVerdict) -> bool {
@@ -880,6 +931,9 @@ fn analyze_impl(
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
 ) -> Result<TFunc, JitVerdict> {
+    if !signature_admitted(code) {
+        return Err(JitVerdict::UnsupportedSignature);
+    }
     // RFC 0076 WS7 — the demotion retry: a burned global-callee
     // marker that escapes into data flow (stored, passed as an
     // argument, tested, returned) re-plans with that name's loads
@@ -897,21 +951,35 @@ fn analyze_impl(
     // excludes that loop and every loop around it, and the loops nested
     // in an excluded loop compile on their own as OSR-only regions (see
     // `Carve`). Each step re-analyzes, so the steps are budgeted.
-    let mut cold: HashSet<usize> = HashSet::default();
-    let mut carve = Carve::default();
+    // (`first_err` is the verdict that started the carving, reported when
+    // carving leaves nothing native.)
+    let CarveState {
+        mut cold,
+        mut carve,
+        mut steps,
+        mut first_err,
+    } = carve_start(probes);
+    // Whether every step so far was for a failure to plan (see [`Carved`]).
+    let mut planning = true;
     let forest = loop_forest(code);
-    let mut steps = 0usize;
-    // The verdict that started the carving, reported when carving leaves
-    // nothing native.
-    let mut first_err: Option<JitVerdict> = None;
     // Numeric speculation (see `Plan::num_slots`), backed off one local at
     // a time when another store gives the local a different lane.
     let mut num_slots = numeric_slots(code);
     let mut backoffs = 0usize;
     loop {
         FAIL_PC.with(|c| c.set(None));
+        let mut in_plan = false;
         match analyze_once(
-            code, resolve, probes, &demote, lane_lists, &cold, &carve, &forest, &num_slots,
+            code,
+            resolve,
+            probes,
+            &demote,
+            lane_lists,
+            &cold,
+            &carve,
+            &forest,
+            &num_slots,
+            &mut in_plan,
         ) {
             // A region that only lacked live values, compiled for a request
             // it can't even enter (a comprehension's header, say): wait for
@@ -942,13 +1010,26 @@ fn analyze_impl(
                 if demote.len() >= 8 || !demote.insert(name_idx) {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee escapes)"));
                 }
+                // (A demoted name plans differently.)
+                planning = false;
             }
             Err(e)
                 if steps < MAX_CARVE_STEPS
                     && carve_step(code, &forest, &mut carve, &mut cold, &e, probes.carve_env) =>
             {
                 steps += 1;
+                planning &= in_plan;
                 first_err.get_or_insert(e);
+                if planning {
+                    if let Some(carved) = probes.carved.as_deref_mut() {
+                        carved.0 = Some(CarveState {
+                            cold: cold.clone(),
+                            carve: carve.clone(),
+                            steps,
+                            first_err: first_err.clone(),
+                        });
+                    }
+                }
             }
             // Carving left no native loop: report the verdict that started
             // it, or, when live values were missing, a retriable miss (a
@@ -970,10 +1051,13 @@ fn analyze_impl(
                     eprintln!("jit lane-list retry {:?}: {:?}", code.name, e);
                 }
                 lane_lists = false;
-                cold.clear();
-                carve = Carve::default();
-                steps = 0;
-                first_err = None;
+                CarveState {
+                    cold,
+                    carve,
+                    steps,
+                    first_err,
+                } = carve_start(probes);
+                planning = true;
             }
             other => {
                 if let Err(e) = &other {
@@ -1161,16 +1245,8 @@ fn analyze_once(
     carve: &Carve,
     loops: &[LoopInfo],
     num_slots: &HashSet<u32>,
+    in_plan: &mut bool,
 ) -> Result<TFunc, JitVerdict> {
-    // RFC 0070 WS2 — sync generator bodies are admitted (yields become
-    // `Yielded` side exits; entry is OSR-only). Coroutines and async
-    // generators stay excluded this wave.
-    if code.is_coroutine || code.is_async_generator || code.is_class_body {
-        return Err(JitVerdict::UnsupportedSignature);
-    }
-    if code.has_varargs || code.has_varkeywords || code.kwonly_count > 0 {
-        return Err(JitVerdict::UnsupportedSignature);
-    }
     let n = code.instructions.len();
     if n < 2 {
         return Err(JitVerdict::Trivial);
@@ -1185,7 +1261,8 @@ fn analyze_once(
         lane_lists,
         loops,
         &region,
-    )?;
+    )
+    .inspect_err(|_| *in_plan = true)?;
     plan.num_slots = num_slots.clone();
     // Region exits: where native code would step into code that stays
     // interpreted, it hands the activation over instead (a cold exit at
