@@ -38,7 +38,7 @@ pub(crate) extern "C" fn tick() {
     }
     NEXT_LOOK.store(now + LOOK_EVERY_MICROS, Ordering::Relaxed);
     if let Some(resident) = crate::text_trim::resident() {
-        crate::alloc::note_resident(resident);
+        crate::alloc::note_resident(resident.all);
         crate::text_trim::grown(resident);
     }
 }

@@ -23,14 +23,17 @@
 //!
 //! A release costs the process about a millisecond, most of it those
 //! faults, so it happens only where it lowers the most memory the process
-//! ever holds: when the resident set is about to pass its highest so far
-//! (within [`margin`] of it). A process that has stopped growing keeps what
-//! it has. The first release also waits for the resident set to reach
-//! [`FIRST_AT`], so an interpreter that only starts up, or runs a small
-//! script, pays nothing; and each one waits twice as long after the last
-//! as that one did, from [`FIRST_WAIT`] up, so a process that grows steadily
-//! (and is always at its highest) releases a handful of times, not at every
-//! megabyte.
+//! ever holds, and has something to free:
+//!
+//! - the resident set is about to pass its highest so far (within
+//!   [`margin`] of it), and is at least [`FIRST_AT`], so an interpreter that
+//!   only starts up, or runs a small script, pays nothing;
+//! - the file-backed part of it (which the kernel reports) has grown
+//!   [`WORTH`] past what the last release left, which is more than a
+//!   program's steady code comes back to: a heap that grows by itself
+//!   releases nothing;
+//! - and the last release was a while ago, twice as long as the one before
+//!   it was from its own, from [`FIRST_WAIT`] up.
 //!
 //! The pages are the file's, so nothing is lost: with one exception, a
 //! debugger's breakpoints, which live in private copies of code pages. A
@@ -58,6 +61,19 @@ fn margin(highest: usize) -> usize {
     (highest / 16).max(1 << 20)
 }
 
+/// How much file-backed memory the resident set gains, over what the last
+/// release left of it, before another: the code a program keeps running
+/// comes back to 2 or 3 MB of that.
+const WORTH: usize = 4 << 20;
+
+/// A process's resident memory: all of it, and the part files back (code,
+/// constants and mapped files).
+#[derive(Clone, Copy)]
+pub(crate) struct Resident {
+    pub(crate) all: usize,
+    pub(crate) files: usize,
+}
+
 const UNSET: u8 = 0;
 const READY: u8 = 1;
 const OFF: u8 = 2;
@@ -68,10 +84,12 @@ static STATE: AtomicU8 = AtomicU8::new(UNSET);
 static RANGE: [[AtomicUsize; 2]; RANGES] =
     [const { [AtomicUsize::new(0), AtomicUsize::new(0)] }; RANGES];
 const RANGES: usize = 4;
-/// The resident set size from which the first release may happen, and the
-/// highest the resident set has been seen.
+/// The resident set size from which the first release may happen, the
+/// highest the resident set has been seen, and the file-backed part the
+/// last release left.
 static NEXT_AT: AtomicUsize = AtomicUsize::new(FIRST_AT);
 static HIGHEST: AtomicUsize = AtomicUsize::new(0);
+static FILES_LEFT: AtomicUsize = AtomicUsize::new(0);
 /// When the next release may happen (in microseconds since [`started`]),
 /// with the wait after it.
 static NEXT_TIME: AtomicU64 = AtomicU64::new(0);
@@ -118,9 +136,9 @@ pub(crate) fn install() {
     STATE.store(if ready { READY } else { OFF }, Ordering::Release);
 }
 
-/// The process's resident set size, where the platform has a cheap way to
+/// The process's resident memory, where the platform has a cheap way to
 /// ask.
-pub(crate) fn resident() -> Option<usize> {
+pub(crate) fn resident() -> Option<Resident> {
     sys::resident()
 }
 
@@ -139,17 +157,21 @@ fn whole_pages(span: (usize, usize), page: usize) -> Option<(usize, usize)> {
     (start < end).then(|| (start, end - start))
 }
 
-/// The process's resident set is `resident` bytes: release the code's pages
-/// if it's time (see the module docs).
-pub(crate) fn grown(resident: usize) {
+/// The process's resident memory is `resident`: release the code's pages if
+/// it's time (see the module docs).
+pub(crate) fn grown(resident: Resident) {
     if STATE.load(Ordering::Acquire) != READY {
         return;
     }
+    let Resident { all, files } = resident;
     let highest = HIGHEST.load(Ordering::Relaxed);
-    if resident > highest {
-        HIGHEST.store(resident, Ordering::Relaxed);
+    if all > highest {
+        HIGHEST.store(all, Ordering::Relaxed);
     }
-    if resident < NEXT_AT.load(Ordering::Relaxed) || resident + margin(highest) < highest {
+    if all < NEXT_AT.load(Ordering::Relaxed)
+        || all + margin(highest) < highest
+        || files < FILES_LEFT.load(Ordering::Relaxed) + WORTH
+    {
         return;
     }
     let at = started().elapsed().as_micros() as u64;
@@ -172,13 +194,16 @@ pub(crate) fn grown(resident: usize) {
         }
     }
     let now = sys::resident().unwrap_or(resident);
+    FILES_LEFT.store(now.files, Ordering::Relaxed);
     let wait = NEXT_WAIT.load(Ordering::Relaxed);
     if DEBUG.load(Ordering::Relaxed) {
         eprintln!(
-            "text trim: at {} ms, resident {} -> {} KiB in {} us, next in {} ms",
+            "text trim: at {} ms, resident {} -> {} KiB (files {} -> {}) in {} us, next in {} ms",
             at / 1000,
-            resident >> 10,
-            now >> 10,
+            all >> 10,
+            now.all >> 10,
+            files >> 10,
+            now.files >> 10,
             (started().elapsed().as_micros() as u64).saturating_sub(at),
             wait / 1000
         );
@@ -190,7 +215,7 @@ pub(crate) fn grown(resident: usize) {
 
 #[cfg(target_vendor = "apple")]
 mod sys {
-    use super::{whole_pages, Image};
+    use super::{whole_pages, Image, Resident};
     use std::ffi::{c_char, c_int, c_ulong, c_void};
 
     extern "C" {
@@ -203,22 +228,45 @@ mod sys {
         ) -> *mut u8;
     }
 
-    /// The process's resident set size.
-    pub(super) fn resident() -> Option<usize> {
-        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
-        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    /// The process's resident memory: `task_info`'s `TASK_VM_INFO`, whose
+    /// `external` is the part an external pager (a file) backs.
+    pub(super) fn resident() -> Option<Resident> {
+        /// The flavor, the words of its first revision (`struct
+        /// task_vm_info`, packed to four bytes), and where the two sizes
+        /// are in it.
+        const TASK_VM_INFO: u32 = 22;
+        const WORDS: usize = 38;
+        const RESIDENT_SIZE: usize = 16;
+        const EXTERNAL: usize = 64;
+        let mut info = [0u32; WORDS];
+        let mut count = WORDS as u32;
         // SAFETY: `info` has room for `count` words of this flavor.
         #[allow(deprecated)] // (`libc::mach_task_self`)
         let kr = unsafe {
             libc::task_info(
                 libc::mach_task_self(),
-                libc::MACH_TASK_BASIC_INFO,
+                TASK_VM_INFO,
                 info.as_mut_ptr().cast(),
                 &raw mut count,
             )
         };
-        // SAFETY: the kernel filled it in.
-        (kr == 0).then(|| unsafe { info.assume_init() }.resident_size as usize)
+        if kr != 0 || (count as usize) < WORDS {
+            return None;
+        }
+        let field = |at: usize| {
+            // SAFETY: within the buffer the kernel filled in.
+            unsafe {
+                info.as_ptr()
+                    .cast::<u8>()
+                    .add(at)
+                    .cast::<u64>()
+                    .read_unaligned() as usize
+            }
+        };
+        Some(Resident {
+            all: field(RESIDENT_SIZE),
+            files: field(EXTERNAL),
+        })
     }
 
     /// Whether a debugger traces the process: the `P_TRACED` flag of its
@@ -400,7 +448,7 @@ mod sys {
 
 #[cfg(target_os = "linux")]
 mod sys {
-    use super::{whole_pages, Image, RANGES};
+    use super::{whole_pages, Image, Resident, RANGES};
     use std::ffi::{c_int, c_void};
     use std::os::unix::fs::FileExt;
 
@@ -429,11 +477,16 @@ mod sys {
             .as_ref()
     }
 
-    /// The process's resident set size.
-    pub(super) fn resident() -> Option<usize> {
+    /// The process's resident memory: `/proc/self/statm`'s second and third
+    /// numbers, in pages (the third is the file-backed part).
+    pub(super) fn resident() -> Option<Resident> {
         // SAFETY: `sysconf` has no preconditions.
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        Some(proc_number(statm()?, b"", 1)? * page)
+        let statm = statm()?;
+        Some(Resident {
+            all: proc_number(statm, b"", 1)? * page,
+            files: proc_number(statm, b"", 2)? * page,
+        })
     }
 
     /// Whether a debugger traces the process (unknown counts as traced).
@@ -515,9 +568,9 @@ mod sys {
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 mod sys {
-    use super::Image;
+    use super::{Image, Resident};
 
-    pub(super) fn resident() -> Option<usize> {
+    pub(super) fn resident() -> Option<Resident> {
         None
     }
 
