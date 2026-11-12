@@ -2636,7 +2636,18 @@ slowdown in that run was the even-sized chunks, since fixed.
   logging` the allocation profile (`WEAVEPY_ALLOC_PROFILE`) has 7.5 MB
   live: strings 11%, dict tables 13%, decoded code objects 16% and their
   VM extensions 5%, inline-cache tables 11%, functions 7%, types 5%, with
-  no single owner above that.
+  no single owner above that. In the suite, though, most of the gap opens
+  in the first call, and it's the baseline JIT's: when a benchmark's
+  module is imported the footprints are close (`chaos` 6.7 MB against 6.5,
+  `stdlib_utils` 9.4 against 8.3, `class_creation` 8.5 against 8.1), and
+  the first call then adds 3.0, 2.6 and 5.4 MB where CPython's adds 0.0,
+  0.1 and 1.2. With `WEAVEPY_FRAME_JIT=0` it adds 0.9, 0.8 and 3.5, and
+  takes 690, 600 and 1,340 page faults instead of 2,200, 3,000 and 3,060.
+  `chaos` compiles nine functions into 97 KB of machine code; the 2 MB is
+  what compiling them passes through: 1.2 MB of heap that is gone again
+  afterwards (0.7 MB of it the IR builder's instruction vectors, grown by
+  doubling), 0.5 MB that stays (records and tables), and the rest pages
+  the allocator and the worker thread touched once.
 - **A soft page fault costs 2.3 microseconds here** (5,000 instructions,
   7,300 cycles, measured as the difference the release makes). A
   workload's first call takes 1,900 of them against CPython's 480 with no
@@ -2728,11 +2739,15 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 Two items the November 12 measurements put ahead of the list below:
 
-- Footprint (1.29 of CPython's): what an import leaves behind. Code
-  objects (8-byte instructions, a line and a column table per body, a
-  constants vector and its object twin), inline-cache tables allocated at
-  first miss for code that runs once, and strings held both as compiler
-  names and as interned objects.
+- Footprint (1.29 of CPython's). First what a baseline compile passes
+  through, about 2 MB a process and 1,500 to 2,400 page faults in the
+  first call: IR vectors sized for the function instead of grown by
+  doubling, a smaller IR instruction, scratch kept between compiles
+  rather than faulted in again, and less set-up per compile. Then what an
+  import leaves behind: code objects (8-byte instructions, a line and a
+  column table per body, a constants vector and its object twin),
+  inline-cache tables allocated at first miss for code that runs once, and
+  strings held both as compiler names and as interned objects.
 - The import path: a code object's first use (30,000 instructions),
   `def` (twice CPython's instructions, three times with annotations) and
   the modules that are Python here and C there. `_colorize`'s dataclasses
