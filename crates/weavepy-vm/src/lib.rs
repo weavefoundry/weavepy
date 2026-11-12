@@ -20282,7 +20282,6 @@ impl Interpreter {
     /// nothing observable (a declined evaluation stores nothing, and the
     /// unused instance was never seen).
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     /// [`Self::core_new`] for a store-only `__init__` (see
     /// [`code_store_init`]): a fresh instance takes the arguments (or
     /// constants) straight into its split values, in the order the
@@ -69978,10 +69977,7 @@ impl Interpreter {
                     .unwrap_or_else(|_| p.to_path_buf())
             }
         };
-        if absolutize(root) != absolutize(&sys0) {
-            return false;
-        }
-        true
+        absolutize(root) == absolutize(&sys0)
     }
 
     /// CPython `module_getattro` / `import_from`'s stdlib-shadowing

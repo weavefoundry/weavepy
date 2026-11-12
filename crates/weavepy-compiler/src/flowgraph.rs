@@ -1785,8 +1785,8 @@ impl Cfg {
                 if store_j == store_k {
                     return;
                 }
-                for idx2 in j + 1..k {
-                    let store_idx = stores_to(&self.blocks[bb].slots[idx2]);
+                for slot in &self.blocks[bb].slots[j + 1..k] {
+                    let store_idx = stores_to(slot);
                     if store_idx >= 0 && (store_idx == store_j || store_idx == store_k) {
                         return;
                     }

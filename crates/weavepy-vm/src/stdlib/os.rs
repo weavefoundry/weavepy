@@ -7415,8 +7415,8 @@ fn struct_seq_init(
         // `None`. Only these names are consumable — CPython counts the found
         // keys and errors if the dict held anything else.
         let mut n_found = 0usize;
-        for i in values.len()..max {
-            let f = layout.slots[i].expect("hidden struct-seq slots are named");
+        for slot in layout.slots.iter().take(max).skip(values.len()) {
+            let f = slot.expect("hidden struct-seq slots are named");
             let v = dict_arg
                 .as_ref()
                 .and_then(|d2| d2.borrow().get(&DictKey(Object::from_static(f))).cloned());

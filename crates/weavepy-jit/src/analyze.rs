@@ -3352,8 +3352,7 @@ fn assigned_on_entry(
         .map(|b| {
             let mut bits = SlotBits::empty(width);
             if is_reachable[b] {
-                for i in raw[b].start..raw[b].end {
-                    let ins = code.instructions[i];
+                for &ins in &code.instructions[raw[b].start..raw[b].end] {
                     if ins.op == OpCode::StoreFast {
                         bits.insert(ins.arg);
                     }
@@ -3426,8 +3425,7 @@ fn compute_livein(
     let mut cur = SlotBits::empty(width);
     for &b in reachable {
         cur.0.copy_from_slice(&assigned_in[b].0);
-        for i in raw[b].start..raw[b].end {
-            let ins = code.instructions[i];
+        for &ins in &code.instructions[raw[b].start..raw[b].end] {
             match ins.op {
                 OpCode::LoadFast if !cur.contains(ins.arg) => {
                     livein.insert(ins.arg);
@@ -3466,8 +3464,7 @@ fn root_livein(
     let mut cur = SlotBits::empty(width);
     for &b in reachable {
         cur.0.copy_from_slice(&assigned_in[b].0);
-        for i in raw[b].start..raw[b].end {
-            let ins = code.instructions[i];
+        for &ins in &code.instructions[raw[b].start..raw[b].end] {
             match ins.op {
                 OpCode::LoadFast | OpCode::DeleteFast if !cur.contains(ins.arg) => {
                     live.insert(ins.arg);

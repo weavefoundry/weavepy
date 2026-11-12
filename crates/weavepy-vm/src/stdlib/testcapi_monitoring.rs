@@ -62,8 +62,8 @@ fn enter_scope(args: &[Object]) -> Result<Object, RuntimeError> {
                 continue;
             }
             let mut mask: i64 = 0;
-            for tool in 0..6 {
-                if m.events[tool] & (1u32 << *ev) != 0 {
+            for (tool, events) in m.events.iter().enumerate().take(6) {
+                if events & (1u32 << *ev) != 0 {
                     mask |= 1 << tool;
                 }
             }

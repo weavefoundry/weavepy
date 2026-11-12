@@ -806,9 +806,9 @@ impl Drop for Owned {
 impl Owned {
     #[inline(never)]
     fn release(&mut self) {
-        for k in 0..self.n {
+        for slot in &self.buf[..self.n] {
             // SAFETY: the first `n` entries are initialized.
-            crate::drop_hot(unsafe { self.buf[k].assume_init_read() });
+            crate::drop_hot(unsafe { slot.assume_init_read() });
         }
     }
 }
