@@ -21,7 +21,7 @@ are how it measures progress.
 | CPython test suite | 464 of 468 `Lib/test` entries pass | November 2, 2026, on macOS |
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
 | Warm speed | 0.85 times CPython's time | November 12, 2026, over 33 workloads |
-| Peak memory | 1.22 times CPython's resident set, 1.24 times its footprint | November 12, 2026, over 33 workloads |
+| Peak memory | 1.12 times CPython's resident set, 1.22 times its footprint | November 12, 2026, over 33 workloads |
 
 The sections below explain what these numbers cover and where they fall short.
 
@@ -97,17 +97,17 @@ See [Conformance](docs/CONFORMANCE.md) for how the grading works.
 
 These ratios compare WeavePy with CPython 3.14.8, so lower is better. They're
 the geometric mean of 33 realistic workloads, measured on November 12, 2026, at
-`3765dc75` on an Intel Core i9 Mac.
+`11c293b4` on an Intel Core i9 Mac.
 
 | Measure | WeavePy / CPython |
 | ---: | ---: |
 | Warm time | 0.85 |
-| Cold time (first call, including compilation) | 0.95 |
+| Cold time (first call, including compilation) | 0.96 |
 | Whole process (start-up, import, four calls) | 0.90 |
 | Start-up (`-c pass`) | 0.74 |
 | Start-up of a script that imports a module of its own | 0.75 |
-| Peak resident memory | 1.22 |
-| Peak memory footprint | 1.24 |
+| Peak resident memory | 1.12 |
+| Peak memory footprint | 1.22 |
 
 Warm time is well under CPython's overall, but results vary widely by workload:
 WeavePy is ahead on 23 of the 33. `scimark` (0.50), `pickle_roundtrip` (0.57),
@@ -136,11 +136,13 @@ measurements and the work behind them.
 ## Known limitations
 
 - **No releases.** Building from source is the only way to get WeavePy today.
-- **Memory.** WeavePy uses more memory than CPython: about 1.2 times its
-  resident set and its footprint (the memory it dirties) on these workloads,
-  and the gap on Linux is larger than the macOS figures above. A process that
-  runs for more than a tenth of a second releases the code pages it no longer
-  runs, which narrows the resident set; shorter ones don't.
+- **Memory.** WeavePy uses more memory than CPython: 1.12 times its resident
+  set and 1.22 times its footprint (the memory it dirties) on these
+  workloads, and the gap on Linux is larger than the macOS figures above. The
+  resident-set figure relies on a profile-guided build, which releases the
+  code pages a program is done with once its imports are over; a plain
+  release build does that only in processes that run for more than a tenth
+  of a second.
 - **Imports and warm-up.** Importing large parts of the standard library costs
   about 1.4 times CPython's instructions; a faster start-up hides most of it
   in short scripts. Cold time is a little under CPython's overall, but some

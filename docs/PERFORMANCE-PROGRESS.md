@@ -7,24 +7,28 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
-Measured on November 12, 2026, at `3765dc75` (this PR), a PGO build from a
+Measured on November 12, 2026, at `11c293b4` (this PR), a PGO build from a
 fresh training run against CPython 3.14.8 on the same host: warm time
-0.845, cold time 0.945, peak RSS 1.215. Whole processes (start-up, import,
-the first call and three more) take 0.90 of CPython's time, `-c pass`
-0.74, and a script that imports a module of its own 0.75 (0.86 before:
-see "Done"). Peak footprint is 1.24 of CPython's in a session where the
-`672cca59` build's is 1.24 too (CPython's own footprint read lower when
-that build's ratio was first measured, at 1.29). Against that build the
-cold time is the figure that moved (0.977 then), with whole processes
-(0.95 then); peak RSS went from 1.08 back to 1.22, the price of leaving
-short processes' code pages alone. WeavePy is ahead on 23 of the 33
+0.854, cold time 0.961, peak RSS 1.124. The build two commits earlier
+(`3765dc75`, the same training, before the early release of finished
+code) read 0.845, 0.945 and 1.215 an hour before: the times differ by
+what two runs do, and an interleaved A/B of the release puts them level.
+Whole processes (start-up, import, the first call and three more) take
+0.90 of CPython's time, `-c pass` 0.74, and a script that imports a
+module of its own 0.75 (0.86 before: see "Done"). Peak footprint is 1.22
+of CPython's (1.23 for `3765dc75` in the same session; CPython's own
+footprint read lower when the ratio was first measured, at 1.29).
+Against the build this PR started the day with (`672cca59`) the cold
+time moved (0.977 then), with whole processes (0.95 then); peak RSS was
+1.08 there for a release that cost short processes time (see "Done"),
+1.22 without it, and is 1.12 now. WeavePy is ahead on 23 of the 33
 workloads warm and 18 cold. The best warm times are `scimark` 0.50,
 `pickle_roundtrip` 0.57, `raytrace` and `unpack_sequence` 0.60, and
-`float_points` and `json_roundtrip` 0.62; the worst `async_tree` 1.19,
-`context_managers` 1.13, `class_creation` 1.10, and `deepcopy` and
-`closures_decorators` 1.07. The worst cold times are `async_tree` 1.38,
-`logging_mix` 1.37, `stdlib_utils` 1.30, `tomllib_loads` 1.27 and
-`mini_interpreter` 1.25.
+`float_points` and `json_roundtrip` 0.62; the worst `async_tree` 1.19 to
+1.25, `context_managers` 1.13, `class_creation` 1.08 to 1.10, and
+`deepcopy` and `closures_decorators` 1.07 to 1.10. The worst cold times
+are `async_tree` 1.38, `logging_mix` 1.37, `stdlib_utils` 1.30,
+`tomllib_loads` 1.27 and `mini_interpreter` 1.25.
 
 Measured earlier on November 12, 2026, at `672cca59` (this PR), a PGO build against
 CPython 3.14.8 on the same host: warm time 0.854, cold time 0.977, peak RSS
@@ -451,6 +455,26 @@ branch and pull request.
   when the frame JIT took over elsewhere: `chaos` retired 4% more
   instructions over four calls, `tomllib_loads` and `stdlib_utils` 2% to
   3%.
+- **Code a program is done with is released at once, off its thread**
+  (this PR). The 100 ms wait above gave back most of what the release
+  had bought on short processes, because a full release costs the
+  program: the system call, then a fault for every page of code it still
+  runs. A profile-ordered binary knows which code that is.
+  `tools/pgo/order.py` now puts its hot group (what the training's
+  programs keep running: 2,583 functions, 7.8 MB) between two marker
+  functions, `weavepy_text_steady_start` and `weavepy_text_steady_end`,
+  and the runtime releases only what lies past the second, with the
+  constants: what start-up, imports and compiles ran. That needs no
+  wait. It happens once, a millisecond after imports go quiet, on a
+  short-lived thread of its own (the call takes 0.16 ms there, 0.6 on
+  Linux), and the full releases follow by their own rule, counting from
+  what this one left. Over the suite it frees about 3.6 MB a process:
+  peak RSS is 0.92 of what it is without, and wall time, first calls and
+  warm calls are the same to within three parts in a thousand, in two
+  interleaved pairs. A binary linked without such an order (a plain
+  release build, whose checked-in order file has no markers) has the two
+  functions side by side and is left as it was;
+  `WEAVEPY_TEXT_TRIM_REST=0` turns it off.
 - **A program's own modules import without `importlib`** (this PR). The
   native importer loads a source file itself, but then built the module's
   `__spec__` and `__loader__` before running its body, and building them
@@ -2901,11 +2925,11 @@ What the `deltablue` measurements above point at, ahead of the list below:
   compiled in case a tier-2 loop calls them, in programs with no such
   loop. (A caller's analysis would have to ask for the callee and try
   again, since it types a call from the callee's compiled return lane.)
-- Release only the code a process is done with, off its own thread: with
-  the pages start-up and imports alone run laid out together (profiles
-  dumped at the end of the imports would tell them apart), a release
-  costs the program no faults and can happen as soon as imports are over
-  again.
+- A tighter steady group for the early release: 4.2 MB of its 7.8 MB is
+  resident when a program's imports end, since it's the union of what
+  33 programs keep running and start-up runs much of it too. Profiles
+  dumped at the end of the imports would tell what only start-up and
+  imports run from what a program goes on running.
 
 Two items the November 12 measurements put ahead of the list below:
 
