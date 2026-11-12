@@ -962,12 +962,17 @@ pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> Option<bool> {
             return None;
         }
         let threshold = st.threshold;
+        let sized = if st.range_budget {
+            size_budget(code)
+        } else {
+            0
+        };
         match st.cache.get_mut(&std::ptr::from_ref(code)) {
             None => Some(true),
             Some(entry) if matches!(entry.tier, Tier::Cold) => {
                 entry.counter = entry.counter.saturating_add(n);
                 let next = entry.counter.saturating_add(1);
-                let due = next >= threshold && compile_allowed(next, threshold);
+                let due = next >= threshold.max(sized) && compile_allowed(next, threshold);
                 if !due {
                     // The caller restarts the lean count.
                     entry.calls = entry.calls.wrapping_add(n);
@@ -1094,6 +1099,30 @@ fn import_size_budget(code: &CodeObject, admit_at: u32) -> u32 {
     }
     let scale = u32::try_from(len / IMPORT_LARGE_BODY + 1).unwrap_or(u32::MAX);
     admit_at.saturating_mul(scale)
+}
+
+/// Bodies longer than this many instructions need work in proportion to
+/// their length before tier 2 analyzes them, whatever the phase (see
+/// [`size_budget`]). What tier 2 is for (a kernel, a scanner's loop, a
+/// small method) is shorter.
+const LARGE_BODY: usize = 256;
+
+/// The work (calls and loop iterations) a large body needs for each
+/// instruction past [`LARGE_BODY`].
+const WORK_PER_INSTRUCTION: u32 = 16;
+
+/// The counter a code object needs before tier 2 analyzes it, for its
+/// length. An analysis costs four to seven microseconds an instruction,
+/// more when it carves loops out and starts over, and what it buys is a
+/// fraction of a microsecond an iteration: at the threshold alone, fifty
+/// iterations, `regex_mix`'s first call spent 15 of its 64 ms analyzing
+/// `re`'s compiler (`_parse`, 1,700 instructions; `_optimize_charset`, six
+/// times over) and `dataclasses._process_class` cost 3 ms, all rejected.
+fn size_budget(code: &CodeObject) -> u32 {
+    let over = code.instructions.len().saturating_sub(LARGE_BODY);
+    u32::try_from(over)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(WORK_PER_INSTRUCTION)
 }
 
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
@@ -1315,6 +1344,7 @@ impl JitState {
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                         || entry.counter < import_size_budget(code, admit_at(self.threshold))
+                        || (self.range_budget && entry.counter < size_budget(code))
                     {
                         return None;
                     }
@@ -2134,6 +2164,7 @@ impl JitState {
                 }
                 entry.counter = entry.counter.saturating_add(stride);
                 entry.counter >= self.threshold
+                    && (!self.range_budget || entry.counter >= size_budget(code))
             }
             Tier::Compiled(..) => {
                 if entry.osr_failures < OSR_FAILURE_BUDGET {
@@ -4316,19 +4347,30 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let st = &mut *st;
         let entry = cache_entry(&mut st.cache, &mut st.sweep_at, &frame.code);
         if matches!(entry.tier, Tier::Cold) {
-            if phase != CompilationPhase::Normal {
-                // A loop-free body gains nothing from native code until
-                // compiled callers exist to take its direct lanes, while
-                // compiling one during start-up or an import costs time and
-                // memory the program may never recover (`ABCMeta.register`
-                // while `_collections_abc` loads). The lean path has no
-                // ordinary frame-entry counter: account for the interval
-                // just completed and count another, so only sustained work
-                // compiles (the checkpoint stays reachable afterwards, even
-                // when pure-leaf calls skip frames).
-                let interval = lean_warm_at();
+            // A loop-free body gains nothing from native code until
+            // compiled callers exist to take its direct lanes, while
+            // compiling one during start-up or an import costs time and
+            // memory the program may never recover (`ABCMeta.register`
+            // while `_collections_abc` loads); and any body needs work in
+            // proportion to its length first (see [`size_budget`]). The
+            // lean path has no ordinary frame-entry counter: account for
+            // the interval just completed and count another, so only
+            // sustained work compiles (the checkpoint stays reachable
+            // afterwards, even when pure-leaf calls skip frames).
+            let interval = lean_warm_at();
+            let sized = if st.range_budget {
+                size_budget(&frame.code)
+            } else {
+                0
+            };
+            let need = if phase == CompilationPhase::Normal {
+                sized
+            } else {
+                sized.max(interval.saturating_mul(IMPORT_THRESHOLD_FACTOR))
+            };
+            if need > warm || phase != CompilationPhase::Normal {
                 entry.counter = entry.counter.saturating_add(interval);
-                if entry.counter < interval.saturating_mul(IMPORT_THRESHOLD_FACTOR) {
+                if entry.counter < need {
                     let hint = &frame.code.jit_hint;
                     entry.calls = entry.calls.wrapping_add(hint.lean_entries());
                     hint.defer_lean_compile();
