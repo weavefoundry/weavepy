@@ -22,6 +22,9 @@ the order from what the training itself executed, in three parts:
    running come first, then each program's own, together. Without `--runs`
    the group is what the merged profile executed COUNT times, which takes
    in a good deal of start-up.
+   The group lies between two marker functions, `weavepy_text_steady_start`
+   and `weavepy_text_steady_end`, which is how the runtime knows where it
+   ends.
 2. Everything else the training executed: BASE.order's entries in their
    order (start-up's first-use order), then the rest: what the most
    programs ran (their imports and compiles share most of it), each
@@ -170,6 +173,22 @@ def layout(ran, programs, lines, hot_count, used=()):
     return out, (len(hot), len(warm_listed) + len(warm_rest), len(unseen))
 
 
+# The functions the runtime finds the hot group by (crates/weavepy-cli/src/
+# text_trim.rs), with Mach-O's leading underscore.
+STEADY_START = "_weavepy_text_steady_start"
+STEADY_END = "_weavepy_text_steady_end"
+
+
+def marked(lines, hot):
+    """`lines` (a layout's, whose first `hot` are the hot group) with the
+    runtime's two markers around that group: the code past the second is
+    what a program has mostly finished with once its imports are over,
+    and the runtime releases its pages then."""
+    if hot == 0:
+        return lines
+    return [STEADY_START] + lines[:hot] + [STEADY_END] + lines[hot:]
+
+
 def programs_in(tool, runs_dir):
     """Each training program's steady counts and the functions it ran at
     all, from the `NAME.short-*` and `NAME.long-*` profiles in `runs_dir`,
@@ -201,6 +220,7 @@ def main():
     with open(base, encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     ordered, (hot, warm, unseen) = layout(ran, programs, lines, hot_count, used)
+    ordered = marked(ordered, hot)
     with open(out, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line in ordered))
     print("%s: %d hot (from %d programs), %d more the training ran, %d others from %s" % (

@@ -52,6 +52,16 @@
 //! Most programs that live that long so release once: a millisecond or two
 //! after their last import, or when they turn [`FIRST_AFTER`] old.
 //!
+//! A binary linked in a profile's order doesn't wait that long for most of
+//! it. `tools/pgo/order.py` puts the code programs keep running first,
+//! between two markers ([`weavepy_text_steady_start`] and
+//! [`weavepy_text_steady_end`]); everything past the second is what
+//! start-up, imports and compiles run. Releasing only that costs the
+//! program next to nothing, since little of it comes back, so it happens
+//! as soon as imports are over, whatever the process's age, and on a
+//! thread of its own, which takes the system call's time too (see
+//! [`rest`]).
+//!
 //! The pages are the file's, so nothing is lost: with one exception, a
 //! debugger's breakpoints, which live in private copies of code pages. A
 //! traced process is left alone. `WEAVEPY_TEXT_TRIM=0` turns the whole thing
@@ -140,6 +150,33 @@ static WORTH_OF: AtomicUsize = AtomicUsize::new(WORTH);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static DEBUG: AtomicBool = AtomicBool::new(false);
 
+/// Where the code a program keeps running begins in a binary linked in a
+/// profile's order (see the module docs). The value only keeps the two
+/// markers from being folded into one function.
+#[no_mangle]
+#[inline(never)]
+pub(crate) extern "C" fn weavepy_text_steady_start() -> u32 {
+    0x7374_6172
+}
+
+/// Where that code ends: the code past it runs once, or now and then.
+#[no_mangle]
+#[inline(never)]
+pub(crate) extern "C" fn weavepy_text_steady_end() -> u32 {
+    0x7374_656e
+}
+
+/// How much code lies between the markers in a binary linked in a
+/// profile's order (a megabyte or two there; a few bytes in any other
+/// binary, where the two are neighbors wherever the linker put them).
+const STEADY: std::ops::RangeInclusive<usize> = (256 << 10)..=(16 << 20);
+
+/// Where the code past the steady part starts (a page boundary inside the
+/// first range), or zero for a binary that isn't linked that way; and
+/// whether that part has been released ahead of the first full release.
+static REST_FROM: AtomicUsize = AtomicUsize::new(0);
+static REST_DONE: AtomicBool = AtomicBool::new(false);
+
 /// Find this binary's code and constants, for [`grown`] to release as the
 /// process grows (see the module docs). Does nothing with
 /// `WEAVEPY_TEXT_TRIM=0`, or where they can't be found or the binary's file
@@ -179,6 +216,25 @@ pub(crate) fn install() {
         }
         image.ranges[0].1 != 0
     });
+    if ready && std::env::var_os("WEAVEPY_TEXT_TRIM_REST").is_none_or(|v| v != "0") {
+        let (from, to) = (
+            weavepy_text_steady_start as *const () as usize,
+            weavepy_text_steady_end as *const () as usize,
+        );
+        // (The range the second marker is in is the one with the code. The
+        // first may lie just ahead of it, on the header's own page.)
+        let holds = |slot: &[AtomicUsize; 2]| {
+            let (start, len) = (
+                slot[0].load(Ordering::Relaxed),
+                slot[1].load(Ordering::Relaxed),
+            );
+            (start..start + len).contains(&to)
+        };
+        if from < to && STEADY.contains(&(to - from)) && RANGE.iter().any(holds) {
+            let page = sys::page();
+            REST_FROM.store((to + page - 1) & !(page - 1), Ordering::Relaxed);
+        }
+    }
     STATE.store(if ready { READY } else { OFF }, Ordering::Release);
 }
 
@@ -203,6 +259,71 @@ fn whole_pages(span: (usize, usize), page: usize) -> Option<(usize, usize)> {
     (start < end).then(|| (start, end - start))
 }
 
+/// Release what lies past the steady code (and the other ranges: the
+/// constants), on a thread of its own: the system call takes about a
+/// millisecond, which a script timed in milliseconds would notice, and
+/// the pages are ones the program has mostly finished with, so few fault
+/// back in. Once a process; the full releases follow by their own rule,
+/// counting from what this one left (`events` is the runtime's count of
+/// import events now).
+fn rest(at: u64, events: usize) {
+    let spawned = std::thread::Builder::new()
+        .name("weavepy-trim".into())
+        .stack_size(64 << 10)
+        .spawn(move || {
+            if STATE.load(Ordering::Acquire) != READY
+                || sys::traced()
+                || BUSY.swap(true, Ordering::Acquire)
+            {
+                return;
+            }
+            let began = std::time::Instant::now();
+            let before = sys::resident();
+            let from = REST_FROM.load(Ordering::Relaxed);
+            for slot in &RANGE {
+                let (start, len) = (
+                    slot[0].load(Ordering::Relaxed),
+                    slot[1].load(Ordering::Relaxed),
+                );
+                // (The range with the steady code gives up what follows it.)
+                let (start, len) = if (start..start + len).contains(&from) {
+                    (from, start + len - from)
+                } else {
+                    (start, len)
+                };
+                // SAFETY: whole pages of this binary's code and constants,
+                // which the file backs unchanged (`locate` checked).
+                if len != 0 && !unsafe { sys::release(start, len) } {
+                    STATE.store(OFF, Ordering::Release);
+                }
+            }
+            let now = sys::resident();
+            if DEBUG.load(Ordering::Relaxed) {
+                if let (Some(before), Some(now)) = (before, now) {
+                    eprintln!(
+                        "text trim: at {} ms, past the steady code, resident {} -> {} KiB (files {} -> {}) in {} us",
+                        at / 1000,
+                        before.all >> 10,
+                        now.all >> 10,
+                        before.files >> 10,
+                        now.files >> 10,
+                        began.elapsed().as_micros()
+                    );
+                }
+            }
+            // (As a full release leaves things: the next one wants the
+            // file-backed part to have grown over what's left now, or over
+            // what has come back by the first look it's old enough for.)
+            if let Some(now) = now {
+                FILES_LEFT.store(now.files, Ordering::Relaxed);
+            }
+            IMPORTS.store(events, Ordering::Relaxed);
+            SETTLED.store(false, Ordering::Relaxed);
+            BUSY.store(false, Ordering::Release);
+        });
+    drop(spawned);
+}
+
 /// The process's resident memory is `resident`, `at` microseconds on the
 /// tick's clock, with the runtime's imports at `imports`: release the
 /// code's pages if it's time (see the module docs).
@@ -216,6 +337,18 @@ pub(crate) fn grown(resident: Resident, at: u64, imports: weavepy_vm::ImportActi
         HIGHEST.store(all, Ordering::Relaxed);
     }
     if at < NEXT_TIME.load(Ordering::Relaxed) {
+        // Too young for a full release: the part past the steady code can
+        // go as soon as imports are over (see the module docs).
+        if REST_FROM.load(Ordering::Relaxed) != 0
+            && !REST_DONE.load(Ordering::Relaxed)
+            && all >= NEXT_AT.load(Ordering::Relaxed)
+            && files >= WORTH_OF.load(Ordering::Relaxed)
+            && imports.running == 0
+            && imports.quiet_micros >= QUIET_FOR.load(Ordering::Relaxed)
+            && !REST_DONE.swap(true, Ordering::Relaxed)
+        {
+            rest(at, imports.events);
+        }
         return;
     }
     if !SETTLED.swap(true, Ordering::Relaxed) {
@@ -375,6 +508,12 @@ mod sys {
                 .read_unaligned()
         };
         flag & P_TRACED != 0
+    }
+
+    /// The system's page size.
+    pub(super) fn page() -> usize {
+        // SAFETY: `sysconf` has no preconditions.
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)
     }
 
     /// The executable's `__TEXT` segment (its code and constants): `None`
@@ -606,6 +745,12 @@ mod sys {
         }
     }
 
+    /// The system's page size.
+    pub(super) fn page() -> usize {
+        // SAFETY: `sysconf` has no preconditions.
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)
+    }
+
     /// The read-only segments of the object this code is in.
     pub(super) fn locate() -> Option<Image> {
         // SAFETY: `sysconf` has no preconditions.
@@ -647,6 +792,10 @@ mod sys {
 
     pub(super) fn traced() -> bool {
         true
+    }
+
+    pub(super) fn page() -> usize {
+        4096
     }
 
     pub(super) unsafe fn release(_start: usize, _len: usize) -> bool {

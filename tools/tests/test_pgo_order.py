@@ -53,6 +53,14 @@ class LayoutTests(unittest.TestCase):
         lines, _ = order.layout(ran(a=10, b=5000), [], [], 1000)
         self.assertEqual(lines, ["_b", "_a"])
 
+    def test_markers_go_around_the_hot_group(self):
+        lines = ["_shared", "_own", "_startup", "_rare"]
+        self.assertEqual(order.marked(lines, 2), [
+            order.STEADY_START, "_shared", "_own", order.STEADY_END,
+            "_startup", "_rare",
+        ])
+        self.assertEqual(order.marked(lines, 0), lines)
+
     def test_base_entries_keep_their_order_and_spelling(self):
         merged = ran(_RNvCs1abc_3foo3bar=2, late=9)
         lines, _ = order.layout(merged, [], ["__RNvCs9xyz_3foo3bar", "_gone"], 1000)
