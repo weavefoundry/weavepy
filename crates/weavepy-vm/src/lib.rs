@@ -8104,6 +8104,7 @@ impl Interpreter {
     #[cold]
     #[inline(never)]
     pub(crate) fn countdown_refill(&mut self) -> bool {
+        memory_tick_from_countdown();
         if crate::gil::handoff_idle() {
             self.gil_countdown = crate::gil::GIL_CHECK_INTERVAL;
             return true;
@@ -82049,9 +82050,11 @@ pub fn set_jit_worker_idle_hook(hook: extern "C" fn()) {
 /// [`set_memory_tick_hook`]): `0` for nothing.
 static MEMORY_TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Have `hook` run whenever a cycle collection comes due, which is about
-/// every couple of thousand container allocations: the executable watches
-/// its memory from there (releasing code pages it no longer runs).
+/// Have `hook` run at the runtime's memory ticks: whenever a cycle
+/// collection comes due (about every couple of thousand container
+/// allocations), and every few thousand calls, returns and loop iterations
+/// of running code. The executable watches its memory from there
+/// (releasing code pages it no longer runs).
 pub fn set_memory_tick_hook(hook: extern "C" fn()) {
     MEMORY_TICK.store(hook as usize, std::sync::atomic::Ordering::Relaxed);
 }
@@ -82066,6 +82069,25 @@ pub(crate) fn memory_tick() {
         hook();
     }
 }
+
+/// [`memory_tick`] from the eval breaker's countdown, which runs out every
+/// [`gil::GIL_CHECK_INTERVAL`] calls, returns and loop iterations: one in
+/// [`MEMORY_TICK_EVERY`] of those ticks, which is still thousands a second
+/// of a busy program.
+#[inline]
+pub(crate) fn memory_tick_from_countdown() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    /// (Threads race on it; a tick more or less is nothing.)
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.load(Relaxed).wrapping_add(1);
+    COUNT.store(n, Relaxed);
+    if n % MEMORY_TICK_EVERY == 0 {
+        memory_tick();
+    }
+}
+
+/// See [`memory_tick_from_countdown`].
+const MEMORY_TICK_EVERY: u32 = 16;
 
 /// The most loop iterations a call (as tier 2 measured them, see
 /// `JitHint::short_loops`) for which a compiled caller calls the code's own

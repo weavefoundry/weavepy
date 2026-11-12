@@ -34,18 +34,19 @@ class LayoutTests(unittest.TestCase):
         ]
         lines, counts = order.layout(merged, programs, ["_startup", "_elsewhere"], 1000)
         self.assertEqual(lines, [
-            order.HOT_START, "_shared", "_b_own", "_a_own", "_c_own", order.HOT_END,
+            "_shared", "_b_own", "_a_own", "_c_own",
             "_startup", "_rare", "_elsewhere",
         ])
         self.assertEqual(counts, (4, 2, 1))
 
     def test_merged_counts_stand_in_without_runs(self):
         lines, _ = order.layout(ran(a=10, b=5000), [], [], 1000)
-        self.assertEqual(lines, [order.HOT_START, "_b", order.HOT_END, "_a"])
+        self.assertEqual(lines, ["_b", "_a"])
 
-    def test_base_markers_are_dropped(self):
-        lines, _ = order.layout(ran(a=1), [], [order.HOT_START, "_a", order.HOT_END], 1000)
-        self.assertEqual(lines, [order.HOT_START, order.HOT_END, "_a"])
+    def test_base_entries_keep_their_order_and_spelling(self):
+        merged = ran(_RNvCs1abc_3foo3bar=2, late=9)
+        lines, _ = order.layout(merged, [], ["__RNvCs9xyz_3foo3bar", "_gone"], 1000)
+        self.assertEqual(lines, ["__RNvCs9xyz_3foo3bar", "_late", "_gone"])
 
 
 if __name__ == "__main__":

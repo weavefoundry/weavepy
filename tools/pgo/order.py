@@ -11,9 +11,8 @@ the build that file was made from: about half of its names match nothing
 there, and some of the hottest functions aren't in it at all. This writes
 the order from what the training itself executed, in three parts:
 
-1. The hot group, between the markers `weavepy_text_hot_start` and
-   `weavepy_text_hot_end`: the functions a program keeps running once it
-   has started, imported and compiled what it needs. `--runs DIR` names a
+1. The hot group: the functions a program keeps running once it has
+   started, imported and compiled what it needs. `--runs DIR` names a
    directory with two profiles per training program, `NAME.short-*.profdata`
    from a short run and `NAME.long-*.profdata` from one of the same program
    that repeats its work more often: a function is in the group when the
@@ -28,9 +27,9 @@ the order from what the training itself executed, in three parts:
 3. BASE.order's other entries (another platform's start-up code).
 
 A function the training never ran isn't listed, so the linker places it
-after all of these. The runtime releases the pages after the hot group
-once a process has stopped running them (crates/weavepy-cli/src/
-text_trim.rs).
+after all of these. The runtime releases its code's pages now and then,
+and what a program keeps running comes back (crates/weavepy-cli/src/
+text_trim.rs): the closer together that code is, the fewer pages do.
 
 The linker wrapper (scripts/link-ordered.py) remaps the names onto the
 link's own symbols, so the names here are the profile's, with Mach-O's
@@ -43,8 +42,6 @@ import re
 import subprocess
 import sys
 
-HOT_START = "_weavepy_text_hot_start"
-HOT_END = "_weavepy_text_hot_end"
 
 
 # As scripts/link-ordered.py matches names: v0 crate disambiguators
@@ -108,11 +105,9 @@ def layout(ran, programs, lines, hot_count):
     functions (as [`executed`] returns them), `programs` each training
     program's steady counts (as [`steady`] returns them) in training
     order, `lines` the base order file's entries."""
-    markers = {key(HOT_START), key(HOT_END)}
     listed = {}
     for line in lines:
-        if key(line) not in markers:
-            listed.setdefault(key(line), line)
+        listed.setdefault(key(line), line)
 
     def count(k):
         return ran[k][1]
@@ -148,9 +143,7 @@ def layout(ran, programs, lines, hot_count):
     seen = hot_set.union(warm_listed)
     warm_rest = sorted((k for k in ran if k not in seen), key=lambda k: (-count(k), k))
     unseen = [k for k in listed if k not in ran]
-    out = [HOT_START]
-    out += [symbol(k) for k in hot]
-    out.append(HOT_END)
+    out = [symbol(k) for k in hot]
     out += [listed[k] for k in warm_listed]
     out += [symbol(k) for k in warm_rest]
     out += [listed[k] for k in unseen]

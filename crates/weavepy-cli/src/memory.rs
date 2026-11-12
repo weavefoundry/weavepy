@@ -1,12 +1,11 @@
 //! What the process does about its own memory as it runs.
 //!
 //! The runtime ticks where a process may have grown: when a cycle
-//! collection comes due (every couple of thousand container allocations)
-//! and when the JIT's worker runs out of work. At a tick, at most once a
-//! millisecond, the process looks at its resident set and:
+//! collection comes due, every few thousand calls, returns and loop
+//! iterations, and when the JIT's worker runs out of work. At a tick, at
+//! most once a millisecond, the process looks at its resident set and:
 //!
-//! - releases the code pages it no longer runs, once it has grown a step
-//!   (see [`crate::text_trim`]);
+//! - releases the code pages it no longer runs (see [`crate::text_trim`]);
 //! - keeps freed heap resident longer once it's large (see
 //!   [`crate::alloc::note_resident`]).
 
