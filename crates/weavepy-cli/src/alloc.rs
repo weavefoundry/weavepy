@@ -116,6 +116,37 @@ const MI_OPTION_PURGE_DELAY: c_int = 15;
 #[cfg(target_vendor = "apple")]
 const PURGE_DELAY_MS: c_long = 50;
 
+/// The resident set size past which a free range of an arena stays resident
+/// for [`LARGE_PURGE_DELAY_MS`] instead (see [`note_resident`]).
+#[cfg(target_vendor = "apple")]
+const LARGE_HEAP: usize = 32 << 20;
+
+/// How long a free range stays resident once the process is large: a
+/// program that builds and drops tens of megabytes at a time takes longer
+/// than [`PURGE_DELAY_MS`] over each round, so every round's memory was
+/// purged and faulted back in, page by page, for the next (`async_tree`: a
+/// third more page faults, and 7% more cycles). The few megabytes a short
+/// delay saves are a small part of such a process.
+#[cfg(target_vendor = "apple")]
+const LARGE_PURGE_DELAY_MS: c_long = 500;
+
+/// Whether [`configure`] set the purge delay (the environment didn't).
+#[cfg(target_vendor = "apple")]
+static PURGE_DELAY_OURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The process's resident set is `resident` bytes: past [`LARGE_HEAP`], the
+/// arenas keep their free ranges resident longer from here on.
+pub(crate) fn note_resident(resident: usize) {
+    #[cfg(target_vendor = "apple")]
+    if resident >= LARGE_HEAP && PURGE_DELAY_OURS.swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        // SAFETY: only stores the value.
+        unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, LARGE_PURGE_DELAY_MS) };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = resident;
+}
+
 /// mimalloc 3's `mi_option_arena_reserve` (its position in `mi_option_t`).
 const MI_OPTION_ARENA_RESERVE: c_int = 23;
 
@@ -366,6 +397,7 @@ pub extern "C" fn configure() {
         #[cfg(target_vendor = "apple")]
         if libc::getenv(c"MIMALLOC_PURGE_DELAY".as_ptr()).is_null() {
             mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS);
+            PURGE_DELAY_OURS.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(target_os = "linux")]
@@ -377,9 +409,9 @@ pub extern "C" fn configure() {
 
 /// Hand the calling thread's free pages back (the JIT worker's, between
 /// compiles): another thread's allocations can then take them. The compiles
-/// are also code the process has just finished running (see `text_trim`).
+/// are also code the process has just finished running (see `memory`).
 extern "C" fn collect_thread_heap() {
     // SAFETY: collects the calling thread's own heap.
     unsafe { mi_collect(true) };
-    crate::text_trim::tick();
+    crate::memory::tick();
 }

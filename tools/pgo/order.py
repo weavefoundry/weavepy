@@ -12,16 +12,19 @@ there, and some of the hottest functions aren't in it at all. This writes
 the order from what the training itself executed, in three parts:
 
 1. The hot group, between the markers `weavepy_text_hot_start` and
-   `weavepy_text_hot_end`: the functions some training process ran at
-   least COUNT times (default 1,000), hottest first. That leaves out what
-   only start-up, an import or a compile runs. `--runs DIR` names a
-   directory with one profile per training process (`*.profdata`), which
-   is what tells a function one process ran a million times from one that
-   a thousand processes ran once each; without it the merged profile's
-   counts stand in.
+   `weavepy_text_hot_end`: the functions a program keeps running once it
+   has started, imported and compiled what it needs. `--runs DIR` names a
+   directory with two profiles per training program, `NAME.short-*.profdata`
+   from a short run and `NAME.long-*.profdata` from one of the same program
+   that repeats its work more often: a function is in the group when the
+   long run of some program executed it at least COUNT times more (default
+   1,000). What start-up, an import or a compile runs counts the same in
+   both, however often that is. The functions the most programs keep
+   running come first, then each program's own, together. Without `--runs`
+   the group is what the merged profile executed COUNT times, which takes
+   in a good deal of start-up.
 2. Everything else the training executed: BASE.order's entries in their
-   order (start-up's first-use order), then the rest, those the most
-   processes ran first.
+   order (start-up's first-use order), then the rest, hottest first.
 3. BASE.order's other entries (another platform's start-up code).
 
 A function the training never ran isn't listed, so the linker places it
@@ -89,19 +92,22 @@ def option(args, flag, default=None):
     return value
 
 
-def layout(ran, runs, lines, hot_count):
+def steady(short, long):
+    """`{key: count}`: how much more often the long run of a program
+    executed each function than the short one (see the module docs)."""
+    more = {}
+    for k, (_, count) in long.items():
+        extra = count - short.get(k, (None, 0))[1]
+        if extra > 0:
+            more[k] = extra
+    return more
+
+
+def layout(ran, programs, lines, hot_count):
     """The order file's lines: `ran` the merged profile's executed
-    functions and each of `runs` one process's (as [`executed`] returns
-    them), `lines` the base order file's entries."""
-    # Per function: how many processes ran it, and the most one of them did.
-    popularity = collections.Counter()
-    most = collections.Counter()
-    for run in runs:
-        for k, (_, count) in run.items():
-            popularity[k] += 1
-            most[k] = max(most[k], count)
-    if not runs:
-        most = collections.Counter({k: count for k, (_, count) in ran.items()})
+    functions (as [`executed`] returns them), `programs` each training
+    program's steady counts (as [`steady`] returns them) in training
+    order, `lines` the base order file's entries."""
     markers = {key(HOT_START), key(HOT_END)}
     listed = {}
     for line in lines:
@@ -115,11 +121,32 @@ def layout(ran, runs, lines, hot_count):
         # (With Mach-O's leading underscore, as BASE.order has it.)
         return "_" + ran[k][0]
 
-    hot = sorted((k for k in ran if most[k] >= hot_count), key=lambda k: (-count(k), k))
+    if programs:
+        # Per function: how many programs keep running it, the first that
+        # does, and the most one of them does.
+        keep = collections.Counter()
+        first = {}
+        most = collections.Counter()
+        for i, program in enumerate(programs):
+            for k, extra in program.items():
+                if extra >= hot_count and k in ran:
+                    keep[k] += 1
+                    first.setdefault(k, i)
+                    most[k] = max(most[k], extra)
+        # What most programs keep running is one block; the rest goes by
+        # program, so that a program's own code shares its pages with
+        # little of another's.
+        shared = max(2, len(programs) // 4)
+        hot = sorted(
+            keep,
+            key=lambda k: (0, -keep[k], -most[k], k) if keep[k] >= shared else (1, first[k], -most[k], k),
+        )
+    else:
+        hot = sorted((k for k in ran if count(k) >= hot_count), key=lambda k: (-count(k), k))
     hot_set = set(hot)
     warm_listed = [k for k in listed if k in ran and k not in hot_set]
     seen = hot_set.union(warm_listed)
-    warm_rest = sorted((k for k in ran if k not in seen), key=lambda k: (-popularity[k], -count(k), k))
+    warm_rest = sorted((k for k in ran if k not in seen), key=lambda k: (-count(k), k))
     unseen = [k for k in listed if k not in ran]
     out = [HOT_START]
     out += [symbol(k) for k in hot]
@@ -130,6 +157,22 @@ def layout(ran, runs, lines, hot_count):
     return out, (len(hot), len(warm_listed) + len(warm_rest), len(unseen))
 
 
+def programs_in(tool, runs_dir):
+    """Each training program's steady counts, from the `NAME.short-*` and
+    `NAME.long-*` profiles in `runs_dir`, in name order."""
+    names = {}
+    for f in sorted(os.listdir(runs_dir)):
+        m = re.match(r"(.+)\.(short|long)-[^.]*\.profdata$", f)
+        if m:
+            names.setdefault(m.group(1), {})[m.group(2)] = os.path.join(runs_dir, f)
+    programs = []
+    for name in sorted(names):
+        pair = names[name]
+        if "short" in pair and "long" in pair:
+            programs.append(steady(executed(tool, pair["short"]), executed(tool, pair["long"])))
+    return programs
+
+
 def main():
     args = sys.argv[1:]
     runs_dir = option(args, "--runs")
@@ -138,19 +181,14 @@ def main():
         raise SystemExit(__doc__)
     tool, merged, base, out = args
     ran = executed(tool, merged)
-    runs = []
-    if runs_dir:
-        runs = [
-            executed(tool, os.path.join(runs_dir, f))
-            for f in sorted(os.listdir(runs_dir))
-            if f.endswith(".profdata")
-        ]
+    programs = programs_in(tool, runs_dir) if runs_dir else []
     with open(base, encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    ordered, (hot, warm, unseen) = layout(ran, runs, lines, hot_count)
+    ordered, (hot, warm, unseen) = layout(ran, programs, lines, hot_count)
     with open(out, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line in ordered))
-    print("%s: %d hot, %d more the training ran, %d others from %s" % (out, hot, warm, unseen, base))
+    print("%s: %d hot (from %d programs), %d more the training ran, %d others from %s" % (
+        out, hot, len(programs), warm, unseen, base))
 
 
 if __name__ == "__main__":

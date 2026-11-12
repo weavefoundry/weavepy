@@ -20,15 +20,24 @@ class LayoutTests(unittest.TestCase):
         b = "_RNvNtCsaKrnU3FAIWq_10weavepy_vm9proc_init16snapshot_std_fds.llvm.123"
         self.assertEqual(order.key(a), order.key(b))
 
-    def test_hot_group_is_what_one_process_ran_often(self):
-        merged = ran(startup=5000, loop=900000, helper=4000, rare=3)
-        runs = [ran(startup=5, loop=450000, helper=2000), ran(startup=5, loop=450000, rare=3)]
-        lines, counts = order.layout(merged, runs, ["_startup", "_elsewhere"], 1000)
+    def test_steady_counts_are_the_long_run_less_the_short(self):
+        short = ran(startup=5000, loop=1000, compile=70000)
+        long = ran(startup=5000, loop=9000, compile=70000, late=4)
+        self.assertEqual(order.steady(short, long), {"loop": 8000, "late": 4})
+
+    def test_hot_group_is_what_programs_keep_running(self):
+        merged = ran(startup=900000, shared=50000, a_own=7000, b_own=6000, c_own=5000, rare=3)
+        programs = [
+            {"shared": 9000, "a_own": 7000, "startup": 0, "rare": 3},
+            {"shared": 9000, "b_own": 6000},
+            {"shared": 8000, "c_own": 5000, "b_own": 2000},
+        ]
+        lines, counts = order.layout(merged, programs, ["_startup", "_elsewhere"], 1000)
         self.assertEqual(lines, [
-            order.HOT_START, "_loop", "_helper", order.HOT_END,
+            order.HOT_START, "_shared", "_b_own", "_a_own", "_c_own", order.HOT_END,
             "_startup", "_rare", "_elsewhere",
         ])
-        self.assertEqual(counts, (2, 2, 1))
+        self.assertEqual(counts, (4, 2, 1))
 
     def test_merged_counts_stand_in_without_runs(self):
         lines, _ = order.layout(ran(a=10, b=5000), [], [], 1000)

@@ -37,6 +37,7 @@ use tracing_subscriber::EnvFilter;
 use weavepy::{InterpreterFlags, RunOptions};
 
 mod alloc;
+mod memory;
 mod text_trim;
 
 /// The process allocator. The interpreter allocates and frees small blocks
@@ -683,7 +684,7 @@ pub fn cli_main() -> i32 {
     // closed, matching CPython (`test_posix.test_close_file`). Must run before
     // any descriptor work.
     weavepy::vm::proc_init::restore_initial_std_fds();
-    text_trim::install();
+    memory::install();
     run_on_large_stack(main_dispatch)
 }
 

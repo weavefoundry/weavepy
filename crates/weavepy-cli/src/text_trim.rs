@@ -15,7 +15,7 @@
 //! [`weavepy_text_hot_start`] and [`weavepy_text_hot_end`]. Everything after
 //! the second marker is the code a run only passes through. Whenever the
 //! process's resident set has grown by a step since the last time (see
-//! [`tick`], which the cycle collector and the JIT's worker call), the pages
+//! [`grown`], which the memory tick calls), the pages
 //! of that part are released: on Linux with `madvise(MADV_DONTNEED)`, on
 //! macOS by mapping the file over the range again (as `alloc.rs` releases
 //! heap pages there, and for the same reason: nothing else takes pages out of
@@ -30,7 +30,7 @@
 //! off. A binary linked without an order file (a development build) has its
 //! markers side by side, and is left alone too.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 /// The first function of the order file's hot group: the code after it, up
 /// to [`weavepy_text_hot_end`], is what programs run steadily. (The two
@@ -74,70 +74,113 @@ const READY: u8 = 1;
 const OFF: u8 = 2;
 
 static STATE: AtomicU8 = AtomicU8::new(UNSET);
-/// The cold part's pages: its start and length.
+/// The code's pages, and the cold part's among them (a length of zero for
+/// none): each a start and a length.
+static TEXT_START: AtomicUsize = AtomicUsize::new(0);
+static TEXT_LEN: AtomicUsize = AtomicUsize::new(0);
 static COLD_START: AtomicUsize = AtomicUsize::new(0);
 static COLD_LEN: AtomicUsize = AtomicUsize::new(0);
-/// On macOS, the binary (open for reading) and the cold part's offset in it.
+/// On macOS, the binary (open for reading) and where its first byte is
+/// mapped.
 static IMAGE_FD: AtomicI32 = AtomicI32::new(-1);
-static COLD_OFFSET: AtomicU64 = AtomicU64::new(0);
+static IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Which pages a release takes (`WEAVEPY_TEXT_TRIM=cold|all|tiered`).
+static MODE: AtomicU8 = AtomicU8::new(MODE_COLD);
+const MODE_COLD: u8 = 0;
+const MODE_ALL: u8 = 1;
+const MODE_TIERED: u8 = 2;
+/// How many releases there have been.
+static RELEASES: AtomicUsize = AtomicUsize::new(0);
 /// The resident set size at which the next release happens.
 static NEXT_AT: AtomicUsize = AtomicUsize::new(FIRST_AT);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static DEBUG: AtomicBool = AtomicBool::new(false);
-/// When [`tick`] next asks for the resident set size, in microseconds since
-/// [`started`], and how long it then waits before asking again.
-static NEXT_LOOK: AtomicU64 = AtomicU64::new(0);
-const LOOK_EVERY_MICROS: u64 = 1000;
-
 /// When [`install`] ran.
 fn started() -> std::time::Instant {
     static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     *STARTED.get_or_init(std::time::Instant::now)
 }
 
-/// Find the cold part of this binary's code and start releasing it as the
-/// process grows (see the module docs). Does nothing when the binary isn't
-/// laid out for it, or `WEAVEPY_TEXT_TRIM=0`.
+/// Find the cold part of this binary's code, for [`grown`] to release as
+/// the process grows (see the module docs). Does nothing when the binary
+/// isn't laid out for it, or `WEAVEPY_TEXT_TRIM=0`.
 pub(crate) fn install() {
     match std::env::var_os("WEAVEPY_TEXT_TRIM") {
         Some(v) if v == "0" => {
             STATE.store(OFF, Ordering::Relaxed);
             return;
         }
-        // (`debug` reports each release on stderr.)
-        Some(v) if v == "debug" => DEBUG.store(true, Ordering::Relaxed),
-        _ => {}
+        Some(v) => {
+            // (`debug` reports each release on stderr.)
+            let v = v.to_string_lossy().into_owned();
+            for word in v.split(',') {
+                match word {
+                    "debug" => {
+                        DEBUG.store(true, Ordering::Relaxed);
+                        started();
+                    }
+                    "cold" => MODE.store(MODE_COLD, Ordering::Relaxed),
+                    "all" => MODE.store(MODE_ALL, Ordering::Relaxed),
+                    "tiered" => MODE.store(MODE_TIERED, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        }
+        None => {}
     }
-    let ready = sys::locate().is_some_and(|cold| {
-        COLD_START.store(cold.start, Ordering::Relaxed);
-        COLD_LEN.store(cold.len, Ordering::Relaxed);
-        IMAGE_FD.store(cold.fd, Ordering::Relaxed);
-        COLD_OFFSET.store(cold.offset, Ordering::Relaxed);
-        true
+    let ready = sys::locate().is_some_and(|image| {
+        TEXT_START.store(image.text.0, Ordering::Relaxed);
+        TEXT_LEN.store(image.text.1, Ordering::Relaxed);
+        let (cold_start, cold_len) = image.cold.unwrap_or((0, 0));
+        COLD_START.store(cold_start, Ordering::Relaxed);
+        COLD_LEN.store(cold_len, Ordering::Relaxed);
+        IMAGE_FD.store(image.fd, Ordering::Relaxed);
+        IMAGE_BASE.store(image.base, Ordering::Relaxed);
+        cold_len != 0 || MODE.load(Ordering::Relaxed) != MODE_COLD
     });
     STATE.store(if ready { READY } else { OFF }, Ordering::Release);
-    if ready {
-        started();
-        weavepy_vm::set_memory_tick_hook(tick);
-    }
 }
 
-/// The cold part of the code: whole pages, and on macOS where the file has
-/// them.
-struct Cold {
-    start: usize,
-    len: usize,
+/// The process's resident set size, where the platform has a cheap way to
+/// ask.
+pub(crate) fn resident() -> Option<usize> {
+    sys::resident()
+}
+
+/// The binary's code: its whole pages and the cold part's (each a start and
+/// a length), and on macOS the file and where its first byte is mapped.
+struct Image {
+    text: (usize, usize),
+    cold: Option<(usize, usize)>,
     fd: i32,
-    offset: u64,
+    base: usize,
 }
 
-/// The cold part between the hot group's end and the end of the code
-/// `text` (a start and an end), when the markers show an ordered binary.
+/// The whole pages within `text` (a start and an end), as a start and a
+/// length.
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
+fn whole_pages(text: (usize, usize), page: usize) -> Option<(usize, usize)> {
+    let start = text.0.checked_add(page - 1)? & !(page - 1);
+    let end = text.1 & !(page - 1);
+    (start < end).then_some((start, end - start))
+}
+
+/// The addresses of the hot group's two markers.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn cold_range(text: (usize, usize), page: usize) -> Option<(usize, usize)> {
-    let hot_start = weavepy_text_hot_start as *const () as usize;
-    let hot_end = weavepy_text_hot_end as *const () as usize;
+fn markers() -> (usize, usize) {
+    (
+        weavepy_text_hot_start as *const () as usize,
+        weavepy_text_hot_end as *const () as usize,
+    )
+}
+
+/// The cold part (a start and a length, in whole pages) between the hot
+/// group's end and the end of the code `text` (a start and an end), when
+/// the markers `hot` show an ordered binary.
+#[cfg(any(target_vendor = "apple", target_os = "linux", test))]
+fn cold_range(text: (usize, usize), hot: (usize, usize), page: usize) -> Option<(usize, usize)> {
     let (lo, hi) = text;
+    let (hot_start, hot_end) = hot;
     if !(lo <= hot_start && hot_start < hot_end && hot_end < hi) || hot_end - hot_start < MIN_HOT {
         return None;
     }
@@ -146,28 +189,33 @@ fn cold_range(text: (usize, usize), page: usize) -> Option<(usize, usize)> {
     (start < end).then_some((start, end - start))
 }
 
-/// A point at which the process may have grown (a cycle collection came
-/// due, the JIT's worker ran out of work): release the cold code's pages if
-/// the resident set has grown a step since the last release.
-pub(crate) extern "C" fn tick() {
+/// The process's resident set is `resident` bytes: release the cold code's
+/// pages if that's a step more than after the last release.
+pub(crate) fn grown(resident: usize) {
     if STATE.load(Ordering::Acquire) != READY {
         return;
     }
-    // (A program allocating flat out ticks thousands of times a second;
-    // asking the kernel for the resident set costs about a microsecond.)
-    let now = started().elapsed().as_micros() as u64;
-    if now < NEXT_LOOK.load(Ordering::Relaxed) {
-        return;
-    }
-    NEXT_LOOK.store(now + LOOK_EVERY_MICROS, Ordering::Relaxed);
-    let Some(resident) = sys::resident() else {
-        return;
-    };
     if resident < NEXT_AT.load(Ordering::Relaxed) || BUSY.swap(true, Ordering::Acquire) {
         return;
     }
-    let start = COLD_START.load(Ordering::Relaxed);
-    let len = COLD_LEN.load(Ordering::Relaxed);
+    let n = RELEASES.fetch_add(1, Ordering::Relaxed) + 1;
+    let all = match MODE.load(Ordering::Relaxed) {
+        MODE_ALL => true,
+        // (The first, second, fourth, eighth... release.)
+        MODE_TIERED => n.is_power_of_two(),
+        _ => false,
+    };
+    let (start, len) = if all || COLD_LEN.load(Ordering::Relaxed) == 0 {
+        (
+            TEXT_START.load(Ordering::Relaxed),
+            TEXT_LEN.load(Ordering::Relaxed),
+        )
+    } else {
+        (
+            COLD_START.load(Ordering::Relaxed),
+            COLD_LEN.load(Ordering::Relaxed),
+        )
+    };
     let began = DEBUG.load(Ordering::Relaxed).then(std::time::Instant::now);
     // SAFETY: the range is whole pages of this binary's code, which the file
     // backs unchanged (`locate` checked, and `release` skips a traced
@@ -201,7 +249,7 @@ pub(crate) extern "C" fn tick() {
 
 #[cfg(target_vendor = "apple")]
 mod sys {
-    use super::{cold_range, Cold, Ordering, COLD_OFFSET, IMAGE_FD};
+    use super::{cold_range, markers, whole_pages, Image, Ordering, IMAGE_BASE, IMAGE_FD};
     use std::ffi::{c_char, c_int, c_ulong, c_void};
 
     extern "C" {
@@ -282,7 +330,7 @@ mod sys {
     ///
     /// (Not through `dladdr`, which reads the image's whole symbol table to
     /// name the address: megabytes of pages for the resident set.)
-    pub(super) fn locate() -> Option<Cold> {
+    pub(super) fn locate() -> Option<Image> {
         // SAFETY: image 0 is the executable, mapped for the process's life.
         let header = unsafe { _dyld_get_image_header(0) };
         if header.is_null() {
@@ -310,7 +358,9 @@ mod sys {
         let header = header as usize;
         // SAFETY: `sysconf` has no preconditions.
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        let (start, len) = cold_range((text, text + size as usize), page)?;
+        let section = (text, text + size as usize);
+        let pages = whole_pages(section, page)?;
+        let cold = cold_range(section, markers(), page);
         // SAFETY: the executable's path, NUL-terminated.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
@@ -330,11 +380,11 @@ mod sys {
             unsafe { libc::close(fd) };
             return None;
         }
-        Some(Cold {
-            start,
-            len,
+        Some(Image {
+            text: pages,
+            cold,
             fd,
-            offset: (start - header) as u64,
+            base: header,
         })
     }
 
@@ -350,7 +400,7 @@ mod sys {
             return true;
         }
         let fd: c_int = IMAGE_FD.load(Ordering::Relaxed);
-        let offset = COLD_OFFSET.load(Ordering::Relaxed);
+        let offset = start - IMAGE_BASE.load(Ordering::Relaxed);
         // SAFETY: the caller's contract; the new mapping has the bytes the
         // old one had, and replaces it atomically.
         let mapped = unsafe {
@@ -369,7 +419,7 @@ mod sys {
 
 #[cfg(target_os = "linux")]
 mod sys {
-    use super::{cold_range, Cold};
+    use super::{cold_range, markers, whole_pages, Image};
     use std::ffi::{c_int, c_void};
     use std::os::unix::fs::FileExt;
 
@@ -447,7 +497,7 @@ mod sys {
     }
 
     /// The executable segment the markers are in, and its cold part.
-    pub(super) fn locate() -> Option<Cold> {
+    pub(super) fn locate() -> Option<Image> {
         let mut find = Find {
             addr: super::weavepy_text_hot_end as *const () as usize,
             text: None,
@@ -456,12 +506,12 @@ mod sys {
         unsafe { libc::dl_iterate_phdr(Some(segment), (&raw mut find).cast()) };
         // SAFETY: `sysconf` has no preconditions.
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        let (start, len) = cold_range(find.text?, page)?;
-        Some(Cold {
-            start,
-            len,
+        let text = find.text?;
+        Some(Image {
+            text: whole_pages(text, page)?,
+            cold: cold_range(text, markers(), page),
             fd: -1,
-            offset: 0,
+            base: 0,
         })
     }
 
@@ -481,17 +531,60 @@ mod sys {
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 mod sys {
-    use super::Cold;
+    use super::Image;
 
     pub(super) fn resident() -> Option<usize> {
         None
     }
 
-    pub(super) fn locate() -> Option<Cold> {
+    pub(super) fn locate() -> Option<Image> {
         None
     }
 
     pub(super) unsafe fn release(_start: usize, _len: usize) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cold_range, MIN_HOT};
+
+    const PAGE: usize = 4096;
+    const TEXT: (usize, usize) = (0x10_0000, 0x90_0000);
+
+    #[test]
+    fn the_cold_part_is_whole_pages_after_the_hot_group() {
+        let hot = (TEXT.0 + 0x900, TEXT.0 + 0x30_0123);
+        assert_eq!(
+            cold_range(TEXT, hot, PAGE),
+            Some((TEXT.0 + 0x30_1000, 0x80_0000 - 0x30_1000))
+        );
+        // (An end within a page keeps that page.)
+        let text = (TEXT.0, TEXT.1 + 0x10);
+        assert_eq!(
+            cold_range(text, hot, PAGE),
+            Some((TEXT.0 + 0x30_1000, 0x80_0000 - 0x30_1000))
+        );
+    }
+
+    #[test]
+    fn an_unordered_binary_has_no_cold_part() {
+        // The markers side by side, as the compiler emitted them.
+        assert_eq!(
+            cold_range(TEXT, (TEXT.0 + 0x5000, TEXT.0 + 0x5010), PAGE),
+            None
+        );
+        // The wrong way around.
+        let far = TEXT.0 + 4 * MIN_HOT;
+        assert_eq!(cold_range(TEXT, (far, TEXT.0 + 0x900), PAGE), None);
+        // In another image than the code.
+        assert_eq!(cold_range(TEXT, (0x900, far), PAGE), None);
+        assert_eq!(cold_range(TEXT, (TEXT.0, TEXT.1 + PAGE), PAGE), None);
+    }
+
+    #[test]
+    fn a_hot_group_up_to_the_last_page_leaves_nothing() {
+        assert_eq!(cold_range(TEXT, (TEXT.0, TEXT.1 - 0x10), PAGE), None);
     }
 }

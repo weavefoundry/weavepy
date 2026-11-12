@@ -60,7 +60,8 @@ echo "== merging"
 shopt -s nullglob
 raw=("$data"/*.profraw "$runs"/*.profraw)
 "$profdata" merge -o "$merged" "${raw[@]}"
-# One profile per benchmark process, for the order file's hot group.
+# One profile per benchmark process, for the order file's hot group (a
+# training command that left none gives an order from the merged counts).
 for f in "$runs"/*.profraw; do
     "$profdata" merge -o "${f%.profraw}.profdata" "$f"
 done
