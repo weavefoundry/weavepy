@@ -2736,7 +2736,15 @@ Two items the November 12 measurements put ahead of the list below:
 - The import path: a code object's first use (30,000 instructions),
   `def` (twice CPython's instructions, three times with annotations) and
   the modules that are Python here and C there. `_colorize`'s dataclasses
-  are 6 ms of every program that imports `traceback`.
+  are 6 ms of every program that imports `traceback`. An annotated `def`
+  retires 8,150 instructions where a plain one retires 2,000: attaching
+  `__annotate__` builds the function's attribute dict (three seeded
+  entries and two interned names) and renaming the annotate function
+  builds a second one, so a field for it, and a name computed when it's
+  read, would take about half of that and 300 bytes a function.
+- Much of the footprint is representation: a dict entry is 40 bytes
+  against CPython's 24 (16-byte values), and a code object's strings live
+  twice, as the compiler's constants and names and as the VM's objects.
 
 1. Exceptions, which explain most of `exceptions`, `context_managers` and
    `collections_mix` (140,000, 80,000 and 20,000 raises a call). A raise
