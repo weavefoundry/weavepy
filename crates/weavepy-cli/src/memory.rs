@@ -39,6 +39,6 @@ pub(crate) extern "C" fn tick() {
     NEXT_LOOK.store(now + LOOK_EVERY_MICROS, Ordering::Relaxed);
     if let Some(resident) = crate::text_trim::resident() {
         crate::alloc::note_resident(resident.all);
-        crate::text_trim::grown(resident, now, weavepy_vm::import_events());
+        crate::text_trim::grown(resident, now, weavepy_vm::import_activity());
     }
 }

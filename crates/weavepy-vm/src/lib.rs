@@ -82093,30 +82093,62 @@ pub(crate) fn memory_tick_from_countdown() {
 /// See [`memory_tick_from_countdown`].
 const MEMORY_TICK_EVERY: u32 = 16;
 
-/// How many module bodies have started or finished running (see
-/// [`import_events`]).
-static IMPORT_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// A count that moves whenever an import starts or finishes running a
-/// module's body, in any thread. While it keeps moving the process is still
-/// passing through code it runs once (the importer, the compiler, each
-/// module's set-up), which is how the executable tells when to release that
-/// code's pages.
-pub fn import_events() -> usize {
-    IMPORT_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+/// Imports as the executable's memory tick sees them (see
+/// [`import_activity`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ImportActivity {
+    /// How many module bodies have started or finished running so far.
+    pub events: usize,
+    /// How many are running now, in any thread.
+    pub running: usize,
+    /// Microseconds since the last of them started or finished.
+    pub quiet_micros: u64,
 }
 
-/// A module body's run, for [`import_events`].
+static IMPORT_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IMPORTS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// When the last import event happened, in microseconds on
+/// [`import_clock`].
+static IMPORT_EVENT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn import_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
+/// What imports are doing. While module bodies keep starting and finishing
+/// the process is still passing through code it runs once (the importer,
+/// the compiler, each module's set-up), which is how the executable tells
+/// when to release that code's pages.
+pub fn import_activity() -> ImportActivity {
+    use std::sync::atomic::Ordering::Relaxed;
+    ImportActivity {
+        events: IMPORT_EVENTS.load(Relaxed),
+        running: IMPORTS_RUNNING.load(Relaxed),
+        quiet_micros: import_clock().saturating_sub(IMPORT_EVENT_AT.load(Relaxed)),
+    }
+}
+
+/// A module body's run, for [`import_activity`].
 pub(crate) struct ImportRun;
 
 pub(crate) fn import_run() -> ImportRun {
-    IMPORT_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    IMPORT_EVENTS.fetch_add(1, Relaxed);
+    IMPORTS_RUNNING.fetch_add(1, Relaxed);
+    IMPORT_EVENT_AT.store(import_clock(), Relaxed);
     ImportRun
 }
 
 impl Drop for ImportRun {
     fn drop(&mut self) {
-        IMPORT_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        IMPORT_EVENTS.fetch_add(1, Relaxed);
+        IMPORTS_RUNNING.fetch_sub(1, Relaxed);
+        IMPORT_EVENT_AT.store(import_clock(), Relaxed);
     }
 }
 

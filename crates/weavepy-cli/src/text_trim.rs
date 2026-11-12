@@ -17,8 +17,8 @@
 //! nothing else takes pages out of the resident set at once). On Linux that
 //! part is larger still, since a fault there maps the sixteen pages around
 //! the one touched. The pages stay in the file cache, and the code the
-//! program is still running comes back a soft fault a page, about a
-//! microsecond each. What doesn't come back is everything the process only
+//! program is still running comes back a soft fault a page, about two
+//! microseconds each. What doesn't come back is everything the process only
 //! passed through.
 //!
 //! A release costs the process two or three milliseconds, nearly all of it
@@ -29,18 +29,22 @@
 //! - the resident set is about to pass its highest so far (within
 //!   [`margin`] of it), and is at least [`FIRST_AT`], so an interpreter that
 //!   only starts up, or runs a small script, pays nothing;
-//! - no import has started or finished for [`QUIET`]: start-up and imports
-//!   are where the one-time code runs, and a release in the middle of them
-//!   gets nearly all of it back at once;
+//! - imports are over for now: no module body is running and none has
+//!   started or finished for [`QUIET`]. Start-up and imports are where the
+//!   one-time code runs, and a release in the middle of them gets nearly
+//!   all of it back at once; right after them is when a program's own heap
+//!   starts to grow. (A module body that has run for [`BODY`] without
+//!   importing anything counts as the program.)
 //! - the file-backed part of the resident set (which the kernel reports)
-//!   has grown [`WORTH`] past what had come back once the wait after the
-//!   last release was over, which is what the program keeps running: a heap
-//!   that grows by itself releases nothing, and neither does a program that
-//!   has settled;
+//!   has grown by [`WORTH`]: over what the last release left, if imports
+//!   have run since, and otherwise over what had come back once the wait
+//!   after it was over, which is what the program keeps running. A heap
+//!   that grows by itself releases nothing, and neither does a program
+//!   that has settled;
 //! - and the last release was a while ago, twice as long as the one before
 //!   it was from its own, from [`FIRST_WAIT`] up.
 //!
-//! Most programs so release once, a few milliseconds after their last
+//! Most programs so release once, a millisecond or two after their last
 //! import.
 //!
 //! The pages are the file's, so nothing is lost: with one exception, a
@@ -64,9 +68,17 @@ const FIRST_WAIT: u64 = 16_000;
 const LONGEST_WAIT: u64 = 30_000_000;
 
 /// How long after an import last started or finished a release waits, in
-/// microseconds: imports come in runs (a module's own, then what its first
-/// call brings in).
-const QUIET: u64 = 4_000;
+/// microseconds, when no module body is running: long enough to tell the
+/// end of a run of imports from the gap between two of them, and no
+/// longer, since a small program's heap reaches its peak within
+/// milliseconds of its last import.
+const QUIET: u64 = 1_000;
+
+/// How long a running module body has gone without an import starting or
+/// finishing before a release stops waiting for it to end, in
+/// microseconds: a body that runs this long is the program (a script run
+/// by importing it), not a module setting itself up.
+const BODY: u64 = 50_000;
 
 /// How near its highest so far the resident set comes before a release:
 /// about what a busy process grows between two looks.
@@ -74,9 +86,9 @@ fn margin(highest: usize) -> usize {
     (highest / 16).max(1 << 20)
 }
 
-/// How much file-backed memory the resident set gains, over what had come
-/// back of it after the last release, before another: less is a release
-/// that frees nothing for long.
+/// How much file-backed memory the resident set gains before another
+/// release (see the module docs for over what): less is a release that
+/// frees nothing for long.
 const WORTH: usize = 3 << 20;
 
 /// A process's resident memory: all of it, and the part files back (code,
@@ -101,15 +113,14 @@ const RANGES: usize = 4;
 /// highest the resident set has been seen.
 static NEXT_AT: AtomicUsize = AtomicUsize::new(FIRST_AT);
 static HIGHEST: AtomicUsize = AtomicUsize::new(0);
-/// The file-backed part of the resident set at the first look after the
-/// wait that followed the last release (what had come back by then), and
-/// whether that look has happened.
+/// The file-backed part of the resident set the last release left, and at
+/// the first look after the wait that followed it (what had come back by
+/// then), with whether that look has happened.
+static FILES_LEFT: AtomicUsize = AtomicUsize::new(0);
 static BACK: AtomicUsize = AtomicUsize::new(0);
 static SETTLED: AtomicBool = AtomicBool::new(true);
-/// The runtime's count of import events at the last look, and when it last
-/// moved (in the tick's microseconds).
+/// The runtime's count of import events at the last release.
 static IMPORTS: AtomicUsize = AtomicUsize::new(0);
-static IMPORTED_AT: AtomicU64 = AtomicU64::new(0);
 /// When the next release may happen (in the tick's microseconds), with the
 /// wait after it.
 static NEXT_TIME: AtomicU64 = AtomicU64::new(0);
@@ -181,9 +192,9 @@ fn whole_pages(span: (usize, usize), page: usize) -> Option<(usize, usize)> {
 }
 
 /// The process's resident memory is `resident`, `at` microseconds on the
-/// tick's clock, with the runtime's count of import events at `imports`:
-/// release the code's pages if it's time (see the module docs).
-pub(crate) fn grown(resident: Resident, at: u64, imports: usize) {
+/// tick's clock, with the runtime's imports at `imports`: release the
+/// code's pages if it's time (see the module docs).
+pub(crate) fn grown(resident: Resident, at: u64, imports: weavepy_vm::ImportActivity) {
     if STATE.load(Ordering::Acquire) != READY {
         return;
     }
@@ -192,19 +203,28 @@ pub(crate) fn grown(resident: Resident, at: u64, imports: usize) {
     if all > highest {
         HIGHEST.store(all, Ordering::Relaxed);
     }
-    if IMPORTS.swap(imports, Ordering::Relaxed) != imports {
-        IMPORTED_AT.store(at, Ordering::Relaxed);
-    }
     if at < NEXT_TIME.load(Ordering::Relaxed) {
         return;
     }
     if !SETTLED.swap(true, Ordering::Relaxed) {
         BACK.store(files, Ordering::Relaxed);
     }
+    // What the code that has run since the last release came to: imports
+    // are done with theirs, a program at work only with what's new to it.
+    let before = if imports.events == IMPORTS.load(Ordering::Relaxed) {
+        BACK.load(Ordering::Relaxed)
+    } else {
+        FILES_LEFT.load(Ordering::Relaxed)
+    };
+    let quiet = if imports.running == 0 {
+        QUIET_FOR.load(Ordering::Relaxed)
+    } else {
+        BODY
+    };
     if all < NEXT_AT.load(Ordering::Relaxed)
         || all + margin(highest) < highest
-        || files < BACK.load(Ordering::Relaxed) + WORTH_OF.load(Ordering::Relaxed)
-        || at < IMPORTED_AT.load(Ordering::Relaxed) + QUIET_FOR.load(Ordering::Relaxed)
+        || files < before + WORTH_OF.load(Ordering::Relaxed)
+        || imports.quiet_micros < quiet
         || BUSY.swap(true, Ordering::Acquire)
     {
         return;
@@ -225,21 +245,23 @@ pub(crate) fn grown(resident: Resident, at: u64, imports: usize) {
             }
         }
     }
+    let now = sys::resident().unwrap_or(resident);
     let wait = NEXT_WAIT.load(Ordering::Relaxed);
     if DEBUG.load(Ordering::Relaxed) {
-        let now = sys::resident().unwrap_or(resident);
         eprintln!(
-            "text trim: at {} ms, resident {} -> {} KiB (files {} -> {}, {} had come back) in {} us, next in {} ms",
+            "text trim: at {} ms, resident {} -> {} KiB (files {} -> {}, from {}) in {} us, next in {} ms",
             at / 1000,
             all >> 10,
             now.all >> 10,
             files >> 10,
             now.files >> 10,
-            BACK.load(Ordering::Relaxed) >> 10,
+            before >> 10,
             began.elapsed().as_micros(),
             wait / 1000
         );
     }
+    FILES_LEFT.store(now.files, Ordering::Relaxed);
+    IMPORTS.store(imports.events, Ordering::Relaxed);
     SETTLED.store(false, Ordering::Relaxed);
     NEXT_TIME.store(at + wait, Ordering::Relaxed);
     NEXT_WAIT.store(wait.saturating_mul(2).min(LONGEST_WAIT), Ordering::Relaxed);
