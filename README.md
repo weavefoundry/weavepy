@@ -20,8 +20,8 @@ are how it measures progress.
 | --- | --- | --- |
 | CPython test suite | 464 of 468 `Lib/test` entries pass | November 2, 2026, on macOS |
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
-| Warm speed | 1.00 to 1.01 times CPython's time | October 30, 2026, over 33 workloads |
-| Peak memory | 1.43 to 1.46 times CPython's | October 30, 2026, over 33 workloads |
+| Warm speed | 0.87 times CPython's time | November 10, 2026, over 33 workloads |
+| Peak memory | 1.27 times CPython's | November 10, 2026, over 33 workloads |
 
 The sections below explain what these numbers cover and where they fall short.
 
@@ -83,7 +83,7 @@ four:
 - **One is skipped,** as CPython skips it: `test_multiprocessing_fork` on macOS.
 
 This sweep needs a CPython source tree, so it runs locally. CI gates every change
-on WeavePy's 464 bundled regression tests instead.
+on WeavePy's 587 bundled regression tests instead.
 
 **Real packages.** The ecosystem lane creates a virtual environment for each
 package, installs it, and runs a behavior check. All 48 rows pass on macOS and
@@ -96,19 +96,21 @@ See [Conformance](docs/CONFORMANCE.md) for how the grading works.
 ## Performance
 
 These ratios compare WeavePy with CPython 3.14.8, so lower is better. They're
-the range across two runs of 33 realistic workloads on an Intel Core i9 Mac.
+the geometric mean of 33 realistic workloads, measured on November 10, 2026, at
+`57960cea` on an Intel Core i9 Mac.
 
 | Measure | WeavePy / CPython |
 | ---: | ---: |
-| Warm time | 1.00 to 1.01 |
-| Cold time (first call, including compilation) | 1.17 to 1.19 |
-| Peak resident memory | 1.43 to 1.46 |
+| Warm time | 0.87 |
+| Cold time (first call, including compilation) | 0.98 |
+| Peak resident memory | 1.27 |
 
-Warm time is at parity overall, but results vary widely by workload. In the first
-run, 16 of the 33 beat CPython, led by `pickle_roundtrip` (0.56) and
-`decimal_telco` (0.58), while `async_tree` (1.67), `context_managers` (1.66), and
-`stdlib_utils` (1.50) trailed it most. Single workloads moved by as much as 40%
-between runs, so treat any one ratio as approximate.
+Warm time is well under CPython's overall, but results vary widely by workload.
+`scimark` (0.51), `pickle_roundtrip` and `unpack_sequence` (0.59), and
+`float_points` (0.62) lead, while `async_tree` (1.27), `logging_mix` (1.15),
+`context_managers` (1.14), and `deepcopy` (1.12) still trail CPython. CPython's
+own times move by a few percent between sessions, and single workloads by more,
+so treat any one ratio as approximate.
 
 Code that the JIT compiles fully can run far faster. The numeric loops in the
 [bench gate fixtures](docs/PERFORMANCE-CPYTHON-PARITY.md) took 5% to 8% of
@@ -132,7 +134,8 @@ measurements and the work behind them.
 - **Memory.** WeavePy uses more memory than CPython, and the gap on Linux is
   larger than the macOS figures above.
 - **Imports and warm-up.** Importing large parts of the standard library costs
-  more than in CPython, and new code runs slower until the JIT warms up.
+  more than in CPython. Cold time is level with CPython's overall, but some
+  workloads, such as `async_tree`, still start slower until the JIT warms up.
 - **Windows.** WeavePy builds and is tested on Windows, but the CPython and
   package baselines are measured on macOS and Linux. On Windows, those lanes
   report results without blocking.
