@@ -39,6 +39,16 @@ class LayoutTests(unittest.TestCase):
         ])
         self.assertEqual(counts, (4, 2, 1))
 
+    def test_the_rest_goes_by_how_many_programs_ran_it(self):
+        merged = ran(imports=40, a_setup=900, b_setup=30, tests_only=5000)
+        used = [
+            {"imports", "a_setup"},
+            {"imports", "b_setup"},
+            {"imports"},
+        ]
+        lines, _ = order.layout(merged, [{}, {}, {}], [], 1000, used)
+        self.assertEqual(lines, ["_imports", "_a_setup", "_b_setup", "_tests_only"])
+
     def test_merged_counts_stand_in_without_runs(self):
         lines, _ = order.layout(ran(a=10, b=5000), [], [], 1000)
         self.assertEqual(lines, ["_b", "_a"])

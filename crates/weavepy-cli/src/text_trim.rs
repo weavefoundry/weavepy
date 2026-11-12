@@ -90,6 +90,15 @@ pub(crate) fn install() {
         Some(v) if v == "debug" => DEBUG.store(true, Ordering::Relaxed),
         _ => {}
     }
+    // (Tuning aids: the resident set size of the first release, in bytes,
+    // and the wait after it, in microseconds.)
+    let tuned = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    if let Some(at) = tuned("WEAVEPY_TEXT_TRIM_AT") {
+        NEXT_AT.store(at as usize, Ordering::Relaxed);
+    }
+    if let Some(wait) = tuned("WEAVEPY_TEXT_TRIM_WAIT") {
+        NEXT_WAIT.store(wait.max(1), Ordering::Relaxed);
+    }
     started();
     let ready = sys::locate().is_some_and(|image| {
         for (slot, (start, len)) in RANGE.iter().zip(image.ranges) {

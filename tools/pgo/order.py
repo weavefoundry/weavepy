@@ -23,7 +23,9 @@ the order from what the training itself executed, in three parts:
    the group is what the merged profile executed COUNT times, which takes
    in a good deal of start-up.
 2. Everything else the training executed: BASE.order's entries in their
-   order (start-up's first-use order), then the rest, hottest first.
+   order (start-up's first-use order), then the rest: what the most
+   programs ran (their imports and compiles share most of it), each
+   program's own together, and last what only the other training ran.
 3. BASE.order's other entries (another platform's start-up code).
 
 A function the training never ran isn't listed, so the linker places it
@@ -100,11 +102,12 @@ def steady(short, long):
     return more
 
 
-def layout(ran, programs, lines, hot_count):
+def layout(ran, programs, lines, hot_count, used=()):
     """The order file's lines: `ran` the merged profile's executed
     functions (as [`executed`] returns them), `programs` each training
     program's steady counts (as [`steady`] returns them) in training
-    order, `lines` the base order file's entries."""
+    order, `used` the functions each ran at all (sets of keys, in the same
+    order), `lines` the base order file's entries."""
     listed = {}
     for line in lines:
         listed.setdefault(key(line), line)
@@ -141,7 +144,24 @@ def layout(ran, programs, lines, hot_count):
     hot_set = set(hot)
     warm_listed = [k for k in listed if k in ran and k not in hot_set]
     seen = hot_set.union(warm_listed)
-    warm_rest = sorted((k for k in ran if k not in seen), key=lambda k: (-count(k), k))
+    # How many programs ran each of the rest, and the first that did.
+    ran_by = collections.Counter()
+    first_ran = {}
+    for i, keys in enumerate(used):
+        for k in keys:
+            ran_by[k] += 1
+            first_ran.setdefault(k, i)
+    common = max(2, len(used) // 4)
+
+    def rest_key(k):
+        if ran_by[k] >= common:
+            return (0, -ran_by[k], -count(k), k)
+        if k in first_ran:
+            return (1, first_ran[k], -count(k), k)
+        # (What only the other training ran: the regression tests.)
+        return (2, 0, -count(k), k)
+
+    warm_rest = sorted((k for k in ran if k not in seen), key=rest_key)
     unseen = [k for k in listed if k not in ran]
     out = [symbol(k) for k in hot]
     out += [listed[k] for k in warm_listed]
@@ -151,19 +171,22 @@ def layout(ran, programs, lines, hot_count):
 
 
 def programs_in(tool, runs_dir):
-    """Each training program's steady counts, from the `NAME.short-*` and
-    `NAME.long-*` profiles in `runs_dir`, in name order."""
+    """Each training program's steady counts and the functions it ran at
+    all, from the `NAME.short-*` and `NAME.long-*` profiles in `runs_dir`,
+    in name order."""
     names = {}
     for f in sorted(os.listdir(runs_dir)):
         m = re.match(r"(.+)\.(short|long)-[^.]*\.profdata$", f)
         if m:
             names.setdefault(m.group(1), {})[m.group(2)] = os.path.join(runs_dir, f)
-    programs = []
+    programs, used = [], []
     for name in sorted(names):
         pair = names[name]
         if "short" in pair and "long" in pair:
-            programs.append(steady(executed(tool, pair["short"]), executed(tool, pair["long"])))
-    return programs
+            short, long = executed(tool, pair["short"]), executed(tool, pair["long"])
+            programs.append(steady(short, long))
+            used.append(set(short) | set(long))
+    return programs, used
 
 
 def main():
@@ -174,10 +197,10 @@ def main():
         raise SystemExit(__doc__)
     tool, merged, base, out = args
     ran = executed(tool, merged)
-    programs = programs_in(tool, runs_dir) if runs_dir else []
+    programs, used = programs_in(tool, runs_dir) if runs_dir else ([], [])
     with open(base, encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    ordered, (hot, warm, unseen) = layout(ran, programs, lines, hot_count)
+    ordered, (hot, warm, unseen) = layout(ran, programs, lines, hot_count, used)
     with open(out, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line in ordered))
     print("%s: %d hot (from %d programs), %d more the training ran, %d others from %s" % (
