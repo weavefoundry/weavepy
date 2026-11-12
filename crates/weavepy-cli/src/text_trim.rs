@@ -21,19 +21,27 @@
 //! microsecond each. What doesn't come back is everything the process only
 //! passed through.
 //!
-//! A release costs the process about a millisecond, most of it those
-//! faults, so it happens only where it lowers the most memory the process
-//! ever holds, and has something to free:
+//! A release costs the process two or three milliseconds, nearly all of it
+//! those faults (a program in the middle of its imports runs through about
+//! 5 MB of code pages, 1,300 of them), so it happens only where it lowers
+//! the most memory the process ever holds, and has something to free:
 //!
 //! - the resident set is about to pass its highest so far (within
 //!   [`margin`] of it), and is at least [`FIRST_AT`], so an interpreter that
 //!   only starts up, or runs a small script, pays nothing;
-//! - the file-backed part of it (which the kernel reports) has grown
-//!   [`WORTH`] past what the last release left, which is more than a
-//!   program's steady code comes back to: a heap that grows by itself
-//!   releases nothing;
+//! - no import has started or finished for [`QUIET`]: start-up and imports
+//!   are where the one-time code runs, and a release in the middle of them
+//!   gets nearly all of it back at once;
+//! - the file-backed part of the resident set (which the kernel reports)
+//!   has grown [`WORTH`] past what had come back once the wait after the
+//!   last release was over, which is what the program keeps running: a heap
+//!   that grows by itself releases nothing, and neither does a program that
+//!   has settled;
 //! - and the last release was a while ago, twice as long as the one before
 //!   it was from its own, from [`FIRST_WAIT`] up.
+//!
+//! Most programs so release once, a few milliseconds after their last
+//! import.
 //!
 //! The pages are the file's, so nothing is lost: with one exception, a
 //! debugger's breakpoints, which live in private copies of code pages. A
@@ -52,8 +60,13 @@ const FIRST_AT: usize = 10 << 20;
 /// How long after the first release the second may happen, in microseconds;
 /// each later one waits twice as long as the one before, up to
 /// [`LONGEST_WAIT`].
-const FIRST_WAIT: u64 = 2_000;
+const FIRST_WAIT: u64 = 16_000;
 const LONGEST_WAIT: u64 = 30_000_000;
+
+/// How long after an import last started or finished a release waits, in
+/// microseconds: imports come in runs (a module's own, then what its first
+/// call brings in).
+const QUIET: u64 = 4_000;
 
 /// How near its highest so far the resident set comes before a release:
 /// about what a busy process grows between two looks.
@@ -61,13 +74,9 @@ fn margin(highest: usize) -> usize {
     (highest / 16).max(1 << 20)
 }
 
-/// How much file-backed memory the resident set gains, over what the last
-/// release left of it, before another. The code a program keeps running
-/// comes back to about 2.5 MB of that in a profile-guided build, so less
-/// than this is a release that frees nothing for long: at 4 MB the first
-/// calls of the suite's workloads took 2.0% longer than with no releases
-/// and peak RSS came to 0.787 of theirs, with no such condition 3.2% and
-/// 0.766.
+/// How much file-backed memory the resident set gains, over what had come
+/// back of it after the last release, before another: less is a release
+/// that frees nothing for long.
 const WORTH: usize = 3 << 20;
 
 /// A process's resident memory: all of it, and the part files back (code,
@@ -88,24 +97,28 @@ static STATE: AtomicU8 = AtomicU8::new(UNSET);
 static RANGE: [[AtomicUsize; 2]; RANGES] =
     [const { [AtomicUsize::new(0), AtomicUsize::new(0)] }; RANGES];
 const RANGES: usize = 4;
-/// The resident set size from which the first release may happen, the
-/// highest the resident set has been seen, and the file-backed part the
-/// last release left.
+/// The resident set size from which the first release may happen, and the
+/// highest the resident set has been seen.
 static NEXT_AT: AtomicUsize = AtomicUsize::new(FIRST_AT);
 static HIGHEST: AtomicUsize = AtomicUsize::new(0);
-static FILES_LEFT: AtomicUsize = AtomicUsize::new(0);
-/// When the next release may happen (in microseconds since [`started`]),
-/// with the wait after it.
+/// The file-backed part of the resident set at the first look after the
+/// wait that followed the last release (what had come back by then), and
+/// whether that look has happened.
+static BACK: AtomicUsize = AtomicUsize::new(0);
+static SETTLED: AtomicBool = AtomicBool::new(true);
+/// The runtime's count of import events at the last look, and when it last
+/// moved (in the tick's microseconds).
+static IMPORTS: AtomicUsize = AtomicUsize::new(0);
+static IMPORTED_AT: AtomicU64 = AtomicU64::new(0);
+/// When the next release may happen (in the tick's microseconds), with the
+/// wait after it.
 static NEXT_TIME: AtomicU64 = AtomicU64::new(0);
 static NEXT_WAIT: AtomicU64 = AtomicU64::new(FIRST_WAIT);
+/// See [`QUIET`] and [`WORTH`] (tuning aids set them).
+static QUIET_FOR: AtomicU64 = AtomicU64::new(QUIET);
+static WORTH_OF: AtomicUsize = AtomicUsize::new(WORTH);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static DEBUG: AtomicBool = AtomicBool::new(false);
-
-/// When [`install`] ran.
-fn started() -> std::time::Instant {
-    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    *STARTED.get_or_init(std::time::Instant::now)
-}
 
 /// Find this binary's code and constants, for [`grown`] to release as the
 /// process grows (see the module docs). Does nothing with
@@ -120,16 +133,22 @@ pub(crate) fn install() {
         Some(v) if v == "debug" => DEBUG.store(true, Ordering::Relaxed),
         _ => {}
     }
-    // (Tuning aids: the resident set size of the first release, in bytes,
-    // and the wait after it, in microseconds.)
+    // (Tuning aids: the resident set size of the first release and the
+    // file-backed growth of a later one, in bytes, and the wait after the
+    // first and after an import, in microseconds.)
     let tuned = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     if let Some(at) = tuned("WEAVEPY_TEXT_TRIM_AT") {
         NEXT_AT.store(at as usize, Ordering::Relaxed);
     }
+    if let Some(worth) = tuned("WEAVEPY_TEXT_TRIM_WORTH") {
+        WORTH_OF.store(worth as usize, Ordering::Relaxed);
+    }
     if let Some(wait) = tuned("WEAVEPY_TEXT_TRIM_WAIT") {
         NEXT_WAIT.store(wait.max(1), Ordering::Relaxed);
     }
-    started();
+    if let Some(quiet) = tuned("WEAVEPY_TEXT_TRIM_QUIET") {
+        QUIET_FOR.store(quiet, Ordering::Relaxed);
+    }
     let ready = sys::locate().is_some_and(|image| {
         for (slot, (start, len)) in RANGE.iter().zip(image.ranges) {
             slot[0].store(start, Ordering::Relaxed);
@@ -161,9 +180,10 @@ fn whole_pages(span: (usize, usize), page: usize) -> Option<(usize, usize)> {
     (start < end).then(|| (start, end - start))
 }
 
-/// The process's resident memory is `resident`: release the code's pages if
-/// it's time (see the module docs).
-pub(crate) fn grown(resident: Resident) {
+/// The process's resident memory is `resident`, `at` microseconds on the
+/// tick's clock, with the runtime's count of import events at `imports`:
+/// release the code's pages if it's time (see the module docs).
+pub(crate) fn grown(resident: Resident, at: u64, imports: usize) {
     if STATE.load(Ordering::Acquire) != READY {
         return;
     }
@@ -172,16 +192,24 @@ pub(crate) fn grown(resident: Resident) {
     if all > highest {
         HIGHEST.store(all, Ordering::Relaxed);
     }
+    if IMPORTS.swap(imports, Ordering::Relaxed) != imports {
+        IMPORTED_AT.store(at, Ordering::Relaxed);
+    }
+    if at < NEXT_TIME.load(Ordering::Relaxed) {
+        return;
+    }
+    if !SETTLED.swap(true, Ordering::Relaxed) {
+        BACK.store(files, Ordering::Relaxed);
+    }
     if all < NEXT_AT.load(Ordering::Relaxed)
         || all + margin(highest) < highest
-        || files < FILES_LEFT.load(Ordering::Relaxed) + WORTH
+        || files < BACK.load(Ordering::Relaxed) + WORTH_OF.load(Ordering::Relaxed)
+        || at < IMPORTED_AT.load(Ordering::Relaxed) + QUIET_FOR.load(Ordering::Relaxed)
+        || BUSY.swap(true, Ordering::Acquire)
     {
         return;
     }
-    let at = started().elapsed().as_micros() as u64;
-    if at < NEXT_TIME.load(Ordering::Relaxed) || BUSY.swap(true, Ordering::Acquire) {
-        return;
-    }
+    let began = std::time::Instant::now();
     // (A traced process's debugger may have written breakpoints, which
     // live in private copies of code pages.)
     if !sys::traced() {
@@ -197,21 +225,22 @@ pub(crate) fn grown(resident: Resident) {
             }
         }
     }
-    let now = sys::resident().unwrap_or(resident);
-    FILES_LEFT.store(now.files, Ordering::Relaxed);
     let wait = NEXT_WAIT.load(Ordering::Relaxed);
     if DEBUG.load(Ordering::Relaxed) {
+        let now = sys::resident().unwrap_or(resident);
         eprintln!(
-            "text trim: at {} ms, resident {} -> {} KiB (files {} -> {}) in {} us, next in {} ms",
+            "text trim: at {} ms, resident {} -> {} KiB (files {} -> {}, {} had come back) in {} us, next in {} ms",
             at / 1000,
             all >> 10,
             now.all >> 10,
             files >> 10,
             now.files >> 10,
-            (started().elapsed().as_micros() as u64).saturating_sub(at),
+            BACK.load(Ordering::Relaxed) >> 10,
+            began.elapsed().as_micros(),
             wait / 1000
         );
     }
+    SETTLED.store(false, Ordering::Relaxed);
     NEXT_TIME.store(at + wait, Ordering::Relaxed);
     NEXT_WAIT.store(wait.saturating_mul(2).min(LONGEST_WAIT), Ordering::Relaxed);
     BUSY.store(false, Ordering::Release);

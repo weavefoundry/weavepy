@@ -1966,6 +1966,7 @@ impl Interpreter {
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
         #[cfg(feature = "jit")]
         let _compile_guard = crate::tier2::startup_compilation_scope();
+        let _import_run = crate::import_run();
         // Startup runs bytecode too (site/.pth imports can allocate enough
         // to trip an auto-collection), so engage the GIL here just as
         // `run_module_as` does for the program body. The process is
@@ -69390,6 +69391,7 @@ impl Interpreter {
         let body_result = {
             #[cfg(feature = "jit")]
             let _compilation_budget = crate::tier2::budget_import_compilation();
+            let _import_run = crate::import_run();
             self.run_frame(&mut frame)
         };
         self.cache.end_initializing(full);
@@ -69563,6 +69565,7 @@ impl Interpreter {
         let body_result = {
             #[cfg(feature = "jit")]
             let _compilation_budget = crate::tier2::budget_import_compilation();
+            let _import_run = crate::import_run();
             self.run_frame(&mut frame)
         };
         self.cache.end_initializing(full);
@@ -69723,6 +69726,7 @@ impl Interpreter {
         let body_result = {
             #[cfg(feature = "jit")]
             let _compilation_budget = crate::tier2::budget_import_compilation();
+            let _import_run = crate::import_run();
             self.run_frame(&mut frame)
         };
         self.cache.end_initializing(full);
@@ -82088,6 +82092,33 @@ pub(crate) fn memory_tick_from_countdown() {
 
 /// See [`memory_tick_from_countdown`].
 const MEMORY_TICK_EVERY: u32 = 16;
+
+/// How many module bodies have started or finished running (see
+/// [`import_events`]).
+static IMPORT_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A count that moves whenever an import starts or finishes running a
+/// module's body, in any thread. While it keeps moving the process is still
+/// passing through code it runs once (the importer, the compiler, each
+/// module's set-up), which is how the executable tells when to release that
+/// code's pages.
+pub fn import_events() -> usize {
+    IMPORT_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A module body's run, for [`import_events`].
+pub(crate) struct ImportRun;
+
+pub(crate) fn import_run() -> ImportRun {
+    IMPORT_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ImportRun
+}
+
+impl Drop for ImportRun {
+    fn drop(&mut self) {
+        IMPORT_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The most loop iterations a call (as tier 2 measured them, see
 /// `JitHint::short_loops`) for which a compiled caller calls the code's own
