@@ -814,7 +814,7 @@ struct Carve {
 /// from it (see [`Probes::carved`]). Steps taken for what inference found
 /// aren't kept, nor any step after one.
 #[derive(Debug, Default)]
-pub struct Carved(Option<CarveState>);
+pub struct Carved(Option<Box<CarveState>>);
 
 impl Carved {
     /// How many carving steps are kept.
@@ -839,7 +839,7 @@ fn carve_start(probes: &Probes<'_>) -> CarveState {
     probes
         .carved
         .as_deref()
-        .and_then(|carved| carved.0.clone())
+        .and_then(|carved| carved.0.as_deref().cloned())
         .unwrap_or_default()
 }
 
@@ -1029,12 +1029,12 @@ fn analyze_impl(
                 first_err.get_or_insert(e);
                 if planning {
                     if let Some(carved) = probes.carved.as_deref_mut() {
-                        carved.0 = Some(CarveState {
+                        carved.0 = Some(Box::new(CarveState {
                             cold: cold.clone(),
                             carve: carve.clone(),
                             steps,
                             first_err: first_err.clone(),
-                        });
+                        }));
                     }
                 }
             }

@@ -14597,6 +14597,78 @@ impl Interpreter {
                         last = pc;
                         pc += 1;
                     }
+                    // The same two in front of a plain namespace (a class
+                    // body's, or `exec`'s locals): the namespace, then the
+                    // globals and the builtins. A class body binds little
+                    // else, and without these arms every one of its names
+                    // ended the burst. A private name (which a class body
+                    // mangles) keeps the full handler.
+                    OpCode::LoadName if self.core_namespace_scope(frame) => {
+                        if len == cap {
+                            break None;
+                        }
+                        let Some(probe) = Self::core_namespace_probe(frame, code, ins.arg) else {
+                            break None;
+                        };
+                        let Some(ns) = frame.class_namespace() else {
+                            break None;
+                        };
+                        // SAFETY (raw dict reads): as in the `LOAD_GLOBAL` arm.
+                        let v = unsafe {
+                            let found = |d: *mut DictData| {
+                                (*d).get_index_of(&probe).and_then(|i| (*d).get_index(i))
+                            };
+                            found(ns.as_ptr())
+                                .or_else(|| found(frame.globals.as_ptr()))
+                                .or_else(|| found(frame.builtins.as_ptr()))
+                        };
+                        let (Some((_, v)), false) = (v, probe.saw_exotic()) else {
+                            break None;
+                        };
+                        let v = clone_hot(v);
+                        // SAFETY: `len < cap`.
+                        unsafe { base.add(len).write(v) };
+                        len += 1;
+                        last = pc;
+                        pc += 1;
+                    }
+                    OpCode::StoreName if self.core_namespace_scope(frame) => {
+                        if len == 0 || crate::capi_watchers::dicts_active() {
+                            break None;
+                        }
+                        let Some(probe) = Self::core_namespace_probe(frame, code, ins.arg) else {
+                            break None;
+                        };
+                        let (Some(ns), Some(key @ Object::Str(_))) =
+                            (frame.class_namespace(), code_name_obj(code, ins.arg))
+                        else {
+                            break None;
+                        };
+                        // SAFETY: no guard is live on the namespace (`peek_mut`
+                        // checks), and nothing below runs code.
+                        let Some(d) = (unsafe { ns.peek_mut() }) else {
+                            break None;
+                        };
+                        // A new name, or one whose old value leaves by a plain
+                        // drop.
+                        let plain = match d.get_index_of(&probe) {
+                            Some(i) => d
+                                .get_index(i)
+                                .is_some_and(|(_, old)| Self::core_droppable(old)),
+                            None => true,
+                        };
+                        if !plain || probe.saw_exotic() {
+                            break None;
+                        }
+                        // SAFETY: `len > 0`; the value moves into the binding.
+                        let v = unsafe { base.add(len - 1).read() };
+                        if let Some(old) = d.insert(DictKey(key.clone()), v) {
+                            drop_hot(old);
+                        }
+                        len -= 1;
+                        last = pc;
+                        pc += 1;
+                    }
                     // A keyword call of a pure leaf through the site's cached
                     // keyword permutation (the full handler's `CallPyKwNames`
                     // hit), evaluated in place like `CALL`'s pure leaves.
@@ -22712,6 +22784,33 @@ impl Interpreter {
             && frame.builtins_obj().is_none()
             && !frame.code.is_class_body
             && !self.globals_missing_any.get()
+    }
+
+    /// A plain namespace in front of the module scope, for the core loop's
+    /// `LOAD_NAME` / `STORE_NAME` arms: a class body's, or `exec`'s locals
+    /// (a dict, not a PEP 3115 mapping), with exact-dict globals and
+    /// builtins behind it.
+    #[inline(always)]
+    fn core_namespace_scope(&self, frame: &Frame) -> bool {
+        frame.class_namespace().is_some()
+            && frame.class_namespace_obj().is_none()
+            && frame.builtins_obj().is_none()
+            && !self.globals_missing_any.get()
+    }
+
+    /// The probe for `co_names[name_idx]` in a namespace frame (see
+    /// [`Self::core_namespace_scope`]), unless a class body would mangle
+    /// the name.
+    #[inline(always)]
+    fn core_namespace_probe<'a>(
+        frame: &Frame,
+        code: &'a CodeObject,
+        name_idx: u32,
+    ) -> Option<crate::object::LeafNameProbe<'a>> {
+        let k = code_name_key(code, name_idx)?;
+        let private = k.s.starts_with("__") && !k.s.ends_with("__");
+        (!(private && frame.code.is_class_body))
+            .then(|| crate::object::LeafNameProbe::new(k.s, k.hash))
     }
 
     /// The core loop's `isinstance(obj, cls)` (the leaf kind's settled
