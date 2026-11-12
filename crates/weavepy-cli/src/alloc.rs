@@ -376,8 +376,10 @@ pub extern "C" fn configure() {
 }
 
 /// Hand the calling thread's free pages back (the JIT worker's, between
-/// compiles): another thread's allocations can then take them.
+/// compiles): another thread's allocations can then take them. The compiles
+/// are also code the process has just finished running (see `text_trim`).
 extern "C" fn collect_thread_heap() {
     // SAFETY: collects the calling thread's own heap.
     unsafe { mi_collect(true) };
+    crate::text_trim::tick();
 }

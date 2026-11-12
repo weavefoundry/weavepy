@@ -82045,6 +82045,28 @@ pub fn set_jit_worker_idle_hook(hook: extern "C" fn()) {
     let _ = hook;
 }
 
+/// What runs at the points where the process may have grown (see
+/// [`set_memory_tick_hook`]): `0` for nothing.
+static MEMORY_TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Have `hook` run whenever a cycle collection comes due, which is about
+/// every couple of thousand container allocations: the executable watches
+/// its memory from there (releasing code pages it no longer runs).
+pub fn set_memory_tick_hook(hook: extern "C" fn()) {
+    MEMORY_TICK.store(hook as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run the hook [`set_memory_tick_hook`] set, if any.
+#[inline]
+pub(crate) fn memory_tick() {
+    let hook = MEMORY_TICK.load(std::sync::atomic::Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: stored from an `extern "C" fn()` by `set_memory_tick_hook`.
+        let hook = unsafe { std::mem::transmute::<usize, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
 /// The most loop iterations a call (as tier 2 measured them, see
 /// `JitHint::short_loops`) for which a compiled caller calls the code's own
 /// native body directly though tier 2 compiled it: a call into tier 2's
