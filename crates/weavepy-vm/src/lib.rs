@@ -68645,6 +68645,14 @@ impl Interpreter {
         }
     }
 
+    /// Whether `importlib.machinery` has been imported (and has finished
+    /// loading): building a module's `(__spec__, __loader__)` pair then
+    /// costs a call, not the machinery's own import.
+    fn import_machinery_loaded(&self) -> bool {
+        self.cache.get("importlib.machinery").is_some()
+            && !self.cache.is_initializing("importlib.machinery")
+    }
+
     /// RFC 0053 WS2 — synthesize and cache a module's PEP 451
     /// `(__spec__, __loader__)` pair on first read. The Rust importer
     /// cannot build specs eagerly (it runs before `importlib` is
@@ -69818,20 +69826,25 @@ impl Interpreter {
         // RFC 0053 WS2 — CPython's import machinery stores `__spec__`
         // and `__loader__` *in the module dict* eagerly, before the body
         // runs. The frozen stdlib defers this (lazy synthesis on
-        // attribute read) to keep startup cheap, but an on-disk import
-        // already paid parse + compile, so populate the pair now:
-        // consumers that read them as plain dict entries —
-        // `globals()['__loader__']` in `linecache.lazycache`, module
-        // bodies snapshotting their own globals (test_import's
-        // `unwritable` fixture) — then see them without tripping the
-        // attribute fast path.
+        // attribute read) to keep startup cheap; an on-disk import
+        // populates the pair now, for consumers that read them as plain
+        // dict entries (`globals()['__loader__']` in
+        // `linecache.lazycache`, module bodies snapshotting their own
+        // globals, as test_import's `unwritable` fixture does) — once
+        // `importlib.machinery` is loaded. Building the pair is what
+        // loads it otherwise: `importlib`, its two bootstrap halves,
+        // `zipimport`, `importlib.util` and `types`, 4.9 ms on a program's
+        // first import of a file of its own, where the import itself takes
+        // 0.6. A program that never asks leaves them unbuilt, as CPython's
+        // modules loaded before `_bootstrap._setup` have none; an
+        // attribute read still builds them.
         if let Object::Module(m) = &module_obj {
             let has_both = {
                 let d = m.dict.borrow();
                 d.contains_key(&DictKey(Object::from_static("__spec__")))
                     && d.contains_key(&DictKey(Object::from_static("__loader__")))
             };
-            if !has_both {
+            if !has_both && self.import_machinery_loaded() {
                 let _ = self.ensure_module_spec(m);
             }
         }
