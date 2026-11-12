@@ -7,6 +7,21 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 12, 2026, at `672cca59` (this PR), a PGO build against
+CPython 3.14.8 on the same host: warm time 0.854, cold time 0.977, peak RSS
+1.081 (1.266 on November 10). Whole processes (start-up, import, the first
+call and three more) take 0.95 of CPython's time, and `-c pass` 0.73. Peak
+footprint, the private memory a process dirties, is 1.29 of CPython's and
+is the memory figure to watch from here: see "Done". Against the build
+this PR started from, in the same session, warm time is 0.858 against
+0.863 and cold 0.973 against 0.978, so the time ratios moved little; what
+changed is where the memory and the first-call time are known to go. The
+best warm times are `scimark` 0.50, `pickle_roundtrip` 0.54, `raytrace`
+0.62, `json_roundtrip` and `unpack_sequence` 0.63; the worst `async_tree`
+1.25, `context_managers` 1.14, `deepcopy` 1.13 and `closures_decorators`
+1.07. The worst cold times are `async_tree` 1.53, `stdlib_utils` 1.29,
+`logging_mix` 1.26, `class_creation` and `tomllib_loads` 1.25.
+
 Measured on November 10, 2026, at `57960cea` (PR #107, merged into `main`
 as `0d8f6b62` on November 11), a PGO build against CPython 3.14.8 on the
 same host: warm time 0.873, cold time 0.980, peak memory 1.266. The best
@@ -325,6 +340,66 @@ branch and pull request.
 
 ## Done
 
+- **The binary's one-time code leaves the resident set** (this PR).
+  Peak RSS on macOS, PGO builds, against CPython 3.14.8.
+  - A run executes far more code than it keeps running. Traced on Linux
+    with callgrind, `deepcopy` executes 3.2 MB of code in all, on 7.0 MB of
+    pages, and one warm call 0.28 MB of it: start-up alone runs 1.5 MB (on
+    3.5 MB of pages), and imports and compiles most of the rest. Every such
+    page stayed resident. On a PGO build the process had 8.8 MB of the
+    binary's code resident after a small workload, against CPython's 4.8
+    MB, which was most of the gap in peak RSS.
+  - The process now releases its code and constants' pages
+    (`crates/weavepy-cli/src/text_trim.rs`): on macOS it maps the binary's
+    file over its `__TEXT` segment again, on Linux it advises the image's
+    read-only segments away. What the program still runs comes back a soft
+    fault a page, about 2.3 microseconds each (5,000 instructions, most of
+    them the kernel's), so a release costs two or three milliseconds. A
+    traced process is left alone (a debugger's breakpoints are private
+    copies of code pages), and `WEAVEPY_TEXT_TRIM=0` turns it off.
+  - When to release took two tries. The first rule was a timer: at 10 MB,
+    then after waits that doubled from 2 ms. In a 160 ms process that was
+    six releases, each in the middle of start-up or an import, where nearly
+    all of the 5 MB it dropped came straight back: 3,500 more page faults a
+    process, 2,400 of them before the first call. The suite's whole
+    processes took 1.5% longer for it, the benchmark modules' imports 28%,
+    and a script that only imports 3% to 8% (`import logging` 64.5 ms
+    against 60.5).
+  - The rule now waits for imports to be over: no module body running and
+    none started or finished for a millisecond (the runtime stamps each,
+    `weavepy_vm::import_activity`), the resident set within a sixteenth of
+    its highest, and 3 MB of file-backed memory gained, over what the last
+    release left if imports ran since and otherwise over what had come
+    back. Waits that double between releases, from 16 ms, bound a program
+    that keeps importing. Most programs release once, a millisecond or two
+    after their last import, and a script that only imports never does.
+    Whole processes take about 1% longer than with no release, first calls
+    1% to 2%, warm calls the same, and peak RSS is 0.87 of theirs (the
+    timer's was 0.765, for the costs above).
+  - Peak RSS comes to 1.12 of CPython's that way (1.30 with no release, and
+    0.99 with the timer), but RSS counts clean, file-backed pages the
+    kernel can drop at no cost. By peak footprint (`/usr/bin/time -l`'s
+    figure: private, dirty memory) WeavePy takes 1.29 of CPython's whatever
+    the rule, and that's the gap that is left: see "What the measurements
+    say".
+  - The runtime ticks for it (`set_memory_tick_hook`): when a cycle
+    collection comes due, every sixteenth time the eval breaker's countdown
+    runs out, and when the JIT's worker goes idle
+    (`crates/weavepy-cli/src/memory.rs`).
+  - `tools/pgo/order.py` writes the linker's order file for a PGO build
+    from its own training run. The checked-in file's names matched 5,291
+    of the PGO build's 23,600 functions, and some of the hottest (the
+    generic drop of an `Object`) weren't in it. The trainer runs each
+    benchmark twice, for three calls and for seven: what the longer run
+    executed at least 1,000 times more is what a program keeps running
+    (2,523 functions), and comes first, the functions most benchmarks share
+    ahead of each benchmark's own. The rest of what the training ran
+    follows, start-up's in its first-use order.
+  - `tools/pgo/build.sh` builds only the `weavepy` binary: the
+    `_testembed` twin was a second fat-LTO link in each of its two builds.
+  - A process past 32 MB keeps freed arena ranges resident for 500 ms
+    instead of 50: `async_tree` builds and drops about 13 MB a call, which
+    was purged and faulted back in every time.
 - **f-strings compiled, frameless property setters, and big ints in
   compiled arithmetic** (PR #107). Instructions on Linux.
   - The frame JIT runs `CONVERT_VALUE`, spec-less `FORMAT_VALUE` and
@@ -2515,6 +2590,92 @@ slowdown in that run was the even-sized chunks, since fixed.
   What remains of the heap is thin: `PyFunction` (216 bytes, about 1,300 to
   3,300 of them), code stubs, the VM's per-code extension (672 bytes), the
   type cache and the collector's tracked list are 100 to 300 KB each.
+- **Tier-2 analyses keep the loops a plan can't compile** (this PR).
+  Carving finds the loops tier 2 doesn't compile one re-analysis at a time,
+  and each attempt on a code object (unseeded, seeded, with and without
+  typed list accumulators, from each loop that asks) found the same ones
+  again: `dataclasses._init_fn` was carved 58 times in one
+  `class_creation` process, and half of the suite's 1,300 analysis passes
+  were repeats. The plan reads the code and its globals, not the
+  requesting activation, so its leading failures are the same for every
+  attempt: the code's cache entry keeps them (`weavepy_jit::Carved`) and
+  each analysis starts from there. A signature tier 2 doesn't compile is
+  rejected before the loop forest is built. The suite's compile outcomes
+  are unchanged, and the time in compile attempts is down by a fifth
+  (`class_creation` 18.7 to 11.3 ms, traced). On callgrind those attempts
+  were 40 of the 50 million instructions `class_creation`'s first call
+  retires over a warm one.
+- **Module and class bodies bind their names in the fast loop** (this
+  PR). The core loop took `STORE_NAME` only to rebind a module-level name
+  and `LOAD_NAME` only at module scope; a new name, and every name in a
+  class body, ended the burst: one full step and a fresh entry each. A
+  module-level `x = 1; y = x` pair took 2,900 instructions against
+  CPython's 730 and takes 850; a class with two methods goes from 43,400
+  to 39,200 (CPython 64,000). The imports measured retire 2% to 4% fewer
+  instructions. `itertools`, a Python module over native cores here, also
+  stopped defining its nineteen pure-Python fallback classes when the
+  native ones exist (1.3 ms to import, now 0.85).
+- **Wall time trails instructions through instructions per cycle.** On a
+  PGO build WeavePy retires fewer instructions than CPython on all but
+  three workloads (`nqueens`, `sudoku`, `logging_mix`), yet takes longer on
+  about ten. Whole runs, both interpreters, on a quiet machine:
+  `class_creation` 0.78 of CPython's instructions at 0.74 instructions a
+  cycle against 1.09; `async_tree` 0.93 at 1.46 against 1.98;
+  `context_managers` 0.92 at 1.81 against 2.20; `deepcopy` 0.98 at 1.77
+  against 1.98. `async_tree` also takes 46,000 page faults against 10,000.
+  So what moves wall time on those is how much distinct code and data a
+  unit of work touches, more than how many instructions it retires.
+- **Footprint, not RSS, is the memory gap.** Peak RSS counts the binary's
+  clean code pages, which the release above moves in and out at will;
+  `/usr/bin/time -l`'s peak footprint counts what a process dirties. At
+  `-c pass` WeavePy's is 3.6 MB against CPython's 5.0, but each import adds
+  more: `import logging` 6.7 MB against 4.3, `import json` 2.2 against 1.3,
+  `import decimal` (a Python module here) 3.0 against 0.6. After `import
+  logging` the allocation profile (`WEAVEPY_ALLOC_PROFILE`) has 7.5 MB
+  live: strings 11%, dict tables 13%, decoded code objects 16% and their
+  VM extensions 5%, inline-cache tables 11%, functions 7%, types 5%, with
+  no single owner above that.
+- **A soft page fault costs 2.3 microseconds here** (5,000 instructions,
+  7,300 cycles, measured as the difference the release makes). A
+  workload's first call takes 1,900 of them against CPython's 480 with no
+  release at all (text first touched, a heap that grows 5.6 MB against
+  1.9 in `class_creation`), about 3 ms of an 80 to 100 ms call. Warm calls
+  take about as many as CPython's over the suite.
+- **Imports cost about 1.4 times CPython's instructions**, hidden by a
+  start-up that costs 0.6 of them. Module by module (`-X importtime`),
+  the common set `collections, functools, re, os, json, typing,
+  dataclasses, enum, logging, argparse, subprocess, pathlib` takes 72 ms
+  of import time against 53: `_colorize` 11.3 against 5.2 (its
+  dataclasses), `typing` 5.6 against 3.0, `ast` 2.7 against 0.5, `enum` 3.1
+  against 1.8. A code object's first use costs about 30,000 instructions
+  (decoding its body from the cache 15,000, building its constants and
+  name tables 15,000), a fifth of `import logging`; a `def` costs 3,000
+  instructions against 1,500 and an annotated one 11,400 against 3,900.
+  Modules that are C in CPython and Python here add their own
+  (`itertools`, `_collections`, `_stat`, `codecs`).
+- **Tried and dropped in the memory work (November 11)**:
+  - *Hot-cold splitting* (`-hot-cold-split`, with and without a threshold
+    of 0 and eight parameters): 8,194 regions leave their functions, and
+    the functions programs keep running shrink from 7.9 to 7.6 MB (6.9 with
+    the aggressive settings), with peak RSS level or slightly up. The
+    profile says 65% of the blocks in executed functions never ran, but
+    they're small and scattered (a bounds check's panic, an error return),
+    not regions worth a call.
+  - *Releasing only the code after a hot group* in the order file, between
+    two marker functions. Start-up and imports run plenty of the hot
+    functions' code once too, so the group stayed 70% resident (5.6 of 7.8
+    MB); releasing everything and letting the working set fault back does
+    better (`go` 15.4 against 13.7 MB) and needs no layout.
+  - *A last-in-first-out cache of small blocks in front of mimalloc*, owned
+    by the interpreter's thread. A hit saves 1.7% to 2.9% of a workload's
+    instructions over `mi_malloc` and `mi_free`, but the checks every
+    allocation and release then make cost 3% to 4%, so the suite retired
+    more with it (`comprehensions` 3.5%). mimalloc already extends a page's
+    free list 4 KiB at a time, so a steady churn stays within a few
+    kilobytes of a size class without it.
+  - *A longer purge delay for every process* (1,000 ms against 50): warm
+    time 0.994 and peak RSS 1.005 over the suite. It's now 500 ms, past 32
+    MB only.
 - **Tried and dropped again (November 4)**: allocating a code object's inline
   cache table only when one of its instructions asks for a cache a second
   time, so run-once code never allocates it (174 KB of `import re, json`'s 399
@@ -2561,6 +2722,18 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+Two items the November 12 measurements put ahead of the list below:
+
+- Footprint (1.29 of CPython's): what an import leaves behind. Code
+  objects (8-byte instructions, a line and a column table per body, a
+  constants vector and its object twin), inline-cache tables allocated at
+  first miss for code that runs once, and strings held both as compiler
+  names and as interned objects.
+- The import path: a code object's first use (30,000 instructions),
+  `def` (twice CPython's instructions, three times with annotations) and
+  the modules that are Python here and C there. `_colorize`'s dataclasses
+  are 6 ms of every program that imports `traceback`.
 
 1. Exceptions, which explain most of `exceptions`, `context_managers` and
    `collections_mix` (140,000, 80,000 and 20,000 raises a call). A raise
