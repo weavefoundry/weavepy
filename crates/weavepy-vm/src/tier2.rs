@@ -9860,10 +9860,16 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
     }
 }
 
-/// One step of a list, tuple or range iterator, without the generic
+/// One step of a list, tuple, range or dict iterator, without the generic
 /// dispatch: the next item, or `None` once exhausted (the iterator then
 /// detached as [`PyIterator::next_value`] leaves it). `None` outside for
 /// any other iterator, or one already borrowed.
+///
+/// A dict or dict-view iterator steps as the core loop's `FOR_ITER` steps
+/// it (`Interpreter::core_dict_next`: a key, a value, or an item's tuple,
+/// read in place); its end, and a dict that changed size, are the general
+/// step's, which reports them. (The general step is three times this
+/// one's instructions a key.)
 #[inline]
 fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<Option<Object>> {
     use crate::object::PyIterator;
@@ -9871,6 +9877,12 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     match &*it {
         PyIterator::List { .. } | PyIterator::Tuple { .. } | PyIterator::Range { .. } => {
             Some(it.next_value())
+        }
+        PyIterator::DictKeys { .. } => {
+            match super::Interpreter::core_dict_next(&mut it, false, false) {
+                crate::DictStep::Item(v, _) => Some(Some(v)),
+                crate::DictStep::Exhausted | crate::DictStep::Decline => None,
+            }
         }
         _ => None,
     }
@@ -14868,13 +14880,24 @@ const OSR_VERDICT_ENTRIES: u32 = 16;
 /// its last rows).
 const OSR_MIN_TRIPS: u64 = 8;
 
+/// [`OSR_MIN_TRIPS`] for compiled code of `stmts` statements. Small code
+/// gains little an iteration over the frame JIT's loop, while the
+/// hand-off costs the same (about 4,000 instructions: `for x in
+/// sorted(xs): pass` over ten items ran 7,400 a pass through its entries
+/// against the frame JIT's 3,400), so its entries must run longer to
+/// repay it: 64 iterations for an empty body, down to the floor at
+/// fifteen statements.
+fn osr_min_trips(stmts: u32) -> u64 {
+    (128 / (u64::from(stmts) + 1)).clamp(OSR_MIN_TRIPS, 64)
+}
+
 /// Count an OSR entry of `code` at `pc` that ran `trips` loop iterations
 /// natively before handing the frame back. An entry whose runs average
 /// too few to pay for themselves (a scanner's inner `while`, run a few
 /// characters per token; a loop over a node's few neighbors) is taken no
 /// more, and the code's back edges are left to the frame JIT, which runs
 /// its loops without the hand-off.
-fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
+fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64, stmts: u32) {
     let key = Rc::as_ptr(code).cast::<CodeObject>();
     let short = JIT.with(|cell| {
         let mut st = cell.borrow_mut();
@@ -14894,7 +14917,7 @@ fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
         if r.1 < OSR_VERDICT_ENTRIES {
             return false;
         }
-        let short = r.2 < u64::from(r.1) * OSR_MIN_TRIPS;
+        let short = r.2 < u64::from(r.1) * osr_min_trips(stmts);
         if crate::hot_gates::env_flags::jit_trace() {
             eprintln!(
                 "jit osr trips {:?} pc {} average {}",
@@ -15396,7 +15419,7 @@ fn enter_compiled(
         let left = jf.poll_left.clamp(0, weavepy_jit::JIT_POLL_STRIDE);
         let trips = u64::from(ctx.polls) * weavepy_jit::JIT_POLL_STRIDE as u64
             + (weavepy_jit::JIT_POLL_STRIDE - left) as u64;
-        note_osr_trips(&frame.code, entry_pc, trips);
+        note_osr_trips(&frame.code, entry_pc, trips, cf.op_mix().1);
     }
     // A cold exit is an expected hand-off, never a deopt charge.
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);

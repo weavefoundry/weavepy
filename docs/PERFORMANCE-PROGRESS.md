@@ -363,6 +363,54 @@ branch and pull request.
 
 ## Done
 
+- **Everyday shapes the suite doesn't run** (this PR, November 12). The
+  33 workloads are tuned to: the general interpreter's `step` is under
+  0.25% of any of them. `tools/pybench/microops.py --instructions
+  --locals` runs 153 single operations, and there WeavePy's geometric
+  mean is 0.97 of CPython's instructions with 61 operations above 1.3
+  (see "What the measurements say"). Fixed so far:
+  - Keyword calls of native callees. A builtin type's method called with
+    keywords (`xs.sort(reverse=True)`, `s.split(maxsplit=1)`) or a builtin
+    type (`int(s, base=2)`, `enumerate(xs, start=1)`) left compiled code
+    for the general interpreter on every call: 3,700 instructions for the
+    `sort` against CPython's 1,080. The builtin keyword lane
+    (`Interpreter::core_builtin_kw_lane`) takes them as it took builtin
+    functions, and keeps its keyword pairs in a pooled vector whose name
+    strings a site's next call finds already written (it allocated a
+    `String` per keyword per call). On a build without PGO the `sort` now
+    takes 2,540 instructions, `split` 2,780 (3,940), `min(xs, key=abs)`
+    3,270 (4,240). The rest is the general call's dispatch by builtin
+    name and the natives' own argument handling.
+  - Tier 2 kept loops it ran badly. It didn't count a keyword call of a
+    class or of a native callee against a loop, on the premise that tier
+    1 paid the same generic binder. The frame JIT has since learned to
+    bind a class's `__init__` directly and to run native keyword calls in
+    place, so a loop of `Point(i, y=2, z=3)` stayed in tier 2 at 7,100
+    instructions an iteration, against 2,400 in the frame JIT and
+    CPython's 3,400. Those calls are charged like any other round trip
+    now, and a loop dense in them retires to the frame JIT within one
+    poll interval.
+  - Locked instructions. `Rc`'s counts are plain loads and stores while
+    one thread runs, but `get_mut`, `make_mut`, `try_unwrap` and
+    `into_inner` still went through `Arc`'s locked compare-and-swap, and
+    a weak handle's clone and drop through its locked increment and
+    decrement: about twenty cycles each on this x86, counted as one
+    instruction. With the bias held a sole owner now reads its two counts
+    and a weak handle updates its count in place (`rc::sole_owner`,
+    `Weak`'s `Drop`); `ThinArc::get_mut`, a frame slot's upgrade and a
+    traceback's hold on its frame shell do the same. Instance recycling,
+    the tuple pool, frame shell recycling, sequence unpacking and the
+    deferred-container list each ran one or two per operation: a warm
+    call of `mini_interpreter` executed 261,000 locked instructions and
+    now executes 900, `sudoku` 196,000 and 400, `tomllib_loads` 207,000
+    and 4,700. A loop over `enumerate()` ran two per element (the tuple
+    pool's), a seventh of its cycles.
+    `target/wt/target/pc-cg/lockcount.py` counts them per function
+    (callgrind per instruction, against the binary's disassembly).
+  - Two bugs the new tests found: `list.sort` ignored an unknown keyword,
+    and raised `TypeError` for a `list` subclass's instance when called
+    with keywords (`super().sort(reverse=True)`).
+
 - **The binary's one-time code leaves the resident set** (this PR).
   Peak RSS on macOS, PGO builds, against CPython 3.14.8.
   - A run executes far more code than it keeps running. Traced on Linux
@@ -2480,6 +2528,54 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **The suite is saturated; single operations aren't** (November 12, the
+  PGO build at `11c293b4`).
+  - Every workload that trails CPython warm retires fewer instructions
+    than CPython and more cycles: `async_tree` 0.85 of the instructions
+    at 1.62 instructions a cycle against 2.37, `class_creation` 0.73 at
+    0.73 against 1.06, `tomllib_loads` 0.88 at 1.48 against 1.88,
+    `context_managers` 0.91 at 1.92 against 2.43, `exceptions` 0.86 at
+    1.99 against 2.49, `sudoku` 1.01 at 2.08 against 2.33
+    (`target/pc/warmic.py`). So instruction work on those workloads has
+    run out; what's left is how much code and data a unit of work
+    touches.
+  - A simulation with this machine's second-level cache (256 KB, 4-way)
+    as the last level puts numbers on it for a build without PGO: a warm
+    call of `async_tree` takes 3.2 million instruction misses there
+    against CPython 3.13's 0.25, `tomllib_loads` 6.7 against 0.8,
+    `class_creation` 5.9 against 1.4, with the data misses level except
+    `async_tree`'s third-level ones (0.55 million against 0.08). A
+    machine with a larger second-level cache (most newer ones) pays less
+    of this.
+  - `async_tree`'s third-level misses are memory: its peak footprint is
+    39.7 MB against 28.6, about 3.2 KB a task against 1.8. A coroutine is
+    five allocations (the object 80 bytes, the frame 112, the shared
+    locals cell 48, the locals and the operand stack), a future 336 bytes
+    against 187, an event-loop handle 440 against 193, a task 1,082
+    against 704. One allocation per frame, and a future's task-only
+    fields kept apart, are what would close it.
+  - Locked instructions aren't the suite's gap: 1 in 1,200 to 1 in
+    650,000 instructions a warm call before the fix above, at most 3% of
+    a workload's cycles (`context_managers`, most of it `threading`'s
+    locks, which CPython pays too).
+  - Single operations are where WeavePy is still behind. Over the 153
+    operations the geometric mean is 0.97 of CPython's instructions.
+    The largest gaps, in instructions an operation over CPython's:
+    `zip` over two tuples 440 an element, `Color(1)` on an `Enum` 3,960,
+    a dict comprehension of 20 items 2,400, `enumerate` 180 an element,
+    `dict.update` and `dict.copy` of 20 items 1,800 and 1,360, a
+    `functools.partial` call 890, `Color.RED.value` 1,850, an
+    `OrderedDict` store 730 in tier 2 (150 in the frame JIT),
+    `str.lower()` of 176 characters 640, `f(*t)` 620, a list
+    comprehension 600, a raise caught in the same frame 570, a `*args`
+    call 310. What several share: a small tuple costs about 250
+    instructions to build and free (CPython about 100), a new container's
+    registration with the collector 126 (`GcState::defer_container`), an
+    attribute read that finds a Python descriptor takes the full miss
+    path every time (about 700 instructions before `__get__` runs), and
+    tier 2's `for` over a value it has no type for calls a 66-instruction
+    helper an element.
+
 - **Where an object-heavy program loses to CPython** (November 12,
   `deltablue`, the one bench fixture that does: 1.5 times CPython's time
   in CI). On a quiet machine a run of 50 iterations takes 99 ms against
@@ -2911,6 +3007,34 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What the single-operation battery points at (see "What the measurements
+say"), in the order the gaps would close the most:
+
+- A site cache for an attribute read that resolves to a Python descriptor
+  (`Enum` members' `.value` and `.name`, `DynamicClassAttribute`, a
+  class's own `__get__`): the descriptor and its `__get__` by class
+  version, called directly.
+- A class whose metaclass defines `__call__` in Python (`Color(1)`):
+  7,900 instructions against 2,700.
+- Small tuples: an allocation written in place and a release that
+  doesn't go through the nested-release trashcan when every element is a
+  scalar or shared; `zip` and `enumerate` reusing their result tuple
+  when the loop has dropped it, as CPython's do.
+- `zip`'s per-element iterator steps (about 450 instructions against
+  `enumerate`'s 135).
+- `dict.copy` and `dict.update`: a copy of a dict whose values can't be
+  part of a cycle needn't scan them again, and the entries' releases
+  could run as one loop.
+- Calls with `*args` and `**kwargs` (wrappers and decorators): the call
+  site's gate cascade (`h_call_site` 336 instructions) and the argument
+  tuple.
+- Tier 2's generic `for`: tuple and list iterators stepped in the
+  helper's first lines.
+- The locked instructions that remain: a function's name is a
+  `std::sync::Arc<str>` cloned at every `def` (`closures_decorators`
+  150,000 a call), a closure's cells sit in a `OnceLock`, and
+  `threading`'s locks take two a call where CPython's take one.
 
 What the `deltablue` measurements above point at, ahead of the list below:
 
