@@ -7,6 +7,25 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured later on November 12, 2026, at `d1f48c5c` (this PR), a PGO build
+from a fresh training run under Rust 1.100 against CPython 3.14.8 on the
+same host: warm time 0.845, cold time 0.947, peak RSS 1.140. Against the
+build below (`11c293b4`) in the same run the suite's time is 0.996: the
+commits since are about operations the suite doesn't run (see "Done"), and
+it shows. Whole processes take 0.90 of CPython's time (0.899 against
+0.907 for the earlier build in one interleaved run), `-c pass` 0.70 (19.5
+ms against 27.7). Peak RSS is 1.131 of CPython's and peak footprint 1.208
+in one run of all three, against 1.112 and 1.199 for the earlier build:
+all of that difference is `async_tree`, whose peak footprint reads 49 MB
+in this build and 40 MB in the earlier one (see "What the measurements
+say"). WeavePy is ahead on 22 of the 33 workloads warm and 18 cold. The
+best warm times are `scimark` 0.52, `pickle_roundtrip` 0.55,
+`json_roundtrip` and `unpack_sequence` 0.62, `raytrace` 0.63 and
+`float_points` 0.64; the worst `async_tree` 1.28, `context_managers`
+1.14, `collections_mix` 1.09, `deepcopy` 1.07 and `logging_mix` 1.06. The
+worst cold times are `async_tree` 1.42, `stdlib_utils` 1.35,
+`logging_mix` 1.24 and `tomllib_loads` 1.23.
+
 Measured on November 12, 2026, at `11c293b4` (this PR), a PGO build from a
 fresh training run against CPython 3.14.8 on the same host: warm time
 0.854, cold time 0.961, peak RSS 1.124. The build two commits earlier
@@ -428,6 +447,29 @@ branch and pull request.
     through the general step's second helper: ten of a dict's keys 3,140
     instructions a pass (3,590 before, CPython 1,950), its values 3,460
     (3,920), `reversed(xs)` 3,620 (4,140).
+  - A dying tuple whose items other owners keep (`enumerate`'s `(i, x)`,
+    a call's `*args`, `zip`'s pairs) gives their counts up in place and
+    frees its allocation, instead of going through the trashcan that
+    guards deep recursion and the slice's drop glue (about 100
+    instructions before its items). An item the tuple is the last owner
+    of ends the walk and the nested release takes over, so deep nests and
+    finalizers go as before. `(i, i, i)` built and dropped: 540
+    instructions to 450 without PGO (CPython 480); `zip` over ten pairs
+    11,430 to 10,720.
+  - A function's keyword-only defaults are matched to its parameters
+    once. A positional call of a function with keyword-only parameters
+    asked twice whether its compiled defaults line up with them,
+    comparing every name each time (250 instructions a call for five).
+    The answer is kept in a byte of the function's padding
+    (`PyFunction::kwonly_memo`), reset with its code. `f(i)` of `def f(a,
+    *rest, x=1, y=2, z=3, w=4, v=5)`: 1,650 instructions to 1,170 (CPython
+    1,240); `Color(1)` on an `Enum`, whose metaclass's `__call__` has
+    five: 8,850 to 7,920; `json.dumps` of a small dict 6% fewer.
+  - Tried and dropped: a tuple allocated and filled directly instead of
+    through `Arc`'s slice constructor (no fewer instructions for a call's
+    `*args`), and skipping the tuple pool's clearing walk when its bucket
+    is full (35 instructions an element less for `zip`, as many more for
+    `enumerate`, which borrows the pool once more).
   - Two bugs the new tests found: `list.sort` ignored an unknown keyword,
     and raised `TypeError` for a `list` subclass's instance when called
     with keywords (`super().sort(reverse=True)`).
@@ -2575,6 +2617,19 @@ slowdown in that run was the even-sized chunks, since fixed.
     against 187, an event-loop handle 440 against 193, a task 1,082
     against 704. One allocation per frame, and a future's task-only
     fields kept apart, are what would close it.
+  - `async_tree`'s peak footprint has two values, and the PGO build at
+    `d1f48c5c` reads the high one: 49 MB in most runs against 40 MB for
+    the build at `11c293b4`, for the same code built without PGO (quick
+    and plain release builds: 40), and for a PGO build of the earlier
+    code with the same profile and toolchain (40 to 41). The difference
+    is transient (the regions read alike once the calls are over) and
+    goes away with `WEAVEPY_TEXT_TRIM_REST=0` (39.8), with tier 2 off
+    (41.5), or with a purge delay of 50 ms or less (38.9, for 13% more
+    cycles and half again the page faults). So it's the allocator taking
+    fresh arena ranges while freed ones wait out the 500 ms a large
+    heap's ranges stay resident (see `alloc::note_resident`), tipped by
+    when this build's first calls allocate. `float_points` reads 5%
+    higher the same way. Not understood further than that.
   - Locked instructions aren't the suite's gap: 1 in 1,200 to 1 in
     650,000 instructions a warm call before the fix above, at most 3% of
     a workload's cycles (`context_managers`, most of it `threading`'s
@@ -3052,6 +3107,10 @@ say"), in the order the gaps would close the most:
   tuple.
 - Tier 2's generic `for`: tuple and list iterators stepped in the
   helper's first lines.
+- The heap's peak when a large one is rebuilt (`async_tree`: 40 or 49 MB
+  by the build): either the allocator reuses a freed range ahead of a
+  fresh one while its purge is pending, or the long purge delay applies
+  only once a range has been reused.
 - The locked instructions that remain: a function's name is a
   `std::sync::Arc<str>` cloned at every `def` (`closures_decorators`
   150,000 a call), a closure's cells sit in a `OnceLock`, and
