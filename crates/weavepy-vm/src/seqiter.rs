@@ -1951,6 +1951,87 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
     Some(Ok(Object::Int(crate::object::py_hash_value(x)?)))
 }
 
+/// `vars(obj)` of a plain instance whose `__dict__` nothing but the
+/// default lookup answers: its attribute dictionary. (A class with a
+/// `__dict__` of its own, attribute hooks, or `__slots__` alone takes the
+/// attribute protocol, as the full call does.)
+pub(crate) fn vars_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    if cls.forbids_dict
+        || cls.flags.is_builtin
+        || inst.native.get().is_some()
+        || inst.c_body.get() != 0
+        || cls.native_kind.get() != 0
+        || cls.is_super_proxy_type()
+        || !Interpreter::default_getattribute(cls)
+        || cls.dunder(crate::types::Dunder::GetAttr).present()
+        // (Every class with instance dictionaries holds the `__dict__`
+        // member descriptor; anything else under that name is the class's
+        // own.)
+        || !matches!(cls.lookup("__dict__"), Some(Object::SlotDescriptor(d)) if d.name == "__dict__")
+    {
+        return None;
+    }
+    Some(Ok(Object::Dict(inst.dict_shared())))
+}
+
+/// `pow` of plain numbers: `pow(base, exp)` of machine ints while the
+/// power fits (a negative exponent's is a float), or with a float operand,
+/// as `**` computes them; and `pow(base, exp, mod)` of machine ints with a
+/// non-negative exponent and a nonzero modulus (modular exponentiation by
+/// squaring, the result taking the modulus's sign as `%` does).
+pub(crate) fn pow_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // `pow(base, exp)` of machine ints with a non-negative exponent, where
+    // the power fits a machine int too.
+    if let [Object::Int(base), Object::Int(exp)] = args {
+        if *exp < 0 {
+            // A negative exponent's power is the floats' (zero to one
+            // raises there).
+            return Some(crate::float_pow(*base as f64, *exp as f64));
+        }
+        let exp = u32::try_from(*exp).ok()?;
+        return base.checked_pow(exp).map(|v| Ok(Object::Int(v)));
+    }
+    // A float operand: `float ** float`, with its errors and its complex
+    // results.
+    if let [x, y] = args {
+        let (x, y) = match (x, y) {
+            (Object::Float(x), Object::Float(y)) => (*x, *y),
+            (Object::Float(x), Object::Int(y)) => (*x, *y as f64),
+            (Object::Int(x), Object::Float(y)) => (*x as f64, *y),
+            _ => return None,
+        };
+        return Some(crate::float_pow(x, y));
+    }
+    let [Object::Int(base), Object::Int(exp), Object::Int(modulus)] = args else {
+        return None;
+    };
+    if *exp < 0 || *modulus == 0 {
+        return None;
+    }
+    let m = i128::from(*modulus).unsigned_abs();
+    let mut b = i128::from(*base).rem_euclid(m as i128) as u128;
+    let mut e = *exp as u64;
+    let mut r: u128 = 1 % m;
+    while e != 0 {
+        if e & 1 != 0 {
+            r = r * b % m;
+        }
+        b = b * b % m;
+        e >>= 1;
+    }
+    let r = r as i128;
+    let r = if *modulus < 0 && r != 0 {
+        r + i128::from(*modulus)
+    } else {
+        r
+    };
+    Some(Ok(Object::Int(r as i64)))
+}
+
 /// `ord(c)` of a one-character `str`.
 pub(crate) fn ord_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Str(s)] = args else {

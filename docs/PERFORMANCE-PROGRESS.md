@@ -478,10 +478,14 @@ branch and pull request.
     with plain arguments found the ones still taking the general call:
     `bool(container)` 3,020 to 860 instructions (CPython 910),
     `slice(a, b)` 3,070 to 1,060 (1,160), `set(xs)` 3,510 to 1,980
-    (1,640), `frozenset(xs)` 4,110 to 2,490 (1,660). Still general:
-    `globals()` 7.9 times CPython, three-argument `pow` 7, `vars(obj)` 6,
-    `object()` 3.4, `bytes(n)` 3, `dict(a=1)` and `dict(d)` 2.9 and 2.6,
-    `setattr` 2.4.
+    (1,640), `frozenset(xs)` 4,110 to 2,490 (1,660), `vars(obj)` 4,520
+    to 905 (1,390), `pow(b, e, m)` 9,020 to 700 (1,290). Still general:
+    `globals()` 7.9 times CPython, `object()` 3.4, `bytes(n)` 3,
+    `dict(a=1)` and `dict(d)` 2.9 and 2.6, `setattr` 2.4. (A leaf half
+    that declines costs more than no leaf half: the call then takes the
+    general path, not the native-body lane. `pow`'s covers every plain
+    numeric shape for that reason. It also fixed `pow(10.0, 400)`, which
+    returned `inf` where `10.0 ** 400` raised `OverflowError`.)
   - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
     inline activation, as an instance's class's does (3,860 to 3,465
     against 620: its body's `cls._member_map_` read and the exit from

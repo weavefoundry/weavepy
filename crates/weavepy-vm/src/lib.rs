@@ -31792,6 +31792,8 @@ impl Interpreter {
                     ("ord", LeafKind::Fast(crate::seqiter::ord_fast)),
                     ("chr", LeafKind::Fast(crate::seqiter::chr_fast)),
                     ("divmod", LeafKind::Fast(crate::seqiter::divmod_fast)),
+                    ("vars", LeafKind::Fast(crate::seqiter::vars_fast)),
+                    ("pow", LeafKind::Fast(crate::seqiter::pow_fast)),
                 ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
@@ -87562,7 +87564,7 @@ fn py_float_mod(x: f64, y: f64) -> Result<f64, RuntimeError> {
 /// exponent is complex (CPython promotes via `complex` rather than
 /// returning NaN like C's `pow`). `x = |x|·e^{iπ}` so
 /// `x^y = |x|^y·(cos πy + i·sin πy)`.
-fn float_pow(x: f64, y: f64) -> Result<Object, RuntimeError> {
+pub(crate) fn float_pow(x: f64, y: f64) -> Result<Object, RuntimeError> {
     // 0.0 to a finite negative power is a division by zero (C99 still treats
     // 0**-inf as +inf, so only finite negative exponents raise).
     if x == 0.0 && y < 0.0 && y.is_finite() {
