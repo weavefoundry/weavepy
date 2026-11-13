@@ -21692,7 +21692,9 @@ impl Interpreter {
             if !store && len >= 2 {
                 let (c, k) = (base.add(len - 2), base.add(len - 1));
                 let r = match (&*c, &*k) {
-                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_get::<3>(c, c, k),
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_) | Object::Float(_)) => {
+                        h_dict_get::<3>(c, c, k)
+                    }
                     (Object::List(_) | Object::Tuple(_), Object::Int(_)) => h_seq_get::<3>(c, c, k),
                     (Object::Str(_), Object::Int(_)) => h_str_get::<3>(c, c, k),
                     (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
@@ -21705,7 +21707,9 @@ impl Interpreter {
             if store && len >= 3 {
                 let (v, c, k) = (base.add(len - 3), base.add(len - 2), base.add(len - 1));
                 let r = match (&*c, &*k) {
-                    (Object::Dict(_), Object::Str(_) | Object::Int(_)) => h_dict_set::<7>(v, c, k),
+                    (Object::Dict(_), Object::Str(_) | Object::Int(_) | Object::Float(_)) => {
+                        h_dict_set::<7>(v, c, k)
+                    }
                     (Object::List(_), Object::Int(_)) => h_list_set::<7>(v, c, k),
                     (Object::Instance(_), Object::Str(_) | Object::Int(_)) => {
                         h_inst_dict_set::<7>(v, c, k)
@@ -30667,9 +30671,7 @@ impl Interpreter {
             | Object::Coroutine(_)
             | Object::AsyncGenerator(_)
             | Object::Module(_) => true,
-            Object::Tuple(t) => t
-                .iter()
-                .all(|x| matches!(x, Object::Int(_) | Object::Str(_))),
+            Object::Tuple(_) => crate::seqiter::plain_hashable(item, 0),
             Object::Type(t) => crate::object::type_hash_is_identity(t),
             Object::Instance(inst) => {
                 (inst.native.get().is_none()

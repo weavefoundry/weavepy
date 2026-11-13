@@ -468,6 +468,12 @@ branch and pull request.
     the receiver's class in place, from an instance method or a class
     method (`super().create()` 6,970 to 2,640 against 1,710). A property
     through `super()` still takes the full path (6,370 against 1,190).
+  - Float keys and plain tuples. A dict or set probe by a finite float
+    takes the native probe that `str` and small `int` keys had (`d[2.5]`
+    2,455 to 1,050 instructions against 600; a compiled site still
+    leaves for the core loop to do it), and `hash()` of a tuple of any
+    plain scalars, or of `bytes`, is a leaf (`hash((1, 2.5))` 1,386 to
+    500 against 580, `hash(b"...")` 1,497 to 370 against 560).
   - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
     inline activation, as an instance's class's does (3,860 to 3,465
     against 620: its body's `cls._member_map_` read and the exit from

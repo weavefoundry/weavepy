@@ -1855,8 +1855,20 @@ pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     }))
 }
 
-/// `hash(x)` of a value whose hash runs no Python code and can't fail: a
-/// native scalar, a `str`, or a tuple of `int`s and `str`s.
+/// Whether hashing `x` runs no Python code and can't fail: a native
+/// scalar, a `str` or `bytes`, or a tuple of such (nested a few levels at
+/// most). A NaN is left out: it hashes by identity.
+pub(crate) fn plain_hashable(x: &Object, depth: u32) -> bool {
+    match x {
+        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) | Object::Bytes(_) => true,
+        Object::Float(f) => !f.is_nan(),
+        Object::Tuple(t) => depth < 4 && t.iter().all(|e| plain_hashable(e, depth + 1)),
+        _ => false,
+    }
+}
+
+/// `hash(x)` of a value whose hash runs no Python code and can't fail
+/// ([`plain_hashable`]), or an instance's where that holds.
 pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = args else {
         return None;
@@ -1876,16 +1888,7 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
         let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
         return interp.leaf_instance_hash(x).map(|h| Ok(Object::Int(h)));
     }
-    let native = match x {
-        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
-        // (A NaN hashes by identity.)
-        Object::Float(f) => !f.is_nan(),
-        Object::Tuple(t) => t
-            .iter()
-            .all(|e| matches!(e, Object::Int(_) | Object::Str(_))),
-        _ => false,
-    };
-    if !native {
+    if !plain_hashable(x, 0) {
         return None;
     }
     Some(Ok(Object::Int(crate::object::py_hash_value(x)?)))
