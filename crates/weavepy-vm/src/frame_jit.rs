@@ -2479,32 +2479,12 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                         }
                         _ => return h_for_iter_rest(st, it, out, pc),
                     },
-                    // A reversed list's next item (its end, and a list that
-                    // shrank under it, are the general step's).
-                    PyIterator::Reversed { items, index, .. } if *index >= 0 => {
-                        match items.peek().and_then(|xs| xs.get(*index as usize)) {
-                            Some(v) => {
-                                *index -= 1;
-                                v
-                            }
-                            None => return h_for_iter_rest(st, it, out, pc),
-                        }
-                    }
-                    // A dict's or a dict view's next key, value or item, as
-                    // the general step takes it (its end, and a dict that
-                    // changed, are that step's).
-                    view @ PyIterator::DictKeys { .. } => {
-                        return match Interpreter::core_dict_next(view, false, false) {
-                            crate::DictStep::Item(Object::Int(i), _) => {
-                                (*st).out = i as u64;
-                                0
-                            }
-                            crate::DictStep::Item(v, _) => {
-                                out.write(v);
-                                1
-                            }
-                            _ => h_for_iter_rest(st, it, out, pc),
-                        };
+                    // A reversed list, or a dict or one of its views: stepped
+                    // out of line, so this helper's frame stays what the
+                    // steps above need (in line here, they cost a string's
+                    // loop 11% more instructions an item).
+                    PyIterator::Reversed { .. } | PyIterator::DictKeys { .. } => {
+                        return h_for_iter_view(st, it, out, pc)
                     }
                     _ => return h_for_iter_rest(st, it, out, pc),
                 };
@@ -2518,6 +2498,55 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
         }
         if matches!(&*it, Object::Generator(_)) && !(*st).sw.is_null() {
             return h_for_iter_gen(st, it, out, pc);
+        }
+        h_for_iter_rest(st, it, out, pc)
+    }
+}
+
+/// [`h_for_iter`] of a reversed list's iterator, or a dict's or dict
+/// view's: the next item, key or value read in place, as the general step
+/// takes it (the end, a list that shrank and a dict that changed are that
+/// step's, through [`h_for_iter_rest`]).
+#[inline(never)]
+unsafe extern "C" fn h_for_iter_view(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
+    // SAFETY: as `h_for_iter_rest`'s; nothing here runs code while the
+    // iterator is borrowed.
+    unsafe {
+        if let Object::Iter(rc) = &*it {
+            if let Some(iter) = rc.peek_mut() {
+                match iter {
+                    PyIterator::Reversed { items, index, .. } if *index >= 0 => {
+                        if let Some(v) = items.peek().and_then(|xs| xs.get(*index as usize)) {
+                            *index -= 1;
+                            if let Object::Int(i) = *v {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            out.write(crate::clone_hot(v));
+                            return 1;
+                        }
+                    }
+                    view @ PyIterator::DictKeys { .. } => {
+                        match Interpreter::core_dict_next(view, false, false) {
+                            crate::DictStep::Item(Object::Int(i), _) => {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            crate::DictStep::Item(v, _) => {
+                                out.write(v);
+                                return 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         h_for_iter_rest(st, it, out, pc)
     }

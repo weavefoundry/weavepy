@@ -447,11 +447,20 @@ branch and pull request.
     instructions once the call retired its loop, and 45% more time on
     CI's Linux runner. The frameless evaluation itself is what to make
     cheaper.
-  - The frame JIT's `FOR_ITER` helper steps a dict's and a dict view's
-    keys and values and a reversed list's items itself, instead of
-    through the general step's second helper: ten of a dict's keys 3,140
-    instructions a pass (3,590 before, CPython 1,950), its values 3,460
-    (3,920), `reversed(xs)` 3,620 (4,140).
+  - The frame JIT's `FOR_ITER` helper hands a dict's and a dict view's
+    keys and values and a reversed list's items to a step of their own
+    (`h_for_iter_view`) instead of the general step: ten of a dict's keys
+    3,370 instructions a pass (3,590 before, CPython 1,950), its values
+    3,690 (3,920), `reversed(xs)` 3,840 (4,140). Stepped in the first
+    helper itself they ran 230 fewer still, but that helper's larger
+    frame cost every other loop: a string's 11% more instructions an
+    item, `enumerate`'s 3%. The battery caught it after the push.
+  - Over the battery's 153 operations the geometric mean of WeavePy's
+    instructions over CPython's went from 1.045 to 1.030 on builds
+    without PGO (`OrderedDict` iteration 36,000 to 18,600, a tuple
+    literal 590 to 460, `list.sort` of ten 4,070 to 3,380, `Color(1)`
+    7,000 to 6,150). Most of what these commits fix isn't among its
+    cases.
   - A dying tuple whose items other owners keep (`enumerate`'s `(i, x)`,
     a call's `*args`, `zip`'s pairs) gives their counts up in place and
     frees its allocation, instead of going through the trashcan that
