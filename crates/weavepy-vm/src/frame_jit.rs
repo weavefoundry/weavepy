@@ -8144,6 +8144,14 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
+        // An instance of a class with a `__getattribute__` of its own: no
+        // cached read applies, and the full handler runs the hook.
+        if let Object::Instance(inst) = &*at {
+            if !site.direct.is_null() && !Interpreter::default_getattribute(inst.cls_raw()) {
+                let (pc, slot) = (u64::from(site.pc), u64::from(site.slot));
+                return h_property(st, site.code, pc, slot, at, u64::from(local), site.direct);
+            }
+        }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
             .or_else(|| builtin_attr_read(st, site, &*at, local))
         {
@@ -8357,10 +8365,16 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
         }
         let r = attr_miss(st, site, at, true);
         if r == 0 {
-            if let Object::Instance(inst) = &*at {
-                if !class_poly_known(site, inst) {
-                    class_poly_note(site, inst, &*(*st).stack.add(slot));
+            match &*at {
+                Object::Instance(inst) => {
+                    if !class_poly_known(site, inst) {
+                        class_poly_note(site, inst, &*(*st).stack.add(slot));
+                    }
                 }
+                Object::Type(cls) if type_name_site(site) => {
+                    type_name_note(site, cls, &*(*st).stack.add(slot));
+                }
+                _ => {}
             }
         }
         if r != CALL_DECLINED {
@@ -8631,6 +8645,36 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
             Some(crate::clone_hot(&m.val))
         }
         _ => None,
+    }
+}
+
+/// Whether `site` reads one of the names every class answers with a string
+/// of its own (`cls.__name__`, as logging, reprs and error messages read
+/// it), which [`type_name_note`] memoizes. (Not `__qualname__`: assigning
+/// it leaves the class's version where it was.)
+fn type_name_site(site: &AttrSite) -> bool {
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*site.code };
+    code.names
+        .get(code.instructions[site.pc as usize].arg as usize)
+        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__"))
+}
+
+/// Remember what the full lookup just read for `cls.__name__` (or
+/// `__module__`) at `site`: a string, of a class whose
+/// metaclass is `type` itself, held for the class's current version (any
+/// assignment to a class attribute, these among them, moves it).
+fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &Object) {
+    let ver = cls.attr_version.get();
+    if ver == 0 || !matches!(value, Object::Str(_)) || !cls.metaclass_is_type() {
+        return;
+    }
+    if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+        *memo = Some(TypeMemo::owned(
+            Rc::as_ptr(cls) as usize,
+            ver,
+            value.clone(),
+        ));
     }
 }
 
@@ -8939,6 +8983,16 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                     drop(v);
                 }
             }
+            // (A class's name, as the site read it before.)
+            Object::Type(cls) => {
+                if let Some(v) = type_attr_memo(site, cls) {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
+                }
+            }
             Object::Module(m) => module_attr_note(site, m),
             _ => {}
         }
@@ -8958,12 +9012,23 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                 Object::Instance(inst) if !class_poly_known(site, inst) => Some(inst.clone()),
                 _ => None,
             };
+            // (Likewise a class whose name the site is about to learn.)
+            let named = match &*at {
+                Object::Type(cls) if type_name_site(site) => Some(cls.clone()),
+                _ => None,
+            };
             let r = attr_miss(st, site, at, false);
             if let (0, Some(inst)) = (r, &recv) {
                 class_poly_note(site, inst, &*at);
             }
+            if let (0, Some(cls)) = (r, &named) {
+                type_name_note(site, cls, &*at);
+            }
             if let Some(inst) = recv {
                 (*(*st).interp).release_hot(Object::Instance(inst));
+            }
+            if let Some(cls) = named {
+                (*(*st).interp).release_hot(Object::Type(cls));
             }
             r
         };

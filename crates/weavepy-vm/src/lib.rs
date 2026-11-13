@@ -10619,21 +10619,40 @@ impl Interpreter {
         let Object::Instance(inst) = &frame.stack[n - 1] else {
             return None;
         };
-        if !Self::default_setattr(inst.cls_raw()) {
-            return None;
-        }
-        let LeafAttr::Property(prop) =
-            Self::leaf_resolve_instance_attr(&frame.code, inst, ins.arg)?
-        else {
-            return None;
+        // A class with a `__setattr__` of its own, a plain Python function
+        // of `(self, name, value)`: every store is a call of it.
+        let hook = if Self::default_setattr(inst.cls_raw()) {
+            None
+        } else {
+            let Object::Function(hook) = inst.cls_raw().lookup("__setattr__")? else {
+                return None;
+            };
+            Some(hook)
         };
-        // SAFETY: GIL-serialized raw read of the setter cell; the clone is
-        // taken before anything else runs.
-        let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
-            return None;
+        let f = match &hook {
+            Some(hook) => hook.clone(),
+            None => {
+                let LeafAttr::Property(prop) =
+                    Self::leaf_resolve_instance_attr(&frame.code, inst, ins.arg)?
+                else {
+                    return None;
+                };
+                // SAFETY: GIL-serialized raw read of the setter cell; the
+                // clone is taken before anything else runs.
+                let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
+                    return None;
+                };
+                f.clone()
+            }
+        };
+        let name = match &hook {
+            Some(_) => Some(Object::from_str(
+                frame.code.names.get(ins.arg as usize)?.as_str(),
+            )),
+            None => None,
         };
         let code = f.code();
-        if code.arg_count != 2
+        if code.arg_count != 2 + u32::from(name.is_some())
             || code.is_generator
             || code.is_coroutine
             || code.is_async_generator
@@ -10645,7 +10664,6 @@ impl Interpreter {
             return None;
         }
         f.lean_cells_ref(&code)?;
-        let f = f.clone();
         // Past the recursion limit the nested lean path raises.
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
@@ -10657,6 +10675,9 @@ impl Interpreter {
         // SAFETY: a parked slot's locals storage is its own, and empty.
         let locals = unsafe { act.frame.locals.storage() };
         locals.push(receiver);
+        if let Some(name) = name {
+            locals.push(name);
+        }
         locals.push(value);
         fill_unbound(locals, code.varnames.len());
         frame.pc = pc as u32 + 1;
@@ -10868,6 +10889,76 @@ impl Interpreter {
         fill_unbound(locals, code.varnames.len());
         frame.pc = pc as u32 + 1;
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(get), guard))
+    }
+
+    /// `LOAD_ATTR` at `pc` of `frame` on an instance whose class answers
+    /// attribute reads with a Python function of `(self, name)`, as an
+    /// inline activation of that function (CPython's
+    /// `LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN`, and the `__getattr__` half of
+    /// its `slot_tp_getattr_hook`): the class's own `__getattribute__`, or
+    /// its `__getattr__` when the default lookup certainly ends in an
+    /// `AttributeError` without running any code. The receiver leaves the
+    /// stack, and the return pushes the result.
+    fn try_inline_attr_hook(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        use crate::types::Dunder;
+        let ins = frame.code.instructions.get(pc)?;
+        if ins.op != OpCode::LoadAttr || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let recv @ Object::Instance(inst) = frame.stack.last()? else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        let name = frame.code.names.get(ins.arg as usize)?;
+        let fallback = cls.dunder(Dunder::GetAttr).present();
+        let hook = if !Self::default_getattribute(cls) {
+            // (An `AttributeError` out of `__getattribute__` goes on to a
+            // `__getattr__`: the full path's.)
+            if fallback {
+                return None;
+            }
+            cls.lookup("__getattribute__")?
+        } else if fallback && default_lookup_misses(recv, name, true) {
+            cls.lookup("__getattr__")?
+        } else {
+            return None;
+        };
+        let Object::Function(hook) = hook else {
+            return None;
+        };
+        let code = hook.code();
+        if code.arg_count != 2
+            || code.kwonly_count != 0
+            || code.has_varargs
+            || code.has_varkeywords
+            || code.is_generator
+            || code.is_coroutine
+            || code.is_async_generator
+            || !Self::lean_code_ok(&code)
+        {
+            return None;
+        }
+        hook.lean_cells_ref(&code)?;
+        let name = Object::from_str(name.as_str());
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let receiver = frame.stack.pop()?;
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        locals.push(receiver);
+        locals.push(name);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(hook), guard))
     }
 
     /// `BINARY_SUBSCR` at `pc` of `frame` on an instance whose class's
@@ -11864,7 +11955,9 @@ impl Interpreter {
                 CoreAttr::Decline => {
                     match frame.code.instructions.get(frame.pc as usize).map(|i| i.op) {
                         Some(OpCode::LoadAttr)
-                            if self.core_property(sw) || self.core_getitem(sw, true) =>
+                            if self.core_property(sw)
+                                || self.core_getitem(sw, true)
+                                || self.core_attr_hook(sw) =>
                         {
                             return None
                         }
@@ -18131,6 +18224,34 @@ impl Interpreter {
             // SAFETY: the caller's activation, synced past the subscript.
             note(unsafe { &*sw.cur }, pc);
         }
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_property`] for a `LOAD_ATTR` a class's Python
+    /// `__getattribute__` or `__getattr__` serves
+    /// ([`Self::try_inline_attr_hook`]). `false` touches nothing.
+    #[inline(never)]
+    fn core_attr_hook(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_attr_hook(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
         let callee: *mut Frame = &raw mut *act.frame;
         // SAFETY: as above.
         unsafe { push_fast(&mut *sw.inl, act) };
@@ -31381,7 +31502,7 @@ impl Interpreter {
     /// Whether `cls` keeps `object.__getattribute__` (the cached
     /// `getattribute_kind` answer, computed on first sight).
     #[inline(always)]
-    fn default_getattribute(cls: &TypeObject) -> bool {
+    pub(crate) fn default_getattribute(cls: &TypeObject) -> bool {
         match cls.getattribute_kind.get() {
             1 => true,
             2 => false,
@@ -53714,12 +53835,21 @@ impl Interpreter {
         // `specialized_load_attr`'s `Cooldown` arm) asks whether the
         // attribute is certainly missing, ahead of the getter lanes.
         let failing = failing_attr_site(&frame.code, pc);
+        // A class with a `__getattribute__` of its own: nothing else can
+        // answer, so its hook goes first.
+        if frame.code.instructions[pc].op == OpCode::LoadAttr
+            && matches!(frame.stack.last(), Some(Object::Instance(inst))
+                if !Self::default_getattribute(inst.cls_raw()))
+            && self.core_attr_hook(sw)
+        {
+            return Ok(());
+        }
         // A property's or a Python data descriptor's getter runs as an
         // inline activation, as the core loop's own arm runs it.
         if frame.code.instructions[pc].op == OpCode::LoadAttr
             && !frame_field
-            && !failing
-            && (self.core_property(sw) || self.core_getitem(sw, true))
+            && ((!failing && (self.core_property(sw) || self.core_getitem(sw, true)))
+                || self.core_attr_hook(sw))
         {
             return Ok(());
         }

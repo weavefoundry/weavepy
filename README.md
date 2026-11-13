@@ -126,6 +126,15 @@ small fraction of CPython's instructions, while `zip`, `Enum` lookups, dict
 copies and calls through `*args` still take one and a half to two and a half
 times as many. The [progress note](docs/PERFORMANCE-PROGRESS.md) lists them.
 
+Ordinary library-heavy code is where WeavePy is behind. A battery of 53
+everyday operations (`tools/pybench/everyday.py`: file and directory work,
+text, data formats, classes, threads, common modules) ran at 1.8 times
+CPython's time on average when first measured on November 13, 2026, with
+`enum`, `dataclasses` and class-protocol code near 8 times. File and stream
+I/O, which was far slower still (a line read took a system call per byte), is
+now level with CPython, and the first of the battery's gaps are closed; the
+rest are the current work.
+
 Code that the JIT compiles fully can run far faster. The numeric loops in the
 [bench gate fixtures](docs/PERFORMANCE-CPYTHON-PARITY.md) took 5% to 8% of
 CPython's time when that report was measured.

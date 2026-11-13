@@ -7,6 +7,21 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 13, 2026 (this PR, quick builds, no fresh PGO run):
+the benchmark suite's figures below still hold, but they aren't the whole
+picture. A battery of 53 everyday operations
+(`tools/pybench/everyday.py`: file and directory work, text, data
+formats, containers, classes, threads, common library modules) put
+WeavePy at 1.83 times CPython's time on average when it was first run,
+with `class_features` and `enum_dataclass_ops` near 8 times,
+`threading_queue_ops` 5.8, `os_listdir_walk` 4.8 and a dozen more past 3.
+Before that, reading a file a line at a time was 360 times slower than
+CPython and writing one 45 times, which no benchmark here had touched.
+The I/O gaps are closed (see "Done"), as are the first few of the
+battery's; most of it is still open and is the work's next target (see
+"Next"). The battery hasn't been rerun as a whole since those fixes, and
+its first run was on a loaded machine, so treat its ratios as a ranking.
+
 Measured later on November 12, 2026, at `d1f48c5c` (this PR), a PGO build
 from a fresh training run under Rust 1.100 against CPython 3.14.8 on the
 same host: warm time 0.845, cold time 0.947, peak RSS 1.140. Against the
@@ -382,6 +397,71 @@ branch and pull request.
 
 ## Done
 
+- **File objects, standard streams and the first everyday cliffs** (this
+  PR, November 12 and 13). Found by timing ordinary scripts instead of
+  the suite:
+  - Buffered reads. A line read took one `read(2)` per byte. Lines now
+    come out of a read-ahead the backend fills a block at a time (any
+    stream but a raw `FileIO`); a seekable descriptor gets the unread
+    bytes back before anything else looks at its offset, `tell()`
+    subtracts them, and a pipe keeps them parked. `StringIO` and
+    `BytesIO` scan their buffer in place. Reading 20,000 lines: 1,049 ms
+    to 2.7 ms (CPython 2.9).
+  - Buffered writes. Text files and read/write binary files hold their
+    writes as binary writers already did; a text stream on a terminal or
+    opened with `buffering=1` flushes at each line end. Streams still
+    holding bytes at shutdown are flushed then (a file kept alive by a
+    reference cycle lost its tail before). Writing 20,000 lines: 72 ms
+    to 2.1 ms (CPython 1.6).
+  - Standard output holds a 128 KiB block when it isn't a terminal, as
+    CPython's does, flushed at `flush()`, by `input()`, after each
+    interactive statement and at exit. 300,000 `print` calls into a
+    file: 1.38 s to 0.23 s (CPython 0.20). A broken pipe now reports as
+    in CPython (`Exception ignored while flushing sys.stdout`, status
+    120). `sys.stdin` iteration: 0.39 s to 0.10 s for 300,000 lines.
+  - Lines and writes handed over in place. A stream works out once what
+    its encoding, error handler and newline mode mean; a line whole in
+    the buffer is copied out once with no decoder, without publishing
+    the loop's frame, and `write()` appends to a buffer that already
+    holds writes. Both are leaf halves, and a leaf site now serves a
+    bound method held in a local (`write = f.write`). Per line, less the
+    loop: iterating a text file 960 instructions (CPython 838),
+    `f.write(s)` 556 (579), `print(a, b, file=f)` 4,054 (5,214). Text
+    `read(n)` read a byte per call: 39,000 to 2,150 for five characters
+    (1,200).
+  - `os.DirEntry` built seven closures per entry and ran a `stat` for
+    every `is_dir()`, `is_file()` and `is_symlink()`. Its methods are
+    the type's, it answers from the directory read's `d_type`, and it
+    keeps the `stat()` results it has fetched. `os.scandir` and
+    `os.walk`: 4.3 to 1.5 times CPython's instructions, and no `stat`
+    per entry.
+  - A native method under a dunder name read through an instance
+    (`lock.__enter__`) took the full attribute path every time, which is
+    what `threading.Condition` does on each `with`, under every
+    `queue.Queue` and `threading.Event`. `lock.__enter__()` 4,415 to 375
+    instructions (CPython 730), `with cond:` 13,050 to 4,600 (2,400), a
+    queue's put and get 49,600 to 32,200 (11,800).
+  - Attribute hooks. A class's Python `__getattribute__`, or its
+    `__getattr__` once the default lookup certainly misses, runs as an
+    inline activation (CPython's `LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN`),
+    and `object.__getattribute__(obj, name)` has a leaf half for a plain
+    instance's own attributes and slots. A constant hook 3,466 to 1,845
+    instructions (CPython 590), one that delegates to
+    `object.__getattribute__` 9,844 to 2,786 (1,240), the bare call
+    4,019 to 657 (950), a `threading.local` read 11,400 to 4,160 (740).
+    A Python `__setattr__` runs inline the same way (6,790 to 5,190
+    against 2,000: what's left is the `object.__setattr__` call inside
+    it, which still takes the general path).
+  - `cls.__name__` and `cls.__module__` are remembered at a compiled
+    site for the class's version: 1,180 to 200 instructions (CPython
+    440), `type(obj).__name__` 1,446 to 496 (672).
+  - The csv reader re-read its dialect's eight attributes for every
+    row, allocated a key string per state access, and stepped a
+    character at a time: 3.4 to 2.0 times CPython.
+  - Also: `input()` flushes standard output whether or not it has a
+    prompt, and a read to the end after a sized read no longer stops at
+    what was read ahead (both found by CPython's tests once output was
+    buffered).
 - **Everyday shapes the suite doesn't run** (this PR, November 12). The
   33 workloads are tuned to: the general interpreter's `step` is under
   0.25% of any of them. `tools/pybench/microops.py --instructions
@@ -2613,6 +2693,62 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **The suite is not the workload** (November 13). The everyday battery's
+  first run, WeavePy's time over CPython's, best of three runs a case, on
+  a loaded machine:
+
+  | Case | Ratio | Case | Ratio |
+  | --- | ---: | --- | ---: |
+  | `class_features` | 7.9 | `os_stat_exists` | 2.7 |
+  | `enum_dataclass_ops` | 7.6 | `csv_ops` | 2.5 |
+  | `threading_queue_ops` | 5.8 | `bigint_ops` | 2.2 |
+  | `os_listdir_walk` | 4.8 | `glob_fnmatch` | 2.2 |
+  | `file_read_binary_chunks` | 4.8 | `collections_ops` | 2.2 |
+  | `context_managers_generators` | 4.0 | `asyncio_ops` | 1.9 |
+  | `inspect_typing_ops` | 3.8 | `shlex_ops` | 1.9 |
+  | `email_html_ops` | 3.6 | `decimal_fraction_ops` | 1.7 |
+  | `configparser_ops` | 3.5 | `math_ops` | 1.7 |
+  | `exceptions_ops` | 3.5 | `difflib_ops` | 1.6 |
+  | `datetime_time_ops` | 3.4 | `heapq_bisect` | 1.5 |
+  | `bytes_ops` | 3.4 | `urllib_parse_ops` | 1.5 |
+  | `pathlib_ops` | 3.2 | `logging_ops` | 1.4 |
+  | `argparse_ops` | 3.0 | `pickle_copy_ops` | 1.3 |
+  | `uuid_secrets_ops` | 2.8 | `sort_ops` | 1.2 |
+  | `weakref_gc_ops` | 2.7 | `str_format_ops` | 1.1 |
+  | `itertools_functools` | 2.7 | `json_ops` | 0.72 |
+
+  Ahead: `re_ops` 0.74, `json_ops` 0.72, `xml_etree_ops` 0.66,
+  `subprocess_ops` 0.61, `list_dict_basics` 0.87, `sqlite_ops` 0.90.
+  Geometric mean over 53: 1.83.
+- **Where a slow case's time goes is usually one operation.** Broken down
+  by instruction count against CPython, a case's loop is mostly at 1.0 to
+  1.5 with one or two operations far out: for `class_features`,
+  two-argument `super(C, o).attr` (8 times), `getattr(o, "prop")` (3.4),
+  `type(o).__name__` (3.2), `issubclass` against an ABC (2.5); for the
+  threading case, `lock.__enter__` read by name; for directory walks, a
+  `stat` per entry. Each was a general path taken where a cached or
+  direct one was missing, 3,000 to 10,000 instructions flat across the
+  attribute and call machinery with no hot function.
+- **The battery's wall-clock ratios are worse than its instruction
+  ratios.** `class_features` retires about twice CPython's instructions a
+  loop and takes six to eight times as long. The general paths are where
+  the instruction-cache footprint is (see the next entries), so a case
+  that lives on them pays twice.
+- Per-operation instruction counts still open after this PR's fixes
+  (WeavePy against CPython): `Color["RED"]` 3,860 against 620, `Color(1)`
+  6,180 against 2,660, a dataclass `==` 6,820 against 1,850 and `<` 8,170
+  against 2,040, `dataclasses.asdict` 47,200 against 15,100, a
+  `__setattr__` hook 6,790 against 1,830, `queue.SimpleQueue` put and get
+  13,500 against 830 (CPython's is C, ours the Python fallback), a
+  thread's start and join 11,900 against 1,850, `f.read(8192)` 2.6
+  times, `b"%d" % n` formatting 2.5 times, `dict(zip(a, b))` 2.1 times,
+  `*args` forwarding 2.1 times, `os.stat` 1.6 times.
+- **A libc `atexit` hook costs a short process 800 page faults on macOS.**
+  Registering one for standard output's buffer added 5% to a small
+  script's instructions (3 MB more resident at exit); the bench fixtures
+  showed it as 4.6% across the board. The interpreter's exits flush
+  explicitly instead (`vm_singletons::exit_process`).
+
 - **The suite is saturated; single operations aren't** (November 12, the
   PGO build at `11c293b4`).
   - Every workload that trails CPython warm retires fewer instructions
@@ -3105,6 +3241,33 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What the everyday battery points at (`tools/pybench/everyday.py`; see
+"What the measurements say"). Rerun it first: several of its worst cases
+moved in this PR, and the list below is from its first run.
+
+- `enum`: member lookup by name and by value, `.name` and `.value`, flag
+  arithmetic. All go through the metaclass and `DynamicClassAttribute`
+  on general paths.
+- `dataclasses`: generated `__eq__` and ordering (tuple builds of the
+  fields compared through general calls), `asdict` and `replace`.
+- `__setattr__` hooks and `object.__setattr__(self, name, value)`, which
+  a frozen dataclass's `__init__` calls once a field: the store-side twin
+  of this PR's attribute-read hooks.
+- `threading.local` and `queue.SimpleQueue` as native types (both are the
+  pure-Python fallbacks), and thread start and join.
+- `getattr(obj, name)` of a property, `type(obj).__name__`, two-argument
+  `super()`, `issubclass` against an ABC.
+- `f.read(n)` in a loop and large single writes; `os.stat` and
+  `os.path.exists`.
+- `bytes` `%` formatting; `dict(zip(a, b))`; `*args` forwarding.
+- Exceptions raised in a callee and caught in its caller (12,400
+  instructions against 6,800 for `os.environ[missing]`), which `argparse`
+  does 25 to 50 times a parse.
+- Then the library cases the battery ranks next, each of which needs its
+  own breakdown: `inspect` and `typing`, `email`, `configparser`,
+  `datetime` (`strptime`, `strftime`, `astimezone`), `pathlib`,
+  `argparse`, `uuid`, `weakref`.
 
 What the single-operation battery points at (see "What the measurements
 say"), in the order the gaps would close the most:
