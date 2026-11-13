@@ -1031,7 +1031,47 @@ impl sealed::Sealed for crate::tuple_storage::TupleStorage {}
 // initialized [Object] tail. Only its constructors create these Arc payloads;
 // unique mutation changes elements/hash, never slice length or metadata.
 unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
+    /// Most tuples die holding scalars and objects that other owners keep
+    /// (`(i, x)` from `enumerate`, a call's `*args`): with the bias held
+    /// those items' counts go down in place and the allocation is freed,
+    /// without the nested release's trashcan and the slice's drop glue
+    /// (a third of their instructions for a tuple of three). An item this
+    /// tuple turns out to be the last owner of ends the walk: the items
+    /// before it are blanked, and the nested release takes the rest.
     fn release_last(last: Arc<Self>) {
+        if crate::rc::refcounts_biased() {
+            let p = Arc::as_ptr(&last);
+            // SAFETY: `last` is the tuple's one strong owner, so with no
+            // weak handle either (`sole_owner`) nothing else reads its
+            // items. Each item's count is given up once: in place here, or
+            // by the nested release below (which sees the blanked items as
+            // scalars). The allocation is freed with the layout `Arc`
+            // allocated it with (see `rc::try_free_last`).
+            unsafe {
+                if crate::rc::sole_owner(p) {
+                    let items: &mut [crate::object::Object] = &mut *p.cast_mut();
+                    let mut done = 0;
+                    for item in items.iter() {
+                        match item.strong_word() {
+                            Some(word) if !crate::rc::plain_release(word) => break,
+                            _ => done += 1,
+                        }
+                    }
+                    if done == items.len() {
+                        let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+                            .extend(std::alloc::Layout::for_value(&*p))
+                            .expect("Arc layout");
+                        let start = crate::rc::strong_word(p).cast::<u8>().cast_mut();
+                        std::mem::forget(last);
+                        std::alloc::dealloc(start, inner.pad_to_align());
+                        return;
+                    }
+                    for item in &mut items[..done] {
+                        ptr::write(item, crate::object::Object::None);
+                    }
+                }
+            }
+        }
         crate::rc::release_nested_arc(last);
     }
     type View = Self;
