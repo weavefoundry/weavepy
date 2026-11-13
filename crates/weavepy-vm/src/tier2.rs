@@ -12133,9 +12133,14 @@ unsafe fn call_dyn_impl(
     }
     // A keyword call of a warm pure leaf evaluates frameless on its
     // marshaled values (no Python runs, so nothing needs revalidating).
+    // Counted against the native driver all the same: the frame JIT
+    // evaluates the same leaf at its call site in a fifth of this round
+    // trip's instructions (`f(i, c=4)` 220 against 1,040), so a loop dense
+    // in them runs better there.
     if kwc > 0 {
         // SAFETY: per the function contract — same live buffers.
         if let Some(v) = unsafe { dyn_kw_pure_leaf(jf, ctx, interp, &callee, argc, kwc, names) } {
+            ctx.dyn_py_calls = ctx.dyn_py_calls.saturating_add(1);
             return dyn_leaf_result(jf, ctx, v, int_result);
         }
     }

@@ -407,6 +407,27 @@ branch and pull request.
     pool's), a seventh of its cycles.
     `target/wt/target/pc-cg/lockcount.py` counts them per function
     (callgrind per instruction, against the binary's disassembly).
+  - Loops tier 2 ran worse than the frame JIT. A compiled loop over a
+    dict or one of its views took the general iterator step for every key
+    (the iterator cloned, a checkpoint, the checked step: 640 instructions
+    a key); it takes the core loop's in-place step now, as list, tuple and
+    range iterators did, and `for k in d` over ten keys went from 7,900
+    instructions a pass to 4,500. An OSR entry and its exit cost about
+    4,000 instructions, and the verdict on a loop's entries asked only
+    that they average eight iterations: `for x in sorted(xs): pass` over
+    ten items ran 7,400 instructions a pass through its entries against
+    the frame JIT's 3,400. The minimum now scales with the compiled
+    code's size (`osr_min_trips`: 64 iterations for an empty body, eight
+    from fifteen statements), so such loops are left to the frame JIT. A
+    keyword call of a pure leaf (`f(i, c=4)` with a keyword-only
+    parameter) ran 1,040 instructions in tier 2's frameless evaluation
+    against 220 at the frame JIT's call site, uncounted; it counts
+    against the loop now (320 an iteration after the hand-over).
+  - The frame JIT's `FOR_ITER` helper steps a dict's and a dict view's
+    keys and values and a reversed list's items itself, instead of
+    through the general step's second helper: ten of a dict's keys 3,140
+    instructions a pass (3,590 before, CPython 1,950), its values 3,460
+    (3,920), `reversed(xs)` 3,620 (4,140).
   - Two bugs the new tests found: `list.sort` ignored an unknown keyword,
     and raised `TypeError` for a `list` subclass's instance when called
     with keywords (`super().sort(reverse=True)`).
