@@ -5402,6 +5402,12 @@ pub struct PyFunction {
     /// current code's own interned names (see [`Self::code_names_kept`]).
     /// Cleared when `__code__` is rebound.
     pub names_kept: crate::sync::Cell<u64>,
+    /// Whether the compiled keyword-only defaults line up with the current
+    /// code's keyword-only parameters (see
+    /// `Interpreter::kwonly_aligned`): 1 aligned, 2 not, 0 not yet asked
+    /// (and again whenever the code is replaced). A byte, in the padding
+    /// beside [`Self::defaults_override`].
+    pub kwonly_memo: crate::sync::Cell<u8>,
     /// Where the cycle collector holds the function (see
     /// [`crate::gc_trace::GcSlot`]).
     pub gc_slot: crate::gc_trace::GcSlot,

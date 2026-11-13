@@ -9687,6 +9687,31 @@ impl Interpreter {
         Some(missing)
     }
 
+    /// Whether `f`'s compiled keyword-only defaults are one per
+    /// keyword-only parameter of `code`, in the parameters' order (what a
+    /// `def` whose keyword-only parameters all have defaults compiles to).
+    /// Decided once per function, and again when its code is replaced
+    /// (`PyFunction::kwonly_memo`; the defaults themselves are fixed at
+    /// its creation): a call of such a function asked twice, comparing
+    /// every name each time (250 instructions a call for five parameters).
+    #[inline]
+    fn kwonly_aligned(f: &PyFunction, code: &CodeObject) -> bool {
+        let memo = f.kwonly_memo.get();
+        if memo != 0 {
+            return memo == 1;
+        }
+        let npos = code.arg_count as usize;
+        let names = &code.varnames[npos..npos + code.kwonly_count as usize];
+        let kd = &f.kw_defaults;
+        let aligned = kd.len() == names.len()
+            && kd
+                .iter()
+                .zip(names)
+                .all(|((n, _), v)| n.as_str() == v.as_str());
+        f.kwonly_memo.set(if aligned { 1 } else { 2 });
+        aligned
+    }
+
     /// `f`'s compiled default for each of `code`'s keyword-only parameters,
     /// in parameter order.
     fn kwonly_defaults<'a>(
@@ -9698,11 +9723,7 @@ impl Interpreter {
         // The compiler lists them in the parameters' order: when every one
         // has a default, the names line up and none is searched for.
         let kd = &f.kw_defaults;
-        let aligned = kd.len() == names.len()
-            && kd
-                .iter()
-                .zip(names)
-                .all(|((n, _), v)| n.as_str() == v.as_str());
+        let aligned = Self::kwonly_aligned(f, code);
         names.iter().enumerate().map(move |(j, name)| {
             if aligned {
                 kd.get(j).map(|(_, v)| v)
@@ -9826,7 +9847,10 @@ impl Interpreter {
     /// parameters.
     #[inline(never)]
     fn kwonly_defaults_cover_slow(f: &PyFunction, code: &CodeObject) -> bool {
-        !f.defaults_maybe_overridden() && Self::kwonly_defaults(f, code).all(|d| d.is_some())
+        !f.defaults_maybe_overridden()
+            // (Aligned defaults are one per parameter.)
+            && (Self::kwonly_aligned(f, code)
+                || Self::kwonly_defaults(f, code).all(|d| d.is_some()))
     }
 
     /// Append to `v` the parameters of a positional call of `f` (running
@@ -55356,6 +55380,7 @@ impl Interpreter {
                         // (A lazily running callee's frame borrows its
                         // function's code until it registers.)
                         self.settle_lazy();
+                        f.kwonly_memo.set(0);
                         crate::frame_jit::retire_code(f.code.replace(c));
                         f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
@@ -59726,6 +59751,7 @@ impl Interpreter {
             closure_cells: std::sync::OnceLock::new(),
             defaults_override: crate::object::OverrideFlag::new(false),
             names_kept: crate::sync::Cell::new(0),
+            kwonly_memo: crate::sync::Cell::new(0),
             gc_slot: crate::gc_trace::GcSlot::new(),
         })))
     }
@@ -85675,6 +85701,7 @@ fn new_function(
         closure_cells: std::sync::OnceLock::new(),
         defaults_override: crate::object::OverrideFlag::new(false),
         names_kept: crate::sync::Cell::new(0),
+        kwonly_memo: crate::sync::Cell::new(0),
     };
     if let Some(ann) = annotations {
         f.slots()
