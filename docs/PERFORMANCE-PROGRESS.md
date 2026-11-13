@@ -429,6 +429,21 @@ branch and pull request.
     `f.write(s)` 556 (579), `print(a, b, file=f)` 4,054 (5,214). Text
     `read(n)` read a byte per call: 39,000 to 2,150 for five characters
     (1,200).
+  - The shapes those halves declined, and what a decline cost. A leaf
+    whose fast half declines used to fall to the full call handler,
+    where an unregistered builtin's body runs in the core loop's lane:
+    registering `write` and `readline` halves made every stream they
+    didn't cover slower (a CRLF file's `readline()` 3,630 to 5,620
+    instructions, a latin-1 file's `write()` 4,330 to 5,820). A declined
+    leaf now runs its body through the lane, and the halves cover what
+    they declined: line ends of every kind under every newline mode
+    (translated and tallied in place), latin-1 and ASCII text, writes
+    whose `\n` becomes `\r\n` or `\r`, and `readline(limit)`. A CRLF
+    `readline()` is 1,510 instructions (CPython 1,040), a latin-1
+    `write()` 990 (990), a `newline="\r\n"` `write()` 1,090 (2,670).
+    A text `readline(n)` also counts characters now, as CPython's does;
+    it counted bytes, and a limit inside a multi-byte character raised
+    `UnicodeDecodeError`.
   - `os.DirEntry` built seven closures per entry and ran a `stat` for
     every `is_dir()`, `is_file()` and `is_symlink()`. Its methods are
     the type's, it answers from the directory read's `d_type`, and it

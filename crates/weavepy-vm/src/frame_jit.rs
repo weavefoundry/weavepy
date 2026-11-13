@@ -4071,7 +4071,7 @@ unsafe extern "C" fn h_for_iter_rest(
         // and a line read that may fill the buffer (and so run a signal
         // handler) through the lane.
         Object::File(f) => {
-            if let Some(line) = f.next_line_pure() {
+            if let Some(line) = f.next_line_pure(None) {
                 if !f.binary {
                     f.telling.set(false);
                 }
@@ -12818,6 +12818,10 @@ pub(crate) struct BuiltinSite {
     kernel: Option<Kernel>,
     recv_tag: u8,
     via_call: bool,
+    /// For a leaf whose fast half may decline: whether its whole body may
+    /// then run through the core loop's lane, as an unregistered builtin's
+    /// would (`Some(via_call)`), instead of the full handler.
+    lane: Option<bool>,
 }
 
 /// [`h_call`] at a site settled on a container's or string's leaf method
@@ -12909,6 +12913,21 @@ unsafe extern "C" fn h_call_leaf(
     unsafe {
         if let Some(r) = call_leaf_in_place(&mut *st, &*site, pc, len as usize) {
             return r;
+        }
+        // A fast half that declined (a write that must flush, a line that
+        // needs the next block): the body through the lane, where it would
+        // have run had it no fast half, not the full handler.
+        if let Some(via_call) = (*site).lane {
+            let whole = BuiltinSite {
+                f: (*site).f,
+                argc: (*site).argc,
+                kind: None,
+                kernel: None,
+                recv_tag: 0,
+                via_call,
+                lane: None,
+            };
+            return h_call_native(st, code, ext, pc, len, &raw const whole);
         }
         h_call(st, code, ext, pc, len)
     }
@@ -21992,6 +22011,23 @@ impl<'a> Lower<'a> {
             Some(_) if in_core => h_site_leaf as *const () as usize,
             Some(_) => return None,
         };
+        // What `Interpreter::builtin_lane` would settle for the builtin
+        // were it not a leaf: a method body the dispatch calls directly or
+        // knows by name, or a function that never looks at its caller's
+        // frame.
+        let lane = match kind {
+            Some(LeafKind::Fast(_)) if f.binds_instance => {
+                if crate::native_call_ic_safe(f.name) {
+                    Some(false)
+                } else {
+                    crate::builtin_method_via_call(f.name).then_some(true)
+                }
+            }
+            Some(LeafKind::Fast(_)) => {
+                crate::builtin_fn_lane_ok(f.name).then(|| crate::builtin_needs_interp(f.name))
+            }
+            _ => None,
+        };
         let site = Box::new(BuiltinSite {
             f: Rc::as_ptr(&f),
             argc,
@@ -21999,6 +22035,7 @@ impl<'a> Lower<'a> {
             kernel,
             recv_tag,
             via_call,
+            lane,
         });
         self.held.push(f);
         let at = std::ptr::from_ref::<BuiltinSite>(&site).cast_mut().cast();

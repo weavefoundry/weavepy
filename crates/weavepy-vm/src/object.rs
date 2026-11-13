@@ -6682,48 +6682,149 @@ fn utf8_prefix(buf: &[u8], want: usize) -> (usize, usize) {
 /// error handler and newline strings again.
 #[derive(Debug, Clone, Copy)]
 struct TextPlan {
-    /// The bytes are UTF-8 and no incremental decoder is in the way.
-    utf8: bool,
+    /// How bytes and text correspond, where that needs no codec.
+    codec: TextCodec,
     /// The error handler is `strict`: valid UTF-8 is the text. Under any
-    /// other handler only ASCII is known to pass unchanged.
+    /// other handler only ASCII is known to pass through UTF-8 unchanged.
     strict: bool,
     /// Where a line ends on a read.
     end: LineEnd,
-    /// A write's `\n` stays as it is.
-    write_untouched: bool,
+    /// A read's `\r` and `\r\n` become `\n` (the universal-newline
+    /// default on a byte-backed stream).
+    translate: bool,
+    /// What a write's `\n` becomes.
+    write_end: WriteEnd,
+}
+
+/// The codecs whose work the stream's own paths can do in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextCodec {
+    /// UTF-8, with no incremental decoder in the way.
+    Utf8,
+    /// ISO 8859-1: each byte is the code point of its value.
+    Latin1,
+    /// ASCII: only ASCII text and bytes pass (anything else is the codec's
+    /// to refuse or to hand to an error handler).
+    Ascii,
+    /// Anything else: the codec's own.
+    Other,
+}
+
+/// What a text stream writes for a `\n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteEnd {
+    /// The `\n` itself.
+    AsIs,
+    Cr,
+    CrLf,
+    /// Not a substitution the plan describes (`StringIO(newline=None)`
+    /// collapses line ends as it's written to).
+    Other,
 }
 
 impl TextPlan {
     /// The packed form of "not worked out yet".
-    const UNKNOWN: u8 = 0;
+    const UNKNOWN: u16 = 0;
 
-    /// One byte for the stream's cell: a set low bit, then the fields.
-    fn pack(self) -> u8 {
+    /// One word for the stream's cell: a set low bit, then the fields.
+    fn pack(self) -> u16 {
+        let codec = match self.codec {
+            TextCodec::Utf8 => 0,
+            TextCodec::Latin1 => 1,
+            TextCodec::Ascii => 2,
+            TextCodec::Other => 3,
+        };
         let end = match self.end {
             LineEnd::Lf => 0,
             LineEnd::Cr => 1,
             LineEnd::CrLf => 2,
             LineEnd::Universal => 3,
         };
-        1 | u8::from(self.utf8) << 1
-            | u8::from(self.strict) << 2
-            | u8::from(self.write_untouched) << 3
+        let write_end = match self.write_end {
+            WriteEnd::AsIs => 0,
+            WriteEnd::Cr => 1,
+            WriteEnd::CrLf => 2,
+            WriteEnd::Other => 3,
+        };
+        1 | codec << 1
+            | u16::from(self.strict) << 3
             | end << 4
+            | u16::from(self.translate) << 6
+            | write_end << 7
     }
 
-    fn unpack(bits: u8) -> Option<Self> {
+    fn unpack(bits: u16) -> Option<Self> {
         (bits & 1 != 0).then(|| Self {
-            utf8: bits & 2 != 0,
-            strict: bits & 4 != 0,
-            write_untouched: bits & 8 != 0,
+            codec: match bits >> 1 & 3 {
+                0 => TextCodec::Utf8,
+                1 => TextCodec::Latin1,
+                2 => TextCodec::Ascii,
+                _ => TextCodec::Other,
+            },
+            strict: bits & 8 != 0,
             end: match bits >> 4 & 3 {
                 0 => LineEnd::Lf,
                 1 => LineEnd::Cr,
                 2 => LineEnd::CrLf,
                 _ => LineEnd::Universal,
             },
+            translate: bits & 64 != 0,
+            write_end: match bits >> 7 & 3 {
+                0 => WriteEnd::AsIs,
+                1 => WriteEnd::Cr,
+                2 => WriteEnd::CrLf,
+                _ => WriteEnd::Other,
+            },
         })
     }
+
+    /// The text `bytes` decode to, when that takes no decoder: `None` for
+    /// bytes this codec's own decoder must see (malformed UTF-8, non-ASCII
+    /// under a handler that may rewrite it).
+    fn decode(self, bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        fn ascii(b: &[u8]) -> &str {
+            // SAFETY: the callers checked `b` is ASCII, which is UTF-8.
+            unsafe { std::str::from_utf8_unchecked(b) }
+        }
+        match self.codec {
+            TextCodec::Utf8 if self.strict => std::str::from_utf8(bytes).ok().map(Cow::Borrowed),
+            TextCodec::Utf8 | TextCodec::Ascii => {
+                bytes.is_ascii().then(|| Cow::Borrowed(ascii(bytes)))
+            }
+            TextCodec::Latin1 if bytes.is_ascii() => Some(Cow::Borrowed(ascii(bytes))),
+            TextCodec::Latin1 => Some(Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect())),
+            TextCodec::Other => None,
+        }
+    }
+
+    /// The bytes `text` encodes to, when that takes no encoder: `None` for
+    /// text this codec's own encoder must see.
+    fn encode(self, text: &str) -> Option<std::borrow::Cow<'_, [u8]>> {
+        use std::borrow::Cow;
+        match self.codec {
+            TextCodec::Utf8 if self.strict => Some(Cow::Borrowed(text.as_bytes())),
+            TextCodec::Utf8 | TextCodec::Ascii => {
+                text.is_ascii().then(|| Cow::Borrowed(text.as_bytes()))
+            }
+            TextCodec::Latin1 if text.is_ascii() => Some(Cow::Borrowed(text.as_bytes())),
+            TextCodec::Latin1 => text
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)).ok())
+                .collect::<Option<Vec<u8>>>()
+                .map(Cow::Owned),
+            TextCodec::Other => None,
+        }
+    }
+}
+
+/// A `readline` limit of `limit` characters of UTF-8 text, as a limit in
+/// bytes of `rest`: `None` (no limit yet) while `rest` holds fewer whole
+/// characters than that, so that the line's end or the next block decides.
+fn utf8_limit(rest: &[u8], limit: Option<usize>) -> Option<usize> {
+    let want = limit?;
+    let (len, count) = utf8_prefix(rest, want);
+    (count == want).then_some(len)
 }
 
 /// Where a line ends, for [`PyFile::read_line_bytes`].
@@ -7027,7 +7128,7 @@ pub struct PyFile {
     /// How this text stream's configuration lets text through, worked out by
     /// [`PyFile::text_plan`] and dropped whenever the encoding, error
     /// handler, newline mode or io layer changes.
-    text_plan: crate::sync::Cell<u8>,
+    text_plan: crate::sync::Cell<u16>,
     /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
     /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
     pub buf_size: crate::sync::Cell<usize>,
@@ -7728,29 +7829,42 @@ impl PyFile {
         if let Some(plan) = TextPlan::unpack(self.text_plan.get()) {
             return plan;
         }
-        let utf8_named = matches!(
-            self.encoding.borrow().as_deref(),
-            None | Some("utf-8" | "UTF-8" | "utf8")
-        );
-        let utf8 = utf8_named && !self.text_incr_active_gate();
+        let named = match self.encoding.borrow().as_deref() {
+            None => TextCodec::Utf8,
+            Some(enc) => match enc.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+                "utf8" => TextCodec::Utf8,
+                "latin1" | "iso88591" | "l1" | "8859" | "cp819" => TextCodec::Latin1,
+                "ascii" | "usascii" | "646" => TextCodec::Ascii,
+                _ => TextCodec::Other,
+            },
+        };
+        // (A codec the plan doesn't serve needn't be asked how it decodes.)
+        let codec = if named != TextCodec::Other && self.text_incr_active_gate() {
+            TextCodec::Other
+        } else {
+            named
+        };
         let strict = self
             .errors
             .borrow()
             .as_deref()
             .is_none_or(|e| e == "strict");
-        let (end, write_untouched) = match self.newline.borrow().as_deref() {
-            None => (LineEnd::Universal, self.io_kind.get() != IoKind::StringIO),
-            Some("") => (LineEnd::Universal, true),
-            Some("\n") => (LineEnd::Lf, true),
-            Some("\r") => (LineEnd::Cr, false),
-            Some("\r\n") => (LineEnd::CrLf, false),
-            Some(_) => (LineEnd::Universal, false),
+        let memory = self.io_kind.get() == IoKind::StringIO;
+        let (end, translate, write_end) = match self.newline.borrow().as_deref() {
+            None if memory => (LineEnd::Universal, false, WriteEnd::Other),
+            None => (LineEnd::Universal, true, WriteEnd::AsIs),
+            Some("") => (LineEnd::Universal, false, WriteEnd::AsIs),
+            Some("\n") => (LineEnd::Lf, false, WriteEnd::AsIs),
+            Some("\r") => (LineEnd::Cr, false, WriteEnd::Cr),
+            Some("\r\n") => (LineEnd::CrLf, false, WriteEnd::CrLf),
+            Some(_) => (LineEnd::Universal, false, WriteEnd::Other),
         };
         let plan = TextPlan {
-            utf8,
+            codec,
             strict,
             end,
-            write_untouched,
+            translate,
+            write_end,
         };
         // (The gate above drops the cell when it first decides.)
         self.text_plan.set(plan.pack());
@@ -7770,48 +7884,67 @@ impl PyFile {
     /// or exhausted, the line needs the next block, a decoder, or newline
     /// translation, or this stream hasn't been through the general path yet.
     /// Runs no code, so a loop can take it without publishing its frame.
-    pub(crate) fn next_line_pure(&self) -> Option<Object> {
+    pub(crate) fn next_line_pure(&self, limit: Option<usize>) -> Option<Object> {
+        // (A zero limit reads nothing, which isn't a line to hand out.)
+        if limit == Some(0) {
+            return None;
+        }
         let plan = if self.binary {
             None
         } else {
             let plan = TextPlan::unpack(self.text_plan.get())?;
-            if !plan.utf8 {
+            if plan.codec == TextCodec::Other {
                 return None;
             }
             Some(plan)
         };
         let end = plan.map_or(LineEnd::Lf, |p| p.end);
-        // A line's object: `bytes`, or the `str` its bytes spell. A `\r` in a
-        // text line means translating or tallying, which the general path
-        // does.
+        // A line's object: `bytes`, or the `str` its bytes spell, with its
+        // line end tallied and, in universal mode, turned into `\n`.
         let make = |line: &[u8]| -> Option<Object> {
             let Some(plan) = plan else {
                 // (Never empty: a line is at least its terminator, and an
                 // exhausted stream isn't asked.)
                 return Some(Object::Bytes(SharedSlice::from(line)));
             };
-            if memchr::memchr(b'\r', line).is_some() {
-                return None;
-            }
-            let text = if plan.strict {
-                std::str::from_utf8(line).ok()?
-            } else if line.is_ascii() {
-                // SAFETY: ASCII is UTF-8.
-                unsafe { std::str::from_utf8_unchecked(line) }
-            } else {
-                return None;
+            let text = plan.decode(line)?;
+            let Some(cr) = memchr::memchr(b'\r', line) else {
+                if self.seennl.get() & 2 == 0 && line.last() == Some(&b'\n') {
+                    self.seennl.set(self.seennl.get() | 2);
+                }
+                return Some(Object::from_str(&*text));
             };
-            if self.seennl.get() & 2 == 0 && line.last() == Some(&b'\n') {
-                self.seennl.set(self.seennl.get() | 2);
+            if plan.end != LineEnd::Universal {
+                // An explicit line end: a `\r` is tallied and stays.
+                self.record_seen_newlines(&text);
+                return Some(Object::from_str(&*text));
             }
-            Some(Object::from_str(text))
+            // Universal mode ends the line at its first `\r` or `\n`, so
+            // the `\r` opens the terminator: itself, or `\r\n`.
+            let ending = line.len() - cr;
+            self.seennl
+                .set(self.seennl.get() | if ending == 2 { 4 } else { 1 });
+            if !plan.translate {
+                return Some(Object::from_str(&*text));
+            }
+            let body = &text[..text.len() - ending];
+            let mut out = String::with_capacity(body.len() + 1);
+            out.push_str(body);
+            out.push('\n');
+            Some(Object::from_str(out))
+        };
+        // A text limit counts characters: UTF-8's as a byte limit on what's
+        // buffered, the single-byte codecs' as it is.
+        let cut = |rest: &[u8]| match plan {
+            Some(p) if p.codec == TextCodec::Utf8 => utf8_limit(rest, limit),
+            _ => limit,
         };
         let mut backend = self.backend.try_borrow_mut().ok()?;
         match &mut *backend {
             FileBackend::Disk(_) | FileBackend::Stdin => {
                 // Bytes wait here only on an open stream that has been read.
                 let mut ra = self.read_ahead.try_borrow_mut().ok()?;
-                let n = line_take(ra.rest(), end, None)?;
+                let n = line_take(ra.rest(), end, cut(ra.rest()))?;
                 let line = make(&ra.rest()[..n])?;
                 ra.consume(n);
                 Some(line)
@@ -7822,7 +7955,7 @@ impl PyFile {
                 }
                 let d = data.try_borrow().ok()?;
                 let rest = d.get(*pos..).filter(|r| !r.is_empty())?;
-                let n = line_take(rest, end, None).unwrap_or(rest.len());
+                let n = line_take(rest, end, cut(rest)).unwrap_or(rest.len());
                 let line = make(&rest[..n])?;
                 *pos += n;
                 Some(line)
@@ -7832,7 +7965,7 @@ impl PyFile {
                     return None;
                 }
                 let rest = data.as_bytes().get(*pos..).filter(|r| !r.is_empty())?;
-                let n = line_take(rest, end, None).unwrap_or(rest.len());
+                let n = line_take(rest, end, utf8_limit(rest, limit)).unwrap_or(rest.len());
                 let line = make(&rest[..n])?;
                 *pos += n;
                 Some(line)
@@ -7859,16 +7992,35 @@ impl PyFile {
         let Some(plan) = TextPlan::unpack(self.text_plan.get()) else {
             return false;
         };
-        if !plan.utf8 || !plan.write_untouched || !(plan.strict || s.is_ascii()) {
+        let Some(bytes) = plan.encode(s) else {
             return false;
-        }
+        };
+        let ending: &[u8] = match plan.write_end {
+            WriteEnd::AsIs => b"\n",
+            WriteEnd::Cr => b"\r",
+            WriteEnd::CrLf => b"\r\n",
+            WriteEnd::Other => return false,
+        };
         let Ok(mut held) = self.write_buf.try_borrow_mut() else {
             return false;
         };
-        if held.is_empty() || held.len() + s.len() >= self.buf_size.get() {
+        // (Room for every byte to be a `\n` that doubles.)
+        if held.is_empty() || held.len() + 2 * bytes.len() >= self.buf_size.get() {
             return false;
         }
-        held.extend_from_slice(s.as_bytes());
+        if plan.write_end == WriteEnd::AsIs {
+            held.extend_from_slice(&bytes);
+        } else {
+            // (`\n` is one byte, and no other character's, in each of
+            // these codecs.)
+            let mut rest: &[u8] = &bytes;
+            while let Some(at) = memchr::memchr(b'\n', rest) {
+                held.extend_from_slice(&rest[..at]);
+                held.extend_from_slice(ending);
+                rest = &rest[at + 1..];
+            }
+            held.extend_from_slice(rest);
+        }
         true
     }
 
@@ -7904,9 +8056,7 @@ impl PyFile {
     pub(crate) fn stdout_write_pure(&self, s: &str) -> Option<Result<(), RuntimeError>> {
         let plan = TextPlan::unpack(self.text_plan.get())?;
         if self.binary
-            || !plan.utf8
-            || !plan.write_untouched
-            || !(plan.strict || s.is_ascii())
+            || plan.write_end != WriteEnd::AsIs
             || *self.closed.borrow()
             || crate::vm_singletons::stdio_unbuffered()
         {
@@ -7916,11 +8066,12 @@ impl PyFile {
         let FileBackend::Stdout(sink) = &*backend else {
             return None;
         };
+        let bytes = plan.encode(s)?;
         let mut sink = sink.try_borrow_mut().ok()?;
         let res = sink
-            .write_all(s.as_bytes())
+            .write_all(&bytes)
             .map_err(|e| crate::error::io_error_to_py(&e));
-        crate::vm_singletons::note_stdout_write(s.as_bytes());
+        crate::vm_singletons::note_stdout_write(&bytes);
         Some(res)
     }
 
@@ -8095,7 +8246,7 @@ impl PyFile {
         use std::borrow::Cow;
         // Strict UTF-8 with nothing to translate (what `open(path, "w")`
         // gives): the string's own bytes.
-        if self.utf8_identity(s.as_bytes()) && self.text_plan().write_untouched {
+        if self.utf8_identity(s.as_bytes()) && self.text_plan().write_end == WriteEnd::AsIs {
             return Ok(Cow::Borrowed(s.as_bytes()));
         }
         let translated = self.translate_newlines_write(s);
@@ -9144,6 +9295,10 @@ impl PyFile {
             let n = line_take(rest, end, limit).unwrap_or(rest.len());
             rest[..n].to_vec()
         }
+        // (A `StringIO`'s limit counts characters.)
+        fn cut_text(rest: &[u8], end: LineEnd, limit: Option<usize>) -> Vec<u8> {
+            cut(rest, end, utf8_limit(rest, limit))
+        }
         match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { data, pos } => {
                 let d = data.borrow();
@@ -9152,7 +9307,7 @@ impl PyFile {
                 Some(line)
             }
             FileBackend::MemText { data, pos } => {
-                let line = cut(data.as_bytes().get(*pos..).unwrap_or(&[]), end, limit);
+                let line = cut_text(data.as_bytes().get(*pos..).unwrap_or(&[]), end, limit);
                 *pos += line.len();
                 Some(line)
             }
@@ -9329,10 +9484,24 @@ impl PyFile {
         // incremental newline decoder holds the `\r` back until the next
         // byte settles it, even across an EINTR-split pipe read:
         // test_file_eintr.test_readlines).
+        // A text stream's limit counts characters, as CPython's does: for
+        // UTF-8 that's a byte limit worked out on what's buffered. (The
+        // single-byte codecs' characters are their bytes; a multi-byte
+        // codec read through this path keeps the byte limit it had.)
+        let chars = !self.binary
+            && matches!(
+                self.encoding.borrow().as_deref(),
+                None | Some("utf-8" | "UTF-8" | "utf8")
+            );
         loop {
             {
                 let mut ra = self.read_ahead.borrow_mut();
-                if let Some(n) = line_take(ra.rest(), end, limit) {
+                let cut = if chars {
+                    utf8_limit(ra.rest(), limit)
+                } else {
+                    limit
+                };
+                if let Some(n) = line_take(ra.rest(), end, cut) {
                     return Ok(ra.take(n));
                 }
             }

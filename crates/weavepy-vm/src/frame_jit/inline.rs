@@ -2447,6 +2447,9 @@ impl<'a> Lower<'a> {
             kernel,
             recv_tag,
             via_call,
+            // (An inlined body's declined call leaves through its caller's
+            // paths.)
+            lane: None,
         });
         self.held.push(f);
         let at = self

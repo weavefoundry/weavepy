@@ -17474,7 +17474,7 @@ pub(crate) fn file_iter_next(
     if is_text {
         f.telling.set(false);
     }
-    if let Some(line) = f.next_line_pure() {
+    if let Some(line) = f.next_line_pure(None) {
         return Ok(Some(line));
     }
     file_check_open(f)?;
@@ -17570,7 +17570,9 @@ fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// `PyFile::next_line_pure`). A leaf half, like [`file_write_fast`].
 fn file_readline_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     match args {
-        [Object::File(f)] => f.next_line_pure().map(Ok),
+        [Object::File(f)] | [Object::File(f), Object::None] => f.next_line_pure(None).map(Ok),
+        // (A negative size is no limit.)
+        [Object::File(f), Object::Int(n)] => f.next_line_pure(usize::try_from(*n).ok()).map(Ok),
         _ => None,
     }
 }
@@ -17599,6 +17601,9 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             if f.binary {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
+            // What the in-place write reads next time: worked out here,
+            // where a codec lookup may run code.
+            f.prepare_text_plan();
             // Text writes commit fully and report the *character* count
             // (CPython `TextIOWrapper.write`), never a partial byte tally.
             if !f.mem_text_append(s) {

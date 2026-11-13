@@ -18674,7 +18674,7 @@ impl Interpreter {
         }
         // A line waiting in a file's buffer runs nothing: no publishing.
         if let Object::File(f) = &source {
-            if let Some(line) = f.next_line_pure() {
+            if let Some(line) = f.next_line_pure(None) {
                 if !f.binary {
                     f.telling.set(false);
                 }
