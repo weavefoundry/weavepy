@@ -3296,8 +3296,10 @@ moved in this PR, and the list below is from its first run.
   pure-Python fallbacks), and thread start and join.
 - `getattr(obj, name)` of a property, `type(obj).__name__`, two-argument
   `super()`, `issubclass` against an ABC.
-- `f.read(n)` in a loop and large single writes; `os.stat` and
-  `os.path.exists`.
+- `f.read(n)` in a loop (1.6 times CPython after this PR dropped an
+  `fcntl` per read: the bytes are still read into a vector and copied
+  into the `bytes` object) and large single writes, which go through the
+  write buffer instead of past it; `os.stat` and `os.path.exists`.
 - Block reads off Unix: the read-ahead's fill asks a descriptor for a
   block only under `cfg(unix)`, so a line read on Windows still takes a
   byte per read (as it did everywhere before this PR). The generic fill

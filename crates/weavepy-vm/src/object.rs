@@ -3237,6 +3237,44 @@ fn read_fd_intr(
     }
 }
 
+/// One `read(2)` of at most `want` bytes for `read(n)`: the bytes (none at
+/// end of stream), or `None` when a non-blocking descriptor has nothing yet
+/// (CPython's raw `read` returns `None` there). PEP 475 as [`read_fd_intr`]:
+/// the GIL released across the call, a tripped signal handler run on
+/// `EINTR` before the retry.
+#[cfg(unix)]
+fn read_fd_sized(
+    fd: std::os::unix::io::RawFd,
+    want: usize,
+    lock: &std::sync::Mutex<()>,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(want);
+    if want == 0 {
+        return Ok(Some(buf));
+    }
+    let dst = buf.as_mut_ptr();
+    loop {
+        let r = crate::gil::allow_threads_then(|| {
+            let _serialized = fd_lock(lock);
+            unsafe { libc::read(fd, dst.cast(), want) }
+        });
+        if r >= 0 {
+            // SAFETY: the kernel wrote `r` bytes, at most `want`, into the
+            // vector's capacity.
+            unsafe { buf.set_len(r as usize) };
+            return Ok(Some(buf));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => service_pending_signals_io()?,
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => return Ok(None),
+            // Carry the errno, so that a stale descriptor surfaces as
+            // `OSError(EBADF)` (test_fileio `testErrnoOnClosedRead`).
+            _ => return Err(crate::error::io_error_to_py(&err)),
+        }
+    }
+}
+
 /// [`read_fd_intr`] for a line read's block: one `read(2)` of at most `room`
 /// bytes, appended to `buf`, whose spare capacity the caller has reserved.
 /// Returns how many bytes came; zero is end of stream.
@@ -8942,6 +8980,12 @@ impl PyFile {
                 FileBackend::Disk(f) => Some(f.as_raw_fd()),
                 _ => None,
             };
+            if let (Some(fd), Some(want), None) = (raw_fd, n, &parked) {
+                // A sized read is one `read(2)` whatever the descriptor's
+                // mode: only a non-blocking one can answer "would block",
+                // so there's no need to ask which it is first.
+                return read_fd_sized(fd, want, &self.fd_syscall_lock);
+            }
             if let Some(fd) = raw_fd {
                 if fd_is_nonblocking(fd) {
                     let more = read_fd_nonblock(fd, n, &self.fd_syscall_lock)?;
