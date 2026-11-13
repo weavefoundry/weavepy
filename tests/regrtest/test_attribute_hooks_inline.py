@@ -335,6 +335,43 @@ kinds = [int, str, Named, dict, Const]
 seen_names = [k.__name__ for _ in range(1000) for k in kinds]
 assert seen_names[-5:] == ["int", "str", "Renamed", "dict", "Const"]
 
+# Names of classes with other metaclasses: `ABCMeta` leaves them to `type`,
+# and a metaclass that answers for itself is asked every time.
+import abc
+
+
+class AbstractBase(abc.ABC):
+    pass
+
+
+class Concrete(AbstractBase):
+    pass
+
+
+class NamingMeta(type):
+    asked = 0
+
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            NamingMeta.asked += 1
+            return "meta says " + type.__getattribute__(cls, "__qualname__")
+        return type.__getattribute__(cls, name)
+
+
+class Named2(metaclass=NamingMeta):
+    pass
+
+
+cc = Concrete()
+for i in range(N):
+    if i == N // 2:
+        Concrete.__name__ = "Solid"
+    want = "Concrete" if i < N // 2 else "Solid"
+    assert type(cc).__name__ == want and Concrete.__name__ == want
+    assert AbstractBase.__name__ == "AbstractBase" and Concrete.__module__ == "__main__"
+    assert Named2.__name__ == "meta says Named2"
+assert NamingMeta.asked == N
+
 # Thread-local storage, which is built on these.
 tl = threading.local()
 tl.value = "main"

@@ -324,7 +324,7 @@ def struct_base64_binascii():
     data = bytes(range(256)) * 4
     for i in range(4000):
         struct.pack("<IHBd", i, 2, 3, 1.5)
-        struct.unpack("<IHBd", b"\x01\x00\x00\x00\x02\x00\x03\x00\x00\x00\x00\x00\x00\x00\xf8?")
+        struct.unpack("<IHBd", struct.pack("<IHBd", i, 2, 3, 1.5))
         base64.b64decode(base64.b64encode(data))
         binascii.hexlify(data)
         int.from_bytes(data[:8], "little"), (i).to_bytes(8, "big")

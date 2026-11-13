@@ -2741,10 +2741,27 @@ slowdown in that run was the even-sized chunks, since fixed.
   direct one was missing, 3,000 to 10,000 instructions flat across the
   attribute and call machinery with no hot function.
 - **The battery's wall-clock ratios are worse than its instruction
-  ratios.** `class_features` retires about twice CPython's instructions a
-  loop and takes six to eight times as long. The general paths are where
-  the instruction-cache footprint is (see the next entries), so a case
-  that lives on them pays twice.
+  ratios.** `class_features`' loop, measured directly after this PR's
+  fixes: 35,500 instructions and 27,000 cycles an iteration against
+  CPython's 14,600 and 5,800 (2.4 times the instructions, 4.6 times the
+  cycles; 1.32 instructions a cycle against 2.51). It isn't warm-up: the
+  eighth run of the loop takes what the first does. And it's more than
+  the sum of its parts: each of its seventeen operations alone runs at
+  2 to 3 instructions a cycle and they add up to 13,600 cycles, half of
+  what the loop takes with all of them in it. The general paths are
+  where the instruction-cache footprint is (see the next entries), so a
+  loop that crosses several of them pays again for each. By cycles
+  against CPython, alone: two-argument `super(C, o).attr` 14 times
+  (10,100 instructions), `type(o).__name__` of a class with an ABC base
+  4.9, `getattr(o, "prop")` 4.0, `o.prop = v` through a setter into a
+  slot 3.1, `3 in o` 2.5, `issubclass(C, AnABC)` 2.4.
+- A second run of the battery after this PR's fixes (also on a loaded
+  machine): 1.81 over 54 cases. `os_listdir_walk` 4.8 to 1.6,
+  `class_features` 7.9 to 5.1, `enum_dataclass_ops` 7.6 to 5.7,
+  `context_managers_generators` 4.0 to 2.8, `exceptions_ops` 3.5 to 2.7,
+  `file_read_binary_chunks` 4.8 to 2.9; the library cases
+  (`configparser`, `inspect` and `typing`, `email`, `datetime`,
+  `weakref`) didn't move, as nothing here touched them.
 - Per-operation instruction counts still open after this PR's fixes
   (WeavePy against CPython): `Color["RED"]` 3,860 against 620, `Color(1)`
   6,180 against 2,660, a dataclass `==` 6,820 against 1,850 and `<` 8,170
