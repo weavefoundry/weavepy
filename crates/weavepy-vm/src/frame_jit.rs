@@ -2479,6 +2479,33 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                         }
                         _ => return h_for_iter_rest(st, it, out, pc),
                     },
+                    // A reversed list's next item (its end, and a list that
+                    // shrank under it, are the general step's).
+                    PyIterator::Reversed { items, index, .. } if *index >= 0 => {
+                        match items.peek().and_then(|xs| xs.get(*index as usize)) {
+                            Some(v) => {
+                                *index -= 1;
+                                v
+                            }
+                            None => return h_for_iter_rest(st, it, out, pc),
+                        }
+                    }
+                    // A dict's or a dict view's next key, value or item, as
+                    // the general step takes it (its end, and a dict that
+                    // changed, are that step's).
+                    view @ PyIterator::DictKeys { .. } => {
+                        return match Interpreter::core_dict_next(view, false, false) {
+                            crate::DictStep::Item(Object::Int(i), _) => {
+                                (*st).out = i as u64;
+                                0
+                            }
+                            crate::DictStep::Item(v, _) => {
+                                out.write(v);
+                                1
+                            }
+                            _ => h_for_iter_rest(st, it, out, pc),
+                        };
+                    }
                     _ => return h_for_iter_rest(st, it, out, pc),
                 };
                 if let Object::Int(i) = *v {
