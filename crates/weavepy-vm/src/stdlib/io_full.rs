@@ -597,6 +597,12 @@ pub(crate) fn apply_buffering(
         if let Object::File(f) = file {
             f.set_io_kind(crate::object::IoKind::Raw);
         }
+    } else if buffering == 1 && !binary {
+        // Text `buffering=1` is line buffering (CPython's `open` passes
+        // `line_buffering=True` to the `TextIOWrapper`).
+        if let Object::File(f) = file {
+            f.set_line_buffering(true);
+        }
     } else if buffering == 1 && binary {
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by the enclosing VM frame on this thread.

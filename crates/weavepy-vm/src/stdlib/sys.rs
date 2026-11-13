@@ -870,8 +870,9 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // Standard I/O streams. We expose them as file-like objects
         // sharing the interpreter's host sinks, so `print()` and
         // direct writes via `sys.stdout.write(...)` agree.
-        let stdout_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
-            Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stdout())));
+        let stdout_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> = Rc::from_arc(
+            std::sync::Arc::new(RefCell::new(crate::vm_singletons::HostStdout)),
+        );
         let stderr_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
             Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stderr())));
         // CPython's `init_sys_streams`: a standard stream whose fd is
@@ -3026,6 +3027,7 @@ fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
             if matches!(value, Object::None) {
                 return Ok(Object::None);
             }
+            let _ = crate::vm_singletons::flush_host_stdout();
             println!("{}", value.repr());
             Ok(Object::None)
         }

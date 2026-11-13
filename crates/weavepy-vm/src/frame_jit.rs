@@ -4067,6 +4067,9 @@ unsafe extern "C" fn h_for_iter_rest(
             // SAFETY: as above.
             return unsafe { for_iter_lane(st, it, pc) };
         }
+        // A file (its own iterator): a line read, through the lane.
+        // SAFETY: the caller's contract.
+        Object::File(_) => return unsafe { for_iter_lane(st, it, pc) },
         _ => return 3,
     };
     let unique = Rc::strong_count(rc) == 1;

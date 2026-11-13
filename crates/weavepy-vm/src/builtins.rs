@@ -17414,12 +17414,21 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         },
     };
+    file_read_line(&f, limit)
+}
+
+/// One line of an open, readable stream: `readline(limit)` past its argument
+/// checks, and a loop's step over the stream.
+fn file_read_line(
+    f: &Rc<crate::object::PyFile>,
+    limit: Option<usize>,
+) -> Result<Object, RuntimeError> {
     // A byte-backed text stream on a newline-unsafe codec (UTF-16/32) or a
     // custom incremental-only codec must find the line boundary in *decoded*
     // text — raw byte scanning would split multi-byte code units and corrupt
     // the decode. Route these through the faithful `TextIOWrapper` readline.
     if !f.binary && f.text_incr_active_gate() {
-        return Ok(stream_text_object(&f, f.readline_text_incr(limit)?));
+        return Ok(stream_text_object(f, f.readline_text_incr(limit)?));
     }
     // Where a line ends depends on the stream's newline policy; the shared
     // `PyFile::read_line_bytes` scans raw bytes for the right terminator
@@ -17431,14 +17440,16 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        Ok(stream_text_object(&f, f.decode_text(out)?))
+        Ok(stream_text_object(f, f.decode_text(out)?))
     }
 }
 
-/// `next(file)` — return the next line, or raise StopIteration at EOF.
-/// Backs both the `__next__` method and the VM's native file iteration.
-pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
-    let f = file_self(args)?;
+/// A `for` loop's step over the stream `f` itself (a file is its own
+/// iterator): the next line, or `None` when the stream is exhausted. What
+/// [`file_next`] does, without the call.
+pub(crate) fn file_iter_next(
+    f: &Rc<crate::object::PyFile>,
+) -> Result<Option<Object>, RuntimeError> {
     // CPython's `TextIOWrapper.__next__` disables `tell()` for the duration of
     // the iteration (the readahead snapshot makes the position ambiguous); a
     // binary stream keeps `tell()` live (`test_io.test_telling`).
@@ -17446,7 +17457,11 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
     if is_text {
         f.telling.set(false);
     }
-    let line = file_readline(args)?;
+    file_check_open(f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
+    let line = file_read_line(f, None)?;
     let empty = match &line {
         Object::Str(s) => s.is_empty(),
         // A `WStr` always holds >= 1 lone surrogate, so it is never empty.
@@ -17455,15 +17470,21 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => true,
     };
     if empty {
-        // Iterator exhausted: CPython restores `telling` to `seekable` and
-        // raises `StopIteration`.
+        // Iterator exhausted: CPython restores `telling` to `seekable`.
         if is_text {
             f.telling.set(f.seekable());
         }
-        Err(stop_iteration())
+        Ok(None)
     } else {
-        Ok(line)
+        Ok(Some(line))
     }
+}
+
+/// `next(file)` — return the next line, or raise StopIteration at EOF.
+/// Backs both the `__next__` method and the VM's native file iteration.
+pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_iter_next(&f)?.ok_or_else(stop_iteration)
 }
 
 pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -17697,7 +17718,11 @@ pub(crate) fn file_reconfigure(
             }
             "line_buffering" | "write_through" => {
                 if !matches!(v, Object::None) {
-                    f.set_extra_attr(k, Object::Bool(v.is_truthy()));
+                    let on = v.is_truthy();
+                    f.set_extra_attr(k, Object::Bool(on));
+                    if k == "line_buffering" {
+                        f.set_line_buffering(on);
+                    }
                 }
             }
             other => {

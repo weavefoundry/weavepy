@@ -3237,6 +3237,39 @@ fn read_fd_intr(
     }
 }
 
+/// [`read_fd_intr`] for a line read's block: one `read(2)` of at most `room`
+/// bytes, appended to `buf`, whose spare capacity the caller has reserved.
+/// Returns how many bytes came; zero is end of stream.
+#[cfg(unix)]
+fn read_fd_into(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut Vec<u8>,
+    room: usize,
+    lock: &std::sync::Mutex<()>,
+) -> Result<usize, RuntimeError> {
+    let spare = buf.spare_capacity_mut();
+    let room = room.min(spare.len());
+    let dst = spare.as_mut_ptr();
+    loop {
+        let r = crate::gil::allow_threads_then(|| {
+            let _serialized = fd_lock(lock);
+            unsafe { libc::read(fd, dst.cast(), room) }
+        });
+        if r >= 0 {
+            // SAFETY: the kernel wrote `r` bytes, at most `room`, into the
+            // spare capacity starting at the vector's length.
+            unsafe { buf.set_len(buf.len() + r as usize) };
+            return Ok(r as usize);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            service_pending_signals_io()?;
+            continue;
+        }
+        return Err(crate::error::io_error_to_py(&err));
+    }
+}
+
 /// Drain `pending` to a raw descriptor, removing the written prefix in place,
 /// and honouring PEP 475: release the GIL across each (possibly blocking)
 /// `write(2)` so peers run, and on `EINTR` run any tripped Python signal
@@ -6436,6 +6469,38 @@ impl fmt::Debug for AsyncGenAwait {
 /// (`io.DEFAULT_BUFFER_SIZE`): 128 KiB since CPython 3.14 (gh-117151).
 pub const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
 
+/// States of [`PyFile::line_buffering`].
+const LINE_BUFFER_UNDECIDED: u8 = 0;
+const LINE_BUFFER_ON: u8 = 1;
+const LINE_BUFFER_OFF: u8 = 2;
+
+/// Streams holding written bytes they haven't pushed to their descriptors,
+/// by address. A stream flushes when it's closed or dropped, but one that's
+/// still alive when the interpreter shuts down (held by a reference cycle, or
+/// by an object that outlives the modules) is flushed from here, as CPython's
+/// last collection flushes it. A stream is listed from its first buffered
+/// write until a flush empties its buffer, or until it drops.
+static PENDING_WRITERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn pending_writers() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    PENDING_WRITERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Flush every stream that still holds written bytes. Runs at interpreter
+/// shutdown, on the thread that holds the GIL; errors are dropped, as they
+/// are for a stream flushed by its destructor.
+pub fn flush_pending_writers() {
+    let addrs = std::mem::take(&mut *pending_writers());
+    for addr in addrs {
+        // SAFETY: a listed stream is alive and at its listed address:
+        // `Drop for PyFile` unlists it, and a stream doesn't move once it's
+        // shared, which it is by the time anything writes to it.
+        let file = unsafe { &*(addr as *const PyFile) };
+        file.write_listed.set(0);
+        let _ = file.flush_write_buf();
+    }
+}
+
 /// `TextIOWrapper._CHUNK_SIZE`, which stayed at 8 KiB when
 /// `DEFAULT_BUFFER_SIZE` grew in 3.14.
 pub const TEXT_CHUNK_SIZE: usize = 8192;
@@ -6481,6 +6546,128 @@ impl IoKind {
         } else {
             IoKind::Text
         }
+    }
+}
+
+/// A stream's read-ahead: bytes already taken from the backend that the
+/// stream hasn't handed out yet. `buf[pos..]` is what's pending.
+#[derive(Debug, Default)]
+pub struct ReadAhead {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ReadAhead {
+    /// How many bytes are waiting.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// The waiting bytes.
+    #[inline]
+    fn rest(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// Hand out the next `n` waiting bytes.
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        let out = self.buf[self.pos..self.pos + n].to_vec();
+        self.pos += n;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        out
+    }
+
+    /// Hand out everything that's waiting, keeping no storage.
+    fn take_all(&mut self) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.buf);
+        if self.pos > 0 {
+            buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        buf
+    }
+
+    /// Put `bytes` ahead of whatever is waiting.
+    fn put_back(&mut self, mut bytes: Vec<u8>) {
+        bytes.extend_from_slice(self.rest());
+        self.buf = bytes;
+        self.pos = 0;
+    }
+
+    /// Storage to read the next block into: the waiting bytes, moved to the
+    /// front, with room for `room` more.
+    fn begin_fill(&mut self, room: usize) -> Vec<u8> {
+        let mut buf = self.take_all();
+        buf.reserve(room);
+        buf
+    }
+}
+
+/// Where a line ends, for [`PyFile::read_line_bytes`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnd {
+    Lf,
+    Cr,
+    CrLf,
+    Universal,
+}
+
+/// What [`line_len`] found in the bytes it was given.
+enum LineScan {
+    /// A whole line of this many bytes, terminator included.
+    Line(usize),
+    /// No terminator in these bytes.
+    Open,
+    /// The bytes end in a `\r` that the next byte may complete to `\r\n`.
+    OpenAfterCr,
+}
+
+/// Find the first line in `buf` under the `end` policy.
+fn line_len(buf: &[u8], end: LineEnd) -> LineScan {
+    match end {
+        LineEnd::Lf => match memchr::memchr(b'\n', buf) {
+            Some(i) => LineScan::Line(i + 1),
+            None => LineScan::Open,
+        },
+        LineEnd::Cr => match memchr::memchr(b'\r', buf) {
+            Some(i) => LineScan::Line(i + 1),
+            None => LineScan::Open,
+        },
+        LineEnd::CrLf => match memchr::memmem::find(buf, b"\r\n") {
+            Some(i) => LineScan::Line(i + 2),
+            None => LineScan::Open,
+        },
+        LineEnd::Universal => match memchr::memchr2(b'\r', b'\n', buf) {
+            None => LineScan::Open,
+            Some(i) if buf[i] == b'\n' => LineScan::Line(i + 1),
+            Some(i) => match buf.get(i + 1) {
+                Some(b'\n') => LineScan::Line(i + 2),
+                Some(_) => LineScan::Line(i + 1),
+                None => LineScan::OpenAfterCr,
+            },
+        },
+    }
+}
+
+/// How many of the bytes in `buf` the next `readline(limit)` hands out, or
+/// `None` if that takes bytes the stream hasn't supplied yet. A limit counts
+/// bytes, and stops a line short; a `\r\n` the limit would split after the
+/// `\r` stays whole in universal mode, as the newline decoder holds a `\r`
+/// back until the next byte settles it.
+fn line_take(buf: &[u8], end: LineEnd, limit: Option<usize>) -> Option<usize> {
+    let cut = limit.unwrap_or(usize::MAX);
+    match line_len(buf, end) {
+        LineScan::Line(n) => {
+            let whole = n <= cut
+                || (n >= 2 && n == cut + 1 && end == LineEnd::Universal && buf[n - 2] == b'\r');
+            Some(if whole { n } else { cut })
+        }
+        LineScan::Open => (buf.len() >= cut).then_some(cut),
+        LineScan::OpenAfterCr => (buf.len() > cut).then_some(cut),
     }
 }
 
@@ -6709,6 +6896,15 @@ pub struct PyFile {
     /// large buffered write surface its `BrokenPipeError` only at flush
     /// (`test_broken_pipe_cleanup`). Empty for every other stream kind.
     pub write_buf: RefCell<Vec<u8>>,
+    /// Whether a text stream pushes its buffer out at every line end
+    /// (CPython's `line_buffering`): `open(..., buffering=1)`, or a stream on
+    /// a terminal. [`LINE_BUFFER_UNDECIDED`] until the first write asks, since
+    /// only `open()` knows the `buffering` argument and every other
+    /// constructor wants the terminal check.
+    pub line_buffering: crate::sync::Cell<u8>,
+    /// The address this stream is listed under in [`PENDING_WRITERS`], or
+    /// zero when it isn't listed.
+    write_listed: crate::sync::Cell<usize>,
     /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
     /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
     pub buf_size: crate::sync::Cell<usize>,
@@ -6759,14 +6955,15 @@ pub struct PyFile {
     /// lock too.
     pub fd_syscall_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// Bytes read ahead of the logical stream position, served back before the
-    /// backend on the next read. Universal-newline `readline` on a
-    /// *non-seekable* stream must read one byte past a `\r` to distinguish a
-    /// lone `\r` from the front half of `\r\n` (CPython's incremental newline
-    /// decoder holds the `\r` back); when that byte starts the next line it
-    /// cannot be `lseek`-ed back, so it parks here
-    /// (test_file_eintr.test_readlines: SIGINT splits the pipe read between
-    /// `\r` and `\n`).
-    pub read_pushback: RefCell<Vec<u8>>,
+    /// backend on the next read: line reads fill it a block at a time (see
+    /// [`PyFile::read_line_bytes`]), so the descriptor's offset runs ahead of
+    /// the stream's by [`ReadAhead::pending`] bytes, as it does under
+    /// CPython's `BufferedReader`. A seekable descriptor gets the bytes back
+    /// (an `lseek` over them) before anything but a line read looks at the
+    /// offset; a pipe can't take them back, so there they stay parked until a
+    /// read consumes them (test_file_eintr.test_readlines: SIGINT splits the
+    /// pipe read between `\r` and `\n`).
+    pub read_ahead: RefCell<ReadAhead>,
 }
 
 impl PyFile {
@@ -6795,6 +6992,8 @@ impl PyFile {
             binary_buffer_cache: RefCell::new(None),
             seennl: crate::sync::Cell::new(0),
             write_buf: RefCell::new(Vec::new()),
+            line_buffering: crate::sync::Cell::new(LINE_BUFFER_UNDECIDED),
+            write_listed: crate::sync::Cell::new(0),
             buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
             text_start_of_stream: crate::sync::Cell::new(true),
             telling: crate::sync::Cell::new(true),
@@ -6803,17 +7002,73 @@ impl PyFile {
             blksize: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE as i64),
             repr_class: RefCell::new(None),
             fd_syscall_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
-            read_pushback: RefCell::new(Vec::new()),
+            read_ahead: RefCell::new(ReadAhead::default()),
         }
     }
 
     /// Whether writes are held in [`PyFile::write_buf`] rather than going
-    /// straight to the OS: a binary `BufferedWriter` backed by a real
-    /// descriptor. Append/random and text streams write through (unchanged
-    /// behaviour); in-memory streams are their own buffer.
+    /// straight to the OS: every stream over a real descriptor but a raw
+    /// `FileIO`, as in CPython, where `open()` puts a `BufferedWriter` or
+    /// `BufferedRandom` under everything else. In-memory streams are their
+    /// own buffer.
     pub fn is_write_buffered(&self) -> bool {
-        self.io_kind.get() == IoKind::BufferedWriter
-            && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+        self.io_kind.get() != IoKind::Raw && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+    }
+
+    /// What this text stream's `.buffer` sibling holds: bytes written but not
+    /// flushed, and bytes read ahead. `None` when no sibling was minted.
+    fn sibling_offsets(&self) -> Option<(usize, usize)> {
+        match self.binary_buffer_cache.borrow().as_ref() {
+            Some(Object::File(buf)) => Some((
+                buf.write_buf.borrow().len(),
+                buf.read_ahead.borrow().pending(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Take this stream off [`PENDING_WRITERS`]: its buffer is empty, or the
+    /// stream is going away.
+    fn unlist_writer(&self) {
+        let addr = self.write_listed.replace(0);
+        if addr != 0 {
+            let mut listed = pending_writers();
+            if let Some(i) = listed.iter().rposition(|&a| a == addr) {
+                listed.swap_remove(i);
+            }
+        }
+    }
+
+    /// Whether this text stream's buffer goes out at every line end. Decided
+    /// at the first write unless `open()` or `reconfigure()` said.
+    fn is_line_buffered(&self) -> bool {
+        match self.line_buffering.get() {
+            LINE_BUFFER_UNDECIDED => {
+                let line = self.isatty();
+                self.line_buffering.set(if line {
+                    LINE_BUFFER_ON
+                } else {
+                    LINE_BUFFER_OFF
+                });
+                line
+            }
+            state => state == LINE_BUFFER_ON,
+        }
+    }
+
+    /// Whether `open(..., buffering=1)` or `reconfigure()` turned line
+    /// buffering on: what the `line_buffering` attribute reports.
+    pub fn line_buffering_set(&self) -> bool {
+        self.line_buffering.get() == LINE_BUFFER_ON && !self.isatty()
+            || self
+                .get_extra_attr("line_buffering")
+                .is_some_and(|v| v.is_truthy())
+    }
+
+    /// Set CPython's `line_buffering` for this text stream.
+    pub fn set_line_buffering(&self, on: bool) {
+        self.line_buffering
+            .set(if on { LINE_BUFFER_ON } else { LINE_BUFFER_OFF });
     }
 
     /// Flush the pending [`PyFile::write_buf`] to the backing descriptor.
@@ -6821,6 +7076,21 @@ impl PyFile {
     /// that already exited) leaves nothing to re-flush, then surfaces the
     /// error like CPython's `BufferedWriter._flush_unlocked`.
     pub fn flush_write_buf(&self) -> Result<(), RuntimeError> {
+        // A text stream's `.buffer` is the layer under it in CPython: what was
+        // written there reaches the descriptor before anything the text layer
+        // still holds, and before the text layer reads or seeks. Here the two
+        // are siblings over one file description, so settle the sibling
+        // first; every operation of this stream that touches the descriptor
+        // passes through this flush.
+        if let Some((pending, ahead)) = self.sibling_offsets() {
+            if pending != 0 || ahead != 0 {
+                let sibling = self.binary_buffer_cache.borrow().clone();
+                if let Some(Object::File(buf)) = sibling {
+                    buf.flush_write_buf()?;
+                    buf.rewind_read_ahead();
+                }
+            }
+        }
         // `pending` is mutated only on the Unix drain path below; off Unix it is
         // write-only-once, so suppress the spurious `unused_mut` there.
         #[cfg_attr(not(unix), allow(unused_mut))]
@@ -6859,6 +7129,8 @@ impl PyFile {
                         pending.extend_from_slice(&wb);
                         *wb = pending;
                     }
+                } else if self.write_buf.borrow().is_empty() {
+                    self.unlist_writer();
                 }
                 return res;
             }
@@ -6879,7 +7151,18 @@ impl PyFile {
         if *self.closed.borrow() {
             return Ok(());
         }
-        let flush_res = self.flush_write_buf();
+        // A standard stream flushes its shared sink too: `with sys.stdout:`
+        // around a pipe whose reader left raises `BrokenPipeError` here, as
+        // CPython's `TextIOWrapper.close` does.
+        let std_stream = matches!(
+            &*self.backend.borrow(),
+            FileBackend::Stdout(_) | FileBackend::Stderr(_)
+        );
+        let flush_res = if std_stream {
+            self.flush()
+        } else {
+            self.flush_write_buf()
+        };
         // `close(2)` can itself fail — CPython's `FileIO.close` raises
         // `OSError(EBADF)` when the descriptor was already closed out from
         // under the object (`os.close(f.fileno())`; test_fileio
@@ -7232,7 +7515,7 @@ impl PyFile {
             FileBackend::Stdin => true,
             FileBackend::Stdout(_) | FileBackend::Stderr(_) => false,
             FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
-            FileBackend::Disk(_) => self.mode.contains('r') || self.mode.contains('+'),
+            FileBackend::Disk(_) => self.mode.bytes().any(|b| b == b'r' || b == b'+'),
         }
     }
 
@@ -7242,12 +7525,10 @@ impl PyFile {
             FileBackend::Stdin => false,
             FileBackend::Stdout(_) | FileBackend::Stderr(_) => true,
             FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
-            FileBackend::Disk(_) => {
-                self.mode.contains('w')
-                    || self.mode.contains('a')
-                    || self.mode.contains('x')
-                    || self.mode.contains('+')
-            }
+            FileBackend::Disk(_) => self
+                .mode
+                .bytes()
+                .any(|b| matches!(b, b'w' | b'a' | b'x' | b'+')),
         }
     }
 
@@ -7304,6 +7585,22 @@ impl PyFile {
     /// Python value `None` leaves the field unset (universal newlines).
     pub fn set_newline(&self, newline: Option<&str>) {
         *self.newline.borrow_mut() = newline.map(str::to_owned);
+    }
+
+    /// Whether `text` passes between `str` and this stream's bytes unchanged:
+    /// the stream is UTF-8, and either strict (the default when `open()`
+    /// names neither an encoding nor an error handler) or the text is ASCII,
+    /// which no error handler touches.
+    fn utf8_identity(&self, text: &[u8]) -> bool {
+        matches!(
+            self.encoding.borrow().as_deref(),
+            None | Some("utf-8" | "UTF-8" | "utf8")
+        ) && (self
+            .errors
+            .borrow()
+            .as_deref()
+            .is_none_or(|e| e == "strict")
+            || text.is_ascii())
     }
 
     /// The error-handler name to feed the codec layer (`"strict"` default).
@@ -7389,8 +7686,15 @@ impl PyFile {
         // CPython's `IncrementalNewlineDecoder` records observed line endings
         // on every read for the `.newlines` attribute, *independent* of whether
         // translation is enabled — so update the tally before translating.
+        if memchr::memchr(b'\r', s.as_bytes()).is_none() {
+            // Only `\n` can be here, and there's nothing to translate.
+            if self.seennl.get() & 2 == 0 && memchr::memchr(b'\n', s.as_bytes()).is_some() {
+                self.seennl.set(self.seennl.get() | 2);
+            }
+            return s;
+        }
         self.record_seen_newlines(&s);
-        if self.newline.borrow().is_none() && s.as_bytes().contains(&b'\r') {
+        if self.newline.borrow().is_none() {
             s.replace("\r\n", "\n").replace('\r', "\n")
         } else {
             s
@@ -7439,12 +7743,25 @@ impl PyFile {
 
     /// Encode a text-mode write through the file's codec, honouring the
     /// configured `errors=` handler and `newline=` translation.
-    pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
+    pub fn encode_text<'a>(&self, s: &'a str) -> Result<std::borrow::Cow<'a, [u8]>, RuntimeError> {
+        use std::borrow::Cow;
+        // Strict UTF-8 with nothing to translate (what `open(path, "w")`
+        // gives): the string's own bytes.
+        if self.utf8_identity(s.as_bytes()) {
+            let untouched = match self.newline.borrow().as_deref() {
+                None => self.io_kind.get() != IoKind::StringIO,
+                Some("" | "\n") => true,
+                Some(_) => false,
+            };
+            if untouched {
+                return Ok(Cow::Borrowed(s.as_bytes()));
+            }
+        }
         let translated = self.translate_newlines_write(s);
         let errors = self.errors_name();
         let enc = match &*self.encoding.borrow() {
             Some(enc) => enc.clone(),
-            None if errors == "strict" => return Ok(translated.into_bytes()),
+            None if errors == "strict" => return Ok(Cow::Owned(translated.into_bytes())),
             None => "utf-8".to_owned(),
         };
         // BOM-once: a BOM-prefixing codec emits the BOM only on the first write
@@ -7460,7 +7777,7 @@ impl PyFile {
         let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
         let out = crate::stdlib::codecs_mod::encode_str(&translated, &effective, &errors)?;
         self.text_start_of_stream.set(false);
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 
     /// Encode a surrogate-bearing `str` (code points, possibly containing lone
@@ -7495,6 +7812,17 @@ impl PyFile {
             }
             crate::stdlib::codecs_mod::decode_bytes(bytes, enc, errors)
         }
+        // The overwhelmingly common case, valid UTF-8 under the defaults:
+        // the bytes become the string as they are. Anything else, malformed
+        // input included, goes on to the codec below.
+        let bytes = if self.utf8_identity(&bytes) {
+            match String::from_utf8(bytes) {
+                Ok(s) => return Ok(self.translate_newlines_read(s)),
+                Err(e) => e.into_bytes(),
+            }
+        } else {
+            bytes
+        };
         let errors = self.errors_name();
         // Text-model codec check happened at wrapper construction; per-read
         // codec calls must not repeat it (`test_io.test_illegal_decoder`).
@@ -8180,6 +8508,7 @@ impl PyFile {
     /// the Python-level `close()` raises it as `OSError`.
     pub fn close_report(&self) -> std::io::Result<()> {
         *self.closed.borrow_mut() = true;
+        self.read_ahead.borrow_mut().take_all();
         // CPython's `TextIOWrapper.close()` closes its underlying buffer
         // layer. The collapsed `PyFile` mints `.buffer` as a memoised
         // *sibling* stream over a dup-ed descriptor (see
@@ -8279,6 +8608,7 @@ impl PyFile {
         self.closefd.set(closefd);
         *self.closed.borrow_mut() = false;
         self.write_buf.borrow_mut().clear();
+        self.read_ahead.borrow_mut().take_all();
         self.text_start_of_stream.set(true);
         *self.binary_buffer_cache.borrow_mut() = None;
     }
@@ -8298,6 +8628,7 @@ impl PyFile {
             use std::os::unix::io::AsRawFd;
             self.check_open()?;
             self.flush_write_buf()?;
+            self.rewind_read_ahead();
             if let Some(parked) = self.take_pushback(n) {
                 return Ok(Some(parked));
             }
@@ -8314,23 +8645,154 @@ impl PyFile {
         self.read_bytes(n).map(Some)
     }
 
-    /// Serve read-ahead bytes parked by [`PyFile::read_line_bytes`]'s
-    /// non-seekable `\r`-lookahead. `Some(bytes)` is a complete short read
-    /// (never mixed with a backend read — a pipe read returning fewer bytes
-    /// than asked is always legal); `None` means nothing is parked. A `None`
-    /// size request drains the whole pushback, then the caller's read-to-EOF
-    /// logic would miss it, so that case appends the backend's remainder here.
+    /// Serve bytes from the read-ahead. `Some(bytes)` is a complete short read
+    /// (never mixed with a backend read: a pipe read returning fewer bytes
+    /// than asked is always legal, and a seekable stream's read-ahead was
+    /// given back before this is asked); `None` means nothing is waiting. A
+    /// `None` size request drains all of it, and the caller appends the
+    /// backend's remainder.
     fn take_pushback(&self, n: Option<usize>) -> Option<Vec<u8>> {
-        let mut pb = self.read_pushback.borrow_mut();
-        if pb.is_empty() {
+        let mut ra = self.read_ahead.borrow_mut();
+        let pending = ra.pending();
+        if pending == 0 {
             return None;
         }
         match n {
-            Some(k) => {
-                let take = k.min(pb.len());
-                Some(pb.drain(..take).collect())
+            Some(k) => Some(ra.take(k.min(pending))),
+            None => Some(ra.take_all()),
+        }
+    }
+
+    /// Give the read-ahead back to a seekable descriptor, so that its offset
+    /// is the stream's position again. Everything that reads, writes or moves
+    /// the offset other than a line read starts here. A descriptor that can't
+    /// seek keeps its read-ahead, and reads drain it first.
+    fn rewind_read_ahead(&self) {
+        if self.read_ahead.borrow().pending() == 0 {
+            return;
+        }
+        // Take the bytes out before the offset moves: the seek below waits
+        // for the descriptor's lock with the GIL released, and another thread
+        // reading this stream must not be served bytes the descriptor is
+        // about to serve again.
+        let parked = self.read_ahead.borrow_mut().take_all();
+        let back = parked.len() as i64;
+        #[cfg(unix)]
+        let rewound = {
+            use std::os::unix::io::AsRawFd;
+            let fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            fd.is_some_and(|fd| {
+                let lock = &self.fd_syscall_lock;
+                crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    unsafe { libc::lseek(fd, -(back as libc::off_t), libc::SEEK_CUR) >= 0 }
+                })
+            })
+        };
+        #[cfg(not(unix))]
+        let rewound = match &mut *self.backend.borrow_mut() {
+            FileBackend::Disk(f) => {
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Current(-back)).is_ok()
             }
-            None => Some(std::mem::take(&mut *pb)),
+            _ => false,
+        };
+        if !rewound {
+            self.read_ahead.borrow_mut().put_back(parked);
+        }
+    }
+
+    /// Read the next block from the backend into the read-ahead, for a line
+    /// read. Returns `false` at end of stream. A buffered stream over a
+    /// descriptor asks for a buffer's worth in one `read(2)` and takes what
+    /// comes, as CPython's `BufferedReader` does; a raw `FileIO` reads a byte,
+    /// because its `readline` must leave the rest of a pipe to other readers.
+    /// Standard input takes a line at most from the process's shared buffer,
+    /// which `input()` and `sys.stdin.buffer` read too.
+    fn fill_read_ahead(&self) -> Result<bool, RuntimeError> {
+        self.check_open()?;
+        self.flush_write_buf()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            enum Source {
+                Fd(std::os::unix::io::RawFd),
+                Stdin,
+                Other,
+            }
+            let source = match &*self.backend.borrow() {
+                FileBackend::Disk(f) if self.io_kind.get() != IoKind::Raw => {
+                    Source::Fd(f.as_raw_fd())
+                }
+                FileBackend::Stdin => Source::Stdin,
+                _ => Source::Other,
+            };
+            match source {
+                Source::Fd(fd) => {
+                    let room = self.buf_size.get().clamp(8192, 8192 * 1024);
+                    // The storage leaves the cell for the read: the GIL is
+                    // released across it, and a signal handler or another
+                    // thread may read this stream meanwhile.
+                    let mut buf = self.read_ahead.borrow_mut().begin_fill(room);
+                    let got = read_fd_into(fd, &mut buf, room, &self.fd_syscall_lock);
+                    self.read_ahead.borrow_mut().put_back(buf);
+                    return got.map(|n| n > 0);
+                }
+                Source::Stdin => {
+                    use std::io::BufRead;
+                    let stdin = std::io::stdin();
+                    let mut handle = stdin.lock();
+                    let avail = handle
+                        .fill_buf()
+                        .map_err(|e| os_error(format!("read: {e}")))?;
+                    if avail.is_empty() {
+                        return Ok(false);
+                    }
+                    let take = memchr::memchr(b'\n', avail).map_or(avail.len(), |i| i + 1);
+                    let mut ra = self.read_ahead.borrow_mut();
+                    let mut buf = ra.take_all();
+                    buf.extend_from_slice(&avail[..take]);
+                    ra.put_back(buf);
+                    handle.consume(take);
+                    return Ok(true);
+                }
+                Source::Other => {}
+            }
+        }
+        let byte = self.read_backend(Some(1))?;
+        if byte.is_empty() {
+            return Ok(false);
+        }
+        let mut ra = self.read_ahead.borrow_mut();
+        let mut buf = ra.take_all();
+        buf.extend_from_slice(&byte);
+        ra.put_back(buf);
+        Ok(true)
+    }
+
+    /// The next line of an in-memory stream, taken straight from its buffer;
+    /// `None` for any other backend.
+    fn mem_read_line(&self, end: LineEnd, limit: Option<usize>) -> Option<Vec<u8>> {
+        fn cut(rest: &[u8], end: LineEnd, limit: Option<usize>) -> Vec<u8> {
+            let n = line_take(rest, end, limit).unwrap_or(rest.len());
+            rest[..n].to_vec()
+        }
+        match &mut *self.backend.borrow_mut() {
+            FileBackend::MemBytes { data, pos } => {
+                let d = data.borrow();
+                let line = cut(d.get(*pos..).unwrap_or(&[]), end, limit);
+                *pos += line.len();
+                Some(line)
+            }
+            FileBackend::MemText { data, pos } => {
+                let line = cut(data.as_bytes().get(*pos..).unwrap_or(&[]), end, limit);
+                *pos += line.len();
+                Some(line)
+            }
+            _ => None,
         }
     }
 
@@ -8340,13 +8802,20 @@ impl PyFile {
         // the stream position (defensive; a pure `BufferedWriter` is not
         // readable, but keeps read-after-write coherent).
         self.flush_write_buf()?;
+        self.rewind_read_ahead();
         if let Some(mut parked) = self.take_pushback(n) {
-            // A read-to-EOF must not stop at the parked byte.
+            // A read-to-EOF must not stop at the parked bytes.
             if n.is_none() {
-                parked.extend(self.read_bytes(None)?);
+                parked.extend(self.read_backend(None)?);
             }
             return Ok(parked);
         }
+        self.read_backend(n)
+    }
+
+    /// [`PyFile::read_bytes`] past the read-ahead: read from the backend
+    /// itself. The caller has checked the stream and flushed its writes.
+    fn read_backend(&self, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
         // Unix disk/pipe descriptors go through the PEP 475-aware raw read:
         // snapshot the fd under a short borrow, then read with the backend
         // released so a signal handler can run (and even touch this stream)
@@ -8462,38 +8931,6 @@ impl PyFile {
         Ok(buf)
     }
 
-    /// Read until the next ``\n`` (inclusive) or EOF and return the
-    /// resulting string. Used by iteration over text-mode files and
-    /// ``StringIO`` instances; binary-mode files refuse the call to
-    /// avoid silently decoding non-UTF-8 bytes.
-    pub fn readline_unbounded(&self) -> Result<String, RuntimeError> {
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let b = self.read_bytes(Some(1))?;
-            if b.is_empty() {
-                break;
-            }
-            out.extend_from_slice(&b);
-            if b[0] == b'\n' {
-                break;
-            }
-        }
-        if self.binary {
-            // Binary mode: caller should iterate by ``readline``
-            // explicitly; the iterator protocol implicitly decodes
-            // to str, which would be wrong for bytes.
-            let _ = out;
-            return Err(type_error(
-                "binary mode files are not iterable in text mode".to_owned(),
-            ));
-        }
-        self.decode_text(out)
-    }
-
-    /// Read one line and return it as a `bytes` object (binary mode) or a
-    /// `str` (text mode), or `None` at EOF. Backs lazy file iteration
-    /// (`for line in f`) for *both* modes — CPython's file object is its
-    /// own iterator and a binary file yields `bytes` lines.
     /// Read one raw, *untranslated* line's bytes, honoring the stream's
     /// `newline` policy for where a line ends — newline *translation* is
     /// applied later by [`decode_text`](Self::decode_text). An optional
@@ -8507,84 +8944,44 @@ impl PyFile {
     /// `\r`/`\n` are ASCII and never occur as UTF-8 continuation bytes, so
     /// byte-level scanning never splits mid-character.
     pub fn read_line_bytes(&self, limit: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
-        enum Nl {
-            Lf,
-            Cr,
-            CrLf,
-            Universal,
-        }
-        let nl = if self.binary {
-            Nl::Lf
+        let end = if self.binary {
+            LineEnd::Lf
         } else {
             match self.newline.borrow().as_deref() {
-                Some("\n") => Nl::Lf,
-                Some("\r") => Nl::Cr,
-                Some("\r\n") => Nl::CrLf,
-                _ => Nl::Universal,
+                Some("\n") => LineEnd::Lf,
+                Some("\r") => LineEnd::Cr,
+                Some("\r\n") => LineEnd::CrLf,
+                _ => LineEnd::Universal,
             }
         };
-        let mut out: Vec<u8> = Vec::new();
+        self.check_open()?;
+        if let Some(line) = self.mem_read_line(end, limit) {
+            return Ok(line);
+        }
+        // Lines come out of the read-ahead, which the backend fills a block
+        // at a time. A line the read-ahead doesn't finish needs the next
+        // block: so does one ending in a `\r` at the block's edge in
+        // universal mode, where a `\n` that follows belongs to it (CPython's
+        // incremental newline decoder holds the `\r` back until the next
+        // byte settles it, even across an EINTR-split pipe read:
+        // test_file_eintr.test_readlines).
         loop {
-            if let Some(lim) = limit {
-                if out.len() >= lim {
-                    break;
+            {
+                let mut ra = self.read_ahead.borrow_mut();
+                if let Some(n) = line_take(ra.rest(), end, limit) {
+                    return Ok(ra.take(n));
                 }
             }
-            let b = self.read_bytes(Some(1))?;
-            if b.is_empty() {
-                break;
-            }
-            let ch = b[0];
-            out.push(ch);
-            match nl {
-                Nl::Lf => {
-                    if ch == b'\n' {
-                        break;
-                    }
-                }
-                Nl::Cr => {
-                    if ch == b'\r' {
-                        break;
-                    }
-                }
-                Nl::CrLf => {
-                    if ch == b'\n' && out.len() >= 2 && out[out.len() - 2] == b'\r' {
-                        break;
-                    }
-                }
-                Nl::Universal => {
-                    if ch == b'\n' {
-                        break;
-                    }
-                    if ch == b'\r' {
-                        // A lone `\r` ends the line, but `\r\n` is a single
-                        // terminator — read one byte to tell them apart
-                        // (CPython's incremental newline decoder holds the
-                        // `\r` back until the next byte settles it, even
-                        // across an EINTR-split pipe read —
-                        // test_file_eintr.test_readlines). When the byte
-                        // belongs to the next line, un-read it: seek back on
-                        // a seekable stream, park it in `read_pushback`
-                        // otherwise.
-                        let nb = self.read_bytes(Some(1))?;
-                        if nb.is_empty() {
-                            break;
-                        }
-                        if nb[0] == b'\n' {
-                            out.push(b'\n');
-                        } else if self.seekable() {
-                            self.seek(-1, 1)?;
-                        } else {
-                            self.read_pushback.borrow_mut().insert(0, nb[0]);
-                        }
-                        break;
-                    }
-                }
+            if !self.fill_read_ahead()? {
+                return Ok(self.read_ahead.borrow_mut().take_all());
             }
         }
-        Ok(out)
     }
 
+    /// Read one line and return it as a `bytes` object (binary mode) or a
+    /// `str` (text mode), or `None` at EOF. Backs lazy file iteration
+    /// (`for line in f`) for *both* modes — CPython's file object is its
+    /// own iterator and a binary file yields `bytes` lines.
     pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
         // Native file iteration (`for line in f`) must honour the same
         // incremental-decoder gate as explicit `readline()`, or a UTF-16/32
@@ -8628,8 +9025,8 @@ impl PyFile {
             return self.mem_bridged.get();
         }
         matches!(
-            self.errors_name().as_str(),
-            "surrogateescape" | "surrogatepass"
+            self.errors.borrow().as_deref(),
+            Some("surrogateescape" | "surrogatepass")
         )
     }
 
@@ -8641,8 +9038,19 @@ impl PyFile {
     /// `write(2)` that a signal cuts short must therefore be resumed here,
     /// not surfaced as a short write.
     pub fn write_text_all(&self, data: &[u8]) -> Result<(), RuntimeError> {
+        self.rewind_read_ahead();
         if self.is_write_buffered() {
             self.write_bytes(data)?;
+            // CPython's `TextIOWrapper.write`: a line-buffered stream flushes
+            // when the text holds a line end. (`write_through` only skips the
+            // text layer's own pending list there; the buffered layer under
+            // it still holds the bytes, as this one buffer does.)
+            if !self.binary
+                && self.is_line_buffered()
+                && memchr::memchr2(b'\n', b'\r', data).is_some()
+            {
+                self.flush_write_buf()?;
+            }
             return Ok(());
         }
         #[cfg(unix)]
@@ -8671,6 +9079,7 @@ impl PyFile {
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
         self.check_open()?;
+        self.rewind_read_ahead();
         // Binary `BufferedWriter`: stage the write in the Python-level buffer
         // and only push to the descriptor once it fills (CPython
         // `BufferedWriter.write`). The bytes are *not* on the fd yet, so
@@ -8695,6 +9104,14 @@ impl PyFile {
             {
                 let mut wb = self.write_buf.borrow_mut();
                 wb.extend_from_slice(data);
+            }
+            let addr = std::ptr::from_ref(self) as usize;
+            if self.write_listed.get() != addr && !data.is_empty() {
+                // (A stream written before it reached its shared home is
+                // listed under where it was: list it under where it is.)
+                self.unlist_writer();
+                self.write_listed.set(addr);
+                pending_writers().push(addr);
             }
             let mut written = (self.write_buf.borrow().len() - before) as i64;
             if self.write_buf.borrow().len() >= bufsize {
@@ -8833,6 +9250,7 @@ impl PyFile {
         self.check_open()?;
         // Drain the staged `BufferedWriter` bytes to the descriptor first.
         self.flush_write_buf()?;
+        self.rewind_read_ahead();
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::Disk(f) => f.flush().map_err(|e| crate::error::io_error_to_py(&e))?,
@@ -8886,14 +9304,17 @@ impl PyFile {
         // Staged `BufferedWriter` bytes sit logically after the descriptor
         // offset, so `tell()` counts them (CPython's `BufferedWriter.tell`
         // returns `raw.tell() + len(buffer)`).
-        let pending = self.write_buf.borrow().len();
+        let (sib_pending, sib_ahead) = self.sibling_offsets().unwrap_or((0, 0));
+        let pending = self.write_buf.borrow().len() + sib_pending;
+        let ahead = self.read_ahead.borrow().pending() + sib_ahead;
         match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { pos, .. } => *pos,
             // Public StringIO positions count characters, not bytes.
             FileBackend::MemText { data, pos } => memtext_char_of_byte(data, *pos),
             FileBackend::Disk(f) => {
                 use std::io::Seek;
-                f.stream_position().map(|n| n as usize).unwrap_or(0) + pending
+                (f.stream_position().map(|n| n as usize).unwrap_or(0) + pending)
+                    .saturating_sub(ahead)
             }
             _ => 0,
         }
@@ -8904,7 +9325,11 @@ impl PyFile {
     /// pipe/FIFO descriptor raises `OSError(ESPIPE)`, which
     /// `test_io.test_optional_abilities` asserts for a non-seekable stream.
     pub fn tell(&self) -> Result<usize, RuntimeError> {
-        let pending = self.write_buf.borrow().len();
+        let (sib_pending, sib_ahead) = self.sibling_offsets().unwrap_or((0, 0));
+        let pending = self.write_buf.borrow().len() + sib_pending;
+        // Bytes a line read took ahead of the stream's position (CPython's
+        // `BufferedReader.tell` subtracts its unread buffer the same way).
+        let ahead = self.read_ahead.borrow().pending() + sib_ahead;
         match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { pos, .. } => Ok(*pos),
             FileBackend::MemText { data, pos } => Ok(memtext_char_of_byte(data, *pos)),
@@ -8913,7 +9338,7 @@ impl PyFile {
                 let p = f
                     .stream_position()
                     .map_err(|e| crate::error::io_error_to_py(&e))?;
-                Ok(p as usize + pending)
+                Ok((p as usize + pending).saturating_sub(ahead))
             }
             _ => Ok(0),
         }
@@ -8925,6 +9350,7 @@ impl PyFile {
         // CPython's `BufferedWriter.seek` flushes the write buffer first so the
         // descriptor offset the seek is relative to is current.
         self.flush_write_buf()?;
+        self.rewind_read_ahead();
         // Unix disk descriptors: serialize the offset move against this
         // file's in-flight GIL-released raw reads/writes (see
         // `fd_syscall_lock`) — an `lseek` interleaving with a concurrent
@@ -9185,6 +9611,7 @@ impl Drop for PyFile {
         // descriptor is dropped, so data written but never explicitly flushed
         // still reaches disk (CPython relies on the buffer's deallocator).
         let _ = self.flush_write_buf();
+        self.unlist_writer();
         #[cfg(unix)]
         {
             let Ok(mut backend) = self.backend.try_borrow_mut() else {

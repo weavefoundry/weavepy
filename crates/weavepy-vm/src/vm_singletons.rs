@@ -383,6 +383,7 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
             // builtin; route through Rust's stdout for the
             // interactive case. Tests/REPL go through `print`, which
             // uses the configured sink.
+            let _ = flush_host_stdout();
             println!("{}", body_for_call);
             Ok(Object::None)
         }),
@@ -1203,6 +1204,10 @@ static STDIO_UNBUFFERED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 pub fn set_stdio_unbuffered(value: bool) {
     STDIO_UNBUFFERED.store(value, std::sync::atomic::Ordering::Release);
+    if value {
+        // Nothing may stay behind in a buffer that's no longer used.
+        let _ = flush_host_stdout();
+    }
 }
 
 pub fn stdio_unbuffered() -> bool {
@@ -1228,6 +1233,152 @@ pub fn note_stdout_write(chunk: &[u8]) {
 /// Read-and-clear the pending flag (the caller is about to flush).
 pub fn take_stdout_pending() -> bool {
     STDOUT_TAIL_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// The process's standard output, as `sys.stdout` and `print` write it.
+///
+/// On a terminal, and under `-u`, this is Rust's `std::io::stdout()`, which
+/// pushes every line out as it ends. Anywhere else (a file, a pipe) it holds
+/// output until a buffer's worth is waiting, which is CPython's rule: a
+/// program that prints a million lines into a pipe makes a few hundred
+/// `write(2)` calls, not a million. The buffer goes out when it fills, at
+/// `sys.stdout.flush()`, before `input()` reads, and when the process exits
+/// (`exit(3)` runs [`host_stdout_at_exit`]; `os._exit` drops it, as in
+/// CPython). Every handle shares the one buffer, so `sys.stdout`,
+/// `sys.stdout.buffer` and the interpreter's own sink stay in order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostStdout;
+
+/// What a redirected standard output holds before it writes.
+const HOST_STDOUT_BLOCK: usize = 128 * 1024;
+
+static HOST_STDOUT_BUF: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether standard output holds its output in [`HOST_STDOUT_BUF`]: 0 until
+/// the first write asks whether fd 1 is a terminal, then 1 (it holds) or 2.
+static HOST_STDOUT_HOLDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn host_stdout_buf() -> std::sync::MutexGuard<'static, Vec<u8>> {
+    HOST_STDOUT_BUF.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn host_stdout_holds() -> bool {
+    use std::sync::atomic::Ordering;
+    if stdio_unbuffered() {
+        return false;
+    }
+    match HOST_STDOUT_HOLDS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use std::io::IsTerminal;
+            let holds = !std::io::stdout().is_terminal();
+            if holds {
+                // SAFETY: registering a plain `extern "C"` function.
+                unsafe { libc::atexit(host_stdout_at_exit) };
+            }
+            HOST_STDOUT_HOLDS.store(if holds { 1 } else { 2 }, Ordering::Relaxed);
+            holds
+        }
+    }
+}
+
+/// Write all of `data` to fd 1 itself, reporting what the descriptor says: a
+/// closed one is `EBADF` and a reader that went away `EPIPE`, where Rust's
+/// `Stdout` swallows the first.
+#[cfg(unix)]
+fn host_stdout_write_fd(buf: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut done = 0;
+    let res = loop {
+        if done == buf.len() {
+            break Ok(());
+        }
+        let rest = &buf[done..];
+        let n = unsafe { libc::write(1, rest.as_ptr().cast(), rest.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(err);
+        }
+        done += n as usize;
+    };
+    // What the descriptor took is gone, whatever happened after.
+    buf.drain(..done);
+    res
+}
+
+#[cfg(not(unix))]
+fn host_stdout_write_fd(buf: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let res = out.write_all(buf).and_then(|()| out.flush());
+    if res.is_ok() {
+        buf.clear();
+    }
+    res
+}
+
+/// Push out what standard output holds. Bytes a failed write didn't take stay
+/// held, as CPython's `BufferedWriter` keeps them: a program that catches the
+/// error from `flush()` and goes on still fails its flush at exit (status
+/// 120). Past two blocks they're dropped, so that a program writing on into a
+/// broken pipe doesn't grow without bound.
+fn host_stdout_drain(buf: &mut Vec<u8>) -> std::io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    // Anything Rust-side code printed without ending its line goes first.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let res = host_stdout_write_fd(buf);
+    if res.is_ok() || buf.len() > 2 * HOST_STDOUT_BLOCK {
+        buf.clear();
+        if buf.capacity() > 2 * HOST_STDOUT_BLOCK {
+            buf.shrink_to(HOST_STDOUT_BLOCK);
+        }
+    }
+    res
+}
+
+/// Flush standard output: what [`HostStdout`] holds, then Rust's own buffer.
+/// For code that's about to read a reply to what it printed, start a child
+/// that shares the descriptor, or leave the process.
+pub fn flush_host_stdout() -> std::io::Result<()> {
+    let held = host_stdout_drain(&mut host_stdout_buf());
+    let own = std::io::Write::flush(&mut std::io::stdout());
+    held.and(own)
+}
+
+/// `exit(3)` hook: a process that ends without flushing `sys.stdout` (an
+/// embedder's exit, a Rust-side `process::exit`) still writes what it printed.
+/// Rust's runtime has flushed its own buffer by now, so only the descriptor
+/// is touched; a buffer some other thread holds locked is left alone.
+extern "C" fn host_stdout_at_exit() {
+    if let Ok(mut buf) = HOST_STDOUT_BUF.try_lock() {
+        if !buf.is_empty() {
+            let _ = host_stdout_write_fd(&mut buf);
+            buf.clear();
+        }
+    }
+}
+
+impl std::io::Write for HostStdout {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if !host_stdout_holds() {
+            return std::io::stdout().write(data);
+        }
+        let mut buf = host_stdout_buf();
+        buf.extend_from_slice(data);
+        if buf.len() >= HOST_STDOUT_BLOCK {
+            host_stdout_drain(&mut buf)?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        flush_host_stdout()
+    }
 }
 
 /// `-X cpu_count=N` / `PYTHON_CPU_COUNT` (gh-109595): overrides what

@@ -1130,7 +1130,9 @@ impl Default for Interpreter {
         // `_Py_SetLocaleFromEnv`) so `_locale.getencoding()` and
         // `locale.setlocale(..., None)` observe the user's locale.
         crate::stdlib::locale_mod::init_from_env();
-        let stdout: Stdout = Rc::from_arc(std::sync::Arc::new(RefCell::new(std::io::stdout())));
+        let stdout: Stdout = Rc::from_arc(std::sync::Arc::new(RefCell::new(
+            crate::vm_singletons::HostStdout,
+        )));
         let mut builtins_dict = builtins::default_builtins();
         // The `builtins` module exposes the core types/exceptions as the
         // real `type` objects (CPython's `builtins.int is int`), not the
@@ -1380,6 +1382,24 @@ impl Interpreter {
     /// `Py_FinalizeEx` reports that with "Exception ignored while flushing
     /// sys.stdout" on stderr and the process exits with status 120
     /// (`test_cmd_line.test_stdout_flush_at_shutdown`).
+    /// Flush `sys.stderr` and `sys.stdout` and drop any error: CPython's
+    /// `flush_io`, which its interactive loop runs after every statement, so
+    /// that a session driven through pipes sees each statement's output.
+    pub fn flush_streams_quietly(&mut self) {
+        for name in ["stderr", "stdout"] {
+            let Some(stream) = self.current_sys_attr(name) else {
+                continue;
+            };
+            if matches!(&stream, Object::None) {
+                continue;
+            }
+            if let Ok(flush) = self.load_attr(&stream, "flush") {
+                let globals = self.builtins.clone();
+                let _ = self.call(&flush, &[], &[], &globals);
+            }
+        }
+    }
+
     pub fn flush_streams(&mut self) -> bool {
         let mut ok = true;
         for name in ["stdout", "stderr"] {
@@ -2619,7 +2639,11 @@ impl Interpreter {
         // PyRefTracer fixture prints object deaths symmetrically with
         // the CREATE lines emitted in `record_alloc`.
         if crate::stdlib::testinternalcapi_mod::reftrace_print_active() {
-            println!("DESTROY {}", dropped.type_name_owned());
+            let _ = writeln!(
+                crate::vm_singletons::HostStdout,
+                "DESTROY {}",
+                dropped.type_name_owned()
+            );
         }
         match dropped {
             // A discarded never-driven `asend`/`athrow`/`aclose` awaitable
@@ -3329,6 +3353,9 @@ impl Interpreter {
         if crate::vm_singletons::has_pending_resource_warnings() {
             self.drain_pending_resource_warnings();
         }
+        // Streams that outlive everything above (a file held by a reference
+        // cycle, say) still owe their descriptors what was written to them.
+        crate::object::flush_pending_writers();
         // RFC 0067 — the `WEAVEPY_VM_STATS=1` shutdown print: dispatch/
         // specialization counters plus the tier-2 JIT block (native
         // entries, deopts, and the WS1 call-path counters). Emitted
@@ -7147,7 +7174,11 @@ impl Interpreter {
         // `_testcapi.toggle_reftrace_printer` (test_ceval_decref):
         // CPython's PyRefTracer fixture prints every object birth.
         if crate::stdlib::testinternalcapi_mod::reftrace_print_active() {
-            println!("CREATE {}", obj.type_name_owned());
+            let _ = writeln!(
+                crate::vm_singletons::HostStdout,
+                "CREATE {}",
+                obj.type_name_owned()
+            );
         }
     }
 
@@ -18503,19 +18534,25 @@ impl Interpreter {
         let Some(&ins) = frame.code.instructions.get(pc) else {
             return false;
         };
-        let Some(Object::LazyIter(l)) = frame.stack.last() else {
-            return false;
+        // A file is its own iterator, and its step (a line read) can run a
+        // signal handler: it takes the lane too.
+        let source = match frame.stack.last() {
+            Some(it @ (Object::LazyIter(_) | Object::File(_))) => it.clone(),
+            _ => return false,
         };
         if ins.op != OpCode::ForIter {
             return false;
         }
-        let l = l.clone();
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
-        let next = self.lazy_iter_next(&l, &globals);
+        let next = match &source {
+            Object::LazyIter(l) => self.lazy_iter_next(l, &globals),
+            Object::File(f) => crate::builtins::file_iter_next(f),
+            _ => unreachable!("matched above"),
+        };
         self.core_pending_exit(sw, pending);
-        drop(l);
+        drop(source);
         // SAFETY: as in `core_type_lane` (the step ran nested activations
         // of its own, never this one).
         let frame = unsafe { &mut *sw.cur };
@@ -40893,6 +40930,9 @@ impl Interpreter {
                                         crate::object::FileBackend::Stdout(_)
                                         | crate::object::FileBackend::Stderr(_),
                                     ) => unbuffered,
+                                    ("line_buffering", crate::object::FileBackend::Disk(_)) => {
+                                        f.line_buffering_set()
+                                    }
                                     _ => false,
                                 };
                                 return Ok(Object::Bool(v));
@@ -66062,6 +66102,7 @@ impl Interpreter {
         use std::io::Write;
         if let Some(prompt) = args.first() {
             let s = prompt.to_str();
+            let _ = crate::vm_singletons::flush_host_stdout();
             print!("{}", s);
             let _ = std::io::stdout().flush();
         }

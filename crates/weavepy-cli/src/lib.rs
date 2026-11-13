@@ -2187,7 +2187,7 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
 /// Never prints a traceback.
 fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
     use weavepy::vm::object::Object;
-    let _ = io::stdout().flush();
+    let _ = weavepy::vm::vm_singletons::flush_host_stdout();
     let status: i32 = match code {
         Object::None => 0,
         Object::Bool(b) => i32::from(b),
@@ -2298,7 +2298,7 @@ fn exit_message_bytes(obj: &weavepy::vm::object::Object) -> Vec<u8> {
 /// (128 + SIGINT) if, impossibly, the signal doesn't terminate us.
 #[cfg(unix)]
 fn exit_via_sigint() -> ! {
-    let _ = io::stdout().flush();
+    let _ = weavepy::vm::vm_singletons::flush_host_stdout();
     let _ = io::stderr().flush();
     // Reset SIGINT to SIG_DFL, unblock it on this thread, and raise it
     // process-wide so we die *by the signal* (returncode == -SIGINT).
@@ -2309,7 +2309,7 @@ fn exit_via_sigint() -> ! {
 
 #[cfg(not(unix))]
 fn exit_via_sigint() -> ! {
-    let _ = io::stdout().flush();
+    let _ = weavepy::vm::vm_singletons::flush_host_stdout();
     let _ = io::stderr().flush();
     std::process::exit(0xC0_00_01_3A_u32 as i32);
 }
