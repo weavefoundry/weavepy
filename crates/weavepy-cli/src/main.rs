@@ -20,7 +20,7 @@
 
 #[cfg(not(windows))]
 fn main() {
-    std::process::exit(weavepy_cli::cli_main());
+    weavepy::vm::vm_singletons::exit_process(weavepy_cli::cli_main());
 }
 
 /// Configure the allocator before anything allocates (see
@@ -33,7 +33,7 @@ static CONFIGURE_ALLOCATOR: extern "C" fn() = weavepy_cli::configure_allocator;
 
 #[cfg(windows)]
 fn main() {
-    std::process::exit(shim::run());
+    weavepy::vm::vm_singletons::exit_process(shim::run());
 }
 
 #[cfg(windows)]

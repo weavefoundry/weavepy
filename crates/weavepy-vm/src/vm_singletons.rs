@@ -1243,8 +1243,8 @@ pub fn take_stdout_pending() -> bool {
 /// program that prints a million lines into a pipe makes a few hundred
 /// `write(2)` calls, not a million. The buffer goes out when it fills, at
 /// `sys.stdout.flush()`, before `input()` reads, and when the process exits
-/// (`exit(3)` runs [`host_stdout_at_exit`]; `os._exit` drops it, as in
-/// CPython). Every handle shares the one buffer, so `sys.stdout`,
+/// ([`exit_process`]; `os._exit` drops it, as in CPython). Every handle
+/// shares the one buffer, so `sys.stdout`,
 /// `sys.stdout.buffer` and the interpreter's own sink stay in order.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostStdout;
@@ -1273,10 +1273,6 @@ fn host_stdout_holds() -> bool {
         _ => {
             use std::io::IsTerminal;
             let holds = !std::io::stdout().is_terminal();
-            if holds {
-                // SAFETY: registering a plain `extern "C"` function.
-                unsafe { libc::atexit(host_stdout_at_exit) };
-            }
             HOST_STDOUT_HOLDS.store(if holds { 1 } else { 2 }, Ordering::Relaxed);
             holds
         }
@@ -1350,17 +1346,14 @@ pub fn flush_host_stdout() -> std::io::Result<()> {
     held.and(own)
 }
 
-/// `exit(3)` hook: a process that ends without flushing `sys.stdout` (an
-/// embedder's exit, a Rust-side `process::exit`) still writes what it printed.
-/// Rust's runtime has flushed its own buffer by now, so only the descriptor
-/// is touched; a buffer some other thread holds locked is left alone.
-extern "C" fn host_stdout_at_exit() {
-    if let Ok(mut buf) = HOST_STDOUT_BUF.try_lock() {
-        if !buf.is_empty() {
-            let _ = host_stdout_write_fd(&mut buf);
-            buf.clear();
-        }
-    }
+/// Leave the process with `code`, writing out what standard output still
+/// holds first: every Rust-side exit of a process that may have run Python
+/// code goes through here. (A libc `atexit` hook would cover them all at
+/// once, but registering one costs a short process some eight hundred page
+/// faults at exit on macOS.)
+pub fn exit_process(code: i32) -> ! {
+    let _ = flush_host_stdout();
+    std::process::exit(code)
 }
 
 impl std::io::Write for HostStdout {

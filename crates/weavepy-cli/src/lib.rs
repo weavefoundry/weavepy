@@ -1127,14 +1127,14 @@ fn argument_expected_error(opt: char) -> ! {
     eprintln!("Argument expected for the -{opt} option");
     eprintln!("usage: weavepy [option] ... [-c cmd | -m mod | file | -] [arg] ...");
     eprintln!("Try `weavepy -h' for more information.");
-    std::process::exit(2);
+    weavepy::vm::vm_singletons::exit_process(2);
 }
 
 /// A startup configuration error CPython reports through
 /// `Py_ExitStatusException`: `Fatal Python error: <where>: <msg>`, exit 1.
 fn config_fatal_error(whence: &str, msg: &str) -> ! {
     eprintln!("Fatal Python error: {whence}: {msg}");
-    std::process::exit(1);
+    weavepy::vm::vm_singletons::exit_process(1);
 }
 
 /// The value of the last `-X name[=value]` occurrence: `None` when the
@@ -1363,7 +1363,7 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
             // CPython surfaces `_PyTraceMalloc_Start`'s ValueError during
             // interpreter init.
             eprintln!("ValueError: the number of frames must be in range [1; 65535]");
-            std::process::exit(1);
+            weavepy::vm::vm_singletons::exit_process(1);
         }
         Some(n) => n as u32,
     };
@@ -1552,7 +1552,7 @@ impl EnvOverrides {
                         "Fatal Python error: init_utf8_mode: invalid PYTHONUTF8 environment \
                          variable value '{other}'"
                     );
-                    std::process::exit(1);
+                    weavepy::vm::vm_singletons::exit_process(1);
                 }
             }
         }
@@ -1589,7 +1589,7 @@ fn decode_command_arg(cmd: &str) -> String {
                     .collect()
             } else {
                 eprintln!("Unable to decode the command from the command line:");
-                std::process::exit(1);
+                weavepy::vm::vm_singletons::exit_process(1);
             }
         }
         Object::Str(s) => s.to_string(),
@@ -1672,7 +1672,7 @@ fn dump_path_config_and_die(cli: &Cli, env: &EnvOverrides, home: &str, prefix: &
     let _ = writeln!(out, "Current thread 0x{:016x} (most recent call first):", 0);
     let _ = writeln!(out, "  <no Python frame>");
     eprint!("{out}");
-    std::process::exit(1);
+    weavepy::vm::vm_singletons::exit_process(1);
 }
 
 /// `_PyUnicode_Dedent`: strip the longest common leading whitespace
@@ -1826,10 +1826,10 @@ fn decode_script_source(bytes: &[u8], filename: &str) -> String {
                     eprintln!("    {trimmed}");
                 }
                 eprintln!("SyntaxError: {msg}");
-                std::process::exit(1);
+                weavepy::vm::vm_singletons::exit_process(1);
             }
             eprint!("{}", format_decode_syntax_error(&err, filename, &msg));
-            std::process::exit(1);
+            weavepy::vm::vm_singletons::exit_process(1);
         }
     }
 }
@@ -1953,7 +1953,7 @@ fn run_path(
                 abs.display(),
                 errno_message(errno)
             );
-            std::process::exit(2);
+            weavepy::vm::vm_singletons::exit_process(2);
         }
     };
     // `python app.zip`: the zip's top-level `__main__` becomes the program.
@@ -2248,7 +2248,7 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
         }
     };
     let _ = io::stderr().flush();
-    std::process::exit(status);
+    weavepy::vm::vm_singletons::exit_process(status);
 }
 
 /// Encode a `SystemExit` message the way CPython writes it to stderr:
@@ -2304,14 +2304,14 @@ fn exit_via_sigint() -> ! {
     // process-wide so we die *by the signal* (returncode == -SIGINT).
     weavepy::vm::stdlib::signal_mod::die_via_sigint();
     // Unreachable in practice; the signal terminates us above.
-    std::process::exit(130);
+    weavepy::vm::vm_singletons::exit_process(130);
 }
 
 #[cfg(not(unix))]
 fn exit_via_sigint() -> ! {
     let _ = weavepy::vm::vm_singletons::flush_host_stdout();
     let _ = io::stderr().flush();
-    std::process::exit(0xC0_00_01_3A_u32 as i32);
+    weavepy::vm::vm_singletons::exit_process(0xC0_00_01_3A_u32 as i32);
 }
 
 fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) -> Result<()> {

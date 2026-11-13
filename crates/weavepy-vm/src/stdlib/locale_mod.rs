@@ -600,7 +600,7 @@ mod tests {
             };
             if initial == b"C" || initial == b"POSIX" {
                 // The requested UTF-8 spelling isn't installed on this host.
-                std::process::exit(77);
+                crate::vm_singletons::exit_process(77);
             }
             let c_locale = CString::new("C").unwrap();
             // SAFETY: no worker has started, and the C locale always exists.

@@ -8010,21 +8010,23 @@ impl PyFile {
 
     /// Fold the line endings present in a freshly decoded chunk into `seennl`.
     fn record_seen_newlines(&self, s: &str) {
-        if !s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
-            return;
-        }
-        let crlf = s.matches("\r\n").count();
-        let cr = s.as_bytes().iter().filter(|&&b| b == b'\r').count() - crlf;
-        let lf = s.as_bytes().iter().filter(|&&b| b == b'\n').count() - crlf;
+        let bytes = s.as_bytes();
         let mut flags = self.seennl.get();
-        if cr > 0 {
-            flags |= 1;
-        }
-        if lf > 0 {
-            flags |= 2;
-        }
-        if crlf > 0 {
-            flags |= 4;
+        // One pass over the line ends, done as soon as all three kinds
+        // have been seen.
+        let mut ends = memchr::memchr2_iter(b'\r', b'\n', bytes).peekable();
+        while let Some(at) = ends.next() {
+            if flags == 7 {
+                break;
+            }
+            if bytes[at] == b'\n' {
+                flags |= 2;
+            } else if ends.peek() == Some(&(at + 1)) && bytes[at + 1] == b'\n' {
+                flags |= 4;
+                ends.next();
+            } else {
+                flags |= 1;
+            }
         }
         self.seennl.set(flags);
     }

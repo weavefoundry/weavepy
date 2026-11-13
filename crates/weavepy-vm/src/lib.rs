@@ -33103,7 +33103,22 @@ impl Interpreter {
             {
                 return Some((LeafAttr::Value(Object::Type(inst.cls())), None));
             }
-            return None;
+            // A native method the class itself supplies under a dunder name
+            // (`lock.__enter__`, which `threading.Condition` calls by name
+            // on every `with`) resolves as any other native method does,
+            // for a receiver that is nothing but an instance of its class:
+            // not a `super` proxy, and with no native value or C body whose
+            // own dunders would answer first.
+            let native_method = !cls.is_super_proxy_type()
+                && inst.native.get().is_none()
+                && inst.c_body.get() == 0
+                && matches!(
+                    Self::leaf_class_attr(code, cls, name_idx),
+                    Some(LeafAttr::BuiltinMethod(_))
+                );
+            if !native_method {
+                return None;
+            }
         }
         let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
             LeafAttr::InstanceOnly => None,
