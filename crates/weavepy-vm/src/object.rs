@@ -9395,8 +9395,13 @@ impl PyLazyIter {
                     visit(it);
                 }
             }
-            LazyIterKind::Zip { iters, result, .. } => {
-                for it in iters {
+            LazyIterKind::Zip {
+                iters,
+                result,
+                held,
+                ..
+            } => {
+                for it in iters.iter().chain(held.iter()) {
                     visit(it);
                 }
                 if let Some(t) = result {
@@ -9619,10 +9624,15 @@ pub enum LazyIterKind {
     /// The builtin `zip(*iterables, strict=...)`. `result` is the last
     /// tuple produced, refilled in place when nothing else holds it
     /// (CPython's `zip_next` reuses its result tuple the same way).
+    /// `held` is what a step in progress already took from the first
+    /// sources: the frame JIT's direct step leaves it when a later source
+    /// needs the general step (see `Interpreter::lazy_gen_pair`), which
+    /// takes it at once.
     Zip {
         iters: Vec<Object>,
         strict: bool,
         result: Option<SharedTuple>,
+        held: Vec<Object>,
     },
     /// The builtin `enumerate(iterable, start)` over a source only the
     /// interpreter can step (a generator, a user iterator); a native

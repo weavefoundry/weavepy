@@ -250,6 +250,7 @@ impl Interpreter {
                     iters,
                     strict: false,
                     result: None,
+                    held: Vec::new(),
                 })
             }
         })
@@ -338,6 +339,7 @@ impl Interpreter {
                     iters,
                     strict,
                     result: None,
+                    held: Vec::new(),
                 }))
             }
         }
@@ -498,8 +500,15 @@ impl Interpreter {
                 _ => None,
             }
         };
-        let mut items = Vec::with_capacity(n);
-        for i in 0..n {
+        // (What the frame JIT's direct step already took from the first
+        // sources of this step, if it stopped partway: see
+        // `Self::lazy_gen_pair`. Taken before anything runs, so a raise
+        // below drops it, as CPython drops a step's items.)
+        let mut items = match &mut *l.state.borrow_mut() {
+            LazyIterKind::Zip { held, .. } if !held.is_empty() => std::mem::take(held),
+            _ => Vec::with_capacity(n),
+        };
+        for i in items.len()..n {
             let Some(it) = source(l, i) else {
                 return Ok(None);
             };
@@ -932,10 +941,15 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         iters,
         strict: false,
         result,
+        held,
     } = st
     else {
         return itertools_pure_next(l);
     };
+    // (A step in progress is the general step's to finish.)
+    if !held.is_empty() {
+        return None;
+    }
     // Two plain sequence cursors (`zip(xs, ys)`), the commonest shape.
     if let [a, b] = iters.as_slice() {
         if let Some((x, y)) = cursor_pair(a, b) {
@@ -992,11 +1006,15 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     let LazyIterKind::Zip {
         iters,
         strict: false,
+        held,
         ..
     } = st
     else {
         return None;
     };
+    if !held.is_empty() {
+        return None;
+    }
     let [a, b] = iters.as_slice() else {
         return None;
     };
@@ -2181,6 +2199,121 @@ impl Interpreter {
         };
         cursor_advance(c)?;
         Some((value, key))
+    }
+
+    /// One item of `source` for [`Self::lazy_gen_pair`]: a generator's
+    /// next yield by its native code ([`Self::gen_native_next`]), or a
+    /// plain cursor's next item. `None` for anything else, and for a
+    /// generator that didn't yield (finished, raised, stopped partway, or
+    /// turned away untouched: the general step finds it as it is).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn lazy_gen_pull(
+        &mut self,
+        source: &Object,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        match source {
+            Object::Generator(g) => match self.gen_native_next(g, snap_gen, dead, depth_cell) {
+                crate::gen_fast::GenNext::Yielded(v) => Some(v),
+                _ => None,
+            },
+            Object::Iter(c) => {
+                let v = cursor_peek(c)?;
+                cursor_advance(c)?;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// One step of `enumerate(gen)`, or of a two-source `zip` with a
+    /// generator among its sources (the other a generator or a plain
+    /// cursor), from a running activation whose recursion depth is at
+    /// `depth_cell`: the pair's two items, each generator stepped by its
+    /// native code where it stands. The general step of such an adapter
+    /// runs in the core loop's lane, with the calling activation published
+    /// and the generator resumed through three more layers: about 1,600
+    /// instructions an item for `for i, x in enumerate(gen)`, against 550
+    /// this way.
+    ///
+    /// `None` when the step isn't one of these or a source didn't give an
+    /// item. Nothing is lost then: a `zip` holds what its first source gave
+    /// (`LazyIterKind::Zip::held`) for the general step, which goes on
+    /// from the second, and a generator that finished, raised or stopped
+    /// partway is found as it is by that step.
+    #[cfg(feature = "jit")]
+    pub(crate) fn lazy_gen_pair(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<(Object, Object)> {
+        let direct = |s: &Object| matches!(s, Object::Generator(_)) || matches!(s, Object::Iter(_));
+        // The sources are copied out: a generator's body may reach this
+        // very adapter, so no view of its state survives a step.
+        let (a, b) = {
+            // SAFETY: a read that runs no code; the view ends with the block.
+            match unsafe { l.state.peek() }? {
+                LazyIterKind::Enumerate {
+                    source: source @ Object::Generator(_),
+                    count,
+                    count_big: None,
+                } if *count < i64::MAX => (source.clone(), None),
+                LazyIterKind::Zip {
+                    iters,
+                    strict: false,
+                    held,
+                    ..
+                } if held.is_empty() => match iters.as_slice() {
+                    [a, b]
+                        if direct(a)
+                            && direct(b)
+                            && (matches!(a, Object::Generator(_))
+                                || matches!(b, Object::Generator(_))) =>
+                    {
+                        (a.clone(), Some(b.clone()))
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        let x = self.lazy_gen_pull(&a, snap_gen, dead, depth_cell)?;
+        let Some(b) = b else {
+            // `enumerate`: the index, counted now that the item is in hand.
+            let mut st = l.state.borrow_mut();
+            let LazyIterKind::Enumerate {
+                count,
+                count_big: None,
+                ..
+            } = &mut *st
+            else {
+                // (The body replaced the adapter's state under the step:
+                // the general pairing's.)
+                drop(st);
+                let pair = Self::enumerate_advance(l, x);
+                let Object::Tuple(t) = &pair else {
+                    return None;
+                };
+                return Some((t[0].clone(), t[1].clone()));
+            };
+            let i = *count;
+            *count += 1;
+            return Some((Object::Int(i), x));
+        };
+        match self.lazy_gen_pull(&b, snap_gen, dead, depth_cell) {
+            Some(y) => Some((x, y)),
+            None => {
+                if let LazyIterKind::Zip { held, .. } = &mut *l.state.borrow_mut() {
+                    held.push(x);
+                }
+                None
+            }
+        }
     }
 
     /// One step of a native adapter that runs no Python code, for every

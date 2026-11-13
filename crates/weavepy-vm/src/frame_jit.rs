@@ -2572,7 +2572,7 @@ unsafe extern "C" fn h_for_iter_gen(
     // SAFETY: the running thread's interpreter, dormant while the helper
     // runs; the stack slot keeps `g` alive.
     let interp = unsafe { &mut *st.interp.cast_mut() };
-    match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+    match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
         crate::gen_fast::GenNext::Yielded(v) => {
             // SAFETY: the slot above the iterator is free.
             unsafe { out.write(v) };
@@ -3545,7 +3545,7 @@ unsafe fn lazy_step(
     unsafe {
         let interp = &mut *st.interp.cast_mut();
         if crate::gen_fast::may_step(gen) {
-            match interp.gen_fast_next(gen, st.snap_gen, 0, st.maybe_dead) {
+            match interp.gen_native_next(gen, st.snap_gen, st.maybe_dead, st.depth_cell) {
                 GenNext::Yielded(v) => return LazyGen::Yielded(v),
                 GenNext::Exhausted(r) => return LazyGen::Returned(r),
                 GenNext::Declined | GenNext::Partial => {}
@@ -4045,6 +4045,19 @@ unsafe extern "C" fn h_for_iter_rest(
                 unsafe { out.write(v) };
                 return 1;
             }
+            // `enumerate(gen)` and a two-source `zip` over a generator, as
+            // `h_for_iter_pair` steps them, here with the pair's tuple.
+            if !st.sw.is_null() {
+                // SAFETY: as above.
+                let interp = unsafe { &mut *st.interp.cast_mut() };
+                if let Some((a, b)) =
+                    interp.lazy_gen_pair(l, st.snap_gen, st.maybe_dead, st.depth_cell)
+                {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(Object::new_tuple_array([a, b])) };
+                    return 1;
+                }
+            }
             // SAFETY: as above.
             return unsafe { for_iter_lane(st, it, pc) };
         }
@@ -4275,7 +4288,7 @@ unsafe extern "C" fn h_for_iter_rest(
 /// `out` and its first above it (as the unpacking leaves them, no tuple
 /// built), anything else declined untouched (the unfused helpers take it,
 /// exhaustion included).
-unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
+unsafe extern "C" fn h_for_iter_pair(st: *mut State, it: *mut Object, out: *mut Object) -> u32 {
     // SAFETY: the code passes an initialized slot with two free ones above
     // it; nothing below runs code while the iterator is borrowed.
     unsafe {
@@ -4330,6 +4343,16 @@ unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
             }
             Object::LazyIter(l) => match crate::seqiter::lazy_pure_pair(l) {
                 Some(pair) => pair,
+                // `enumerate(gen)`, or a `zip` with a generator among its
+                // two sources: each generator stepped by its native code.
+                None if !(*st).sw.is_null() => {
+                    let s = &mut *st;
+                    let interp = &mut *s.interp.cast_mut();
+                    match interp.lazy_gen_pair(l, s.snap_gen, s.maybe_dead, s.depth_cell) {
+                        Some(pair) => pair,
+                        None => return 3,
+                    }
+                }
                 None => return 3,
             },
             _ => return 3,
@@ -12147,7 +12170,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         // The builtin and the generator (the stack's own
                         // slots hold them past the step) leave by plain
@@ -12203,7 +12226,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         crate::release_run(base.add(start), 4);
                         base.add(start).write(v);
@@ -14180,7 +14203,7 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
             return None;
         };
         let interp = &mut *st.interp.cast_mut();
-        let (v, exit) = match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+        let (v, exit) = match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
             crate::gen_fast::GenNext::Yielded(v) => (v, false),
             crate::gen_fast::GenNext::Exhausted(v) => (v, true),
             crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
@@ -20532,7 +20555,11 @@ impl<'a> Lower<'a> {
         // step allows; any other step below.
         if fused_pair_at(self.code, pc) {
             let r = self
-                .call(h_for_iter_pair as *const () as usize, &[it, out_slot], true)
+                .call(
+                    h_for_iter_pair as *const () as usize,
+                    &[self.st, it, out_slot],
+                    true,
+                )
                 .expect("returns");
             let pair_b = self.b.create_block();
             let single = self.b.create_block();

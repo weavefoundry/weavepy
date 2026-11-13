@@ -896,8 +896,39 @@ impl Interpreter {
         if !native.enters_at(pc) || stack.capacity() < deepest.max(native.need()) {
             return Err(usize::MAX);
         }
+        let locals = locals.as_mut_ptr();
+        // SAFETY: the checks above are `gen_native_run`'s contract.
+        unsafe { self.gen_native_run(frame_ptr, native, locals, snap_gen, depth, dead) }
+    }
+
+    /// [`Self::gen_native_yield`] past its checks: the native code `native`
+    /// run on `frame` from its pc, and what it stopped at.
+    ///
+    /// # Safety
+    ///
+    /// `frame` is a generator's frame that nothing else holds, its code the
+    /// one `native` was compiled from; `locals` addresses its locals (at
+    /// least the code's count); its pc is one `native` enters at, and its
+    /// stack has the capacity `native` needs.
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    unsafe fn gen_native_run(
+        &mut self,
+        frame_ptr: *mut Frame,
+        native: &crate::frame_jit::Native,
+        locals: *mut Object,
+        snap_gen: u64,
+        depth: u8,
+        dead: *const std::cell::Cell<bool>,
+    ) -> Result<(Object, bool), usize> {
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *frame_ptr };
+        // SAFETY: as in `gen_fast_step`.
+        let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
+        let pc = frame.pc as usize;
+        let stack = &mut frame.stack;
         let mut st = crate::frame_jit::State {
-            locals: locals.as_mut_ptr(),
+            locals,
             stack: stack.as_mut_ptr(),
             len: stack.len(),
             cap: stack.capacity(),
@@ -1153,6 +1184,128 @@ impl Interpreter {
         self.gen_fast_resume::<true>(g, ext, Object::None, snap_gen, 0, dead, Some(sink))
     }
 
+    /// `next(g)` from a running activation (whose recursion depth is at
+    /// `depth_cell`), for the commonest state of a compiled body: fresh, or
+    /// suspended at a `yield`, where its native code enters, with nothing
+    /// else to settle.
+    /// One pass of checks, then the native code runs to the next `yield`
+    /// (or `return`), a fresh generator's first resume included. Anything
+    /// the checks turn away, touching nothing, is [`Self::gen_fast_next`]'s:
+    /// a body without native code, a frame with a frame object or saved
+    /// exception state, a collapsed `yield from` chain.
+    ///
+    /// The checks are [`Self::gen_fast_send`]'s, [`Self::gen_fast_resume`]'s
+    /// and [`Self::gen_native_yield`]'s, each made once (those three
+    /// functions between them ask for the body's verdict twice and read the
+    /// thread's depth through its thread-local, 190 instructions more a
+    /// resume).
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn gen_native_next(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> GenNext {
+        use std::sync::atomic::Ordering;
+        'lean: {
+            if g.chain.get() != 0 || depth_cell.is_null() {
+                break 'lean;
+            }
+            // SAFETY: nothing below reaches the cell again until `state`'s
+            // last use (`peek_mut` rejects a live guard or shared cells).
+            let Some(state) = (unsafe { g.state_raw().peek_mut() }) else {
+                break 'lean;
+            };
+            let first = match &*state {
+                GeneratorState::Suspended(_) => false,
+                GeneratorState::Created(_) => true,
+                _ => break 'lean,
+            };
+            let (GeneratorState::Suspended(boxed) | GeneratorState::Created(boxed)) = &mut *state
+            else {
+                break 'lean;
+            };
+            let frame: &mut Frame = boxed;
+            // SAFETY: the frame's code outlives the step (as in
+            // `gen_fast_step`).
+            let code: &CodeObject = unsafe { &*Rc::as_ptr(&frame.code) };
+            let Some(ext) = crate::code_vm_ext(code) else {
+                break 'lean;
+            };
+            let pc = frame.pc as usize;
+            let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
+                break 'lean;
+            };
+            // (`gen_fast_ok`'s conditions, a partial step's, and the
+            // native entry's.)
+            if frame.sent_consumed
+                || pc == 0
+                || frame.py_frame.is_some()
+                || frame.has_saved_exc_info()
+                || frame.parked_native.is_some()
+                || frame
+                    .shell_cache
+                    .as_ref()
+                    .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
+                || crate::trace::eval_frame_record_active()
+                || {
+                    let v = verdicts(code, ext);
+                    v & CODE_MASK == CODE_NO || (first && v >> PROLOGUE_SHIFT == CODE_NO)
+                }
+                || !native.enters_at(pc)
+                || pc >= code.instructions.len()
+                // SAFETY: the running thread's own depth cell.
+                || unsafe { (*depth_cell).get() } + 2 >= crate::recursion::recursion_limit()
+            {
+                break 'lean;
+            }
+            // SAFETY: as in `gen_fast_step`.
+            let Some(locals) = (unsafe { frame.locals.peek_mut() }) else {
+                break 'lean;
+            };
+            // (Room for the sent value and what the code needs past it, as
+            // `gen_native_yield` asks once the value is pushed.)
+            let depth = frame.stack.len() + 1;
+            let deepest = code
+                .stacksize
+                .map_or(depth + 8, |s| (s as usize).max(depth + 1));
+            if locals.len() < code.varnames.len()
+                || frame.stack.capacity() < deepest.max(native.need())
+            {
+                break 'lean;
+            }
+            let locals = locals.as_mut_ptr();
+            // Committed: the generator runs.
+            let prev = std::mem::replace(state, GeneratorState::Running);
+            let (GeneratorState::Suspended(mut boxed) | GeneratorState::Created(mut boxed)) = prev
+            else {
+                unreachable!("checked above");
+            };
+            let frame: &mut Frame = &mut boxed;
+            frame.gen_first_resume = first;
+            let start = frame.pc;
+            frame.stack.push_fast(Object::None);
+            // SAFETY: the checks above.
+            let ran = unsafe { self.gen_native_run(frame, native, locals, snap_gen, 0, dead) };
+            return match ran {
+                Ok((v, false)) => {
+                    Self::park_stepped(g, boxed);
+                    GenNext::Yielded(v)
+                }
+                Ok((v, true)) => {
+                    self.retire_gen(g, boxed);
+                    GenNext::Exhausted(v)
+                }
+                Err(at) => {
+                    self.gen_resume_rest(g, boxed, ext, start, false, at, snap_gen, 0, None, dead)
+                }
+            };
+        }
+        self.gen_fast_next(g, snap_gen, 0, dead)
+    }
+
     /// [`Self::gen_fast_send`] once the body's verdict admits fast steps
     /// (`ext` is its code's extension table); with `FOLD`, a drain's (see
     /// [`Self::gen_fast_drain`]), its yields into `fold`.
@@ -1231,6 +1384,33 @@ impl Interpreter {
         };
         #[cfg(not(feature = "jit"))]
         let handed = usize::MAX;
+        self.gen_resume_rest(
+            g, boxed, ext, start, partial, handed, snap_gen, depth, fold, dead,
+        )
+    }
+
+    /// The rest of a resume whose native code didn't reach a `yield` or a
+    /// `return` (`handed` is where it stopped, `usize::MAX` if it never
+    /// ran, [`MARKED_AT`] for the general loop): the body's fast steps from
+    /// there, and the generator parked or retired with what they reached.
+    /// `start` is the pc the resume began at, `partial` whether it began
+    /// with no value sent.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn gen_resume_rest(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        mut boxed: Box<Frame>,
+        ext: &crate::CodeConstObjects,
+        start: u32,
+        partial: bool,
+        handed: usize,
+        snap_gen: u64,
+        depth: u8,
+        fold: Option<FoldSink>,
+        dead: *const std::cell::Cell<bool>,
+    ) -> GenNext {
+        let frame: &mut Frame = &mut boxed;
         #[cfg(feature = "jit")]
         let step = if handed == MARKED_AT {
             GenStep::Bail
