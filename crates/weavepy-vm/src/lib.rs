@@ -68335,6 +68335,70 @@ impl Interpreter {
         self.run_frame(&mut frame)
     }
 
+    /// `IMPORT_NAME` in `frame` of the absolute `name` when the module is
+    /// already imported and nothing else has a say: what [`Self::do_import`]
+    /// returns for it from the import cache (the module itself for a
+    /// from-list whose every name its dict already holds, else the module
+    /// of `name`'s first segment). `None`, with nothing done, for anything
+    /// that needs the full import: a relative import, a module still
+    /// loading or missing, a from-list name that may be a submodule or
+    /// `*`, a replaced `__import__` or builtins, an audit hook, `-X
+    /// importtime`, the interpreter's own loads, and interpreter shutdown.
+    pub(crate) fn cached_import(
+        &self,
+        frame: &Frame,
+        name: &str,
+        level: &Object,
+        fromlist: &Object,
+    ) -> Option<Object> {
+        if !matches!(level, Object::Int(0))
+            || name.is_empty()
+            || self.internal_import_depth != 0
+            || frame.builtins_obj().is_some()
+            || !Rc::ptr_eq(&frame.builtins, &self.builtins)
+            || crate::trace::any_audit_active()
+            || crate::import_time::reports_cached()
+            || crate::vm_singletons::modules_torn_down()
+        {
+            return None;
+        }
+        // (Only the interpreter's own `__import__` is skipped.)
+        match self
+            .builtins
+            .borrow()
+            .get(&crate::object::StrKey("__import__"))
+        {
+            Some(Object::Builtin(b)) if b.name == "__vm:__import__" => {}
+            _ => return None,
+        }
+        if self.cache.initializing_holder(name).is_some() {
+            return None;
+        }
+        let leaf = self
+            .cache
+            .get(name)
+            .filter(|m| !matches!(m, Object::None))?;
+        match fromlist {
+            Object::Tuple(names) if !names.is_empty() => {
+                let Object::Module(m) = &leaf else {
+                    return None;
+                };
+                let dict = m.dict.try_borrow().ok()?;
+                let held = names.iter().all(|n| {
+                    matches!(n, Object::Str(s)
+                        if &**s != "*" && dict.get(&crate::object::StrKey(s)).is_some())
+                });
+                drop(dict);
+                held.then_some(leaf)
+            }
+            Object::None | Object::Tuple(_) => match name.split_once('.') {
+                None => Some(leaf),
+                Some((front, _)) => self.cache.get(front).filter(|m| !matches!(m, Object::None)),
+            },
+            _ => None,
+        }
+    }
+
     fn do_import(
         &mut self,
         name: &str,

@@ -5222,6 +5222,48 @@ unsafe extern "C" fn h_container(
     unsafe {
         let st = &mut *st;
         let (ins, len) = (*ins, len as usize);
+        // `import m` and `from m import x` of a module that's already
+        // imported (a function-level import, on every call but the first):
+        // the module from the import cache, the name from its dict. Any
+        // other import is the interpreter's. (Not in an inlined body, whose
+        // builtins aren't this frame's to check.)
+        if ins.op == OpCode::ImportName {
+            if can_raise == 0 || len < 2 {
+                return u64::MAX;
+            }
+            let frame = &*st.frame;
+            let Some(name) = (&*code).names.get(ins.arg as usize) else {
+                return u64::MAX;
+            };
+            let (level, fromlist) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
+            let Some(module) = (*st.interp).cached_import(frame, name, level, fromlist) else {
+                return u64::MAX;
+            };
+            // (The level is an int; the from-list a constant.)
+            crate::drop_hot_at(st.stack.add(len - 1));
+            st.stack.add(len - 2).write(module);
+            return len as u64 - 1;
+        }
+        if ins.op == OpCode::ImportFrom {
+            if len == 0 || len >= st.cap {
+                return u64::MAX;
+            }
+            let (Object::Module(m), Some(name)) = (
+                &*st.stack.add(len - 1),
+                (&*code).names.get(ins.arg as usize),
+            ) else {
+                return u64::MAX;
+            };
+            let found = m
+                .dict
+                .peek()
+                .and_then(|d| d.get(&crate::object::StrKey(name)).map(crate::clone_hot));
+            let Some(v) = found else {
+                return u64::MAX;
+            };
+            st.stack.add(len).write(v);
+            return len as u64 + 1;
+        }
         if ins.op == OpCode::LoadSpecial {
             return Interpreter::core_load_special(&*code, ins, pc as usize, st.stack, len, st.cap)
                 .map_or(u64::MAX, |n| n as u64);
@@ -16212,6 +16254,8 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::EndSend
             | OpCode::BuildSet
             | OpCode::SetUpdate
+            | OpCode::ImportName
+            | OpCode::ImportFrom
     )
 }
 
@@ -17721,7 +17765,9 @@ impl<'a> Lower<'a> {
             | OpCode::MapAdd
             | OpCode::DictUpdate
             | OpCode::BuildSlice
-            | OpCode::SetUpdate => return self.container(pc),
+            | OpCode::SetUpdate
+            | OpCode::ImportName
+            | OpCode::ImportFrom => return self.container(pc),
             OpCode::BuildSet => return self.build_set(pc, ins.arg as usize),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
             OpCode::LoadAttr => return self.load_attr(pc, ins.arg),
